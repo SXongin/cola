@@ -271,6 +271,39 @@ mod tests {
     }
 
     #[test]
+    fn the_gate_checks_its_credential_before_codex_runs() {
+        let workflow = workflow();
+        // A dead key must name itself (#776): the preflight runs before the
+        // sandboxed run, reads the same endpoint/model the action does, and
+        // fails on anything but 200.
+        let check = step(&workflow, "Check the gate credential");
+        for needle in [
+            "$GATE_KEY",
+            "$GATE_ENDPOINT",
+            "$GATE_MODEL",
+            "%{http_code}",
+            "exit 1",
+        ] {
+            assert!(check.contains(needle), "the credential check must use {needle}");
+        }
+        let check_at = workflow.find("- name: Check the gate credential").unwrap();
+        let codex_at = workflow.find("- name: Run Codex (read-only)").unwrap();
+        assert!(
+            check_at < codex_at,
+            "the credential check must precede the Codex run"
+        );
+        // One definition of the provider, shared by the check and the action.
+        assert!(
+            workflow.contains("responses-api-endpoint: ${{ env.GATE_ENDPOINT }}"),
+            "the Codex step must read the shared endpoint"
+        );
+        assert!(
+            workflow.contains("model: ${{ env.GATE_MODEL }}"),
+            "the Codex step must read the shared model"
+        );
+    }
+
+    #[test]
     fn the_workflow_uses_the_shared_scripts() {
         let workflow = workflow();
         // The Codex step itself: the bound and the pin must stay, or a hang

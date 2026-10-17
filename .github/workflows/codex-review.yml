@@ -65,6 +65,21 @@
 # this workflow writes to `$RUNNER_TEMP` (never sourced from the reviewed
 # tree, which may predate it; tested by xtask), so a recurrence cannot discard
 # a finished review.
+#
+# Credential preflight (#776): a dead key must name itself. When the Go key
+# expired (2026-10-17, the first run after 2d23329b returned the gate to that
+# lane), the action reported only its drop-sudo wrapper's exit
+# (`Error: /usr/bin/sudo exited with code 1`) and the post step only found an
+# empty output file, so the run read as "Codex produced no output". A minimal
+# Responses call (a 16-token cap, far below a review) before Codex therefore
+# carries the credential's own status, and any non-200 fails with the endpoint,
+# the status and the body. The endpoint's `/v1/models` is unauthenticated
+# (measured 2026-10-18: 200 without a key), so only a real inference request
+# answers the question; the Go lane also needs an `x-opencode-session` header
+# (measured: 400 `MissingSessionID` without one). `GATE_ENDPOINT`/`GATE_MODEL`
+# sit in the job env so the check and the action share one definition; the
+# wiring is guarded by `cargo test -p xtask codex_gate`.
+#
 # Publication and approval are two tiers: a review whose last line ends with
 # the verdict is published, while approval requires the marker to stand on its
 # own line, so a quoted marker can never approve a change. A same-job retry is
@@ -119,6 +134,11 @@ jobs:
       pull-requests: write
     env:
       PR: ${{ github.event.pull_request.number }}
+      # The provider is workflow configuration (#776): the credential check and
+      # the Codex step read the same two values, so a switch cannot leave the
+      # preflight probing a different endpoint than the review uses.
+      GATE_ENDPOINT: https://opencode.ai/zen/go/v1/responses
+      GATE_MODEL: gpt-6-luna
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -304,6 +324,35 @@ jobs:
             fi
           } > codex-prompt.md
 
+      # A dead credential fails here with its own reason (#776): inside the
+      # sandboxed run the action reports its drop-sudo wrapper's exit and the
+      # post step only sees an empty output file. One minimal request, and any
+      # status but 200 names the endpoint, the status and the body.
+      - name: Check the gate credential
+        env:
+          GATE_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GATE_KEY:-}" ]; then
+            echo "::error title=Review gate credential::OPENCODE_API_KEY is empty; set the repository secret."
+            exit 1
+          fi
+          body=$(jq -nc --arg model "$GATE_MODEL" '{model: $model, input: "ping", max_output_tokens: 16}')
+          code=$(curl -sS -o "$RUNNER_TEMP/gate-preflight.json" -w '%{http_code}' \
+            --max-time 30 \
+            -X POST "$GATE_ENDPOINT" \
+            -H "Authorization: Bearer $GATE_KEY" \
+            -H 'Content-Type: application/json' \
+            -H 'x-opencode-session: cola-codex-gate-preflight' \
+            -d "$body") || {
+              echo "::error title=Review gate unreachable::curl could not reach $GATE_ENDPOINT."
+              exit 1
+            }
+          if [ "$code" != "200" ]; then
+            echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT: $(head -c 400 "$RUNNER_TEMP/gate-preflight.json" | tr '\n' ' ')"
+            exit 1
+          fi
+
       # Bounded, and salvageable when it does not return (#530): a completed
       # review is still published if the step is cancelled at its bound; a cut
       # stream (no verdict) fails the post step instead of being published.
@@ -314,8 +363,8 @@ jobs:
         uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
           openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
-          responses-api-endpoint: https://opencode.ai/zen/go/v1/responses
-          model: gpt-6-luna
+          responses-api-endpoint: ${{ env.GATE_ENDPOINT }}
+          model: ${{ env.GATE_MODEL }}
           codex-version: 0.160.0
           permission-profile: ":read-only"
           prompt-file: codex-prompt.md
