@@ -4,7 +4,7 @@
 # Pre-commit mirrors CI (fmt + clippy) but only fires when staged files touch
 # Rust, so docs/.scratch-only commits stay fast. commit-msg enforces
 # Conventional Commits. pre-push runs a dependency audit. post-checkout keeps a
-# linked worktree's CodeGraph index local (see AGENTS.md pitfall 15).
+# linked worktree's CodeGraph index local (see AGENTS.md).
 # See AGENTS.md for details.
 
 pre-commit:
@@ -35,7 +35,7 @@ pre-push:
 # stays the user's own call. Every failure is reported, never propagated, so a
 # broken CodeGraph cannot fail a checkout. The job is configured by the checkout
 # it runs in, so a worktree created before it landed needs one manual
-# `codegraph init -y .` (AGENTS.md pitfall 15).
+# `codegraph init -y .`.
 post-checkout:
   commands:
     codegraph:
