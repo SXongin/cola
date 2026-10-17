@@ -49,7 +49,7 @@ Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict p
 
 Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run the repo's review pair once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch under the binding's re-review bound (`docs/agents/flow.md`).
 
-Then run the repo's full verification loop (`AGENTS.md`, "Local development") on the branch: fmt check, clippy, tests, release build.
+Then run the repo's full verification loop (`CONTRIBUTING.md`, "Verification loop") on the branch: fmt check, clippy, tests, release build.
 
 Assemble the dossier:
 
