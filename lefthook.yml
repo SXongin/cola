@@ -4,8 +4,9 @@
 # Pre-commit mirrors CI (fmt + clippy) but only fires when staged files touch
 # Rust, so docs/.scratch-only commits stay fast. commit-msg enforces
 # Conventional Commits. pre-push runs a dependency audit. post-checkout keeps a
-# linked worktree's CodeGraph index local (see AGENTS.md).
-# See AGENTS.md for details.
+# linked worktree's CodeGraph index local (see CONTRIBUTING.md, "Local
+# development").
+# See CONTRIBUTING.md's "Verification loop" and "Local development".
 
 pre-commit:
   parallel: true
