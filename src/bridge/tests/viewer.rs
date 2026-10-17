@@ -2413,7 +2413,10 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
     // the shared pager holds string callback fields.
     let next = pager_button(&card, "下一页")["value"].clone();
     assert_eq!(next["op"], "page");
-    assert_eq!(next["path"], file_str);
+    // The viewer resolves the path, so the pager carries the canonical
+    // spelling — compare like-for-like (`tempfile` hands back the raw one,
+    // which differs on macOS `/private/var` and Windows 8.3 names).
+    assert_eq!(next["path"], canonical(&file));
     assert_eq!(next["return_dir"], proj_dir);
     assert_eq!(next["return_show_hidden"], "true");
     assert_eq!(next["return_keyword"], "long");
@@ -3337,6 +3340,79 @@ async fn reread_edits_the_same_overflow_message_and_updates_the_card() {
             .find(|button| button["text"]["content"] == "🔄 重新读取")
             .unwrap()["value"]["rich_message_id"],
         "msg_file"
+    );
+}
+
+/// 发为文件 delivers the original bytes as a File Message; it does NOT replace
+/// the Rich Text Message carrying an overflow preview. The rebuilt card must
+/// keep tracking that message, so a later 重新读取 edits it (with the new rows)
+/// instead of posting a second copy and orphaning the first (#744, Codex gate
+/// round 7 — the transfer used to drop the id).
+#[tokio::test]
+async fn reread_after_send_as_file_edits_the_same_overflow_message() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+
+    // 发为文件 on the overflow viewer: one File Message, off the callback path.
+    let result = app
+        .host_action_on_message(send_as_file_payload(&original), "msg_csv_card")
+        .await
+        .expect("the transfer click acknowledges");
+    assert!(result.card.is_none());
+    wait_for_card_update(
+        &platform,
+        "已发送为文件消息",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为文件消息"),
+    )
+    .await;
+    let transferred = patches_to(&platform, "msg_csv_card")
+        .await
+        .last()
+        .cloned()
+        .expect("the transfer PATCHes the viewer card");
+
+    // The rebuilt card still names the Rich Text Message the transfer kept.
+    let payload = reread_payload(&transferred);
+    assert_eq!(
+        payload["rich_message_id"], "msg_file",
+        "the transfer's rebuilt card keeps the existing Rich Text Message id: {payload}"
+    );
+
+    // New rows: a deliberate re-read must EDIT that same message, not post a
+    // second one.
+    std::fs::write(
+        &file,
+        format!(
+            "name,age\n{}",
+            (0..61)
+                .map(|i| format!("r{i},{i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    )
+    .unwrap();
+    app.host_action_on_message(payload, "msg_csv_card")
+        .await
+        .expect("the re-read acknowledges");
+    // The re-read rebuilds the card with the overflow lane's tracking line,
+    // which the transfer's "已发送为文件消息" patch cannot satisfy.
+    wait_for_card_update(&platform, "r60 edited in place", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为富文本消息")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+            message_id, msg_type, content, outcome: crate::feishu::MessageEditOutcome::Updated,
+            ..
+        } if message_id == "msg_file" && msg_type == "post" && content.to_string().contains("r60"))),
+        "the existing Rich Text Message is edited with the new row: {calls:?}"
+    );
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "no second Rich Text Message is posted: {calls:?}"
     );
 }
 

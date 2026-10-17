@@ -1253,6 +1253,19 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     }) {
         value["viewer_embedded_image_key"] = json!(image_key);
     }
+    // The transfer does not erase an existing Rich Text Message: its id (and
+    // a prior refresh failure) must ride the payload so the rebuilt card keeps
+    // tracking it, and a later 重新读取 edits that message instead of posting
+    // a duplicate (#744, Codex gate round 7). Strings, like the pager's own
+    // lane carriage (`lane_from_page_payload`).
+    if let Some(lane) = view.lane.as_ref() {
+        if let Some(message_id) = lane.rich_message_id.as_deref() {
+            value["viewer_lane_rich_message_id"] = json!(message_id);
+        }
+        if lane.refresh_failed {
+            value["viewer_lane_refresh_failed"] = json!("true");
+        }
+    }
     value
 }
 
