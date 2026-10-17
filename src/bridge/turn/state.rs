@@ -529,12 +529,13 @@ pub(super) struct GapCoverage {
 /// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
 /// plus the capped input and output the renderer keeps, plus the File Content
 /// tracking block the panel body appends, one `img` element per embedded image,
-/// the compact file marker the folded header carries — ADR-0076 — and the
-/// 「📂 打开」 button a `write`/`edit` panel carries beside the fold, ADR-0083
-/// §8, #743). Shared by the timeline's tool items and the todo tail reserve,
-/// so every place a panel's bytes are summed charges its images, its header
-/// marker and its button too. `session_id` is the same routing the card build
-/// renders the button with — exactly what renders is charged, never more.
+/// the compact file marker the folded header carries — ADR-0076 — the folded
+/// header's file detail and the 「📂 打开」 button a `write`/`edit` panel carries
+/// inside the fold, ADR-0083 §8 amendment, #766). Shared by the timeline's tool
+/// items and the todo tail reserve, so every place a panel's bytes are summed
+/// charges its images, its header marker, its file detail and its button too.
+/// `session_id` is the same routing the card build renders the button with —
+/// exactly what renders is charged, never more.
 fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
     let input = p
         .input()
@@ -550,6 +551,7 @@ fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
         + crate::feishu::card::tool_render::file_tracking_estimate(p)
         + crate::feishu::card::tool_render::file_image_estimate(p)
         + crate::feishu::card::tool_render::file_header_marker_estimate(p)
+        + crate::feishu::card::tool_render::panel_file_detail_estimate(p)
         + crate::feishu::card::tool_render::tool_open_button_estimate(p, session_id)
 }
 
@@ -4242,12 +4244,12 @@ impl StreamAccumulator {
                 TimelineKind::Tool(call_id) => {
                     // The panel's own elements plus one `img` per embedded File
                     // Content (`with_tool_at` pushes them after the panel,
-                    // ADR-0076) plus one 「📂 打开」 button after a `write`/`edit`
-                    // panel (ADR-0083 §8, #743) — missing any of them would let
-                    // a near-budget card be rejected by Feishu instead of
-                    // splitting. The size side comes from `panel_estimate`,
-                    // which charges each image's and the button's serialized
-                    // bytes too.
+                    // ADR-0076) plus one 「📂 打开」 button inside a `write`/`edit`
+                    // panel (ADR-0083 §8 amendment, #766) — missing any of them
+                    // would let a near-budget card be rejected by Feishu instead
+                    // of splitting. The size side comes from `panel_estimate`,
+                    // which charges each image's, the folded header's file
+                    // detail and the button's serialized bytes too.
                     let panel = self.tools.get(call_id);
                     let session = self.session_id.as_deref();
                     let images = panel.map(ToolPanel::embedded_file_count).unwrap_or(0);
@@ -5578,6 +5580,40 @@ mod tests {
             crate::feishu::card::tool_render::tool_open_button_estimate(&written, None),
             0,
             "no Session to route by, no button, no charge"
+        );
+    }
+
+    /// The folded header's file detail (ADR-0083 §8 amendment, #766) is card
+    /// JSON too: `panel_estimate` charges its serialized bytes, so dropping the
+    /// term would let a near-budget card omit what the header renders. The two
+    /// panels carry the SAME input and output — only the tool name differs, and
+    /// `panel_estimate` does not read it — so the difference is exactly the
+    /// detail's charge.
+    #[test]
+    fn panel_estimate_charges_the_header_file_detail() {
+        let named = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"filePath": "a \"quoted\".md"})),
+            Some("ok"),
+        );
+        let anonymous = ToolPanel::for_test(
+            "bash",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"filePath": "a \"quoted\".md"})),
+            Some("ok"),
+        );
+        let detail = crate::feishu::card::tool_render::panel_file_detail_estimate(&named);
+        assert!(detail > 0, "a named file's header detail has a byte cost");
+        assert_eq!(
+            crate::feishu::card::tool_render::panel_file_detail_estimate(&anonymous),
+            0,
+            "a tool that names no file charges no detail"
+        );
+        assert_eq!(
+            panel_estimate(&named, None),
+            panel_estimate(&anonymous, None) + detail,
+            "panel_estimate must charge the header detail's bytes"
         );
     }
 

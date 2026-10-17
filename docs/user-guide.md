@@ -464,7 +464,8 @@ Notes:
   「🔄 重新读取」 re-reads and updates the viewer in
   place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
   「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit
-  Tool Panel's 「📂 打开」 button opens its file in the viewer. A File Message
+  Tool Panel's folded header names the file it touched, and its 「📂 打开」 button
+  rides inside the fold — expand the panel, then open the file in the viewer. A File Message
   is a file for the reader to download or hand to the client; cola does **not**
   promise inline preview.
 - The **Path Scope** (`~` expanded, relative paths resolved from the session

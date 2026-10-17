@@ -249,11 +249,10 @@ impl ToolPanel {
         input_path(obj).filter(|path| !path.trim().is_empty())
     }
 
-    /// How many body elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
-    /// one standalone button after a qualifying panel, none otherwise — so the
-    /// component estimate charges precisely what renders. Decided by the
-    /// button builder itself, never re-derived, so the count cannot drift from
-    /// the render.
+    /// How many card elements the 「📂 打开」 button adds (ADR-0083 §8, #743):
+    /// one button inside a qualifying panel, none otherwise — so the component
+    /// estimate charges precisely what renders. Decided by the button builder
+    /// itself, never re-derived, so the count cannot drift from the render.
     pub(crate) fn open_button_count(&self, session_id: Option<&str>) -> usize {
         usize::from(tool_open_button_element(self, session_id).is_some())
     }
@@ -771,6 +770,59 @@ fn header_file_name(name: &str) -> String {
     clip_header_name_tail(chosen, FILE_HEADER_NAME_MAX_CHARS)
 }
 
+/// The file a file-touching panel is about, as its FOLDED header names it
+/// (ADR-0083 §8 amendment, #766). The panel body carries the path in its Input
+/// line, but the body starts collapsed, so a `write`/`edit` panel used to say
+/// nothing about the file it touched until the reader unfolded it — and a text
+/// `read` likewise.
+///
+/// The name is the same short form the File Content marker/caption uses
+/// ([`header_file_name`]): basename first, one printable line, tail-clipped to
+/// [`FILE_HEADER_NAME_MAX_CHARS`]. A folded header is one `plain_text` line,
+/// and on a phone a full absolute path would dominate it — the directories
+/// belong to the unfolded body and the viewer.
+///
+/// A `read` whose output carries a File Content gets NO fragment: that file is
+/// already named by the `📎` marker (`SentAsFile`/`Undelivered`, ADR-0076) or by
+/// the embedded image's caption, and two names for one file on one line is
+/// noise. `None` for every other tool and for a call with no usable path.
+fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
+    let (icon, path) = match tool.name() {
+        "write" | "edit" => ("📄", tool.file_open_path()?),
+        // The book icon the read panel's Input line already uses — and the one
+        // that still reads correctly for a directory read. Only a read WITHOUT
+        // a File Content gets the fragment: one with one is already named by
+        // the `📎` marker or the image caption.
+        "read" => {
+            if !tool.files().is_empty() {
+                return None;
+            }
+            let obj = tool.input()?.as_object()?;
+            ("📖", input_path(obj).filter(|path| !path.trim().is_empty())?)
+        }
+        _ => return None,
+    };
+    // A directory read may name its path with a trailing separator. Dropping it
+    // lets the short-name rule reach the directory's own name instead of
+    // rendering the whole path; a path that is nothing BUT separators keeps its
+    // form (`header_file_name` then falls back to it).
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let name = if trimmed.is_empty() { path } else { trimmed };
+    Some(format!(" · {icon} {}", header_file_name(name)))
+}
+
+/// The byte length the folded header's file detail [`panel_file_detail`]
+/// contributes to the card (ADR-0083 §8 amendment, #766), for a card-size
+/// estimate that must charge what the header renders. Like the File Content
+/// marker's estimate, the title is a `plain_text` element whose bytes reach the
+/// card JSON verbatim, so the detail is charged at its JSON-escaped length —
+/// charging the raw length would under-count a quote or control character in a
+/// filename. `0` when the panel carries no detail. Kept beside the render so
+/// the two cannot drift.
+pub(crate) fn panel_file_detail_estimate(tool: &ToolPanel) -> usize {
+    header_fragment_estimate(panel_file_detail(tool))
+}
+
 /// The compact File Content marker the folded panel HEADER carries (ADR-0076
 /// amendment). The detailed tracking line lives in the panel BODY, which is
 /// collapsed by default, so the user never sees it — worst of all for `未发送`,
@@ -828,9 +880,18 @@ fn file_header_marker(tool: &ToolPanel) -> Option<String> {
 /// size. `0` when the panel carries no File Content. Kept beside the render so
 /// the two cannot drift.
 pub(crate) fn file_header_marker_estimate(tool: &ToolPanel) -> usize {
-    file_header_marker(tool)
-        .map(|marker| json_escaped_len(&marker))
-        .unwrap_or(0)
+    header_fragment_estimate(file_header_marker(tool))
+}
+
+/// The byte length an optional folded-header fragment contributes to the card:
+/// its JSON-escaped form, or `0` when the header carries none. Shared by the
+/// File Content marker (ADR-0076) and the file detail (ADR-0083 §8 amendment,
+/// #766) so the two estimates cannot drift apart. The header title is a
+/// `plain_text` element — NOT markdown-sanitized like the panel body — so its
+/// bytes reach the card's JSON verbatim and only the JSON escaping inflates
+/// them; the escape accounting lives in [`json_escaped_len`].
+fn header_fragment_estimate(fragment: Option<String>) -> usize {
+    fragment.map(|text| json_escaped_len(&text)).unwrap_or(0)
 }
 
 /// The byte length of the tracking block [`file_tracking_block`] appends to a
@@ -930,13 +991,14 @@ pub(crate) fn file_image_estimate(tool: &ToolPanel) -> usize {
 }
 
 /// The 「📂 打开」 button a `write`/`edit` panel carries (ADR-0083 §8, #743):
-/// a standalone `button` element, pushed immediately AFTER the panel — outside
-/// the fold, so it stays reachable while the panel is collapsed — whose value
-/// is the panel's [`super::session::tool_file_value`] payload: `action:
-/// "file"` with no `op`, opening the File Viewer rather than transferring it
-/// (#739's `op: "send"`). `None` when the panel names no open path
-/// ([`ToolPanel::file_open_path`]) or no Session is known to route the click
-/// by — no button rather than a broken one.
+/// a `button` element placed INSIDE the panel's body, first, so the folded
+/// card shows no button row (ADR-0083 §8 amendment, #766) and a long diff
+/// cannot push the way in out of view. Its value is the panel's
+/// [`super::session::tool_file_value`] payload: `action: "file"` with no `op`,
+/// opening the File Viewer rather than transferring it (#739's `op: "send"`).
+/// Feishu's JSON 2.0 button supports nesting in a collapsible panel. `None`
+/// when the panel names no open path ([`ToolPanel::file_open_path`]) or no
+/// Session is known to route the click by — no button rather than a broken one.
 pub(super) fn tool_open_button_element(
     tool: &ToolPanel,
     session_id: Option<&str>,
@@ -951,7 +1013,7 @@ pub(super) fn tool_open_button_element(
     }))
 }
 
-/// The serialized byte length [`tool_open_button_element`] adds to a card body
+/// The serialized byte length [`tool_open_button_element`] adds to a card
 /// (ADR-0083 §8, #743), for a card-size estimate that must charge exactly what
 /// renders. `0` when the panel carries no button. Kept beside the render so
 /// the two cannot drift.
@@ -969,13 +1031,17 @@ pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&st
 /// File Content the card does NOT show — one sent as a File Message or left
 /// undelivered — appends the compact file marker [`file_header_marker`] so the
 /// file — and a `未发送` one above all — is visible while folded (ADR-0076
-/// amendment); an embedded image, visible beside the panel, adds none.
-/// `element_id` is the panel's stable identity on the card (see
-/// [`super::shell::collapsible_panel_chunks`]).
+/// amendment); an embedded image, visible beside the panel, adds none. The
+/// panel's own file also joins the header [`panel_file_detail`] (ADR-0083 §8
+/// amendment, #766). `element_id` is the panel's stable identity on the card
+/// (see [`super::shell::collapsible_panel_chunks`]). `session_id` routes the
+/// panel's 「📂 打开」 button, which renders inside the fold — a `write`/`edit`
+/// panel's way into the file it produced (ADR-0083 §8 amendment, #766).
 pub(super) fn tool_panel_element(
     tool: &ToolPanel,
     at_ms: Option<i64>,
     element_id: Option<&str>,
+    session_id: Option<&str>,
     md: &mut CardMarkdown,
 ) -> serde_json::Value {
     // One name read for the panel's name-keyed decisions: the output
@@ -1079,6 +1145,13 @@ pub(super) fn tool_panel_element(
     if let Some(details) = &title_details {
         title.push_str(&format!(" · {}", details));
     }
+    // The file the call is about, visible while the panel is folded
+    // (ADR-0083 §8 amendment, #766): its Input line is inside the fold, so a
+    // collapsed `write`/`edit` — and a text `read` — would otherwise never name
+    // the file it touched.
+    if let Some(detail) = panel_file_detail(tool) {
+        title.push_str(&detail);
+    }
     // A live task call carries its child session's liveness in the title, so
     // the line stays readable while the panel is folded (ADR-0054).
     if tool.is_live()
@@ -1096,7 +1169,21 @@ pub(super) fn tool_panel_element(
     if let Some(marker) = file_header_marker(tool) {
         title.push_str(&marker);
     }
-    collapsible_panel(&title, &content, element_id)
+    let mut panel = collapsible_panel(&title, &content, element_id);
+    // The way into the produced file lives INSIDE the fold (ADR-0083 §8
+    // amendment, #766): a full-width button after every `write`/`edit` panel
+    // crowded the chat, above all on a phone. Opening the file now takes
+    // expanding the panel first, accepted because the folded header already
+    // names it. It is the body's FIRST element so a long diff cannot push it
+    // out of view.
+    if let Some(button) = tool_open_button_element(tool, session_id)
+        && let Some(elements) = panel
+            .get_mut("elements")
+            .and_then(serde_json::Value::as_array_mut)
+    {
+        elements.insert(0, button);
+    }
+    panel
 }
 
 /// The meaningful parts of a unified file diff (a file-editing tool's recorded
@@ -2610,12 +2697,12 @@ mod tests {
         );
     }
 
-    /// The 「📂 打开」 rides BESIDE the folded panel, not inside it (ADR-0083
-    /// §8, #743): the panel's own fold state hides its body, so a button in
-    /// the body would need unfolding first. The button is the element right
-    /// after the still-folded panel.
+    /// The 「📂 打开」 rides INSIDE the folded panel (ADR-0083 §8 amendment,
+    /// #766): the card body carries only the panel, the panel stays collapsed,
+    /// and the button is the body's first element — unfolded, it is the first
+    /// thing the reader sees, ahead of a diff.
     #[test]
-    fn the_open_button_rides_beside_the_folded_panel() {
+    fn the_open_button_rides_inside_the_folded_panel() {
         let panel = ToolPanel::for_test(
             "write",
             ToolStatus::Completed,
@@ -2627,16 +2714,147 @@ mod tests {
             .with_tool_at(panel, None, Some("tool_call_write"), Some("ses_1"))
             .build();
         let elements = card["body"]["elements"].as_array().expect("body elements");
-        assert_eq!(elements.len(), 2, "the panel and its button: {card}");
+        assert_eq!(elements.len(), 1, "the panel alone: {card}");
         let folded = &elements[0];
         assert_eq!(folded["tag"], "collapsible_panel");
         assert_eq!(folded["expanded"], false, "the panel stays folded");
-        let button = &elements[1];
-        assert_eq!(button["tag"], "button");
+        let body = folded["elements"].as_array().expect("panel body");
+        let button = &body[0];
+        assert_eq!(button["tag"], "button", "the button leads the body: {card}");
         assert_eq!(button["text"]["content"], "📂 打开");
         assert_eq!(button["value"]["action"], "file");
         assert_eq!(button["value"]["path"], "report.md");
         assert_eq!(button["value"]["session_id"], "ses_1");
+        let markdown = &body[1];
+        assert_eq!(markdown["tag"], "markdown", "the panel content follows");
+        assert!(
+            markdown["content"].as_str().unwrap().contains("**Input**"),
+            "the body is still the rendered call: {markdown}"
+        );
+    }
+
+    /// A `write`/`edit` panel's folded header names the file it touched
+    /// (ADR-0083 §8 amendment, #766): the path's BASENAME, through the same
+    /// short-name rule the `📎` marker uses, so an absolute path never reaches
+    /// the one-line header.
+    #[test]
+    fn write_and_edit_headers_name_the_touched_file() {
+        for (name, input, want) in [
+            (
+                "write",
+                json!({"filePath": "report.md", "content": "hi"}),
+                "report.md",
+            ),
+            ("write", json!({"path": "src/v2w.rs"}), "v2w.rs"),
+            (
+                "edit",
+                json!({"filePath": "/root/workspace/dev/cola/src/feishu/card/tool_render.rs"}),
+                "tool_render.rs",
+            ),
+            ("edit", json!({"path": "src/v2.rs"}), "v2.rs"),
+        ] {
+            let title = panel_title(ToolPanel::for_test(
+                name,
+                ToolStatus::Completed,
+                Some(input),
+                Some("ok"),
+            ));
+            assert!(
+                title.ends_with(&format!(" · 📄 {want}")),
+                "{name} header must name {want}: {title}"
+            );
+            assert!(
+                !title.contains("/root/") && !title.contains("src/"),
+                "no directories in the folded header: {title}"
+            );
+        }
+    }
+
+    /// A text `read` names its file in the folded header too — its path lives
+    /// in the Input line, inside the fold (ADR-0083 §8 amendment, #766) — while
+    /// a `read` that carries a File Content adds NO fragment: the `📎` marker
+    /// (or the embedded image's caption) already names that file, and the
+    /// header must not say it twice.
+    #[test]
+    fn a_read_header_names_its_file_only_without_a_file_content() {
+        let text = panel_title(ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "/x/y.rs"})),
+            Some("<path>/x/y.rs</path>"),
+        ));
+        assert!(text.ends_with(" · 📖 y.rs"), "text read header: {text}");
+
+        // A directory read's path may keep its trailing separator: the
+        // detail still reaches the directory's own name, never the whole path.
+        let dir = panel_title(ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "/tmp/notes/"})),
+            Some("Read directory /tmp/notes/, 3 entries\n..."),
+        ));
+        assert!(dir.ends_with(" · 📖 notes"), "directory read header: {dir}");
+
+        let pdf = read_panel("doc.pdf", "application/pdf", b"%PDF", FileDelivery::SentAsFile);
+        let title = panel_title(pdf);
+        assert!(title.contains("📎 doc.pdf"), "the marker names it: {title}");
+        assert!(!title.contains("📖"), "no second name on one line: {title}");
+    }
+
+    /// A name longer than [`FILE_HEADER_NAME_MAX_CHARS`] is clipped to its TAIL
+    /// (the extension survives), and a control character folds to a space — the
+    /// header is one `plain_text` line, so neither may break it.
+    #[test]
+    fn a_long_or_control_laden_header_name_is_clipped_and_folded() {
+        let long = format!("{}.md", "a".repeat(FILE_HEADER_NAME_MAX_CHARS));
+        let clipped = panel_title(ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": long})),
+            Some("ok"),
+        ));
+        let shown = clipped.rsplit("📄 ").next().expect("the detail");
+        assert!(
+            shown.starts_with('…') && shown.ends_with(".md"),
+            "a long name keeps its tail: {clipped}"
+        );
+        assert!(
+            shown.chars().count() <= FILE_HEADER_NAME_MAX_CHARS,
+            "clipped to the budget: {clipped}"
+        );
+
+        let folded = panel_title(ToolPanel::for_test(
+            "edit",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "re\nport.md"})),
+            Some("ok"),
+        ));
+        assert!(folded.contains("📄 re port.md"), "folded to one line: {folded}");
+    }
+
+    /// The header detail is charged at its JSON-escaped length, exactly like
+    /// the File Content marker, so card splitting sees the bytes the header
+    /// renders (ADR-0083 §8 amendment, #766).
+    #[test]
+    fn the_header_detail_estimate_charges_the_rendered_bytes() {
+        let named = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "a \"quoted\".md"})),
+            Some("ok"),
+        );
+        let detail = panel_file_detail(&named).expect("the detail");
+        assert_eq!(
+            panel_file_detail_estimate(&named),
+            serde_json::to_string(&detail).unwrap().len() - 2,
+            "the estimate is the JSON-escaped length"
+        );
+        assert!(
+            panel_file_detail_estimate(&named) > detail.len(),
+            "an escaping quote must cost its extra byte"
+        );
+        let anonymous = ToolPanel::for_test("write", ToolStatus::Completed, None, Some("ok"));
+        assert_eq!(panel_file_detail_estimate(&anonymous), 0);
     }
 
     /// A filename may carry a control character — a newline above all. The
