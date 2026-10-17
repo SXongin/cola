@@ -3416,6 +3416,79 @@ async fn reread_after_send_as_file_edits_the_same_overflow_message() {
     );
 }
 
+/// An UNCHANGED re-read after 发为文件 must leave the overflow preview alone.
+/// The bytes are already in the File Message, so nothing was sent afresh and
+/// the Rich Text Message still holds exactly this content: retiring it with a
+/// "content updated" notice would be a lie and would destroy the only copy of
+/// the table on the card (#741 keeps the preview, #744 keeps the message;
+/// Codex gate round 7).
+#[tokio::test]
+async fn unchanged_reread_after_send_as_file_keeps_the_overflow_preview() {
+    let (_work_dir, _project, _state, app, platform, _file, original) = open_overflow_csv_viewer().await;
+    app.host_action_on_message(send_as_file_payload(&original), "msg_csv_card")
+        .await
+        .expect("the transfer click acknowledges");
+    wait_for_card_update(
+        &platform,
+        "已发送为文件消息",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为文件消息"),
+    )
+    .await;
+    let transferred = patches_to(&platform, "msg_csv_card")
+        .await
+        .last()
+        .cloned()
+        .expect("the transfer PATCHes the viewer card");
+
+    let before = patches_to(&platform, "msg_csv_card").await.len();
+    app.host_action_on_message(reread_payload(&transferred), "msg_csv_card")
+        .await
+        .expect("the unchanged re-read acknowledges");
+    let reread = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let patches = patches_to(&platform, "msg_csv_card").await;
+            if patches.len() > before {
+                break patches.last().unwrap().clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the unchanged re-read refreshes the card");
+
+    let text = card_text(&reread);
+    assert!(
+        text.contains("| r0 | 0 |"),
+        "the truncated table stays on the card: {text}"
+    );
+    assert!(
+        text.contains("已发送为文件消息"),
+        "the file message is still named: {text}"
+    );
+    assert!(
+        !text.contains("文件内容已更新"),
+        "no false update notice on an unchanged re-read: {text}"
+    );
+    assert_eq!(
+        reread_payload(&reread)["rich_message_id"],
+        "msg_file",
+        "the card keeps tracking the rich copy for the next real change"
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        !calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+            message_id, content, ..
+        } if message_id == "msg_file" && content.to_string().contains("文件内容已更新"))),
+        "the rich copy is not replaced by a notice: {calls:?}"
+    );
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "the rich copy is not re-posted: {calls:?}"
+    );
+}
+
 /// Two re-read callbacks on the same card must not both reach the edit-limit
 /// fallback and send duplicate Rich Text Messages.
 #[tokio::test]

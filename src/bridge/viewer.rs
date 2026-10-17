@@ -739,6 +739,14 @@ pub(crate) async fn open_viewer_lanes(
     };
     let structural_overflow =
         crate::feishu::card::viewer::detect_structural_overflow(kind, ext, preview_text).is_some();
+    // `open_lane`'s text arm never sends: it reports a File Message this
+    // viewer ALREADY delivered for the same bytes (an unchanged re-read, or a
+    // text preview whose snapshot a 发为文件 transfer sent). Nothing landed in
+    // this pass, so the rich copy — which still holds exactly this content —
+    // is kept, and the card keeps its truncated preview: replacing the copy
+    // with a "content updated" notice would be false and would delete the only
+    // copy of the content on the card (#741, #744; Codex gate round 7).
+    let mut already_delivered = false;
     let lane = match open_lane(
         platform,
         cards,
@@ -755,7 +763,10 @@ pub(crate) async fn open_viewer_lanes(
     .await
     {
         Some(mut lane) => {
-            if let Some(message_id) = existing_rich_message_id {
+            already_delivered = classified.kind == ClassifiedKind::Text;
+            if already_delivered {
+                lane.rich_message_id = existing_rich_message_id.map(str::to_string);
+            } else if let Some(message_id) = existing_rich_message_id {
                 let notice = rich_post_content("文件内容已更新；最新内容以文件查看卡或文件消息为准。");
                 let (_, rich_message_id, refresh_failed) =
                     refresh_rich_message(platform, reply_target, &notice, Some(message_id), timeout_ms).await;
@@ -786,13 +797,16 @@ pub(crate) async fn open_viewer_lanes(
         }
     };
     // `overflowed` means LANDED — a delivered preview leaves the card — never
-    // merely lane-taken: a failed send keeps its preview and its rescue.
-    let overflowed = lane.as_ref().is_some_and(|lane| {
-        matches!(
-            lane.delivery,
-            FileDelivery::SentAsRichText | FileDelivery::SentAsFile
-        ) && (classified.kind != ClassifiedKind::Text || structural_overflow)
-    });
+    // merely lane-taken: a failed send keeps its preview and its rescue, and a
+    // lane that delivered nothing this pass (the text short-circuit above)
+    // leaves the card's own preview standing.
+    let overflowed = !already_delivered
+        && lane.as_ref().is_some_and(|lane| {
+            matches!(
+                lane.delivery,
+                FileDelivery::SentAsRichText | FileDelivery::SentAsFile
+            ) && (classified.kind != ClassifiedKind::Text || structural_overflow)
+        });
     (lane, overflowed)
 }
 
