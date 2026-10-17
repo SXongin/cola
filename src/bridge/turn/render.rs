@@ -1674,8 +1674,8 @@ pub(super) fn render_turn_parts(
                     }
                     // The part's own position identifies it for the Rendered
                     // Cursor frontier (spec #561): parts carry no id (AGENTS.md
-                    // #9), so the message identity plus the ordinal is the
-                    // whole position.
+                    // pitfall `wire-shapes`), so the message identity plus the
+                    // ordinal is the whole position.
                     let source = PartSource::at(message.id.clone(), index);
                     if render_part(acc, Some(source), part) {
                         rendered_any = true;
