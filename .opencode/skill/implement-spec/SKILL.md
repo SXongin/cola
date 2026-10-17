@@ -2,6 +2,9 @@
 name: implement-spec
 description: "Implement the result of /to-spec and /to-tickets in code — one integration branch, every ticket landed linearly (rebase, never a merge commit) by the merger sub-agent, reviewed by the repo's paired pass, ending in a single rebase-mergeable PR."
 disable-model-invocation: true
+metadata:
+  upstream: "mattpocock/skills (skills/engineering/implement-spec/SKILL.md)"
+  upstream-sha256: "7a22dd2e60b8fcece478ced9d2533582adf3520d695acd3ab715341535c9e56d"
 ---
 
 # Implement Spec (cola)
