@@ -1047,6 +1047,69 @@ async fn cat_routes_image_text_and_binary_by_content() {
     );
 }
 
+/// Sending an already embedded image as a file adds a File Message without
+/// removing the image preview from the viewer card.
+#[tokio::test]
+async fn transferring_an_embedded_image_keeps_its_image_element() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("shot.png"), png()).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat shot.png",
+        key,
+        "m_image",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    fn image_key(card: &serde_json::Value) -> Option<String> {
+        match card {
+            serde_json::Value::Object(object) => {
+                if object.get("tag").and_then(serde_json::Value::as_str) == Some("img") {
+                    return object
+                        .get("img_key")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                }
+                object.values().find_map(image_key)
+            }
+            serde_json::Value::Array(items) => items.iter().find_map(image_key),
+            _ => None,
+        }
+    }
+    let original_key = image_key(&original).expect("the opened image is embedded");
+    let payload = send_as_file_payload(&original);
+    assert_eq!(payload["viewer_embedded_image_key"], original_key);
+
+    app.host_action_on_message(payload, "msg_image_viewer")
+        .await
+        .expect("the image transfer acknowledges");
+    wait_for_card_update(&platform, "image transfer", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    let updated = platform.updated_cards().await.pop().expect("viewer patch");
+    assert_eq!(image_key(&updated).as_deref(), Some(original_key.as_str()));
+    assert!(card_text(&updated).contains("图片（.png）"));
+    assert!(card_text(&updated).contains("已发送为文件消息"));
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "the file copy is sent once"
+    );
+    let recorded = uploads(&platform).await;
+    assert_eq!(recorded.len(), 2, "one image and one file upload: {recorded:?}");
+    assert!(matches!(recorded[0], PlatformCall::UploadImage { .. }));
+    assert!(matches!(recorded[1], PlatformCall::UploadFile { .. }));
+}
+
 /// Re-opening the same image uploads it once: the process-local content-hash
 /// cache reuses the `image_key` (ADR-0083 §5, ADR-0076).
 #[tokio::test]
@@ -2000,6 +2063,68 @@ async fn a_long_text_file_pages_inside_the_viewer() {
             .unwrap_or(false),
         "the last page cannot flip forward: {text}"
     );
+}
+
+/// A page callback's lane belongs to the old snapshot. When the file changes
+/// from paged text to an image, the rebuild reports the fresh image as
+/// undelivered rather than attaching the stale text-delivery status.
+#[tokio::test]
+async fn flipping_a_page_after_a_kind_change_replaces_the_stale_lane() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("long.txt");
+    std::fs::write(&file, numbered_lines(3000)).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat long.txt",
+        key,
+        "m_changed_page",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    app.host_action_on_message(send_as_file_payload(&original), "msg_changed_page")
+        .await
+        .expect("transfer from the paged text viewer acknowledges");
+    wait_for_card_update(&platform, "text file transfer", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    let transferred = platform.updated_cards().await.pop().expect("transfer patch");
+    let next = pager_button(&transferred, "下一页")["value"].clone();
+    assert_eq!(next["viewer_lane_mime"], "text/plain", "the text lane is carried");
+    assert_eq!(next["viewer_lane_delivery"], "sent_as_file");
+
+    let image = png();
+    std::fs::write(&file, &image).unwrap();
+    let updated = flip_viewer_page(&app, &platform, next, "msg_changed_page").await;
+    let text = card_text(&updated);
+    assert!(
+        text.contains("图片（.txt）"),
+        "the fresh content is classified: {text}"
+    );
+    assert!(
+        text.contains("未发送"),
+        "the fresh lane is stated honestly: {text}"
+    );
+    assert!(
+        !text.contains("已发送为文件消息"),
+        "the stale delivery line is gone: {text}"
+    );
+    assert!(
+        !text.contains("文本（") && !text.contains("line 3000"),
+        "stale preview is gone: {text}"
+    );
+    assert!(
+        text.contains("image/png"),
+        "the tracking line names the new bytes: {text}"
+    );
+    assert_eq!(updated.to_string().matches("\"tag\":\"img\"").count(), 0);
 }
 
 /// Page state round-trips through the button payload (ADR-0052): the viewer
@@ -3001,6 +3126,89 @@ async fn fitting_reread_edit_limit_does_not_send_an_untracked_notice() {
             msg_type, content, ..
         } if msg_type == "post" && content.to_string().contains("最新内容以文件查看卡为准"))),
         "an edit-limit refusal does not create an untracked retirement notice"
+    );
+}
+
+/// When a re-read's rich preview no longer fits the post budget, the old copy
+/// is retired with the post-cap notice before the File Message takes over.
+#[tokio::test]
+async fn reread_past_post_cap_retires_the_old_rich_copy() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+    let csv = format!(
+        "name,age\n{}",
+        (0..300)
+            .map(|i| format!("r{i},{}", "x".repeat(200)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let rich_md = crate::feishu::card::viewer::rich_post_md(
+        crate::feishu::card::viewer::ViewerKind::Delimited,
+        Some("csv"),
+        &csv,
+    );
+    assert!(
+        rich_md.is_none(),
+        "the refreshed full table exceeds the post budget: input {}, output {}",
+        csv.len(),
+        rich_md.as_ref().map_or(0, String::len)
+    );
+    std::fs::write(&file, csv).unwrap();
+
+    app.host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("the post-cap re-read acknowledges");
+    wait_for_card_update(&platform, "post-cap reread patch", CardUpdates::Latest, |_| true).await;
+    let updated = platform.updated_cards().await.pop().expect("viewer patch");
+    assert!(
+        card_text(&updated).contains("已发送为文件消息"),
+        "post-cap fallback card: {}",
+        card_text(&updated)
+    );
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+        message_id,
+        msg_type,
+        content,
+        outcome: crate::feishu::MessageEditOutcome::Updated,
+        ..
+    } if message_id == "msg_file" && msg_type == "post"
+        && content.to_string().contains("最新内容以文件消息为准"))));
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "the new file lane lands once"
+    );
+}
+
+/// A re-read that changes a rich-text preview into a whole-bytes image lane
+/// retires the old rich copy with the viewer/file-message notice.
+#[tokio::test]
+async fn reread_to_whole_bytes_lane_retires_the_old_rich_copy() {
+    let (_work_dir, _project, _state, app, platform, file, original) = open_overflow_csv_viewer().await;
+    std::fs::write(&file, png()).unwrap();
+
+    app.host_action_on_message(reread_payload(&original), "msg_reply")
+        .await
+        .expect("the whole-bytes re-read acknowledges");
+    wait_for_card_update(&platform, "embedded image refresh", CardUpdates::Latest, |card| {
+        card_text(card).contains("已内嵌")
+    })
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(calls.iter().any(|call| matches!(call, PlatformCall::EditMessage {
+        message_id,
+        msg_type,
+        content,
+        outcome: crate::feishu::MessageEditOutcome::Updated,
+        ..
+    } if message_id == "msg_file" && msg_type == "post"
+        && content.to_string().contains("最新内容以文件查看卡或文件消息为准"))));
+    assert_eq!(
+        rich_text_messages(&platform).await.len(),
+        1,
+        "no replacement rich copy"
     );
 }
 
