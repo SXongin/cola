@@ -675,9 +675,10 @@ async fn refresh_rich_message(
 /// cut note, no rescue delivery) only then: on a failed/timed-out send the
 /// lane is `Undelivered` and the card keeps its truncated preview, its cut
 /// note and the 「发为文件」 rescue, so nothing is silently dropped.
-/// Shared by `/cat` (which sends the card anew) and a file-row/tool-open
-/// click (which PATCHes the clicked card once the send lands), so the two
-/// entry points cannot disagree about where a preview went.
+/// Shared by `/cat` (which sends the card anew) and file-row/Tool Panel opens
+/// (whose callers respectively replace the browse card or reply with a
+/// standalone viewer), so the entry points cannot disagree about where a
+/// preview went.
 pub(crate) async fn open_viewer_lanes(
     platform: &Arc<dyn Platform>,
     cards: &CardsHandle,

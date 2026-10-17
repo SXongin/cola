@@ -2203,8 +2203,8 @@ async fn viewer_row_without_callback_message_id_is_rejected_without_inline_open(
 /// A Tool Panel's 「📂 打开」 click (ADR-0083 §8, #743): the payload carries the
 /// Session, not the Chat — the click resolves the Session's Chat/Topic from
 /// the SessionStore and its (possibly relative) structured path against the
-/// Session's directory, then opens the File Viewer in place. No `op` rides
-/// along, so the click routes to the opener, never to #739's transfer.
+/// Session's directory, then sends a standalone File Viewer reply. No `op`
+/// rides along, so the click routes to the opener, never to #739's transfer.
 #[tokio::test]
 async fn tool_panel_open_button_opens_the_viewer_through_the_session() {
     let _wd = test_work_dir();
@@ -2228,15 +2228,16 @@ async fn tool_panel_open_button_opens_the_viewer_through_the_session() {
     );
     let result = app.host_action(payload).await.expect("the click is acknowledged");
     assert!(result.card.is_none(), "the bounded open runs after ack");
-    wait_for_card_update(&platform, "tool viewer open", CardUpdates::Latest, |card| {
-        card_text(card).contains("written by the agent")
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(card) = platform.replied_cards().await.last().cloned() {
+                break card;
+            }
+            tokio::task::yield_now().await;
+        }
     })
-    .await;
-    let opened = patches_to(&platform, "msg_tool_open")
-        .await
-        .last()
-        .cloned()
-        .expect("the viewer patches the clicked card");
+    .await
+    .expect("the standalone viewer reply lands");
     assert_eq!(card_header(&opened), "📄 report.md", "the viewer names the file");
     let text = card_text(&opened);
     assert!(
@@ -2257,8 +2258,113 @@ async fn tool_panel_open_button_opens_the_viewer_through_the_session() {
         "the viewer opens with working controls: {opened}"
     );
     assert!(
-        platform.replied_cards().await.is_empty(),
-        "the ack patches in place"
+        patches_to(&platform, "msg_tool_open").await.is_empty(),
+        "the Tool Panel's live card is never patched"
+    );
+    assert!(
+        platform.calls.lock().await.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { reply_to, card }
+                if reply_to == "msg_tool_open" && card_text(card).contains("written by the agent")
+        )),
+        "the viewer is a new reply in the live card's chat/thread"
+    );
+}
+
+/// A Tool Panel embedded in a live Turn card opens a separate viewer message;
+/// the Turn's later flush still owns and updates only its original card.
+#[tokio::test]
+async fn live_turn_tool_panel_open_keeps_the_viewer_after_the_turn_flushes() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("report.md"), "standalone viewer body\n").unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    // Seed and flush a real Turn CardSession with a live write panel. Its
+    // rendered button supplies the actual Tool Panel callback payload.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_seed", Some("msg_live_turn")).await;
+    Turn::set_session(&cards, "ses_seed").await;
+    Turn::set_card_state(&cards, "ses_seed", crate::feishu::card::CardState::Streaming).await;
+    Turn::push_tool(
+        &cards,
+        "ses_seed",
+        "call_write",
+        crate::feishu::card::tool_render::ToolPanel::for_test(
+            "write",
+            crate::backend::ToolStatus::Running,
+            Some(serde_json::json!({"filePath": "report.md", "content": "written"})),
+            Some("written"),
+        ),
+    )
+    .await;
+    Turn::flush_card(&cards, "ses_seed").await;
+    let turn_card = patches_to(&platform, "msg_live_turn")
+        .await
+        .last()
+        .cloned()
+        .expect("the live Turn card renders");
+    let open_payload = card_buttons(&turn_card)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "📂 打开")
+        .unwrap_or_else(|| panic!("the live write panel has its open button: {turn_card}"))["value"]
+        .clone();
+    assert_eq!(open_payload["session_id"], "ses_seed");
+    assert!(
+        open_payload.get("dir").is_none(),
+        "Tool Panel payload has no listing"
+    );
+
+    let result = app
+        .host_action_on_message(open_payload, "msg_live_turn")
+        .await
+        .expect("the click is acknowledged");
+    assert!(result.card.is_none(), "the bounded open runs after ack");
+
+    let viewer = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(card) = platform.replied_cards().await.last().cloned()
+                && card_text(&card).contains("standalone viewer body")
+            {
+                break card;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the standalone File Viewer is sent");
+    assert_eq!(card_header(&viewer), "📄 report.md");
+    assert_eq!(patches_to(&platform, "msg_live_turn").await.len(), 1);
+
+    // The Turn continues and flushes after the viewer was sent. Its card gains
+    // new Turn content without replacing either the live panel or viewer.
+    Turn::push_text(&cards, "ses_seed", "turn continued after viewer open").await;
+    Turn::flush_card(&cards, "ses_seed").await;
+    let turn_updates = patches_to(&platform, "msg_live_turn").await;
+    assert_eq!(turn_updates.len(), 2, "the Turn performed its subsequent flush");
+    let continued_turn = turn_updates.last().unwrap();
+    let turn_text = card_text(continued_turn);
+    assert!(
+        turn_text.contains("turn continued after viewer open"),
+        "{turn_text}"
+    );
+    assert!(
+        turn_text.contains("report.md"),
+        "the Turn's Tool Panel survives: {turn_text}"
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the separate viewer message survives the Turn's PATCH"
+    );
+    assert!(
+        !turn_text.contains("standalone viewer body"),
+        "the viewer preview never replaces the Turn card"
     );
 }
 
@@ -2283,15 +2389,18 @@ async fn tool_panel_open_button_passes_absolute_paths_through() {
     payload["open_message_id"] = serde_json::json!("msg_tool_outside");
     let result = app.host_action(payload).await.expect("the click is acknowledged");
     assert!(result.card.is_none(), "the bounded open runs after ack");
-    wait_for_card_update(&platform, "outside viewer open", CardUpdates::Latest, |card| {
-        card_text(card).contains("elsewhere")
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(card) = platform.replied_cards().await.last().cloned()
+                && card_text(&card).contains("elsewhere")
+            {
+                break card;
+            }
+            tokio::task::yield_now().await;
+        }
     })
-    .await;
-    let opened = patches_to(&platform, "msg_tool_outside")
-        .await
-        .last()
-        .cloned()
-        .expect("the viewer patches the clicked card");
+    .await
+    .expect("the standalone viewer reply lands");
     assert_eq!(card_header(&opened), "📄 notes.md");
     assert!(
         card_text(&opened).contains(&canonical(&elsewhere.path().join("notes.md"))),
@@ -3504,10 +3613,10 @@ async fn row_open_fifo_fails_promptly_after_the_callback_ack() {
 
 /// #741: a structurally-overflowing file opened from a Tool Panel's
 /// 「📂 打开」 (#743) takes the same lane — the send goes out off the callback
-/// path and the clicked card is PATCHed with the landed viewer, which carries
-/// no listing to return to and no second delivery.
+/// path and a standalone viewer is replied in the live Turn's chat/thread,
+/// which carries no listing to return to and no second delivery.
 #[tokio::test]
-async fn a_tool_open_of_an_overflowing_preview_sends_then_patches() {
+async fn a_tool_open_of_an_overflowing_preview_sends_then_replies() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let csv = format!(
@@ -3533,13 +3642,18 @@ async fn a_tool_open_of_an_overflowing_preview_sends_then_patches() {
     assert!(result.card.is_none(), "the click does not rebuild inline");
     assert!(result.toast.is_some(), "the click acknowledges with a toast");
 
-    wait_for_card_update(
-        &platform,
-        "已发送为富文本消息",
-        CardUpdates::Latest,
-        |card| card_text(card).contains("已发送为富文本消息"),
-    )
-    .await;
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(card) = platform.replied_cards().await.last().cloned()
+                && card_text(&card).contains("已发送为富文本消息")
+            {
+                break card;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the standalone overflow viewer reply lands");
     let posts = rich_text_messages(&platform).await;
     assert_eq!(posts.len(), 1, "exactly one Rich Text Message: {posts:?}");
     match &posts[0] {
@@ -3548,23 +3662,25 @@ async fn a_tool_open_of_an_overflowing_preview_sends_then_patches() {
         }
         other => panic!("expected a post reply, got {other:?}"),
     }
-    let patch = patches_to(&platform, "msg_turn_card").await;
-    let updated = patch.last().expect("the clicked card was PATCHed");
-    let text = card_text(updated);
-    assert_eq!(card_header(updated), "📄 people.csv");
+    let text = card_text(&updated);
+    assert_eq!(card_header(&updated), "📄 people.csv");
     assert!(
         text.contains("已发送为富文本消息"),
-        "the PATCHed card says where the content went: {text}"
+        "the standalone viewer says where the content went: {text}"
     );
     assert!(
         !text.contains("返回目录"),
         "no listing to return to, so no return control: {text}"
     );
     assert!(
-        !card_buttons(updated)
+        !card_buttons(&updated)
             .iter()
             .any(|b| b["text"]["content"] == "发为文件"),
         "a landed preview offers no second delivery: {text}"
+    );
+    assert!(
+        patches_to(&platform, "msg_turn_card").await.is_empty(),
+        "the Tool Panel card is not replaced by the overflow viewer"
     );
 }
 

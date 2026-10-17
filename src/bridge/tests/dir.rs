@@ -1538,6 +1538,10 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
         payload.get("op").is_none(),
         "no pick/topic op on a file row: {payload}"
     );
+    assert!(
+        payload.get("session_id").is_none(),
+        "a browse row is distinguished from a Tool Panel by its listing, not a Session: {payload}"
+    );
     assert_eq!(payload["path"], canonical(&file), "the row names the file");
     payload["open_message_id"] = serde_json::json!("msg_file_row");
 

@@ -625,6 +625,9 @@ struct ViewerOpen {
     thread_key: ThreadKey,
     path: String,
     session_dir: Option<String>,
+    /// Tool Panel opens create a new viewer message; browse-row opens replace
+    /// the listing card they came from.
+    standalone: bool,
     card_message_id: String,
     return_to: OwnedReturnTo,
     page: usize,
@@ -671,6 +674,7 @@ struct ViewerOpenFailure<'a> {
     resolved: &'a std::path::Path,
     path: &'a str,
     card_message_id: &'a str,
+    standalone: bool,
     return_to: &'a OwnedReturnTo,
     line: &'a str,
     timeout_ms: u64,
@@ -3094,11 +3098,13 @@ impl App {
                 toast: Some("正在重新读取…".to_string()),
             });
         }
-        // Every file-row/tool-open click with callback context takes the same
-        // bounded background path: stat + one classification snapshot choose
-        // the byte lane and structural-overflow lane, then the clicked card is
-        // patched after delivery. Even a fitting text file must classify off
-        // this callback path because a host read can block (e.g. a network mount).
+        // Both click paths take the same bounded background read, but their
+        // payloads distinguish delivery: browse rows carry the listing state
+        // (`dir`/`keyword`/`page`, or `return_*` on a viewer page), while a Tool
+        // Panel carries `session_id` and no listing. The latter must reply with
+        // a standalone viewer message, never PATCH the live Turn card.
+        // Even a fitting text file must classify off this callback path because
+        // a host read can block (e.g. a network mount).
         // Pager flips are handled above with their own bounded background path.
         if !op.is_empty() {
             return Some(CardActionResult {
@@ -3124,6 +3130,7 @@ impl App {
         };
         let app = Arc::clone(self);
         let core = Arc::clone(core);
+        let standalone = session_id.is_some();
         let message_id = open_message_id.to_string();
         let path = resolved.to_string_lossy().to_string();
         let return_to = OwnedReturnTo {
@@ -3137,6 +3144,7 @@ impl App {
                 thread_key,
                 path,
                 session_dir,
+                standalone,
                 card_message_id: message_id,
                 return_to,
                 page,
@@ -3346,15 +3354,16 @@ impl App {
         }
     }
 
-    /// Open a structurally-overflowing preview from a click, off the card
     /// Finish a viewer open after its callback ack. One bounded filesystem
-    /// snapshot selects the path kind and content lanes; only after any needed
-    /// delivery settles is the clicked card replaced.
+    /// snapshot selects the path kind and content lanes; after any needed
+    /// delivery settles, browse rows replace their listing card while Tool
+    /// Panel opens reply with a standalone viewer beside the live Turn.
     async fn run_viewer_open(self: &Arc<Self>, open: ViewerOpen) {
         let ViewerOpen {
             thread_key,
             path,
             session_dir,
+            standalone,
             card_message_id,
             return_to,
             page,
@@ -3390,6 +3399,7 @@ impl App {
                     resolved: &resolved,
                     path: &path,
                     card_message_id: &card_message_id,
+                    standalone,
                     return_to: &return_to,
                     line: &failure.line(&resolved),
                     timeout_ms,
@@ -3404,6 +3414,7 @@ impl App {
                     resolved: &resolved,
                     path: &path,
                     card_message_id: &card_message_id,
+                    standalone,
                     return_to: &return_to,
                     line: &line,
                     timeout_ms,
@@ -3417,6 +3428,7 @@ impl App {
                     resolved: &resolved,
                     path: &path,
                     card_message_id: &card_message_id,
+                    standalone,
                     return_to: &return_to,
                     line: &line,
                     timeout_ms,
@@ -3476,16 +3488,28 @@ impl App {
                 )
             }
         };
-        if !matches!(
+        if standalone {
+            if !matches!(
+                crate::bridge::bounded_call(
+                    "standalone viewer open card reply",
+                    timeout_ms,
+                    self.feishu.reply_card(&card_message_id, &card),
+                )
+                .await,
+                Some(Ok(_))
+            ) {
+                tracing::warn!("standalone viewer open card reply to {card_message_id} did not land");
+            }
+        } else if !matches!(
             crate::bridge::bounded_call(
-                "viewer open card update",
+                "browse viewer open card update",
                 timeout_ms,
                 self.feishu.update_message(&card_message_id, &card),
             )
             .await,
             Some(Ok(()))
         ) {
-            tracing::warn!("viewer open card update for {card_message_id} did not land");
+            tracing::warn!("browse viewer open card update for {card_message_id} did not land");
         }
     }
 
@@ -3495,6 +3519,7 @@ impl App {
             resolved,
             path,
             card_message_id,
+            standalone,
             return_to,
             line,
             timeout_ms,
@@ -3506,9 +3531,24 @@ impl App {
             page: return_to.page,
         });
         let card = crate::feishu::card::viewer::build_viewer_failure_card(thread_key, path, line, return_to);
-        if !matches!(
+        if standalone {
+            if !matches!(
+                crate::bridge::bounded_call(
+                    "standalone viewer open failure card reply",
+                    timeout_ms,
+                    self.feishu.reply_card(card_message_id, &card),
+                )
+                .await,
+                Some(Ok(_))
+            ) {
+                tracing::warn!(
+                    "standalone viewer open failure card reply for {} did not land",
+                    resolved.display()
+                );
+            }
+        } else if !matches!(
             crate::bridge::bounded_call(
-                "viewer open failure card update",
+                "browse viewer open failure card update",
                 timeout_ms,
                 self.feishu.update_message(card_message_id, &card),
             )
@@ -3516,7 +3556,7 @@ impl App {
             Some(Ok(()))
         ) {
             tracing::warn!(
-                "viewer open failure card update for {} did not land",
+                "browse viewer open failure card update for {} did not land",
                 resolved.display()
             );
         }
