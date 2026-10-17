@@ -2065,6 +2065,44 @@ async fn a_long_text_file_pages_inside_the_viewer() {
     );
 }
 
+/// A 500 KB minified UTF-8 preview is larger than one card's raw element
+/// sequence, but still below the preview read cap: it belongs to the pager,
+/// not the File Message overflow lane (#740, #669).
+#[tokio::test]
+async fn a_half_megabyte_minified_text_file_uses_the_viewer_pager() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("minified.txt"), "x".repeat(500 * 1024)).unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat minified.txt",
+        key,
+        "m_minified",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    assert_eq!(card_header(&card), "📄 minified.txt");
+    assert!(pager_label(&card).is_some(), "the text preview has a pager");
+    assert!(
+        card_buttons(&card)
+            .iter()
+            .any(|button| button["value"]["op"] == "page"),
+        "a next-page action is available"
+    );
+    assert!(
+        file_messages(&platform).await.is_empty(),
+        "no overflow File Message"
+    );
+}
+
 /// A page callback's lane belongs to the old snapshot. When the file changes
 /// from paged text to an image, the rebuild reports the fresh image as
 /// undelivered rather than attaching the stale text-delivery status.
@@ -2394,6 +2432,70 @@ async fn tool_panel_open_button_opens_the_viewer_through_the_session() {
         )),
         "the viewer is a new reply in the live card's chat/thread"
     );
+}
+
+/// A Tool Panel open acknowledges before canonical path resolution. Park that
+/// exact filesystem step in the bounded worker; the callback must still return
+/// its ack while resolution is stalled (CODING_STANDARDS.md §4).
+#[tokio::test]
+async fn tool_panel_open_acknowledges_before_stalled_path_resolution() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("report.md");
+    std::fs::write(&file, "viewer after parked resolve\n").unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    let mut payload = crate::feishu::card::session::tool_file_value("ses_seed", "report.md");
+    payload["open_message_id"] = serde_json::json!("msg_tool_resolve");
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let release_rx = std::sync::Arc::new(std::sync::Mutex::new(release_rx));
+    crate::bridge::handler::install_viewer_resolve_test_hook(
+        file.clone(),
+        std::sync::Arc::new(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        }),
+    );
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(std::time::Duration::from_millis(700), app.host_action(payload))
+        .await
+        .expect("the callback does not wait for filesystem work")
+        .expect("the callback is acknowledged");
+    assert!(result.card.is_none());
+    assert!(started.elapsed() < std::time::Duration::from_millis(700));
+
+    let entered = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio::task::spawn_blocking(move || entered_rx.recv()),
+    )
+    .await;
+    crate::bridge::handler::clear_viewer_resolve_test_hook();
+    release_tx.send(()).unwrap();
+    entered
+        .expect("path resolution reached the parked background step")
+        .unwrap()
+        .unwrap();
+
+    let opened = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(card) = platform.replied_cards().await.last().cloned()
+                && card_text(&card).contains("viewer after parked resolve")
+            {
+                break card;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the bounded Tool Panel open finishes after resolution is released");
+    assert!(card_text(&opened).contains("viewer after parked resolve"));
 }
 
 /// A Tool Panel embedded in a live Turn card opens a separate viewer message;
@@ -2748,6 +2850,187 @@ async fn reread_refreshes_the_viewer_card_in_place() {
     assert_eq!(card_header(refreshed), "📄 notes.txt");
     assert!(card_text(refreshed).contains("after refresh"));
     assert!(!card_text(refreshed).contains("before refresh"));
+}
+
+/// A binary File Message is delivered once per content snapshot. Re-reading
+/// unchanged bytes keeps the card's sent line without sending another message;
+/// changing the bytes rotates the identity and allows one new delivery (#744).
+#[tokio::test]
+async fn rereading_binary_content_sends_only_once_per_identity() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("report.pdf");
+    std::fs::write(&file, b"%PDF-1.7\noriginal snapshot\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat report.pdf",
+        key,
+        "m_binary_reread",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let mut current = first_card(&platform).await;
+    let first_payload = reread_payload(&current);
+    let original_identity = first_payload["viewer_file_identity"]
+        .as_str()
+        .and_then(|identity| identity.parse::<u64>().ok())
+        .expect("the card carries the uploaded content identity");
+    assert_eq!(
+        first_payload["viewer_sent_file_identity"]
+            .as_str()
+            .and_then(|identity| identity.parse::<u64>().ok()),
+        Some(original_identity),
+        "the re-read knows which snapshot was already delivered"
+    );
+    assert_eq!(file_messages(&platform).await.len(), 1);
+
+    for _ in 0..2 {
+        let before = patches_to(&platform, "msg_reply").await.len();
+        app.host_action_on_message(reread_payload(&current), "msg_reply")
+            .await
+            .expect("unchanged binary re-read acknowledges");
+        current = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let patches = patches_to(&platform, "msg_reply").await;
+                if patches.len() > before {
+                    break patches.last().unwrap().clone();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the same viewer card is refreshed");
+        assert!(card_text(&current).contains("已发送为文件消息"));
+        assert_eq!(
+            file_messages(&platform).await.len(),
+            1,
+            "unchanged bytes are not resent"
+        );
+    }
+
+    std::fs::write(&file, b"%PDF-1.7\nchanged snapshot with more bytes\n").unwrap();
+    let before = patches_to(&platform, "msg_reply").await.len();
+    app.host_action_on_message(reread_payload(&current), "msg_reply")
+        .await
+        .expect("changed binary re-read acknowledges");
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let patches = patches_to(&platform, "msg_reply").await;
+            if patches.len() > before {
+                break patches.last().unwrap().clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the changed viewer card is refreshed");
+    assert!(card_text(&changed).contains("已发送为文件消息"));
+    assert_ne!(
+        reread_payload(&changed)["viewer_file_identity"]
+            .as_str()
+            .and_then(|identity| identity.parse::<u64>().ok()),
+        Some(original_identity),
+        "changed bytes rotate the stateless identity"
+    );
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        2,
+        "new bytes get one new message"
+    );
+}
+
+/// A text transfer's once-guard is tied to the card's content identity. After a
+/// re-read captures changed text, the new button can deliver that new snapshot
+/// instead of hitting the old 「文件已发送」 guard (finding N1).
+#[tokio::test]
+async fn reread_rotates_the_text_transfer_once_guard() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "original text snapshot\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat notes.txt",
+        key,
+        "m_text_transfer",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let original = first_card(&platform).await;
+    let old_identity = send_as_file_payload(&original)["viewer_file_identity"]
+        .as_str()
+        .and_then(|identity| identity.parse::<u64>().ok())
+        .expect("the text transfer payload carries the snapshot identity");
+    let mut transfer = send_as_file_payload(&original);
+    transfer["open_message_id"] = serde_json::json!("msg_reply");
+    app.host_action(transfer)
+        .await
+        .expect("the first transfer acknowledges");
+    wait_for_card_update(&platform, "first text delivery", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    assert_eq!(file_messages(&platform).await.len(), 1);
+
+    std::fs::write(&file, "changed text snapshot after refresh\n").unwrap();
+    let sent_card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("transfer card patch");
+    let before = patches_to(&platform, "msg_reply").await.len();
+    app.host_action_on_message(reread_payload(&sent_card), "msg_reply")
+        .await
+        .expect("the changed text re-read acknowledges");
+    let refreshed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let patches = patches_to(&platform, "msg_reply").await;
+            if patches.len() > before && card_text(patches.last().unwrap()).contains("changed text snapshot")
+            {
+                break patches.last().unwrap().clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the refreshed text snapshot lands on the same card");
+    assert_ne!(
+        send_as_file_payload(&refreshed)["viewer_file_identity"]
+            .as_str()
+            .and_then(|identity| identity.parse::<u64>().ok()),
+        Some(old_identity),
+        "the refreshed transfer control carries a new identity"
+    );
+
+    let mut refreshed_transfer = send_as_file_payload(&refreshed);
+    refreshed_transfer["open_message_id"] = serde_json::json!("msg_reply");
+    let result = app
+        .host_action(refreshed_transfer)
+        .await
+        .expect("the refreshed content can be sent");
+    assert_eq!(result.toast.as_deref(), Some("正在发送文件…"));
+    wait_for_card_update(&platform, "second text delivery", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        2,
+        "new identity is delivered once"
+    );
 }
 
 /// A disk change alone is inert: only a user click rebuilds the standalone
@@ -4005,15 +4288,15 @@ async fn a_post_body_past_the_cap_goes_to_the_file_lane() {
     );
 }
 
-/// #741: a text preview past the element budget cannot ride a post body
-/// either — its bytes dwarf the same 30 KB cap — so it goes to the File
-/// Message lane with the card saying so.
+/// #740: even a text file that would need hundreds of raw chunks remains in the
+/// card lane; the renderer windows it and supplies a pager rather than treating
+/// chunk count as structural overflow.
 #[tokio::test]
-async fn element_overflow_text_goes_to_the_file_lane() {
+async fn element_overflow_text_stays_on_the_card_pager() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
-    // ~1 MB of short lines: hundreds of fenced elements, past the card's
-    // element budget and far past the post cap, within the 8 MB preview cap.
+    // ~1 MB of short lines: far more raw elements than one card can hold, but
+    // still within the 8 MB preview cap.
     std::fs::write(proj.path().join("long.log"), "x\n".repeat(500_000)).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
@@ -4031,21 +4314,20 @@ async fn element_overflow_text_goes_to_the_file_lane() {
     )
     .await;
 
-    assert!(
-        rich_text_messages(&platform).await.is_empty(),
-        "no Rich Text Message past the post cap"
-    );
-    assert_eq!(
-        file_messages(&platform).await.len(),
-        1,
-        "exactly one File Message instead"
-    );
+    assert!(rich_text_messages(&platform).await.is_empty());
+    assert!(file_messages(&platform).await.is_empty(), "text stays pageable");
     let card = first_card(&platform).await;
     let text = card_text(&card);
     assert_eq!(card_header(&card), "📄 long.log");
     assert!(
-        text.contains("已发送为文件消息"),
-        "the card says where the content went: {text}"
+        pager_label(&card).is_some(),
+        "the card renders the first page: {text}"
+    );
+    assert!(
+        card_buttons(&card)
+            .iter()
+            .any(|button| button["value"]["op"] == "page"),
+        "the card carries pager controls"
     );
 }
 

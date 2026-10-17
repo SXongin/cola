@@ -68,7 +68,10 @@ pub(crate) const MAX_CONCURRENT_VIEWER_FS_READS: usize = 4;
 /// enforced here (#673 owns that work).
 pub(crate) fn resolve_cat_path(input: &str, session_dir: &str) -> PathBuf {
     let expanded = crate::bridge::command::expand_against(input, Path::new(session_dir));
-    std::fs::canonicalize(&expanded).unwrap_or_else(|_| crate::bridge::command::lexical_normalize(&expanded))
+    let lexical = crate::bridge::command::lexical_normalize(&expanded);
+    #[cfg(test)]
+    crate::bridge::handler::park_viewer_resolve_for_test(&lexical);
+    std::fs::canonicalize(&expanded).unwrap_or(lexical)
 }
 
 /// What a resolved path turned out to be.
@@ -456,6 +459,9 @@ pub(crate) struct OverflowPreview<'a> {
 pub(crate) struct ViewerLaneOptions<'a> {
     pub(crate) timeout_ms: u64,
     pub(crate) existing_rich_message_id: Option<&'a str>,
+    /// Identity of the File Message already delivered by this viewer snapshot.
+    /// A re-read with the same bytes updates the card without posting again.
+    pub(crate) existing_sent_file_identity: Option<u64>,
 }
 
 /// The structural-overflow lane a viewer opens with (ADR-0083 §5, #741): a
@@ -487,6 +493,7 @@ pub(crate) async fn open_overflow_lane(
     preview: &OverflowPreview<'_>,
     timeout_ms: u64,
     existing_rich_message_id: Option<&str>,
+    existing_sent_file_identity: Option<u64>,
 ) -> Option<ViewerFileLane> {
     let structural_overflow = detect_structural_overflow(preview.kind, preview.ext, preview.text).is_some();
     if !structural_overflow {
@@ -505,6 +512,7 @@ pub(crate) async fn open_overflow_lane(
             name: preview.name.to_string(),
             size: preview.size,
             delivery: FileDelivery::Undelivered,
+            content_identity: None,
             embedded_image_key: None,
             rich_message_id: Some(message_id.to_string()),
             refresh_failed: true,
@@ -525,6 +533,7 @@ pub(crate) async fn open_overflow_lane(
             name: preview.name.to_string(),
             size: preview.size,
             delivery,
+            content_identity: None,
             embedded_image_key: None,
             rich_message_id,
             refresh_failed,
@@ -551,20 +560,30 @@ pub(crate) async fn open_overflow_lane(
     // travel with no re-read, through the same cached upload + single send as
     // every other whole-bytes lane.
     let content = FileContent::from_bytes(preview.mime, preview.name, preview.text.as_bytes().to_vec());
-    let delivery = deliver(
-        platform,
-        cards,
-        reply_target,
-        ClassifiedKind::File,
-        content,
-        timeout_ms,
-    )
-    .await;
+    let identity = content_identity_hash(
+        &content.mime,
+        &content.name,
+        content.data.as_deref().unwrap_or_default(),
+    );
+    let delivery = if existing_sent_file_identity == Some(identity) {
+        FileDelivery::SentAsFile
+    } else {
+        deliver(
+            platform,
+            cards,
+            reply_target,
+            ClassifiedKind::File,
+            content,
+            timeout_ms,
+        )
+        .await
+    };
     Some(ViewerFileLane {
         mime: preview.mime.to_string(),
         name: preview.name.to_string(),
         size: preview.size,
         delivery,
+        content_identity: Some(identity),
         embedded_image_key: None,
         rich_message_id,
         refresh_failed,
@@ -694,6 +713,7 @@ pub(crate) async fn open_viewer_lanes(
     let ViewerLaneOptions {
         timeout_ms,
         existing_rich_message_id,
+        existing_sent_file_identity,
     } = options;
     let (kind, preview_text) = match classified.kind {
         ClassifiedKind::Text => (
@@ -704,7 +724,17 @@ pub(crate) async fn open_viewer_lanes(
     };
     let structural_overflow =
         crate::feishu::card::viewer::detect_structural_overflow(kind, ext, preview_text).is_some();
-    let lane = match open_lane(platform, cards, reply_target, name, classified, timeout_ms).await {
+    let lane = match open_lane(
+        platform,
+        cards,
+        reply_target,
+        name,
+        classified,
+        existing_sent_file_identity,
+        timeout_ms,
+    )
+    .await
+    {
         Some(mut lane) => {
             if let Some(message_id) = existing_rich_message_id {
                 let notice = rich_post_content("文件内容已更新；最新内容以文件查看卡或文件消息为准。");
@@ -731,6 +761,7 @@ pub(crate) async fn open_viewer_lanes(
                 &preview,
                 timeout_ms,
                 existing_rich_message_id,
+                existing_sent_file_identity,
             )
             .await
         }
@@ -757,6 +788,7 @@ pub(crate) async fn open_lane(
     reply_target: &str,
     name: &str,
     classified: &mut Classified,
+    existing_sent_file_identity: Option<u64>,
     timeout_ms: u64,
 ) -> Option<ViewerFileLane> {
     if classified.kind == ClassifiedKind::Text {
@@ -770,11 +802,25 @@ pub(crate) async fn open_lane(
             name: name.to_string(),
             size,
             delivery: FileDelivery::Undelivered,
+            content_identity: None,
             embedded_image_key: None,
             rich_message_id: None,
             refresh_failed: false,
         });
     };
+    let identity = content_identity_hash(&mime, name, &bytes);
+    if existing_sent_file_identity == Some(identity) {
+        return Some(ViewerFileLane {
+            mime,
+            name: name.to_string(),
+            size,
+            delivery: FileDelivery::SentAsFile,
+            content_identity: Some(identity),
+            embedded_image_key: None,
+            rich_message_id: None,
+            refresh_failed: false,
+        });
+    }
     let content = FileContent::from_bytes(&mime, name, bytes);
     let delivery = deliver(
         platform,
@@ -790,6 +836,7 @@ pub(crate) async fn open_lane(
         name: name.to_string(),
         size,
         delivery,
+        content_identity: Some(identity),
         embedded_image_key: None,
         rich_message_id: None,
         refresh_failed: false,
@@ -810,6 +857,7 @@ pub(crate) struct PreparedFileTransfer {
     mime: String,
     name: String,
     size: u64,
+    content_identity: Option<u64>,
     content: Option<FileContent>,
 }
 
@@ -833,11 +881,15 @@ pub(crate) fn prepare_file_transfer(
     // to the Platform (the same number `FileContent::from_bytes` carries).
     let size = bytes.as_ref().map_or(classified.size, |bytes| bytes.len() as u64);
     let mime = classified.mime.clone();
+    let content_identity = bytes
+        .as_deref()
+        .map(|bytes| content_identity_hash(&mime, name, bytes));
     let content = bytes.map(|bytes| FileContent::from_bytes(&mime, name, bytes));
     PreparedFileTransfer {
         mime,
         name: name.to_string(),
         size,
+        content_identity,
         content,
     }
 }
@@ -855,6 +907,7 @@ pub(crate) async fn send_prepared_file_transfer(
         mime,
         name,
         size,
+        content_identity,
         content,
     } = prepared;
     let delivery = match content {
@@ -876,6 +929,7 @@ pub(crate) async fn send_prepared_file_transfer(
         name,
         size,
         delivery,
+        content_identity,
         embedded_image_key: None,
         rich_message_id: None,
         refresh_failed: false,

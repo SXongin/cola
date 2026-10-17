@@ -29,10 +29,7 @@ use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS, serialized_len};
 use super::session::{BrowseView, browse_view_value, pager_element};
 use super::shell::card_shell;
 use super::tool_render::{FileDelivery, delivery_suffix, file_image_element};
-use super::{
-    FEISHU_CARD_LIMIT_BYTES, MAX_CARD_COMPONENTS, MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text,
-    fenced_code,
-};
+use super::{FEISHU_CARD_LIMIT_BYTES, MAX_CARD_JSON_CHARS, MAX_ELEMENT_TEXT_CHARS, chunk_text, fenced_code};
 
 /// What the viewer decided a file's bytes are (§6): decided by CONTENT — magic
 /// bytes first, then UTF-8 validity — never by the file's name.
@@ -77,6 +74,8 @@ pub(crate) struct ViewerFileLane {
     pub(crate) name: String,
     pub(crate) size: u64,
     pub(crate) delivery: FileDelivery,
+    /// Identity of the bytes this lane actually names, for stateless refreshes.
+    pub(crate) content_identity: Option<u64>,
     /// An image already embedded before a later file transfer. It remains on
     /// the viewer while `delivery` records the additional File Message.
     pub(crate) embedded_image_key: Option<String>,
@@ -93,12 +92,6 @@ pub(crate) struct ViewerFileLane {
 /// stays on the card.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum StructuralOverflow {
-    /// A text preview needing more fenced elements than the card holds: one
-    /// fenced block per element, past [`MAX_CARD_COMPONENTS`].
-    TooManyElements {
-        /// Fenced elements the full preview needs.
-        chunks: usize,
-    },
     /// A delimited preview past the card's row budget: more body rows than
     /// [`MAX_TABLE_ROWS`].
     TableOverBudget {
@@ -113,10 +106,10 @@ pub(crate) enum StructuralOverflow {
 }
 
 /// Detect whether a preview the card would render structurally overflows it
-/// (#741, ADR-0083 §5): branch on the RENDERED shape — fenced elements for
-/// text, tables and rows for delimited text — never on byte size. `None` when
-/// the preview fits the card's structural limits (the card layer still pages
-/// or budgets it by size, #740). The byte lanes ([`ViewerKind::Image`],
+/// (#741, ADR-0083 §5): branch on the RENDERED shape — tables and rows for
+/// delimited text — never on byte size. Text is always pageable, including a
+/// minified one-line file (#740). `None` when the preview fits the card's
+/// structural limits. The byte lanes ([`ViewerKind::Image`],
 /// [`ViewerKind::Binary`], [`ViewerKind::TextTooLarge`]) never take this lane.
 pub(crate) fn detect_structural_overflow(
     kind: ViewerKind,
@@ -124,10 +117,7 @@ pub(crate) fn detect_structural_overflow(
     text: &str,
 ) -> Option<StructuralOverflow> {
     match kind {
-        ViewerKind::Text => {
-            let chunks = chunk_text(text, PREVIEW_CHUNK_CHARS).len();
-            (chunks > MAX_CARD_COMPONENTS).then_some(StructuralOverflow::TooManyElements { chunks })
-        }
+        ViewerKind::Text => None,
         ViewerKind::Delimited => {
             let delim = delim_for(ext);
             let mut records = delimited_records(text, delim);
@@ -215,12 +205,21 @@ pub(crate) fn rich_post_content(md: &str) -> serde_json::Value {
 /// embedded newline stays on one markdown line — the same validity the card's
 /// own [`table_row`] keeps, without its budgets.
 fn full_delimited_table(text: &str, delim: char) -> Option<String> {
-    let mut records = delimited_records(text, delim);
+    let mut records = full_delimited_records(text, delim);
     let header = records.next()?;
+    if records.overflowed() {
+        return None;
+    }
     let mut lines = vec![full_table_row(&header)];
     lines.push(full_table_row(&vec!["---".to_string(); header.len().max(1)]));
     let mut used = lines.iter().map(|line| serialized_len(line) + 8).sum::<usize>();
-    for row in records {
+    if used > FEISHU_CARD_LIMIT_BYTES {
+        return None;
+    }
+    while let Some(row) = records.next() {
+        if records.overflowed() {
+            return None;
+        }
         let line = full_table_row(&row);
         used += serialized_len(&line) + 8;
         if used > FEISHU_CARD_LIMIT_BYTES {
@@ -480,6 +479,9 @@ pub(crate) struct ViewerCard<'a> {
     pub(crate) ext: Option<&'a str>,
     /// The preview's text: the bytes read, already bounded by the read cap.
     pub(crate) text: &'a str,
+    /// Stable process-local identity for this exact File Content snapshot,
+    /// carried by re-read and transfer controls to rotate deliver-once state.
+    pub(crate) content_identity: Option<u64>,
     /// Whether the card layer already dropped preview content (the card budget
     /// cut it). A file past the preview read cap is never previewed at all, so
     /// it takes the File Message lane rather than being truncated here.
@@ -684,6 +686,10 @@ fn push_text_page(
     // shape — never the row's `dir`/`page`, whose `page` is the LISTING's.
     let return_page = view.return_to.map(|listing| listing.page.to_string());
     let mut extra: Vec<(&str, &str)> = vec![("path", view.path)];
+    let lane_identity = view.content_identity.map(|identity| identity.to_string());
+    if let Some(identity) = lane_identity.as_deref() {
+        extra.push(("viewer_file_identity", identity));
+    }
     if let Some(session_dir) = view.session_dir {
         extra.push(("session_dir", session_dir));
     }
@@ -714,6 +720,11 @@ fn push_text_page(
         .lane
         .as_ref()
         .and_then(|lane| lane.rich_message_id.as_deref());
+    let lane_content_identity = view
+        .lane
+        .as_ref()
+        .and_then(|lane| lane.content_identity)
+        .map(|identity| identity.to_string());
     let lane_refresh_failed = view
         .lane
         .as_ref()
@@ -736,6 +747,9 @@ fn push_text_page(
         }
         if let Some(message_id) = lane_rich_message_id {
             extra.push(("viewer_lane_rich_message_id", message_id));
+        }
+        if let Some(identity) = lane_content_identity.as_deref() {
+            extra.push(("viewer_lane_content_identity", identity));
         }
     }
     if let Some(pager) = pager_element(
@@ -1036,6 +1050,16 @@ fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Va
     if let Some(session_dir) = view.session_dir {
         value["session_dir"] = json!(session_dir);
     }
+    if let Some(identity) = view.content_identity {
+        value["viewer_file_identity"] = json!(identity.to_string());
+        if view
+            .lane
+            .as_ref()
+            .is_some_and(|lane| matches!(lane.delivery, FileDelivery::SentAsFile))
+        {
+            value["viewer_sent_file_identity"] = json!(identity.to_string());
+        }
+    }
     if let Some(message_id) = view
         .lane
         .as_ref()
@@ -1113,6 +1137,10 @@ pub(crate) fn lane_from_page_payload(value: &serde_json::Value) -> Option<Viewer
             .get("viewer_lane_refresh_failed")
             .and_then(serde_json::Value::as_str)
             == Some("true"),
+        content_identity: value
+            .get("viewer_lane_content_identity")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|identity| identity.parse().ok()),
     })
 }
 
@@ -1192,6 +1220,9 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     }
     if let Some(session_dir) = view.session_dir {
         value["session_dir"] = json!(session_dir);
+    }
+    if let Some(identity) = view.content_identity {
+        value["viewer_file_identity"] = json!(identity.to_string());
     }
     if let Some(image_key) = view.lane.as_ref().and_then(|lane| {
         lane.embedded_image_key.as_deref().or(match &lane.delivery {
@@ -1314,13 +1345,14 @@ fn clip_cell(cell: &str) -> (String, bool) {
 /// one 30 KB field, or a million-column row) turn into allocations (finding
 /// #739 §1, round 2).
 fn delimited_records(text: &str, delim: char) -> DelimitedRecords<'_> {
-    DelimitedRecords {
-        chars: text.chars().peekable(),
-        delim,
-        done: false,
-        #[cfg(test)]
-        scanned: 0,
-    }
+    DelimitedRecords::new(text, delim, MAX_CELL_CHARS, MAX_PREVIEW_COLUMNS)
+}
+
+/// The rich-text parser has no preview cell/column caps. It keeps only a
+/// body-sized prefix of a pathological cell or row so it can reject the post
+/// lane without silently clipping or allocating an unbounded record.
+fn full_delimited_records(text: &str, delim: char) -> DelimitedRecords<'_> {
+    DelimitedRecords::new(text, delim, FEISHU_CARD_LIMIT_BYTES, FEISHU_CARD_LIMIT_BYTES)
 }
 
 #[cfg(test)]
@@ -1339,6 +1371,9 @@ thread_local! {
 struct DelimitedRecords<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     delim: char,
+    max_cell_chars: usize,
+    max_columns: usize,
+    overflowed: bool,
     /// Set once the input is exhausted, so a later `next` never restarts.
     done: bool,
     /// Characters pulled so far — the bounded-work measure the test reads; it
@@ -1348,6 +1383,23 @@ struct DelimitedRecords<'a> {
 }
 
 impl DelimitedRecords<'_> {
+    fn new(text: &str, delim: char, max_cell_chars: usize, max_columns: usize) -> DelimitedRecords<'_> {
+        DelimitedRecords {
+            chars: text.chars().peekable(),
+            delim,
+            max_cell_chars,
+            max_columns,
+            overflowed: false,
+            done: false,
+            #[cfg(test)]
+            scanned: 0,
+        }
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     /// How many characters the parse has pulled so far (tests only).
     #[cfg(test)]
     fn scanned(&self) -> usize {
@@ -1386,12 +1438,12 @@ impl Iterator for DelimitedRecords<'_> {
             if quoted {
                 match c {
                     '"' if self.chars.peek() == Some(&'"') => {
-                        cell.push('"');
+                        self.overflowed |= cell.push('"', self.max_cell_chars);
                         self.chars.next();
                         self.count();
                     }
                     '"' => quoted = false,
-                    _ => cell.push(c),
+                    _ => self.overflowed |= cell.push(c, self.max_cell_chars),
                 }
                 continue;
             }
@@ -1399,14 +1451,14 @@ impl Iterator for DelimitedRecords<'_> {
                 quoted = true;
                 touched = true;
             } else if c == self.delim {
-                push_record_cell(&mut record, &mut cell);
+                self.overflowed |= push_record_cell(&mut record, &mut cell, self.max_columns);
                 touched = true;
             } else if c == '\n' || c == '\r' {
                 if c == '\r' && self.chars.peek() == Some(&'\n') {
                     self.chars.next();
                     self.count();
                 }
-                push_record_cell(&mut record, &mut cell);
+                self.overflowed |= push_record_cell(&mut record, &mut cell, self.max_columns);
                 if touched {
                     return Some(std::mem::take(&mut record));
                 }
@@ -1416,13 +1468,13 @@ impl Iterator for DelimitedRecords<'_> {
                 if !c.is_whitespace() {
                     touched = true;
                 }
-                cell.push(c);
+                self.overflowed |= cell.push(c, self.max_cell_chars);
             }
         }
         // The final record: a file may not end in a newline.
         self.done = true;
         if touched {
-            push_record_cell(&mut record, &mut cell);
+            self.overflowed |= push_record_cell(&mut record, &mut cell, self.max_columns);
             Some(record)
         } else {
             None
@@ -1430,7 +1482,7 @@ impl Iterator for DelimitedRecords<'_> {
     }
 }
 
-/// One parsed cell, bounded: it stores at most [`MAX_CELL_CHARS`] + 1
+/// One parsed cell, bounded: it stores at most its parser's limit + 1
 /// characters (the one extra lets [`clip_cell`] see the cell was cut), skips
 /// its leading whitespace (trimmed either way), and counts every character it
 /// consumes — so a pathological field can never grow without limit.
@@ -1446,18 +1498,20 @@ struct BoundedCell {
 }
 
 impl BoundedCell {
-    /// Append `c`, holding the stored text to [`MAX_CELL_CHARS`] + 1 characters.
-    fn push(&mut self, c: char) {
+    /// Append `c`, holding the stored text to `max_chars` + 1 characters.
+    /// Returns true once the input exceeds the storage bound.
+    fn push(&mut self, c: char, max_chars: usize) -> bool {
         if !self.started {
             if c.is_whitespace() {
-                return;
+                return false;
             }
             self.started = true;
         }
-        if self.counted <= MAX_CELL_CHARS {
+        if self.counted <= max_chars {
             self.text.push(c);
         }
         self.counted += 1;
+        self.counted > max_chars
     }
 
     /// Whether the cell has seen no non-whitespace character yet.
@@ -1486,17 +1540,20 @@ impl BoundedCell {
 /// [`MAX_PREVIEW_COLUMNS`] + 1 cells: one past the column cap, which is enough
 /// for the renderer's `cut` to see the row was wide. Any further cell is
 /// dropped with its text, so a million-column row cannot materialize.
-fn push_record_cell(record: &mut Vec<String>, cell: &mut BoundedCell) {
-    if record.len() <= MAX_PREVIEW_COLUMNS {
+fn push_record_cell(record: &mut Vec<String>, cell: &mut BoundedCell, max_columns: usize) -> bool {
+    if record.len() <= max_columns {
         record.push(cell.take());
+        false
     } else {
         cell.reset();
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feishu::card::MAX_CARD_COMPONENTS;
 
     fn key() -> ThreadKey {
         ThreadKey::new("chat_1".into(), "chat_1".into())
@@ -1552,6 +1609,7 @@ mod tests {
             kind,
             ext,
             text,
+            content_identity: None,
             truncated: false,
             page: 1,
             return_to: None,
@@ -1573,6 +1631,7 @@ mod tests {
             name: name.to_string(),
             size,
             delivery,
+            content_identity: None,
             embedded_image_key: None,
             rich_message_id: None,
             refresh_failed: false,
@@ -2287,6 +2346,7 @@ mod tests {
             name: "people.csv".to_string(),
             size: 15,
             delivery: FileDelivery::SentAsRichText,
+            content_identity: None,
             embedded_image_key: None,
             rich_message_id: Some("om_rich".into()),
             refresh_failed: false,
@@ -2318,6 +2378,7 @@ mod tests {
             name: "people.csv".to_string(),
             size: 15,
             delivery: FileDelivery::Undelivered,
+            content_identity: None,
             embedded_image_key: None,
             rich_message_id: None,
             refresh_failed: false,
@@ -2463,12 +2524,12 @@ mod tests {
             detect_structural_overflow(ViewerKind::Delimited, Some("csv"), &at_cap).is_none(),
             "a table within the row cap stays on the card"
         );
-        // A text preview needing more fenced elements than the card holds
-        // overflows; a large single block that fits stays.
+        // Text is paged regardless of its chunk count; even a minified file
+        // stays in the card lane.
         let many = "x".repeat(PREVIEW_CHUNK_CHARS * (MAX_CARD_COMPONENTS + 1) + 1);
         assert!(
-            detect_structural_overflow(ViewerKind::Text, Some("txt"), &many).is_some(),
-            "past the element budget takes the lane"
+            detect_structural_overflow(ViewerKind::Text, Some("txt"), &many).is_none(),
+            "text past the element budget remains pageable"
         );
         let fitting = "y".repeat(PREVIEW_CHUNK_CHARS * 3);
         assert!(
@@ -2481,11 +2542,9 @@ mod tests {
         assert!(detect_structural_overflow(ViewerKind::TextTooLarge, Some("log"), "x").is_none());
     }
 
-    /// #741: the element boundary is exact — a text preview needing exactly
-    /// [`MAX_CARD_COMPONENTS`] fenced elements fits, one character more takes
-    /// the lane.
+    /// #740: the old raw-chunk boundary must not divert text from its pager.
     #[test]
-    fn structural_overflow_pins_the_exact_element_boundary() {
+    fn text_chunk_count_never_triggers_structural_overflow() {
         let at_budget = "x".repeat(PREVIEW_CHUNK_CHARS * MAX_CARD_COMPONENTS);
         assert_eq!(
             chunk_text(&at_budget, PREVIEW_CHUNK_CHARS).len(),
@@ -2497,13 +2556,7 @@ mod tests {
             "exactly the element budget stays on the card"
         );
         let one_more = "x".repeat(PREVIEW_CHUNK_CHARS * MAX_CARD_COMPONENTS + 1);
-        assert_eq!(
-            detect_structural_overflow(ViewerKind::Text, Some("txt"), &one_more),
-            Some(StructuralOverflow::TooManyElements {
-                chunks: MAX_CARD_COMPONENTS + 1,
-            }),
-            "one character past the budget takes the lane"
-        );
+        assert!(detect_structural_overflow(ViewerKind::Text, Some("txt"), &one_more).is_none());
     }
 
     /// #741: the Rich Text Message lane flips within one row of the documented
@@ -2537,7 +2590,12 @@ mod tests {
         );
         // The fitting body is JUST under the cap: its slack is less than one
         // row's own lane cost, so the flip is within one row of the budget.
-        let row_cost = serialized_len(&format!("| {} |", "x".repeat(1400))) + 8;
+        let posted_row = md.lines().nth(2).expect("first posted body row");
+        assert!(
+            posted_row.contains(&"x".repeat(1400)),
+            "the posted row retains the full field"
+        );
+        let row_cost = serialized_len(posted_row) + 8;
         let slack = FEISHU_CARD_LIMIT_BYTES.saturating_sub(serialized_len(&md) + 128);
         assert!(
             slack < row_cost,
@@ -2565,6 +2623,28 @@ mod tests {
             .expect("a 60-row small-cell table fits the post cap");
         assert!(md.contains("| name | age |"), "the header: {md}");
         assert!(md.contains("| r59 | 59 |"), "every row, none cut: {md}");
+
+        // The rich lane has none of the preview's 120-character/20-column
+        // limits. A long field and wide row in a structurally overflowing
+        // table both survive intact while the whole post fits its real cap.
+        let long = "x".repeat(1_400);
+        let header = (0..25).map(|i| format!("c{i}")).collect::<Vec<_>>().join(",");
+        let rows = (0..60)
+            .map(|row| {
+                let mut cells = (0..25).map(|col| format!("r{row}c{col}")).collect::<Vec<_>>();
+                if row == 0 {
+                    cells[0] = long.clone();
+                }
+                cells.join(",")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wide = format!("{header}\n{rows}");
+        let md = rich_post_md(ViewerKind::Delimited, Some("csv"), &wide)
+            .expect("the full 25-column table fits the post cap");
+        assert!(md.contains(&long), "the full long field is posted");
+        assert!(md.contains("r59c24"), "the last column and row are posted");
+        assert_eq!(md.lines().count(), 62, "header, separator, and all rows");
         // A body past the cap is no post body: the File lane owns it. Cells
         // are parser-bounded, so the overflow comes from ROWS — thousands of
         // them — and the build aborts past the cap instead of materializing

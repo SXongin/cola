@@ -387,6 +387,7 @@ pub(crate) async fn send_cat_card(
                 crate::bridge::viewer::ViewerLaneOptions {
                     timeout_ms: timeout,
                     existing_rich_message_id: None,
+                    existing_sent_file_identity: None,
                 },
             )
             .await;
@@ -470,6 +471,14 @@ pub(crate) fn build_viewer_for_classified(
         ClassifiedKind::Text => kind_for_extension(ext),
     };
     let shown = path.to_string_lossy().to_string();
+    let file_name = file_display_name(path);
+    let content_identity = lane.as_ref().and_then(|lane| lane.content_identity).or_else(|| {
+        classified
+            .bytes
+            .as_deref()
+            .or_else(|| classified.text.as_deref().map(str::as_bytes))
+            .map(|bytes| crate::bridge::handles::content_identity_hash(&classified.mime, &file_name, bytes))
+    });
     build_viewer_card(
         thread_key,
         ViewerCard {
@@ -479,6 +488,7 @@ pub(crate) fn build_viewer_for_classified(
             kind,
             ext,
             text: classified.text.as_deref().unwrap_or(""),
+            content_identity,
             truncated: false,
             page,
             return_to,
