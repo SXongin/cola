@@ -29,23 +29,17 @@ Follow Conventional Commits — see `CONTRIBUTING.md`. The format is enforced by
   drops an event, or doubles a card's text when ignored.
 - **Two OpenCode API generations are mounted — check which one a route belongs
   to.** cola exposes no HTTP API of its own; it is a client of the OpenCode
-  backend. The unprefixed routes are the **V1** compatibility surface
-  (`src/opencode/v1/`); `/api/...` is the current **V2** protocol
-  (`src/opencode/v2/`). A per-generation **strategy** behind the generation-blind
-  `OpenCodeBackend` owns that generation's paths, payloads, decoders and
-  semantics, so the Bridge, Turn, pollers and cards never branch on a generation
-  (ADR-0055). The Turn is **submit+observe** on both: `attempt` submits through
-  the strategy's native prompt (V1's fire-and-forget `POST
-  /session/{id}/prompt_async`, V2's admit-then-return
-  `/api/session/{id}/prompt`), and the post-prompt drain observes the turn's
-  completion from the transcript + run state (ADR-0056). V1's conversation routes
-  stay unprefixed because the other mounted client (OpenChamber) reads and writes
-  that store — the two message stores do not project into each other. Session
-  creation (`POST /api/session`, parsing the `{data: Session}` envelope, because
-  `location.directory` exists only there) is served by both generations and stays
-  on the adapter; **compaction is not** — the path is shared but the contract is
-  not (V1 sends no body and answers 204, V2 sends `{}` and answers `{data}`), so
-  each strategy owns its own call and the wire tests pin both sides.
+  backend. The unprefixed routes are **V1** (`src/opencode/v1/`), `/api/...` is
+  **V2** (`src/opencode/v2/`), and a per-generation **strategy** behind the
+  generation-blind `OpenCodeBackend` owns that generation's paths, payloads,
+  decoders and semantics, so the Bridge, Turn, pollers and cards never branch on
+  a generation (ADR-0055). Two contracts that survive that split: the Turn is
+  **submit+observe** on both — `attempt` submits through the strategy's native
+  prompt, and the post-prompt drain observes completion from the transcript + run
+  state (ADR-0056) — and **each strategy owns its own compaction call**, because
+  the path is shared but the contract is not (V1 sends no body and answers 204,
+  V2 sends `{}` and answers `{data}`). Session creation is the shared exception:
+  it stays on the adapter.
 - **A card callback runs on a deadline**: the action handler is raced against a
   short ack budget and a late result is dropped — the card is answered early and
   never updated — so the handler behind a click is cheap and bounded: filesystem

@@ -4,8 +4,10 @@ A bridge bot that brings the OpenCode AI coding experience into Feishu.
 
 ## Where the rules live
 
-This file is the index. Every rule has one home, and the only thing here that is
-not a pointer is the pitfall list at the bottom.
+This file is the index. It names the document that owns each rule, and carries
+only what every session needs before opening one — the branch loop, the commit
+trailer, the handoff note, and the pitfalls below. Where this file and an owner
+disagree, the owner wins.
 
 - **The change contract** — branch loop, commit conventions, the verification
   loop, PR rules, the Codex gate, coverage and security policy, releasing —
