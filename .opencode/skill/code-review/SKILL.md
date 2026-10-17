@@ -22,6 +22,22 @@ If that file is absent, take the two axes from the repo: **Standards** from `COD
 
 Run the `adversarial-review` skill over the **same base** and, when one was given, the **same pathspec**. Do not invent the rubric: that skill — or `.github/codex/prompts/review.md`'s `## The adversarial pass` and `## Rules` — is the source, and its final `CODEX_REVIEW_VERDICT` line is kept.
 
+## Re-review round (same scope)
+
+*When* a re-review runs, who routes the fix, and the two-round bound are `docs/agents/flow.md`; this is the mechanics.
+
+A fix round at the **same scope** resumes the sessions of the reviewers that raised the findings — all three — instead of dispatching fresh ones. Keep each reviewer's session id from the first round; `foreman` and `implement-spec` hold it for the lifetime of a ticket.
+
+The resumed prompt carries:
+
+- the findings **verbatim**, never a summary;
+- the fix's delta as a **ref pair**, not pasted text: the HEAD the first round reviewed and the current HEAD, so the reviewer runs `git diff <from>..<to>` itself — plus the original full-diff command for the whole picture;
+- the brief: for every finding, resolved / not resolved / partially, with the reason; and what the delta could break that the first round did not see.
+
+The adversarial half follows its own skill's re-review step, which re-derives its verdict from the whole diff rather than the delta alone. Resuming keeps the reviewer independent of the author and leaves the bound and the reported verdict untouched.
+
+Start fresh reviewers the moment the scope is no longer the one that raised the findings — the whole-branch pass after a ticket window included. A resumed reviewer judges the delta it was briefed on and has already accepted the rest; a new scope has no such "rest".
+
 ## Aggregate
 
 Present three sections — `## Standards`, `## Spec`, `## Adversarial` — verbatim or lightly cleaned. **Never merge or rerank across them**: the axes are deliberately separate, and a single cross-axis "worst issue" is the reranking the separation exists to prevent. Close with a one-line per-axis finding count (and each axis's worst issue, if any) — but keep the adversarial section's `CODEX_REVIEW_VERDICT` line **last, with nothing after it**, so a gate that parses it is not broken by the summary.

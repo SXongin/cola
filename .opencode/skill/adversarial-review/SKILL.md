@@ -25,12 +25,23 @@ Confirm the base resolves (`git rev-parse <base>`). Review with the gate's merge
 
 Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** — a sub-agent cannot spawn it. The prompt carries:
 
-- the diff `git diff "$BASE"` (with `BASE` the merge-base, plus `-- <paths>` when scoped), the untracked files from `git ls-files --others --exclude-standard` (not in the diff), and the commit list (`git log <base>..HEAD --oneline`, plus `-- <paths>` when scoped);
+- the merge-base SHA `BASE` and the pathspec, so the reviewer runs `git diff "$BASE"` itself (plus `-- <paths>`) — hand over the **ref, never pasted diff text**; it holds `git diff`, `git log` and `git show`. Give the commit list as the command too (`git log <base>..HEAD --oneline`, plus `-- <paths>` when scoped);
+- the untracked files' **content** from `git ls-files --others --exclude-standard` (they are not in the diff);
 - the `## The adversarial pass` and `## Rules` sections pasted in full (the sub-agent has no network; paste the rubric rather than pointing at it), minus the host-tree clause, with that omission stated in the prompt;
 - this brief:
   > You are reproducing the CI Codex gate's adversarial pass on this diff. The reference trees named in `docs/agents/references.md` exist on this host, so the host-tree exemption in the Rules does not apply. Report findings first and finish with the `CODEX_REVIEW_VERDICT` line the Rules prescribe.
 
-### 3. Aggregate
+### 3. Re-review round (same scope)
+
+`docs/agents/flow.md` binds when a re-review runs and its two-round bound. Resume the **same** reviewer session with:
+
+- the findings **verbatim**;
+- the ref pair `<round-head>..HEAD` for the fix's delta, plus the unchanged full-diff command;
+- the brief: for every finding, resolved / not resolved / partially, with the reason; what the delta could break; and re-derive `CODEX_REVIEW_VERDICT` from the **whole** `git diff "$BASE"`, not the delta alone.
+
+Start a fresh reviewer at a new scope, on a design-changing fix, and for a cross-ticket finding — a resumed reviewer has already accepted the rest of the diff.
+
+### 4. Aggregate
 
 Present the findings under `## Adversarial`, verbatim or lightly cleaned, keeping the reviewer's final `CODEX_REVIEW_VERDICT` line. Do **not** merge or rerank them against `/code-review`'s two-axis report — the axes stay separate, exactly as CI reports them.
 

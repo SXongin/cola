@@ -37,8 +37,8 @@ For each ticket, in order:
 
 1. **Mark the window** — `PRE=$(git rev-parse HEAD)`, the review's fixed point.
 2. **Dispatch the implementer** (`subagent_type: implementer`) with the dispatch prompt below.
-3. **Review the window** — run the repo's review pair over `PRE...HEAD` with the ticket as the spec source (`docs/agents/flow.md`). The review sub-agents dispatch from this main session; a sub-agent cannot spawn them.
-4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review under the binding's re-review bound (`docs/agents/flow.md`).
+3. **Review the window** — run the repo's review pair over `PRE...HEAD` with the ticket as the spec source (`docs/agents/flow.md`). The review sub-agents dispatch from this main session; a sub-agent cannot spawn them. Keep the three reviewer session ids for step 4.
+4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review at the same scope by resuming the reviewer sessions that raised them (`docs/agents/flow.md`; `/code-review`, "Re-review round"), under the binding's re-review bound.
 5. **Record progress** — post the progress comment below. It carries the review outcome and marks the batch's sanctioned `/compact` boundary; never compact mid-ticket.
 
 Done when the ticket's commits are on the branch, its window review is clean or fixed, and the progress comment is posted. Then take the next ticket; never two at once.
@@ -47,7 +47,7 @@ Done when the ticket's commits are on the branch, its window review is clean or 
 
 Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict pauses the batch.
 
-Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run the repo's review pair once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch under the binding's re-review bound (`docs/agents/flow.md`).
+Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run the repo's review pair once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch under the binding's re-review bound (`docs/agents/flow.md`). The whole-branch pass is a **new scope**, so it starts fresh reviewers rather than resuming a ticket window's.
 
 Then run the repo's full verification loop (`CONTRIBUTING.md`, "Verification loop") on the branch: fmt check, clippy, tests, release build.
 
@@ -126,7 +126,7 @@ Re-run `/foreman <spec>` after an interruption. The branch log and the progress 
 - **Branch**: if `<branch>` exists, verify it still has commits `origin/main` does not and that every one of them carries a `Refs:` trailer naming one of this spec's tickets; then switch to it. A branch failing either check stops and asks instead of being adopted.
 - **Windows**: a ticket's window is the run of commits carrying its `Refs: #<n>` trailer, with `PRE` at the commit before the run. Rebuild both from the log.
 - **Tickets**: one with a progress comment is done. One with commits but no comment gets its window reviewed, then its comment. One with neither is re-dispatched.
-- **Interrupted fix round**: the `task_id` is gone; re-review the window (the findings resurface), then dispatch a fresh implementer with them.
+- **Interrupted fix round**: the `task_id` is gone; re-review the window with fresh reviewers (the findings resurface), then dispatch a fresh implementer with them.
 - **Dirty tree**: never start a ticket on one. Inspect `git status` and the diff: work belonging to a ticket goes to a fresh implementer to finish and commit; anything else stops and asks.
 
 ## Setup
