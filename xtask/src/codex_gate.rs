@@ -439,6 +439,16 @@ mod tests {
             workflow.contains("model: ${{ env.GATE_MODEL }}"),
             "the Codex step must read the shared model"
         );
+        // The key must not ride the command line: curl reads it from a config
+        // file the step removes.
+        assert!(
+            !check.contains(r#"-H "Authorization"#),
+            "the key must not be passed in argv"
+        );
+        assert!(
+            check.contains(r#"-K "$curl_config""#),
+            "curl must read the key from the config file"
+        );
     }
 
     #[test]
