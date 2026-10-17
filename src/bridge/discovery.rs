@@ -103,8 +103,13 @@ fn default_data_home() -> std::path::PathBuf {
 /// (`KEY=VALUE` pairs as sysinfo returns them). `OPENCODE_SERVER_USERNAME` if
 /// set, else the server's own default `"opencode"`.
 ///
-/// V1 only: a V2 server ignores `OPENCODE_SERVER_USERNAME` and always accepts
-/// the username `opencode` (spec #364 §2), so V2 candidates never consult this.
+/// The `--port` branch of [`resolve_credentials`] consults this for every
+/// lineage, because the generation is not known until the candidate is probed.
+/// It is the effective username **only** on V1: a V2 server ignores
+/// `OPENCODE_SERVER_USERNAME` and always accepts `opencode` (spec #364 §2), so
+/// [`crate::bridge::attach::resolve_probe`] drops an env-derived username once the
+/// candidate classifies as V2 — and the probe itself is authenticated with this
+/// value first, which is #763.
 fn username_from_env(env: &[String]) -> String {
     env.iter()
         .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_USERNAME="))
