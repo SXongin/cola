@@ -198,6 +198,42 @@ async fn cat_opens_a_text_file_with_the_language_hint_and_the_resolved_path() {
     assert!(!text.contains("已截断"), "a small file is not truncated: {text}");
 }
 
+#[tokio::test]
+async fn absolute_file_outside_session_directory_opens_with_privacy_hint() {
+    let _wd = test_work_dir();
+    let session_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let file = outside_dir.path().join("notes.md");
+    std::fs::write(&file, "private notes\n").unwrap();
+
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &session_dir.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        &format!("/cat {}", file.display()),
+        key,
+        "m_outside",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let text = card_text(&first_card(&platform).await);
+    assert!(text.contains("notes.md"), "the external file opens: {text}");
+    assert!(
+        text.contains("private notes"),
+        "the file content is shown: {text}"
+    );
+    assert!(
+        text.contains("会话目录之外"),
+        "the privacy hint names the scope: {text}"
+    );
+    assert!(text.contains("不是访问边界"), "the hint is not a sandbox: {text}");
+}
+
 /// A `/cat` FIFO must fail promptly on the command path, without waiting for a
 /// writer or pinning the message handler's runtime worker.
 #[cfg(unix)]
@@ -2077,7 +2113,7 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
 
     // Open the viewer the way a browse file row does: no op, the listing's
     // whole state in dir/show_hidden/keyword/page.
-    let card = app
+    let result = app
         .host_action(serde_json::json!({
             "action": "file",
             "path": file_str,
@@ -2087,11 +2123,20 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
             "show_hidden": true,
             "keyword": "long",
             "page": 1,
+            "open_message_id": "msg_listing_viewer",
         }))
         .await
-        .expect("the row opens the viewer")
-        .card
-        .expect("a card");
+        .expect("the row open is acknowledged");
+    assert!(result.card.is_none(), "classification stays off the callback");
+    wait_for_card_update(&platform, "viewer open", CardUpdates::Latest, |card| {
+        card_text(card).contains("line 0001")
+    })
+    .await;
+    let card = patches_to(&platform, "msg_listing_viewer")
+        .await
+        .last()
+        .cloned()
+        .expect("the bounded viewer open patches the clicked card");
     let back = card_buttons(&card)
         .into_iter()
         .find(|b| b["text"]["content"] == "← 返回目录")
@@ -2126,6 +2171,35 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
     );
 }
 
+#[tokio::test]
+async fn viewer_row_without_callback_message_id_is_rejected_without_inline_open() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("notes.txt");
+    std::fs::write(&file, "notes\n").unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "file",
+            "path": file,
+            "chat_id": key.chat_id,
+            "thread_id": key.thread_id,
+            "dir": proj.path(),
+            "page": 1,
+        }))
+        .await
+        .expect("a callback without its message reference is handled");
+
+    assert!(result.card.is_none(), "no inline viewer is built");
+    assert_eq!(result.toast.as_deref(), Some("无法打开文件：找不到文件浏览卡。"));
+    assert!(patches_to(&platform, "").await.is_empty());
+}
+
 /// A Tool Panel's 「📂 打开」 click (ADR-0083 §8, #743): the payload carries the
 /// Session, not the Chat — the click resolves the Session's Chat/Topic from
 /// the SessionStore and its (possibly relative) structured path against the
@@ -2146,13 +2220,23 @@ async fn tool_panel_open_button_opens_the_viewer_through_the_session() {
 
     // The payload the button carries: the Session plus the call's structured
     // path, spelled relative exactly as the tool recorded it.
-    let payload = crate::feishu::card::session::tool_file_value("ses_seed", "report.md");
+    let mut payload = crate::feishu::card::session::tool_file_value("ses_seed", "report.md");
+    payload["open_message_id"] = serde_json::json!("msg_tool_open");
     assert!(
         payload.get("op").is_none(),
         "the button never transfers: {payload}"
     );
-    let result = app.host_action(payload).await.expect("the click is handled");
-    let opened = result.card.expect("the viewer opens in place");
+    let result = app.host_action(payload).await.expect("the click is acknowledged");
+    assert!(result.card.is_none(), "the bounded open runs after ack");
+    wait_for_card_update(&platform, "tool viewer open", CardUpdates::Latest, |card| {
+        card_text(card).contains("written by the agent")
+    })
+    .await;
+    let opened = patches_to(&platform, "msg_tool_open")
+        .await
+        .last()
+        .cloned()
+        .expect("the viewer patches the clicked card");
     assert_eq!(card_header(&opened), "📄 report.md", "the viewer names the file");
     let text = card_text(&opened);
     assert!(
@@ -2190,18 +2274,32 @@ async fn tool_panel_open_button_passes_absolute_paths_through() {
 
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
 
     let absolute = elsewhere.path().join("notes.md").to_string_lossy().to_string();
-    let payload = crate::feishu::card::session::tool_file_value("ses_seed", &absolute);
-    let result = app.host_action(payload).await.expect("the click is handled");
-    let opened = result.card.expect("the viewer opens in place");
+    let mut payload = crate::feishu::card::session::tool_file_value("ses_seed", &absolute);
+    payload["open_message_id"] = serde_json::json!("msg_tool_outside");
+    let result = app.host_action(payload).await.expect("the click is acknowledged");
+    assert!(result.card.is_none(), "the bounded open runs after ack");
+    wait_for_card_update(&platform, "outside viewer open", CardUpdates::Latest, |card| {
+        card_text(card).contains("elsewhere")
+    })
+    .await;
+    let opened = patches_to(&platform, "msg_tool_outside")
+        .await
+        .last()
+        .cloned()
+        .expect("the viewer patches the clicked card");
     assert_eq!(card_header(&opened), "📄 notes.md");
     assert!(
         card_text(&opened).contains(&canonical(&elsewhere.path().join("notes.md"))),
         "the absolute path opens as-is: {opened}"
+    );
+    assert!(
+        card_text(&opened).contains("会话目录之外"),
+        "the outside-session path carries a privacy hint: {opened}"
     );
 }
 
@@ -3084,7 +3182,7 @@ async fn a_failed_rich_text_send_keeps_the_preview_and_the_rescue() {
     let card = first_card(&platform).await;
     let text = card_text(&card);
     assert!(
-        text.contains("| r0 | 0 |") && text.contains("表格过长"),
+        text.contains("| r0 | 0 |") && text.contains("后续行未显示"),
         "the truncated preview and its honest cut note stay: {text}"
     );
     assert!(

@@ -209,7 +209,7 @@ pub struct App {
     /// process-local claim per Chat + clicked card until its task and PATCH end.
     viewer_actions_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     /// Viewers whose File Message landed, so stale callbacks cannot redeliver.
-    viewer_file_transfers_sent: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    viewer_file_transfers_sent: Arc<std::sync::Mutex<indexmap::IndexMap<(String, String), ()>>>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -624,6 +624,7 @@ struct OwnedReturnTo {
 struct ViewerOpen {
     thread_key: ThreadKey,
     path: String,
+    session_dir: Option<String>,
     card_message_id: String,
     return_to: OwnedReturnTo,
     page: usize,
@@ -635,6 +636,7 @@ struct ViewerOpen {
 struct ViewerReread {
     thread_key: ThreadKey,
     path: String,
+    session_dir: Option<String>,
     card_message_id: String,
     rich_message_id: Option<String>,
     return_to: OwnedReturnTo,
@@ -646,6 +648,7 @@ struct ViewerReread {
 struct ViewerPage {
     thread_key: ThreadKey,
     path: String,
+    session_dir: Option<String>,
     card_message_id: String,
     return_to: OwnedReturnTo,
     page: usize,
@@ -671,6 +674,20 @@ struct ViewerOpenFailure<'a> {
     return_to: &'a OwnedReturnTo,
     line: &'a str,
     timeout_ms: u64,
+}
+
+/// Remember a completed viewer File Message within the same bounded,
+/// oldest-first window as the bridge's other process-local once-guards.
+fn remember_viewer_file_transfer(
+    sent: &mut indexmap::IndexMap<(String, String), ()>,
+    key: (String, String),
+    cap: usize,
+) {
+    if sent.contains_key(&key) {
+        return;
+    }
+    while sent.len() >= cap && crate::bridge::handles::evict_oldest_idle(sent, |_| true) {}
+    sent.insert(key, ());
 }
 
 /// RAII claim for one in-flight File Viewer action. A duplicate callback gets
@@ -942,7 +959,7 @@ impl App {
             core,
             access,
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
         })
     }
 
@@ -2895,16 +2912,25 @@ impl App {
             .filter(|id| !id.is_empty());
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let mut thread_key = thread_key_from_value(value);
-        let mut session_dir: Option<String> = None;
-        if let Some(sid) = session_id {
+        let session_dir = {
             let sessions = self.sessions.lock().await;
-            if thread_key.chat_id.is_empty()
-                && let Some(resolved) = sessions.thread_for_session(sid)
-            {
-                thread_key = resolved;
+            let mut session_dir = None;
+            if let Some(sid) = session_id {
+                if thread_key.chat_id.is_empty()
+                    && let Some(resolved) = sessions.thread_for_session(sid)
+                {
+                    thread_key = resolved;
+                }
+                session_dir = sessions.directory_for_session(sid);
             }
-            session_dir = sessions.directory_for_session(sid);
-        }
+            value
+                .get("session_dir")
+                .and_then(|v| v.as_str())
+                .filter(|dir| !dir.is_empty())
+                .map(str::to_string)
+                .or(session_dir)
+                .or_else(|| sessions.current_directory(&thread_key))
+        };
         // The row's `path` comes straight from the browse scan, so it names a
         // filesystem entry, not free text: it is read **verbatim**. Trimming it
         // would open a different file (or none) for a name that ends in — or is
@@ -2933,8 +2959,8 @@ impl App {
         // A tool panel's structured path resolves on the Path Scope (an
         // absolute scan path resolves to itself, so browse rows never take
         // this lane — only a payload carrying a Session does).
-        let resolved = match session_dir {
-            Some(dir) if session_id.is_some() => crate::bridge::viewer::resolve_cat_path(&path, &dir),
+        let resolved = match (session_id, session_dir.as_deref()) {
+            (Some(_), Some(dir)) => crate::bridge::viewer::resolve_cat_path(&path, dir),
             _ => std::path::PathBuf::from(&path),
         };
         // The listing to return to, when the row came from one
@@ -2977,12 +3003,6 @@ impl App {
                 1,
             )
         };
-        let return_to = (!home_dir.is_empty()).then(|| BrowseView {
-            dir: &home_dir,
-            show_hidden: home_hidden,
-            keyword: &home_keyword,
-            page: home_page,
-        });
         if op == "page" {
             let Some(open_message_id) = value
                 .get("open_message_id")
@@ -3004,6 +3024,7 @@ impl App {
             let page = ViewerPage {
                 thread_key,
                 path: resolved.to_string_lossy().to_string(),
+                session_dir: session_dir.clone(),
                 card_message_id: open_message_id.to_string(),
                 return_to: OwnedReturnTo {
                     dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
@@ -3059,6 +3080,7 @@ impl App {
                 app.run_viewer_reread(ViewerReread {
                     thread_key,
                     path,
+                    session_dir: session_dir.clone(),
                     card_message_id,
                     rich_message_id,
                     return_to,
@@ -3078,80 +3100,55 @@ impl App {
         // patched after delivery. Even a fitting text file must classify off
         // this callback path because a host read can block (e.g. a network mount).
         // Pager flips are handled above with their own bounded background path.
-        if op.is_empty()
-            && let Some(open_message_id) = value
-                .get("open_message_id")
-                .and_then(|v| v.as_str())
-                .filter(|id| !id.is_empty())
-        {
-            let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("正在打开文件…".to_string()),
-                });
-            };
-            let app = Arc::clone(self);
-            let core = Arc::clone(core);
-            let message_id = open_message_id.to_string();
-            let path = resolved.to_string_lossy().to_string();
-            let return_to = OwnedReturnTo {
-                dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
-                keyword: home_keyword.clone(),
-                show_hidden: home_hidden,
-                page: home_page,
-            };
-            tokio::spawn(async move {
-                app.run_viewer_open(ViewerOpen {
-                    thread_key,
-                    path,
-                    card_message_id: message_id,
-                    return_to,
-                    page,
-                    core,
-                    in_flight_guard,
-                })
-                .await;
+        if !op.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
             });
+        }
+        let Some(open_message_id) = value
+            .get("open_message_id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无法打开文件：找不到文件浏览卡。".to_string()),
+            });
+        };
+        let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("正在打开文件…".to_string()),
             });
-        }
-        match crate::feishu::card::command::path_answer(&thread_key, &resolved, return_to, page) {
-            crate::feishu::card::command::PathAnswer::Viewer(card) => Some(CardActionResult {
-                card: Some(card),
-                toast: None,
-            }),
-            // The row said file, but that path is a directory now: answer the
-            // Directory Browser where the row pointed rather than invent a
-            // viewer (the same rule as `/cat <directory>`).
-            crate::feishu::card::command::PathAnswer::Directory(dir) => {
-                let dir = dir.to_string_lossy().to_string();
-                Some(CardActionResult {
-                    card: Some(
-                        self.build_dir_browse_for(
-                            core,
-                            &thread_key,
-                            BrowseView {
-                                dir: &dir,
-                                show_hidden: false,
-                                keyword: "",
-                                page: 1,
-                            },
-                        )
-                        .await,
-                    ),
-                    toast: None,
-                })
-            }
-            // The file vanished or cannot be read between the render and the
-            // click: the reason as a Toast, the clicked card still standing —
-            // never an empty viewer (ADR-0083 §2).
-            crate::feishu::card::command::PathAnswer::Line(line) => Some(CardActionResult {
-                card: None,
-                toast: Some(line),
-            }),
-        }
+        };
+        let app = Arc::clone(self);
+        let core = Arc::clone(core);
+        let message_id = open_message_id.to_string();
+        let path = resolved.to_string_lossy().to_string();
+        let return_to = OwnedReturnTo {
+            dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
+            keyword: home_keyword.clone(),
+            show_hidden: home_hidden,
+            page: home_page,
+        };
+        tokio::spawn(async move {
+            app.run_viewer_open(ViewerOpen {
+                thread_key,
+                path,
+                session_dir,
+                card_message_id: message_id,
+                return_to,
+                page,
+                core,
+                in_flight_guard,
+            })
+            .await;
+        });
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在打开文件…".to_string()),
+        })
     }
 
     /// Finish a pager flip after the callback has acknowledged. The carried
@@ -3160,6 +3157,7 @@ impl App {
         let ViewerPage {
             thread_key,
             path,
+            session_dir,
             card_message_id,
             return_to,
             page,
@@ -3214,8 +3212,11 @@ impl App {
             &classified,
             lane,
             browse_view,
-            page,
-            false,
+            crate::feishu::card::command::ViewerBuildOptions {
+                page,
+                overflowed: false,
+                session_dir: session_dir.as_deref(),
+            },
         );
         if !matches!(
             crate::bridge::bounded_call(
@@ -3237,6 +3238,7 @@ impl App {
         let ViewerReread {
             thread_key,
             path,
+            session_dir,
             card_message_id,
             rich_message_id,
             return_to,
@@ -3309,8 +3311,11 @@ impl App {
             &classified,
             lane,
             browse_view,
-            page,
-            overflowed,
+            crate::feishu::card::command::ViewerBuildOptions {
+                page,
+                overflowed,
+                session_dir: session_dir.as_deref(),
+            },
         );
         if !matches!(
             crate::bridge::bounded_call(
@@ -3349,6 +3354,7 @@ impl App {
         let ViewerOpen {
             thread_key,
             path,
+            session_dir,
             card_message_id,
             return_to,
             page,
@@ -3462,8 +3468,11 @@ impl App {
                     &classified,
                     lane,
                     browse_view,
-                    page,
-                    overflowed,
+                    crate::feishu::card::command::ViewerBuildOptions {
+                        page,
+                        overflowed,
+                        session_dir: session_dir.as_deref(),
+                    },
                 )
             }
         };
@@ -4068,7 +4077,7 @@ impl App {
             .viewer_file_transfers_sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&transfer_key)
+            .contains_key(&transfer_key)
         {
             return Some(CardActionResult {
                 card: None,
@@ -4180,19 +4189,35 @@ impl App {
                     &lane.delivery,
                     crate::feishu::card::tool_render::FileDelivery::SentAsFile
                 ) {
-                    self.viewer_file_transfers_sent
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert((thread_key.chat_id.clone(), message_id.clone()));
+                    remember_viewer_file_transfer(
+                        &mut self
+                            .viewer_file_transfers_sent
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        (thread_key.chat_id.clone(), message_id.clone()),
+                        crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
+                    );
                 }
+                let session_dir = if let Some(dir) = value
+                    .get("session_dir")
+                    .and_then(|v| v.as_str())
+                    .filter(|dir| !dir.is_empty())
+                {
+                    Some(dir.to_string())
+                } else {
+                    self.sessions.lock().await.current_directory(&thread_key)
+                };
                 crate::feishu::card::command::build_viewer_for_classified(
                     &thread_key,
                     &resolved,
                     &classified,
                     Some(lane),
                     return_to,
-                    viewer_page(&value),
-                    false,
+                    crate::feishu::card::command::ViewerBuildOptions {
+                        page: viewer_page(&value),
+                        overflowed: false,
+                        session_dir: session_dir.as_deref(),
+                    },
                 )
             }
             Err(line) => {
@@ -4669,7 +4694,20 @@ impl App {
 
 #[cfg(test)]
 mod viewer_reread_slot_tests {
-    use super::spawn_bounded_viewer_fs_read;
+    use super::{remember_viewer_file_transfer, spawn_bounded_viewer_fs_read};
+
+    #[test]
+    fn viewer_transfer_once_guard_evicts_the_oldest_entry_at_its_cap() {
+        let mut sent = indexmap::IndexMap::new();
+        remember_viewer_file_transfer(&mut sent, ("chat".into(), "first".into()), 2);
+        remember_viewer_file_transfer(&mut sent, ("chat".into(), "second".into()), 2);
+        remember_viewer_file_transfer(&mut sent, ("chat".into(), "third".into()), 2);
+
+        assert_eq!(sent.len(), 2);
+        assert!(!sent.contains_key(&("chat".into(), "first".into())));
+        assert!(sent.contains_key(&("chat".into(), "second".into())));
+        assert!(sent.contains_key(&("chat".into(), "third".into())));
+    }
 
     /// A timed-out wait leaves the blocking job's slot held until its closure
     /// returns; subsequent work is refused rather than accumulated in the pool.
