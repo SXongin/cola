@@ -200,6 +200,8 @@ enum PromptRoute {
 /// shared core so the coordinator's own code can reach the aggregate; flows
 /// receive narrow per-concern handles instead (`SharedCore::turn_handles` is
 /// the Turn's bundle, spec #298).
+type ViewerFileTransferKey = (String, String, u64);
+
 pub struct App {
     pub(crate) core: Arc<SharedCore>,
     /// The Host gate (ADR-0035): every inbound message and card action is
@@ -209,7 +211,7 @@ pub struct App {
     /// process-local claim per Chat + clicked card until its task and PATCH end.
     viewer_actions_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
     /// Viewers whose File Message landed, so stale callbacks cannot redeliver.
-    viewer_file_transfers_sent: Arc<std::sync::Mutex<indexmap::IndexMap<(String, String), ()>>>,
+    viewer_file_transfers_sent: Arc<std::sync::Mutex<indexmap::IndexMap<ViewerFileTransferKey, ()>>>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -636,6 +638,7 @@ struct ViewerReread {
     session_dir: Option<String>,
     card_message_id: String,
     rich_message_id: Option<String>,
+    sent_file_identity: Option<u64>,
     return_to: OwnedReturnTo,
     page: usize,
     in_flight_guard: ViewerActionGuard,
@@ -663,6 +666,44 @@ enum ViewerOpenRead {
     },
 }
 
+#[cfg(test)]
+pub(crate) type ViewerResolveTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static VIEWER_RESOLVE_TEST_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<(std::path::PathBuf, ViewerResolveTestHook)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_viewer_resolve_test_hook(path: std::path::PathBuf, hook: ViewerResolveTestHook) {
+    *VIEWER_RESOLVE_TEST_HOOK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path, hook));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_viewer_resolve_test_hook() {
+    *VIEWER_RESOLVE_TEST_HOOK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn park_viewer_resolve_for_test(path: &std::path::Path) {
+    let hook = VIEWER_RESOLVE_TEST_HOOK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(target, _)| target == path)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 struct ViewerOpenFailure<'a> {
     thread_key: &'a ThreadKey,
     resolved: &'a std::path::Path,
@@ -677,8 +718,8 @@ struct ViewerOpenFailure<'a> {
 /// Remember a completed viewer File Message within the same bounded,
 /// oldest-first window as the bridge's other process-local once-guards.
 fn remember_viewer_file_transfer(
-    sent: &mut indexmap::IndexMap<(String, String), ()>,
-    key: (String, String),
+    sent: &mut indexmap::IndexMap<ViewerFileTransferKey, ()>,
+    key: ViewerFileTransferKey,
     cap: usize,
 ) {
     if sent.contains_key(&key) {
@@ -817,7 +858,21 @@ fn reconcile_viewer_page_lane(
     path: &std::path::Path,
 ) -> Option<crate::feishu::card::viewer::ViewerFileLane> {
     let lane = lane?;
-    if lane.mime == classified.mime && lane.size == classified.size {
+    let fresh_identity = classified
+        .bytes
+        .as_deref()
+        .or_else(|| classified.text.as_deref().map(str::as_bytes))
+        .map(|bytes| {
+            crate::bridge::handles::content_identity_hash(
+                &classified.mime,
+                &crate::feishu::card::command::file_display_name(path),
+                bytes,
+            )
+        });
+    let identity_matches = lane
+        .content_identity
+        .is_none_or(|identity| fresh_identity == Some(identity));
+    if lane.mime == classified.mime && lane.size == classified.size && identity_matches {
         return Some(lane);
     }
     Some(crate::feishu::card::viewer::ViewerFileLane {
@@ -825,6 +880,7 @@ fn reconcile_viewer_page_lane(
         name: crate::feishu::card::command::file_display_name(path),
         size: classified.size,
         delivery: crate::feishu::card::tool_render::FileDelivery::Undelivered,
+        content_identity: None,
         embedded_image_key: None,
         rich_message_id: None,
         refresh_failed: false,
@@ -2982,7 +3038,9 @@ impl App {
         // absolute scan path resolves to itself, so browse rows never take
         // this lane — only a payload carrying a Session does).
         let resolved = match (session_id, session_dir.as_deref()) {
-            (Some(_), Some(dir)) => crate::bridge::viewer::resolve_cat_path(&path, dir),
+            (Some(_), Some(dir)) => crate::bridge::command::lexical_normalize(
+                &crate::bridge::command::expand_against(&path, std::path::Path::new(dir)),
+            ),
             _ => std::path::PathBuf::from(&path),
         };
         // The listing to return to, when the row came from one
@@ -3092,6 +3150,10 @@ impl App {
                 .and_then(|v| v.as_str())
                 .filter(|id| !id.is_empty())
                 .map(str::to_string);
+            let sent_file_identity = value
+                .get("viewer_sent_file_identity")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|identity| identity.parse().ok());
             let return_to = OwnedReturnTo {
                 dir: (!home_dir.is_empty()).then(|| home_dir.clone()),
                 keyword: home_keyword.clone(),
@@ -3105,6 +3167,7 @@ impl App {
                     session_dir: session_dir.clone(),
                     card_message_id,
                     rich_message_id,
+                    sent_file_identity,
                     return_to,
                     page,
                     in_flight_guard,
@@ -3268,6 +3331,7 @@ impl App {
             session_dir,
             card_message_id,
             rich_message_id,
+            sent_file_identity,
             return_to,
             page,
             in_flight_guard,
@@ -3329,6 +3393,7 @@ impl App {
             crate::bridge::viewer::ViewerLaneOptions {
                 timeout_ms,
                 existing_rich_message_id: rich_message_id.as_deref(),
+                existing_sent_file_identity: sent_file_identity,
             },
         )
         .await;
@@ -3395,18 +3460,28 @@ impl App {
             .load(std::sync::atomic::Ordering::Relaxed);
         let resolved = std::path::PathBuf::from(&path);
         let read_path = resolved.clone();
+        let read_session_dir = session_dir.clone();
         let read = bounded_viewer_fs_read(
             self.cards_handle().viewer_fs_read_slots.clone(),
             timeout_ms,
             "⚠️ 打开任务繁忙，请稍后再试。",
             &format!("⚠️ 无法读取 `{}`：打开超时。", resolved.display()),
-            move || match crate::bridge::viewer::open_cat_path(&read_path) {
-                crate::bridge::viewer::CatOpen::Directory(dir) => Ok(ViewerOpenRead::Directory(dir)),
-                crate::bridge::viewer::CatOpen::File { path, size } => {
-                    crate::bridge::viewer::classify(&path, size)
-                        .map(|classified| ViewerOpenRead::File { path, classified })
+            move || {
+                // Canonicalization can touch a stalled/network filesystem too:
+                // keep it in the same bounded worker as stat and classification,
+                // after the card callback has already acknowledged.
+                let resolved = match read_session_dir.as_deref() {
+                    Some(dir) => crate::bridge::viewer::resolve_cat_path(&read_path.to_string_lossy(), dir),
+                    None => read_path,
+                };
+                match crate::bridge::viewer::open_cat_path(&resolved) {
+                    crate::bridge::viewer::CatOpen::Directory(dir) => Ok(ViewerOpenRead::Directory(dir)),
+                    crate::bridge::viewer::CatOpen::File { path, size } => {
+                        crate::bridge::viewer::classify(&path, size)
+                            .map(|classified| ViewerOpenRead::File { path, classified })
+                    }
+                    crate::bridge::viewer::CatOpen::Failed(failure) => Err(failure),
                 }
-                crate::bridge::viewer::CatOpen::Failed(failure) => Err(failure),
             },
         )
         .await;
@@ -3490,6 +3565,7 @@ impl App {
                     crate::bridge::viewer::ViewerLaneOptions {
                         timeout_ms,
                         existing_rich_message_id: None,
+                        existing_sent_file_identity: None,
                     },
                 )
                 .await;
@@ -4131,7 +4207,16 @@ impl App {
             });
         }
         let thread_key = thread_key_from_value(value);
-        let transfer_key = (thread_key.chat_id.clone(), message_id.to_string());
+        let content_identity = value
+            .get("viewer_file_identity")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|identity| identity.parse().ok())
+            .unwrap_or(0);
+        let transfer_key = (
+            thread_key.chat_id.clone(),
+            message_id.to_string(),
+            content_identity,
+        );
         if self
             .viewer_file_transfers_sent
             .lock()
@@ -4155,7 +4240,7 @@ impl App {
         let app = Arc::clone(self);
         tokio::spawn(async move {
             let _in_flight_guard = in_flight_guard;
-            app.run_viewer_file_transfer(thread_key, path, message_id, value)
+            app.run_viewer_file_transfer(thread_key, path, message_id, content_identity, value)
                 .await;
         });
         Some(CardActionResult {
@@ -4179,6 +4264,7 @@ impl App {
         thread_key: ThreadKey,
         path: String,
         message_id: String,
+        content_identity: u64,
         value: serde_json::Value,
     ) {
         let resolved = std::path::PathBuf::from(&path);
@@ -4252,14 +4338,23 @@ impl App {
                     &lane.delivery,
                     crate::feishu::card::tool_render::FileDelivery::SentAsFile
                 ) {
+                    let mut sent = self
+                        .viewer_file_transfers_sent
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let key = (thread_key.chat_id.clone(), message_id.clone());
                     remember_viewer_file_transfer(
-                        &mut self
-                            .viewer_file_transfers_sent
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner),
-                        (thread_key.chat_id.clone(), message_id.clone()),
+                        &mut sent,
+                        (key.0.clone(), key.1.clone(), content_identity),
                         crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
                     );
+                    if let Some(delivered_identity) = lane.content_identity {
+                        remember_viewer_file_transfer(
+                            &mut sent,
+                            (key.0, key.1, delivered_identity),
+                            crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
+                        );
+                    }
                 }
                 let session_dir = if let Some(dir) = value
                     .get("session_dir")
@@ -4762,14 +4857,30 @@ mod viewer_reread_slot_tests {
     #[test]
     fn viewer_transfer_once_guard_evicts_the_oldest_entry_at_its_cap() {
         let mut sent = indexmap::IndexMap::new();
-        remember_viewer_file_transfer(&mut sent, ("chat".into(), "first".into()), 2);
-        remember_viewer_file_transfer(&mut sent, ("chat".into(), "second".into()), 2);
-        remember_viewer_file_transfer(&mut sent, ("chat".into(), "third".into()), 2);
+        remember_viewer_file_transfer(&mut sent, ("chat".into(), "card".into(), 1), 2);
+        remember_viewer_file_transfer(&mut sent, ("chat".into(), "card".into(), 2), 2);
+        remember_viewer_file_transfer(&mut sent, ("chat".into(), "other".into(), 3), 2);
 
         assert_eq!(sent.len(), 2);
-        assert!(!sent.contains_key(&("chat".into(), "first".into())));
-        assert!(sent.contains_key(&("chat".into(), "second".into())));
-        assert!(sent.contains_key(&("chat".into(), "third".into())));
+        assert!(!sent.contains_key(&("chat".into(), "card".into(), 1)));
+        assert!(sent.contains_key(&("chat".into(), "card".into(), 2)));
+        assert!(sent.contains_key(&("chat".into(), "other".into(), 3)));
+    }
+
+    #[test]
+    fn viewer_transfer_once_guard_rotates_with_content_identity() {
+        let mut sent = indexmap::IndexMap::new();
+        let old = ("chat".into(), "card".into(), 11);
+        let refreshed = ("chat".into(), "card".into(), 22);
+        remember_viewer_file_transfer(&mut sent, old.clone(), 10);
+
+        assert!(sent.contains_key(&old), "same snapshot remains deliver-once");
+        assert!(
+            !sent.contains_key(&refreshed),
+            "a refreshed content identity can be delivered"
+        );
+        remember_viewer_file_transfer(&mut sent, refreshed.clone(), 10);
+        assert!(sent.contains_key(&refreshed));
     }
 
     /// A timed-out wait leaves the blocking job's slot held until its closure
