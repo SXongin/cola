@@ -32,7 +32,7 @@ than adding a cola-side allow-list.
   string — the model does not know the skill exists and goes looking for it.
 - **`@` cannot be the sigil in Feishu.** Typing `@` opens the person-mention
   picker, and mentions arrive as opaque `@_user_N` tokens
-  (`AGENTS.md` pitfall #10); there is no client-side `@skill-id` resolution in
+  (`AGENTS.md` pitfall `mentions`); there is no client-side `@skill-id` resolution in
   a message.
 - **The workflow skills are user-invoked.** `implement-spec`, `grill-with-docs`,
   `to-spec`, … set `disable-model-invocation`, so the model never sees them in

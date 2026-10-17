@@ -73,7 +73,7 @@ The snapshot never: injects a prompt or any write into the session, spends token
 - `GET /session/status` reflects the attached server instance only — consistent with the one-server Shared Store invariant (ADR-0005, ADR-0013). After a server restart an in-flight run is lost anyway, so `idle` is the correct post-restart answer.
 - Patching the switch-card into a snapshot discards the session list; accepted — the action is complete.
 - The busy-follow's accumulator composition with claimed pending blocks needs implementation care in `src/bridge/request/` and `src/bridge/turn/render.rs` (a blocked external run approved from the snapshot then streams the rest); verify against the sweep's vanished-block resolution (`resolve_vanished_inline`, `src/bridge/request/kind.rs:195`) and the `turn_started_ms` replacement guard (`Turn::armed_turn_anchor`, `src/bridge/turn/mod.rs:1029`; the turn filter, `src/bridge/turn/render.rs:428-445`).
-- **Child-session (sub-task) pending permissions keep today's standalone delivery** via the parent-chain walk (pitfall #11); the snapshot embeds only same-session requests. Surfacing a descendant's blockers on the parent's snapshot is possible future work.
+- **Child-session (sub-task) pending permissions keep today's standalone delivery** via the parent-chain walk (pitfall `child-session-permissions`); the snapshot embeds only same-session requests. Surfacing a descendant's blockers on the parent's snapshot is possible future work.
 - The tail window (four messages) and suppression heuristic may need tuning from real use; both are presentation-level constants, not protocol.
 
 ## Domain note

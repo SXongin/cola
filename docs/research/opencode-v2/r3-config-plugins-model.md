@@ -151,7 +151,7 @@ breaks — the capability is just gone.
 3. Enumerate with `GET /api/permission/request` (location-scoped) or
    `GET /api/session/{sessionID}/permission` — the latter **works in V2** and returns
    `{data: Permission.Request[]}` (`groups/permission.ts:88-102`). (In V1 this route existed but
-   returned empty — that was cola pitfall #3; in V2 it is implemented.)
+   returned empty — that was cola pitfall `generations`; in V2 it is implemented.)
 
 Docs are explicit that this is the client's job: "Non-interactive clients must decide how to handle
 approval requests; configured `deny` rules always remain enforced"
