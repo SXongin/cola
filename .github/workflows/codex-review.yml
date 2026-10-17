@@ -99,7 +99,7 @@ jobs:
       github.actor != 'dependabot[bot]' &&
       !startsWith(github.head_ref || '', 'release/')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     permissions:
       contents: read
       issues: read
@@ -297,7 +297,7 @@ jobs:
       - name: Run Codex (read-only)
         id: codex
         continue-on-error: true
-        timeout-minutes: 12
+        timeout-minutes: 30
         uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
           openai-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
