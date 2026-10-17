@@ -3693,6 +3693,21 @@ impl App {
         thread_key: &ThreadKey,
         view: BrowseView<'_>,
     ) -> Option<CardActionResult> {
+        // ADR-0007: a bound topic owns exactly one session. `/dir` and the
+        // `/dir` card are refused there at command entry
+        // (`Command::topic_rejection`), but `/cat <directory>` legitimately
+        // renders the same browse card inside a topic (a read surface, never
+        // gated — spec #669 story 41). Its 选择/切换到这里 must therefore
+        // refuse the same way here, or a click would supersede the topic's
+        // session through the pending declaration below.
+        if thread_key.thread_id != thread_key.chat_id
+            && core.sessions.lock().await.get_active(thread_key).is_some()
+        {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(crate::bridge::command::TOPIC_SELECTION_REJECTION.to_string()),
+            });
+        }
         let Some(directory) = resolve_browse_dir(view.dir) else {
             return Some(CardActionResult {
                 card: None,
@@ -4365,6 +4380,20 @@ impl App {
                     .get("viewer_embedded_image_key")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
+                // The transferred bytes are an ADDITION to what the viewer
+                // already delivered: an existing Rich Text Message survives
+                // (its stale preview is refreshed on the next re-read), so the
+                // rebuilt card must keep tracking it — otherwise that re-read
+                // posts a second copy and orphans the first (#744, Codex gate
+                // round 7).
+                lane.rich_message_id = value
+                    .get("viewer_lane_rich_message_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                lane.refresh_failed = value
+                    .get("viewer_lane_refresh_failed")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("true");
                 let transfer_status = match &lane.delivery {
                     crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
                         Some(ViewerFileTransferStatus::Sent)
