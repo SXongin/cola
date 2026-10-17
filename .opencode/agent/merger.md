@@ -1,6 +1,7 @@
 ---
 description: "Lands one completed implementer branch onto the integration branch — rebase/cherry-pick, never a merge commit — resolves conflicts, verifies the result, and reports back. Dispatched by the implement-spec flow; never reviews code, pushes, or touches the tracker."
 mode: subagent
+model: opencode/deepseek-v4.1-flash-free#high
 permissions:
   - action: subagent
     resource: "*"
