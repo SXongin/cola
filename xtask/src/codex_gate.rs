@@ -239,7 +239,9 @@ mod tests {
         })
     }
 
-    /// Run the workflow's credential check against `endpoint`.
+    /// Run the workflow's credential check against `endpoint`. The stubs live
+    /// on loopback, so the harness bypasses any proxy the host sets — the
+    /// workflow itself must keep curl's normal proxy handling.
     fn run_credential_check(endpoint: &str) -> std::process::Output {
         let workflow = workflow();
         let script = run_block(step(&workflow, "Check the gate credential"));
@@ -250,6 +252,8 @@ mod tests {
             .env("GATE_ENDPOINT", endpoint)
             .env("GATE_MODEL", "test-model")
             .env("GATE_KEY", "test-key")
+            .env("no_proxy", "*")
+            .env("NO_PROXY", "*")
             .output()
             .expect("bash runs")
     }
@@ -454,6 +458,27 @@ mod tests {
         ] {
             assert!(seen.contains(field), "the probe must send {field}: {seen}");
         }
+    }
+
+    #[test]
+    fn the_credential_check_names_an_unreachable_endpoint() {
+        // Bind and drop, so the port is closed: curl records no status and
+        // exits on the connection failure, which is a different report from an
+        // endpoint that answered with a status.
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let out = run_credential_check(&format!("http://{addr}/v1/responses"));
+        let log = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success(),
+            "an unreachable endpoint must fail the step"
+        );
+        assert!(
+            log.contains("could not reach") && log.contains(&addr.to_string()),
+            "the transport failure must name the endpoint: {log}"
+        );
     }
 
     #[test]
