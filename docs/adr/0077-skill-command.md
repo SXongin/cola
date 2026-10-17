@@ -94,7 +94,7 @@ than adding a cola-side allow-list.
   stays comfortably under Feishu's 30 KB limit. Only a genuinely large
   dispatch degrades: past `SKILL_FOLD_MAX` folds the overflow collapses into one
   `🧩 已加载技能（等 N 个）` summary fold, and a fold past the aggregate keeps its
-  title with an omission body (AGENTS.md #13). A **mixed dispatch** — some ids
+  title with an omission body (AGENTS.md pitfall `card-budgets`). A **mixed dispatch** — some ids
   resolve, some do not — still submits the resolved ones and leads the card with
   a `⚠️ 未找到技能：…` line naming the rest, so an unknown id is never dropped
   silently (Q19); a dispatch whose ids ALL fail to resolve keeps the

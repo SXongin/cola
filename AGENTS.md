@@ -82,14 +82,17 @@ and the map from the old numbers.
   text and reasoning on **content**: a poll-keyed dedupe never fires and the text
   doubles.
 - **`attach`** — **One store, many clients**: cola attaches to whatever
-  `opencode serve` is on the default store, whoever started it, and self-starts
-  one when none is running (`src/bridge/discovery.rs`). Never use a private data
-  dir — it silently breaks that sharing — and a mapped session that 404s is a
-  leftover from another store, recreated automatically. Discovery reads the
-  server's port, username and password from the server process's **environment**
-  (`sysinfo`, so it works off Linux too): the username is
-  `OPENCODE_SERVER_USERNAME` (default `opencode`) and the server compares it, so
-  **both** fields are required — a missing username 401s even with a correct
+  `opencode serve` is on the default store, whoever started it, and starts one of
+  its own only when `start_server` allows it (`auto` by default, `never` for
+  attach-only, ADR-0013). Never use a private data dir — it silently breaks that
+  sharing — and a mapped session that 404s is a leftover from another store,
+  recreated automatically. Discovery resolves each server process through
+  `sysinfo`: a classic `serve --port P` keeps its port in argv and its credentials
+  in the environment (`OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`
+  on V1 only), while a V2 `serve --service` has no `--port` and is reached through
+  its registration file (`$XDG_STATE_HOME/opencode/service.json`), always with the
+  username `opencode`. Either way Basic auth needs **both** halves — the server
+  compares the username, so a missing or wrong one 401s even with a correct
   password. (On OpenChamber's server the global SSE connection is ended every few
   seconds — cosmetic; cola renders by polling.)
 - **`ws-lifecycle`** — Feishu WS frames are binary protobuf (pbbp2), parsed by
@@ -98,9 +101,9 @@ and the map from the old numbers.
   `src/feishu/ws.rs`). **Ack every event**: a card callback needs its ack frame or
   Feishu shows "目标回调服务超时", and an unacked event is re-delivered forever
   until the client is treated as dead and stops receiving events at all (symptom:
-  the bot goes silent while its TCP connection still reads ESTAB). Delivery is
-  at-least-once, so dedupe on `header.event_id` and drop events older than 5
-  minutes.
+  the bot goes silent while its TCP connection still reads ESTAB). Message
+  delivery is at-least-once, so `im.message.receive_v1` is deduped on
+  `header.event_id` and anything older than 5 minutes is dropped.
 - **`mentions`** — Feishu @mentions arrive as opaque `@_user_N` tokens, so a
   prompt leaks `@_user_1` and the AI cannot see who was referenced unless they are
   resolved: strip the bot's own mention (it needs `bot_open_id` from

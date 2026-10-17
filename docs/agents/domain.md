@@ -18,8 +18,8 @@ decision is resolved. If they don't exist yet, proceed silently.
 
 ## Use its vocabulary, and flag conflicts
 
-The rules are `CODING_STANDARDS.md` "Code conventions": name a domain concept
-with the term `GLOSSARY.md` defines rather than a synonym it avoids, and surface
-a contradiction with an existing ADR instead of silently overriding it. An
-unresolved term is a signal either way — you may be inventing language the
-project doesn't use, or there is a real gap to note for `/domain-modeling`.
+`CODING_STANDARDS.md` "Code conventions" owns both rules — a concept named with
+the term `GLOSSARY.md` defines, and a contradiction with an existing ADR surfaced
+rather than silently overridden. One signal it does not carry: a concept with no
+entry yet means either you are inventing language the project does not use, or
+there is a real gap to note for `/domain-modeling`.
