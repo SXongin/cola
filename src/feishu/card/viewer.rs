@@ -19,6 +19,13 @@
 //! listing's whole state — both payloads are the browse handler's own
 //! [`BrowseView`] shape, so neither can drift from the browse card (#742 wires
 //! the row that passes `return_to`; #739/#740/#741/#744 extend the render).
+//!
+//! An **HTML page** (the path spells `.html`/`.htm`; the bytes are still text,
+//! so CONTENT keeps deciding the kind) leads with 「🌐 预览网页」 instead
+//! (#774): the platform renders an uploaded `.html` in the *client's* file
+//! preview — measured 2026-10-18, inline `<script>` included — and no card
+//! component can. The card keeps its source preview and says where the rendered
+//! page is.
 
 use serde_json::json;
 
@@ -527,6 +534,17 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
         "content": markdown.clean(&naming_block(&view)),
     }));
 
+    // An HTML page's rendered preview lives in the File Message, not the card
+    // (#774): the line says where it is before the source block, so the lead
+    // button below is never a surprise and a reader never mistakes the source
+    // for the page.
+    if needs_html_page_lane(&view) {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean(&html_page_note(&view)),
+        }));
+    }
+
     // A LANDED overflow preview went out as its own message (#741): the card
     // carries no preview, no truncation note and no rescue delivery — the
     // tracking line below says where the content went. A preview the lane did
@@ -934,6 +952,49 @@ fn naming_block(view: &ViewerCard<'_>) -> String {
     )
 }
 
+/// Whether this viewer is an HTML page's lane (#774): its bytes are text — the
+/// CONTENT decides that, as §6 requires — and the path spells an HTML
+/// extension. The extension never decides the KIND; it decides only which
+/// transfer the card leads with, because the page's rendered preview exists
+/// solely in the client's File Message preview.
+fn needs_html_page_lane(view: &ViewerCard<'_>) -> bool {
+    matches!(view.kind, ViewerKind::Text | ViewerKind::TextTooLarge)
+        && matches!(
+            view.ext.map(str::to_ascii_lowercase).as_deref(),
+            Some("html" | "htm")
+        )
+}
+
+/// Whether the file's own bytes already went out as a File Message — the one
+/// predicate both the transfer button and the HTML page note obey, so the card
+/// can neither offer a send it has performed nor claim one it has not.
+fn file_message_delivered(view: &ViewerCard<'_>) -> bool {
+    view.lane.as_ref().is_some_and(|lane| {
+        matches!(
+            &lane.delivery,
+            FileDelivery::SentAsFile | FileDelivery::FileSendOutcomeUnknown
+        )
+    })
+}
+
+/// The HTML page's lead line (#774): where the rendered preview is — the File
+/// Message, opened in Feishu's client — and, past the client's 12MB preview
+/// cap, that it may not render the page at all.
+fn html_page_note(view: &ViewerCard<'_>) -> String {
+    let mut note = if file_message_delivered(view) {
+        format!("{SEND_AS_PAGE}：文件已发到会话；在飞书中点开即为渲染后的页面。")
+    } else {
+        format!("{SEND_AS_PAGE}：点此把文件发到会话，在飞书中点开即为渲染后的页面。")
+    };
+    if view.size > crate::feishu::file::HTML_PREVIEW_MAX_BYTES {
+        note.push_str(&format!(
+            "超过 {} 的文件飞书客户端可能不渲染，只能下载。",
+            human_size(crate::feishu::file::HTML_PREVIEW_MAX_BYTES),
+        ));
+    }
+    note
+}
+
 /// One tracking line for the card's whole-bytes lane (ADR-0083 §5): `📎 name ·
 /// mime · size` plus the shared delivery suffix, so the viewer spells a
 /// delivered file exactly as a Tool Panel does (ADR-0076).
@@ -957,7 +1018,7 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 }
 
 /// The viewer's button row (ADR-0083 §3, §5): 「← 返回目录」 when opened from a
-/// browse listing, otherwise 「📂 所在目录」, and 「发为文件」 unless the
+/// browse listing, otherwise 「📂 所在目录」, and the transfer unless the
 /// preview already landed as its own message (`overflowed`): a landed preview
 /// needs no rescue delivery, while a preview the lane did NOT deliver keeps
 /// the button as its way out. The directory control carries the browse
@@ -965,25 +1026,36 @@ fn lane_line(lane: &ViewerFileLane) -> String {
 /// pass the listing in; the transfer button carries the RESOLVED path the
 /// click must upload, plus the browse listing's whole state so the card it
 /// PATCHes back to can still carry 「← 返回目录」.
+///
+/// An HTML page's transfer LEADS the row and is named for what it buys
+/// (#774): its File Message is the preview the card cannot be, so the one
+/// action that shows the page must not sit after two navigation controls.
+/// Same action, same payload — only the label and the order differ.
 fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Value {
-    let mut columns = vec![button_column("🔄 重新读取", reread_value(thread_key, view))];
-    columns.extend(directory_columns(thread_key, view.path, view.return_to));
+    let page = needs_html_page_lane(view);
     // A File Message already carries the original bytes; Rich Text carries only
     // a rendered preview, so the transfer action remains essential there.
     // An ambiguous timed-out File Message is also not retried: it may have
     // landed and Feishu cannot edit or retract it.
-    let file_message_may_already_be_delivered = view.lane.as_ref().is_some_and(|lane| {
-        matches!(
-            &lane.delivery,
-            super::tool_render::FileDelivery::SentAsFile
-                | super::tool_render::FileDelivery::FileSendOutcomeUnknown
-        )
-    });
-    if !file_message_may_already_be_delivered {
-        columns.push(button_column("发为文件", transfer_value(thread_key, view)));
+    let delivered = file_message_delivered(view);
+    let mut columns = Vec::new();
+    if page && !delivered {
+        columns.push(button_column(SEND_AS_PAGE, transfer_value(thread_key, view)));
+    }
+    columns.push(button_column("🔄 重新读取", reread_value(thread_key, view)));
+    columns.extend(directory_columns(thread_key, view.path, view.return_to));
+    if !delivered && !page {
+        columns.push(button_column(SEND_AS_FILE, transfer_value(thread_key, view)));
     }
     button_row(columns)
 }
+
+/// The transfer button's label: the original bytes as one File Message.
+const SEND_AS_FILE: &str = "发为文件";
+
+/// The transfer button's label on an HTML page (#774): the same File Message,
+/// named for the rendered page its client preview shows.
+const SEND_AS_PAGE: &str = "🌐 预览网页";
 
 /// The stateless re-read action (ADR-0052, ADR-0083 §9): the resolved file,
 /// current viewer page, return-listing state and existing overflow message id.
@@ -2367,6 +2439,110 @@ mod tests {
         assert_eq!(send["value"]["return_show_hidden"], true);
         assert_eq!(send["value"]["return_keyword"], "no");
         assert_eq!(send["value"]["return_page"], 2);
+    }
+
+    /// #774: an HTML page leads with 「🌐 预览网页」 — its File Message is the
+    /// only surface that renders the page — and keeps its source block. The
+    /// transfer is the SAME action (file/send), so no new callback rides along.
+    #[test]
+    fn an_html_page_leads_with_the_page_preview_and_keeps_its_source() {
+        let card = build_viewer_card(
+            &key(),
+            view(
+                "/tmp/proj/index.html",
+                ViewerKind::Text,
+                Some("html"),
+                "<h1>hi</h1>\n",
+            ),
+        );
+        let text = card_text(&card);
+        assert!(text.contains("预览网页：点此把文件发到会话"), "{text}");
+        assert!(text.contains("```html"), "the source preview stays: {text}");
+        assert!(!text.contains("超过"), "under the cap: no warning: {text}");
+
+        let buttons = card_buttons(&card);
+        assert_eq!(buttons[0]["text"]["content"], "🌐 预览网页");
+        assert_eq!(buttons[0]["value"]["action"], "file");
+        assert_eq!(buttons[0]["value"]["op"], "send");
+        assert_eq!(buttons[0]["value"]["path"], "/tmp/proj/index.html");
+        assert!(
+            buttons.iter().all(|b| b["text"]["content"] != "发为文件"),
+            "one transfer action, named for the page: {text}"
+        );
+    }
+
+    /// `.htm` and a differently-cased `.HTML` take the same lane; every other
+    /// text file keeps the 「发为文件」 row exactly as it was.
+    #[test]
+    fn only_html_and_htm_take_the_page_lane() {
+        for (name, ext) in [("/tmp/p/x.htm", "htm"), ("/tmp/p/x.HTML", "HTML")] {
+            let card = build_viewer_card(&key(), view(name, ViewerKind::Text, Some(ext), "<p>x</p>\n"));
+            assert_eq!(
+                card_buttons(&card)[0]["text"]["content"],
+                "🌐 预览网页",
+                "{name} leads with the page preview"
+            );
+        }
+        let md = build_viewer_card(
+            &key(),
+            view("/tmp/p/notes.md", ViewerKind::Text, Some("md"), "# hi\n"),
+        );
+        let text = card_text(&md);
+        assert!(!text.contains("预览网页"), "no page lane for .md: {text}");
+        assert_eq!(card_buttons(&md)[0]["text"]["content"], "🔄 重新读取");
+        assert!(
+            card_buttons(&md)
+                .iter()
+                .any(|b| b["text"]["content"] == "发为文件"),
+            "the ordinary transfer is unchanged: {text}"
+        );
+    }
+
+    /// Past Feishu's 12MB client preview cap the page still sends — the card
+    /// says the client may not render it, rather than promising a preview it
+    /// cannot deliver.
+    #[test]
+    fn an_over_cap_html_page_warns_the_client_may_not_render_it() {
+        let mut over = view(
+            "/tmp/p/big.html",
+            ViewerKind::Text,
+            Some("html"),
+            "<html></html>\n",
+        );
+        over.size = crate::feishu::file::HTML_PREVIEW_MAX_BYTES + 1;
+        let text = card_text(&build_viewer_card(&key(), over));
+        assert!(text.contains("超过 12.0 MB"), "{text}");
+        assert!(text.contains("可能不渲染"), "{text}");
+    }
+
+    /// #774, deliver-once: once the page's bytes went out as a File Message the
+    /// card states where the preview is and offers no second send — the note
+    /// and the button read the same predicate.
+    #[test]
+    fn a_delivered_html_page_states_where_the_preview_is_and_drops_the_send() {
+        let card = build_viewer_card(
+            &key(),
+            with_lane(
+                view(
+                    "/tmp/p/index.html",
+                    ViewerKind::Text,
+                    Some("html"),
+                    "<h1>x</h1>\n",
+                ),
+                "text/plain",
+                "index.html",
+                10,
+                FileDelivery::SentAsFile,
+            ),
+        );
+        let text = card_text(&card);
+        assert!(text.contains("文件已发到会话"), "{text}");
+        assert!(
+            card_buttons(&card)
+                .iter()
+                .all(|b| b["text"]["content"] != "🌐 预览网页"),
+            "no second send: {text}"
+        );
     }
 
     /// #741, deliver-once: a preview that LANDED as its own message carries no

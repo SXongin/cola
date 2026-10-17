@@ -343,3 +343,42 @@ The unit test that asserted the row is replaced by its inverse: an outside-sessi
 its resolved path with no `⚠️` row, and the two bridge tests that asserted the row now assert
 its absence.
 
+
+## Amendment (2026-10-18, #774): an HTML page's viewer leads with the File Message
+
+Decision 10 rejected HTML rendering on the ground that "the platform has no such component".
+That ground was true of the **card** and false of the **platform**: the rendered page exists, in
+the client's own file preview. Measured 2026-10-18 by probe (#774; the full evidence lives in
+`docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md` §2):
+
+- a `.html` File Message renders as a **page** when opened — desktop and mobile — and its inline
+  `<script>` executes; the client toggles to a code view. Feishu's help centre caps that preview
+  at **12 MB**.
+- a `.md` File Message renders as rich text, with a rendered preview excerpt **before** the file
+  is even opened; a card `markdown` element and a `post` `md` tag render the same markdown
+  equivalently.
+
+So an HTML page has a viewer cola cannot build and does not need to: the File Message. What
+changes is only the **card's action priority and copy** — no new lane, no new payload:
+
+- **Classification is untouched.** CONTENT still decides the kind (§6): an `.html` file is UTF-8
+  text and previews as a fenced code block with the `html` language token. The extension decides
+  only which action the card leads with — an `html`/`htm` file is a *page*.
+- **The page's transfer leads the row and is named for what it buys.** For an `.html`/`.htm` text
+  file the card's first button is 「🌐 预览网页」, the same action and payload as 「发为文件」
+  (`file`/`send`, the resolved path, the browse listing's whole state); 「🔄 重新读取」 and the
+  directory control follow. Every other file keeps 「发为文件」 exactly as it was, so one action
+  keeps one name per intent and the callback grammar is unchanged.
+- **The card says where the preview is.** One line above the source block states that the button
+  sends the file and that opening it in Feishu shows the rendered page; past
+  `HTML_PREVIEW_MAX_BYTES` (12 MB, `src/feishu/file.rs`) it adds that the client may not render it
+  at all. The line obeys the same delivered-bytes predicate as the button, so the card can neither
+  offer a send it has performed nor claim one it has not — a `TextTooLarge` page, delivered on
+  open by the File Message lane, reads the delivered form.
+- **The source preview stays.** A page's markup is still worth reading, and the card is the only
+  place cola shows it; the amendment demotes the action, it does not delete the preview.
+
+Not in this amendment: **rendering markdown inside the card**. The measurement makes it viable —
+the card `markdown` element already renders that family — but it is a separate change (a
+preview/source toggle is a new card state), and decision 10's blanket "no rich-text rendering"
+sentence is narrowed here only to the extent measured above.
