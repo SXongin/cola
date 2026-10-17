@@ -1575,7 +1575,13 @@ fn push_record_cell(record: &mut Vec<String>, cell: &mut BoundedCell, max_column
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feishu::card::MAX_ELEMENT_TEXT_CHARS;
+    use crate::feishu::card::{MAX_ELEMENT_TEXT_CHARS, chunk_text};
+
+    /// The per-chunk size `ViewerKind::Text` fenced before #769 (the removed
+    /// `PREVIEW_CHUNK_CHARS`): the old render split anything longer into several
+    /// elements, so a card rendering such a fixture as ONE element is a shape
+    /// the old code could not produce.
+    const OLD_PREVIEW_CHUNK_CHARS: usize = MAX_ELEMENT_TEXT_CHARS - 64;
 
     fn key() -> ThreadKey {
         ThreadKey::new("chat_1".into(), "chat_1".into())
@@ -2618,45 +2624,61 @@ mod tests {
 
     /// #769: a preview that fits the card's JSON budget renders as ONE fenced
     /// block — never one element per raw chunk — so no line is cut at a
-    /// character boundary and the fence appears exactly once.
+    /// character boundary and the fence appears exactly once. Both fixtures are
+    /// ones the OLD per-chunk render split (two elements just past 4,000 chars,
+    /// seven near 17.7 KB, measured on 6f45e61a), so a one-element card is a
+    /// shape that render could not produce — reverting the arm fails this test.
     #[test]
     fn a_fitting_text_preview_renders_one_whole_block() {
-        let body: String = (0..160)
-            .map(|i| format!("line {i}: {}\n", "x".repeat(16)))
-            .collect();
-        assert!(
-            body.len() >= 4_000 && body.len() > MAX_ELEMENT_TEXT_CHARS,
-            "the fixture is a 4000-char file, past one raw chunk: {} chars",
-            body.len()
-        );
-        let card = build_viewer_card(
-            &key(),
-            view("/tmp/notes.txt", ViewerKind::Text, Some("txt"), &body),
-        );
-        let json_len = serde_json::to_string(&card).unwrap().len();
-        assert!(
-            json_len < MAX_CARD_JSON_CHARS,
-            "the card fits its own budget: {json_len}"
-        );
-        let blocks = preview_blocks(&card);
-        assert_eq!(blocks.len(), 1, "exactly one preview element: {blocks:#?}");
-        let block = blocks[0];
-        assert_eq!(block.matches("```").count(), 2, "one fence, closed once: {block}");
-        assert!(
-            block.contains(&body),
-            "the preview carries every line whole, no character cut"
-        );
-        assert!(!has_pager(&card), "one block needs no pager");
-        assert_eq!(
-            detect_structural_overflow(ViewerKind::Text, Some("txt"), &body),
-            None,
-            "a text preview never takes the Rich Text / File lane"
-        );
+        for lines in [160usize, 660] {
+            let body: String = (0..lines)
+                .map(|i| format!("line {i}: {}\n", "x".repeat(16)))
+                .collect();
+            assert!(
+                body.len() >= 4_000 && chunk_text(&body, OLD_PREVIEW_CHUNK_CHARS).len() >= 2,
+                "{lines} lines: a 4000-char file the old per-chunk render split, got {} chars",
+                body.len()
+            );
+            let card = build_viewer_card(
+                &key(),
+                view("/tmp/notes.txt", ViewerKind::Text, Some("txt"), &body),
+            );
+            let json_len = serde_json::to_string(&card).unwrap().len();
+            assert!(
+                json_len < MAX_CARD_JSON_CHARS,
+                "{lines} lines: the card fits its own budget: {json_len}"
+            );
+            let blocks = preview_blocks(&card);
+            assert_eq!(
+                blocks.len(),
+                1,
+                "{lines} lines: exactly one preview element: {blocks:#?}"
+            );
+            let block = blocks[0];
+            assert_eq!(
+                block.matches("```").count(),
+                2,
+                "{lines} lines: one fence, closed once: {block}"
+            );
+            assert!(
+                block.contains(&body),
+                "{lines} lines: the preview carries every line whole, no character cut"
+            );
+            assert!(!has_pager(&card), "{lines} lines: one block needs no pager");
+            assert_eq!(
+                detect_structural_overflow(ViewerKind::Text, Some("txt"), &body),
+                None,
+                "{lines} lines: a text preview never takes the Rich Text / File lane"
+            );
+        }
     }
 
     /// #769: past the card's preview budget the preview pages by LINES — one
     /// closed fenced block per page, the flip moving to the next window — and a
-    /// whole line is never split to make a page fit.
+    /// whole line is never split to make a page fit. The paged path itself is
+    /// #740's and unchanged by #769 (measured byte-identical on 6f45e61a), so
+    /// this pins the pager's SHAPE; the assertions that discriminate the change
+    /// are the one-block ones above.
     #[test]
     fn a_text_preview_past_the_budget_pages_one_block_per_page() {
         let body: String = (0..8_000)
@@ -2687,6 +2709,26 @@ mod tests {
         assert_eq!(preview_blocks(&second).len(), 1, "one block on page 2");
         let (first_block, second_block) = (preview_blocks(&first)[0], preview_blocks(&second)[0]);
         assert_ne!(first_block, second_block, "the flip moves the window");
+        // Page 2's pager flips both ways: back to 1, on to 3.
+        let page2_buttons = card_buttons(&second);
+        assert!(
+            page2_buttons.iter().any(|button| {
+                button["text"]["content"] == "上一页"
+                    && button["value"]["page"] == 1
+                    && button["disabled"] == false
+            }),
+            "page 2 can go back to page 1"
+        );
+        assert!(
+            page2_buttons
+                .iter()
+                .any(|button| { button["text"]["content"] == "下一页" && button["value"]["page"] == 3 }),
+            "page 2 can go on to page 3"
+        );
+        assert!(
+            card_text(&second).contains("第 2/"),
+            "the indicator names the page that is shown"
+        );
         for block in [first_block, second_block] {
             assert_eq!(block.matches("```").count(), 2, "a closed fence: {block}");
             // The window cuts on line boundaries: everything it shows is a
