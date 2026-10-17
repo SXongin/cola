@@ -530,10 +530,12 @@ pub(super) struct GapCoverage {
 /// plus the capped input and output the renderer keeps, plus the File Content
 /// tracking block the panel body appends, one `img` element per embedded image,
 /// the compact file marker the folded header carries — ADR-0076 — the folded
-/// header's file detail and the 「📂 打开」 button a `write`/`edit` panel carries
-/// inside the fold, ADR-0083 §8 amendment, #766). Shared by the timeline's tool
+/// header's file detail, the 「📂 打开」 button a `write`/`edit`/file-`read`
+/// panel carries inside the fold, and the note a clipped `read` body appends
+/// beside it, ADR-0083 §8 amendment, #766/#770). Shared by the timeline's tool
 /// items and the todo tail reserve, so every place a panel's bytes are summed
-/// charges its images, its header marker, its file detail and its button too.
+/// charges its images, its header marker, its file detail, its button and its
+/// truncation note too.
 /// `session_id` is the same routing the card build renders the button with —
 /// exactly what renders is charged, never more.
 fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
@@ -553,6 +555,7 @@ fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
         + crate::feishu::card::tool_render::file_header_marker_estimate(p)
         + crate::feishu::card::tool_render::panel_file_detail_estimate(p)
         + crate::feishu::card::tool_render::tool_open_button_estimate(p, session_id)
+        + crate::feishu::card::tool_render::read_truncation_note_estimate(p, session_id)
 }
 
 /// The content hash of one panel's File Content at `index` (ADR-0076), or
@@ -5580,6 +5583,51 @@ mod tests {
             crate::feishu::card::tool_render::tool_open_button_estimate(&written, None),
             0,
             "no Session to route by, no button, no charge"
+        );
+    }
+
+    /// A file `read` panel's 「📂 打开」 AND the note its clipped body appends
+    /// (ADR-0083 §8 amendment, #770) are card JSON too: `panel_estimate`
+    /// charges both — exactly what renders, so a clipped read cannot pass the
+    /// split check while the serialized card carries bytes nothing counted.
+    /// The Session-less panel renders neither, so it is charged neither.
+    #[test]
+    fn panel_estimate_charges_a_read_panels_button_and_note() {
+        // A body well past the panel's own budget: the panel clips it, so the
+        // note renders beside the button.
+        let clipped = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"path": "/x/big.rs"})),
+            Some(&format!("Read file /x/big.rs, lines 1-1\n{}", "x".repeat(4_000))),
+        );
+        let button = crate::feishu::card::tool_render::tool_open_button_estimate(&clipped, Some("ses_1"));
+        let note = crate::feishu::card::tool_render::read_truncation_note_estimate(&clipped, Some("ses_1"));
+        assert!(button > 0, "a file read's button has a byte cost");
+        assert!(note > 0, "and its clipped body's note has one too");
+        assert_eq!(
+            panel_estimate(&clipped, Some("ses_1")),
+            panel_estimate(&clipped, None) + button + note,
+            "panel_estimate must charge the read panel's button and note"
+        );
+
+        // A body that fits carries no note: only the button is charged.
+        let small = ToolPanel::for_test(
+            "read",
+            ToolStatus::Completed,
+            Some(serde_json::json!({"path": "/x/small.rs"})),
+            Some("Read file /x/small.rs, lines 1-1\n1: fn main() {}"),
+        );
+        let button = crate::feishu::card::tool_render::tool_open_button_estimate(&small, Some("ses_1"));
+        assert_eq!(
+            crate::feishu::card::tool_render::read_truncation_note_estimate(&small, Some("ses_1")),
+            0,
+            "nothing was clipped, no note to charge"
+        );
+        assert_eq!(
+            panel_estimate(&small, Some("ses_1")),
+            panel_estimate(&small, None) + button,
+            "the button alone is charged"
         );
     }
 

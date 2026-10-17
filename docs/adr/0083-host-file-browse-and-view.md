@@ -275,3 +275,36 @@ what the eye lands on. The placement is reversed, and the folded header takes ov
 The way into the viewer itself is unchanged: the payload is the call's structured
 `filePath`/`path`, `action: "file"`, no `op`. The **viewer's own** action row is unaffected — a
 viewer is not folded, so its buttons stay in the body.
+
+## Amendment (2026-10-17, #770): a file `read` panel gets the way in, and its clipped body says so
+
+§8 gave the button to `write`/`edit` alone, on the grounds that "A `read` panel gets none: its content
+is already on the card". That reason does not hold where a reader would feel it most: a `read` body is
+clamped to `TOOL_OUTPUT_MAX_CHARS` (3000) characters, so the panel shows a **preview** of the file with
+a `…` where the rest was — and §8 left the reader no way at all to see the rest. The `read` panel now
+carries the same control, in the same place:
+
+- **Only a file `read` gets the button.** It appears when the call's structured input
+  names a path *and* the read was of a file: a **directory** read (V1's `<type>directory</type>`,
+  V2's `Read directory …` header line) names no file to open, and a read carrying a **File Content**
+  (an image or a PDF) already reaches the reader through its own delivery (ADR-0076's embed or File
+  Message lane), so a second way in would only duplicate it. A still-running read has no output yet and
+  therefore no directory verdict: it carries no button until one arrives — the same "charge what
+  renders" rule the estimates follow.
+- **The placement and the payload are #766's, unchanged.** The button is the panel body's first
+  element, `action: "file"` with no `op`, routed by the Session — so a click opens the same File
+  Viewer, carrying 「📂 所在目录」 for its parent directory (a tool panel has no listing to return to).
+  The path is the call's own structured one, V1's `filePath` or V2's `path`, read through the same
+  `input_path` rule the panel's Input line uses.
+- **A clipped `read` body says it was clipped.** When the body that renders exceeds
+  `TOOL_OUTPUT_MAX_CHARS`, one more line closes the Output section —
+  `_（预览已截断，打开查看完整文件）_` — naming what the `…` means and where the rest is. It renders
+  exactly when the button does, so it never promises a control a directory read, an image read or a
+  panel with no Session to route the click by does not have; a body that fits carries nothing. The byte
+  charge follows the render: `panel_estimate` adds `read_truncation_note_estimate`, beside the button's
+  own `tool_open_button_estimate`.
+- **The folded header is unchanged.** A text `read` keeps its ` · 📖 <name>` fragment (#766), a
+  directory read included; the button adds no second name.
+
+Everything else in §8 stands: prose paths are still never parsed into controls, and a `read` stays a
+cola-local, generation-neutral read.

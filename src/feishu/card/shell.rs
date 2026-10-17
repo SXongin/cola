@@ -229,10 +229,11 @@ impl CardBuilder {
     /// running → completed update keeps the start time (the item is keyed once,
     /// on first appearance); `None` renders no clock. `element_id` is the
     /// panel's stable identity on the card (see [`collapsible_panel_chunks`]).
-    /// `session_id` is the Turn's Session when known: a `write`/`edit` panel
-    /// then carries its 「📂 打开」 button INSIDE the fold — the panel body's
-    /// first element, so the collapsed card has no button row (ADR-0083 §8
-    /// amendment, #766), and the folded header still names the file.
+    /// `session_id` is the Turn's Session when known: a `write`/`edit` panel —
+    /// or a file `read` (ADR-0083 §8 amendment, #770) — then carries its
+    /// 「📂 打开」 button INSIDE the fold, the panel body's first element, so the
+    /// collapsed card has no button row (ADR-0083 §8 amendment, #766), and the
+    /// folded header still names the file.
     pub fn with_tool_at(
         mut self,
         tool: ToolPanel,
@@ -243,11 +244,10 @@ impl CardBuilder {
         let panel = tool.clone();
         self.tools.push(tool);
         // All tools are shown; the streaming card splits into continuation
-        // cards when the component estimate exceeds the Feishu limit. A
-        // `write`/`edit` panel's 「📂 打开」 button is built into the panel
-        // itself (ADR-0083 §8 amendment, #766), so it is not a body element
-        // here: no Session to route the click by means no button rather than a
-        // broken one.
+        // cards when the component estimate exceeds the Feishu limit. The
+        // 「📂 打开」 button is built into the panel itself (ADR-0083 §8
+        // amendment, #766), so it is not a body element here: no Session to
+        // route the click by means no button rather than a broken one.
         self.body.push(tool_panel_element(
             &panel,
             at_ms,
