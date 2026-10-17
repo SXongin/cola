@@ -951,6 +951,79 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
     }
 }
 
+/// A bound topic owns exactly one session (ADR-0007). `/cat <directory>` is a
+/// read surface and is never gated (spec #669 story 41) — but the browse card
+/// it renders carries 选择/切换到这里, the pick the `/dir` card owns and that
+/// `Command::topic_rejection` refuses at command entry. The click must refuse
+/// the same way: no pending declared, no session superseded (Codex gate round
+/// 7, which caught `/cat /projB` + 切换到这里 rebinding a bound topic).
+#[tokio::test]
+async fn cat_directory_pick_is_rejected_in_a_bound_topic() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::create_dir(proj.path().join("child")).unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state_dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_bound".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            thread_key: topic_key.clone(),
+            session_id: "ses_owned".into(),
+            directory: "/work/topic".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        &format!("/cat {}", proj.path().to_string_lossy()),
+        topic_key.clone(),
+        "msg_cat_dir",
+        crate::config::ConversationKind::Topic,
+    )
+    .await;
+
+    let card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the directory answers a browse card");
+    let pick = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["text"]["content"] == "切换到这里")
+        .unwrap_or_else(|| panic!("the browse card offers the pick: {}", card_text(&card)))["value"]
+        .clone();
+    let result = app.host_action(pick).await.expect("the pick is handled");
+
+    assert!(result.card.is_none(), "a refused pick rebuilds nothing");
+    assert_eq!(
+        result.toast.as_deref(),
+        Some(crate::bridge::command::TOPIC_SELECTION_REJECTION),
+        "the pick refuses exactly like /dir does in a bound topic"
+    );
+    let sessions = app.sessions.lock().await;
+    assert!(
+        sessions.pending_for(&topic_key).is_none(),
+        "no pending may supersede a bound topic's session"
+    );
+    assert_eq!(
+        sessions
+            .get_active(&topic_key)
+            .expect("the topic keeps its session")
+            .session_id,
+        "ses_owned"
+    );
+}
+
 /// `Command::topic_rejection` matches `/topic` on the VARIANT, so the fields
 /// never change the verdict. This shape (`directory: None, name: Some`) is
 /// unreachable through `parse_command` — no message text produces it — so it
