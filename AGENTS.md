@@ -91,9 +91,11 @@ and the map from the old numbers.
   in the environment (`OPENCODE_SERVER_PASSWORD`, and `OPENCODE_SERVER_USERNAME`
   on V1 only), while a V2 `serve --service` has no `--port` and is reached through
   its registration file (`$XDG_STATE_HOME/opencode/service.json` — the server's
-  own state home, not cola's), always with the username `opencode`. Either way
-  Basic auth needs **both** halves — the server
-  compares the username, so a missing or wrong one 401s even with a correct
+  own state home, not cola's), always with the username `opencode`. The attach
+  forces `opencode` on V2 once the generation is classified, but the *probe* still
+  authenticates with the environment value, so a foreground V2 server with it set
+  can probe inconclusive (#763). Either way Basic auth needs **both** halves — the
+  server compares the username, so a missing or wrong one 401s even with a correct
   password. (On OpenChamber's server the global SSE connection is ended every few
   seconds — cosmetic; cola renders by polling.)
 - **`ws-lifecycle`** — Feishu WS frames are binary protobuf (pbbp2), parsed by
