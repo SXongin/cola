@@ -4,21 +4,34 @@
 # `main: review` ruleset needs (ADR-0034 item 6); it replaces the OpenCode
 # review workflow (trial: issue #516 / PR #517).
 #
-# Codex reaches the model through the DeepSeek API, which natively speaks the
-# Responses protocol Codex requires (their Codex integration sets
-# `wire_api = "responses"`:
-# https://api-docs.deepseek.com/quick_start/agent_integrations/codex). It runs
-# `deepseek-flash` on the workspace's own key (repo secret
-# `DEEPSEEK_API_KEY`), so the gate is independent of any OpenCode plan
-# allowance: the Go lane's only Responses model is the metered `gpt-6-luna`
-# (a spent allowance answers `429 Too Many Requests`), and OpenCode's free tier
-# is licensed to the OpenCode client alone (a third-party client gets
-# `403 Forbidden: OpenCode's free tier can only be used from within OpenCode`),
-# both measured 2026-10-17. The action's Responses proxy points at the endpoint
-# named by `responses-api-endpoint`, keeping the key inside the proxy process,
-# and runs Codex read-only (`permission-profile: ":read-only"` with the action's
-# default safety strategy). GH_TOKEN stays on the gh steps only — never in the
-# Codex step's environment, where prompt-injected PR content could read it.
+# The gate's provider, endpoint, model and secret are workflow configuration,
+# not an ADR pin (ADR-0034, 2026-10-17 amendment) — this comment is the record.
+# Codex reaches the model through OpenCode Go's Responses-compatible endpoint
+# (`https://opencode.ai/zen/go/v1/responses`; `gpt-6-luna` is the Go lane's only
+# Responses model) on the workspace's own Go key (repo secret
+# `OPENCODE_API_KEY`), so the gate's usage is attributed to `opencode-go` in the
+# Go usage report.
+#
+# This reverses the 2026-10-16 DeepSeek stand-in, deliberately. That move was
+# forced: while the gate rode the metered Go allowance, a spent allowance
+# answered `429 Too Many Requests` and the gate produced no review at all, so it
+# moved onto DeepSeek's own key (`DEEPSEEK_API_KEY`) — independent of any plan
+# allowance, at the cost of a second provider and key to keep alive. Go Plus
+# ($40/month; upgraded 2026-10-17) raises `gpt-6-luna`'s monthly allowance from
+# $15 to $60 (≈16,920 requests per 5 hours), which is what makes the shared plan
+# affordable again. The trade-off is taken knowingly: the gate now shares the
+# plan with the author-side review pair, and a spent allowance fails the gate
+# loudly (a `429` reaches no output, so the post step exits) rather than
+# silently. OpenCode's free tier remains unusable for the gate — it is licensed
+# to the OpenCode client alone (a third-party client gets `403 Forbidden:
+# OpenCode's free tier can only be used from within OpenCode`), measured
+# 2026-10-17.
+#
+# The action's Responses proxy points at the endpoint named by
+# `responses-api-endpoint`, keeping the key inside the proxy process, and runs
+# Codex read-only (`permission-profile: ":read-only"` with the action's default
+# safety strategy). GH_TOKEN stays on the gh steps only — never in the Codex
+# step's environment, where prompt-injected PR content could read it.
 #
 # Approval contract: this workflow posts the review itself and records the new
 # comment's ID as a step output; the approve step fetches exactly that comment
@@ -300,9 +313,9 @@ jobs:
         timeout-minutes: 30
         uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
         with:
-          openai-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
-          responses-api-endpoint: https://api.deepseek.com/responses
-          model: deepseek-flash
+          openai-api-key: ${{ secrets.OPENCODE_API_KEY }}
+          responses-api-endpoint: https://opencode.ai/zen/go/v1/responses
+          model: gpt-6-luna
           codex-version: 0.160.0
           permission-profile: ":read-only"
           prompt-file: codex-prompt.md
