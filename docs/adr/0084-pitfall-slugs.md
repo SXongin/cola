@@ -1,5 +1,7 @@
 # Pitfalls are cited by slug, not by position
 
+## Context
+
 `AGENTS.md` "Known pitfalls" was a numbered list, and 29 references across
 fifteen files cite those numbers: four ADRs, six `docs/research/` notes, and five
 files inside the frozen `.scratch/` archive — which the tracker policy forbids
