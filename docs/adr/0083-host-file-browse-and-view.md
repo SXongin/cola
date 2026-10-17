@@ -244,3 +244,34 @@ rows and the way into the File Viewer; **Command** gains `/cat`. **ADR-0078 is m
 amended**: its browser listed directories only, and ADR-0083 extends that same card — the
 later record governs, and the earlier one says so where it states the old scope. "Viewer"
 alone is not a domain term — the platform has viewers (在线预览) that cola does not control.
+
+## Amendment (2026-10-17, #766): the open button rides inside the fold, and the folded header names the file
+
+§8 put a `write`/`edit` panel's 「📂 打开」 button **beside** the panel, deliberately outside the
+fold "so the file opens without unfolding". Read on a phone, that gives every written or edited
+file a full-width button row of its own — in a turn heavy on edits the button, not the work, is
+what the eye lands on. The placement is reversed, and the folded header takes over the naming:
+
+- **The button is the panel body's first element.** A collapsed panel shows no button; opening
+  the file is expand → 打开 (two taps). The two taps are accepted: opening the produced file is a
+  secondary action — the reader usually wants the diff or the success line — and the folded
+  header already names the file. Feishu's JSON 2.0 button docs list the collapsible panel among
+  the containers a button may nest in, so no new surface is involved; putting it first keeps a
+  3000-character diff from pushing it out of view.
+- **The folded header names the file the call is about.** A `write`/`edit` header gains
+  ` · 📄 <name>`; a `read` whose output carries **no** File Content gains ` · 📖 <name>` (its
+  path otherwise lives only in the folded Input line, and its book icon still reads correctly for
+  a directory read). The name is the same short form ADR-0076's marker and image caption use: one
+  printable line, basename first, tail-clipped to 24 characters — in a phone-width header a full
+  absolute path would dominate the line, so the directories belong to the unfolded body and the
+  viewer.
+- **A `read` with a File Content gets no path fragment.** That file is already named by the `📎`
+  marker (`SentAsFile`/`Undelivered`) or by the embedded image's caption; naming it twice on one
+  line is noise. ADR-0076's amendment stands unchanged for those files.
+- **The size estimate charges the header bytes.** `panel_file_detail_estimate` measures the
+  fragment's JSON-escaped length, exactly like the marker's, and `panel_estimate` adds it, so
+  card splitting cannot under-count a header the card renders.
+
+The way into the viewer itself is unchanged: the payload is the call's structured
+`filePath`/`path`, `action: "file"`, no `op`. The **viewer's own** action row is unaffected — a
+viewer is not folded, so its buttons stay in the body.
