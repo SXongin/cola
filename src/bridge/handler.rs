@@ -770,6 +770,12 @@ fn viewer_preview_failure_reason(size: u64) -> &'static str {
     }
 }
 
+/// The line a Tool Panel preview replies when the File Message timed out after
+/// the request may have reached Feishu (#778): the same words the stale-click
+/// Toast uses, because there is no card of cola's own to state `发送结果未知` on
+/// and a silent ambiguous outcome reads as a silent failure.
+const VIEWER_PREVIEW_UNKNOWN_LINE: &str = "⚠️ 发送结果未知，为避免重复未重试。";
+
 /// RAII claim for one in-flight File Viewer action. A duplicate callback gets
 /// acknowledged without spawning another sender; Drop releases even if the
 /// spawned task is cancelled or unwinds.
@@ -4499,37 +4505,16 @@ impl App {
                     .get("viewer_lane_refresh_failed")
                     .and_then(serde_json::Value::as_str)
                     == Some("true");
-                let transfer_status = match &lane.delivery {
-                    crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
-                        Some(ViewerFileTransferStatus::Sent)
-                    }
-                    crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
-                        Some(ViewerFileTransferStatus::OutcomeUnknown)
-                    }
-                    _ => None,
-                };
-                if let Some(status) = transfer_status {
-                    let mut sent = self
-                        .viewer_file_transfers_sent
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let key_path = resolved.to_string_lossy().to_string();
-                    let key = (thread_key.chat_id.clone(), message_id.clone(), key_path);
-                    remember_viewer_file_transfer(
-                        &mut sent,
-                        (key.0.clone(), key.1.clone(), key.2.clone(), content_identity),
-                        status,
-                        crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
-                    );
-                    if let Some(delivered_identity) = lane.content_identity {
-                        remember_viewer_file_transfer(
-                            &mut sent,
-                            (key.0, key.1, key.2, delivered_identity),
-                            status,
-                            crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
-                        );
-                    }
-                }
+                // The viewer's own lane reports the same delivered/ambiguous
+                // outcome through the shared memory the panel preview uses, so the
+                // two cannot drift on what counts as sent.
+                self.remember_viewer_file_delivery(
+                    &thread_key,
+                    &message_id,
+                    &resolved,
+                    content_identity,
+                    &lane,
+                );
                 let session_dir = if let Some(dir) = value
                     .get("session_dir")
                     .and_then(|v| v.as_str())
@@ -4573,13 +4558,14 @@ impl App {
     /// one File Message and report ONLY off the card — the clicked message is the
     /// agent's Turn card, so no PATCH may touch it.
     ///
-    /// A landed send is remembered on the same bounded window as every other
-    /// viewer File Message ([`ViewerFileTransferKey`], keyed by the path too
-    /// because one Turn card can carry several file panels), so a second click on
-    /// the same panel does not post a duplicate — the button stays on the card,
-    /// which no PATCH rewrites. A definite failure (an unreadable file, or bytes
-    /// past the 30 MB cap) is deduped on nothing and spoken as a reply, so the
-    /// button stays live for a retry.
+    /// A landed (or ambiguous) send is remembered on the same bounded window as
+    /// every other viewer File Message ([`ViewerFileTransferKey`], keyed by the
+    /// path too because one Turn card can carry several file panels), so a second
+    /// click on the same panel does not post a duplicate — the button stays on the
+    /// card, which no PATCH rewrites. With no card of cola's own to write `未发送`
+    /// or `发送结果未知` on, both a definite failure and an ambiguous timeout are
+    /// spoken as a reply, so the click's outcome is never silent; a definite
+    /// failure is deduped on nothing, leaving the button live for a retry.
     async fn finish_viewer_preview(
         self: &Arc<Self>,
         thread_key: &ThreadKey,
@@ -4598,7 +4584,7 @@ impl App {
         let (classified, prepared) = match read {
             Ok(snapshot) => snapshot,
             Err(line) => {
-                self.reply_viewer_preview_failure(message_id, &line, timeout_ms)
+                self.reply_viewer_preview_outcome(message_id, &line, timeout_ms)
                     .await;
                 return;
             }
@@ -4615,35 +4601,15 @@ impl App {
             timeout_ms,
         )
         .await;
-        let status = match &lane.delivery {
-            crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
-                Some(ViewerFileTransferStatus::Sent)
-            }
-            crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
-                Some(ViewerFileTransferStatus::OutcomeUnknown)
-            }
-            _ => None,
-        };
-        if let Some(status) = status {
-            let mut sent = self
-                .viewer_file_transfers_sent
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let key_path = resolved.to_string_lossy().to_string();
-            let key = (thread_key.chat_id.clone(), message_id.to_string(), key_path);
-            remember_viewer_file_transfer(
-                &mut sent,
-                (key.0.clone(), key.1.clone(), key.2.clone(), content_identity),
-                status,
-                crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
-            );
-            if let Some(delivered_identity) = lane.content_identity {
-                remember_viewer_file_transfer(
-                    &mut sent,
-                    (key.0, key.1, key.2, delivered_identity),
-                    status,
-                    crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
-                );
+        // A delivered — or possibly-delivered — File Message is remembered, and an
+        // ambiguous one is spoken; a definite non-send falls through to its reply.
+        if self.remember_viewer_file_delivery(thread_key, message_id, resolved, content_identity, &lane) {
+            if matches!(
+                lane.delivery,
+                crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown
+            ) {
+                self.reply_viewer_preview_outcome(message_id, VIEWER_PREVIEW_UNKNOWN_LINE, timeout_ms)
+                    .await;
             }
             return;
         }
@@ -4656,15 +4622,60 @@ impl App {
                 "发送失败"
             }
         );
-        self.reply_viewer_preview_failure(message_id, &line, timeout_ms)
+        self.reply_viewer_preview_outcome(message_id, &line, timeout_ms)
             .await;
     }
 
-    /// Speak a Tool Panel preview's failure under the clicked card (#778). With
-    /// no card of cola's own to write `未发送` on, the reply IS the outcome —
-    /// bounded like every other transfer network step, so a wedged call cannot
-    /// outlive its timeout.
-    async fn reply_viewer_preview_failure(self: &Arc<Self>, message_id: &str, line: &str, timeout_ms: u64) {
+    /// Remember a viewer File Message that LANDED — or may have (an ambiguous
+    /// timeout) — in the same bounded deliver-once window every viewer transfer
+    /// shares (#739, #778), under BOTH the identity the click asked for and the
+    /// identity the bytes actually carried, so a stale callback for either cannot
+    /// post a duplicate. Returns whether anything was remembered: a definite
+    /// non-send (`Undelivered`) remembers nothing, leaving the button live for a
+    /// retry. One rule for the viewer's own lane and a Tool Panel's preview, so the
+    /// two cannot drift on what counts as delivered.
+    fn remember_viewer_file_delivery(
+        &self,
+        thread_key: &ThreadKey,
+        message_id: &str,
+        path: &std::path::Path,
+        content_identity: u64,
+        lane: &crate::feishu::card::viewer::ViewerFileLane,
+    ) -> bool {
+        use crate::feishu::card::tool_render::FileDelivery;
+        let status = match &lane.delivery {
+            FileDelivery::SentAsFile => ViewerFileTransferStatus::Sent,
+            FileDelivery::FileSendOutcomeUnknown => ViewerFileTransferStatus::OutcomeUnknown,
+            _ => return false,
+        };
+        let mut sent = self
+            .viewer_file_transfers_sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key_path = path.to_string_lossy().to_string();
+        let key = (thread_key.chat_id.clone(), message_id.to_string(), key_path);
+        remember_viewer_file_transfer(
+            &mut sent,
+            (key.0.clone(), key.1.clone(), key.2.clone(), content_identity),
+            status,
+            crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
+        );
+        if let Some(delivered_identity) = lane.content_identity {
+            remember_viewer_file_transfer(
+                &mut sent,
+                (key.0, key.1, key.2, delivered_identity),
+                status,
+                crate::bridge::handles::FILE_MESSAGE_SENDS_CAP,
+            );
+        }
+        true
+    }
+
+    /// Speak a Tool Panel preview's outcome under the clicked card (#778) — a
+    /// definite failure, or an ambiguous send. With no card of cola's own to write
+    /// `未发送`/`发送结果未知` on, the reply IS the outcome — bounded like every
+    /// other transfer network step, so a wedged call cannot outlive its timeout.
+    async fn reply_viewer_preview_outcome(self: &Arc<Self>, message_id: &str, line: &str, timeout_ms: u64) {
         if !matches!(
             crate::bridge::bounded_call(
                 "viewer preview failure reply",
