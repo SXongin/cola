@@ -11,3 +11,5 @@ test.log
 .codegraph/
 # Local cargo-mutants audit output (one-off; never committed)
 mutants.out*/
+# Local git worktrees — see AGENTS.md
+.worktrees/
