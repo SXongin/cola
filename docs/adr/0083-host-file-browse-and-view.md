@@ -392,3 +392,38 @@ Not in this amendment: **rendering markdown inside the card**. The measurement m
 the card `markdown` element already renders that family — but it is a separate change (a
 preview/source toggle is a new card state), and decision 10's blanket "no rich-text rendering"
 sentence is narrowed here only to the extent measured above.
+
+## Amendment (2026-10-18, #778): a Tool Panel's HTML page button sends, and does not touch the card
+
+#774 gave the *viewer* the page lane, but a Tool Panel still led with 「📂 打开」: the reader went
+panel → viewer → 「🌐 预览网页」, and the middle hop showed the same markup the panel's body had
+already shown. For an HTML page that hop buys nothing, so the panel leads with the page directly —
+two hops collapse to one. The change is a second semantics for the panel's button, and nothing
+else:
+
+- **The button is page-aware, on one shared predicate.** A Tool Panel whose structured path spells
+  `.html`/`.htm` (the same extension rule the viewer's page lane uses — now factored into one
+  `is_html_page_path`, so the two cannot disagree) reads 「🌐 预览网页」; every other path keeps
+  「📂 打开」. The extension still never decides the KIND (§6): it decides which action the button
+  names.
+- **`op: "preview"` is the new, PATCH-free transfer.** The viewer's 「发为文件」/「🌐 预览网页」
+  carries `op: "send"`, which PATCHes the clicked message with the outcome — correct on the viewer,
+  whose clicked message IS the card, and wrong on a Tool Panel, whose clicked message is the
+  agent's **Turn card**: that PATCH would overwrite the panel and the reply. `op: "preview"` runs
+  the same transfer (one File Message) and rewrites no card.
+- **The panel payload is routed as the open payload already was.** It carries the Session, never
+  the Chat, so the Chat/Topic and the session directory are read from the SessionStore exactly as
+  `handle_file_card_action` does; the structured path resolves on the Path Scope (§4), so a panel
+  whose `filePath` is relative to the session directory sends the right file. A Session the store
+  no longer knows answers an honest Toast, no transfer.
+- **There is no card of cola's own to write `未发送` on.** A landed send is its own evidence (the
+  File Message) and adds no card copy; a definite failure is spoken as a reply under the clicked
+  card — `⚠️ 无法发送 …：原因` — because a silent failure would leave the button looking live with
+  nothing sent.
+- **Deliver-once still holds, keyed by the path.** The same bounded window remembers a landed or
+  ambiguous send so a stale second click cannot post a duplicate; the key gains the path, because
+  one Turn card can carry several file panels and the clicked message alone does not name one file.
+  A definite failure is remembered on nothing, so the button stays live for a retry.
+
+The callback grammar gains one `op` value; the open lane, the viewer's own lane, and every other
+file kind are unchanged.
