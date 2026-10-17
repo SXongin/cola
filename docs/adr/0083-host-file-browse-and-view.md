@@ -348,8 +348,13 @@ its absence.
 
 Decision 10 rejected HTML rendering on the ground that "the platform has no such component".
 That ground was true of the **card** and false of the **platform**: the rendered page exists, in
-the client's own file preview. Measured 2026-10-18 by probe (#774; the full evidence lives in
-`docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md` §2):
+the client's own file preview. Feishu's help centre **documents** that preview
+([在飞书中查看 HTML 文件](https://www.feishu.cn/hc/zh-CN/articles/052565607602): "点击文件，即可预览
+文件内容 … 点击右上角代码，可切换至代码视图"), and the owner verified it on the release build in a
+real chat, desktop and mobile. The probe seeded for #774 supplied the one detail the help centre
+does not state — an inline `<script>` executes — and its date is host-local, **2026-10-18 (UTC+8;
+2026-10-17 UTC)**, which is why CI's UTC runner and this record can disagree about "today". The full
+evidence lives in `docs/research/feishu-rich-surfaces/r1-display-surface-inventory.md` §2:
 
 - a `.html` File Message renders as a **page** when opened — desktop and mobile — and its inline
   `<script>` executes; the client toggles to a code view. Feishu's help centre caps that preview

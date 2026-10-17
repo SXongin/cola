@@ -2474,6 +2474,33 @@ mod tests {
         assert_eq!(card_buttons(&too_large)[0]["text"]["content"], "🌐 预览网页");
         assert_eq!(card_buttons(&too_large)[0]["value"]["op"], "send");
 
+        // The lane needs a TEXT kind: an `.html` whose BYTES are not text is a
+        // binary, and keeps the ordinary transfer — §6's content-decides rule
+        // is not overridden by a page-named file (#774).
+        let binary = build_viewer_card(
+            &key(),
+            with_lane(
+                view("/tmp/p/blob.html", ViewerKind::Binary, Some("html"), ""),
+                "application/octet-stream",
+                "blob.html",
+                4,
+                FileDelivery::Undelivered,
+            ),
+        );
+        let text = card_text(&binary);
+        assert!(
+            card_buttons(&binary)
+                .iter()
+                .all(|b| b["text"]["content"] != "🌐 预览网页"),
+            "an .html-NAMED binary is not a page: {text}"
+        );
+        assert!(
+            card_buttons(&binary)
+                .iter()
+                .any(|b| b["text"]["content"] == "发为文件"),
+            "it keeps the ordinary transfer: {text}"
+        );
+
         let md = build_viewer_card(
             &key(),
             view("/tmp/p/notes.md", ViewerKind::Text, Some("md"), "# hi\n"),
