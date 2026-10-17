@@ -410,3 +410,39 @@ rubric, the read-only posture, the line-final `CODEX_REVIEW_VERDICT: PASS|FAIL`
 contract, approval only on `PASS` and pinned to the reviewed commit, and the
 skips (fork, Dependabot, `release/*`). Swapping the provider is a workflow change
 that CI has to prove, not a decision-record change.
+
+## Amendment (2026-10-17): a repo-local skill may shadow its upstream
+
+The 2026-10-09 amendment recorded that the upstream `/implement` and
+`/implement-spec` skills "are never forked" (PR #601's policy), and held cola's
+divergences in `AGENTS.md` / `docs/agents/flow.md` prose. That clause is
+**superseded**. A divergence whose home is prose is *ambient* — it sits in every
+context window and is diluted — where a skill is *invoked*, loading exactly when
+the flow reaches it.
+
+A repo-local skill under `.opencode/skill/<id>/SKILL.md` therefore **shadows**
+the global `~/.agents/skills/<id>/SKILL.md`: OpenCode loads both into one map
+keyed by id, project sources after global ones, so the later write wins (verified
+live 2026-10-17 on `caveman` — the project file replaced the global one, and
+removing it restored the global one). The rule for *which* skills may shadow, and
+how a shadow is maintained, is `docs/agents/skills.md`:
+
+- **compose** — a *pure addition* shadows with a thin skill that reads the
+  upstream file at runtime and adds the delta. `/code-review` composes upstream's
+  two axes with `/adversarial-review`, so a review point cannot run one axis
+  alone, and leaves upstream's internals to flow through.
+- **fork** — a change to upstream's *own steps* owns the text. `/implement-spec`
+  lands linearly, never by a merge commit. Every shadow carries a pin: a verbatim
+  snapshot of the upstream `SKILL.md` at `docs/agents/upstream/<id>.md`, which
+  `/upgrade-skills` diffs against upstream and a fold refreshes.
+
+Because a shadow hides `~/.agents/skills`, an upstream update is invisible until
+diffed deliberately — so the layer ships its own fold, `/upgrade-skills`, and a
+stale shadow is a review finding rather than silent drift.
+
+What this ADR pins is unchanged: the Codex Action, the two axes plus adversarial
+rubric, the read-only posture, the line-final `CODEX_REVIEW_VERDICT: PASS|FAIL`
+contract, approval only on `PASS` pinned to the reviewed commit, and the skips.
+The pair stays the repo's review pass — `/code-review` now *carries* both the axes
+and the adversarial pass in one skill, still never one alone — and the author-side
+model sharing the gate's lens (the 2026-10-09 trade) stands.

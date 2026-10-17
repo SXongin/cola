@@ -1,6 +1,6 @@
 # Local skills
 
-Where cola's agent workflow diverges from an upstream skill, the **mechanism** — *how* a step runs — lives in a **repo-local skill** under `.opencode/skill/`, not restated in `AGENTS.md` prose or a sub-agent prompt. The **policy** — *when* a step runs and *who* calls it — stays in `docs/agents/flow.md`. This file is the convention; the skills are the mechanism.
+Where cola's agent workflow diverges from an upstream skill, the **mechanism** — *how* a step runs — lives in a **repo-local skill** under `.opencode/skill/`, not restated in `AGENTS.md` prose or a sub-agent prompt. The **policy** — *when* a step runs and *who* calls it — stays in `docs/agents/flow.md`. This file is the convention; the skills are the mechanism. (ADR-0034's 2026-10-17 amendment supersedes that ADR's earlier "never forked" clause and records the decision.)
 
 ## Why a skill, not prose
 
@@ -10,7 +10,7 @@ Policy prose (`AGENTS.md`, `flow.md`) is *ambient*: it sits in every context win
 
 Both `.opencode/skill/<id>/SKILL.md` and `.agents/skills/<id>/SKILL.md` are live sources, and `.opencode` wins a name collision. The rule is **what the skill drives**:
 
-- **`.opencode/skill/`** — the skill drives OpenCode machinery: it dispatches sub-agents (`implementer`, `merger`, `code-reviewer`) or leans on OpenCode config (`subagent` denials, `disable-model-invocation`, the skill tool). Every skill here — `foreman`, `adversarial-review`, `code-review`, `implement-spec` — is this case: the sub-agent types they dispatch exist only in `.opencode/agent/`.
+- **`.opencode/skill/`** — the skill drives OpenCode machinery: it dispatches sub-agents (`implementer`, `merger`, `code-reviewer`) or leans on OpenCode config (`subagent` denials, `disable-model-invocation`, the skill tool). Every skill here — `foreman`, `adversarial-review`, `code-review`, `implement-spec`, `upgrade-skills` — is this case: the sub-agent types they dispatch exist only in `.opencode/agent/`.
 - **`.agents/skills/`** — the skill is instructions any agent could follow, with no OpenCode coupling; put it there so another tool (Claude Code, Codex) can share it. Note the two traps in that path: it reads **only `skills/`** (plural — `.agents/skill/` silently loads nothing), and `.opencode` outranks it, so a same-id `.opencode/skill/` silently shadows it. Sub-agents are OpenCode-only: `.agents/agent/` is not read at all.
 
 ## Shadowing
@@ -28,4 +28,4 @@ A shadowed skill must never point at itself: its `SKILL.md` reads the upstream *
 
 A shadow replaces the global skill, so the local copy does **not** inherit upstream updates — and a stale skill is worse than stale prose, because the agent follows it confidently. So upgrading is a **review, not a command**: fetch upstream, diff it against the local copy, and fold in only what still applies. Never let a CLI update be the thing that changes behaviour — `skills update` only rewrites `~/.agents/skills/`, which the shadow hides.
 
-The procedure is the **`/upgrade-skills`** skill. It leans on a **pin**: each derived skill records its upstream source and the upstream `SKILL.md`'s sha256 in frontmatter `metadata` (`upstream`, `upstream-sha256`), so "has upstream moved?" is one `sha256sum` away, and every fold updates the pin. A **compose** skill reads upstream live and has no text to fold — only its pointer can go stale; a **fork** carries the pin and is folded by hand.
+The procedure is the **`/upgrade-skills`** skill. Its pin is a **snapshot**: `docs/agents/upstream/<id>.md` is a verbatim copy of the upstream `SKILL.md` as of the last fold, so a `diff` against `~/.agents/skills/<id>/SKILL.md` is exactly what upstream changed since (the directory vendors third-party skill text for that diff alone; the local skill's `metadata.upstream` names its source). A **compose** skill reads upstream live and has no text to fold — only its pointer can go stale; a **fork** owns upstream's steps and marks its divergences. Either way, a fold refreshes the snapshot.

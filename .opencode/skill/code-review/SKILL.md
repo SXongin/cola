@@ -3,7 +3,6 @@ name: code-review
 description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) — the repo's *paired* pass: the two-axis review (Standards + Spec) AND the adversarial pass (correctness, test adequacy, robustness), reported side by side under `## Standards`, `## Spec`, `## Adversarial`, never merged. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
 metadata:
   upstream: "mattpocock/skills (skills/engineering/code-review/SKILL.md)"
-  upstream-sha256: "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50"
 ---
 
 Cola's entry point for review. It runs **both** halves of the repo's paired pass in one skill, so a review point can never run one axis alone.
