@@ -1,13 +1,13 @@
 ---
 name: foreman
-description: Run one spec's tickets as a serial batch — resolve them via ## Parent, order by native blocking edges, implement each with an `implementer` sub-agent, run the repo's review pair on each ticket's commit window and once more over the whole branch (`docs/agents/flow.md`), then stop for one spec-level acceptance before a single PR. Use ONLY when the user explicitly asks to run a spec's tickets (e.g. "/foreman 123"); never start a batch on your own.
+description: Run one spec's tickets as a serial batch — resolve them via ## Parent, order by native blocking edges, implement each with an `implementer` sub-agent, run the repo's review pair on each ticket's commit window and once more over the whole branch (`docs/agents/flow.md`), then ship the single PR and drive it to green before stopping. Use ONLY when the user explicitly asks to run a spec's tickets (e.g. "/foreman 123"); never start a batch on your own.
 ---
 
 # Foreman
 
-Run a spec's tickets as one serial batch on one branch, ending in one PR. The spec is the unit of acceptance: the user reviews once, at the end, instead of once per ticket.
+Run a spec's tickets as one serial batch on one branch, ending in one PR driven to green. The spec is the unit of acceptance: the user reviews once, at the end, instead of once per ticket.
 
-The main session is the foreman — it resolves the batch, prepares the branch, dispatches one `implementer` sub-agent per ticket, reviews each ticket's commit window, and stops before the PR. Sub-agents implement; the foreman schedules, reviews, and reports.
+The main session is the foreman — it resolves the batch, prepares the branch, dispatches one `implementer` sub-agent per ticket, reviews each ticket's commit window, then ships the PR and drives it to green. Sub-agents implement; the foreman schedules, reviews, reports, and ships.
 
 ## 1. Resolve the batch
 
@@ -69,19 +69,17 @@ Assemble the dossier:
 
 Done when every ticket appears, the aggregate review has a verdict or a skip, and every verification command has a result.
 
-## 5. Stop for acceptance
-
-Present the dossier and stop. Do not push. Continue only on the user's explicit go.
-
-## 6. Ship
-
-On the user's go:
+## 5. Ship
 
 - Push the branch — `git log --merges main..HEAD` must be empty first (rebase is the only merge method this repo allows).
 - Open exactly one PR against `main`: a Conventional Commits title derived from the spec (`CONTRIBUTING.md`, "Pull request rules"), body with what the batch delivers, the per-ticket summary, the risks, and a close line listing **every ticket and the spec issue itself** — one keyword per issue (`Closes #a, closes #b, …, closes #<spec>`). The batch PR is the spec's delivery, so the spec closes with it; it stays open only when the drop list named a child the batch did not cover, and the body then names that child.
 - Verify the PR is rebase-mergeable: `gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` must be `true`. A conflict with `main` can leave a merge-free branch `rebaseable: false`; if so, rebase onto `origin/main`, push, and check again.
 
-Done when the PR exists, its branch is merge-commit-free, and `rebaseable` is `true`. Stop there — the user merges.
+Done when the PR exists, its branch is merge-commit-free, and `rebaseable` is `true`.
+
+## 6. Drive the PR to green
+
+Watch the required checks (`gh pr checks <branch> --required`) and the Codex gate. A red check or a FAIL is a fix round — route it like step 3.4 — and a re-push, under the binding's bound (`docs/agents/flow.md`). Done when the required checks are green and the gate passes. Stop there — the user verifies and merges.
 
 ## Dispatch prompt
 
@@ -115,7 +113,7 @@ Put the decision to the user when:
 
 ## Guardrails
 
-- Push and open the PR only after the user accepts at step 5.
+- Drive the PR to a green required-check set and a passing Codex gate before stopping; the user merges.
 - One ticket at a time, blockers first.
 - Progress comments are the only writes the batch makes to the tracker; the PR closes the tickets.
 - The implementer stays on the batch branch — `main` is never its checkout.
@@ -133,4 +131,4 @@ Re-run `/foreman <spec>` after an interruption. The branch log and the progress 
 
 ## Setup
 
-The implementer inherits this session's model and takes the user's permission rules, except where its own block sets them (`subagent` — V1's `task` — is denied). For an unattended batch, allow `git checkout`/`switch`, `git fetch`/`pull`/`rebase`, and `gh issue view`/`list`/`comment`/`api`; keep `git push` and `gh pr create` on ask, so acceptance is enforced twice.
+The implementer inherits this session's model and takes the user's permission rules, except where its own block sets them (`subagent` — V1's `task` — is denied). For an unattended batch, allow `git checkout`/`switch`, `git fetch`/`pull`/`rebase`, and `gh issue view`/`list`/`comment`/`api`; keep `git push` and `gh pr create` on ask, so shipping stays a deliberate step.
