@@ -26,4 +26,6 @@ A shadowed skill must never point at itself: its `SKILL.md` reads the upstream *
 
 ## Upgrading
 
-A shadow replaces the global skill, so the local copy does **not** inherit upstream updates — and a stale skill is worse than stale prose, because the agent follows it confidently. So upgrading is a **review, not a command**: fetch the upstream skill, diff it against the local copy, and fold in only what still applies. Do it by hand (or with a skill). In particular, never let a CLI update be the thing that changes behaviour — it rewrites `~/.agents/skills`, which the local copy shadows, so an upstream change is invisible until diffed deliberately.
+A shadow replaces the global skill, so the local copy does **not** inherit upstream updates — and a stale skill is worse than stale prose, because the agent follows it confidently. So upgrading is a **review, not a command**: fetch upstream, diff it against the local copy, and fold in only what still applies. Never let a CLI update be the thing that changes behaviour — `skills update` only rewrites `~/.agents/skills/`, which the shadow hides.
+
+The procedure is the **`/upgrade-skills`** skill. It leans on a **pin**: each derived skill records its upstream source and the upstream `SKILL.md`'s sha256 in frontmatter `metadata` (`upstream`, `upstream-sha256`), so "has upstream moved?" is one `sha256sum` away, and every fold updates the pin. A **compose** skill reads upstream live and has no text to fold — only its pointer can go stale; a **fork** carries the pin and is folded by hand.
