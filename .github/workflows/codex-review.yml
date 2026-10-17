@@ -347,6 +347,10 @@ jobs:
           # removed before the step ends.
           curl_config="$RUNNER_TEMP/codex-gate-curl.conf"
           (umask 077; printf 'header = "Authorization: Bearer %s"\n' "$GATE_KEY" > "$curl_config")
+          # The trap removes the key file on every exit, a cancellation
+          # included; the explicit removal below only closes the ordinary path
+          # early.
+          trap 'rm -f "$curl_config"' EXIT
           curl_status=0
           code=$(curl -sS -o "$RUNNER_TEMP/gate-preflight.json" -w '%{http_code}' \
             --max-time 30 \
