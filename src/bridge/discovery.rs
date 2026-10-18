@@ -989,13 +989,26 @@ fn service_start_plan(generation_override: GenerationOverride, disabled: bool) -
     ServiceStartPlan::TryService
 }
 
+/// A spawned service attempt's process handle, so the attempt can be waited
+/// out. A `Child` that is merely dropped is never waited on: a failed attempt
+/// would stay a zombie for as long as cola runs, which is exactly what the
+/// spec's "no leftover service child" rules out (ticket #809).
+trait ServiceAttempt: Send {
+    /// The attempt's pid.
+    fn pid(&self) -> i32;
+    /// Non-blocking: wait the process out once it has exited, returning whether
+    /// it is gone. `false` while it still runs — a service cola only attached
+    /// must never be blocked on.
+    fn try_reap(&mut self) -> bool;
+}
+
 /// The process-side view the Shared Service start path needs. Real code uses
 /// [`RealServiceHost`]; a test substitutes every operation, so no process is
 /// started and no real registration is read.
 trait ServiceHost: Send + Sync {
     /// Spawn `opencode serve --service` detached, its output appended to the
-    /// service log; the child's pid.
-    fn spawn_service(&self, log_path: &std::path::Path) -> anyhow::Result<i32>;
+    /// service log; the attempt's pid and process handle.
+    fn spawn_service(&self, log_path: &std::path::Path) -> anyhow::Result<Box<dyn ServiceAttempt>>;
     /// The registration file's raw contents, when it exists.
     fn registration(&self, path: &std::path::Path) -> Option<String>;
     /// Whether a pid is a live process.
@@ -1013,7 +1026,7 @@ trait ServiceHost: Send + Sync {
 struct RealServiceHost;
 
 impl ServiceHost for RealServiceHost {
-    fn spawn_service(&self, log_path: &std::path::Path) -> anyhow::Result<i32> {
+    fn spawn_service(&self, log_path: &std::path::Path) -> anyhow::Result<Box<dyn ServiceAttempt>> {
         spawn_service_detached(log_path)
     }
 
@@ -1046,9 +1059,13 @@ impl ServiceHost for RealServiceHost {
 /// The child keeps its inherited `XDG_STATE_HOME` (its registration must land
 /// where the clients look) and has cola's data-home/credential variables
 /// stripped by [`service_start_command`].
-fn spawn_service_detached(log_path: &std::path::Path) -> anyhow::Result<i32> {
+///
+/// The child is a `tokio` one so its handle can be waited on: dropping a bare
+/// `std::process::Child` never reaps it, and the attempt's own reap path is the
+/// one place a failed start can wait it out (ticket #809).
+fn spawn_service_detached(log_path: &std::path::Path) -> anyhow::Result<Box<dyn ServiceAttempt>> {
     let cmd = service_start_command();
-    let mut command = std::process::Command::new("opencode");
+    let mut command = tokio::process::Command::new("opencode");
     command.args(&cmd.args).envs(cmd.env.iter().cloned());
     for key in &cmd.remove_env {
         command.env_remove(key);
@@ -1067,7 +1084,6 @@ fn spawn_service_detached(log_path: &std::path::Path) -> anyhow::Result<i32> {
 
     #[cfg(unix)]
     {
-        use std::os::unix::process::CommandExt;
         // A NEW PROCESS GROUP detaches the daemon from cola's: a signal aimed at
         // cola's group (Ctrl-C at its terminal, a supervisor's group kill) never
         // reaches the service. `setsid` is not reachable here — `pre_exec` is
@@ -1084,13 +1100,41 @@ fn spawn_service_detached(log_path: &std::path::Path) -> anyhow::Result<i32> {
     // declared here rather than pulled from a crate for one call.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
-    Ok(command.spawn()?.id() as i32)
+    let child = command.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("`opencode serve --service` spawned without a pid"))?
+        as i32;
+    Ok(Box::new(RealServiceAttempt { pid, child }))
+}
+
+/// The real attempt: the detached child, held so a failed start can wait it
+/// out. Dropping it does not kill the daemon — it only hands the child to the
+/// runtime's orphan queue, so a service cola merely attached still outlives
+/// cola (ADR-0085).
+struct RealServiceAttempt {
+    pid: i32,
+    child: tokio::process::Child,
+}
+
+impl ServiceAttempt for RealServiceAttempt {
+    fn pid(&self) -> i32 {
+        self.pid
+    }
+
+    fn try_reap(&mut self) -> bool {
+        // An error means the child is already reaped or unwaitable: gone either
+        // way, so the caller must not keep waiting on it.
+        self.child
+            .try_wait()
+            .map(|status| status.is_some())
+            .unwrap_or(true)
+    }
 }
 
 /// Start (or adopt) the machine-wide Shared Service and return the candidate
@@ -1109,18 +1153,23 @@ async fn start_shared_service(
     registration_path: &std::path::Path,
     log_path: &std::path::Path,
 ) -> Result<ServerCandidate, ServiceStartFailure> {
-    let child_pid = host
+    let mut attempt = host
         .spawn_service(log_path)
         .map_err(|e| ServiceStartFailure::Spawn(e.to_string()))?;
+    let child_pid = attempt.pid();
     let deadline = tokio::time::Instant::now() + SERVICE_START_TIMEOUT;
     let mut exited_at: Option<tokio::time::Instant> = None;
     loop {
         if let Some(candidate) = live_service_registration(host, registration_path) {
+            // The attempt itself may be the exited contender that found an
+            // incumbent, so collect it before the handle is dropped — an
+            // unreaped child would outlive the start as a zombie.
+            attempt.try_reap();
             return Ok(candidate);
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            reap_failed_service_attempt(host, child_pid).await;
+            reap_failed_service_attempt(host, &mut *attempt).await;
             return Err(ServiceStartFailure::NoRegistration { child_pid });
         }
         // A child that exits without a live registration failed the attempt (a
@@ -1129,7 +1178,7 @@ async fn start_shared_service(
         if !host.alive(child_pid) {
             let exited = *exited_at.get_or_insert(now);
             if now.duration_since(exited) >= SERVICE_START_EXIT_GRACE {
-                reap_failed_service_attempt(host, child_pid).await;
+                reap_failed_service_attempt(host, &mut *attempt).await;
                 return Err(ServiceStartFailure::NoRegistration { child_pid });
             }
         }
@@ -1142,22 +1191,46 @@ async fn start_shared_service(
 /// `opencode ... serve --service` — an exited pid may have been recycled, and
 /// cola must never kill an unrelated process (the same guard the Owned Server
 /// path applies before it kills).
-async fn reap_failed_service_attempt(host: &dyn ServiceHost, child_pid: i32) {
+///
+/// Whichever way it goes, the attempt's own child is waited out: a failed start
+/// must leave no service child behind, and an un-waited one lingers as a zombie
+/// for as long as cola runs (ticket #809).
+async fn reap_failed_service_attempt(host: &dyn ServiceHost, attempt: &mut dyn ServiceAttempt) {
+    let child_pid = attempt.pid();
     let is_our_service = host.alive(child_pid)
         && host
             .cmd(child_pid)
             .is_some_and(|args| is_opencode_service_cmd(&args));
     if !is_our_service {
+        attempt.try_reap();
         return;
     }
     let _ = host.terminate(child_pid);
-    let deadline = tokio::time::Instant::now() + SERVICE_START_KILL_GRACE;
-    while host.alive(child_pid) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    if wait_for_attempt_exit(attempt, SERVICE_START_KILL_GRACE).await {
+        return;
     }
     if host.alive(child_pid) {
         tracing::warn!("OpenCode service attempt (pid {child_pid}) ignored SIGTERM; killing it");
         let _ = host.force_kill(child_pid);
+    }
+    if !wait_for_attempt_exit(attempt, SERVICE_START_KILL_GRACE).await {
+        tracing::warn!("OpenCode service attempt (pid {child_pid}) could not be reaped");
+    }
+}
+
+/// Poll the attempt's process handle until the child has exited and been waited
+/// out, bounded by `grace`. Waiting on the handle — not on a liveness lookup —
+/// is what reaps it.
+async fn wait_for_attempt_exit(attempt: &mut dyn ServiceAttempt, grace: std::time::Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + grace;
+    loop {
+        if attempt.try_reap() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -2393,7 +2466,12 @@ mod tests {
         /// Whether a SIGTERM actually ends the attempt (the graceful case).
         dies_on_terminate: bool,
         cmd: Vec<(i32, Vec<String>)>,
-        calls: std::sync::Mutex<Vec<String>>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// Whether the spawned attempt's process has exited and can be waited
+        /// out: SIGTERM/SIGKILL flip it when the test scripts the death, and
+        /// `attempt_exited()` scripts a child that exited on its own (the
+        /// contender that found an incumbent).
+        attempt_exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeServiceHost {
@@ -2405,8 +2483,16 @@ mod tests {
                 alive: std::sync::Mutex::new(Vec::new()),
                 dies_on_terminate: false,
                 cmd: Vec::new(),
-                calls: std::sync::Mutex::new(Vec::new()),
+                calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                attempt_exited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
+        }
+
+        /// The attempt's process exited on its own (nothing was signalled).
+        fn attempt_exited(self) -> Self {
+            self.attempt_exited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self
         }
 
         fn spawn_error(mut self, message: &str) -> Self {
@@ -2442,11 +2528,39 @@ mod tests {
         }
     }
 
+    /// The scripted [`ServiceAttempt`]: the process exits when the host's
+    /// terminate/kill flips the shared flag (or the test scripts it), and the
+    /// reap is recorded in the host's call log — so "the attempt was waited
+    /// out" is asserted without a process.
+    struct FakeAttempt {
+        pid: i32,
+        exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl ServiceAttempt for FakeAttempt {
+        fn pid(&self) -> i32 {
+            self.pid
+        }
+
+        fn try_reap(&mut self) -> bool {
+            if self.exited.load(std::sync::atomic::Ordering::SeqCst) {
+                self.calls.lock().unwrap().push(format!("reap {}", self.pid));
+                return true;
+            }
+            false
+        }
+    }
+
     impl ServiceHost for FakeServiceHost {
-        fn spawn_service(&self, _log_path: &std::path::Path) -> anyhow::Result<i32> {
+        fn spawn_service(&self, _log_path: &std::path::Path) -> anyhow::Result<Box<dyn ServiceAttempt>> {
             self.calls.lock().unwrap().push("spawn".to_string());
             match &self.spawn {
-                Ok(pid) => Ok(*pid),
+                Ok(pid) => Ok(Box::new(FakeAttempt {
+                    pid: *pid,
+                    exited: std::sync::Arc::clone(&self.attempt_exited),
+                    calls: std::sync::Arc::clone(&self.calls),
+                })),
                 Err(message) => anyhow::bail!("{message}"),
             }
         }
@@ -2475,6 +2589,8 @@ mod tests {
             self.calls.lock().unwrap().push(format!("terminate {pid}"));
             if self.dies_on_terminate {
                 self.alive.lock().unwrap().retain(|p| *p != pid);
+                self.attempt_exited
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
             Ok(())
         }
@@ -2482,6 +2598,8 @@ mod tests {
         fn force_kill(&self, pid: i32) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("kill {pid}"));
             self.alive.lock().unwrap().retain(|p| *p != pid);
+            self.attempt_exited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2854,6 +2972,7 @@ mod tests {
         let host = FakeServiceHost::new()
             .registration(&service_registration_json(999, 49374, "incumbent-pw"))
             // Our own child (4242) exited; the incumbent (999) is live.
+            .attempt_exited()
             .live(999, &["opencode", "serve", "--service"]);
         let candidate = start_shared_service(
             &host,
@@ -2865,7 +2984,9 @@ mod tests {
 
         assert_eq!(candidate.pid, 999);
         assert_eq!(candidate.password, "incumbent-pw");
-        assert_eq!(host.calls(), vec!["spawn"]);
+        // The adopted attempt is waited out, not dropped: a child left
+        // unreaped would linger as a zombie for as long as cola runs.
+        assert_eq!(host.calls(), vec!["spawn", "reap 4242"]);
     }
 
     /// No registration in time: the attempt is terminated (SIGTERM) and the
@@ -2884,7 +3005,8 @@ mod tests {
         .expect_err("nothing registered");
 
         assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
-        assert_eq!(host.calls(), vec!["spawn", "terminate 4242"]);
+        // Terminated AND waited out: a failed start leaves no service child.
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "reap 4242"]);
         assert!(failure.to_string().contains("serve --service"), "{failure}");
     }
 
@@ -2908,7 +3030,7 @@ mod tests {
         .expect_err("nothing registered");
 
         assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
-        assert_eq!(host.calls(), vec!["spawn", "terminate 4242"]);
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "reap 4242"]);
     }
 
     /// A child that ignores SIGTERM is force-killed.
@@ -2925,7 +3047,10 @@ mod tests {
         .expect_err("nothing registered");
 
         assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
-        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "kill 4242"]);
+        assert_eq!(
+            host.calls(),
+            vec!["spawn", "terminate 4242", "kill 4242", "reap 4242"]
+        );
     }
 
     /// A child that exited without registering fails the attempt after a short
@@ -2934,7 +3059,7 @@ mod tests {
     /// it may have been recycled.
     #[tokio::test(start_paused = true)]
     async fn a_service_attempt_that_exited_without_registering_fails_fast() {
-        let host = FakeServiceHost::new();
+        let host = FakeServiceHost::new().attempt_exited();
         let started = std::time::Instant::now();
         let failure = start_shared_service(
             &host,
@@ -2945,7 +3070,8 @@ mod tests {
         .expect_err("a dead child cannot register");
 
         assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
-        assert_eq!(host.calls(), vec!["spawn"], "a dead pid is never signalled");
+        // A dead pid is never signalled, but its child is still collected.
+        assert_eq!(host.calls(), vec!["spawn", "reap 4242"]);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
