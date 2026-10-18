@@ -2809,21 +2809,43 @@ mod tests {
         );
     }
 
-    /// #781: the pager carries the view, so a flip cannot silently change it —
-    /// a paged source view stays source on its next window.
+    /// #781, the gate's second-round shape: a file whose RENDER fits (so the
+    /// default is the rendered view and a toggle is offered) while its fenced
+    /// SOURCE needs paging. `next`'s `viewer_view` is the only thing keeping a
+    /// flip on the source; without it the rebuilt page renders by default.
     #[test]
     fn a_paged_source_view_carries_the_view_across_a_flip() {
-        let body: String = (0..4_000)
-            .map(|i| format!("line {i}: {}\n", "y".repeat(64)))
-            .collect();
-        let mut card_view = view("/tmp/proj/huge.md", ViewerKind::Text, Some("md"), &body);
+        // A 500-backtick fence run makes the fenced block outgrow the card
+        // while the rendered body — which carries no fence — still fits.
+        let body = format!("{}\n{}\n", "`".repeat(500), "x".repeat(20_000));
+
+        let mut card_view = view("/tmp/proj/paged.md", ViewerKind::Text, Some("md"), &body);
         card_view.view = Some(ViewerView::Source);
         let card = build_viewer_card(&key(), card_view);
+        assert!(
+            card_buttons(&card).iter().any(|b| b["value"]["op"] == "view"),
+            "the fixture's RENDER fits, so the toggle is offered: {}",
+            card_text(&card)
+        );
+        assert!(has_pager(&card), "its SOURCE pages: {}", card_text(&card));
         let next = card_buttons(&card)
             .into_iter()
             .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == "下一页")
             .expect("the pager's next button");
         assert_eq!(next["value"]["viewer_view"], "source", "{next}");
+
+        // The DEFAULT is the rendered view (no fence with a language token, no
+        // pager), so a flip that lost the view would visibly switch to it — the
+        // carriage is the only thing that keeps page 2 on the source. (The
+        // rendered body starts with the raw backtick line, so the discriminator
+        // is the fenced block's `markdown` token, not the backticks.)
+        let default_view = view("/tmp/proj/paged.md", ViewerKind::Text, Some("md"), &body);
+        let rendered = build_viewer_card(&key(), default_view);
+        assert!(
+            !card_text(&rendered).contains("```markdown") && !has_pager(&rendered),
+            "the default renders with no pager: {}",
+            card_text(&rendered)
+        );
     }
 
     /// #781: the toggle carries the whole stateless carriage — the browse

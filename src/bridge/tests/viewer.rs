@@ -2454,6 +2454,70 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
     );
 }
 
+/// #781, the discriminating case: a markdown file whose RENDER fits while its
+/// fenced SOURCE pages. A flip carries `viewer_view`, and page 2 proves it end
+/// to end — drop the view in the handler and the rebuilt page renders instead
+/// (no fence, no pager).
+#[tokio::test]
+async fn viewer_markdown_source_view_survives_a_page_flip() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let body = format!("{}\n{}\n", "`".repeat(500), "x".repeat(20_000));
+    std::fs::write(proj.path().join("paged.md"), body).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat paged.md",
+        key.clone(),
+        "m_paged",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    let rendered = card_text(&card);
+    assert!(
+        !rendered.contains("```markdown") && pager_label(&card).is_none(),
+        "the default view renders (no fence, no pager): {rendered}"
+    );
+
+    let to_source = card_buttons(&card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "view")
+        .expect("the rendered view offers its source")["value"]
+        .clone();
+    let source = drive_viewer_rebuild(&app, &platform, to_source, "msg_paged").await;
+    let source_text = card_text(&source);
+    assert!(
+        source_text.contains("```markdown"),
+        "the source renders: {source_text}"
+    );
+    let next = card_buttons(&source)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == "下一页")
+        .expect("the source pages")["value"]
+        .clone();
+    assert_eq!(next["viewer_view"], "source", "{next}");
+    assert_eq!(next["page"], 2, "{next}");
+
+    let page2 = drive_viewer_rebuild(&app, &platform, next, "msg_paged").await;
+    let page2_text = card_text(&page2);
+    assert!(
+        page2_text.contains("```markdown"),
+        "page 2 stays on the source view: {page2_text}"
+    );
+    assert!(
+        pager_label(&page2).is_some_and(|label| label.contains("第 2/")),
+        "the source pager names page 2: {page2_text}"
+    );
+}
+
 /// A preview that fits one card renders NO pager — no 上一页/下一页 buttons,
 /// no page line (ADR-0083 §6).
 #[tokio::test]
