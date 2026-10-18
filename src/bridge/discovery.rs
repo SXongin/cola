@@ -20,6 +20,33 @@ use crate::config::{GenerationOverride, port_from_url};
 use crate::opencode::strategy::Generation;
 use crate::opencode::transport::Transport;
 
+/// What a discovered `opencode serve` process is to cola, in selection order.
+///
+/// A V2 **Shared Service** (`serve --service`) is the machine-wide rendezvous
+/// every default OpenCode client (TUI, desktop, WebUI) uses, so it is always
+/// the canonical pick when present. A **Coexistent** server is someone else's
+/// classic `serve --port` (OpenChamber, a manual CLI). cola's **Owned** server
+/// is the one it spawned itself. Selection priority is
+/// Service > Coexistent > Owned (ADR-0085).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerClass {
+    Service,
+    Coexistent,
+    Owned,
+}
+
+impl ServerClass {
+    /// The selection rank: lower wins. Explicit rather than derived so
+    /// reordering the variants can never silently change the priority.
+    fn rank(self) -> u8 {
+        match self {
+            ServerClass::Service => 0,
+            ServerClass::Coexistent => 1,
+            ServerClass::Owned => 2,
+        }
+    }
+}
+
 /// An `opencode serve` process discovered on the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerCandidate {
@@ -36,6 +63,11 @@ pub struct ServerCandidate {
     /// itself resolves as its default data home — `$XDG_DATA_HOME` if set,
     /// else `~/.local/share` — on every platform).
     pub uses_default_store: bool,
+    /// What the scan can tell about the process: a `--service` daemon is a
+    /// [`ServerClass::Service`], anything else a [`ServerClass::Coexistent`].
+    /// Owned-ness is not knowable from argv; [`Self::class_against`] resolves
+    /// it against cola's recorded pid.
+    pub class: ServerClass,
 }
 
 impl ServerCandidate {
@@ -44,6 +76,19 @@ impl ServerCandidate {
     /// config tiebreaker all go through it).
     pub(crate) fn url(&self) -> String {
         local_url(self.port)
+    }
+
+    /// The class for one selection pass: Owned when the recorded pid matches,
+    /// otherwise what the scan found. A Shared Service is never Owned — cola
+    /// may start and attach it, but it never records or reaps it (ADR-0085),
+    /// so a stale/corrupt pid record must not turn the shared rendezvous into
+    /// something cola may kill.
+    pub fn class_against(&self, self_pid: Option<i32>) -> ServerClass {
+        match self.class {
+            ServerClass::Service => ServerClass::Service,
+            _ if Some(self.pid) == self_pid => ServerClass::Owned,
+            _ => ServerClass::Coexistent,
+        }
     }
 }
 
@@ -226,6 +271,24 @@ fn server_scan_refresh() -> ProcessRefreshKind {
         .with_environ(UpdateKind::Always)
 }
 
+/// The class a scan can infer from a server's command line. A V2 managed
+/// service is the one with `--service` (its port and password live in the
+/// registration file); a classic `serve --port` is Coexistent until the pid
+/// record says otherwise.
+fn class_from_args(args: &[String]) -> ServerClass {
+    if args.iter().any(|a| a == "--service") {
+        ServerClass::Service
+    } else {
+        ServerClass::Coexistent
+    }
+}
+
+/// Whether a candidate may be selected/attached at all: it must read the
+/// default store, and port 0 is never an endpoint (issue #748).
+fn is_eligible(candidate: &ServerCandidate) -> bool {
+    candidate.uses_default_store && candidate.port != 0
+}
+
 /// Scan for running `opencode serve` processes. Thin I/O — the interesting
 /// decisions live in [`select_server`].
 ///
@@ -278,42 +341,48 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 password,
                 username,
                 uses_default_store,
+                class: class_from_args(&args),
             })
         })
         .collect()
 }
 
-/// Pick the server cola should attach to (ADR-0013).
+/// Pick the server cola should attach to (ADR-0013, ADR-0085).
 ///
 /// Only default-store servers are eligible (a custom-store server is someone
 /// else's data — attaching would both break sharing and couple cola to that
 /// runtime). A candidate on port 0 is never eligible: that port is not an
 /// endpoint (see [`resolve_credentials`]), so it could only ever send the
-/// reconnect loop into a probe that cannot succeed (issue #748). Among eligible
-/// servers a Coexistent Server (pid != `self_pid`) always wins over cola's
-/// Owned Server (pid == `self_pid`), so cola steps aside as soon as OpenChamber
-/// (or a manual `opencode serve`) raises one; within the winning class the
-/// configured port wins, else the lowest port. Deterministic — the reconnect
-/// loop never flaps between two default-store servers.
+/// reconnect loop into a probe that cannot succeed (issue #748).
+///
+/// Eligible candidates are ranked by class: **Shared Service > Coexistent
+/// Server > Owned Server**. The V2 managed service is the rendezvous every
+/// default client uses, so it wins even over a smaller-port Coexistent server.
+/// Within the winning class the configured `[opencode] url` port wins, else the
+/// lowest port. Deterministic — the reconnect loop never flaps between two
+/// default-store servers.
 pub fn pick_server(
     candidates: &[ServerCandidate],
     preferred_port: Option<u16>,
     self_pid: Option<i32>,
 ) -> Option<&ServerCandidate> {
-    let mut eligible: Vec<&ServerCandidate> = candidates
-        .iter()
-        .filter(|c| c.uses_default_store && c.port != 0)
-        .collect();
+    let mut eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| is_eligible(c)).collect();
     // Deterministic across scans: sysinfo enumerates processes in randomized
     // order, so taking `first()` unsorted would make the reconnect loop flap
-    // between two servers of the same class (ADR-0013).
-    eligible.sort_by_key(|c| c.port);
-    let coexist: Vec<&ServerCandidate> = eligible
-        .iter()
-        .copied()
-        .filter(|c| Some(c.pid) != self_pid)
+    // between two servers of the same class (ADR-0013). The pid is the final
+    // tiebreaker in the (pathological) case of two candidates on one port.
+    eligible.sort_by(|a, b| {
+        a.class_against(self_pid)
+            .rank()
+            .cmp(&b.class_against(self_pid).rank())
+            .then_with(|| a.port.cmp(&b.port))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    let winning_class = eligible.first()?.class_against(self_pid);
+    let class: Vec<&ServerCandidate> = eligible
+        .into_iter()
+        .filter(|c| c.class_against(self_pid) == winning_class)
         .collect();
-    let class = if coexist.is_empty() { eligible } else { coexist };
     preferred_port
         .and_then(|p| class.iter().find(|c| c.port == p).copied())
         .or_else(|| class.first().copied())
@@ -626,6 +695,9 @@ pub async fn spawn_own_server(
         password,
         username: DEFAULT_SERVER_USERNAME.to_string(),
         uses_default_store: true,
+        // A spawned `serve --port` is cola's Owned Server by pid; the field
+        // only records what the command line says (ADR-0013).
+        class: ServerClass::Coexistent,
     };
     let transport = attach::candidate_transport(&candidate);
     resolve_spawned_server_over(
@@ -745,6 +817,14 @@ mod tests {
             password: password.into(),
             username: DEFAULT_SERVER_USERNAME.into(),
             uses_default_store,
+            class: ServerClass::Coexistent,
+        }
+    }
+
+    fn service_cand(pid: i32, port: u16) -> ServerCandidate {
+        ServerCandidate {
+            class: ServerClass::Service,
+            ..cand(pid, port, "service", true)
         }
     }
 
@@ -857,6 +937,94 @@ mod tests {
             4096
         );
         assert!(pick_server(&[private], None, None).is_none());
+    }
+
+    #[test]
+    fn scan_classifies_a_service_from_its_argv() {
+        let args = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            class_from_args(&args(&["opencode", "serve", "--service"])),
+            ServerClass::Service
+        );
+        assert_eq!(
+            class_from_args(&args(&["opencode", "serve", "--port", "4096"])),
+            ServerClass::Coexistent
+        );
+    }
+
+    #[test]
+    fn pick_server_prefers_service_over_a_smaller_port_coexistent() {
+        // The V2 Shared Service is the machine-wide rendezvous every default
+        // client uses; an OpenChamber/classic server on a lower port must not
+        // steal the attach (ADR-0085).
+        let coexist = cand(2, 4001, "openchamber", true);
+        let service = service_cand(3, 49374);
+        assert_eq!(
+            pick_server(&[coexist.clone(), service.clone()], None, None)
+                .unwrap()
+                .pid,
+            3
+        );
+        assert_eq!(pick_server(&[service, coexist], None, None).unwrap().pid, 3);
+    }
+
+    #[test]
+    fn pick_server_honors_the_configured_port_within_the_service_class() {
+        let a = service_cand(1, 49374);
+        let b = service_cand(2, 49375);
+        assert_eq!(pick_server(&[a, b], Some(49375), None).unwrap().port, 49375);
+    }
+
+    #[test]
+    fn pick_server_prefers_service_even_over_the_owned_server() {
+        let owned = cand(1, 4096, "cola-secret", true);
+        let service = service_cand(2, 49374);
+        assert_eq!(
+            pick_server(&[owned, service], Some(4096), Some(1)).unwrap().pid,
+            2
+        );
+    }
+
+    #[test]
+    fn pick_server_keeps_owned_last_across_scan_orders() {
+        // Whatever order sysinfo reports, the Owned Server never outranks a
+        // Service or a Coexistent one — even on the configured port.
+        let owned = cand(1, 4096, "cola-secret", true);
+        let service = service_cand(2, 49374);
+        let coexist = cand(3, 4001, "openchamber", true);
+        for servers in [
+            [owned.clone(), coexist.clone(), service.clone()],
+            [service.clone(), owned.clone(), coexist.clone()],
+            [coexist.clone(), service.clone(), owned.clone()],
+        ] {
+            assert_eq!(
+                pick_server(&servers, Some(4096), Some(1)).unwrap().pid,
+                2,
+                "the service is canonical"
+            );
+        }
+        let coexist_only = [owned.clone(), coexist];
+        assert_eq!(
+            pick_server(&coexist_only, Some(4096), Some(1)).unwrap().pid,
+            3,
+            "without a service the coexistent still beats the owned"
+        );
+        assert_eq!(
+            pick_server(&[owned], Some(4096), Some(1)).unwrap().pid,
+            1,
+            "the owned server is the last resort"
+        );
+    }
+
+    #[test]
+    fn pick_server_is_deterministic_across_scan_order_for_services() {
+        let a = service_cand(1, 49374);
+        let b = service_cand(2, 49375);
+        assert_eq!(
+            pick_server(&[a.clone(), b.clone()], None, None).unwrap().port,
+            49374
+        );
+        assert_eq!(pick_server(&[b, a], None, None).unwrap().port, 49374);
     }
 
     #[test]

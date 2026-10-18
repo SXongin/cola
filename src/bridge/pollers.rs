@@ -582,6 +582,7 @@ pub(crate) async fn mark_stale_cards(
 mod tests {
     use super::*;
     use crate::bridge::core::SharedCore;
+    use crate::bridge::discovery::ServerClass;
     use crate::bridge::test_support::{MockBackend, RecordingPlatform, test_config};
     use std::sync::Arc;
 
@@ -592,6 +593,7 @@ mod tests {
             username: "opencode".into(),
             password: "x".into(),
             uses_default_store: true,
+            class: ServerClass::Coexistent,
         }
     }
 
