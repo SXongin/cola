@@ -843,11 +843,15 @@ enum ServiceStartFailure {
     /// No live `serve --service` registration appeared in time; the attempt was
     /// terminated. The `serve --port` fallback follows.
     NoRegistration { child_pid: i32 },
-    /// A registration appeared but the server never classified for the attach.
-    /// Deliberately NOT a fallback: a live rendezvous exists, and raising an
-    /// Owned Server beside it would put two servers on one store
-    /// (ADR-0013, ADR-0085). The reconnect loop attaches once the probe
-    /// classifies.
+    /// A registration appeared, but the process exited before its generation
+    /// resolved. Nothing is left to attach to, so the `serve --port` fallback
+    /// follows — and the attempt's child was already waited out.
+    Exited(String),
+    /// A registration appeared and the process is still ALIVE, but it never
+    /// classified for the attach. Deliberately NOT a fallback: a live
+    /// rendezvous exists, and raising an Owned Server beside it would put two
+    /// servers on one store (ADR-0013, ADR-0085). The reconnect loop attaches
+    /// once the probe classifies.
     Attach(String),
 }
 
@@ -859,6 +863,10 @@ impl std::fmt::Display for ServiceStartFailure {
                 f,
                 "no live `serve --service` registration appeared within {}s (attempt pid {child_pid})",
                 SERVICE_START_TIMEOUT.as_secs()
+            ),
+            Self::Exited(evidence) => write!(
+                f,
+                "the shared service exited before its generation resolved: {evidence}"
             ),
             Self::Attach(evidence) => write!(
                 f,
@@ -1194,14 +1202,20 @@ impl ServerStarter for OpencodeStarter {
         // recorded as self-spawned — it is never an Owned Server and the yield
         // must never reap it (ADR-0085).
         let transport = attach::candidate_transport(&candidate);
-        resolve_spawned_server_over(
+        match resolve_spawned_server_over(
             &transport,
             &candidate,
             generation_override,
             SELF_START_PROBE_TIMEOUT,
         )
         .await
-        .map_err(ServiceStartFailure::Attach)
+        {
+            Ok(resolved) => Ok(resolved),
+            // A service that registered and then died is GONE: the caller may
+            // raise the Owned Server fallback (spec #809 acceptance 6).
+            Err(SpawnResolveFailure::Exited(evidence)) => Err(ServiceStartFailure::Exited(evidence)),
+            Err(SpawnResolveFailure::Inconclusive(evidence)) => Err(ServiceStartFailure::Attach(evidence)),
+        }
     }
 
     async fn start_port(
@@ -1239,8 +1253,8 @@ impl ServerStarter for OpencodeStarter {
             SELF_START_PROBE_TIMEOUT,
         )
         .await
-        .map_err(|evidence| {
-            anyhow::anyhow!("spawned OpenCode server's generation could not be resolved: {evidence}")
+        .map_err(|failure| {
+            anyhow::anyhow!("spawned OpenCode server's generation could not be resolved: {failure}")
         })
     }
 }
@@ -1291,11 +1305,16 @@ async fn spawn_own_server_over(
                 );
                 return Ok(resolved);
             }
-            // Only "the service is not there" falls back. A registration that
-            // appeared but never classified is a LIVE rendezvous: raising an
-            // Owned Server beside it would put two servers on one store, which
-            // is exactly what ADR-0013/ADR-0085 exist to prevent.
-            Err(failure @ (ServiceStartFailure::Spawn(_) | ServiceStartFailure::NoRegistration { .. })) => {
+            // Only "the service is not there" falls back — never started, never
+            // registered, or registered and then GONE. A registration whose
+            // process is still alive but never classified is a LIVE rendezvous:
+            // raising an Owned Server beside it would put two servers on one
+            // store, which is exactly what ADR-0013/ADR-0085 exist to prevent.
+            Err(
+                failure @ (ServiceStartFailure::Spawn(_)
+                | ServiceStartFailure::NoRegistration { .. }
+                | ServiceStartFailure::Exited(_)),
+            ) => {
                 tracing::warn!(
                     "could not start the OpenCode service ({failure}); falling back to `opencode serve --port`"
                 );
@@ -1309,6 +1328,30 @@ async fn spawn_own_server_over(
     starter.start_port(preferred_port, generation_override).await
 }
 
+/// Why a just-started server's generation never resolved. The distinction is
+/// load-bearing: a process that is GONE may be replaced by the `serve --port`
+/// fallback, while a live one must not be (a second server on one store is
+/// exactly what ADR-0013/ADR-0085 exist to prevent).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpawnResolveFailure {
+    /// The spawned process exited before its generation resolved.
+    Exited(String),
+    /// The process is still alive, but its probe stayed inconclusive.
+    Inconclusive(String),
+}
+
+impl std::fmt::Display for SpawnResolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited(evidence) => write!(
+                f,
+                "the spawned server exited before its generation resolved: {evidence}"
+            ),
+            Self::Inconclusive(evidence) => write!(f, "{evidence}"),
+        }
+    }
+}
+
 /// The retry loop around the attach decision for a just-started server (the
 /// Shared Service or an Owned Server): the startup window answers nothing, or
 /// answers unclassifiably (V2's 503-while-migrating), so inconclusive probes are
@@ -1319,7 +1362,7 @@ async fn resolve_spawned_server_over(
     candidate: &ServerCandidate,
     generation_override: GenerationOverride,
     timeout: std::time::Duration,
-) -> Result<ResolvedServer, String> {
+) -> Result<ResolvedServer, SpawnResolveFailure> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match attach::resolve_candidate_over(transport, candidate, generation_override).await {
@@ -1329,12 +1372,10 @@ async fn resolve_spawned_server_over(
                     if self_spawned_pid() == Some(candidate.pid) {
                         clear_self_spawned();
                     }
-                    return Err(format!(
-                        "the spawned server exited before its generation resolved: {evidence}"
-                    ));
+                    return Err(SpawnResolveFailure::Exited(evidence));
                 }
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(evidence);
+                    return Err(SpawnResolveFailure::Inconclusive(evidence));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
@@ -2242,8 +2283,17 @@ mod tests {
         .await
         .expect_err("an inconclusive spawn must not attach");
 
-        assert!(error.contains("503"), "evidence: {error}");
-        assert!(!error.contains("spawn-secret"), "the credential leaked: {error}");
+        // The pid is still alive, so this is the LIVE-rendezvous case, never
+        // the "gone" one a fallback may follow (spec #809 acceptance 6).
+        assert!(
+            matches!(error, SpawnResolveFailure::Inconclusive(_)),
+            "a live process is not gone: {error:?}"
+        );
+        assert!(error.to_string().contains("503"), "evidence: {error}");
+        assert!(
+            !error.to_string().contains("spawn-secret"),
+            "the credential leaked: {error}"
+        );
     }
 
     /// The V1 leg of the spawn path: V1's 200-`text/html` catch-all resolves V1
@@ -2299,7 +2349,14 @@ mod tests {
         .await
         .expect_err("a dead child cannot resolve");
 
-        assert!(error.contains("exited"), "evidence: {error}");
+        // The failure is typed as "gone", which is what lets the Shared Service
+        // start fall back instead of leaving cola serverless (spec #809
+        // acceptance 6).
+        assert!(
+            matches!(error, SpawnResolveFailure::Exited(_)),
+            "a dead child is gone, not a live rendezvous: {error:?}"
+        );
+        assert!(error.to_string().contains("exited"), "evidence: {error}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "a dead child must not wait out the budget"
@@ -2720,10 +2777,26 @@ mod tests {
         assert_eq!(resolved.url, local_url(4096));
     }
 
-    /// A registration that appeared but never classified is a LIVE rendezvous:
-    /// raising an Owned Server beside it would put two servers on one store
-    /// (ADR-0013, ADR-0085), so this is the one failure that does NOT fall
-    /// back.
+    /// A service that registered and then exited leaves no server behind, so
+    /// the Owned `serve --port` fallback follows — the counterpart of the
+    /// no-registration case, and acceptance 6 of the spec (a start failure
+    /// falls back with no leftover service child).
+    #[tokio::test]
+    async fn spawn_own_server_falls_back_when_the_service_exited_after_registering() {
+        let starter =
+            FakeStarter::new().service_fails(ServiceStartFailure::Exited("connection refused".into()));
+        let resolved = spawn_own_server_over(None, GenerationOverride::Auto, false, &starter)
+            .await
+            .expect("the port leg resolves");
+
+        assert_eq!(starter.calls(), vec!["service", "port"]);
+        assert_eq!(resolved.url, local_url(4096));
+    }
+
+    /// A registration that appeared and whose process is STILL ALIVE but never
+    /// classified is a LIVE rendezvous: raising an Owned Server beside it would
+    /// put two servers on one store (ADR-0013, ADR-0085), so this is the one
+    /// failure that does NOT fall back.
     #[tokio::test]
     async fn spawn_own_server_does_not_fall_back_when_a_live_service_never_classifies() {
         let starter = FakeStarter::new().service_fails(ServiceStartFailure::Attach("503".into()));
