@@ -868,18 +868,14 @@ impl std::fmt::Display for ServiceStartFailure {
     }
 }
 
-/// Whether a command line really is the V2 managed service: an `opencode`
-/// binary running the `serve` subcommand in `--service` mode. A registration
-/// pid that no longer matches this is stale — the pid died and was recycled, or
+/// Whether a command line really is the V2 Shared Service: an `opencode …
+/// serve` invocation — the SAME recognition a scan applies, so an
+/// interpreter-launched dev server (`node /opt/opencode/dist/index.js serve`,
+/// #812) is the service too — running in `--service` mode. A registration pid
+/// that no longer matches this is stale — the pid died and was recycled, or
 /// another program owns it now — so it is never attached to, and never killed.
-///
-/// Kept local rather than folded into [`is_live_opencode_serve`]: that
-/// predicate is the Owned Server's `serve --port` check (and the dev-launch
-/// argv widening is #812's), while this one is the service's own identity.
 fn is_opencode_service_cmd(args: &[String]) -> bool {
-    args.first().is_some_and(|a| a.contains("opencode"))
-        && args.iter().skip(1).any(|a| a == "serve")
-        && args.iter().skip(1).any(|a| a == "--service")
+    is_opencode_serve_args(args) && args.iter().any(|a| a == "--service")
 }
 
 /// The candidate a registration file describes, when it names a LIVE
@@ -1994,6 +1990,37 @@ mod tests {
         assert!(!is_opencode_serve_args(&argv(&["opencode", "serve", "-h"])));
     }
 
+    /// The service's own identity check is the ONE serve-recognition predicate
+    /// plus `--service`, so it cannot drift from a scan: a dev-launched service
+    /// (`node /opt/opencode/dist/index.js serve --service`) is the service,
+    /// while a classic `serve --port` and a help invocation are not (issue
+    /// #812, ticket #810 §2).
+    #[test]
+    fn is_opencode_service_cmd_recognizes_direct_and_dev_launches() {
+        assert!(is_opencode_service_cmd(&service_argv()));
+        assert!(is_opencode_service_cmd(&dev_service_argv()));
+        assert!(is_opencode_service_cmd(&argv(&[
+            "/usr/bin/opencode",
+            "serve",
+            "--service"
+        ])));
+
+        // A classic `serve --port` is not the service …
+        assert!(!is_opencode_service_cmd(&argv(&[
+            "opencode", "serve", "--port", "4096"
+        ])));
+        // … and neither is a help invocation that merely lists the flags.
+        assert!(!is_opencode_service_cmd(&argv(&["opencode", "--help"])));
+        assert!(!is_opencode_service_cmd(&argv(&["opencode", "serve", "--help"])));
+        // Not an `opencode` server at all, even with the flag.
+        assert!(!is_opencode_service_cmd(&argv(&[
+            "node",
+            "/opt/other/server.js",
+            "serve",
+            "--service"
+        ])));
+    }
+
     /// The dev-launch argv also reaches `resolve_credentials`: port from argv,
     /// password from the environment — no registration file involved.
     #[test]
@@ -2416,6 +2443,15 @@ mod tests {
             .collect()
     }
 
+    /// A dev launch of the Shared Service: the entrypoint is not `argv[0]`, so
+    /// recognition cannot key on the binary name alone (issue #812).
+    fn dev_service_argv() -> Vec<String> {
+        ["node", "/opt/opencode/dist/index.js", "serve", "--service"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     #[test]
     fn service_start_command_spawns_the_rendezvous_without_a_port_or_password() {
         let cmd = service_start_command();
@@ -2460,6 +2496,13 @@ mod tests {
         assert!(candidate.uses_default_store);
         assert_eq!(candidate.class, ServerClass::Service);
         assert!(candidate.is_service());
+
+        // The dev launch is adopted too: the identity check is the shared
+        // serve predicate plus `--service`, never `argv[0]` (issue #812).
+        let dev = registration_service_candidate(&raw, &|_| true, &|_| Some(dev_service_argv()))
+            .expect("a dev-launched service is the service");
+        assert_eq!(dev.pid, 4242);
+        assert_eq!(dev.class, ServerClass::Service);
     }
 
     #[test]
@@ -2770,6 +2813,29 @@ mod tests {
         assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
         assert_eq!(host.calls(), vec!["spawn", "terminate 4242"]);
         assert!(failure.to_string().contains("serve --service"), "{failure}");
+    }
+
+    /// The reap recognizes a dev-launched service too. Rejecting it would leave
+    /// the attempt neither adopted nor reaped — the service child still running
+    /// while cola falls back to `serve --port` (issue #812, ticket #810 §2).
+    #[tokio::test(start_paused = true)]
+    async fn a_dev_launched_service_attempt_is_reaped_too() {
+        let host = FakeServiceHost::new()
+            .live(
+                4242,
+                &["node", "/opt/opencode/dist/index.js", "serve", "--service"],
+            )
+            .dies_on_terminate();
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("nothing registered");
+
+        assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242"]);
     }
 
     /// A child that ignores SIGTERM is force-killed.
