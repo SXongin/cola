@@ -832,6 +832,14 @@ fn header_file_name(name: &str) -> String {
 /// nothing about the file it touched until the reader unfolded it — and a text
 /// `read` likewise.
 ///
+/// A MULTI-file patch is the exception that names no path (#793): its folded
+/// header carries the deduped file count and the change totals instead
+/// (`📄 3 files · +42 −7`). One path could not describe several files, the
+/// `Index:` lines that separate them are inside the fold, and the count is what
+/// tells the reader whether expanding is worth it. The [`EditDiff`] comes from
+/// the same parse rule the body's header used ([`file_edit_diff`]), so the
+/// count and the totals cannot disagree with the hunks below.
+///
 /// The name is the same short form the File Content marker/caption uses
 /// ([`header_file_name`]): basename first, one printable line, tail-clipped to
 /// [`FILE_HEADER_NAME_MAX_CHARS`]. A folded header is one `plain_text` line,
@@ -843,6 +851,20 @@ fn header_file_name(name: &str) -> String {
 /// the embedded image's caption, and two names for one file on one line is
 /// noise. `None` for every other tool and for a call with no usable path.
 fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
+    if is_file_editing(tool.name())
+        && let Some(diff) = tool
+            .output()
+            .as_deref()
+            .and_then(|output| file_edit_diff(tool.name(), output))
+        && diff.paths.len() > 1
+    {
+        return Some(format!(
+            " · 📄 {} files · +{} −{}",
+            diff.paths.len(),
+            diff.additions,
+            diff.deletions
+        ));
+    }
     let (icon, path) = match tool.name() {
         "write" | "edit" => ("📄", tool.file_open_path()?),
         // The book icon the read panel's Input line already uses — and the one
@@ -1765,21 +1787,32 @@ fn diff_header_path(line: &str) -> Option<String> {
     (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
 }
 
-/// The header a diff panel shows while folded: the change count, led by the
-/// file count when the patch touched more than one (#793). A multi-file patch's
-/// body keeps an `Index:` line per file, but those are invisible until the
-/// reader expands — the folded header is where the reader decides whether to.
-/// A single file keeps the bare totals: an `edit` names its target on the Input
-/// line, and a path repeated in one patch counts once, because `paths` is
-/// deduped. Counts and file count both come from this one [`EditDiff`], never
-/// from a second scan of the body.
-fn diff_header(diff: &EditDiff) -> String {
-    let counts = format!("+{} −{}", diff.additions, diff.deletions);
-    let files = diff.paths.len();
-    if files > 1 {
-        format!("📄 {files} files · {counts}")
+/// The header a diff panel's Output section leads with: the change count.
+/// `None` for a MULTI-file patch — its count and totals ride the FOLDED title
+/// ([`panel_file_detail`], #793), which stays visible when the panel expands,
+/// so repeating the line under `**Output**` would say it twice. A single file
+/// keeps the bare totals: an `edit` names its target on the Input line, and a
+/// path repeated in one patch counts once, because `paths` is deduped. The
+/// count and the totals come from this one [`EditDiff`], never from a second
+/// scan of the body.
+fn diff_header(diff: &EditDiff) -> Option<String> {
+    (diff.paths.len() <= 1).then(|| format!("+{} −{}", diff.additions, diff.deletions))
+}
+
+/// The [`EditDiff`] a file-editing tool's output parses to, with that tool's
+/// framing: `edit` drops the file-header block (its Input line names the one
+/// target), `apply_patch`/`patch` keep each file's `Index:` line. `None` for
+/// any other tool and for an output that is not a recognized diff. The one
+/// parse rule the Output header and the folded title share, so the two cannot
+/// disagree.
+fn file_edit_diff(name: &str, output: &str) -> Option<EditDiff> {
+    if !is_file_editing(name) {
+        return None;
+    }
+    if name == "edit" {
+        parse_edit_diff(output)
     } else {
-        counts
+        parse_multi_file_diff(output)
     }
 }
 
@@ -1959,15 +1992,12 @@ fn is_file_editing(name: &str) -> bool {
 /// Returns `(header, body style, body)`: the header is the short markdown line
 /// above the body (file path, change count, result count); the style decides
 /// how the body blocks (see [`BodyStyle`]). A `todowrite` header is the list's
-/// size and per-status counts — the folded panel's progress line.
+/// size and per-status counts — the folded panel's progress line. A multi-file
+/// diff returns no header: its count and totals ride the folded title
+/// ([`panel_file_detail`], #793), which stays visible when the panel expands.
 fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
     if is_file_editing(name) {
-        let parsed = if name == "edit" {
-            parse_edit_diff(output)
-        } else {
-            parse_multi_file_diff(output)
-        };
-        return match parsed {
+        return match file_edit_diff(name, output) {
             Some(d) => {
                 // The hunks, then the tool's trailing note (LSP diagnostics) on
                 // its own paragraph — inside the same code block so the panel
@@ -1980,7 +2010,7 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
                     body.push_str(d.tail.trim_end());
                     body.push('\n');
                 }
-                (Some(header), BodyStyle::Code(Some(lang)), body)
+                (header, BodyStyle::Code(Some(lang)), body)
             }
             None => (None, BodyStyle::Auto, output.to_string()),
         };
@@ -5473,16 +5503,15 @@ Index: .config/opencode/AGENTS.md
                 error: None,
             },
         });
-        let card = CardBuilder::new()
-            .with_state(CardState::Done)
-            .with_tool(tool)
-            .build();
-        let md = card["body"]["elements"][0]["elements"][0]["content"]
-            .as_str()
-            .expect("panel markdown content");
+        let title = panel_title(tool.clone());
         assert!(
-            md.contains("**Output**\n\n📄 2 files · +3 −2"),
-            "the joined files' count and totals: {md}"
+            title.contains("📄 2 files · +3 −2"),
+            "the folded title carries the joined files' count and totals: {title}"
+        );
+        let md = panel_md(tool);
+        assert!(
+            !md.contains("📄 2 files"),
+            "the expanded body does not repeat the title's count: {md}"
         );
         assert_eq!(
             md.matches("@@ -1 +1 @@").count() + md.matches("@@ -1 +1,2 @@").count(),
@@ -5868,7 +5897,7 @@ see the compiler's note above
             "the second file's header is not a +/- line"
         );
         let (header, style, _) = format_tool_output("apply_patch", &two);
-        assert_eq!(header.as_deref(), Some("📄 2 files · +2 −2"));
+        assert_eq!(header, None, "two files: the folded title owns the count (#793)");
         assert_eq!(
             style,
             BodyStyle::Code(Some(PLAIN_TEXT)),
@@ -5937,9 +5966,8 @@ Index: /a/two.rs
 +y";
         let (header, style, body) = format_tool_output("apply_patch", diff);
         assert_eq!(
-            header.as_deref(),
-            Some("📄 2 files · +2 −2"),
-            "count header: {header:?}"
+            header, None,
+            "a multi-file patch has no body header: the folded title owns it (#793)"
         );
         assert_eq!(
             style,
@@ -5954,13 +5982,14 @@ Index: /a/two.rs
         assert!(!body.contains("+++"), "file header noise dropped: {body}");
     }
 
-    /// #793: a multi-file patch's folded header says how many files it touched
-    /// ahead of the totals — the body's `Index:` separators are invisible until
-    /// the reader expands, so the count is what says whether expanding is worth
-    /// it. The count and the totals are the same `EditDiff`: the paths it
-    /// deduped and the lines it summed.
+    /// #793: a multi-file patch's COLLAPSED title says how many files it
+    /// touched ahead of the totals — the body's `Index:` separators are
+    /// invisible until the reader expands, so the count is what says whether
+    /// expanding is worth it. The title owns that line, so the expanded body
+    /// does not repeat it, and the count and totals are one `EditDiff`: the
+    /// paths it deduped and the lines it summed.
     #[test]
-    fn a_multi_file_patch_header_names_the_file_count() {
+    fn a_multi_file_patch_title_names_the_file_count() {
         let diff = "\
 Index: /a/one.rs
 ===================================================================
@@ -5984,21 +6013,67 @@ Index: /a/three.md
 @@ -1 +1 @@
 -old
 +new";
-        let (header, _, body) = format_tool_output("patch", diff);
-        assert_eq!(
-            header.as_deref(),
-            Some("📄 3 files · +4 −3"),
-            "the file count leads the totals across every file"
+        let tool = panel_with(
+            "patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": diff}),
+            Some("Success. Updated the following files"),
         );
         assert_eq!(
-            body.lines().filter(|l| l.starts_with("Index: ")).count(),
+            panel_title(tool.clone()),
+            "✅ patch · 📄 3 files · +4 −3",
+            "the folded title carries the file count and the totals"
+        );
+        let body = panel_md(tool);
+        assert!(
+            !body.contains("📄 3 files") && !body.contains("+4 −3"),
+            "the body does not repeat the title's count: {body}"
+        );
+        assert_eq!(
+            body.matches("Index: ").count(),
             3,
             "the body keeps one `Index:` separator per file: {body}"
         );
     }
 
+    /// #793: the count-and-totals fragment is a `plain_text` title byte the
+    /// card carries, so [`panel_file_detail_estimate`] must charge it through
+    /// the same derivation the title renders — a fragment the split check
+    /// missed would let a near-budget card grow past the serialized cap.
+    #[test]
+    fn the_multi_file_title_detail_is_charged() {
+        let diff = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-old
++new
+Index: /a/two.rs
+===================================================================
+--- /a/two.rs
++++ /a/two.rs
+@@ -1 +1 @@
+-old
++new";
+        let tool = panel_with(
+            "patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": diff}),
+            Some("Success. Updated the following files"),
+        );
+        assert_eq!(
+            panel_file_detail_estimate(&tool),
+            json_escaped_len(" · 📄 2 files · +2 −2"),
+            "the folded title's count and totals are card bytes"
+        );
+    }
+
     /// #793: a patch that names the same file twice is still one file — the
-    /// deduped `paths` decide, so the header never claims `2 files` for one
+    /// deduped `paths` decide, so the title never claims `2 files` for one
     /// target. A lone file also gets no `1 file` prefix, which would only
     /// repeat the path the Input line already shows.
     #[test]
@@ -6025,12 +6100,26 @@ Index: /a/one.rs
             2,
             "the body is untouched: {body}"
         );
+        let tool = panel_with(
+            "patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": diff}),
+            Some("Success. Updated the following files"),
+        );
+        assert_eq!(
+            panel_title(tool.clone()),
+            "✅ patch",
+            "one file gets no count detail in the title"
+        );
+        assert!(panel_md(tool).contains("+2 −2"), "the body keeps the totals");
     }
 
-    /// #793 regression: a single-file `edit` header stays byte-identical to
-    /// what the panel showed before the file count existed.
+    /// #793 regression: a single-file `edit`/`patch` panel's folded title and
+    /// body stay byte-identical to before the file count existed — the title
+    /// names the edited file, and the body heads with the bare totals.
     #[test]
-    fn a_single_file_edit_header_is_the_bare_change_count() {
+    fn a_single_file_edit_keeps_todays_title_and_body() {
         let diff = "\
 Index: /a/one.rs
 ===================================================================
@@ -6041,6 +6130,33 @@ Index: /a/one.rs
 +new";
         let (header, _, _) = format_tool_output("edit", diff);
         assert_eq!(header.as_deref(), Some("+1 −1"));
+
+        let edit = panel_with(
+            "edit",
+            ToolStatus::Completed,
+            json!({"filePath": "src/main.rs"}),
+            json!({"diff": diff}),
+            Some("Edit applied successfully."),
+        );
+        assert_eq!(panel_title(edit.clone()), "✅ edit · 📄 main.rs");
+        assert!(
+            panel_md(edit).contains("**Output**\n\n+1 −1"),
+            "the body keeps today's bare header"
+        );
+
+        let patch = panel_with(
+            "patch",
+            ToolStatus::Completed,
+            json!({"patchText": "*** Begin Patch"}),
+            json!({"diff": diff}),
+            Some("Success. Updated the following files"),
+        );
+        assert_eq!(
+            panel_title(patch.clone()),
+            "✅ patch",
+            "a one-file patch never gained a detail"
+        );
+        assert!(panel_md(patch).contains("**Output**\n\n+1 −1"));
     }
 
     /// A patch that touches two languages has no honest grammar to fence with:
