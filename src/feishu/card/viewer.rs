@@ -27,13 +27,12 @@
 //! component can. The card keeps its source preview and says nothing else: the
 //! label is the whole explanation.
 //!
-//! A **Markdown** file (the path spells `.md`/`.markdown`/`.mark`) leads with
-//! its RENDERED text instead (#781): the card `markdown` element renders the
-//! file itself, and 「查看源码」 switches to the faithful fenced block — one
-//! card, toggled statelessly, the same payload-driven rebuild the pager uses. A
-//! render that would outgrow the card's preview budget keeps today's source view
-//! and offers no toggle; the complete, uncapped render stays the 「发为文件」
-//! File Message's own client preview.
+//! A **Markdown** file (the path spells `.md`/`.markdown`/`.mark`) keeps the
+//! fenced source as its view and offers its RENDERED text behind 「📖 渲染预览」
+//! (#781): the card `markdown` element renders the file itself, one stateless
+//! payload-driven rebuild away — the same rebuild the pager uses. A render that
+//! would outgrow the card's preview budget is not offered at all; the complete,
+//! uncapped render stays the 「发为文件」 File Message's own client preview.
 
 use serde_json::json;
 
@@ -80,15 +79,17 @@ impl ViewerKind {
 }
 
 /// Which of a markdown file's two renderings a **File Viewer** card shows
-/// (#781): the rendered text — what a `.md` file is FOR — or the faithful
-/// fenced source block. `None` on a payload is the default (rendered when it
-/// fits the card, source otherwise); every non-markdown preview ignores it.
+/// (#781): the faithful fenced source block — what the card opens on — or the
+/// rendered text. `None` on a payload is the default, the SOURCE; every
+/// non-markdown preview ignores it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ViewerView {
-    /// The file's text as one `markdown` element — Feishu renders it.
+    /// The file's text as one `markdown` element — Feishu renders it. The
+    /// reader asks for this one explicitly: a long document rendered whole
+    /// floods a phone screen, so it is opt-in.
     Rendered,
-    /// The fenced code block showing the file verbatim — today's behaviour for
-    /// every text file, and the only faithful view of arbitrary markdown.
+    /// The fenced code block showing the file verbatim — the default for every
+    /// text file, and the only faithful view of arbitrary markdown.
     Source,
 }
 
@@ -540,8 +541,8 @@ pub(crate) struct ViewerCard<'a> {
     /// builder clamps it into `[1, total_pages]`. Ignored by every other kind.
     pub(crate) page: usize,
     /// Which markdown rendering to show (#781): `None` is the default — the
-    /// rendered text when it fits the card, the source view otherwise — and a
-    /// `Some` records the reader's explicit toggle. Ignored by every preview
+    /// SOURCE view — and `Some(Rendered)` is the reader asking for the rendered
+    /// text, which is shown only when it fits the card. Ignored by every preview
     /// that is not a markdown document.
     pub(crate) view: Option<ViewerView>,
     /// The browse listing this viewer was opened from, when it was (ADR-0083
@@ -591,14 +592,20 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
     let rendered_body = is_markdown_document(&view)
         .then(|| markdown.clean(view.text))
         .filter(|body| serialized_len(body) + 128 <= PREVIEW_JSON_BUDGET);
+    // The card OPENS on the source view (#781): the rendered text is one tap
+    // away, and a long document rendered whole floods a phone screen — the
+    // owner's own read of the first cut, on a real device. `view` records the
+    // reader's explicit choice, so `Some(Rendered)` is the only path to the
+    // render; `None` and `Some(Source)` both mean the source.
+    let shown_rendered = rendered_body.is_some() && matches!(view.view, Some(ViewerView::Rendered));
     // The toggle offers the view the reader is NOT looking at, and only when the
     // render fits ([`rendered_body`] is `None` otherwise). One decision, so the
     // element the card emits and the button it offers cannot disagree.
-    let view_toggle = match (&rendered_body, view.view) {
-        (None, _) => None,
-        (Some(_), Some(ViewerView::Source)) => Some(ViewerView::Rendered),
-        (Some(_), _) => Some(ViewerView::Source),
-    };
+    let view_toggle = rendered_body.is_some().then_some(if shown_rendered {
+        ViewerView::Source
+    } else {
+        ViewerView::Rendered
+    });
 
     // A LANDED overflow preview went out as its own message (#741): the card
     // carries no preview, no truncation note and no rescue delivery — the
@@ -650,13 +657,12 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                 }
             }
             ViewerKind::Text => {
-                // A markdown document leads with its RENDERED text (#781) — the
-                // sanitized body decided above — unless the reader chose the
-                // source; the source path is otherwise unchanged, so a file
-                // whose render the card cannot hold behaves exactly as before.
+                // A markdown document still opens on its SOURCE (#781); the
+                // RENDERED text is shown only when the reader asked for it AND
+                // the sanitized body fits the card.
                 let rendered = match (rendered_body, view.view) {
-                    (Some(_), Some(ViewerView::Source)) => None,
-                    (body, _) => body,
+                    (Some(body), Some(ViewerView::Rendered)) => Some(body),
+                    _ => None,
                 };
                 if let Some(body) = rendered {
                     elements.push(json!({
@@ -2684,12 +2690,12 @@ mod tests {
         );
     }
 
-    /// #781: a markdown file leads with its RENDERED text — one `markdown`
-    /// element, no fence — and carries 「查看源码」 as the FIRST button. The
-    /// toggle is stateless: its payload names the target view, the same
-    /// carriage every viewer rebuild control uses.
+    /// #781: a markdown file OPENS on its fenced source — the card's default for
+    /// every text file — and carries 「📖 渲染预览」 as the FIRST button. The
+    /// toggle is stateless: its payload names the target view, the same carriage
+    /// every viewer rebuild control uses.
     #[test]
-    fn a_markdown_file_leads_with_its_rendered_text_and_offers_its_source() {
+    fn a_markdown_file_opens_on_its_source_and_offers_the_render() {
         let card = build_viewer_card(
             &key(),
             view(
@@ -2700,17 +2706,17 @@ mod tests {
             ),
         );
         let text = card_text(&card);
-        assert!(text.contains("# hi"), "the rendered text renders: {text}");
         assert!(
-            preview_blocks(&card).is_empty(),
-            "no source fence on the default view: {text}"
+            text.contains("```markdown"),
+            "the default view is the source: {text}"
         );
+        assert_eq!(preview_blocks(&card).len(), 1, "one fenced block: {text}");
 
         let buttons = card_buttons(&card);
-        assert_eq!(buttons[0]["text"]["content"], "查看源码");
+        assert_eq!(buttons[0]["text"]["content"], "📖 渲染预览");
         assert_eq!(buttons[0]["value"]["action"], "file");
         assert_eq!(buttons[0]["value"]["op"], "view");
-        assert_eq!(buttons[0]["value"]["viewer_view"], "source");
+        assert_eq!(buttons[0]["value"]["viewer_view"], "rendered");
         assert_eq!(buttons[0]["value"]["path"], "/tmp/proj/notes.md");
         assert_eq!(buttons[0]["value"]["chat_id"], "chat_1");
         assert_eq!(buttons[0]["value"]["thread_id"], "chat_1");
@@ -2722,44 +2728,49 @@ mod tests {
         );
     }
 
-    /// #781: an explicit source view renders the fenced block and offers the
-    /// render back — the toggle's two halves are each other's inverse.
+    /// #781: an explicit Rendered view renders the text — one `markdown`
+    /// element, no fence — and offers the source back; the toggle's two halves
+    /// are each other's inverse.
     #[test]
-    fn an_explicit_source_view_renders_the_fence_and_offers_the_render_back() {
+    fn an_explicit_rendered_view_renders_the_text_and_offers_the_source() {
         let mut card_view = view(
             "/tmp/proj/notes.md",
             ViewerKind::Text,
             Some("md"),
             "# hi\n\nbody\n",
         );
-        card_view.view = Some(ViewerView::Source);
+        card_view.view = Some(ViewerView::Rendered);
         let card = build_viewer_card(&key(), card_view);
         let text = card_text(&card);
-        assert!(text.contains("```markdown"), "the source block renders: {text}");
+        assert!(text.contains("# hi"), "the rendered text renders: {text}");
+        assert!(
+            preview_blocks(&card).is_empty(),
+            "no fence on the rendered view: {text}"
+        );
 
         let button = card_buttons(&card)
             .into_iter()
             .find(|b| b["value"]["op"] == "view")
             .unwrap_or_else(|| panic!("the view toggle is offered: {text}"));
-        assert_eq!(button["text"]["content"], "📖 渲染预览");
-        assert_eq!(button["value"]["viewer_view"], "rendered");
+        assert_eq!(button["text"]["content"], "查看源码");
+        assert_eq!(button["value"]["viewer_view"], "source");
         assert_eq!(
             button["value"]["page"], 1,
             "the toggle carries the page: {button}"
         );
     }
 
-    /// #781: `mark`/`MARKDOWN` (and any case) take the same lane — and the
+    /// #781: `mark`/`MARKDOWN` (and any case) offer the render — and the
     /// extension still never decides the KIND: a markdown-NAMED binary keeps the
     /// ordinary row (§6).
     #[test]
-    fn only_markdown_extensions_take_the_rendered_view() {
+    fn only_markdown_extensions_offer_the_render() {
         for (name, ext) in [("/tmp/p/x.mark", "mark"), ("/tmp/p/x.MARKDOWN", "MARKDOWN")] {
             let card = build_viewer_card(&key(), view(name, ViewerKind::Text, Some(ext), "# x\n"));
             assert_eq!(
                 card_buttons(&card)[0]["text"]["content"],
-                "查看源码",
-                "{name} leads with the rendered view"
+                "📖 渲染预览",
+                "{name} offers the rendered view"
             );
         }
         let binary = build_viewer_card(
@@ -2779,10 +2790,11 @@ mod tests {
         );
     }
 
-    /// #781: a render the card cannot hold keeps today's source view and offers
-    /// NO toggle — the complete render stays the File Message's client preview.
+    /// #781: a render the card cannot hold is not offered at all — no toggle,
+    /// the source view exactly as before, and the complete render left to the
+    /// File Message's client preview.
     #[test]
-    fn a_markdown_render_over_the_budget_keeps_the_source_and_no_toggle() {
+    fn a_markdown_render_over_the_budget_is_not_offered() {
         let body: String = (0..4_000)
             .map(|i| format!("line {i}: {}\n", "y".repeat(64)))
             .collect();
@@ -2809,41 +2821,33 @@ mod tests {
         );
     }
 
-    /// #781, the gate's second-round shape: a file whose RENDER fits (so the
-    /// default is the rendered view and a toggle is offered) while its fenced
-    /// SOURCE needs paging. `next`'s `viewer_view` is the only thing keeping a
-    /// flip on the source; without it the rebuilt page renders by default.
+    /// #781: the shape a long markdown file opens on — the render FITS (a
+    /// 500-backtick fence run makes only the fenced SOURCE outgrow the card), so
+    /// the source view pages while 「📖 渲染预览」 is still offered, and the
+    /// rendered view it switches to is one element with no pager.
     #[test]
-    fn a_paged_source_view_carries_the_view_across_a_flip() {
+    fn a_long_markdown_opens_on_a_paged_source_that_still_offers_its_render() {
         // A 500-backtick fence run makes the fenced block outgrow the card
         // while the rendered body — which carries no fence — still fits.
         let body = format!("{}\n{}\n", "`".repeat(500), "x".repeat(20_000));
 
-        let mut card_view = view("/tmp/proj/paged.md", ViewerKind::Text, Some("md"), &body);
-        card_view.view = Some(ViewerView::Source);
-        let card = build_viewer_card(&key(), card_view);
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/proj/paged.md", ViewerKind::Text, Some("md"), &body),
+        );
+        assert!(has_pager(&card), "the source view pages: {}", card_text(&card));
         assert!(
             card_buttons(&card).iter().any(|b| b["value"]["op"] == "view"),
-            "the fixture's RENDER fits, so the toggle is offered: {}",
+            "the render fits, so it is still offered: {}",
             card_text(&card)
         );
-        assert!(has_pager(&card), "its SOURCE pages: {}", card_text(&card));
-        let next = card_buttons(&card)
-            .into_iter()
-            .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == "下一页")
-            .expect("the pager's next button");
-        assert_eq!(next["value"]["viewer_view"], "source", "{next}");
 
-        // The DEFAULT is the rendered view (no fence with a language token, no
-        // pager), so a flip that lost the view would visibly switch to it — the
-        // carriage is the only thing that keeps page 2 on the source. (The
-        // rendered body starts with the raw backtick line, so the discriminator
-        // is the fenced block's `markdown` token, not the backticks.)
-        let default_view = view("/tmp/proj/paged.md", ViewerKind::Text, Some("md"), &body);
-        let rendered = build_viewer_card(&key(), default_view);
+        let mut rendered_view = view("/tmp/proj/paged.md", ViewerKind::Text, Some("md"), &body);
+        rendered_view.view = Some(ViewerView::Rendered);
+        let rendered = build_viewer_card(&key(), rendered_view);
         assert!(
             !card_text(&rendered).contains("```markdown") && !has_pager(&rendered),
-            "the default renders with no pager: {}",
+            "the rendered view is one element with no pager: {}",
             card_text(&rendered)
         );
     }
@@ -2941,20 +2945,20 @@ mod tests {
     }
 
     /// #781: a re-read and a transfer each PATCH the viewer they were clicked
-    /// on, so both payloads carry the view the reader chose — reverting either
-    /// carriage would reset a source view to the default.
+    /// on, so both payloads carry the view the reader chose — dropping either
+    /// carriage resets an explicit Rendered view to the default source.
     #[test]
     fn the_reread_and_transfer_payloads_carry_the_chosen_view() {
         let mut card_view = view("/tmp/proj/notes.md", ViewerKind::Text, Some("md"), "# hi\n");
-        card_view.view = Some(ViewerView::Source);
+        card_view.view = Some(ViewerView::Rendered);
 
         let reread = reread_value(&key(), &card_view);
         assert_eq!(reread["op"], "reread");
-        assert_eq!(reread["viewer_view"], "source", "{reread}");
+        assert_eq!(reread["viewer_view"], "rendered", "{reread}");
 
         let transfer = transfer_value(&key(), &card_view);
         assert_eq!(transfer["op"], "send");
-        assert_eq!(transfer["viewer_view"], "source", "{transfer}");
+        assert_eq!(transfer["viewer_view"], "rendered", "{transfer}");
 
         // A card on the default carries nothing: its rebuilds re-decide it.
         let plain = view("/tmp/proj/notes.md", ViewerKind::Text, Some("md"), "# hi\n");
