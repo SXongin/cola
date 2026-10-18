@@ -777,58 +777,146 @@ async fn resolve_spawned_server_over(
 pub enum RestartOutcome {
     /// The running server was cola's own and has been restarted.
     Restarted,
+    /// The V2 Shared Service was restarted through `opencode service restart`.
+    RestartedService,
     /// No OpenCode server is currently running on the default store.
     NoServer,
     /// The running server was started by someone else — cola must not touch it.
     NotOwned,
 }
 
-/// Restart the running OpenCode server, but ONLY if it is one cola spawned.
+/// What `/restart-opencode` may do, decided purely from a scan. Follows the
+/// canonical pick: cola restarts the server it is attached to (or would attach
+/// to), never a lower-priority one it is about to yield.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestartPlan {
+    /// Restart the V2 Shared Service via the `opencode service` CLI.
+    Service,
+    /// Re-raise cola's Owned Server on the same port and password.
+    Owned { pid: i32, port: u16, password: String },
+    /// The canonical server is someone else's classic `serve --port`.
+    NotOwned,
+    /// Nothing eligible on the default store.
+    NoServer,
+}
+
+/// The restart decision — a pure function so Service / Owned / Coexistent /
+/// none are unit-tested without touching a process.
+fn restart_plan(candidates: &[ServerCandidate], self_pid: Option<i32>) -> RestartPlan {
+    let Some(server) = pick_server(candidates, None, self_pid) else {
+        return RestartPlan::NoServer;
+    };
+    match server.class_against(self_pid) {
+        ServerClass::Service => RestartPlan::Service,
+        ServerClass::Owned => RestartPlan::Owned {
+            pid: server.pid,
+            port: server.port,
+            password: server.password.clone(),
+        },
+        ServerClass::Coexistent => RestartPlan::NotOwned,
+    }
+}
+
+/// How long `/restart-opencode` waits for the managed service to serve again.
+const SERVICE_RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Restart the running OpenCode server according to [`restart_plan`].
 ///
-/// cola never restarts a server it doesn't own (e.g. one launched by another
-/// tool): it has no record of how that server was configured, and killing it
-/// could take down another application's runtime. `NotOwned` tells the caller
-/// to reply that the server needs a manual restart.
+/// A V2 Shared Service is restarted through its own CLI
+/// (`opencode service restart`); cola never kills or re-spawns it with
+/// `serve --port`, and never writes `self-opencode.pid` for it (ADR-0085).
+/// An Owned Server keeps the old path: terminate, wait for the port to free,
+/// re-raise on the same port/password, wait for it to accept. Any other
+/// server is someone else's — `NotOwned` tells the caller to ask for a manual
+/// restart, because cola has no record of how it was configured.
 pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
     let candidates = scan_processes();
-    let eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| c.uses_default_store).collect();
-    if eligible.is_empty() {
-        return Ok(RestartOutcome::NoServer);
+    match restart_plan(&candidates, self_spawned_pid()) {
+        RestartPlan::NoServer => Ok(RestartOutcome::NoServer),
+        RestartPlan::NotOwned => Ok(RestartOutcome::NotOwned),
+        RestartPlan::Service => restart_managed_service().await,
+        RestartPlan::Owned { pid, port, password } => {
+            // Confirm ownership against the live process before killing: the
+            // record must still name this pid AND it must be a real
+            // `opencode serve` (a recycled pid is never killed).
+            if !is_self_spawned(pid) {
+                return Ok(RestartOutcome::NotOwned);
+            }
+            restart_owned_server(pid, port, password).await
+        }
     }
-    // A coexistent server is running but cola owns nothing — never touch it.
-    let Some(server) = eligible.iter().find(|c| is_self_spawned(c.pid)).copied() else {
-        return Ok(RestartOutcome::NotOwned);
-    };
-    // Kill our own server, wait for the port to release, re-raise it on the same
-    // port/password, and wait until it accepts connections again.
+}
+
+/// Restart the V2 Shared Service without taking ownership of it. The daemon
+/// rewrites its registration file; cola waits, bounded, until a live
+/// `serve --service` matching that registration accepts connections again.
+async fn restart_managed_service() -> anyhow::Result<RestartOutcome> {
+    tracing::info!("restarting the V2 Shared Service (`opencode service restart`)");
+    let status = std::process::Command::new("opencode")
+        .args(["service", "restart"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("`opencode service restart` exited with {status}");
+    }
+    wait_for_live_service(SERVICE_RESTART_TIMEOUT).await?;
+    tracing::info!("shared OpenCode service is serving again");
+    Ok(RestartOutcome::RestartedService)
+}
+
+/// Poll until the registration file describes a live `serve --service` whose
+/// port accepts connections. `scan_processes` already refuses a stale
+/// registration pid, so a hit here is the service the CLI just raised.
+async fn wait_for_live_service(timeout: std::time::Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let live = scan_processes().into_iter().find(|c| c.is_service());
+        let reachable = match live {
+            Some(service) => tokio::net::TcpStream::connect(("127.0.0.1", service.port))
+                .await
+                .is_ok(),
+            None => false,
+        };
+        if reachable {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "the OpenCode service did not accept connections within {}s of restarting",
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// The Owned Server path: kill our own process, wait for the port to release,
+/// re-raise it on the same port/password, and wait until it accepts.
+async fn restart_owned_server(pid: i32, port: u16, password: String) -> anyhow::Result<RestartOutcome> {
     let _ = clear_self_spawned();
-    if let Err(e) = terminate_process(server.pid) {
-        tracing::warn!("terminate self-spawned opencode {} failed: {}", server.pid, e);
+    if let Err(e) = terminate_process(pid) {
+        tracing::warn!("terminate self-spawned opencode {} failed: {}", pid, e);
         return Err(e);
     }
-    tracing::info!("restarting self-spawned opencode (pid {})", server.pid);
+    tracing::info!("restarting self-spawned opencode (pid {})", pid);
     // Give the process time to die and the port to free up.
     for _ in 0..50 {
-        if !process_alive(server.pid) {
+        if !process_alive(pid) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     for _ in 0..25 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", server.port))
-            .await
-            .is_err()
-        {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    let pid = spawn_self_server(server.port, &server.password)?;
-    wait_for_port(server.port).await?;
+    let new_pid = spawn_self_server(port, &password)?;
+    wait_for_port(port).await?;
     tracing::info!(
         "restarted self-spawned opencode on port {} (pid {})",
-        server.port,
-        pid
+        port,
+        new_pid
     );
     Ok(RestartOutcome::Restarted)
 }
@@ -1057,6 +1145,46 @@ mod tests {
         let others = other_servers(&all, &service);
         assert_eq!(others.iter().map(|c| c.pid).collect::<Vec<_>>(), vec![2, 3]);
         assert!(other_servers(std::slice::from_ref(&service), &service).is_empty());
+    }
+
+    #[test]
+    fn restart_plan_restarts_the_shared_service() {
+        let owned = cand(1, 4096, "cola-secret", true);
+        let service = service_cand(2, 49374);
+        assert_eq!(restart_plan(&[owned, service], Some(1)), RestartPlan::Service);
+    }
+
+    #[test]
+    fn restart_plan_restarts_the_owned_server_on_its_own_port_and_password() {
+        let owned = cand(1, 4096, "cola-secret", true);
+        assert_eq!(
+            restart_plan(&[owned], Some(1)),
+            RestartPlan::Owned {
+                pid: 1,
+                port: 4096,
+                password: "cola-secret".into()
+            }
+        );
+    }
+
+    #[test]
+    fn restart_plan_reports_not_owned_for_a_coexistent_server() {
+        let coexist = cand(2, 52137, "openchamber", true);
+        assert_eq!(restart_plan(&[coexist], None), RestartPlan::NotOwned);
+        // The plan follows the canonical pick: an Owned Server that the
+        // Coexistent one outranks is about to be yielded, not restarted.
+        let owned = cand(1, 4096, "cola-secret", true);
+        let coexist = cand(2, 52137, "openchamber", true);
+        assert_eq!(restart_plan(&[owned, coexist], Some(1)), RestartPlan::NotOwned);
+    }
+
+    #[test]
+    fn restart_plan_reports_no_server() {
+        assert_eq!(restart_plan(&[], None), RestartPlan::NoServer);
+        let custom = cand(1, 4096, "x", false);
+        assert_eq!(restart_plan(&[custom], None), RestartPlan::NoServer);
+        let private = cand(2, 0, "stdio", true);
+        assert_eq!(restart_plan(&[private], None), RestartPlan::NoServer);
     }
 
     #[test]
