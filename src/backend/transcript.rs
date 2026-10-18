@@ -1522,6 +1522,18 @@ impl ToolStatus {
     pub fn is_live(&self) -> bool {
         matches!(self, Self::Pending | Self::Running)
     }
+
+    /// Whether the call settled as a FAILURE: the typed `Error`, or a status this
+    /// build does not model that the server named `failed`. One rule, so the
+    /// card's status icon, its error body and its panels' content cannot
+    /// disagree about whether a call failed.
+    pub fn is_failure(&self) -> bool {
+        match self {
+            Self::Error => true,
+            Self::Other(status) => status == "failed",
+            _ => false,
+        }
+    }
 }
 
 /// A tool call's output: the raw payload, its content blocks, and the
