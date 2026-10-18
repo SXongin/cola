@@ -473,3 +473,30 @@ needed to read one. That capability is now one tap away, with the source still t
 Not in this amendment: rendering any non-markdown text kind as markdown (the extension rule is the
 markdown trio alone), and any per-table authoring of source vs render — the sanitizer's existing
 budget behaviour is the whole of it.
+
+## Amendment (2026-10-18, #788): a `write` Tool Panel shows the file it produced
+
+§8 gave a `write` panel the way into the file it produced but left the panel itself showing only the
+path and the tool's bare success sentence — "Wrote file successfully." — so the file the agent had
+just written was the one thing the card did not show, even though §8's own reason for the button
+("the files the agent *produced*, which are the ones a reader wants in full") is that the produced
+file is what a reader wants. A `write` panel now renders that content as its body, the way a `read`
+panel already renders the file it read:
+
+- **The body is the call's own `content`.** The `content` input — V1's and V2's alike — is the
+  Output section's body, in place of the success sentence, which is dropped as noise the way `edit`
+  drops its summary. A trailing note the tool reported after that summary (V1's "LSP errors
+  detected …") is kept beside the content, as it is for an edit. The Input line and the folded
+  header are unchanged, and the body's `📄 <path>` header is the `read` panel's shape.
+- **The fence takes the touched file's language.** `language_for_path` (the one measured table the
+  File Viewer and a `read` panel share, #786) reads the call's own `filePath`/`path` through the
+  same `input_path` rule every file formatter uses, so a written `.md` previews its **source**,
+  exactly as the viewer's default does.
+- **The body is a preview like a `read`'s.** It is clamped to `TOOL_OUTPUT_MAX_CHARS` (3000)
+  characters, and a clipped one closes with the same `_（预览已截断，打开查看完整文件）_` note,
+  rendering exactly when the 「📂 打开」 button does (ADR-0083 §8 amendment, #770). The byte charge
+  follows: `panel_estimate` sums `panel_output_estimate` — the rendered content body — in place of
+  the output text it would otherwise count.
+- **A body only where one exists.** A FAILED `write` keeps its error text, and a call whose input
+  carries no usable `content` keeps today's output panel; nothing is invented. A `write` carries no
+  File Content block (ADR-0076), so this adds none.
