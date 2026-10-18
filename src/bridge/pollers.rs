@@ -23,15 +23,23 @@ async fn busy(waits: &WaitsHandle) -> bool {
     !waits.inflight.lock().await.is_empty()
 }
 
-/// Whether the server cola is currently attached to is its Owned Server
-/// (pid matches `self_pid`). None/false when serverless or attached to a
-/// Coexistent Server.
-fn current_is_owned(candidates: &[ServerCandidate], self_pid: Option<i32>, current: &str) -> bool {
-    let Some(self_pid) = self_pid else { return false };
+/// Whether the server cola is currently attached to is still present in this
+/// scan — the same process (pid, when the attach path carried one) on the same
+/// port, still on the default store.
+///
+/// This is the guard that separates "the canonical pick moved to another live
+/// server" (defer while a turn is in flight — the server being left behind is
+/// still serving) from "the attached server is gone" (reattach immediately,
+/// even busy: the endpoint is dead). A replacement on the same port is NOT the
+/// attached server — its pid differs, so the old endpoint is gone and the pass
+/// must re-resolve now.
+fn current_is_alive(candidates: &[ServerCandidate], current: &str, attached_pid: Option<i32>) -> bool {
     let Some(port) = crate::config::port_from_url(current) else {
         return false;
     };
-    candidates.iter().any(|c| c.port == port && c.pid == self_pid)
+    candidates.iter().any(|c| {
+        c.uses_default_store && c.port != 0 && c.port == port && attached_pid.is_none_or(|pid| c.pid == pid)
+    })
 }
 
 /// Whether this reconcile pass must re-resolve the attachment: the picked
@@ -140,11 +148,15 @@ pub(crate) async fn wait_for_server_ready(
 /// the canonical default-store server (Shared Service first, then a Coexistent
 /// Server over cola's Owned), lazily spawn an Owned Server when `allow_spawn`
 /// and none exists, and reap a leftover Owned Server once another server is
-/// the pick. When more than one eligible server exists, the pass also WARNs
-/// once naming the canonical and every ignored server, so the choice is
-/// visible without attempting to sync two servers. The reconnect loop runs
-/// this with `allow_spawn=false` on a cadence; the Lazy Start hook runs it with
-/// `allow_spawn=true` at the moment a server is needed.
+/// the pick. A migration — the yield included — is deferred while a turn is in
+/// flight AND the attached server is still alive, so an appearing Service (or
+/// a preferred sibling) never truncates a streaming generation; a dead
+/// attached server reattaches immediately (the heal path). When more than one
+/// eligible server exists, the pass also WARNs once naming the canonical and
+/// every ignored server, so the choice is visible without attempting to sync
+/// two servers. The reconnect loop runs this with `allow_spawn=false` on a
+/// cadence; the Lazy Start hook runs it with `allow_spawn=true` at the moment a
+/// server is needed.
 ///
 /// Returns whether a server is attached (or was just started).
 ///
@@ -251,10 +263,13 @@ async fn reconcile(
     let pick_is_owned = self_pid == Some(server.pid);
 
     if needs_reattach(&current, attached_pid, server) {
-        let current_is_owned = current_is_owned(&candidates, self_pid, &current);
-        if current_is_owned && !pick_is_owned && busy(&handles.flow.waits).await {
-            // Defer the yield: keep streaming on our Owned Server until idle,
-            // so the in-flight generation isn't truncated.
+        if current_is_alive(&candidates, &current, attached_pid) && busy(&handles.flow.waits).await {
+            // Defer ANY migration while a turn streams on a server that is
+            // still alive — not only the Owned-Server yield. A Shared Service
+            // appearing while cola is attached to OpenChamber (or a preferred
+            // sibling within the same class) is exactly the case the spec asks
+            // to defer, so the in-flight generation is never truncated. A dead
+            // current server is not deferred: the heal path reattaches now.
             return Ok(true);
         }
         tracing::warn!(
@@ -627,14 +642,24 @@ mod tests {
     }
 
     #[test]
-    fn current_is_owned_only_when_pid_and_port_match() {
+    fn current_is_alive_tracks_identity_not_just_the_port() {
         let servers = vec![cand(7, 4096)];
-        assert!(current_is_owned(&servers, Some(7), "http://localhost:4096"));
-        assert!(!current_is_owned(&servers, Some(8), "http://localhost:4096"));
-        assert!(!current_is_owned(&servers, None, "http://localhost:4096"));
-        assert!(!current_is_owned(&servers, Some(7), "http://localhost:4097"));
-        assert!(!current_is_owned(&servers, Some(7), "http://mock"));
-        assert!(!current_is_owned(&servers, Some(7), ""));
+        assert!(current_is_alive(&servers, "http://localhost:4096", Some(7)));
+        // A replacement on the same port is NOT the attached server: its
+        // endpoint is gone, so the pass must reattach immediately.
+        assert!(!current_is_alive(&servers, "http://localhost:4096", Some(8)));
+        // No identity on the attachment: the port is the only thing to compare.
+        assert!(current_is_alive(&servers, "http://localhost:4096", None));
+        assert!(!current_is_alive(&servers, "http://localhost:4097", Some(7)));
+        assert!(!current_is_alive(&servers, "http://mock", Some(7)));
+        assert!(!current_is_alive(&servers, "", Some(7)));
+        // A candidate on a custom store is someone else's data — not the
+        // attached server, even on the same port.
+        let custom = ServerCandidate {
+            uses_default_store: false,
+            ..cand(7, 4096)
+        };
+        assert!(!current_is_alive(&[custom], "http://localhost:4096", Some(7)));
     }
 
     /// Same-URL replacements are the reason identity (pid), not just the URL,
