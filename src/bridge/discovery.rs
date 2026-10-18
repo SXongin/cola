@@ -269,11 +269,28 @@ fn service_registration_credentials(env: &[String], pid: i32) -> Option<(u16, St
     Some((port, registration.password))
 }
 
+/// The basic-auth password a classic `serve --port` process carries in its
+/// environment. OpenCode's `Env.password` prefers `OPENCODE_PASSWORD` and falls
+/// back to the legacy `OPENCODE_SERVER_PASSWORD`, so cola reads the same order:
+/// a server started with only the preferred name would otherwise probe with an
+/// empty password and 401 forever (issue #812).
+fn password_from_env(env: &[String]) -> String {
+    env.iter()
+        .find_map(|kv| kv.strip_prefix("OPENCODE_PASSWORD="))
+        .or_else(|| {
+            env.iter()
+                .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
 /// Resolve one server process's attach credentials — port, username and
 /// password — or `None` when discovery cannot reach it.
 ///
 /// A classic `serve --port P` process carries its port in argv and its
-/// credentials in the process environment (V1's model). A V2 managed service
+/// credentials in the process environment (V1's model; see [`password_from_env`]
+/// for the password's name precedence). A V2 managed service
 /// (`serve --service`) has no `--port`; its registration file is the fallback
 /// attach path (spec #364 §2), and its username is fixed at `opencode` so a
 /// poisoned `OPENCODE_SERVER_USERNAME` cannot break the attach.
@@ -292,11 +309,7 @@ fn resolve_credentials(args: &[String], env: &[String], pid: i32) -> Option<(u16
         if port == 0 {
             return None;
         }
-        let password = env
-            .iter()
-            .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
-            .unwrap_or("")
-            .to_string();
+        let password = password_from_env(env);
         return Some((port, username_from_env(env), password));
     }
     if !args.iter().any(|a| a == "--service") {
@@ -335,6 +348,29 @@ fn class_from_args(args: &[String]) -> ServerClass {
     }
 }
 
+/// How many leading argv tokens may name the `opencode` entrypoint. An
+/// interpreter-launched dev server is `node <path>/opencode ... serve` or
+/// `bun <path>/opencode serve`, so the path sits at `argv[1]`; three tokens
+/// leave room for an interpreter flag without letting an unrelated later
+/// argument (say a `--cwd /home/opencode/...` path) stand in for the binary.
+const SERVE_ARGV_HEAD: usize = 3;
+
+/// Whether a process's argv is an `opencode … serve` invocation — the ONE
+/// server-recognition predicate, shared by [`scan_processes`] and
+/// [`is_live_opencode_serve`] so a discovered server and a live one can never
+/// disagree (issue #812).
+///
+/// The entrypoint need not be `argv[0]`: `node /opt/opencode/dist/index.js
+/// serve` and `bun …/opencode serve` are real dev launches. A `serve` that is
+/// only being described on the command line (`--help` / `-h`) is not a server.
+fn is_opencode_serve_args(args: &[String]) -> bool {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return false;
+    }
+    let names_opencode = args.iter().take(SERVE_ARGV_HEAD).any(|a| a.contains("opencode"));
+    names_opencode && args.iter().any(|a| a == "serve")
+}
+
 /// Whether a candidate may be selected/attached at all: it must read the
 /// default store, and port 0 is never an endpoint (issue #748).
 fn is_eligible(candidate: &ServerCandidate) -> bool {
@@ -362,8 +398,7 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 .iter()
                 .map(|s| s.to_string_lossy().into_owned())
                 .collect();
-            let is_server = args.first().map(|a| a.contains("opencode")).unwrap_or(false)
-                && args.iter().skip(1).any(|a| a == "serve");
+            let is_server = is_opencode_serve_args(&args);
             if !is_server {
                 return None;
             }
@@ -618,13 +653,12 @@ fn is_self_spawned_record(path: &std::path::Path, pid: i32) -> bool {
 
 /// Whether a pid is a live `opencode serve` process (not a dead/zombie pid that
 /// the OS recycled, and not some other program that happened to reuse the pid).
-/// Reads the process cmdline via sysinfo and checks the `serve` subcommand.
+/// Reads the process cmdline via sysinfo and applies the shared
+/// [`is_opencode_serve_args`] predicate, so liveness can never accept a command
+/// line a scan would reject.
 fn is_live_opencode_serve(pid: i32) -> bool {
     process_cmd(pid)
-        .map(|args| {
-            args.first().map(|a| a.contains("opencode")).unwrap_or(false)
-                && args.iter().skip(1).any(|a| a == "serve")
-        })
+        .map(|args| is_opencode_serve_args(&args))
         .unwrap_or(false)
 }
 
@@ -1852,6 +1886,11 @@ mod tests {
         pairs.iter().map(|(k, v)| format!("{k}={v}")).collect()
     }
 
+    /// A process argv as sysinfo returns it (one `String` per token).
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn server_candidate_url_uses_the_one_loopback_spelling() {
         assert_eq!(cand(7, 4096, "x", true).url(), "http://localhost:4096");
@@ -1890,6 +1929,80 @@ mod tests {
         assert_eq!(
             resolve_credentials(&args, &env, 7),
             Some((4096, "admin".to_string(), "secret".to_string()))
+        );
+    }
+
+    /// OpenCode's `Env.password` prefers `OPENCODE_PASSWORD` and falls back to
+    /// the legacy name; discovery must read the same order or a server started
+    /// with only the preferred name probes with an empty password and 401s
+    /// (issue #812).
+    #[test]
+    fn port_server_password_prefers_the_opencode_password_name() {
+        let args = argv(&["opencode", "serve", "--port", "4096"]);
+        let both = env_lines(&[
+            ("OPENCODE_PASSWORD", "preferred"),
+            ("OPENCODE_SERVER_PASSWORD", "legacy"),
+        ]);
+        assert_eq!(resolve_credentials(&args, &both, 7).unwrap().2, "preferred");
+        // Either name alone still works.
+        assert_eq!(
+            resolve_credentials(&args, &env_lines(&[("OPENCODE_PASSWORD", "preferred")]), 7)
+                .unwrap()
+                .2,
+            "preferred"
+        );
+        assert_eq!(
+            resolve_credentials(&args, &env_lines(&[("OPENCODE_SERVER_PASSWORD", "legacy")]), 7)
+                .unwrap()
+                .2,
+            "legacy"
+        );
+        // Neither set keeps the historical empty password (unauthenticated).
+        assert_eq!(resolve_credentials(&args, &[], 7).unwrap().2, "");
+    }
+
+    /// The one shared predicate must see interpreter-launched dev servers while
+    /// still rejecting anything that merely mentions `serve` — notably a help
+    /// invocation that lists the subcommand.
+    #[test]
+    fn is_opencode_serve_args_recognizes_direct_and_interpreter_launches() {
+        assert!(is_opencode_serve_args(&argv(&["/usr/bin/opencode", "serve"])));
+        assert!(is_opencode_serve_args(&argv(&[
+            "node",
+            "/opt/opencode/dist/index.js",
+            "serve",
+            "--port",
+            "4096"
+        ])));
+        assert!(is_opencode_serve_args(&argv(&[
+            "bun",
+            "/repo/opencode/src/index.ts",
+            "serve"
+        ])));
+
+        // Not `opencode`, even though the argv carries a `serve` token.
+        assert!(!is_opencode_serve_args(&argv(&[
+            "node",
+            "/opt/other/server.js",
+            "serve"
+        ])));
+        // No `serve` subcommand at all.
+        assert!(!is_opencode_serve_args(&argv(&["opencode"])));
+        // A help invocation is not a server.
+        assert!(!is_opencode_serve_args(&argv(&["opencode", "--help"])));
+        assert!(!is_opencode_serve_args(&argv(&["opencode", "serve", "--help"])));
+        assert!(!is_opencode_serve_args(&argv(&["opencode", "serve", "-h"])));
+    }
+
+    /// The dev-launch argv also reaches `resolve_credentials`: port from argv,
+    /// password from the environment — no registration file involved.
+    #[test]
+    fn dev_launched_serve_resolves_port_and_password() {
+        let args = argv(&["node", "/opt/opencode/dist/index.js", "serve", "--port", "4096"]);
+        let env = env_lines(&[("OPENCODE_PASSWORD", "preferred")]);
+        assert_eq!(
+            resolve_credentials(&args, &env, 7),
+            Some((4096, "opencode".to_string(), "preferred".to_string()))
         );
     }
 
