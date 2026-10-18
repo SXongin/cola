@@ -358,11 +358,9 @@ pub(crate) fn fenced_code(text: &str, lang: Option<&str>) -> String {
 /// The shortest fence [`fenced_code`] ever emits, in backticks.
 const MIN_FENCE_LEN: usize = 3;
 
-/// The fence length [`fenced_code`] needs for `text`: one backtick longer than
-/// the text's longest backtick run, so a run inside the content can never close
-/// the block. The one place the rule lives — the fence and the size charge that
-/// must cover it both read it.
-fn fenced_run(text: &str) -> usize {
+/// The longest run of consecutive backticks in `text` — the content fact both
+/// the fence length and its size charge derive from.
+fn longest_backtick_run(text: &str) -> usize {
     text.chars()
         .fold((0usize, 0usize), |(best, run), c| {
             if c == '`' {
@@ -373,7 +371,35 @@ fn fenced_run(text: &str) -> usize {
             }
         })
         .0
-        + 1
+}
+
+/// The fence length [`fenced_code`] needs for `text`: one backtick longer than
+/// the text's longest backtick run, so a run inside the content can never close
+/// the block. The one place the rule lives — the fence and the size charge that
+/// must cover it both read it.
+fn fenced_run(text: &str) -> usize {
+    longest_backtick_run(text) + 1
+}
+
+/// The bytes [`fenced_code`] adds around a body whose longest backtick run is
+/// `longest_run`: the two fences and the two newlines that pad the body, NOT
+/// the language token (it rides the header, covered by the per-element wrapper
+/// constant like the minimum fence). Expressed on the run itself so a byte
+/// budget can include the fence while a clip grows the run one character at a
+/// time — [`fenced_block_overhead`] is the same rule over a finished text, so
+/// the two cannot disagree.
+pub(crate) fn fenced_block_bytes(longest_run: usize) -> usize {
+    let fence = (longest_run + 1).max(MIN_FENCE_LEN);
+    2 * fence + 2
+}
+
+/// The whole fence-and-newline cost [`fenced_code`] adds around `text`,
+/// minimum fence included. A caller that must keep the body AND its fence
+/// inside one byte budget reads this; [`fenced_overhead`] is the same quantity
+/// minus the minimum fence, which the per-element wrapper constant already
+/// covers.
+pub(crate) fn fenced_block_overhead(text: &str) -> usize {
+    fenced_block_bytes(longest_backtick_run(text))
 }
 
 /// The bytes the **rejection fallback**'s fence adds around `text`, beyond the
@@ -383,11 +409,10 @@ fn fenced_run(text: &str) -> usize {
 ///
 /// The minimum fence's own bytes are NOT part of this quantity: the per-element
 /// wrapper constant the callers add on top already covers them. Pure, and
-/// measured from the text alone — the same [`fenced_run`] the render sizes its
-/// fence with, so the charge cannot drift from what will be written.
+/// measured from the text alone — the same [`longest_backtick_run`] the render
+/// sizes its fence with, so the charge cannot drift from what will be written.
 pub(crate) fn fenced_overhead(text: &str) -> usize {
-    let fence = fenced_run(text).max(MIN_FENCE_LEN);
-    (2 * fence + 2).saturating_sub(2 * MIN_FENCE_LEN + 2)
+    fenced_block_overhead(text).saturating_sub(fenced_block_bytes(0))
 }
 
 /// The content cap for a session title, in characters. The server's `title`

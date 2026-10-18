@@ -3,7 +3,10 @@ use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::{AwaitingAction, clip_md, exceeds_md_budget, fenced_code, fenced_overhead, truncate_md};
+use super::{
+    AwaitingAction, clip_md, exceeds_md_budget, fenced_block_bytes, fenced_block_overhead, fenced_code,
+    fenced_overhead, truncate_md,
+};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
@@ -44,8 +47,13 @@ pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_"
 /// input, header, button and note. Bytes are what Feishu limits and what the
 /// splitter estimates; a character cap would let one CJK char (3 bytes) or one
 /// control char (JSON's six-byte `\uXXXX` escape) count as one and blow the
-/// budget by up to sixfold. Shared with the permission card, which renders the
-/// same diff under the same cap (#794).
+/// budget by up to sixfold.
+///
+/// The budget covers the escaped body AND the fence [`fenced_code`] wraps it
+/// in ([`clip_fenced_body`]): a body carrying a long backtick run would
+/// otherwise clip at ~12 KB and demand ~24 KB more in fence, blowing the card
+/// on its own. Shared with the permission card, which renders the same diff
+/// under the same cap (#794).
 pub(crate) const DIFF_MAX_ESCAPED_BYTES: usize = 12_000;
 
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
@@ -1017,25 +1025,49 @@ fn escaped_char_len(c: char) -> usize {
     }
 }
 
-/// Clip `text` to at most `max_escaped_bytes` bytes of its JSON-escaped form,
-/// with NO truncation marker — the bare clip a fenced body takes when a note
-/// below the fence says it was clipped (the `…` immediately before a closing
-/// fence stops Feishu rendering the block as code at all, #788). Measured in
-/// escaped bytes, not characters, so the cap matches the card's own byte
-/// budget ([`DIFF_MAX_ESCAPED_BYTES`], #792); the cut lands on a character
+/// Whether `text` fits a fenced-body budget: its JSON-escaped length PLUS the
+/// whole fence [`fenced_code`] will wrap it in (dynamic backtick run, minimum
+/// fence and newlines). The one budget test [`clip_fenced_body`] and the diff
+/// note share, so a body is clipped exactly when the note says so.
+fn fenced_body_fits(text: &str, max_escaped_bytes: usize) -> bool {
+    json_escaped_len(text) + fenced_block_overhead(text) <= max_escaped_bytes
+}
+
+/// Clip `text` to fit `max_escaped_bytes`, where the budget covers the body's
+/// JSON-escaped bytes AND the fence [`fenced_code`] adds around it, with NO
+/// truncation marker — the bare clip a fenced body takes when a note below the
+/// fence says it was clipped (the `…` immediately before a closing fence stops
+/// Feishu rendering the block as code at all, #788).
+///
+/// The fence must be inside the budget, not beside it: `fenced_code` sizes its
+/// fence to the body's longest backtick run plus one, so a body that clips at
+/// the cap while carrying a run of backticks would demand up to twice the cap
+/// in fence alone — ~36 KB from a 12 KB body, past both the card estimate and
+/// Feishu's hard limit, and a lone panel cannot split away from it. The walk
+/// therefore charges each char's escaped bytes plus the fence growth a new
+/// backtick run causes, and stops before the one that would cross the budget
+/// (the charge only ever grows, so the first over-budget prefix is the answer).
+/// Measured in escaped bytes, not characters, so the cap matches the card's own
+/// byte budget ([`DIFF_MAX_ESCAPED_BYTES`], #792); the cut lands on a character
 /// boundary. Shared with the permission card (#794).
-pub(crate) fn clip_escaped_bytes(text: &str, max_escaped_bytes: usize) -> String {
-    if json_escaped_len(text) <= max_escaped_bytes {
+pub(crate) fn clip_fenced_body(text: &str, max_escaped_bytes: usize) -> String {
+    if fenced_body_fits(text, max_escaped_bytes) {
         return text.to_string();
     }
     let mut used = 0usize;
+    let mut run = 0usize;
+    let mut longest = 0usize;
     let mut clipped = String::new();
     for c in text.chars() {
         let cost = escaped_char_len(c);
-        if used + cost > max_escaped_bytes {
+        let next_run = if c == '`' { run + 1 } else { 0 };
+        let next_longest = longest.max(next_run);
+        if used + cost + fenced_block_bytes(next_longest) > max_escaped_bytes {
             break;
         }
         used += cost;
+        run = next_run;
+        longest = next_longest;
         clipped.push(c);
     }
     clipped
@@ -1197,14 +1229,14 @@ fn diff_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> 
 /// The note a file-editing panel appends under a diff its budget CLIPPED
 /// ([`DIFF_TRUNCATION_NOTE`]): the clip's only signal, because the fenced body
 /// clips bare (#788). Renders IFF the body the panel shows is a recognized diff
-/// ([`diff_output`]) whose JSON-escaped length exceeds
-/// [`DIFF_MAX_ESCAPED_BYTES`] — a FAILED call's error text is not a diff and
-/// takes no note, since there is no change to name. Unlike
-/// [`preview_truncation_note`] it needs no button: "已截断" is true even when
-/// nothing can be opened, so the reader still knows the diff is partial.
+/// ([`diff_output`]) whose escaped body PLUS its fence exceeds
+/// [`DIFF_MAX_ESCAPED_BYTES`] ([`fenced_body_fits`]) — a FAILED call's error
+/// text is not a diff and takes no note, since there is no change to name.
+/// Unlike [`preview_truncation_note`] it needs no button: "已截断" is true even
+/// when nothing can be opened, so the reader still knows the diff is partial.
 fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
     diff_output(tool)
-        .filter(|(_, _, body)| json_escaped_len(body) > DIFF_MAX_ESCAPED_BYTES)
+        .filter(|(_, _, body)| !fenced_body_fits(body, DIFF_MAX_ESCAPED_BYTES))
         .map(|_| DIFF_TRUNCATION_NOTE)
 }
 
@@ -1339,15 +1371,24 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 /// the panel never writes, nor miss the file a `write` just produced — and a
 /// diff is charged under the SAME cap it renders under, never the old
 /// 3,000-character preview (#792).
+///
+/// The boundary #792's acceptance line names: a diff that already fit the old
+/// 3,000-character preview renders exactly as it did before and is charged at
+/// its rendered size — the clip is a no-op, so nothing grows. Only a diff the
+/// byte budget newly reveals (over 3,000 characters but inside
+/// [`DIFF_MAX_ESCAPED_BYTES`]) is charged larger than the old preview charge,
+/// because the card now carries those bytes. Ordinary `read`/`write` panels
+/// keep their 3,000-character budget and their old charge untouched.
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
     // A diff renders its parsed hunks clipped at the byte budget, not the raw
     // recorded diff at the preview cap: charge exactly that body, the count
-    // header above it and the fence around it.
+    // header above it and the fence around it. The clip includes the fence in
+    // its budget, so the charge can never trail a backtick run's fence.
     if let Some((header, _, body)) = diff_output(tool) {
         let header = header
             .map(|header| json_escaped_len(&CardMarkdown::new().element(&header)))
             .unwrap_or(0);
-        let body = clip_escaped_bytes(&body, DIFF_MAX_ESCAPED_BYTES);
+        let body = clip_fenced_body(&body, DIFF_MAX_ESCAPED_BYTES);
         return header + json_escaped_len(&body) + fenced_overhead(&body);
     }
     let write = write_body(tool);
@@ -1467,7 +1508,7 @@ pub(super) fn tool_panel_element(
             // the way-in note), exactly as before.
             let note = truncation_note(tool, session_id);
             let body = if is_diff_body(name, &style) {
-                clip_escaped_bytes(&body, DIFF_MAX_ESCAPED_BYTES)
+                clip_fenced_body(&body, DIFF_MAX_ESCAPED_BYTES)
             } else if note.is_some() && matches!(style, BodyStyle::Code(_)) {
                 clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
             } else {
@@ -5190,27 +5231,38 @@ Index: src/main.rs
     }
 
     /// #792: the diff body budget is measured in JSON-ESCAPED bytes, not
-    /// characters. The widest single character escapes to six bytes (a control
-    /// char as `\uXXXX`), so a character-counted cap of the same number lets a
-    /// quote-, newline- or CJK-heavy body blow the card budget severalfold —
-    /// while a 6,000-char ASCII diff, which fits, must pass through whole.
+    /// characters, AND it includes the fence `fenced_code` will add. The widest
+    /// single character escapes to six bytes (a control char as `\uXXXX`), so a
+    /// character-counted cap of the same number lets a quote-, newline- or
+    /// CJK-heavy body blow the card budget severalfold; and a body of backticks
+    /// costs up to twice its escaped length again in fence, which a body-only
+    /// cap misses entirely.
     #[test]
-    fn the_diff_clip_counts_json_escaped_bytes_not_characters() {
-        // Plain ASCII: 6,000 chars is 6,000 escaped bytes, so it fits.
+    fn the_diff_clip_counts_json_escaped_bytes_and_its_fence() {
+        // Plain ASCII: 6,000 chars plus the 8-byte minimum fence fits.
         let ascii = "a".repeat(6_000);
-        assert_eq!(clip_escaped_bytes(&ascii, DIFF_MAX_ESCAPED_BYTES), ascii);
-        // CJK: 5,000 chars is 15,000 escaped bytes; whole characters only.
+        assert_eq!(clip_fenced_body(&ascii, DIFF_MAX_ESCAPED_BYTES), ascii);
+        // CJK: 5,000 chars is 15,000 escaped bytes; whole characters only, and
+        // the minimum fence leaves 11,992 bytes for the body.
         let cjk = "中".repeat(5_000);
-        assert_eq!(
-            clip_escaped_bytes(&cjk, DIFF_MAX_ESCAPED_BYTES),
-            "中".repeat(4_000)
-        );
+        assert_eq!(clip_fenced_body(&cjk, DIFF_MAX_ESCAPED_BYTES), "中".repeat(3_997));
         // A control character is JSON's widest escape: six bytes, so the cap
-        // holds exactly 2,000 of them.
+        // holds 1,998 of them beside the minimum fence.
         let control = "\u{1}".repeat(3_000);
-        let clipped = clip_escaped_bytes(&control, DIFF_MAX_ESCAPED_BYTES);
-        assert_eq!(clipped.chars().count(), 2_000);
-        assert_eq!(json_escaped_len(&clipped), DIFF_MAX_ESCAPED_BYTES);
+        let clipped = clip_fenced_body(&control, DIFF_MAX_ESCAPED_BYTES);
+        assert_eq!(clipped.chars().count(), 1_998);
+        assert!(json_escaped_len(&clipped) + fenced_block_overhead(&clipped) <= DIFF_MAX_ESCAPED_BYTES);
+        // A single 20,000-backtick run: the fence is one backtick longer on
+        // each side, so only 3,998 survive — 3,998 escaped bytes plus an 8,000
+        // byte fence. Clipping on escaped bytes alone would keep 12,000 and
+        // then pay ~24,000 more in fence.
+        let ticks = "`".repeat(20_000);
+        let clipped = clip_fenced_body(&ticks, DIFF_MAX_ESCAPED_BYTES);
+        assert_eq!(clipped.len(), 3_998);
+        assert_eq!(
+            json_escaped_len(&clipped) + fenced_block_overhead(&clipped),
+            11_998
+        );
         // The per-character charge the clip walks is serde_json's own total.
         let mixed = "a\"\\\n\t\u{1}\u{7f}中";
         let sum: usize = mixed.chars().map(escaped_char_len).sum();
@@ -5273,15 +5325,14 @@ Index: src/main.rs
             .and_then(|rest| rest.split_once("\n```\n\n"))
             .unwrap_or_else(|| panic!("one closed fence above the note: {md}"));
         assert_eq!(after, DIFF_TRUNCATION_NOTE, "the note follows the fence: {md}");
+        let fenced = json_escaped_len(body) + fenced_block_overhead(body);
         assert!(
-            json_escaped_len(body) <= DIFF_MAX_ESCAPED_BYTES,
-            "the rendered body respects the byte budget: {}",
-            json_escaped_len(body)
+            fenced <= DIFF_MAX_ESCAPED_BYTES,
+            "the rendered body plus its fence respects the budget: {fenced}"
         );
         assert!(
-            json_escaped_len(body) > DIFF_MAX_ESCAPED_BYTES - 6,
-            "the clip fills the budget rather than cutting early: {}",
-            json_escaped_len(body)
+            fenced > DIFF_MAX_ESCAPED_BYTES - 8,
+            "the clip fills the budget rather than cutting early: {fenced}"
         );
     }
 
