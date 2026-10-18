@@ -151,6 +151,18 @@ Notes for #669:
   tokenized contents)") [ours] — that is cc-connect's choice, not a Feishu feature.
 - Four or more leading spaces also produce a code block (CommonMark indented code block) [doc].
 
+**Measured addendum (2026-10-18, live card, one code block per `markdown` element).** The
+documented list above is **not** the client's grammar registry. `c_sharp`, `protobuf`,
+`docker_file`, `cmake`, `makefile`, `diff` and the short `ts` render with **no syntax
+colour**, while the undocumented `cs`, `typescript` and the short aliases
+`rs`/`md`/`js`/`py`/`sh`/`yml` **do** highlight — and `typescript`, not `ts`, is the token
+that colourises a `.ts` file [ours]. A fenced `diff` gets no red/green on the `+`/`-` lines;
+fencing the same hunk with the **touched file's own language** DOES colour its keywords and
+strings [ours]. Fence placement matters too: a fence whose opening line directly follows a
+paragraph line is sometimes not parsed as a code block, which is why every measurement block
+was its own element. cola's resulting extension→token table is `src/feishu/card/lang.rs`,
+which pins both the measured-working and the measured-broken spellings.
+
 ### 1.4 Size / element limits — documented vs measured
 
 | Limit | Value | Provenance |

@@ -39,6 +39,7 @@ use serde_json::json;
 use crate::backend::file_content::human_size;
 use crate::config::ThreadKey;
 
+use super::lang::{PLAIN_TEXT, language_token};
 use super::sanitize::{CardMarkdown, MAX_TABLE_ROWS, serialized_len};
 use super::session::{BrowseView, browse_view_value, pager_element};
 use super::shell::card_shell;
@@ -301,181 +302,6 @@ pub(crate) fn kind_for_extension(ext: Option<&str>) -> ViewerKind {
         Some("csv" | "tsv") => ViewerKind::Delimited,
         _ => ViewerKind::Text,
     }
-}
-
-/// What the platform renders when a code block carries no language it knows:
-/// Feishu's own Plain Text token (research §1.3). The viewer asks for it by
-/// name for an extension it has no token for, so the degradation is visible in
-/// the card rather than an unlabelled fence.
-pub(crate) const PLAIN_TEXT: &str = "plain_text";
-
-/// Every language token Feishu's fenced code blocks accept, verbatim from the
-/// docs (research §1.3). The runtime never needs the whole list — the map below
-/// is what it reads; this copy exists so the test can prove every mapped token
-/// is one the platform documents and the table cannot invent one.
-#[cfg(test)]
-const FEISHU_CODE_TOKENS: &[&str] = &[
-    "plain_text",
-    "abap",
-    "ada",
-    "apache",
-    "apex",
-    "assembly",
-    "bash",
-    "c_sharp",
-    "cpp",
-    "c",
-    "cmake",
-    "cobol",
-    "css",
-    "coffee_script",
-    "d",
-    "dart",
-    "delphi",
-    "diff",
-    "django",
-    "docker_file",
-    "erlang",
-    "fortran",
-    "gherkin",
-    "go",
-    "graphql",
-    "groovy",
-    "html",
-    "htmlbars",
-    "http",
-    "haskell",
-    "json",
-    "java",
-    "javascript",
-    "julia",
-    "kotlin",
-    "latex",
-    "lisp",
-    "lua",
-    "matlab",
-    "makefile",
-    "markdown",
-    "nginx",
-    "objective_c",
-    "opengl_shading_language",
-    "php",
-    "perl",
-    "powershell",
-    "prolog",
-    "properties",
-    "protobuf",
-    "python",
-    "r",
-    "ruby",
-    "rust",
-    "sas",
-    "scss",
-    "sql",
-    "scala",
-    "scheme",
-    "shell",
-    "solidity",
-    "swift",
-    "toml",
-    "thrift",
-    "typescript",
-    "vbscript",
-    "visual_basic",
-    "xml",
-    "yaml",
-];
-
-/// The extension → language-token table (lowercased extension, no dot).
-/// Deliberately absent — they render as [`PLAIN_TEXT`] — are the extensions
-/// whose token would be a guess: `.ts`/`.tsx`/`.jsx` (a `.ts` file may be a
-/// TypeScript source, an MPEG transport stream or a translation table), `.log`,
-/// `.txt`, `.ini`, `.cfg`, `.conf`, `.env` (no token exists) and everything
-/// else unknown. An absent extension is never forced into a near-miss
-/// spelling: honest plain text beats a highlight that lies.
-const EXT_LANGUAGE: &[(&str, &str)] = &[
-    ("md", "markdown"),
-    ("markdown", "markdown"),
-    ("rs", "rust"),
-    ("py", "python"),
-    ("pyi", "python"),
-    ("js", "javascript"),
-    ("mjs", "javascript"),
-    ("cjs", "javascript"),
-    ("ts", PLAIN_TEXT),
-    ("tsx", PLAIN_TEXT),
-    ("jsx", PLAIN_TEXT),
-    ("go", "go"),
-    ("java", "java"),
-    ("kt", "kotlin"),
-    ("kts", "kotlin"),
-    ("swift", "swift"),
-    ("c", "c"),
-    ("h", "c"),
-    ("cc", "cpp"),
-    ("cpp", "cpp"),
-    ("cxx", "cpp"),
-    ("hpp", "cpp"),
-    ("hh", "cpp"),
-    ("cs", "c_sharp"),
-    ("rb", "ruby"),
-    ("php", "php"),
-    ("pl", "perl"),
-    ("pm", "perl"),
-    ("lua", "lua"),
-    ("r", "r"),
-    ("sql", "sql"),
-    ("sh", "bash"),
-    ("bash", "bash"),
-    ("zsh", "shell"),
-    ("ps1", "powershell"),
-    ("psm1", "powershell"),
-    ("json", "json"),
-    ("toml", "toml"),
-    ("yaml", "yaml"),
-    ("yml", "yaml"),
-    ("xml", "xml"),
-    ("xsd", "xml"),
-    ("svg", "xml"),
-    ("html", "html"),
-    ("htm", "html"),
-    ("css", "css"),
-    ("scss", "scss"),
-    ("diff", "diff"),
-    ("patch", "diff"),
-    ("proto", "protobuf"),
-    ("tex", "latex"),
-    ("hs", "haskell"),
-    ("scala", "scala"),
-    ("dart", "dart"),
-    ("groovy", "groovy"),
-    ("gradle", "groovy"),
-    ("erl", "erlang"),
-    ("graphql", "graphql"),
-    ("gql", "graphql"),
-    ("dockerfile", "docker_file"),
-    ("mk", "makefile"),
-    ("cmake", "cmake"),
-    ("ex", PLAIN_TEXT),
-    ("txt", PLAIN_TEXT),
-    ("log", PLAIN_TEXT),
-    ("ini", PLAIN_TEXT),
-    ("cfg", PLAIN_TEXT),
-    ("conf", PLAIN_TEXT),
-    ("env", PLAIN_TEXT),
-];
-
-/// The language token for a file's extension, or [`PLAIN_TEXT`] when the
-/// platform has none for it.
-pub(crate) fn language_token(ext: Option<&str>) -> &'static str {
-    let Some(ext) = ext.map(str::to_ascii_lowercase) else {
-        return PLAIN_TEXT;
-    };
-    EXT_LANGUAGE
-        .iter()
-        .find(|(candidate, _)| *candidate == ext)
-        .map(|(_, token)| *token)
-        .unwrap_or(PLAIN_TEXT)
 }
 
 /// The columns one delimited-text preview renders. A table wider than this
@@ -1906,37 +1732,13 @@ mod tests {
         view
     }
 
-    /// Every token the map can produce is one Feishu documents, no extension is
-    /// listed twice, and the extensions whose token would be a guess stay
-    /// `plain_text` (ADR-0083 §6, research §1.3).
+    /// The map's own verification moved to [`super::lang`] with the table: it
+    /// pins the measured tokens (`cs`, `typescript`, the short aliases) and the
+    /// spellings that render plain. Here only the viewer's contract: an
+    /// extension with no honest token still renders as plain text rather than a
+    /// near-miss highlight (ADR-0083 §6).
     #[test]
-    fn extension_map_only_names_platform_tokens() {
-        for (ext, token) in EXT_LANGUAGE {
-            assert!(
-                FEISHU_CODE_TOKENS.contains(token),
-                "`{ext}` maps to `{token}`, which Feishu does not document"
-            );
-            assert_eq!(
-                language_token(Some(ext)),
-                *token,
-                "`{ext}` must map to its own table entry"
-            );
-            let upper = ext.to_uppercase();
-            assert_eq!(
-                language_token(Some(&upper)),
-                *token,
-                "the match is case-insensitive (`{upper}`)"
-            );
-        }
-        let mut exts: Vec<&str> = EXT_LANGUAGE.iter().map(|(e, _)| *e).collect();
-        exts.sort();
-        let before = exts.len();
-        exts.dedup();
-        assert_eq!(exts.len(), before, "no duplicate extension entries");
-
-        // An extension with no honest token renders as plain text rather than a
-        // near-miss highlight.
-        assert_eq!(language_token(Some("ts")), PLAIN_TEXT);
+    fn an_extension_without_a_token_stays_plain_text() {
         assert_eq!(language_token(Some("log")), PLAIN_TEXT);
         assert_eq!(language_token(Some("env")), PLAIN_TEXT);
         assert_eq!(language_token(Some("zzz")), PLAIN_TEXT);
