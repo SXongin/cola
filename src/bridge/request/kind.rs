@@ -13,6 +13,9 @@ use crate::bridge::pollers::result_card;
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::turn::Turn;
+use crate::feishu::card::tool_render::{
+    DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_language_for, parse_edit_diff,
+};
 use crate::opencode;
 
 use super::delivery::{
@@ -1528,11 +1531,6 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Cap for an edit diff shown on a permission card. The request body is one
-/// card element with no further chunking on the standalone card, so a huge
-/// diff must be clipped here to stay under Feishu's card size limit.
-const PERMISSION_DIFF_MAX_CHARS: usize = 1200;
-
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by the snapshot card's pending block,
 /// ADR-0028 — the adopt-time block must look and behave like today's cards).
@@ -1561,12 +1559,13 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
     if matches!(action, "edit" | "patch" | "apply_patch")
         && let Some(diff) = diff
     {
-        let parsed = crate::feishu::card::tool_render::parse_edit_diff(diff);
-        let path = p
+        let parsed = parse_edit_diff(diff);
+        let metadata_filepath = p
             .metadata
             .as_ref()
             .and_then(|m| m.get("filepath"))
-            .and_then(|v| v.as_str())
+            .and_then(|v| v.as_str());
+        let path = metadata_filepath
             .or_else(|| parsed.as_ref().and_then(|d| d.path.as_deref()))
             .or_else(|| p.patterns.first().map(String::as_str))
             .unwrap_or("?");
@@ -1579,18 +1578,38 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
             )),
             None => s.push_str(&format!("**改动**: 📄 `{}`\n", truncate(path, 200))),
         }
+        // The fence language: the metadata `filepath` first, then every file the
+        // diff itself names (`EditDiff::paths`, so a multi-file patch agrees on
+        // one language), and the first pattern only when neither names a file.
+        // `diff_language_for` falls to `plain_text` when they disagree, so a
+        // `.rs` hunk is never coloured with a `.md` file's grammar.
+        let mut language_paths: Vec<&str> = metadata_filepath.into_iter().collect();
+        if let Some(d) = parsed.as_ref() {
+            for touched in &d.paths {
+                if !language_paths.contains(&touched.as_str()) {
+                    language_paths.push(touched);
+                }
+            }
+        }
+        let language = if language_paths.is_empty() {
+            diff_language_for(p.patterns.first().map(String::as_str))
+        } else {
+            diff_language_for(language_paths)
+        };
         let body = parsed.map(|d| d.body).unwrap_or_else(|| diff.to_string());
         // Clip BARE, then say so outside the fence: the `…` `truncate_md`
         // appends immediately before the closing fence stops Feishu rendering
         // the block as code at all (#788) — and this is the card where a reader
         // decides whether to approve the change, so losing the code block is
-        // worse here than anywhere.
-        let clipped = crate::feishu::card::exceeds_md_budget(&body, PERMISSION_DIFF_MAX_CHARS);
-        let body = crate::feishu::card::clip_md(&body, PERMISSION_DIFF_MAX_CHARS);
-        s.push_str(&crate::feishu::card::fenced_code(&body, None));
+        // worse here than anywhere. The budget is the Tool Panel's own escaped
+        // byte cap (#792): the same diff renders under the same limit on both
+        // surfaces, and bytes are what the card's JSON budget counts.
+        let clipped = clip_fenced_body(&body, DIFF_MAX_ESCAPED_BYTES);
+        let was_clipped = clipped.len() != body.len();
+        s.push_str(&crate::feishu::card::fenced_code(&clipped, Some(language)));
         s.push('\n');
-        if clipped {
-            s.push_str(crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE);
+        if was_clipped {
+            s.push_str(DIFF_TRUNCATION_NOTE);
             s.push('\n');
         }
     } else if let Some(meta) = &p.metadata {
@@ -1664,33 +1683,94 @@ Index: /proj/src/main.rs
         assert!(s.contains("@@ -1 +1 @@"), "hunk header: {}", s);
         assert!(s.contains("-old line"), "removed line: {}", s);
         assert!(s.contains("+new line"), "added line: {}", s);
-        assert!(s.contains("```"), "diff fenced: {}", s);
+        assert!(
+            s.contains("```rust\n@@ -1 +1 @@"),
+            "the diff is fenced with the edited file's language: {}",
+            s
+        );
         assert!(s.contains("是否允许"), "closing prompt: {}", s);
+        assert!(
+            !s.contains(DIFF_TRUNCATION_NOTE),
+            "a one-line change stays under the budget: {}",
+            s
+        );
         // The diff must not leak as escaped raw JSON metadata.
         assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
     }
 
-    /// #788: a permission diff past the cap clips BARE and says so after the
-    /// fence. The `…` inside a fenced body stops Feishu rendering it as code —
-    /// and this card is where the reader decides whether to approve.
+    #[test]
+    fn describe_permission_fences_by_the_touched_files_language() {
+        for (path, diff_path, needle) in [
+            ("/proj/notes.md", "/proj/notes.md", "```markdown\n@@ -1 +1 @@"),
+            ("/proj/script.py", "/proj/script.py", "```python\n@@ -1 +1 @@"),
+            (
+                "/proj/thing.unknownext",
+                "/proj/thing.unknownext",
+                "```plain_text\n@@ -1 +1 @@",
+            ),
+        ] {
+            let diff = format!("--- {diff_path}\n+++ {diff_path}\n@@ -1 +1 @@\n-old\n+new");
+            let p = perm("edit", serde_json::json!({ "filepath": path, "diff": diff }));
+            let s = describe_permission(&p);
+            assert!(s.contains(needle), "`{path}` fence language: {s}");
+        }
+    }
+
+    /// A multi-file patch shares ONE fence language: every touched file must
+    /// agree, or the hunks would be coloured with one file's grammar.
+    #[test]
+    fn describe_permission_multi_file_diff_agrees_on_one_language() {
+        let same = "\
+Index: /proj/src/a.rs
+===
+--- /proj/src/a.rs
++++ /proj/src/a.rs
+@@ -1 +1 @@
+-a
++a2
+Index: /proj/src/b.rs
+===
+--- /proj/src/b.rs
++++ /proj/src/b.rs
+@@ -1 +1 @@
+-b
++b2";
+        let p = perm("apply_patch", serde_json::json!({ "diff": same }));
+        let s = describe_permission(&p);
+        assert!(s.contains("```rust\n@@ -1 +1 @@"), "shared .rs language: {s}");
+
+        let mixed = same.replace("/proj/src/b.rs", "/proj/notes.md");
+        let p = perm("apply_patch", serde_json::json!({ "diff": mixed }));
+        let s = describe_permission(&p);
+        assert!(
+            s.contains("```plain_text\n@@ -1 +1 @@"),
+            "disagreeing languages fall to plain_text: {s}"
+        );
+    }
+
+    /// #788/#792/#794: a permission diff past the byte budget clips BARE and
+    /// says so after the fence. The `…` inside a fenced body stops Feishu
+    /// rendering it as code — and this card is where the reader decides
+    /// whether to approve.
     #[test]
     fn a_clipped_permission_diff_keeps_its_code_block_and_says_so() {
         let mut diff = String::from(
-            "Index: /proj/src/main.rs\n===\n--- /proj/src/main.rs\n+++ /proj/src/main.rs\n@@ -1,1 +1,400 @@\n",
+            "Index: /proj/src/main.rs\n===\n--- /proj/src/main.rs\n+++ /proj/src/main.rs\n@@ -1,1 +1,1000 @@\n",
         );
-        for n in 1..=400 {
-            diff.push_str(&format!("+let value_{n} = compute({n});\n"));
+        for n in 1..=1000 {
+            diff.push_str(&format!("+let value_{n} = compute_something_fairly_long({n});\n"));
         }
         let p = perm(
             "edit",
             serde_json::json!({ "filepath": "/proj/src/main.rs", "diff": diff }),
         );
         let s = describe_permission(&p);
-        let note = crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE;
+        let note = DIFF_TRUNCATION_NOTE;
         assert!(
             s.contains(&format!("```\n{note}")),
             "the fence closes bare, right before the note: {s}"
         );
+        assert!(s.contains("```rust\n"), "the fence keeps its language: {s}");
         assert!(!s.contains('…'), "no ellipsis inside the fence: {s}");
         assert!(s.contains("是否允许"), "closing prompt still present: {s}");
     }
@@ -1713,6 +1793,33 @@ Index: /proj/src/main.rs
         assert!(s.contains("cargo test"), "command shown: {}", s);
         assert!(!s.contains("```"), "no diff fence for bash: {}", s);
         assert!(s.contains("是否允许"));
+    }
+
+    /// #794: only the diff arm changed. Every non-diff branch — bash, a
+    /// question, the generic metadata fallback — must stay byte-identical, so
+    /// these pin the WHOLE description, not just a substring.
+    #[test]
+    fn non_diff_permission_descriptions_are_byte_identical() {
+        let bash = describe_permission(&perm("bash", serde_json::json!({ "command": "cargo test" })));
+        assert_eq!(
+            bash,
+            "⚡ **执行 Shell 命令**\n**对象**:\n- `/proj/src/main.rs`\n**命令**: `cargo test`\n\nAI 想要执行这个操作，是否允许？"
+        );
+
+        let question = describe_permission(&perm("question", serde_json::json!({ "input": "Which?" })));
+        assert_eq!(
+            question,
+            "❓ **向你提问**\n**对象**:\n- `/proj/src/main.rs`\n**输入**: `Which?`\n\nAI 想要执行这个操作，是否允许？"
+        );
+
+        let generic = describe_permission(&perm(
+            "webfetch",
+            serde_json::json!({ "url": "https://example.com" }),
+        ));
+        assert_eq!(
+            generic,
+            "🌐 **访问网页**\n**对象**:\n- `/proj/src/main.rs`\n**详情**: `{\"url\":\"https://example.com\"}`\nAI 想要执行这个操作，是否允许？"
+        );
     }
 
     /// V2's permission action is the tool name, so `shell`/`subagent` must not
