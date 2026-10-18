@@ -551,5 +551,29 @@ pays three or six bytes for it. A diff now has its own cap, `DIFF_MAX_ESCAPED_BY
 - **Only the diff moves.** A `read`/`write` preview keeps `TOOL_OUTPUT_MAX_CHARS` characters and
   its own note. The permission card reuses the constant and the clip helper (#794).
 
-Not in this amendment: the diff panel's context lines and multi-file headers (the sibling tickets
-under spec #790).
+Not in this amendment: the diff panel's context lines and multi-file headers, settled by the
+amendment below (#791, #793).
+
+## Amendment (2026-10-18, #791, #793): diff context stays, and a multi-file panel counts its files
+
+The #792 amendment bounded a diff's body; the sibling tickets under spec #790 settled what that
+body and its folded header say.
+
+- **Context lines are kept verbatim (#791).** A hunk's `@@`, ` `, `-` and `+` lines are copied
+  byte-for-byte: a context line's leading space is diff syntax and its trailing spaces are content,
+  so no `trim_end` runs. Upstream's `createTwoFilesPatch` already caps each hunk at four context
+  lines per side, so the producer bounds what is kept — and the context places a change and says
+  whether neighbouring changes are one run or two.
+- **A tail note still starts at a truly empty line.** A unified hunk cannot hold an empty line (a
+  blank source line is the context line `" "`), so a real empty line remains the LSP note's
+  boundary — except between two files of a joined patch, where the next line opens the next file
+  (`opens_file_block`).
+- **A multi-file panel's count rides the FOLDED title (#793).** An `edit` / `apply_patch` /
+  `patch` diff over more than one deduped path leads the title with `📄 N files · +A −D`, and the
+  body omits that line (the title stays visible when the panel expands) while keeping one
+  `Index:` separator per file. A single-file panel is unchanged: `📄 <path>` in the title, the
+  bare `+A −D` above the hunks. Count and totals come from the same `EditDiff`, and the title
+  fragment is charged by `panel_file_detail_estimate`, so the split check still counts it.
+
+Not in this amendment: the turn-level diff product and its red/green/HTML presentation (another
+spec).
