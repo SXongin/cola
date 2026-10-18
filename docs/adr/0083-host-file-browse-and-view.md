@@ -516,3 +516,28 @@ panel already renders the file it read:
 - **A body only where one exists.** A FAILED `write` keeps its error text, and a call whose input
   carries no usable `content` keeps today's output panel; nothing is invented. A `write` carries no
   File Content block (ADR-0076), so this adds none.
+
+## Amendment (2026-10-18, #792): a diff body's budget is counted in escaped bytes
+
+The #788 amendment gave a clipped diff its own note, but the diff still shared the `read`/`write`
+preview's `TOOL_OUTPUT_MAX_CHARS` (3000) **character** cap — a preview's budget, applied to a
+change — and a character counts a CJK character or a JSON control escape as "one" while the card
+pays three or six bytes for it. A diff now has its own cap, `DIFF_MAX_ESCAPED_BYTES` (12,000):
+
+- **Measured in JSON-escaped bytes, not characters.** A card is rejected on its serialized size and
+  a panel cannot be split, so the cap is the bytes the body occupies inside the card's `content`
+  string. JSON's widest escape is six bytes for one character (a control char as `\uXXXX`), so a
+  character-counted cap of the same number could overrun the card budget sixfold; the clip
+  (`clip_escaped_bytes`) cuts on a character boundary.
+- **Bare clip, and only a clip adds the note.** The body carries no `…` (the #788 rule), and the
+  diff's `_（改动过长，已截断）_` note renders iff the body was clipped; a diff that fits is
+  otherwise untouched — no note, no rewrite.
+- **The estimate charges the same cap and the same body.** `panel_output_estimate` charges the
+  parsed diff the render writes (not the raw recorded diff), clipped at
+  `DIFF_MAX_ESCAPED_BYTES`, plus its count header and dynamic fence, so the split check and the
+  render cannot drift apart.
+- **Only the diff moves.** A `read`/`write` preview keeps `TOOL_OUTPUT_MAX_CHARS` characters and
+  its own note. The permission card reuses the constant and the clip helper (#794).
+
+Not in this amendment: the diff panel's context lines and multi-file headers (the sibling tickets
+under spec #790).
