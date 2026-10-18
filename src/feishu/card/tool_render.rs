@@ -1866,9 +1866,21 @@ fn file_edit_diff(name: &str, output: &str) -> Option<EditDiff> {
 /// `.md` file's grammar. The paths come from [`EditDiff::paths`] — an `Index:`
 /// line when the patch has one, else the `---`/`+++` header (V2's `edit`).
 fn diff_language(diff: &EditDiff) -> &'static str {
-    let mut langs = diff.paths.iter().map(|path| language_for_path(path));
+    diff_language_for(diff.paths.iter().map(String::as_str).chain(diff.path.as_deref()))
+}
+
+/// [`diff_language`] over an explicit path list: the one language every path
+/// shares, [`PLAIN_TEXT`] when they disagree or when the list is empty.
+///
+/// Shared with the permission card (#794): its diff carries the same hunks and
+/// must fence them the same way, but its paths also come from the request's
+/// metadata `filepath` and (only when neither names a file) its patterns — so
+/// the path list is the caller's, and the agreement rule stays here rather than
+/// being copied next to it.
+pub(crate) fn diff_language_for<'a>(paths: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let mut langs = paths.into_iter().map(language_for_path);
     let Some(first) = langs.next() else {
-        return diff.path.as_deref().map(language_for_path).unwrap_or(PLAIN_TEXT);
+        return PLAIN_TEXT;
     };
     if langs.any(|lang| lang != first) {
         PLAIN_TEXT
