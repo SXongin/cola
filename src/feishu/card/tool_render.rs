@@ -1096,11 +1096,19 @@ fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option
 /// — the clamp [`tool_panel_element`] applies ([`truncate_md`] at
 /// [`TOOL_OUTPUT_MAX_CHARS`]) — measured from the same body the render shows,
 /// the way every size estimate here re-derives its render, so the note
-/// [`preview_truncation_note`] renders is the one charged. `false` for every
-/// other tool (an `edit` diff carries no note) and for a call with no body.
+/// [`preview_truncation_note`] renders is the one charged. Only the panel's own
+/// file PREVIEW counts: a FAILED `write` renders its error text instead
+/// ([`write_body`] is `None`), which the note must never promise the way into,
+/// and a panel of another tool (an `edit` diff) carries no note at all.
 fn preview_body_clipped(tool: &ToolPanel) -> bool {
-    matches!(tool.name(), "read" | "write")
-        && panel_output_body(tool).is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
+    let body = if tool.name() == "write" {
+        write_body(tool).map(|(_, _, body)| body)
+    } else if tool.name() == "read" {
+        tool.output().map(|raw| format_tool_output("read", &raw).2)
+    } else {
+        None
+    };
+    body.is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
 }
 
 /// The serialized byte length the truncation note [`preview_truncation_note`]
@@ -1127,12 +1135,6 @@ fn panel_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)>
     } else {
         tool.output().map(|raw| format_tool_output(tool.name(), &raw))
     }
-}
-
-/// The body text [`panel_output`] renders, without its header or style — what
-/// the truncation-note predicate measures against the panel's own clamp.
-fn panel_output_body(tool: &ToolPanel) -> Option<String> {
-    panel_output(tool).map(|(_, _, body)| body)
 }
 
 /// The body a `write` panel renders in place of its success sentence (#788):
@@ -3326,6 +3328,27 @@ mod tests {
         assert!(
             !md.contains("secret"),
             "the content cannot replace a failure: {md}"
+        );
+
+        // A long FAILED-write error is not a file preview: its panel carries no
+        // "open the full file" note, whatever its length (#788).
+        let long_error = format!("write failed: {}", "e".repeat(TOOL_OUTPUT_MAX_CHARS * 2));
+        let failed = ToolPanel::for_test(
+            "write",
+            ToolStatus::Error,
+            Some(json!({"filePath": "report.md", "content": "secret"})),
+            Some(&long_error),
+        );
+        assert_eq!(
+            preview_truncation_note_estimate(&failed, Some("ses_1")),
+            0,
+            "an error body is not a clipped preview"
+        );
+        let md = panel_md_with_session(failed, "ses_1");
+        assert!(md.contains("write failed:"), "the error is the body: {md}");
+        assert!(
+            !md.contains(PREVIEW_TRUNCATION_NOTE),
+            "no note over an error: {md}"
         );
 
         // The tool's trailing note survives AFTER the fence, outside the
