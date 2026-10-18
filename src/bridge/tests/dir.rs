@@ -1565,8 +1565,12 @@ async fn dir_browse_file_row_opens_the_viewer_in_place_and_declares_nothing() {
     assert!(text.contains(&canonical(&file)), "the resolved path: {text}");
     assert!(text.contains("13 B"), "the size: {text}");
     assert!(
-        text.contains("```markdown") && text.contains("# notes"),
-        "the file's own bytes: {text}"
+        text.contains("# notes") && !text.contains("```markdown"),
+        "the file's own bytes render (#781): {text}"
+    );
+    assert!(
+        card_buttons(&viewer).iter().any(|b| b["value"]["op"] == "view"),
+        "the rendered view offers its source: {text}"
     );
     assert!(
         text.contains("← 返回目录"),

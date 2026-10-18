@@ -403,6 +403,8 @@ pub(crate) async fn send_cat_card(
                     page: 1,
                     overflowed,
                     session_dir: Some(&session_dir),
+                    // A `/cat` open leads with the default view (#781).
+                    view: None,
                 },
             );
             platform.reply_card(message_id, &card).await?;
@@ -447,6 +449,9 @@ pub(crate) struct ViewerBuildOptions<'a> {
     pub(crate) page: usize,
     pub(crate) overflowed: bool,
     pub(crate) session_dir: Option<&'a str>,
+    /// The markdown view to show (#781), or `None` for the default (rendered
+    /// when the render fits the card, source otherwise).
+    pub(crate) view: Option<super::viewer::ViewerView>,
 }
 
 pub(crate) fn build_viewer_for_classified(
@@ -465,6 +470,7 @@ pub(crate) fn build_viewer_for_classified(
         page,
         overflowed,
         session_dir,
+        view,
     } = options;
     let kind = match classified.kind {
         ClassifiedKind::Image => ViewerKind::Image,
@@ -493,6 +499,7 @@ pub(crate) fn build_viewer_for_classified(
             content_identity,
             truncated: false,
             page,
+            view,
             return_to,
             lane,
             overflowed,

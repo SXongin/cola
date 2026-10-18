@@ -64,10 +64,11 @@ fn pager_button<'a>(card: &'a serde_json::Value, label: &str) -> &'a serde_json:
         .unwrap_or_else(|| panic!("pager button `{label}` not found on {}", card_text(card)))
 }
 
-/// Drive a viewer pager callback through its asynchronous card PATCH. If the
-/// previous page task is still releasing its per-card claim, retry the same
-/// stateless payload until the next patch lands.
-async fn flip_viewer_page(
+/// Drive a viewer rebuild callback — a pager flip or the markdown view toggle
+/// (#781) — through its asynchronous card PATCH. If the previous rebuild task is
+/// still releasing its per-card claim, retry the same stateless payload until
+/// the next patch lands.
+async fn drive_viewer_rebuild(
     app: &std::sync::Arc<crate::bridge::App>,
     platform: &RecordingPlatform,
     mut payload: serde_json::Value,
@@ -78,8 +79,8 @@ async fn flip_viewer_page(
     let result = app
         .host_action(payload)
         .await
-        .expect("the viewer page callback is acknowledged");
-    assert!(result.card.is_none(), "page rebuild stays off-callback");
+        .expect("the viewer rebuild callback is acknowledged");
+    assert!(result.card.is_none(), "the rebuild stays off-callback");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let patches = patches_to(platform, message_id).await;
@@ -537,8 +538,12 @@ async fn cat_accepts_an_absolute_path_outside_the_session_directory() {
     let card = first_card(&platform).await;
     let text = card_text(&card);
     assert!(
-        text.contains("```markdown"),
-        "a .md file is highlighted as markdown: {text}"
+        text.contains("# notes"),
+        "a .md file leads with its rendered text (#781): {text}"
+    );
+    assert!(
+        !text.contains("```markdown"),
+        "the rendered view carries no source fence: {text}"
     );
     assert!(
         text.contains(&canonical(&outside)),
@@ -1534,7 +1539,7 @@ async fn transfer_from_a_later_page_survives_a_pager_flip() {
     assert_eq!(next["return_show_hidden"], "true");
     assert_eq!(next["return_keyword"], "long");
     assert_eq!(next["return_page"], "2");
-    let page2 = flip_viewer_page(&app, &platform, next, "msg_page_transfer").await;
+    let page2 = drive_viewer_rebuild(&app, &platform, next, "msg_page_transfer").await;
     assert_eq!(pager_label(&page2).as_deref(), Some("第 2/2 页 · 共 3000 个"));
 
     let mut transfer = send_as_file_payload(&page2);
@@ -2142,7 +2147,7 @@ async fn a_long_text_file_pages_inside_the_viewer() {
 
     // Flipping renders the NEXT window: the last line arrives, the first is
     // gone, and the pager names the page it is on.
-    let page2 = flip_viewer_page(
+    let page2 = drive_viewer_rebuild(
         &app,
         &platform,
         pager_button(&card, "下一页")["value"].clone(),
@@ -2243,7 +2248,7 @@ async fn flipping_a_page_after_a_kind_change_replaces_the_stale_lane() {
 
     let image = png();
     std::fs::write(&file, &image).unwrap();
-    let updated = flip_viewer_page(&app, &platform, next, "msg_changed_page").await;
+    let updated = drive_viewer_rebuild(&app, &platform, next, "msg_changed_page").await;
     let text = card_text(&updated);
     assert!(
         text.contains("图片（.txt）"),
@@ -2296,14 +2301,14 @@ async fn viewer_pager_rebuilds_the_same_window_from_its_payload() {
 
     // The target page renders its own window.
     let next = pager_button(&card, "下一页")["value"].clone();
-    let page2 = flip_viewer_page(&app, &platform, next, "msg_replay_viewer").await;
+    let page2 = drive_viewer_rebuild(&app, &platform, next, "msg_replay_viewer").await;
     assert!(card_text(&page2).contains("line 3000"));
     assert!(!card_text(&page2).contains("line 0001"));
 
     // And the way back lands exactly on the first window.
     let prev = pager_button(&page2, "上一页")["value"].clone();
     assert_eq!(prev["page"], 1, "previous-page payload: {prev}");
-    let back = flip_viewer_page(&app, &platform, prev, "msg_replay_viewer").await;
+    let back = drive_viewer_rebuild(&app, &platform, prev, "msg_replay_viewer").await;
     assert_eq!(
         card_text(&back),
         first_text,
@@ -2314,6 +2319,77 @@ async fn viewer_pager_rebuilds_the_same_window_from_its_payload() {
         Some("第 1/2 页 · 共 3000 个"),
         "{}",
         card_text(&back)
+    );
+}
+
+/// #781: the markdown view toggle is the SAME stateless rebuild as a page flip —
+/// the click PATCHes the card it was clicked on (no new message, no File
+/// Message), and the payload alone decides which view renders.
+#[tokio::test]
+async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    std::fs::write(proj.path().join("notes.md"), "# Title\n\ntext body\n").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+
+    send_command_in(
+        &app,
+        "/cat notes.md",
+        key.clone(),
+        "m_md",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    let rendered = card_text(&card);
+    assert!(
+        rendered.contains("# Title"),
+        "the default view renders: {rendered}"
+    );
+    let to_source = card_buttons(&card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "view")
+        .expect("the view toggle is on the card")["value"]
+        .clone();
+    assert_eq!(to_source["viewer_view"], "source");
+
+    // The toggle PATCHes the clicked card: no second message, no File Message.
+    let files_before = file_messages(&platform).await.len();
+    let source_card = drive_viewer_rebuild(&app, &platform, to_source, "msg_md_viewer").await;
+    let source = card_text(&source_card);
+    assert!(
+        source.contains("```markdown"),
+        "the source view renders: {source}"
+    );
+    assert_eq!(
+        patches_to(&platform, "msg_md_viewer").await.len(),
+        1,
+        "the toggle rewrites the card it was clicked on"
+    );
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        files_before,
+        "the view toggle sends nothing"
+    );
+
+    // And back: the payload alone restores the rendered view exactly.
+    let to_render = card_buttons(&source_card)
+        .into_iter()
+        .find(|b| b["value"]["op"] == "view")
+        .expect("the render toggle is on the source card")["value"]
+        .clone();
+    assert_eq!(to_render["viewer_view"], "rendered");
+    let back = drive_viewer_rebuild(&app, &platform, to_render, "msg_md_viewer").await;
+    assert_eq!(
+        card_text(&back),
+        rendered,
+        "the payload alone restores the rendered view"
     );
 }
 
@@ -2423,7 +2499,7 @@ async fn flipping_a_viewer_page_keeps_the_way_back_to_the_listing() {
     assert_eq!(next["return_keyword"], "long");
     assert_eq!(next["return_page"], "1");
     // The flipped page still offers the same way back.
-    let page2 = flip_viewer_page(&app, &platform, next, "msg_listing_viewer").await;
+    let page2 = drive_viewer_rebuild(&app, &platform, next, "msg_listing_viewer").await;
     let back2 = card_buttons(&page2)
         .into_iter()
         .find(|b| b["text"]["content"] == "← 返回目录")
