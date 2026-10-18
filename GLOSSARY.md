@@ -73,7 +73,7 @@ The act of terminating an Owned Server and re-attaching to the canonical server 
 _Avoid_: Give way, step down, hand over
 
 **Lazy Start**:
-Spawning an Owned Server only at the moment a server is actually needed (a prompt is about to be sent and no server exists), never proactively at boot. Boot-time behavior is attach-only unless `start_server = "eager"`.
+Spawning a server only at the moment one is actually needed (a prompt is about to be sent and no server exists), never proactively at boot: the V2 **Shared Service** first, falling back to an **Owned Server**. Boot-time behavior is attach-only unless `start_server = "eager"`.
 _Avoid_: On-demand start, deferred start
 
 **Lazy Session Creation**:
