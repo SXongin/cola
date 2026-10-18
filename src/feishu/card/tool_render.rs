@@ -4070,6 +4070,19 @@ mod tests {
         );
     }
 
+    /// The head test tolerates a leading blank line (`trim_start`), matching the
+    /// V1 line loop that skips one — so a decorated V1 output still takes the V1
+    /// branch and keeps its path and language.
+    #[test]
+    fn read_v1_output_with_leading_blank_line_still_parses() {
+        let raw = "\n<path>/x/y.rs</path>\n<type>file</type>\n<content>\n1: use std::fs;\n</content>";
+        let (header, style, body) = format_tool_output("read", raw);
+        assert_eq!(header.as_deref(), Some("📄 `/x/y.rs`"));
+        assert_eq!(style, BodyStyle::Code(Some("rust")));
+        assert!(!body.contains("<path>"), "wrapper stripped: {}", body);
+        assert!(body.contains("use std::fs"), "code kept: {}", body);
+    }
+
     /// #202: a `task` output is an XML envelope (`<task id state>`) around the
     /// subagent's report. The panel shows the report alone — the wrapper must
     /// not leak, and a background task's `<summary>` becomes the header.
