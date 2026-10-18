@@ -171,22 +171,22 @@ async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
         Some(&candidate.password),
         candidate.url(),
     );
-    match attach::resolve_candidate_over(&transport, candidate, generation_override).await {
-        Ok(resolved) => Some(ServerStatus {
-            url: resolved.url,
-            pid: candidate.pid,
-            generation: Some(resolved.generation.as_str().to_string()),
-            evidence: String::new(),
-            other_servers,
-        }),
-        Err(evidence) => Some(ServerStatus {
-            url: candidate.url(),
-            pid: candidate.pid,
-            generation: None,
-            evidence,
-            other_servers,
-        }),
-    }
+    let (url, generation, evidence) =
+        match attach::resolve_candidate_over(&transport, candidate, generation_override).await {
+            Ok(resolved) => (
+                resolved.url,
+                Some(resolved.generation.as_str().to_string()),
+                String::new(),
+            ),
+            Err(evidence) => (candidate.url(), None, evidence),
+        };
+    Some(ServerStatus {
+        url,
+        pid: candidate.pid,
+        generation,
+        evidence,
+        other_servers,
+    })
 }
 
 /// The human-readable `cola status` report.
