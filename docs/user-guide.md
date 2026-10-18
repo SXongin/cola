@@ -417,7 +417,7 @@ detailed help for any of these.
 | --- | --- |
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
-| `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint (a markdown file leads with its rendered text and a 「查看源码」 toggle), `.csv`/`.tsv` uses a markdown table, and images are embedded when Feishu's limits allow. Other binary files, images beyond those limits and text beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB upload cap; above it, nothing is sent and the card says 未发送. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths resolve as absolute paths, including outside the session directory |
+| `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint (a markdown file keeps its source and offers a 「📖 渲染预览」 toggle), `.csv`/`.tsv` uses a markdown table, and images are embedded when Feishu's limits allow. Other binary files, images beyond those limits and text beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB upload cap; above it, nothing is sent and the card says 未发送. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths resolve as absolute paths, including outside the session directory |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
@@ -461,11 +461,10 @@ Notes:
   for text, embedded-image and Rich Text previews; it is suppressed after a File
   Message has already carried the bytes. If a File Message send times out, the
   card says the result is unknown and does not retry to avoid a duplicate.
-  For a markdown file (`.md`/`.markdown`/`.mark`) the card instead **renders**
-  the document: its preview is the file's own text rather than a fenced block,
-  and its first button 「查看源码」 switches to the faithful source (「📖 渲染预览」
-  switches back). A render too large for the card keeps the source view and
-  offers no toggle; the File Message stays the complete, uncapped render.
+  For a markdown file (`.md`/`.markdown`/`.mark`) the card keeps its source
+  preview and offers the document's **rendered** text behind its first button
+  「📖 渲染预览」 (「查看源码」 switches back). A render too large for the card is
+  not offered at all; the File Message stays the complete, uncapped render.
   For a **text** `.html`/`.htm` file the transfer **leads** the row as
   「🌐 预览网页」: Feishu renders an uploaded `.html` as a page when the file
   message is opened (inline scripts included), so the File Message is that
