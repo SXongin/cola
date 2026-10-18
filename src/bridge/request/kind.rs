@@ -1591,8 +1591,10 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
         // decides whether to approve the change, so losing the code block is
         // worse here than anywhere. The budget is the Tool Panel's own escaped
         // byte cap (#792): the same diff renders under the same limit on both
-        // surfaces, and bytes are what the card's JSON budget counts.
-        let clipped = clip_fenced_body(&body, DIFF_MAX_ESCAPED_BYTES);
+        // surfaces, and bytes are what the card's JSON budget counts. The
+        // language passed here is the same one the fence below is given, so the
+        // opening tag's bytes are inside the cap, not beside it.
+        let clipped = clip_fenced_body(&body, Some(language), DIFF_MAX_ESCAPED_BYTES);
         let was_clipped = clipped.len() != body.len();
         s.push_str(&crate::feishu::card::fenced_code(&clipped, Some(language)));
         s.push('\n');
@@ -1702,6 +1704,34 @@ Index: /proj/src/main.rs
             let s = describe_permission(&p);
             assert!(s.contains(needle), "`{path}` fence language: {s}");
         }
+    }
+
+    /// #792 review: the permission card passes the language it fences with into
+    /// the byte budget, so the opening fence's tag is inside the cap. A body
+    /// that fits at 11,998 bytes without a tag is pushed over by `.rs`'s 4-byte
+    /// `rust` tag at 12,002, and must clip.
+    #[test]
+    fn a_permission_diff_counts_its_language_tag_inside_the_byte_budget() {
+        // `@@ -1,1 +1,1 @@\n` (16) + `+` (1) + filler + `\n` (1).
+        let filler = "a".repeat(11_972);
+        let diff = format!("--- /proj/big.rs\n+++ /proj/big.rs\n@@ -1,1 +1,1 @@\n+{filler}\n");
+        let parsed = parse_edit_diff(&diff).expect("a one-line hunk");
+        assert_eq!(parsed.body.len(), 11_990, "the fixture sits at the tag edge");
+        assert_eq!(
+            parsed.body,
+            clip_fenced_body(&parsed.body, None, DIFF_MAX_ESCAPED_BYTES),
+            "the body and its fence fit without a language tag"
+        );
+        let p = perm(
+            "edit",
+            serde_json::json!({ "filepath": "/proj/big.rs", "diff": diff }),
+        );
+        let s = describe_permission(&p);
+        assert!(
+            s.contains(DIFF_TRUNCATION_NOTE),
+            "the 4-byte rust tag pushes the block over the cap: {s}"
+        );
+        assert!(s.contains("```rust\n"), "and the fence keeps the tag: {s}");
     }
 
     /// #794's path precedence: one selected path — metadata `filepath`, else
