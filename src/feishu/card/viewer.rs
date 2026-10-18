@@ -26,6 +26,14 @@
 //! preview — measured 2026-10-18, inline `<script>` included — and no card
 //! component can. The card keeps its source preview and says nothing else: the
 //! label is the whole explanation.
+//!
+//! A **Markdown** file (the path spells `.md`/`.markdown`/`.mark`) leads with
+//! its RENDERED text instead (#781): the card `markdown` element renders the
+//! file itself, and 「查看源码」 switches to the faithful fenced block — one
+//! card, toggled statelessly, the same payload-driven rebuild the pager uses. A
+//! render that would outgrow the card's preview budget keeps today's source view
+//! and offers no toggle; the complete, uncapped render stays the 「发为文件」
+//! File Message's own client preview.
 
 use serde_json::json;
 
@@ -67,6 +75,40 @@ impl ViewerKind {
             Self::Delimited => "表格",
             Self::Image => "图片",
             Self::Binary => "二进制",
+        }
+    }
+}
+
+/// Which of a markdown file's two renderings a **File Viewer** card shows
+/// (#781): the rendered text — what a `.md` file is FOR — or the faithful
+/// fenced source block. `None` on a payload is the default (rendered when it
+/// fits the card, source otherwise); every non-markdown preview ignores it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ViewerView {
+    /// The file's text as one `markdown` element — Feishu renders it.
+    Rendered,
+    /// The fenced code block showing the file verbatim — today's behaviour for
+    /// every text file, and the only faithful view of arbitrary markdown.
+    Source,
+}
+
+impl ViewerView {
+    /// The wire word a button payload carries under `viewer_view`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Rendered => "rendered",
+            Self::Source => "source",
+        }
+    }
+
+    /// The view a payload's `viewer_view` names, or `None` when it is absent or
+    /// unknown — a card built before #781, or a control that never carried one.
+    /// The caller then applies the default.
+    pub(crate) fn from_payload(value: &serde_json::Value) -> Option<Self> {
+        match value.get("viewer_view")?.as_str()? {
+            "rendered" => Some(Self::Rendered),
+            "source" => Some(Self::Source),
+            _ => None,
         }
     }
 }
@@ -497,6 +539,11 @@ pub(crate) struct ViewerCard<'a> {
     /// a flipped page renders the same window (ADR-0052). `1` on open; the
     /// builder clamps it into `[1, total_pages]`. Ignored by every other kind.
     pub(crate) page: usize,
+    /// Which markdown rendering to show (#781): `None` is the default — the
+    /// rendered text when it fits the card, the source view otherwise — and a
+    /// `Some` records the reader's explicit toggle. Ignored by every preview
+    /// that is not a markdown document.
+    pub(crate) view: Option<ViewerView>,
     /// The browse listing this viewer was opened from, when it was (ADR-0083
     /// §3): renders 「← 返回目录」 carrying that state. `None` for `/cat`.
     pub(crate) return_to: Option<BrowseView<'a>>,
@@ -584,24 +631,36 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                 }
             }
             ViewerKind::Text => {
-                let lang = language_token(view.ext);
-                // ONE fenced block when it fits the card's preview budget — a
-                // text preview is never cut per element, so a line is never
-                // split and the fence never appears twice. The budget is
-                // cola's own card-JSON share, not a Feishu per-element cap, so
-                // a single large block is exactly what the paged path already
-                // renders per page.
-                let block = fenced_code(view.text, Some(lang));
-                if serialized_len(&block) + 128 <= PREVIEW_JSON_BUDGET {
+                // A markdown document leads with its RENDERED text (#781): the
+                // `markdown` element renders what the file IS, and 「查看源码」
+                // keeps the fenced block one tap away. A render the card cannot
+                // hold falls through to the source path unchanged, so a file
+                // past the budget behaves exactly as before.
+                if shows_rendered(&view) {
                     elements.push(json!({
                         "tag": "markdown",
-                        "content": markdown.clean(&block),
+                        "content": markdown.clean(view.text),
                     }));
                 } else {
-                    // Past it, the shared pager windows the preview by LINES
-                    // (#740): the budget decides only THAT it pages, never
-                    // what the reader sees.
-                    push_text_page(&mut elements, &mut markdown, thread_key, &view, lang);
+                    let lang = language_token(view.ext);
+                    // ONE fenced block when it fits the card's preview budget — a
+                    // text preview is never cut per element, so a line is never
+                    // split and the fence never appears twice. The budget is
+                    // cola's own card-JSON share, not a Feishu per-element cap, so
+                    // a single large block is exactly what the paged path already
+                    // renders per page.
+                    let block = fenced_code(view.text, Some(lang));
+                    if serialized_len(&block) + 128 <= PREVIEW_JSON_BUDGET {
+                        elements.push(json!({
+                            "tag": "markdown",
+                            "content": markdown.clean(&block),
+                        }));
+                    } else {
+                        // Past it, the shared pager windows the preview by LINES
+                        // (#740): the budget decides only THAT it pages, never
+                        // what the reader sees.
+                        push_text_page(&mut elements, &mut markdown, thread_key, &view, lang);
+                    }
                 }
             }
         }
@@ -677,78 +736,11 @@ fn push_text_page(
         "tag": "markdown",
         "content": markdown.clean(&block),
     }));
-    // The pager's extra fields are strings only: the path plus the browse
-    // listing to return to, mirroring the 「发为文件」 payload's `return_*`
-    // shape — never the row's `dir`/`page`, whose `page` is the LISTING's.
-    let return_page = view.return_to.map(|listing| listing.page.to_string());
-    let mut extra: Vec<(&str, &str)> = vec![("path", view.path)];
-    let lane_identity = view.content_identity.map(|identity| identity.to_string());
-    if let Some(identity) = lane_identity.as_deref() {
-        extra.push(("viewer_file_identity", identity));
-    }
-    if let Some(session_dir) = view.session_dir {
-        extra.push(("session_dir", session_dir));
-    }
-    if let Some(listing) = view.return_to {
-        extra.push(("return_dir", listing.dir));
-        extra.push((
-            "return_show_hidden",
-            if listing.show_hidden { "true" } else { "false" },
-        ));
-        extra.push(("return_keyword", listing.keyword));
-        extra.push(("return_page", return_page.as_deref().unwrap_or("1")));
-    }
-    let lane_size = view.lane.as_ref().map(|lane| lane.size.to_string());
-    let lane_delivery = view.lane.as_ref().map(|lane| match &lane.delivery {
-        super::tool_render::FileDelivery::Unresolved => "unresolved",
-        super::tool_render::FileDelivery::Embedded { .. } => "embedded",
-        super::tool_render::FileDelivery::SentAsFile => "sent_as_file",
-        super::tool_render::FileDelivery::FileSendOutcomeUnknown => "file_send_outcome_unknown",
-        super::tool_render::FileDelivery::SentAsRichText => "sent_as_rich_text",
-        super::tool_render::FileDelivery::Undelivered => "undelivered",
-    });
-    let lane_image_key = view.lane.as_ref().and_then(|lane| {
-        lane.embedded_image_key.as_deref().or(match &lane.delivery {
-            super::tool_render::FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
-            _ => None,
-        })
-    });
-    let lane_rich_message_id = view
-        .lane
-        .as_ref()
-        .and_then(|lane| lane.rich_message_id.as_deref());
-    let lane_content_identity = view
-        .lane
-        .as_ref()
-        .and_then(|lane| lane.content_identity)
-        .map(|identity| identity.to_string());
-    let lane_refresh_failed = view
-        .lane
-        .as_ref()
-        .map(|lane| if lane.refresh_failed { "true" } else { "false" });
-    if let (Some(lane), Some(size), Some(delivery), Some(refresh_failed)) = (
-        view.lane.as_ref(),
-        lane_size.as_deref(),
-        lane_delivery,
-        lane_refresh_failed,
-    ) {
-        extra.extend([
-            ("viewer_lane_mime", lane.mime.as_str()),
-            ("viewer_lane_name", lane.name.as_str()),
-            ("viewer_lane_size", size),
-            ("viewer_lane_delivery", delivery),
-            ("viewer_lane_refresh_failed", refresh_failed),
-        ]);
-        if let Some(image_key) = lane_image_key {
-            extra.push(("viewer_lane_image_key", image_key));
-        }
-        if let Some(message_id) = lane_rich_message_id {
-            extra.push(("viewer_lane_rich_message_id", message_id));
-        }
-        if let Some(identity) = lane_content_identity.as_deref() {
-            extra.push(("viewer_lane_content_identity", identity));
-        }
-    }
+    // The pager's extra fields are the same stateless carriage every viewer
+    // rebuild control carries ([`viewer_carry_fields`]), strings only because
+    // the shared pager holds string callback fields.
+    let carry = viewer_carry_fields(view);
+    let extra: Vec<(&str, &str)> = carry.iter().map(|(key, value)| (*key, value.as_str())).collect();
     if let Some(pager) = pager_element(
         "file",
         thread_key,
@@ -761,6 +753,70 @@ fn push_text_page(
     ) {
         elements.push(pager);
     }
+}
+
+/// The stateless state EVERY viewer rebuild control carries (#740, #781): the
+/// resolved path, the Session's path scope, the browse listing to return to,
+/// the snapshot's identity and the whole-bytes lane — so a rebuild from any
+/// control (a page flip, the markdown view toggle) renders the same card with
+/// its way back and its completed transfer intact (ADR-0052). The view itself
+/// rides along when the reader set one explicitly ([`ViewerView`]): a card the
+/// default already renders as source stays on the default, while an explicit
+/// 「查看源码」 survives a flip. `page` is deliberately absent — it is the
+/// control's own axis, not carried state.
+fn viewer_carry_fields(view: &ViewerCard<'_>) -> Vec<(&'static str, String)> {
+    let mut fields: Vec<(&'static str, String)> = vec![("path", view.path.to_string())];
+    if let Some(identity) = view.content_identity {
+        fields.push(("viewer_file_identity", identity.to_string()));
+    }
+    if let Some(session_dir) = view.session_dir {
+        fields.push(("session_dir", session_dir.to_string()));
+    }
+    if let Some(listing) = view.return_to {
+        fields.push(("return_dir", listing.dir.to_string()));
+        fields.push((
+            "return_show_hidden",
+            if listing.show_hidden { "true" } else { "false" }.to_string(),
+        ));
+        fields.push(("return_keyword", listing.keyword.to_string()));
+        fields.push(("return_page", listing.page.to_string()));
+    }
+    if let Some(viewer_view) = view.view {
+        fields.push(("viewer_view", viewer_view.as_str().to_string()));
+    }
+    if let Some(lane) = view.lane.as_ref() {
+        let delivery = match &lane.delivery {
+            FileDelivery::Unresolved => "unresolved",
+            FileDelivery::Embedded { .. } => "embedded",
+            FileDelivery::SentAsFile => "sent_as_file",
+            FileDelivery::FileSendOutcomeUnknown => "file_send_outcome_unknown",
+            FileDelivery::SentAsRichText => "sent_as_rich_text",
+            FileDelivery::Undelivered => "undelivered",
+        };
+        fields.extend([
+            ("viewer_lane_mime", lane.mime.clone()),
+            ("viewer_lane_name", lane.name.clone()),
+            ("viewer_lane_size", lane.size.to_string()),
+            ("viewer_lane_delivery", delivery.to_string()),
+            (
+                "viewer_lane_refresh_failed",
+                if lane.refresh_failed { "true" } else { "false" }.to_string(),
+            ),
+        ]);
+        if let Some(image_key) = lane.embedded_image_key.as_deref().or(match &lane.delivery {
+            FileDelivery::Embedded { image_key } => Some(image_key.as_str()),
+            _ => None,
+        }) {
+            fields.push(("viewer_lane_image_key", image_key.to_string()));
+        }
+        if let Some(message_id) = lane.rich_message_id.as_deref() {
+            fields.push(("viewer_lane_rich_message_id", message_id.to_string()));
+        }
+        if let Some(identity) = lane.content_identity {
+            fields.push(("viewer_lane_content_identity", identity.to_string()));
+        }
+    }
+    fields
 }
 
 /// A line-windowed text preview: `lines` are the preview's TRUE lines (what
@@ -966,6 +1022,44 @@ fn needs_html_page_lane(view: &ViewerCard<'_>) -> bool {
     matches!(view.kind, ViewerKind::Text | ViewerKind::TextTooLarge) && is_html_page_path(view.path)
 }
 
+/// Whether a path spells a markdown document (#781): `md`/`markdown`/`mark`,
+/// case-insensitively — the three extensions Feishu's own import accepts (the
+/// `markdown` code token's partners). Like [`is_html_page_path`], the extension
+/// never decides the KIND (CONTENT does, §6): it decides only that the viewer
+/// offers the file's rendered text beside its source.
+pub(crate) fn is_markdown_path(path: &str) -> bool {
+    matches!(
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("md" | "markdown" | "mark")
+    )
+}
+
+/// Whether the card CAN render this file as markdown (#781): a text preview
+/// whose path spells a markdown extension and whose RENDERED body fits the
+/// card's preview budget. [`serialized_len`] already applies the sanitizer's
+/// own `<`→`&#60;` expansion, so it is the rendered element's serialized length
+/// to within the sanitizer's table fencing (which only ever shrinks a render
+/// back toward source). A render that does not fit offers no toggle: the card
+/// keeps today's source view, and the complete, uncapped render stays the
+/// 「发为文件」 File Message's client preview.
+fn markdown_renders(view: &ViewerCard<'_>) -> bool {
+    matches!(view.kind, ViewerKind::Text)
+        && is_markdown_path(view.path)
+        && serialized_len(view.text) + 128 <= PREVIEW_JSON_BUDGET
+}
+
+/// Which view the card actually renders (#781): the reader's explicit toggle
+/// when the render fits, the DEFAULT (rendered) otherwise — and always source
+/// when the render does not fit, whatever the payload asked for. One predicate,
+/// so the element the card emits and the button it offers can never disagree.
+fn shows_rendered(view: &ViewerCard<'_>) -> bool {
+    markdown_renders(view) && !matches!(view.view, Some(ViewerView::Source))
+}
+
 /// Whether the file's own bytes already went out (or may have) as a File
 /// Message — a timed-out send is not retried, because it may have landed and
 /// Feishu cannot edit or retract it. A file past the upload cap deliberately
@@ -1021,6 +1115,15 @@ fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     if page && !delivered {
         columns.push(button_column(SEND_AS_PAGE, transfer_value(thread_key, view)));
     }
+    // A markdown file's view toggle leads the row too (#781): it is the card's
+    // primary reading control — the one action that changes what the card SHOWS
+    // rather than sending the file elsewhere.
+    if let Some(target) = markdown_toggle(view) {
+        columns.push(button_column(
+            view_toggle_label(target),
+            view_toggle_value(thread_key, view, target),
+        ));
+    }
     columns.push(button_column("🔄 重新读取", reread_value(thread_key, view)));
     columns.extend(directory_columns(thread_key, view.path, view.return_to));
     if !delivered && !page {
@@ -1029,12 +1132,62 @@ fn viewer_buttons(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
     button_row(columns)
 }
 
+/// The view a markdown card's toggle offers, or `None` when the card has none
+/// to offer (#781): not a markdown document, or a render the card cannot hold.
+/// The TARGET is always the view the reader is not currently looking at.
+fn markdown_toggle(view: &ViewerCard<'_>) -> Option<ViewerView> {
+    markdown_renders(view).then(|| {
+        if shows_rendered(view) {
+            ViewerView::Source
+        } else {
+            ViewerView::Rendered
+        }
+    })
+}
+
+/// A markdown view toggle's label (#781), each naming the view it switches TO —
+/// so the button reads as what the reader is about to get, never as the state
+/// they are already in.
+fn view_toggle_label(target: ViewerView) -> &'static str {
+    match target {
+        ViewerView::Source => VIEW_SOURCE,
+        ViewerView::Rendered => VIEW_RENDERED,
+    }
+}
+
 /// The transfer button's label: the original bytes as one File Message.
 const SEND_AS_FILE: &str = "发为文件";
 
 /// The transfer button's label on an HTML page (#774): the same File Message,
 /// named for the rendered page its client preview shows.
 const SEND_AS_PAGE: &str = "🌐 预览网页";
+
+/// The markdown view toggle's labels (#781): switch to the fenced source, and
+/// back to the rendered text.
+const VIEW_SOURCE: &str = "查看源码";
+const VIEW_RENDERED: &str = "📖 渲染预览";
+
+/// The stateless markdown view toggle (#781): the carriage every viewer rebuild
+/// control shares ([`viewer_carry_fields`]) plus the TARGET view and the page
+/// the reader is on — so a flip back to a paged source window lands where it
+/// was. Routed through the pager's own bounded rebuild (`op: "view"` rides the
+/// `op: "page"` path), so no second rebuild machinery exists.
+fn view_toggle_value(thread_key: &ThreadKey, view: &ViewerCard<'_>, target: ViewerView) -> serde_json::Value {
+    let mut value = json!({
+        "action": "file",
+        "op": "view",
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+        "page": view.page,
+    });
+    let carry = viewer_carry_fields(view);
+    let fields: Vec<(&str, &str)> = carry.iter().map(|(key, value)| (*key, value.as_str())).collect();
+    value = super::with_callback_field(value, &fields);
+    // The target OVERWRITES the carried current view (a Set, not a race): this
+    // button is the one control whose payload names the view it asks for.
+    value["viewer_view"] = json!(target.as_str());
+    value
+}
 
 /// The stateless re-read action (ADR-0052, ADR-0083 §9): the resolved file,
 /// current viewer page, return-listing state and existing overflow message id.
@@ -1088,6 +1241,11 @@ fn reread_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::Va
         .and_then(|lane| lane.rich_message_id.as_deref())
     {
         value["rich_message_id"] = json!(message_id);
+    }
+    // A re-read keeps the view the reader chose (#781) — an explicit
+    // 「查看源码」 survives it, while a card on the default stays on it.
+    if let Some(viewer_view) = view.view {
+        value["viewer_view"] = json!(viewer_view.as_str());
     }
     value
 }
@@ -1267,6 +1425,11 @@ fn transfer_value(thread_key: &ThreadKey, view: &ViewerCard<'_>) -> serde_json::
         if lane.refresh_failed {
             value["viewer_lane_refresh_failed"] = json!("true");
         }
+    }
+    // The transfer's card PATCH rebuilds the viewer it was clicked on: keep the
+    // markdown view the reader chose (#781), like the page it keeps above.
+    if let Some(viewer_view) = view.view {
+        value["viewer_view"] = json!(viewer_view.as_str());
     }
     value
 }
@@ -1706,6 +1869,7 @@ mod tests {
             content_identity: None,
             truncated: false,
             page: 1,
+            view: None,
             return_to: None,
             lane: None,
             overflowed: false,
@@ -2503,18 +2667,201 @@ mod tests {
             "an .html-NAMED binary keeps the ordinary transfer: {text}"
         );
 
-        let md = build_viewer_card(
+        let plain = build_viewer_card(
             &key(),
-            view("/tmp/p/notes.md", ViewerKind::Text, Some("md"), "# hi\n"),
+            view("/tmp/p/notes.txt", ViewerKind::Text, Some("txt"), "plain\n"),
         );
-        let text = card_text(&md);
-        assert_eq!(card_buttons(&md)[0]["text"]["content"], "🔄 重新读取");
+        let text = card_text(&plain);
+        assert_eq!(card_buttons(&plain)[0]["text"]["content"], "🔄 重新读取");
         assert!(
-            card_buttons(&md)
+            card_buttons(&plain)
                 .iter()
                 .any(|b| b["text"]["content"] == "发为文件"),
             "the ordinary transfer is unchanged: {text}"
         );
+    }
+
+    /// #781: a markdown file leads with its RENDERED text — one `markdown`
+    /// element, no fence — and carries 「查看源码」 as the FIRST button. The
+    /// toggle is stateless: its payload names the target view, the same
+    /// carriage every viewer rebuild control uses.
+    #[test]
+    fn a_markdown_file_leads_with_its_rendered_text_and_offers_its_source() {
+        let card = build_viewer_card(
+            &key(),
+            view(
+                "/tmp/proj/notes.md",
+                ViewerKind::Text,
+                Some("md"),
+                "# hi\n\nbody\n",
+            ),
+        );
+        let text = card_text(&card);
+        assert!(text.contains("# hi"), "the rendered text renders: {text}");
+        assert!(
+            preview_blocks(&card).is_empty(),
+            "no source fence on the default view: {text}"
+        );
+
+        let buttons = card_buttons(&card);
+        assert_eq!(buttons[0]["text"]["content"], "查看源码");
+        assert_eq!(buttons[0]["value"]["action"], "file");
+        assert_eq!(buttons[0]["value"]["op"], "view");
+        assert_eq!(buttons[0]["value"]["viewer_view"], "source");
+        assert_eq!(buttons[0]["value"]["path"], "/tmp/proj/notes.md");
+        assert_eq!(buttons[0]["value"]["chat_id"], "chat_1");
+        assert_eq!(buttons[0]["value"]["thread_id"], "chat_1");
+        // The transfer is untouched: a markdown file still has its File Message
+        // — the COMPLETE, uncapped render.
+        assert!(
+            buttons.iter().any(|b| b["text"]["content"] == "发为文件"),
+            "the file transfer stays: {text}"
+        );
+    }
+
+    /// #781: an explicit source view renders the fenced block and offers the
+    /// render back — the toggle's two halves are each other's inverse.
+    #[test]
+    fn an_explicit_source_view_renders_the_fence_and_offers_the_render_back() {
+        let mut card_view = view(
+            "/tmp/proj/notes.md",
+            ViewerKind::Text,
+            Some("md"),
+            "# hi\n\nbody\n",
+        );
+        card_view.view = Some(ViewerView::Source);
+        let card = build_viewer_card(&key(), card_view);
+        let text = card_text(&card);
+        assert!(text.contains("```markdown"), "the source block renders: {text}");
+
+        let button = card_buttons(&card)
+            .into_iter()
+            .find(|b| b["value"]["op"] == "view")
+            .unwrap_or_else(|| panic!("the view toggle is offered: {text}"));
+        assert_eq!(button["text"]["content"], "📖 渲染预览");
+        assert_eq!(button["value"]["viewer_view"], "rendered");
+        assert_eq!(
+            button["value"]["page"], 1,
+            "the toggle carries the page: {button}"
+        );
+    }
+
+    /// #781: `mark`/`MARKDOWN` (and any case) take the same lane — and the
+    /// extension still never decides the KIND: a markdown-NAMED binary keeps the
+    /// ordinary row (§6).
+    #[test]
+    fn only_markdown_extensions_take_the_rendered_view() {
+        for (name, ext) in [("/tmp/p/x.mark", "mark"), ("/tmp/p/x.MARKDOWN", "MARKDOWN")] {
+            let card = build_viewer_card(&key(), view(name, ViewerKind::Text, Some(ext), "# x\n"));
+            assert_eq!(
+                card_buttons(&card)[0]["text"]["content"],
+                "查看源码",
+                "{name} leads with the rendered view"
+            );
+        }
+        let binary = build_viewer_card(
+            &key(),
+            with_lane(
+                view("/tmp/p/blob.md", ViewerKind::Binary, Some("md"), ""),
+                "application/octet-stream",
+                "blob.md",
+                4,
+                FileDelivery::Undelivered,
+            ),
+        );
+        let text = card_text(&binary);
+        assert!(
+            card_buttons(&binary).iter().all(|b| b["value"]["op"] != "view"),
+            "a .md-NAMED binary offers no render: {text}"
+        );
+    }
+
+    /// #781: a render the card cannot hold keeps today's source view and offers
+    /// NO toggle — the complete render stays the File Message's client preview.
+    #[test]
+    fn a_markdown_render_over_the_budget_keeps_the_source_and_no_toggle() {
+        let body: String = (0..4_000)
+            .map(|i| format!("line {i}: {}\n", "y".repeat(64)))
+            .collect();
+        let card = build_viewer_card(
+            &key(),
+            view("/tmp/proj/huge.md", ViewerKind::Text, Some("md"), &body),
+        );
+        let text = card_text(&card);
+        assert!(
+            card_buttons(&card).iter().all(|b| b["value"]["op"] != "view"),
+            "no toggle past the budget: {text}"
+        );
+        assert!(has_pager(&card), "the source view pages as before: {text}");
+
+        // An explicit Rendered on a file that cannot render is not honoured: the
+        // card falls back to source rather than shipping a broken render.
+        let mut forced = view("/tmp/proj/huge.md", ViewerKind::Text, Some("md"), &body);
+        forced.view = Some(ViewerView::Rendered);
+        let forced_card = build_viewer_card(&key(), forced);
+        assert!(
+            preview_blocks(&forced_card).len() == 1,
+            "a render that does not fit still falls back to source: {}",
+            card_text(&forced_card)
+        );
+    }
+
+    /// #781: the pager carries the view, so a flip cannot silently change it —
+    /// a paged source view stays source on its next window.
+    #[test]
+    fn a_paged_source_view_carries_the_view_across_a_flip() {
+        let body: String = (0..4_000)
+            .map(|i| format!("line {i}: {}\n", "y".repeat(64)))
+            .collect();
+        let mut card_view = view("/tmp/proj/huge.md", ViewerKind::Text, Some("md"), &body);
+        card_view.view = Some(ViewerView::Source);
+        let card = build_viewer_card(&key(), card_view);
+        let next = card_buttons(&card)
+            .into_iter()
+            .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == "下一页")
+            .expect("the pager's next button");
+        assert_eq!(next["value"]["viewer_view"], "source", "{next}");
+    }
+
+    /// #781: the toggle carries the whole stateless carriage — the browse
+    /// listing it must return to, the session path scope and the lane — so a
+    /// rebuild from it renders the same card, its way back intact.
+    #[test]
+    fn the_view_toggle_carries_the_listing_the_scope_and_the_lane() {
+        let mut card_view = view("/tmp/proj/notes.md", ViewerKind::Text, Some("md"), "# hi\n");
+        card_view.content_identity = Some(42);
+        card_view.session_dir = Some("/tmp/proj");
+        card_view.return_to = Some(BrowseView {
+            dir: "/tmp/proj",
+            show_hidden: true,
+            keyword: "no",
+            page: 2,
+        });
+        card_view.lane = Some(ViewerFileLane {
+            mime: "text/markdown".into(),
+            name: "notes.md".into(),
+            size: 5,
+            delivery: FileDelivery::Undelivered,
+            content_identity: Some(42),
+            embedded_image_key: None,
+            rich_message_id: None,
+            refresh_failed: false,
+        });
+        let card = build_viewer_card(&key(), card_view);
+        let button = card_buttons(&card)
+            .into_iter()
+            .find(|b| b["value"]["op"] == "view")
+            .expect("the view toggle");
+        let value = &button["value"];
+        assert_eq!(value["return_dir"], "/tmp/proj");
+        assert_eq!(value["return_show_hidden"], "true");
+        assert_eq!(value["return_keyword"], "no");
+        assert_eq!(value["return_page"], "2");
+        assert_eq!(value["session_dir"], "/tmp/proj");
+        assert_eq!(value["viewer_file_identity"], "42");
+        assert_eq!(value["viewer_lane_content_identity"], "42");
+        assert_eq!(value["viewer_lane_mime"], "text/markdown");
+        assert_eq!(value["viewer_lane_delivery"], "undelivered");
     }
 
     /// #774, deliver-once: once the page's bytes went out as a File Message the

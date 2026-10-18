@@ -669,6 +669,9 @@ struct ViewerReread {
     embedded_image_key: Option<String>,
     return_to: OwnedReturnTo,
     page: usize,
+    /// The markdown view to rebuild at (#781): a re-read keeps the view the
+    /// reader chose, so an explicit 「查看源码」 survives it.
+    view: Option<crate::feishu::card::viewer::ViewerView>,
     in_flight_guard: ViewerActionGuard,
 }
 
@@ -680,6 +683,10 @@ struct ViewerPage {
     card_message_id: String,
     return_to: OwnedReturnTo,
     page: usize,
+    /// The markdown view to rebuild at (#781): `op: "page"` carries the reader's
+    /// current one so a flip cannot silently change the view, `op: "view"` the
+    /// target the toggle named.
+    view: Option<crate::feishu::card::viewer::ViewerView>,
     lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
     in_flight_guard: ViewerActionGuard,
 }
@@ -3101,40 +3108,52 @@ impl App {
         // — strings only, because the shared pager holds string callback
         // fields — and the TARGET viewer page as `page` (a row's `page` is the
         // LISTING's, so the op is what tells the two shapes apart).
-        let (home_dir, home_keyword, home_hidden, home_page, page) = if matches!(op, "page" | "reread") {
-            (
-                value
-                    .get("return_dir")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                value
-                    .get("return_keyword")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                return_hidden(value),
-                return_page_num(value),
-                viewer_page(value),
-            )
-        } else {
-            (
-                value
-                    .get("dir")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                value
-                    .get("keyword")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                parse_show_hidden(value),
-                value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize,
-                1,
-            )
-        };
-        if op == "page" {
+        let (home_dir, home_keyword, home_hidden, home_page, page) =
+            if matches!(op, "page" | "reread" | "view") {
+                (
+                    value
+                        .get("return_dir")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    value
+                        .get("return_keyword")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    return_hidden(value),
+                    return_page_num(value),
+                    viewer_page(value),
+                )
+            } else {
+                (
+                    value
+                        .get("dir")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    value
+                        .get("keyword")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    parse_show_hidden(value),
+                    value.get("page").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize,
+                    1,
+                )
+            };
+        // The pager flip and the markdown view toggle share ONE bounded rebuild
+        // (#740, #781): both re-read the file and rebuild the card at the
+        // payload's `(page, view)`, so the toggle needs no second machinery. The
+        // view rides the payload like the page does (ADR-0052), and an absent
+        // one reads as the default.
+        if matches!(op, "page" | "view") {
+            let toggling = op == "view";
+            let busy = if toggling {
+                "正在切换视图…"
+            } else {
+                "正在翻页…"
+            };
             let Some(open_message_id) = value
                 .get("open_message_id")
                 .and_then(|v| v.as_str())
@@ -3148,7 +3167,7 @@ impl App {
             let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
                 return Some(CardActionResult {
                     card: None,
-                    toast: Some("正在翻页…".to_string()),
+                    toast: Some(busy.to_string()),
                 });
             };
             let app = Arc::clone(self);
@@ -3164,13 +3183,14 @@ impl App {
                     page: home_page,
                 },
                 page,
+                view: crate::feishu::card::viewer::ViewerView::from_payload(value),
                 lane: crate::feishu::card::viewer::lane_from_page_payload(value),
                 in_flight_guard,
             };
             tokio::spawn(async move { app.run_viewer_page(page).await });
             return Some(CardActionResult {
                 card: None,
-                toast: Some("正在翻页…".to_string()),
+                toast: Some(busy.to_string()),
             });
         }
         if op == "reread" {
@@ -3219,6 +3239,8 @@ impl App {
                 show_hidden: home_hidden,
                 page: home_page,
             };
+            // A re-read keeps the view the reader chose (#781).
+            let view = crate::feishu::card::viewer::ViewerView::from_payload(value);
             tokio::spawn(async move {
                 app.run_viewer_reread(ViewerReread {
                     thread_key,
@@ -3231,6 +3253,7 @@ impl App {
                     embedded_image_key,
                     return_to,
                     page,
+                    view,
                     in_flight_guard,
                 })
                 .await;
@@ -3301,8 +3324,9 @@ impl App {
         })
     }
 
-    /// Finish a pager flip after the callback has acknowledged. The carried
-    /// lane is retained while the bounded read rebuilds the requested window.
+    /// Finish a pager flip or a markdown view toggle (#740, #781) after the
+    /// callback has acknowledged. The carried lane is retained while the bounded
+    /// read rebuilds the requested `(page, view)`.
     async fn run_viewer_page(self: &Arc<Self>, page: ViewerPage) {
         let ViewerPage {
             thread_key,
@@ -3311,6 +3335,7 @@ impl App {
             card_message_id,
             return_to,
             page,
+            view,
             lane,
             in_flight_guard,
         } = page;
@@ -3367,6 +3392,7 @@ impl App {
                 page,
                 overflowed: false,
                 session_dir: session_dir.as_deref(),
+                view,
             },
         );
         if !matches!(
@@ -3397,6 +3423,7 @@ impl App {
             embedded_image_key,
             return_to,
             page,
+            view,
             in_flight_guard,
         } = reread;
         let _in_flight_guard = in_flight_guard;
@@ -3472,6 +3499,7 @@ impl App {
                 page,
                 overflowed,
                 session_dir: session_dir.as_deref(),
+                view,
             },
         );
         if !matches!(
@@ -3646,6 +3674,10 @@ impl App {
                         page,
                         overflowed,
                         session_dir: session_dir.as_deref(),
+                        // A fresh open leads with the default view (#781): the
+                        // rendered markdown for a `.md` file that fits, source
+                        // otherwise.
+                        view: None,
                     },
                 )
             }
@@ -4534,6 +4566,9 @@ impl App {
                         page: viewer_page(&value),
                         overflowed: false,
                         session_dir: session_dir.as_deref(),
+                        // The transfer's PATCH rebuilds the card it was clicked
+                        // on: keep the markdown view the reader chose (#781).
+                        view: crate::feishu::card::viewer::ViewerView::from_payload(&value),
                     },
                 )
             }
