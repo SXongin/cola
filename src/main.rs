@@ -155,8 +155,9 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
 /// The invariant is the STORE: sessions are shared only when cola, OpenChamber
 /// and the CLI read the same data directory (`~/.local/share/opencode`). So
 /// cola attaches to whatever `opencode serve` is already running on the default
-/// store (OpenChamber's, a manual one — whoever started it), a
-/// Coexistent Server winning over cola's Owned. `eager` additionally spawns
+/// store (OpenChamber's, a manual one — whoever started it), a Shared Service
+/// winning, then a Coexistent Server over cola's Owned (ADR-0085). `eager`
+/// additionally spawns
 /// cola's own server at boot when none exists. `auto` (lazy) and `never`
 /// return `None` when nothing runs — `auto` spawns on first demand (Lazy
 /// Start), `never` stays attach-only. Returns the resolved endpoint +

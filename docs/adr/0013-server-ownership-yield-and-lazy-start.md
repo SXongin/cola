@@ -1,5 +1,12 @@
 # Server ownership: yield + lazy start + autostart
 
+> **Later addition (ADR-0085)**: a V2 **Shared Service** (`serve --service`) now
+> outranks both classes below — the priority reads Shared Service > Coexistent >
+> Owned, and `/restart-opencode` restarts the service through
+> `opencode service restart` instead of owning it. Everything else here (Yield,
+> Lazy Start, autostart, the existence/visibility rules) still holds; read
+> "Coexistent wins over Owned" as the ordering *within* the non-service classes.
+
 cola used to start its own `opencode serve` at boot whenever none was running,
 and blindly attach to the first default-store server. OpenChamber never reuses
 an existing server (it always spawns its own on a random port), so cola-first

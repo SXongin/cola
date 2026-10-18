@@ -52,6 +52,14 @@ _Avoid_: Setup, login, pairing
 The default OpenCode data directory (`~/.local/share/opencode`; `$XDG_DATA_HOME` when set) that every client — cola, OpenChamber, the CLI — reads and writes. The single source of truth for sessions; cola's "one server" invariant is about who serves this store.
 _Avoid_: Database, data dir, state directory
 
+**Shared Service**:
+The V2 `opencode serve --service` daemon. It registers `{id, version, url, pid, password}` in `$XDG_STATE_HOME/opencode/service.json` (`$XDG_STATE_HOME` as the daemon's own environment defines it) and is the rendezvous the default clients — TUI, desktop, Web UI — connect to with no configuration. cola may start and attach it but never owns or reaps it; it is never written to `self-opencode.pid` (ADR-0085).
+_Avoid_: Daemon, background server, managed server
+
+**Canonical Server**:
+The single server one reconcile pass picks to attach to, a pure function of the scan: Shared Service > Coexistent Server > Owned Server (ADR-0085). Other eligible default-store servers are reported but never aggregated; cola syncs one server, and a mapped Session is what makes the sync bidirectional.
+_Avoid_: Preferred server, chosen server
+
 **Owned Server**:
 An `opencode serve` process that cola itself spawned (pid recorded in `~/.cola/self-opencode.pid`). Only an Owned Server may be killed, restarted, or reaped by cola; everything else is someone else's process. Its protocol generation is probed like any other attachment's — the `opencode` binary on PATH may be either lineage (spec #364 §2).
 _Avoid_: Managed server, our server, private server
@@ -61,7 +69,7 @@ A default-store `opencode serve` started by someone else — OpenChamber's manag
 _Avoid_: Foreign server, external server, shared server
 
 **Yield**:
-The act of terminating an Owned Server and re-attaching to a Coexistent Server, so the Shared Store returns to exactly one server. Deferred while a session is in flight (a mid-stream generation must not be truncated).
+The act of terminating an Owned Server and re-attaching to the canonical server (a Shared Service or a Coexistent Server that outranks it), so the Shared Store returns to exactly one server. Deferred while a session is in flight (a mid-stream generation must not be truncated).
 _Avoid_: Give way, step down, hand over
 
 **Lazy Start**:

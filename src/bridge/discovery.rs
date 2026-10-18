@@ -6,6 +6,9 @@
 //! (`~/.local/share/opencode`). cola therefore attaches to any OpenCode server
 //! running on the default store (whoever started it — OpenChamber, a manual
 //! `opencode serve`, another tool) and only starts its own when none exists.
+//! Among those candidates a V2 Shared Service outranks everything (ADR-0085):
+//! it is the process the default clients connect to, so attaching anywhere else
+//! breaks the real-time sync they expect.
 //!
 //! The server's protocol generation is not discovery's call: it is learned by
 //! probing at attach time (`crate::opencode::generation`, spec #364 §2). A V2
