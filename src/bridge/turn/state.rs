@@ -532,11 +532,11 @@ pub(super) struct GapCoverage {
 /// panel body appends, one `img` element per embedded image, the compact file
 /// marker the folded header carries — ADR-0076 — the folded header's file
 /// detail, the 「📂 打开」 button a `write`/`edit`/file-`read` panel carries
-/// inside the fold, and the note a clipped `read`/`write` body appends beside
-/// it, ADR-0083 §8 amendment, #766/#770/#788). Shared by the timeline's tool
-/// items and the todo tail reserve, so every place a panel's bytes are summed
-/// charges its images, its header marker, its file detail, its button and its
-/// truncation note too.
+/// inside the fold, the trailing note a `write` call reports after its content,
+/// and the note a clipped `read`/`write` body appends beside it, ADR-0083 §8
+/// amendment, #766/#770/#788). Shared by the timeline's tool items and the todo
+/// tail reserve, so every place a panel's bytes are summed charges its images,
+/// its header marker, its file detail, its button and its notes too.
 /// `session_id` is the same routing the card build renders the button with —
 /// exactly what renders is charged, never more.
 fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
@@ -553,6 +553,7 @@ fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
         + crate::feishu::card::tool_render::file_header_marker_estimate(p)
         + crate::feishu::card::tool_render::panel_file_detail_estimate(p)
         + crate::feishu::card::tool_render::tool_open_button_estimate(p, session_id)
+        + crate::feishu::card::tool_render::write_tail_estimate(p)
         + crate::feishu::card::tool_render::preview_truncation_note_estimate(p, session_id)
 }
 
