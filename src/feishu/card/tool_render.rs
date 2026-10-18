@@ -1557,8 +1557,12 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
             // the only thing that says the next `---`/`+++` pair is a header
             // again, not `+`/`-` hunk content.
             in_hunk = false;
-        } else if !in_hunk && l.starts_with("diff --git ") {
+        } else if l.starts_with("diff --git ") {
             // `a/old b/new` — the explicit Index/filepath carries the target.
+            // A joined patch's next file starts here, so this ends the previous
+            // hunk (a real hunk line always starts with `+`, `-`, or a space,
+            // so this marker can never be content).
+            in_hunk = false;
         } else if !in_hunk && (l.starts_with("--- ") || l.starts_with("+++ ")) {
             // The old/new file headers of a unified diff. A V2 `edit` patch has
             // no `Index:`, so the header is the only place its target is named.
@@ -1617,22 +1621,35 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
 }
 
 /// Whether the next non-empty line at or after `from` opens another file's
-/// header block in a concatenated patch: an `Index:` line, a `===` underline,
-/// or a `diff --git` line. [`recorded_diff`] joins per-file patch strings —
-/// each ending in `\n` — with `\n`, so a joined multi-file patch carries a real
-/// blank line between files. That line is a file boundary, not the trailing
-/// note's start; reading it as one would swallow every file after the first
-/// into [`EditDiff::tail`].
+/// header block in a concatenated patch. [`recorded_diff`] joins per-file
+/// patch strings — each ending in `\n` — with `\n`, so a joined multi-file
+/// patch carries a real blank line between files. That line is a file
+/// boundary, not the trailing note's start; reading it as one would swallow
+/// every file after the first into [`EditDiff::tail`].
+///
+/// The evidence is the opener **and** the header line after it: a real block
+/// spells out `===` / `index` / `---` / `+++` next, where a note that merely
+/// quotes a line starting with `Index: …` does not. Requiring both keeps such
+/// a note in `tail`, as the spec's blank-line boundary demands.
 fn opens_file_block(lines: &[&str], from: usize) -> bool {
-    lines
+    let mut block = lines
         .get(from..)
         .unwrap_or_default()
         .iter()
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .find(|line| !line.is_empty())
-        .is_some_and(|line| {
-            line.starts_with("Index: ") || line.starts_with("===") || line.starts_with("diff --git ")
-        })
+        .filter(|line| !line.is_empty());
+    let Some(opener) = block.next() else {
+        return false;
+    };
+    if !(opener.starts_with("Index: ") || opener.starts_with("===") || opener.starts_with("diff --git ")) {
+        return false;
+    }
+    block.next().is_some_and(|line| {
+        line.starts_with("===")
+            || line.starts_with("index ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+    })
 }
 
 /// The file a `---`/`+++` header names, without a git `a/`/`b/` prefix or a
@@ -5385,6 +5402,82 @@ Index: /a/two.rs
         assert_eq!(d.paths, vec!["/a/one.rs", "/a/two.rs"]);
         assert!(d.body.contains("+d"), "second hunk kept: {:?}", d.body);
         assert!(d.tail.is_empty(), "no note: {:?}", d.tail);
+    }
+
+    /// Review #791: a joined Git-style patch opens its next file with
+    /// `diff --git` after the blank separator. That marker must end the
+    /// previous hunk, or the next file's `---`/`+++` headers are counted as a
+    /// deletion and an addition and land in the body.
+    #[test]
+    fn a_joined_git_patch_ends_the_previous_hunk_at_diff_git() {
+        let first = "\
+diff --git a/src/one.rs b/src/one.rs
+--- a/src/one.rs
++++ b/src/one.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let second = "\
+diff --git a/src/two.rs b/src/two.rs
+--- a/src/two.rs
++++ b/src/two.rs
+@@ -1,2 +1,2 @@
+ keep
+-c
++d";
+        let diff = format!("{first}\n{second}");
+        let d = parse_multi_file_diff(&diff).expect("parsed");
+        assert_eq!(d.paths, vec!["src/one.rs", "src/two.rs"]);
+        assert_eq!(
+            (d.additions, d.deletions),
+            (2, 2),
+            "the second file's ---/+++ headers are not content: {:?}",
+            d.body
+        );
+        assert!(d.body.contains(" keep"), "context kept: {:?}", d.body);
+        assert!(d.body.contains("+d"), "second hunk kept: {:?}", d.body);
+        assert!(
+            !d.body.contains("+++ b/src/two.rs") && !d.body.contains("--- a/src/two.rs"),
+            "second file's headers stay out of the body: {:?}",
+            d.body
+        );
+        assert!(d.tail.is_empty(), "no note: {:?}", d.tail);
+    }
+
+    /// Review #791: a note is text, not a patch. The first line after the
+    /// blank boundary may merely *start* like a file header — a real file
+    /// block spells its `---`/`+++` headers out next, so the note stays in
+    /// `tail` instead of being parsed as another file.
+    #[test]
+    fn a_note_that_starts_like_a_file_header_stays_in_the_tail() {
+        let diff = "\
+Index: /a/b.rs
+===================================================================
+--- /a/b.rs
++++ /a/b.rs
+@@ -1 +1 @@
+ keep
+-old
++new
+
+Index: this quoted line is diagnostic prose, not a file header
+see the compiler's note above
+--- not a real header either";
+        let d = parse_edit_diff(diff).expect("parsed");
+        assert_eq!(d.paths, vec!["/a/b.rs"], "no phantom file: {:?}", d.paths);
+        assert_eq!(d.body, "@@ -1 +1 @@\n keep\n-old\n+new\n");
+        assert!(
+            d.tail.contains("Index: this quoted line is diagnostic prose"),
+            "the note's first line is kept: {:?}",
+            d.tail
+        );
+        assert!(
+            d.tail.contains("--- not a real header either"),
+            "the whole note is kept: {:?}",
+            d.tail
+        );
+        assert!(!d.body.contains("diagnostic prose"), "note not in hunks");
     }
 
     /// V2's `edit` metadata is `createTwoFilesPatch` output, which has no
