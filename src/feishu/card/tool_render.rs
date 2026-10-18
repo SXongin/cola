@@ -1171,19 +1171,28 @@ fn call_failed(tool: &ToolPanel) -> bool {
         }
 }
 
+/// The character cap on a `write` panel's trailing note (#788). The note is a
+/// preview like the content, and one panel carries BOTH: a content of
+/// [`TOOL_OUTPUT_MAX_CHARS`] characters can serialize to six bytes a character
+/// (JSON's widest escape), so the note's own cap must leave that worst case plus
+/// the panel's fixed overhead under the card budget — a single panel cannot be
+/// split, and an oversized one would be sent whole and rejected by Feishu.
+const WRITE_TAIL_MAX_CHARS: usize = 500;
+
 /// The trailing note a `write` panel keeps after its fenced content (#788): the
 /// text the tool reported after its success summary (V1's diagnostics), shown as
 /// its own paragraph OUTSIDE the content's [`TOOL_OUTPUT_MAX_CHARS`] preview
 /// budget, so a long note is never clipped by the content's clamp nor mistaken
-/// for a clipped content — while its own budget keeps a single panel bounded
-/// (a lone panel cannot split). `None` whenever the panel renders no content
-/// body ([`write_body`]), or the tool reported no note.
+/// for a clipped content — while its own
+/// [`WRITE_TAIL_MAX_CHARS`] cap keeps a single panel under the card budget.
+/// `None` whenever the panel renders no content body ([`write_body`]), or the
+/// tool reported no note.
 fn write_tail(tool: &ToolPanel) -> Option<String> {
     write_body(tool)?;
     tool.output()
         .as_deref()
         .and_then(summary_tail)
-        .map(|tail| truncate_md(tail, TOOL_OUTPUT_MAX_CHARS))
+        .map(|tail| truncate_md(tail, WRITE_TAIL_MAX_CHARS))
 }
 
 /// The serialized byte length the trailing note [`write_tail`] appends to a
@@ -3338,9 +3347,9 @@ mod tests {
             "the summary is still dropped: {md}"
         );
 
-        // A long note does NOT clip the content or fake a truncation: the note
-        // is shown outside the content's own budget (#788).
-        let long_tail = "N".repeat(TOOL_OUTPUT_MAX_CHARS);
+        // A note is never counted against the content's budget, so a note larger
+        // than the content cannot fake a truncated preview (#788).
+        let long_tail = "N".repeat(400);
         let noted = ToolPanel::for_test(
             "write",
             ToolStatus::Completed,
@@ -3356,8 +3365,8 @@ mod tests {
         assert!(md.contains(&long_tail), "the note is not clipped: {md}");
         assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no clip, no note: {md}");
 
-        // A note past the panel's own budget is clipped there, not rendered
-        // whole: a lone panel cannot split, so one panel must stay bounded.
+        // A note past its own cap is clipped there, not rendered whole: a lone
+        // panel cannot split, so one panel must stay bounded.
         let huge_tail = "N".repeat(4 * TOOL_OUTPUT_MAX_CHARS);
         let noted = ToolPanel::for_test(
             "write",
@@ -3367,7 +3376,7 @@ mod tests {
         );
         assert_eq!(
             write_tail_estimate(&noted),
-            json_escaped_len(&truncate_md(&huge_tail, TOOL_OUTPUT_MAX_CHARS)),
+            json_escaped_len(&truncate_md(&huge_tail, WRITE_TAIL_MAX_CHARS)),
             "the clipped note's bytes are charged"
         );
         let md = panel_md_with_session(noted, "ses_1");

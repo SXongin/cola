@@ -5666,6 +5666,34 @@ mod tests {
         );
     }
 
+    /// #788: a single `write` panel carries TWO preview sections — the file's
+    /// content and the tool's trailing note — and a single panel cannot be
+    /// split, so its worst case must fit Feishu's card budget on its own. The
+    /// widest JSON escape (a control character, six bytes) in both sections is
+    /// that worst case; the note's own cap is what keeps the pair inside the
+    /// budget.
+    #[test]
+    fn a_write_panels_content_and_note_stay_under_the_card_budget() {
+        let widest = "\u{1}";
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(serde_json::json!({
+                "filePath": "x.md",
+                "content": widest.repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS * 2),
+            })),
+            Some(&format!(
+                "Wrote file successfully.\n\n{}",
+                widest.repeat(crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS),
+            )),
+        );
+        let estimate = panel_estimate(&panel, Some("ses_1"));
+        assert!(
+            estimate < crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "a lone panel cannot split, so its worst case must fit the budget: {estimate}"
+        );
+    }
+
     /// The folded header's file detail (ADR-0083 §8 amendment, #766) is card
     /// JSON too: `panel_estimate` charges its serialized bytes, so dropping the
     /// term would let a near-budget card omit what the header renders. The two
