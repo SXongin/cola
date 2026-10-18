@@ -505,9 +505,14 @@ panel already renders the file it read:
   appends immediately before the closing fence stops Feishu rendering the block as code at all —
   the same body without the marker keeps its syntax colour, and a newline after the `…` does not
   rescue it (a trailing non-ASCII *character*, by contrast, is fine: a clip landing mid-Chinese
-  still highlights). So a fenced body that carries the truncation note clips bare (`clip_md`), the
-  note below the fence being the "clipped" signal; every other clip keeps the marker, which is the
-  only signal a body without a note has. This repairs the same defect in a clipped `read` panel.
+  still highlights). So a fenced body that carries a truncation note clips bare (`clip_md`), the
+  note below the fence being the "clipped" signal — and every fenced body that clips carries one: a
+  `read`/`write` preview names the way in (`_（预览已截断，打开查看完整文件）_`), while a
+  file-editing diff says only that it was clipped (`_（改动过长，已截断）_`), because the open
+  button shows the file's CURRENT content, not the diff, and must not be promised as a way to the
+  rest of it. Every other clip keeps the marker, the only signal a body without a note has. This
+  repairs the same defect in a clipped `read` panel; a clipped `edit`/`patch` diff took the marker
+  path and therefore lost its code block entirely, which the diff note fixes too.
 - **A body only where one exists.** A FAILED `write` keeps its error text, and a call whose input
   carries no usable `content` keeps today's output panel; nothing is invented. A `write` carries no
   File Content block (ADR-0076), so this adds none.

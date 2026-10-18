@@ -26,6 +26,14 @@ const V2_DIRECTORY_HEADER_PREFIX: &str = "Read directory ";
 /// 「🌐 预览网页」 for an HTML page, #778).
 const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
 
+/// The line a file-editing panel appends under a diff its budget CLIPPED. The
+/// note is a fenced body's ONLY clip signal: the `…` `truncate_md` appends
+/// stops Feishu rendering the block as code at all (#788), so the body clips
+/// bare ([`clip_md`]) and this line says why. Unlike
+/// [`PREVIEW_TRUNCATION_NOTE`] it names no way-in: the 「📂 打开」 button opens
+/// the file's CURRENT content, not the diff that changed it.
+pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_";
+
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
 ///
 /// The panel owns the decoded [`ToolCall`] — identity, typed status, raw
@@ -360,10 +368,7 @@ impl ToolPanel {
     /// already applied the sources' precedence into the typed output's blocks,
     /// so a payload carrying more than one text source can never render twice.
     pub fn output(&self) -> Option<String> {
-        if self.call.identity.name == "edit"
-            || self.call.identity.name == "apply_patch"
-            || self.call.identity.name == "patch"
-        {
+        if is_file_editing(&self.call.identity.name) {
             edit_tool_output(&self.call)
         } else {
             tool_output(&self.call)
@@ -1092,14 +1097,41 @@ fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option
     preview_body_clipped(tool).then_some(PREVIEW_TRUNCATION_NOTE)
 }
 
+/// The note a file-editing panel appends under a diff its budget CLIPPED
+/// ([`DIFF_TRUNCATION_NOTE`]): the clip's only signal, because the fenced body
+/// clips bare (#788). Renders IFF the body the panel shows is a recognized diff
+/// ([`BodyStyle::Code`]) longer than [`TOOL_OUTPUT_MAX_CHARS`] — a FAILED call's
+/// error text is not a diff and takes no note, since there is no change to name.
+/// Unlike [`preview_truncation_note`] it needs no button: "已截断" is true even
+/// when nothing can be opened, so the reader still knows the diff is partial.
+fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
+    if !is_file_editing(tool.name()) {
+        return None;
+    }
+    panel_output(tool)
+        .filter(|(_, style, body)| {
+            matches!(style, BodyStyle::Code(_)) && exceeds_md_budget(body, TOOL_OUTPUT_MAX_CHARS)
+        })
+        .map(|_| DIFF_TRUNCATION_NOTE)
+}
+
+/// The note a panel appends under a body its budget clipped: a `read`/`write`
+/// preview's way-in note, or a file-editing diff's bare clip signal. One
+/// function, because the render and the size estimate must agree on exactly one
+/// note (a panel never carries both: a tool is either an editing tool or it
+/// isn't).
+fn truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
+    preview_truncation_note(tool, session_id).or_else(|| diff_truncation_note(tool))
+}
+
 /// Whether a `read`/`write` panel's rendered body is clipped by its own budget
 /// — the clamp [`tool_panel_element`] applies ([`truncate_md`] at
 /// [`TOOL_OUTPUT_MAX_CHARS`]) — measured from the same body the render shows,
 /// the way every size estimate here re-derives its render, so the note
 /// [`preview_truncation_note`] renders is the one charged. Only the panel's own
 /// file PREVIEW counts: a FAILED `write` renders its error text instead
-/// ([`write_body`] is `None`), which the note must never promise the way into,
-/// and a panel of another tool (an `edit` diff) carries no note at all.
+/// ([`write_body`] is `None`), which the note must never promise the way into.
+/// A file-editing diff is [`diff_truncation_note`]'s, not this one's.
 fn preview_body_clipped(tool: &ToolPanel) -> bool {
     let body = if tool.name() == "write" {
         write_body(tool).map(|(_, _, body)| body)
@@ -1111,14 +1143,14 @@ fn preview_body_clipped(tool: &ToolPanel) -> bool {
     body.is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
 }
 
-/// The serialized byte length the truncation note [`preview_truncation_note`]
-/// appends to a `read`/`write` panel's body (ADR-0083 §8 amendment,
-/// #770/#788), for a card-size estimate that must charge exactly what the panel
-/// writes — a note the estimate missed would let a clipped body pass the split
-/// check while the serialized card still carries bytes nothing counted. `0` when
-/// the note does not render. Kept beside the render so the two cannot drift.
+/// The serialized byte length the truncation note [`truncation_note`] appends
+/// to a clipped body (ADR-0083 §8 amendment, #770/#788), for a card-size
+/// estimate that must charge exactly what the panel writes — a note the estimate
+/// missed would let a clipped body pass the split check while the serialized
+/// card still carries bytes nothing counted. `0` when the note does not render.
+/// Kept beside the render so the two cannot drift.
 pub(crate) fn preview_truncation_note_estimate(tool: &ToolPanel, session_id: Option<&str>) -> usize {
-    preview_truncation_note(tool, session_id)
+    truncation_note(tool, session_id)
         .map(|note| json_escaped_len(&CardMarkdown::new().element(note)))
         .unwrap_or(0)
 }
@@ -1325,10 +1357,10 @@ pub(super) fn tool_panel_element(
             // A fenced code body that carries the truncation note below the
             // fence clips WITHOUT the `…`: the ellipsis immediately before the
             // closing fence stops Feishu rendering the block as code at all
-            // (measured, #788), and the note already says it was clipped. Every
-            // other body keeps `truncate_md`'s marker — the only signal a body
-            // without a note has.
-            let note = preview_truncation_note(tool, session_id);
+            // (measured, #788), and the note already says it was clipped — the
+            // only signal a clipped diff has. Every other body keeps
+            // `truncate_md`'s marker.
+            let note = truncation_note(tool, session_id);
             let body = if note.is_some() && matches!(style, BodyStyle::Code(_)) {
                 clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
             } else {
@@ -1716,6 +1748,14 @@ fn read_output_is_directory(output: &str) -> bool {
         .is_some_and(|first| first.starts_with(V2_DIRECTORY_HEADER_PREFIX))
 }
 
+/// Whether a tool is one whose panel shows its recorded diff in place of the
+/// tool's success sentence ([`edit_tool_output`]) — the names the diff parser
+/// and the clip note both key on. `edit` records a single file's diff; V1's
+/// `apply_patch` and V2's `patch` record a multi-file patch.
+fn is_file_editing(name: &str) -> bool {
+    matches!(name, "edit" | "apply_patch" | "patch")
+}
+
 /// Render a tool's raw output string human-friendly. OpenCode's `read` tool
 /// wraps its output in XML tags (`<path>…</path>`, `<type>…</type>`,
 /// `<content>…</content>`) — strip them so the card shows just the file path
@@ -1738,7 +1778,7 @@ fn read_output_is_directory(output: &str) -> bool {
 /// how the body blocks (see [`BodyStyle`]). A `todowrite` header is the list's
 /// size and per-status counts — the folded panel's progress line.
 fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, String) {
-    if name == "edit" || name == "apply_patch" || name == "patch" {
+    if is_file_editing(name) {
         let parsed = if name == "edit" {
             parse_edit_diff(output)
         } else {
@@ -4855,6 +4895,11 @@ Index: src/main.rs
                 error: None,
             },
         });
+        assert_eq!(
+            diff_truncation_note(&tool),
+            None,
+            "a diff that fits carries no note"
+        );
         let card = CardBuilder::new()
             .with_state(CardState::Done)
             .with_tool(tool)
@@ -4875,6 +4920,95 @@ Index: src/main.rs
         assert!(md.contains("+fn main() { println"), "added line: {}", md);
         assert!(!md.contains("use std::fs;"), "context line dropped: {}", md);
         assert!(md.contains("\n```"), "closing fence: {}", md);
+    }
+
+    /// A file-editing panel whose diff exceeds the panel budget clips the body
+    /// BARE and says so below the fence (#788, this fix). The `…` `truncate_md`
+    /// appends sits immediately before the closing fence, which stops Feishu
+    /// rendering the block as code at all — so before this, the LARGEST diffs
+    /// were the ones that lost monospace and syntax colour entirely. Unlike a
+    /// clipped `read`/`write`, the note promises no way-in: the open button
+    /// shows the file's current content, not the diff that changed it.
+    #[test]
+    fn a_clipped_edit_diff_keeps_its_code_block_and_says_so() {
+        for name in ["edit", "apply_patch", "patch"] {
+            let tool = long_diff_panel(name);
+            assert!(
+                diff_truncation_note(&tool).is_some(),
+                "{name}: a clipped diff carries the note"
+            );
+            // The note needs no button, so a routeless panel still renders it —
+            // and the estimate still charges it.
+            assert_eq!(
+                preview_truncation_note_estimate(&tool, None),
+                DIFF_TRUNCATION_NOTE.len(),
+                "{name}: the note's bytes are charged"
+            );
+            let md = panel_md(tool);
+            assert!(md.contains("```rust"), "{name}: the fence survives: {md}");
+            assert!(
+                !md.contains('…'),
+                "{name}: no ellipsis inside the fenced body: {md}"
+            );
+            assert!(
+                md.contains(&format!("```\n\n{DIFF_TRUNCATION_NOTE}")),
+                "{name}: the fence closes bare, right before the note: {md}"
+            );
+        }
+
+        // A FAILED call's error text is not a diff: no clip note.
+        let failed = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_failed".into(),
+            },
+            status: ToolStatus::Error,
+            started_at: None,
+            input: Some(json!({"filePath": "src/main.rs"})),
+            metadata: None,
+            output: ToolOutput {
+                raw: Some(json!("Edit failed.")),
+                blocks: vec![ContentBlock::Text("Edit failed.".into())],
+                error: Some("x".repeat(2 * TOOL_OUTPUT_MAX_CHARS)),
+            },
+        });
+        assert_eq!(
+            diff_truncation_note(&failed),
+            None,
+            "an error body carries no diff note"
+        );
+    }
+
+    /// A file-editing panel whose rendered diff body is longer than
+    /// [`TOOL_OUTPUT_MAX_CHARS`]: the shape the clip note exists for.
+    fn long_diff_panel(name: &str) -> ToolPanel {
+        let mut diff = String::from(
+            "\
+Index: src/main.rs
+===================================================================
+--- src/main.rs
++++ src/main.rs
+@@ -1,1 +1,400 @@
+",
+        );
+        for n in 1..=400 {
+            diff.push_str(&format!("+let value_{n} = compute({n});\n"));
+        }
+        ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: name.to_string(),
+                call_id: format!("call_{name}"),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({"filePath": "src/main.rs"})),
+            metadata: Some(json!({ "diff": diff })),
+            output: ToolOutput {
+                raw: Some(json!("Edit applied successfully.")),
+                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
+                error: None,
+            },
+        })
     }
 
     /// V2 records the edit's diff as `metadata.files[]` (one
