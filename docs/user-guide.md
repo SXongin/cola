@@ -473,7 +473,10 @@ Notes:
   place. 「📂 所在目录」 opens the file's parent in the Directory Browser;
   「← 返回目录」 returns from a browse-row viewer to its listing. A write/edit
   Tool Panel's folded header names the file it touched, and its 「📂 打开」 button
-  rides inside the fold — expand the panel, then open the file in the viewer. For
+  rides inside the fold — expand the panel, then open the file in the viewer. A
+  `write` panel also previews the content it wrote (fenced with the file's
+  language, clipped to the same 3000-character preview a `read` shows, with the
+  same truncation note). For
   an HTML page (`.html`/`.htm`) that button instead reads 「🌐 预览网页」 and sends
   the file as one File Message directly, without opening the viewer first: the
   panel already showed the markup, so the page its client renders is the only
