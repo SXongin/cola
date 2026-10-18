@@ -1215,10 +1215,14 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 /// the file a `write` just produced.
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
     let write = write_body(tool);
+    // The header rides the body's markdown OUTSIDE any fence, so it is charged
+    // through the card's own sanitizer — a path that closes its inline code span
+    // (`a\`<<<<.rs`) has its `<`-es expanded there, and the raw length would
+    // under-count them.
     let header = write
         .as_ref()
         .and_then(|(header, _, _)| header.as_deref())
-        .map(json_escaped_len)
+        .map(|header| json_escaped_len(&CardMarkdown::new().element(header)))
         .unwrap_or(0);
     let body = write
         .map(|(_, _, body)| body)
@@ -3500,6 +3504,28 @@ mod tests {
             panel_output_estimate(&panel),
             json_escaped_len(&format!("📄 `{long_path}`")) + 1,
             "the header's path and the one-char body are both charged"
+        );
+
+        // A path that closes its inline code span early (`a`<<<<.rs`) is charged
+        // as the SANITIZER renders it: its bare `<`s expand to `&lt;`, which a
+        // raw-length charge would miss (#788).
+        let tricky = "a`<<<<<<<<<<<<.rs";
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": tricky, "content": "x"})),
+            Some("Wrote file successfully."),
+        );
+        let header = format!("📄 `{tricky}`");
+        let rendered = CardMarkdown::new().element(&header);
+        assert!(
+            rendered.len() > header.len(),
+            "the sanitizer expands the bare `<`s: {rendered}"
+        );
+        assert_eq!(
+            panel_output_estimate(&panel),
+            json_escaped_len(&rendered) + 1,
+            "the expanded header is charged, not the raw path"
         );
     }
 
