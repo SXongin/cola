@@ -1765,6 +1765,24 @@ fn diff_header_path(line: &str) -> Option<String> {
     (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
 }
 
+/// The header a diff panel shows while folded: the change count, led by the
+/// file count when the patch touched more than one (#793). A multi-file patch's
+/// body keeps an `Index:` line per file, but those are invisible until the
+/// reader expands — the folded header is where the reader decides whether to.
+/// A single file keeps the bare totals: an `edit` names its target on the Input
+/// line, and a path repeated in one patch counts once, because `paths` is
+/// deduped. Counts and file count both come from this one [`EditDiff`], never
+/// from a second scan of the body.
+fn diff_header(diff: &EditDiff) -> String {
+    let counts = format!("+{} −{}", diff.additions, diff.deletions);
+    let files = diff.paths.len();
+    if files > 1 {
+        format!("📄 {files} files · {counts}")
+    } else {
+        counts
+    }
+}
+
 /// The language token a diff's hunks are fenced with (measured 2026-10-18: a
 /// `rust` fence colours the keywords and strings inside a `+`/`-` hunk, where
 /// Feishu's documented `diff` token renders plain).
@@ -1926,7 +1944,8 @@ fn is_file_editing(name: &str) -> bool {
 /// and the numbered lines; a `task`/`subagent` output is an XML envelope around
 /// the content the reader wants. An `edit`, `apply_patch` or `patch` output is
 /// substituted by its unified diff (`apply_patch`/`patch` keep each file's
-/// `Index:` line) — keep only the hunks and report the change count. A
+/// `Index:` line) — keep only the hunks and report the change count, led by the
+/// touched-file count when the patch names more than one file. A
 /// `todowrite` output is its todo list JSON-encoded — render it as a status
 /// checklist; a `websearch` output is a result envelope — render it as a
 /// title+url list. Other tools pass through unchanged.
@@ -1954,17 +1973,14 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
                 // its own paragraph — inside the same code block so the panel
                 // never loses it.
                 let lang = diff_language(&d);
+                let header = diff_header(&d);
                 let mut body = d.body;
                 if !d.tail.is_empty() {
                     body.push('\n');
                     body.push_str(d.tail.trim_end());
                     body.push('\n');
                 }
-                (
-                    Some(format!("+{} −{}", d.additions, d.deletions)),
-                    BodyStyle::Code(Some(lang)),
-                    body,
-                )
+                (Some(header), BodyStyle::Code(Some(lang)), body)
             }
             None => (None, BodyStyle::Auto, output.to_string()),
         };
@@ -5415,6 +5431,66 @@ Index: .config/opencode/AGENTS.md
         assert!(!md.contains("(1 replacement)"), "generated summary dropped: {md}");
     }
 
+    /// #793: V2's `edit` records `metadata.files[]`, and `recorded_diff` joins
+    /// the per-file patches. Two entries are two files, so the folded header
+    /// says `📄 2 files`; the totals stay the joined patch's own counts, and the
+    /// body keeps both hunks untouched.
+    #[test]
+    fn edit_v2_metadata_with_two_files_heads_with_the_file_count() {
+        let patch_one = "\
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-old
++new";
+        let patch_two = "\
+===================================================================
+--- /a/two.rs
++++ /a/two.rs
+@@ -1 +1,2 @@
+-x
++y
++z";
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit_two".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({"path": "/a/one.rs"})),
+            metadata: Some(json!({
+                "files": [
+                    {"file": "/a/one.rs", "patch": patch_one},
+                    {"file": "/a/two.rs", "patch": patch_two}
+                ],
+                "truncated": false
+            })),
+            output: ToolOutput {
+                raw: Some(json!("Edited 2 files")),
+                blocks: vec![ContentBlock::Text("Edited 2 files".into())],
+                error: None,
+            },
+        });
+        let card = CardBuilder::new()
+            .with_state(CardState::Done)
+            .with_tool(tool)
+            .build();
+        let md = card["body"]["elements"][0]["elements"][0]["content"]
+            .as_str()
+            .expect("panel markdown content");
+        assert!(
+            md.contains("**Output**\n\n📄 2 files · +3 −2"),
+            "the joined files' count and totals: {md}"
+        );
+        assert_eq!(
+            md.matches("@@ -1 +1 @@").count() + md.matches("@@ -1 +1,2 @@").count(),
+            2,
+            "both files' hunks stay in the body: {md}"
+        );
+    }
+
     /// V1's text output is its success sentence, then — when the LSP reported
     /// diagnostics — a note after a blank line. The summary is dropped, the
     /// note stays after the hunks: the blank line is the boundary, so a
@@ -5792,7 +5868,7 @@ see the compiler's note above
             "the second file's header is not a +/- line"
         );
         let (header, style, _) = format_tool_output("apply_patch", &two);
-        assert_eq!(header.as_deref(), Some("+2 −2"));
+        assert_eq!(header.as_deref(), Some("📄 2 files · +2 −2"));
         assert_eq!(
             style,
             BodyStyle::Code(Some(PLAIN_TEXT)),
@@ -5860,7 +5936,11 @@ Index: /a/two.rs
 -x
 +y";
         let (header, style, body) = format_tool_output("apply_patch", diff);
-        assert_eq!(header.as_deref(), Some("+2 −2"), "count header: {header:?}");
+        assert_eq!(
+            header.as_deref(),
+            Some("📄 2 files · +2 −2"),
+            "count header: {header:?}"
+        );
         assert_eq!(
             style,
             BodyStyle::Code(Some("rust")),
@@ -5872,6 +5952,95 @@ Index: /a/two.rs
         assert!(body.contains("+y"), "second hunk kept: {body}");
         assert!(body.contains(" let a = 1;"), "context kept: {body}");
         assert!(!body.contains("+++"), "file header noise dropped: {body}");
+    }
+
+    /// #793: a multi-file patch's folded header says how many files it touched
+    /// ahead of the totals — the body's `Index:` separators are invisible until
+    /// the reader expands, so the count is what says whether expanding is worth
+    /// it. The count and the totals are the same `EditDiff`: the paths it
+    /// deduped and the lines it summed.
+    #[test]
+    fn a_multi_file_patch_header_names_the_file_count() {
+        let diff = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1,2 @@
+-old
++new
++extra
+Index: /a/two.rs
+===================================================================
+--- /a/two.rs
++++ /a/two.rs
+@@ -1 +1 @@
+-x
++y
+Index: /a/three.md
+===================================================================
+--- /a/three.md
++++ /a/three.md
+@@ -1 +1 @@
+-old
++new";
+        let (header, _, body) = format_tool_output("patch", diff);
+        assert_eq!(
+            header.as_deref(),
+            Some("📄 3 files · +4 −3"),
+            "the file count leads the totals across every file"
+        );
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("Index: ")).count(),
+            3,
+            "the body keeps one `Index:` separator per file: {body}"
+        );
+    }
+
+    /// #793: a patch that names the same file twice is still one file — the
+    /// deduped `paths` decide, so the header never claims `2 files` for one
+    /// target. A lone file also gets no `1 file` prefix, which would only
+    /// repeat the path the Input line already shows.
+    #[test]
+    fn a_repeated_file_keeps_the_bare_change_count() {
+        let diff = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-old
++new
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -5 +5 @@
+-old
++new";
+        let (header, _, body) = format_tool_output("patch", diff);
+        assert_eq!(header.as_deref(), Some("+2 −2"), "one file, bare totals");
+        assert_eq!(
+            body.lines().filter(|l| l.starts_with("Index: ")).count(),
+            2,
+            "the body is untouched: {body}"
+        );
+    }
+
+    /// #793 regression: a single-file `edit` header stays byte-identical to
+    /// what the panel showed before the file count existed.
+    #[test]
+    fn a_single_file_edit_header_is_the_bare_change_count() {
+        let diff = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-old
++new";
+        let (header, _, _) = format_tool_output("edit", diff);
+        assert_eq!(header.as_deref(), Some("+1 −1"));
     }
 
     /// A patch that touches two languages has no honest grammar to fence with:
