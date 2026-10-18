@@ -5756,6 +5756,50 @@ mod tests {
         );
     }
 
+    /// #792 review: the diff byte cap covers the dynamic FENCE, not just the
+    /// body. A hunk carrying one long backtick run would otherwise clip at
+    /// 12 KB of body and then demand ~24 KB of fence — ~36 KB for a lone
+    /// panel, past both the card estimate ceiling and Feishu's hard limit,
+    /// and a panel cannot split away from itself.
+    #[test]
+    fn a_backtick_diff_body_and_its_fence_stay_under_the_card_budget() {
+        use crate::backend::{ContentBlock, ToolOutput};
+        let diff = format!(
+            "Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,1 @@\n+{}\n",
+            "`".repeat(25_000)
+        );
+        let panel = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(serde_json::json!({"filePath": "src/main.rs"})),
+            metadata: Some(serde_json::json!({ "diff": diff })),
+            output: ToolOutput {
+                raw: Some(serde_json::json!("Edit applied successfully.")),
+                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
+                error: None,
+            },
+        });
+        let estimate = panel_estimate(&panel, Some("ses_1"));
+        assert!(
+            estimate < crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the fence is inside the cap, not beside it: {estimate}"
+        );
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.set_session("ses_1");
+        acc.push_tool("call_edit", panel);
+        let card = acc.build_card().to_string();
+        assert!(
+            card.len() < crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the rendered card fits: {}",
+            card.len()
+        );
+    }
+
     /// The folded header's file detail (ADR-0083 §8 amendment, #766) is card
     /// JSON too: `panel_estimate` charges its serialized bytes, so dropping the
     /// term would let a near-budget card omit what the header renders. The two
