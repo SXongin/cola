@@ -13,8 +13,9 @@ use crate::bridge::pollers::result_card;
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::turn::Turn;
+use crate::feishu::card::lang::language_for_path;
 use crate::feishu::card::tool_render::{
-    DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_language_for, parse_edit_diff,
+    DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, parse_edit_diff,
 };
 use crate::opencode;
 
@@ -1578,24 +1579,11 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
             )),
             None => s.push_str(&format!("**改动**: 📄 `{}`\n", truncate(path, 200))),
         }
-        // The fence language: the metadata `filepath` first, then every file the
-        // diff itself names (`EditDiff::paths`, so a multi-file patch agrees on
-        // one language), and the first pattern only when neither names a file.
-        // `diff_language_for` falls to `plain_text` when they disagree, so a
-        // `.rs` hunk is never coloured with a `.md` file's grammar.
-        let mut language_paths: Vec<&str> = metadata_filepath.into_iter().collect();
-        if let Some(d) = parsed.as_ref() {
-            for touched in &d.paths {
-                if !language_paths.contains(&touched.as_str()) {
-                    language_paths.push(touched);
-                }
-            }
-        }
-        let language = if language_paths.is_empty() {
-            diff_language_for(p.patterns.first().map(String::as_str))
-        } else {
-            diff_language_for(language_paths)
-        };
+        // The fence language follows the ONE path the card already selected for
+        // its header — metadata `filepath`, else the diff's own path, else the
+        // first pattern (#794). No agreement check runs across every touched
+        // file, so a multi-file patch fences with the selected file's grammar.
+        let language = language_for_path(path);
         let body = parsed.map(|d| d.body).unwrap_or_else(|| diff.to_string());
         // Clip BARE, then say so outside the fence: the `…` `truncate_md`
         // appends immediately before the closing fence stops Feishu rendering
@@ -1716,19 +1704,54 @@ Index: /proj/src/main.rs
         }
     }
 
-    /// A multi-file patch shares ONE fence language: every touched file must
-    /// agree, or the hunks would be coloured with one file's grammar.
+    /// #794's path precedence: one selected path — metadata `filepath`, else
+    /// the diff's own path, else the first pattern — and the fence language is
+    /// that path's language. No agreement check across a patch's files.
     #[test]
-    fn describe_permission_multi_file_diff_agrees_on_one_language() {
+    fn describe_permission_fence_language_follows_the_path_precedence() {
+        // 1. Metadata `filepath` wins over the diff's header, even when the
+        //    two disagree: a `.md` permission is fenced as markdown, not
+        //    `plain_text`.
+        let diff = "--- /proj/src/main.rs\n+++ /proj/src/main.rs\n@@ -1 +1 @@\n-old\n+new";
+        let p = perm(
+            "edit",
+            serde_json::json!({ "filepath": "/proj/README.md", "diff": diff }),
+        );
+        let s = describe_permission(&p);
+        assert!(
+            s.contains("```markdown\n@@ -1 +1 @@"),
+            "metadata filepath wins: {s}"
+        );
+        assert!(!s.contains("```plain_text"), "metadata filepath wins: {s}");
+
+        // 2. Without a metadata `filepath`, the diff's own path wins over the
+        //    request's patterns (which name a `.rs` file here).
+        let py = "--- /proj/script.py\n+++ /proj/script.py\n@@ -1 +1 @@\n-old\n+new";
+        let p = perm("edit", serde_json::json!({ "diff": py }));
+        let s = describe_permission(&p);
+        assert!(
+            s.contains("```python\n@@ -1 +1 @@"),
+            "the diff's path beats the patterns: {s}"
+        );
+
+        // 3. Only when neither names a file does the first pattern decide.
+        let p = perm("edit", serde_json::json!({ "diff": "not a unified diff" }));
+        let s = describe_permission(&p);
+        assert!(s.contains("```rust\n"), "the pattern decides: {s}");
+    }
+
+    /// A multi-file patch fences with the ONE selected path's language, not an
+    /// agreement across every touched file: a mixed patch is not forced to
+    /// `plain_text`. These are V2-shaped diffs (headers, no `Index:`), so the
+    /// parsed path is the first file's.
+    #[test]
+    fn describe_permission_multi_file_diff_uses_one_selected_path() {
         let same = "\
-Index: /proj/src/a.rs
-===
 --- /proj/src/a.rs
 +++ /proj/src/a.rs
 @@ -1 +1 @@
 -a
 +a2
-Index: /proj/src/b.rs
 ===
 --- /proj/src/b.rs
 +++ /proj/src/b.rs
@@ -1739,12 +1762,16 @@ Index: /proj/src/b.rs
         let s = describe_permission(&p);
         assert!(s.contains("```rust\n@@ -1 +1 @@"), "shared .rs language: {s}");
 
-        let mixed = same.replace("/proj/src/b.rs", "/proj/notes.md");
+        let mixed = same.replace("/proj/src/a.rs", "/proj/notes.md");
         let p = perm("apply_patch", serde_json::json!({ "diff": mixed }));
         let s = describe_permission(&p);
         assert!(
-            s.contains("```plain_text\n@@ -1 +1 @@"),
-            "disagreeing languages fall to plain_text: {s}"
+            s.contains("```markdown\n@@ -1 +1 @@"),
+            "the first file's language fences a mixed patch: {s}"
+        );
+        assert!(
+            !s.contains("```plain_text"),
+            "a mixed patch no longer forces plain_text: {s}"
         );
     }
 
