@@ -3,7 +3,7 @@ use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::{AwaitingAction, exceeds_md_budget, fenced_code, first_n_chars_bytes, truncate_md};
+use super::{AwaitingAction, exceeds_md_budget, fenced_code, truncate_md};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
@@ -1137,44 +1137,78 @@ fn panel_output_body(tool: &ToolPanel) -> Option<String> {
 
 /// The body a `write` panel renders in place of its success sentence (#788):
 /// the call's own `content` input — the file it produced, which is what a reader
-/// wants and what the panel's 「📂 打开」 already opens the way to — with the
-/// tool's trailing note (V1's diagnostics after the success summary) kept on its
-/// own paragraph, exactly as [`edit_tool_output`] treats an edit's tail.
+/// wants and what the panel's 「📂 打开」 already opens the way to.
 ///
 /// `None` — the panel then renders its output text as before — for a call that
-/// FAILED (its error text is the body) and for one whose input carries no usable
-/// `content` string. The header is the same `📄 <path>` shape the `read` panel's
-/// body carries, and the fence takes the touched file's language
-/// ([`language_for_path`]), so a written `.md` previews its SOURCE like the
-/// viewer's default.
+/// FAILED ([`call_failed`]: its error text is the body) and for one whose input
+/// carries no usable `content` string. The header is the same `📄 <path>` shape
+/// the `read` panel's body carries, and the fence takes the touched file's
+/// language ([`language_for_path`]), so a written `.md` previews its SOURCE like
+/// the viewer's default.
 fn write_body(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if tool.name() != "write" || tool.status() == &ToolStatus::Error {
+    if tool.name() != "write" || call_failed(tool) {
         return None;
     }
     let obj = tool.input()?.as_object()?;
     let content = obj.get("content")?.as_str()?;
     let path = input_path(obj).filter(|path| !path.trim().is_empty());
-    let mut body = content.to_string();
-    if let Some(tail) = tool.output().as_deref().and_then(summary_tail) {
-        body.push_str("\n\n");
-        body.push_str(tail);
-    }
     let header = path.map(|path| format!("📄 `{path}`"));
     let lang = path.map(language_for_path).unwrap_or(PLAIN_TEXT);
-    Some((header, BodyStyle::Code(Some(lang)), body))
+    Some((header, BodyStyle::Code(Some(lang)), content.to_string()))
+}
+
+/// Whether the call settled as a FAILURE, by the same rule its status icon
+/// draws ([`ToolPanel::status_icon`]): the typed `Error`, a status this build
+/// does not model but the server named `failed`, or runtime metadata that
+/// reports one. A failed `write` keeps its error text rather than the content it
+/// never wrote (#788).
+fn call_failed(tool: &ToolPanel) -> bool {
+    tool.metadata_failure()
+        || match tool.status() {
+            ToolStatus::Error => true,
+            ToolStatus::Other(status) => status == "failed",
+            _ => false,
+        }
+}
+
+/// The trailing note a `write` panel keeps after its fenced content (#788): the
+/// text the tool reported after its success summary (V1's diagnostics), shown as
+/// its own paragraph OUTSIDE the content's [`TOOL_OUTPUT_MAX_CHARS`] preview
+/// budget, so a long note is never clipped by the content's clamp nor mistaken
+/// for a clipped content. `None` whenever the panel renders no content body
+/// ([`write_body`]), or the tool reported no note.
+fn write_tail(tool: &ToolPanel) -> Option<String> {
+    write_body(tool)?;
+    tool.output()
+        .as_deref()
+        .and_then(summary_tail)
+        .map(str::to_string)
+}
+
+/// The serialized byte length the trailing note [`write_tail`] appends to a
+/// `write` panel (#788), for the size estimate — the note is card JSON like the
+/// truncation note whose charge [`preview_truncation_note_estimate`] measures.
+/// `0` when the note does not render. Kept beside the render so the two cannot
+/// drift.
+pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
+    write_tail(tool)
+        .map(|tail| json_escaped_len(&CardMarkdown::new().element(&tail)))
+        .unwrap_or(0)
 }
 
 /// The serialized byte length the Output body a panel renders contributes to
 /// its card size (#788): a `write` call's own `content` ([`write_body`], which
 /// the output text does not carry), else the tool's output text — the body the
-/// render shows, capped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's own
-/// clamp. Kept beside the render so the estimate cannot charge a body the panel
-/// never writes, nor miss the file a `write` just produced.
+/// render shows, clipped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's
+/// own clamp and measured JSON-ESCAPED, the form the body takes inside the
+/// card's `content` string (each newline and quote costs its extra byte). Kept
+/// beside the render so the estimate cannot charge a body the panel never
+/// writes, nor miss the file a `write` just produced.
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
     write_body(tool)
         .map(|(_, _, body)| body)
         .or_else(|| tool.output())
-        .map(|body| first_n_chars_bytes(&body, TOOL_OUTPUT_MAX_CHARS))
+        .map(|body| json_escaped_len(&truncate_md(&body, TOOL_OUTPUT_MAX_CHARS)))
         .unwrap_or(0)
 }
 
@@ -1277,6 +1311,12 @@ pub(super) fn tool_panel_element(
                     content.push_str(&fenced_code(&body, None));
                 }
                 BodyStyle::Auto => content.push_str(&body),
+            }
+            // The tool's own trailing note rides after the fenced body, outside
+            // the content's preview budget (#788), the way the truncation note
+            // closes the section below it (ADR-0083 §8 amendment, #770/#788).
+            if let Some(tail) = write_tail(tool) {
+                content.push_str(&format!("\n\n{tail}"));
             }
             // A clipped `read`/`write` body says so, naming the button above it
             // (ADR-0083 §8 amendment, #770/#788). Only those two get it: they
@@ -3256,7 +3296,26 @@ mod tests {
             "the content cannot replace an error: {md}"
         );
 
-        // The tool's trailing note survives beside the fenced content.
+        // A status this build does not model but the server named "failed" is a
+        // failure too — its error text must not be replaced by the content.
+        let failed = ToolPanel::for_test(
+            "write",
+            ToolStatus::Other("failed".into()),
+            Some(json!({"filePath": "report.md", "content": "secret"})),
+            Some("write failed"),
+        );
+        let md = panel_md_with_session(failed, "ses_1");
+        assert!(
+            md.contains("write failed"),
+            "a named failure keeps its error: {md}"
+        );
+        assert!(
+            !md.contains("secret"),
+            "the content cannot replace a failure: {md}"
+        );
+
+        // The tool's trailing note survives AFTER the fence, outside the
+        // content's preview budget.
         let noted = ToolPanel::for_test(
             "write",
             ToolStatus::Completed,
@@ -3266,12 +3325,55 @@ mod tests {
         let md = panel_md_with_session(noted, "ses_1");
         assert!(md.contains("fn main() {}"), "the content is the body: {md}");
         assert!(
-            md.contains("LSP errors detected"),
-            "the trailing note is kept: {md}"
+            md.contains("```\n\nLSP errors detected"),
+            "the trailing note rides outside the fence: {md}"
         );
         assert!(
             !md.contains("Wrote file successfully."),
             "the summary is still dropped: {md}"
+        );
+
+        // A long note does NOT clip the content or fake a truncation: the note
+        // is shown outside the content's own budget (#788).
+        let long_tail = "N".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let noted = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "src/main.rs", "content": "fn main() {}"})),
+            Some(&format!("Wrote file successfully.\n\n{long_tail}")),
+        );
+        assert_eq!(
+            preview_truncation_note_estimate(&noted, Some("ses_1")),
+            0,
+            "the content fits; a long note cannot fake a clip"
+        );
+        let md = panel_md_with_session(noted, "ses_1");
+        assert!(md.contains(&long_tail), "the note is not clipped: {md}");
+        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no clip, no note: {md}");
+    }
+
+    /// The body charge is the JSON-ESCAPED length the card serializes, not the
+    /// raw UTF-8 length: a written file full of newlines and quotes costs two
+    /// bytes each inside the card's `content` string, and a raw-length estimate
+    /// would let a near-budget card pass the split check while the serialized
+    /// card exceeds Feishu's cap (#788).
+    #[test]
+    fn the_write_body_estimate_charges_the_escaped_bytes() {
+        let content = "\n".repeat(1_000);
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "src/main.rs", "content": content})),
+            Some("Wrote file successfully."),
+        );
+        assert_eq!(
+            panel_output_estimate(&panel),
+            2 * 1_000,
+            "each newline costs its escaped byte pair inside the card"
+        );
+        assert!(
+            panel_output_estimate(&panel) > content.len(),
+            "the raw byte length would under-charge"
         );
     }
 
