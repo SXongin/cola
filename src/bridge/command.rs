@@ -504,7 +504,7 @@ pub fn help_text() -> String {
 `/skill` · Skill picker: list every registered skill (also `/skill <id>`)
 `/autoaccept` · Show auto-approve status; `/autoaccept on|off` switches
 `/restart` · Restart cola (keeps startup args + log redirect)
-`/restart-opencode` · Restart the OpenCode server (only when cola started it)
+`/restart-opencode` · Restart the OpenCode server (an owned server or the V2 managed service)
 `/update` · Update cola (GitHub Releases self-update; cargo installs get the cargo command)
 `/version` · Show cola version & build provenance (release / crates.io / dev build)
 `/help <command>` · Show help for one command (e.g. `/help model`)
@@ -572,7 +572,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/restart\nRestart cola itself, keeping startup args and the log redirect. The new process takes over the singleton lock (passes --replace). Under a systemd unit cola exits and lets `Restart=on-failure` bring it back; elsewhere it re-execs. cola announces in this chat when it's back."
         }
         "restart-opencode" => {
-            "/restart-opencode\nRestart the OpenCode server. cola only restarts a server IT started; a server launched by another tool is left alone and needs a manual restart."
+            "/restart-opencode\nRestart the OpenCode server. cola restarts a server IT started, and the V2 managed service (`serve --service`) through `opencode service restart`; any other server is left alone and needs a manual restart."
         }
         "update" => {
             "/update\nUpdate cola to the latest version (ADR-0030).\n- GitHub Releases install: check GitHub Releases; if newer, download, verify (SHA256SUMS), replace the running binary and restart. When running as a systemd unit, the restart hands back to `Restart=on-failure`; otherwise the new process re-execs with --replace.\n- cargo install (`cargo install colark` / `cargo binstall colark`, detected from cargo's install receipt): nothing is replaced; cola reports the crates.io version and the command to run (`cargo install colark`; binstall users `cargo binstall colark`; add `--force` if cargo says already installed).\nCLI equivalent: `cola update [--check]`."
@@ -1338,6 +1338,16 @@ pub(crate) async fn handle_command(
                         .flow
                         .platform
                         .reply_text(message_id, "♻️ 已重启 OpenCode 服务器。")
+                        .await?;
+                }
+                Ok(crate::bridge::discovery::RestartOutcome::RestartedService) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            "♻️ 已重启 OpenCode 托管服务（Shared Service）；cola 会在几秒内重新连接。",
+                        )
                         .await?;
                 }
                 Ok(crate::bridge::discovery::RestartOutcome::NotOwned) => {
