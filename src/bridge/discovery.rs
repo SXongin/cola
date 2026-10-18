@@ -1151,6 +1151,16 @@ mod tests {
     }
 
     #[test]
+    fn a_service_is_never_owned_even_when_the_pid_record_names_it() {
+        // cola never records a service pid, and a corrupt/stale record must
+        // not turn the shared rendezvous into something cola may reap: the
+        // Service class wins over the pid match (ADR-0085).
+        let service = service_cand(1, 49374);
+        assert_eq!(service.class_against(Some(1)), ServerClass::Service);
+        assert_eq!(pick_server(&[service], None, Some(1)).unwrap().pid, 1);
+    }
+
+    #[test]
     fn restart_plan_restarts_the_shared_service() {
         let owned = cand(1, 4096, "cola-secret", true);
         let service = service_cand(2, 49374);
