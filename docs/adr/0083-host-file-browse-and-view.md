@@ -529,22 +529,25 @@ pays three or six bytes for it. A diff now has its own cap, `DIFF_MAX_ESCAPED_BY
   string. JSON's widest escape is six bytes for one character (a control char as `\uXXXX`), so a
   character-counted cap of the same number could overrun the card budget sixfold; the clip
   (`clip_fenced_body`) cuts on a character boundary.
-- **The budget includes the fence, not just the body.** `fenced_code` sizes its fence to the body's
-  longest backtick run plus one, so a backtick-heavy body capped only on its escaped bytes could
-  then demand up to twice the cap in fence — ~36 KB from a 12 KB body, past the card estimate and
-  Feishu's hard limit, with no split to escape it. The clip charges
-  `fenced_block_bytes` for the run it has kept, including the minimum fence and its newlines, so
-  the rendered fenced block stays inside 12,000 (the language token rides the header, covered by
-  the panel's fixed overhead like every fenced body).
+- **The budget includes the fence and its language tag, not just the body.** `fenced_code` sizes
+  its fence to the body's longest backtick run plus one, so a backtick-heavy body capped only on
+  its escaped bytes could then demand up to twice the cap in fence — ~36 KB from a 12 KB body,
+  past the card estimate and Feishu's hard limit, with no split to escape it. The opening fence
+  line also carries the language token (`rust` is four bytes), which can push a body that just
+  fits without a tag over the cap. The clip charges `fenced_block_bytes` for the run it has kept,
+  including the minimum fence and its newlines, plus the selected language's bytes, so the
+  rendered block (body + fence + tag) stays inside 12,000. Both surfaces pass the language they
+  fence with: the tool panel its diff's `BodyStyle::Code` token, the permission card its selected
+  path's language (#794).
 - **Bare clip, and only a clip adds the note.** The body carries no `…` (the #788 rule), and the
   diff's `_（改动过长，已截断）_` note renders iff the body was clipped; a diff that fits is
   otherwise untouched — no note, no rewrite.
 - **The estimate charges the same cap and the same body.** `panel_output_estimate` charges the
   parsed diff the render writes (not the raw recorded diff), clipped at
-  `DIFF_MAX_ESCAPED_BYTES`, plus its count header and dynamic fence, so the split check and the
-  render cannot drift apart. A diff that already fit the old 3,000-character preview is a no-op
-  for the clip and charges its rendered size; only a diff the byte budget newly reveals is charged
-  larger, because the card now carries those bytes.
+  `DIFF_MAX_ESCAPED_BYTES`, plus its count header, its whole fence and the opening fence's
+  language tag, so the split check and the render cannot drift apart. A diff that already fit the
+  old 3,000-character preview is a no-op for the clip and charges its rendered size; only a diff
+  the byte budget newly reveals is charged larger, because the card now carries those bytes.
 - **Only the diff moves.** A `read`/`write` preview keeps `TOOL_OUTPUT_MAX_CHARS` characters and
   its own note. The permission card reuses the constant and the clip helper (#794).
 

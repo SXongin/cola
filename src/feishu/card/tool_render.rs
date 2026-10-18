@@ -49,11 +49,12 @@ pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_"
 /// control char (JSON's six-byte `\uXXXX` escape) count as one and blow the
 /// budget by up to sixfold.
 ///
-/// The budget covers the escaped body AND the fence [`fenced_code`] wraps it
-/// in ([`clip_fenced_body`]): a body carrying a long backtick run would
-/// otherwise clip at ~12 KB and demand ~24 KB more in fence, blowing the card
-/// on its own. Shared with the permission card, which renders the same diff
-/// under the same cap (#794).
+/// The budget covers the escaped body, the fence [`fenced_code`] wraps it in AND
+/// the opening fence's language token ([`clip_fenced_body`]): a body carrying a
+/// long backtick run would otherwise clip at ~12 KB and demand ~24 KB more in
+/// fence, and a body that just fits without a tag can be pushed over by the tag
+/// alone. Shared with the permission card, which renders the same diff under
+/// the same cap (#794).
 pub(crate) const DIFF_MAX_ESCAPED_BYTES: usize = 12_000;
 
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
@@ -1025,35 +1026,50 @@ fn escaped_char_len(c: char) -> usize {
     }
 }
 
+/// The bytes the opening fence's language token adds to a fenced block: zero
+/// for `None` or an empty token (the shapes [`fenced_code`] renders as a bare
+/// fence). The tag sits on the opening fence line, so it is part of the block
+/// the diff budget and `panel_output_estimate` must charge.
+fn fence_lang_bytes(lang: Option<&str>) -> usize {
+    lang.filter(|lang| !lang.is_empty()).map_or(0, str::len)
+}
+
 /// Whether `text` fits a fenced-body budget: its JSON-escaped length PLUS the
 /// whole fence [`fenced_code`] will wrap it in (dynamic backtick run, minimum
-/// fence and newlines). The one budget test [`clip_fenced_body`] and the diff
-/// note share, so a body is clipped exactly when the note says so.
-fn fenced_body_fits(text: &str, max_escaped_bytes: usize) -> bool {
-    json_escaped_len(text) + fenced_block_overhead(text) <= max_escaped_bytes
+/// fence and newlines) PLUS the opening fence's language token. The one budget
+/// test [`clip_fenced_body`] and the diff note share, so a body is clipped
+/// exactly when the note says so.
+fn fenced_body_fits(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> bool {
+    json_escaped_len(text) + fenced_block_overhead(text) + fence_lang_bytes(lang) <= max_escaped_bytes
 }
 
 /// Clip `text` to fit `max_escaped_bytes`, where the budget covers the body's
-/// JSON-escaped bytes AND the fence [`fenced_code`] adds around it, with NO
-/// truncation marker — the bare clip a fenced body takes when a note below the
-/// fence says it was clipped (the `…` immediately before a closing fence stops
-/// Feishu rendering the block as code at all, #788).
+/// JSON-escaped bytes, the fence [`fenced_code`] adds around it AND the opening
+/// fence's `lang` token, with NO truncation marker — the bare clip a fenced
+/// body takes when a note below the fence says it was clipped (the `…`
+/// immediately before a closing fence stops Feishu rendering the block as code
+/// at all, #788).
 ///
 /// The fence must be inside the budget, not beside it: `fenced_code` sizes its
 /// fence to the body's longest backtick run plus one, so a body that clips at
 /// the cap while carrying a run of backticks would demand up to twice the cap
 /// in fence alone — ~36 KB from a 12 KB body, past both the card estimate and
-/// Feishu's hard limit, and a lone panel cannot split away from it. The walk
-/// therefore charges each char's escaped bytes plus the fence growth a new
-/// backtick run causes, and stops before the one that would cross the budget
-/// (the charge only ever grows, so the first over-budget prefix is the answer).
-/// Measured in escaped bytes, not characters, so the cap matches the card's own
-/// byte budget ([`DIFF_MAX_ESCAPED_BYTES`], #792); the cut lands on a character
-/// boundary. Shared with the permission card (#794).
-pub(crate) fn clip_fenced_body(text: &str, max_escaped_bytes: usize) -> String {
-    if fenced_body_fits(text, max_escaped_bytes) {
+/// Feishu's hard limit, and a lone panel cannot split away from it. The
+/// language tag is part of the rendered block too, so it is charged as well: a
+/// body that fits without a tag can otherwise be pushed over by the tag alone
+/// (`rust` is four bytes). The walk therefore charges each char's escaped bytes
+/// plus the fence growth a new backtick run causes against the tag-adjusted
+/// budget, and stops before the one that would cross it (the charge only ever
+/// grows, so the first over-budget prefix is the answer). Measured in escaped
+/// bytes, not characters, so the cap matches the card's own byte budget
+/// ([`DIFF_MAX_ESCAPED_BYTES`], #792); the cut lands on a character boundary.
+/// Shared with the permission card, which passes its own selected language
+/// (#794).
+pub(crate) fn clip_fenced_body(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> String {
+    if fenced_body_fits(text, lang, max_escaped_bytes) {
         return text.to_string();
     }
+    let lang_bytes = fence_lang_bytes(lang);
     let mut used = 0usize;
     let mut run = 0usize;
     let mut longest = 0usize;
@@ -1062,7 +1078,7 @@ pub(crate) fn clip_fenced_body(text: &str, max_escaped_bytes: usize) -> String {
         let cost = escaped_char_len(c);
         let next_run = if c == '`' { run + 1 } else { 0 };
         let next_longest = longest.max(next_run);
-        if used + cost + fenced_block_bytes(next_longest) > max_escaped_bytes {
+        if used + cost + fenced_block_bytes(next_longest) + lang_bytes > max_escaped_bytes {
             break;
         }
         used += cost;
@@ -1211,6 +1227,16 @@ fn is_diff_body(name: &str, style: &BodyStyle) -> bool {
     is_file_editing(name) && matches!(style, BodyStyle::Code(_))
 }
 
+/// The language token a [`BodyStyle::Code`] body renders its opening fence
+/// with, `None` for every other style. The token is part of the fenced block,
+/// so the diff budget, its note and its estimate all read it here.
+fn code_lang(style: &BodyStyle) -> Option<&'static str> {
+    match style {
+        BodyStyle::Code(lang) => *lang,
+        BodyStyle::Auto | BodyStyle::Markdown => None,
+    }
+}
+
 /// The diff body a file-editing panel renders, UNclipped: the parsed hunks of
 /// an `edit` / `apply_patch` / `patch` call. `None` for every other panel and
 /// for an editing call whose output is not a recognized diff (a FAILED call's
@@ -1229,14 +1255,14 @@ fn diff_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> 
 /// The note a file-editing panel appends under a diff its budget CLIPPED
 /// ([`DIFF_TRUNCATION_NOTE`]): the clip's only signal, because the fenced body
 /// clips bare (#788). Renders IFF the body the panel shows is a recognized diff
-/// ([`diff_output`]) whose escaped body PLUS its fence exceeds
+/// ([`diff_output`]) whose escaped body, fence and language tag exceed
 /// [`DIFF_MAX_ESCAPED_BYTES`] ([`fenced_body_fits`]) — a FAILED call's error
 /// text is not a diff and takes no note, since there is no change to name.
 /// Unlike [`preview_truncation_note`] it needs no button: "已截断" is true even
 /// when nothing can be opened, so the reader still knows the diff is partial.
 fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
     diff_output(tool)
-        .filter(|(_, _, body)| !fenced_body_fits(body, DIFF_MAX_ESCAPED_BYTES))
+        .filter(|(_, style, body)| !fenced_body_fits(body, code_lang(style), DIFF_MAX_ESCAPED_BYTES))
         .map(|_| DIFF_TRUNCATION_NOTE)
 }
 
@@ -1382,14 +1408,17 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
     // A diff renders its parsed hunks clipped at the byte budget, not the raw
     // recorded diff at the preview cap: charge exactly that body, the count
-    // header above it and the fence around it. The clip includes the fence in
-    // its budget, so the charge can never trail a backtick run's fence.
-    if let Some((header, _, body)) = diff_output(tool) {
+    // header above it and the WHOLE fence around it, language tag included.
+    // The clip includes the same three in its budget, so the charge is exactly
+    // what the render writes and can never trail a backtick run's fence or the
+    // opening tag.
+    if let Some((header, style, body)) = diff_output(tool) {
         let header = header
             .map(|header| json_escaped_len(&CardMarkdown::new().element(&header)))
             .unwrap_or(0);
-        let body = clip_fenced_body(&body, DIFF_MAX_ESCAPED_BYTES);
-        return header + json_escaped_len(&body) + fenced_overhead(&body);
+        let lang = code_lang(&style);
+        let body = clip_fenced_body(&body, lang, DIFF_MAX_ESCAPED_BYTES);
+        return header + json_escaped_len(&body) + fenced_block_overhead(&body) + fence_lang_bytes(lang);
     }
     let write = write_body(tool);
     // The header rides the body's markdown OUTSIDE any fence, so it is charged
@@ -1508,7 +1537,7 @@ pub(super) fn tool_panel_element(
             // the way-in note), exactly as before.
             let note = truncation_note(tool, session_id);
             let body = if is_diff_body(name, &style) {
-                clip_fenced_body(&body, DIFF_MAX_ESCAPED_BYTES)
+                clip_fenced_body(&body, code_lang(&style), DIFF_MAX_ESCAPED_BYTES)
             } else if note.is_some() && matches!(style, BodyStyle::Code(_)) {
                 clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
             } else {
@@ -5243,37 +5272,58 @@ Index: src/main.rs
     }
 
     /// #792: the diff body budget is measured in JSON-ESCAPED bytes, not
-    /// characters, AND it includes the fence `fenced_code` will add. The widest
-    /// single character escapes to six bytes (a control char as `\uXXXX`), so a
-    /// character-counted cap of the same number lets a quote-, newline- or
-    /// CJK-heavy body blow the card budget severalfold; and a body of backticks
-    /// costs up to twice its escaped length again in fence, which a body-only
-    /// cap misses entirely.
+    /// characters, AND it includes the fence `fenced_code` will add plus that
+    /// fence's language tag. The widest single character escapes to six bytes
+    /// (a control char as `\uXXXX`), so a character-counted cap of the same
+    /// number lets a quote-, newline- or CJK-heavy body blow the card budget
+    /// severalfold; a body of backticks costs up to twice its escaped length
+    /// again in fence, which a body-only cap misses; and a 4-byte `rust` tag is
+    /// enough to push a body that just fits over the cap.
     #[test]
-    fn the_diff_clip_counts_json_escaped_bytes_and_its_fence() {
-        // Plain ASCII: 6,000 chars plus the 8-byte minimum fence fits.
+    fn the_diff_clip_counts_json_escaped_bytes_fence_and_language() {
+        // Plain ASCII: 6,000 chars plus the fence and `rust` tag fit.
         let ascii = "a".repeat(6_000);
-        assert_eq!(clip_fenced_body(&ascii, DIFF_MAX_ESCAPED_BYTES), ascii);
-        // CJK: 5,000 chars is 15,000 escaped bytes; whole characters only, and
-        // the minimum fence leaves 11,992 bytes for the body.
-        let cjk = "中".repeat(5_000);
-        assert_eq!(clip_fenced_body(&cjk, DIFF_MAX_ESCAPED_BYTES), "中".repeat(3_997));
-        // A control character is JSON's widest escape: six bytes, so the cap
-        // holds 1,998 of them beside the minimum fence.
-        let control = "\u{1}".repeat(3_000);
-        let clipped = clip_fenced_body(&control, DIFF_MAX_ESCAPED_BYTES);
-        assert_eq!(clipped.chars().count(), 1_998);
-        assert!(json_escaped_len(&clipped) + fenced_block_overhead(&clipped) <= DIFF_MAX_ESCAPED_BYTES);
-        // A single 20,000-backtick run: the fence is one backtick longer on
-        // each side, so only 3,998 survive — 3,998 escaped bytes plus an 8,000
-        // byte fence. Clipping on escaped bytes alone would keep 12,000 and
-        // then pay ~24,000 more in fence.
-        let ticks = "`".repeat(20_000);
-        let clipped = clip_fenced_body(&ticks, DIFF_MAX_ESCAPED_BYTES);
-        assert_eq!(clipped.len(), 3_998);
         assert_eq!(
-            json_escaped_len(&clipped) + fenced_block_overhead(&clipped),
-            11_998
+            clip_fenced_body(&ascii, Some("rust"), DIFF_MAX_ESCAPED_BYTES),
+            ascii
+        );
+        // CJK: 5,000 chars is 15,000 escaped bytes; whole characters only.
+        let cjk = "中".repeat(5_000);
+        assert_eq!(
+            clip_fenced_body(&cjk, Some("rust"), DIFF_MAX_ESCAPED_BYTES),
+            "中".repeat(3_996)
+        );
+        // The tag is what clips at the boundary: 3,997 chars plus the 8-byte
+        // minimum fence are 11,999 bytes and fit a tagless fence, but the
+        // 4-byte `rust` tag makes 12,003 — over the cap.
+        let boundary = "中".repeat(3_997);
+        assert_eq!(
+            clip_fenced_body(&boundary, None, DIFF_MAX_ESCAPED_BYTES),
+            boundary
+        );
+        assert_eq!(
+            clip_fenced_body(&boundary, Some("rust"), DIFF_MAX_ESCAPED_BYTES),
+            "中".repeat(3_996)
+        );
+        // A control character is JSON's widest escape: six bytes, so the cap
+        // holds 1,998 of them beside the fence and the 4-byte tag.
+        let control = "\u{1}".repeat(3_000);
+        let clipped = clip_fenced_body(&control, Some("rust"), DIFF_MAX_ESCAPED_BYTES);
+        assert_eq!(clipped.chars().count(), 1_998);
+        assert_eq!(
+            json_escaped_len(&clipped) + fenced_block_overhead(&clipped) + "rust".len(),
+            DIFF_MAX_ESCAPED_BYTES
+        );
+        // A single 20,000-backtick run: the fence is one backtick longer on
+        // each side, so only 3,997 survive — 3,997 escaped bytes plus a 7,998
+        // byte fence and the 4-byte tag. Clipping on escaped bytes alone would
+        // keep 12,000 and then pay ~24,000 more in fence.
+        let ticks = "`".repeat(20_000);
+        let clipped = clip_fenced_body(&ticks, Some("rust"), DIFF_MAX_ESCAPED_BYTES);
+        assert_eq!(clipped.len(), 3_997);
+        assert_eq!(
+            json_escaped_len(&clipped) + fenced_block_overhead(&clipped) + "rust".len(),
+            11_999
         );
         // The per-character charge the clip walks is serde_json's own total.
         let mixed = "a\"\\\n\t\u{1}\u{7f}中";
@@ -5294,10 +5344,10 @@ Index: src/main.rs
             ascii.push_str(&format!("+let value_{n:03} = compute({n:03});\n"));
         }
         let (_, _, ascii_body) = format_tool_output("edit", &ascii);
+        let ascii_fenced = json_escaped_len(&ascii_body) + fenced_block_overhead(&ascii_body) + "rust".len();
         assert!(
-            json_escaped_len(&ascii_body) <= DIFF_MAX_ESCAPED_BYTES,
-            "the fixture fits the byte budget: {}",
-            json_escaped_len(&ascii_body)
+            ascii_fenced <= DIFF_MAX_ESCAPED_BYTES,
+            "the fixture fits the byte budget with its fence and tag: {ascii_fenced}"
         );
         let panel = edit_panel(&ascii);
         assert_eq!(
@@ -5337,10 +5387,10 @@ Index: src/main.rs
             .and_then(|rest| rest.split_once("\n```\n\n"))
             .unwrap_or_else(|| panic!("one closed fence above the note: {md}"));
         assert_eq!(after, DIFF_TRUNCATION_NOTE, "the note follows the fence: {md}");
-        let fenced = json_escaped_len(body) + fenced_block_overhead(body);
+        let fenced = json_escaped_len(body) + fenced_block_overhead(body) + "rust".len();
         assert!(
             fenced <= DIFF_MAX_ESCAPED_BYTES,
-            "the rendered body plus its fence respects the budget: {fenced}"
+            "the rendered body, fence and tag respect the budget: {fenced}"
         );
         assert!(
             fenced > DIFF_MAX_ESCAPED_BYTES - 8,
@@ -5349,10 +5399,10 @@ Index: src/main.rs
     }
 
     /// #792: `panel_output_estimate` charges the diff the panel RENDERS — the
-    /// parsed body clipped at the byte cap, its count header and its fence —
-    /// never the raw recorded diff under the old 3,000-character preview cap.
-    /// A fitting 6,000-char diff is charged in full, so the card estimate
-    /// cannot trail the body the card actually carries.
+    /// parsed body clipped at the byte cap, its count header, its whole fence
+    /// and the opening fence's language tag — never the raw recorded diff under
+    /// the old 3,000-character preview cap. A fitting 6,000-char diff is charged
+    /// in full, so the card estimate cannot trail the body the card carries.
     #[test]
     fn the_diff_estimate_charges_the_body_it_renders() {
         let mut cjk =
@@ -5372,8 +5422,9 @@ Index: src/main.rs
             estimate,
             json_escaped_len(&CardMarkdown::new().element(&header))
                 + json_escaped_len(body)
-                + fenced_overhead(body),
-            "the charge is the rendered body, fence and header"
+                + fenced_block_overhead(body)
+                + "rust".len(),
+            "the charge is the rendered body, fence, tag and header"
         );
         assert!(
             estimate < DIFF_MAX_ESCAPED_BYTES + 200,
@@ -5397,7 +5448,8 @@ Index: src/main.rs
             panel_output_estimate(&edit_panel(&ascii)),
             json_escaped_len(&CardMarkdown::new().element("+200 −0"))
                 + json_escaped_len(&ascii_body)
-                + fenced_overhead(&ascii_body),
+                + fenced_block_overhead(&ascii_body)
+                + "rust".len(),
             "the whole body is charged, not a 3,000-char preview"
         );
     }
