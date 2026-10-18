@@ -183,8 +183,10 @@ start_server = "auto"            # auto (default) | never | eager
   password are read from the running server itself — its environment, or a V2
   managed service's registration file — so nothing to configure), so `url` is a
   tiebreaker among several servers of the same kind — and the fallback
-  port when cola starts its own server. A server cola did **not** start
-  (OpenChamber's, a manual one) always wins over cola's own.
+  port when cola starts its own server. Among the servers cola can attach to,
+  the priority is **Shared Service > Coexistent Server > Owned Server**: the V2
+  `serve --service` wins, then a server another tool started, and only then
+  cola's own.
 - **`start_server`** — when cola may start its own `opencode serve`:
   - `auto` (default) — attaches at boot and spawns an own server only at the
     moment a message needs one and none is running.
@@ -273,6 +275,63 @@ cola attaches to an already-running OpenCode server automatically; with the
 default `auto` policy it starts its own server on demand, so no manual
 `opencode serve` is needed. If no config file exists yet, cola prints a hint
 telling you where to put one and exits.
+
+## Multi-client sync
+
+cola adds no per-client adapter: sync happens at the **server + shared store +
+session** layer. If every client talks to one default-store server and opens the
+same session, a prompt from any of them reaches the others automatically.
+
+**V2 canonical server.** OpenCode V2's `opencode serve --service` is the
+machine-wide rendezvous the TUI, the desktop app and the Web UI resolve from
+zero arguments — a bare `opencode` *is* that process. cola starts it when no
+server is running (`start_server = "auto"` or `"eager"`) and otherwise attaches
+to the running one. V1 has no service and keeps using `serve --port`.
+
+**OpenChamber** raises its own managed server on a random port instead of
+reading the registration file, so it does not sync until you point it at the
+service:
+
+```bash
+OPENCODE_HOST=$(jq -r .url ~/.local/state/opencode/service.json) \
+OPENCODE_SERVER_PASSWORD=$(jq -r .password ~/.local/state/opencode/service.json) \
+OPENCODE_SKIP_START=true openchamber
+```
+
+`OPENCODE_HOST` must carry an explicit port and no path.
+`OPENCODE_SERVER_PASSWORD` is the name OpenChamber reads for the server's
+password (OpenCode's server also accepts `OPENCODE_PASSWORD`, but OpenChamber
+does not). `OPENCODE_SKIP_START=true` makes OpenChamber attach instead of
+raising its own server; without it, it launches that random-port managed server
+again.
+
+**The same session is the only lever.** One server is not enough — both sides
+must open the same session:
+
+| Client | Join the shared session with |
+| --- | --- |
+| TUI | `opencode -s <session id>` |
+| Feishu | `/switch <id\|short hash\|title>` |
+
+`/new` switches the Active Session; open that new session in the TUI with `-s`
+and the two keep syncing. Non-active sessions are not followed: an external
+message or reply there is not pushed to Feishu (ADR-0017), while
+permission/question cards are still raised, because those are polled per
+directory rather than per session.
+
+**Two servers.** With more than one default-store server running, cola picks
+exactly one, deterministically — a Shared Service beats a Coexistent Server
+beats cola's Owned Server. It never aggregates them, and two servers do not
+share sessions, so do not expect both to sync. The log warns which server was
+chosen and which were ignored, and
+[`cola status`](#inspect-status--doctor--config) lists the ignored ones.
+
+**Config semantics.** `[opencode] url` is a tiebreaker among servers of the same
+class — never a pin, and it cannot outrank the service class. `start_server`
+keeps its three states: `auto` starts a server only when a message needs one,
+`eager` starts it at boot, and `never` attaches only. `opencode service set
+disabled true` (OpenCode's own setting) makes cola skip starting the service; it
+then attaches a running server, or falls back to its Owned `serve --port`.
 
 ## Claim (private by default)
 
@@ -439,7 +498,7 @@ detailed help for any of these.
 | `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and a `#<id>` that matches no skill stays plain text (`#644`, `C#caveman` and `##foreman` are never skill tokens). A bare `/skill` opens the skill picker — searchable by id/name/description and paged 20 rows at a time — and `/skill <id>` is an alias for ids the `#` form cannot type (`2fa-helper`, `web_scrape`) |
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
-| `/restart-opencode` | Restart the OpenCode server (only one cola itself started) |
+| `/restart-opencode` | Restart the OpenCode server (cola's Owned Server or the V2 managed service) |
 | `/update` | Update cola via its install channel (GitHub Releases self-update, or the cargo command for `cargo install`/`cargo binstall` installs) |
 | `/version` | Show cola version and build provenance (release / crates.io / dev build) |
 | `/help [command]` | List commands, or show detailed help for one |
@@ -557,8 +616,9 @@ Notes:
   session's own selection, else `[opencode] model`, else what the server
   recorded). `/compact` and `/stop` need a real session and keep their
   "还没有会话" replies on a pending.
-- `/restart-opencode` leaves a server launched by another tool alone — it only
-  restarts a server cola started itself.
+- `/restart-opencode` restarts an Owned Server or the V2 managed service
+  (`opencode service restart`); a server launched by another tool is left alone
+  (`NotOwned`).
 - Topic rule: inside a topic already bound to a session, `/switch`, `/new`,
   `/dir` and `/sub attach` are rejected — go back to the main conversation. A
   topic that has never bound a session (including a `/topic`-opened topic still
