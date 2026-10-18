@@ -34,6 +34,20 @@ const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整�
 /// the file's CURRENT content, not the diff that changed it.
 pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_";
 
+/// The budget for a file-editing panel's diff BODY, measured in the bytes the
+/// body occupies once the card serializes it (its JSON-escaped form) — NOT in
+/// characters, and not the [`TOOL_OUTPUT_MAX_CHARS`] preview cap.
+///
+/// A real diff routinely exceeds 3,000 characters, and a panel cannot be split
+/// (the whole card is bounded by [`super::MAX_CARD_JSON_CHARS`]), so a diff gets
+/// its own cap at roughly half the card budget, leaving room for the panel's
+/// input, header, button and note. Bytes are what Feishu limits and what the
+/// splitter estimates; a character cap would let one CJK char (3 bytes) or one
+/// control char (JSON's six-byte `\uXXXX` escape) count as one and blow the
+/// budget by up to sixfold. Shared with the permission card, which renders the
+/// same diff under the same cap (#794).
+pub(crate) const DIFF_MAX_ESCAPED_BYTES: usize = 12_000;
+
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
 ///
 /// The panel owns the decoded [`ToolCall`] — identity, typed status, raw
@@ -967,6 +981,44 @@ fn json_escaped_len(text: &str) -> usize {
         .unwrap_or(text.len())
 }
 
+/// The bytes one character contributes to [`json_escaped_len`]: `"` and `\`
+/// take a two-byte escape, a control character JSON's widest six-byte
+/// `\uXXXX` form (with the short `\n`/`\r`/`\t`/`\b`/`\f` forms at two), and
+/// everything else its own UTF-8 length — serde_json does not escape
+/// non-ASCII. The clip walks this charge, so it never cuts a char in half and
+/// never over-counts a body by its worst case.
+fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        c if c < '\u{20}' => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Clip `text` to at most `max_escaped_bytes` bytes of its JSON-escaped form,
+/// with NO truncation marker — the bare clip a fenced body takes when a note
+/// below the fence says it was clipped (the `…` immediately before a closing
+/// fence stops Feishu rendering the block as code at all, #788). Measured in
+/// escaped bytes, not characters, so the cap matches the card's own byte
+/// budget ([`DIFF_MAX_ESCAPED_BYTES`], #792); the cut lands on a character
+/// boundary. Shared with the permission card (#794).
+pub(crate) fn clip_escaped_bytes(text: &str, max_escaped_bytes: usize) -> String {
+    if json_escaped_len(text) <= max_escaped_bytes {
+        return text.to_string();
+    }
+    let mut used = 0usize;
+    let mut clipped = String::new();
+    for c in text.chars() {
+        let cost = escaped_char_len(c);
+        if used + cost > max_escaped_bytes {
+            break;
+        }
+        used += cost;
+        clipped.push(c);
+    }
+    clipped
+}
+
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
 /// its adjacency to the panel gives the correspondence. `alt` and `title` share
@@ -1097,21 +1149,40 @@ fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option
     preview_body_clipped(tool).then_some(PREVIEW_TRUNCATION_NOTE)
 }
 
-/// The note a file-editing panel appends under a diff its budget CLIPPED
-/// ([`DIFF_TRUNCATION_NOTE`]): the clip's only signal, because the fenced body
-/// clips bare (#788). Renders IFF the body the panel shows is a recognized diff
-/// ([`BodyStyle::Code`]) longer than [`TOOL_OUTPUT_MAX_CHARS`] — a FAILED call's
-/// error text is not a diff and takes no note, since there is no change to name.
-/// Unlike [`preview_truncation_note`] it needs no button: "已截断" is true even
-/// when nothing can be opened, so the reader still knows the diff is partial.
-fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
+/// Whether a panel's body is a file-editing DIFF ([`BodyStyle::Code`] from an
+/// `edit` / `apply_patch` / `patch` panel): the one body shape under the diff
+/// byte budget ([`DIFF_MAX_ESCAPED_BYTES`]). Every other body — a `read` or
+/// `write` preview, an `Auto` block — stays on [`TOOL_OUTPUT_MAX_CHARS`].
+fn is_diff_body(name: &str, style: &BodyStyle) -> bool {
+    is_file_editing(name) && matches!(style, BodyStyle::Code(_))
+}
+
+/// The diff body a file-editing panel renders, UNclipped: the parsed hunks of
+/// an `edit` / `apply_patch` / `patch` call. `None` for every other panel and
+/// for an editing call whose output is not a recognized diff (a FAILED call's
+/// error text falls back to [`BodyStyle::Auto`]), which keeps the preview path
+/// untouched. The ONE derivation the render, [`diff_truncation_note`] and
+/// [`panel_output_estimate`] share, so the clip, its note and its charge
+/// cannot drift.
+fn diff_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
     if !is_file_editing(tool.name()) {
         return None;
     }
-    panel_output(tool)
-        .filter(|(_, style, body)| {
-            matches!(style, BodyStyle::Code(_)) && exceeds_md_budget(body, TOOL_OUTPUT_MAX_CHARS)
-        })
+    let (header, style, body) = panel_output(tool)?;
+    is_diff_body(tool.name(), &style).then_some((header, style, body))
+}
+
+/// The note a file-editing panel appends under a diff its budget CLIPPED
+/// ([`DIFF_TRUNCATION_NOTE`]): the clip's only signal, because the fenced body
+/// clips bare (#788). Renders IFF the body the panel shows is a recognized diff
+/// ([`diff_output`]) whose JSON-escaped length exceeds
+/// [`DIFF_MAX_ESCAPED_BYTES`] — a FAILED call's error text is not a diff and
+/// takes no note, since there is no change to name. Unlike
+/// [`preview_truncation_note`] it needs no button: "已截断" is true even when
+/// nothing can be opened, so the reader still knows the diff is partial.
+fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
+    diff_output(tool)
+        .filter(|(_, _, body)| json_escaped_len(body) > DIFF_MAX_ESCAPED_BYTES)
         .map(|_| DIFF_TRUNCATION_NOTE)
 }
 
@@ -1235,17 +1306,28 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 }
 
 /// The serialized byte length the Output body a panel renders contributes to
-/// its card size (#788): a `write` call's own `content` ([`write_body`], which
-/// the output text does not carry) together with the `📄 <path>` header that
-/// body renders — the path is not part of the content, and every other panel's
-/// header rides its charged output text — else the tool's output text. The body
-/// is clipped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's own clamp,
-/// measured JSON-ESCAPED (the form it takes inside the card's `content` string,
-/// each newline and quote costing its extra byte) and with the dynamic fence
-/// [`fenced_overhead`] charges for a body full of backticks. Kept beside the
-/// render so the estimate cannot charge a body the panel never writes, nor miss
-/// the file a `write` just produced.
+/// its card size (#788): a file-editing panel's PARSED diff ([`diff_output`],
+/// clipped at [`DIFF_MAX_ESCAPED_BYTES`] as the render writes it, #792); a
+/// `write` call's own `content` ([`write_body`], which the output text does not
+/// carry) together with the `📄 <path>` header that body renders; else the
+/// tool's output text. Every body is measured JSON-ESCAPED (the form it takes
+/// inside the card's `content` string, each newline and quote costing its extra
+/// byte) and with the dynamic fence [`fenced_overhead`] charges for a body full
+/// of backticks. Kept beside the render so the estimate cannot charge a body
+/// the panel never writes, nor miss the file a `write` just produced — and a
+/// diff is charged under the SAME cap it renders under, never the old
+/// 3,000-character preview (#792).
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
+    // A diff renders its parsed hunks clipped at the byte budget, not the raw
+    // recorded diff at the preview cap: charge exactly that body, the count
+    // header above it and the fence around it.
+    if let Some((header, _, body)) = diff_output(tool) {
+        let header = header
+            .map(|header| json_escaped_len(&CardMarkdown::new().element(&header)))
+            .unwrap_or(0);
+        let body = clip_escaped_bytes(&body, DIFF_MAX_ESCAPED_BYTES);
+        return header + json_escaped_len(&body) + fenced_overhead(&body);
+    }
     let write = write_body(tool);
     // The header rides the body's markdown OUTSIDE any fence, so it is charged
     // through the card's own sanitizer — a path that closes its inline code span
@@ -1354,14 +1436,17 @@ pub(super) fn tool_panel_element(
             } else if let Some(h) = &header {
                 content.push_str(&format!("{}\n\n", h));
             }
-            // A fenced code body that carries the truncation note below the
-            // fence clips WITHOUT the `…`: the ellipsis immediately before the
-            // closing fence stops Feishu rendering the block as code at all
-            // (measured, #788), and the note already says it was clipped — the
-            // only signal a clipped diff has. Every other body keeps
-            // `truncate_md`'s marker.
+            // A file-editing diff is capped by its own BYTE budget (#792), and
+            // clips bare: the `…` immediately before the closing fence stops
+            // Feishu rendering the block as code at all (measured, #788), and
+            // the note below already says it was clipped — the only signal a
+            // clipped diff has. A `read`/`write` preview keeps its 3,000-CHAR
+            // budget and `truncate_md`'s marker (or `clip_md` when it carries
+            // the way-in note), exactly as before.
             let note = truncation_note(tool, session_id);
-            let body = if note.is_some() && matches!(style, BodyStyle::Code(_)) {
+            let body = if is_diff_body(name, &style) {
+                clip_escaped_bytes(&body, DIFF_MAX_ESCAPED_BYTES)
+            } else if note.is_some() && matches!(style, BodyStyle::Code(_)) {
                 clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
             } else {
                 truncate_md(&body, TOOL_OUTPUT_MAX_CHARS)
@@ -5058,8 +5143,178 @@ Index: src/main.rs
         );
     }
 
+    /// #792: the diff body budget is measured in JSON-ESCAPED bytes, not
+    /// characters. The widest single character escapes to six bytes (a control
+    /// char as `\uXXXX`), so a character-counted cap of the same number lets a
+    /// quote-, newline- or CJK-heavy body blow the card budget severalfold —
+    /// while a 6,000-char ASCII diff, which fits, must pass through whole.
+    #[test]
+    fn the_diff_clip_counts_json_escaped_bytes_not_characters() {
+        // Plain ASCII: 6,000 chars is 6,000 escaped bytes, so it fits.
+        let ascii = "a".repeat(6_000);
+        assert_eq!(clip_escaped_bytes(&ascii, DIFF_MAX_ESCAPED_BYTES), ascii);
+        // CJK: 5,000 chars is 15,000 escaped bytes; whole characters only.
+        let cjk = "中".repeat(5_000);
+        assert_eq!(
+            clip_escaped_bytes(&cjk, DIFF_MAX_ESCAPED_BYTES),
+            "中".repeat(4_000)
+        );
+        // A control character is JSON's widest escape: six bytes, so the cap
+        // holds exactly 2,000 of them.
+        let control = "\u{1}".repeat(3_000);
+        let clipped = clip_escaped_bytes(&control, DIFF_MAX_ESCAPED_BYTES);
+        assert_eq!(clipped.chars().count(), 2_000);
+        assert_eq!(json_escaped_len(&clipped), DIFF_MAX_ESCAPED_BYTES);
+        // The per-character charge the clip walks is serde_json's own total.
+        let mixed = "a\"\\\n\t\u{1}\u{7f}中";
+        let sum: usize = mixed.chars().map(escaped_char_len).sum();
+        assert_eq!(sum, json_escaped_len(mixed));
+    }
+
+    /// #792: a diff body is capped in JSON-escaped BYTES, not characters. A
+    /// 6,000-char ASCII diff fits and renders WHOLE; a 5,000-char CJK diff
+    /// escapes to ~15 KB, so it clips BARE — the `…` would stop the fence
+    /// rendering as code (#788) — and the note follows the closed fence.
+    #[test]
+    fn a_diff_panel_caps_its_body_in_escaped_bytes() {
+        // 200 added lines ≈ 6,421 ASCII characters: under the byte budget.
+        let mut ascii =
+            String::from("Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,200 @@\n");
+        for n in 0..200 {
+            ascii.push_str(&format!("+let value_{n:03} = compute({n:03});\n"));
+        }
+        let (_, _, ascii_body) = format_tool_output("edit", &ascii);
+        assert!(
+            json_escaped_len(&ascii_body) <= DIFF_MAX_ESCAPED_BYTES,
+            "the fixture fits the byte budget: {}",
+            json_escaped_len(&ascii_body)
+        );
+        let panel = edit_panel(&ascii);
+        assert_eq!(
+            diff_truncation_note(&panel),
+            None,
+            "a diff that fits says nothing"
+        );
+        assert_eq!(preview_truncation_note_estimate(&panel, None), 0);
+        let md = panel_md(panel);
+        assert!(
+            md.contains("+let value_199 = compute(199);"),
+            "the whole diff renders: {md}"
+        );
+        assert!(!md.contains('…'), "nothing was clipped: {md}");
+
+        // 5,000 CJK characters escape to 15,000 bytes: over the budget even
+        // though a 12,000-CHAR cap would have kept them.
+        let mut cjk =
+            String::from("Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,1 @@\n+");
+        cjk.push_str(&"中".repeat(5_000));
+        let panel = edit_panel(&cjk);
+        assert_eq!(
+            diff_truncation_note(&panel),
+            Some(DIFF_TRUNCATION_NOTE),
+            "an over-budget diff says it was clipped"
+        );
+        assert_eq!(
+            preview_truncation_note_estimate(&panel, None),
+            DIFF_TRUNCATION_NOTE.len(),
+            "the note's bytes are charged"
+        );
+        let md = panel_md(panel);
+        assert!(!md.contains('…'), "the clipped body carries no ellipsis: {md}");
+        let (body, after) = md
+            .split_once("```rust\n")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n```\n\n"))
+            .unwrap_or_else(|| panic!("one closed fence above the note: {md}"));
+        assert_eq!(after, DIFF_TRUNCATION_NOTE, "the note follows the fence: {md}");
+        assert!(
+            json_escaped_len(body) <= DIFF_MAX_ESCAPED_BYTES,
+            "the rendered body respects the byte budget: {}",
+            json_escaped_len(body)
+        );
+        assert!(
+            json_escaped_len(body) > DIFF_MAX_ESCAPED_BYTES - 6,
+            "the clip fills the budget rather than cutting early: {}",
+            json_escaped_len(body)
+        );
+    }
+
+    /// #792: `panel_output_estimate` charges the diff the panel RENDERS — the
+    /// parsed body clipped at the byte cap, its count header and its fence —
+    /// never the raw recorded diff under the old 3,000-character preview cap.
+    /// A fitting 6,000-char diff is charged in full, so the card estimate
+    /// cannot trail the body the card actually carries.
+    #[test]
+    fn the_diff_estimate_charges_the_body_it_renders() {
+        let mut cjk =
+            String::from("Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,1 @@\n+");
+        cjk.push_str(&"中".repeat(5_000));
+        let panel = edit_panel(&cjk);
+        let (header, _, _) = format_tool_output("edit", &cjk);
+        let header = header.expect("the count header");
+        let estimate = panel_output_estimate(&panel);
+        let md = panel_md(panel);
+        let (body, _) = md
+            .split_once("```rust\n")
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once("\n```\n\n"))
+            .expect("the clipped fenced body");
+        assert_eq!(
+            estimate,
+            json_escaped_len(&CardMarkdown::new().element(&header))
+                + json_escaped_len(body)
+                + fenced_overhead(body),
+            "the charge is the rendered body, fence and header"
+        );
+        assert!(
+            estimate < DIFF_MAX_ESCAPED_BYTES + 200,
+            "and the charge is capped with the body: {estimate}"
+        );
+
+        // A fitting diff charges its WHOLE rendered body: the old 3,000-char
+        // slice would have under-charged it by more than half.
+        let mut ascii =
+            String::from("Index: src/main.rs\n--- src/main.rs\n+++ src/main.rs\n@@ -1,1 +1,200 @@\n");
+        for n in 0..200 {
+            ascii.push_str(&format!("+let value_{n:03} = compute({n:03});\n"));
+        }
+        let (_, _, ascii_body) = format_tool_output("edit", &ascii);
+        assert!(
+            json_escaped_len(&ascii_body) > TOOL_OUTPUT_MAX_CHARS,
+            "the fixture is past the old character cap: {}",
+            json_escaped_len(&ascii_body)
+        );
+        assert_eq!(
+            panel_output_estimate(&edit_panel(&ascii)),
+            json_escaped_len(&CardMarkdown::new().element("+200 −0"))
+                + json_escaped_len(&ascii_body)
+                + fenced_overhead(&ascii_body),
+            "the whole body is charged, not a 3,000-char preview"
+        );
+    }
+
+    /// A file-editing panel carrying `diff` in V1's `metadata.diff`, the shape
+    /// the render reads (#792).
+    fn edit_panel(diff: &str) -> ToolPanel {
+        ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({"filePath": "src/main.rs"})),
+            metadata: Some(json!({ "diff": diff })),
+            output: ToolOutput {
+                raw: Some(json!("Edit applied successfully.")),
+                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
+                error: None,
+            },
+        })
+    }
+
     /// A file-editing panel whose rendered diff body is longer than
-    /// [`TOOL_OUTPUT_MAX_CHARS`]: the shape the clip note exists for.
+    /// [`DIFF_MAX_ESCAPED_BYTES`]: the shape the clip note exists for.
     fn long_diff_panel(name: &str) -> ToolPanel {
         let mut diff = String::from(
             "\

@@ -5694,6 +5694,68 @@ mod tests {
         );
     }
 
+    /// #792: a file-editing panel's diff body is capped in JSON-ESCAPED bytes
+    /// (12,000, the worst character escaping to six), so a lone panel — which
+    /// cannot be split — still fits the card budget even with a worst-case
+    /// diff, and the bytes the clip note adds are charged beside the button.
+    #[test]
+    fn a_diff_panels_body_and_note_stay_under_the_card_budget() {
+        use crate::backend::{ContentBlock, ToolOutput};
+        let widest = "\u{1}".repeat(9_000);
+        let panel = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".into(),
+                call_id: "call_edit".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(serde_json::json!({"filePath": "big.rs"})),
+            metadata: Some(serde_json::json!({
+                "diff": format!("@@ -1,1 +1,1 @@\n+{widest}\n"),
+            })),
+            output: ToolOutput {
+                raw: Some(serde_json::json!("Edit applied successfully.")),
+                blocks: vec![ContentBlock::Text("Edit applied successfully.".into())],
+                error: None,
+            },
+        });
+        let estimate = panel_estimate(&panel, Some("ses_1"));
+        assert!(
+            estimate < crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "a lone panel cannot split, so its worst case must fit the budget: {estimate}"
+        );
+        // The clipped diff's note is charged with or without a Session: unlike
+        // a `read` preview's note it promises no way-in, so it needs no button.
+        let note = crate::feishu::card::tool_render::preview_truncation_note_estimate(&panel, Some("ses_1"));
+        assert_eq!(
+            note,
+            crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE.len(),
+            "the clipped diff's note is charged"
+        );
+        assert_eq!(
+            crate::feishu::card::tool_render::preview_truncation_note_estimate(&panel, None),
+            note,
+            "and it is charged on a routeless panel too"
+        );
+        let button = crate::feishu::card::tool_render::tool_open_button_estimate(&panel, Some("ses_1"));
+        assert_eq!(
+            panel_estimate(&panel, Some("ses_1")),
+            panel_estimate(&panel, None) + button,
+            "the Session adds only the button, never a second note"
+        );
+        // The built card serializes under Feishu's own cap.
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Done;
+        acc.set_session("ses_1");
+        acc.push_tool("call_edit", panel);
+        let card = acc.build_card().to_string();
+        assert!(
+            card.len() < crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the rendered card fits: {}",
+            card.len()
+        );
+    }
+
     /// The folded header's file detail (ADR-0083 §8 amendment, #766) is card
     /// JSON too: `panel_estimate` charges its serialized bytes, so dropping the
     /// term would let a near-budget card omit what the header renders. The two
