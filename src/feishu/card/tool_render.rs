@@ -1872,11 +1872,11 @@ fn diff_language(diff: &EditDiff) -> &'static str {
 /// [`diff_language`] over an explicit path list: the one language every path
 /// shares, [`PLAIN_TEXT`] when they disagree or when the list is empty.
 ///
-/// Shared with the permission card (#794): its diff carries the same hunks and
-/// must fence them the same way, but its paths also come from the request's
-/// metadata `filepath` and (only when neither names a file) its patterns — so
-/// the path list is the caller's, and the agreement rule stays here rather than
-/// being copied next to it.
+/// This is the Tool Panel's rule for a patch that may touch several files. The
+/// permission card does not use it: #794 gives that surface a single selected
+/// path (metadata `filepath`, else the diff's path, else its first pattern), so
+/// its fence follows exactly that file rather than an agreement across all of
+/// them.
 pub(crate) fn diff_language_for<'a>(paths: impl IntoIterator<Item = &'a str>) -> &'static str {
     let mut langs = paths.into_iter().map(language_for_path);
     let Some(first) = langs.next() else {
