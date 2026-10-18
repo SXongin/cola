@@ -411,9 +411,11 @@ async fn bounded_viewer_read_failure_copy_and_slot_lifetime_are_pinned() {
     assert_eq!(busy, 3);
 }
 
-/// An extension the platform has no language token for renders as `plain_text`
-/// — honestly, never a near-miss highlight (ADR-0083 §6; `.ts` is ambiguous,
-/// `.log`/`.env` have no token at all).
+/// An extension with no honest language token renders as `plain_text` —
+/// never a near-miss highlight (ADR-0083 §6; `.log`/`.env` have no token at
+/// all). `.ts` is NOT one of them: measured 2026-10-18 on a live card,
+/// `typescript` highlights a TypeScript file (the short `ts` does not), so the
+/// long token is the one the viewer asks for.
 #[tokio::test]
 async fn cat_unknown_extensions_degrade_to_plain_text() {
     let _wd = test_work_dir();
@@ -428,7 +430,7 @@ async fn cat_unknown_extensions_degrade_to_plain_text() {
     let key = thread();
     seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
 
-    for name in ["build.log", "config.ts", ".env"] {
+    for name in ["build.log", ".env"] {
         send_command_in(
             &app,
             &format!("/cat {name}"),
@@ -444,11 +446,21 @@ async fn cat_unknown_extensions_degrade_to_plain_text() {
             text.contains("```plain_text"),
             "`{name}` degrades to plain text: {text}"
         );
-        assert!(
-            !text.contains("```typescript") && !text.contains("```ts"),
-            "`{name}` is never given a token it does not have: {text}"
-        );
     }
+
+    // The measured TypeScript token, not the documented-but-broken short one.
+    send_command_in(
+        &app,
+        "/cat config.ts",
+        key,
+        "msg_config.ts",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let cards = platform.replied_cards().await;
+    let text = card_text(cards.last().expect("a viewer card"));
+    assert!(text.contains("```typescript"), "a .ts preview: {text}");
+    assert!(!text.contains("```ts\n"), "never the short token: {text}");
 }
 
 /// A delimited-text file previews as a markdown table — a table is what those

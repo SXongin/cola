@@ -1,5 +1,6 @@
 use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 
+use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
 use super::{AwaitingAction, exceeds_md_budget, fenced_code, truncate_md};
@@ -1403,6 +1404,33 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     })
 }
 
+/// The language token a diff's hunks are fenced with (measured 2026-10-18: a
+/// `rust` fence colours the keywords and strings inside a `+`/`-` hunk, where
+/// Feishu's documented `diff` token renders plain).
+///
+/// A multi-file patch uses the one language every touched file shares — the
+/// `Index:` lines the multi-file body keeps — and [`PLAIN_TEXT`] when they
+/// disagree, so a `.rs` hunk is never coloured with a `.md` file's grammar.
+/// A single-file `edit` names its target only in `path`, because its body has
+/// no `Index:` line.
+fn diff_language(diff: &EditDiff) -> &'static str {
+    let mut shared: Option<&'static str> = None;
+    for line in diff.body.lines() {
+        let Some(path) = line.strip_prefix("Index: ") else {
+            continue;
+        };
+        let lang = language_for_path(path);
+        match shared {
+            None => shared = Some(lang),
+            Some(seen) if seen != lang => return PLAIN_TEXT,
+            _ => {}
+        }
+    }
+    shared
+        .or_else(|| diff.path.as_deref().map(language_for_path))
+        .unwrap_or(PLAIN_TEXT)
+}
+
 /// One item of a `todowrite` tool payload (OpenCode's `Todo.Info`). The
 /// payload's `priority` is dropped on purpose: it rarely varies within one
 /// list (agents mark nearly everything high), so showing it would add a marker
@@ -1563,6 +1591,7 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
                 // The hunks, then the tool's trailing note (LSP diagnostics) on
                 // its own paragraph — inside the same code block so the panel
                 // never loses it.
+                let lang = diff_language(&d);
                 let mut body = d.body;
                 if !d.tail.is_empty() {
                     body.push('\n');
@@ -1571,7 +1600,7 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
                 }
                 (
                     Some(format!("+{} −{}", d.additions, d.deletions)),
-                    BodyStyle::Code(None),
+                    BodyStyle::Code(Some(lang)),
                     body,
                 )
             }
@@ -1664,7 +1693,7 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
     }
     (
         Some(format!("📄 `{}`", path)),
-        BodyStyle::Code(code_lang_for_path(&path)),
+        BodyStyle::Code(Some(language_for_path(&path))),
         body,
     )
 }
@@ -1870,7 +1899,7 @@ fn parse_v2_read_output(output: &str) -> Option<(Option<String>, BodyStyle, Stri
         ("📁", path)
     };
     let style = if icon == "📄" {
-        BodyStyle::Code(code_lang_for_path(path))
+        BodyStyle::Code(Some(language_for_path(path)))
     } else {
         BodyStyle::Code(None)
     };
@@ -1996,37 +2025,6 @@ fn parse_websearch_markdown(output: &str) -> Option<Vec<SearchEntry>> {
         previous_blank = line.trim().is_empty();
     }
     (!results.is_empty()).then_some(results)
-}
-
-/// A language hint for a file path's extension, used as the fenced-code-block
-/// language on a `read` panel. Unknown/extension-less paths get `text`.
-fn code_lang_for_path(path: &str) -> Option<&'static str> {
-    let ext = std::path::Path::new(path).extension()?.to_str()?;
-    Some(match ext {
-        "rs" => "rust",
-        "py" => "python",
-        "js" | "mjs" | "cjs" => "javascript",
-        "ts" | "tsx" => "typescript",
-        "jsx" => "jsx",
-        "go" => "go",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" | "hh" => "cpp",
-        "java" => "java",
-        "rb" => "ruby",
-        "php" => "php",
-        "sh" | "bash" | "zsh" => "bash",
-        "ps1" => "powershell",
-        "md" | "markdown" => "markdown",
-        "json" => "json",
-        "yaml" | "yml" => "yaml",
-        "toml" => "toml",
-        "xml" | "svg" => "xml",
-        "html" | "htm" => "html",
-        "css" | "scss" | "less" => "css",
-        "sql" => "sql",
-        "txt" | "log" => "text",
-        _ => "text",
-    })
 }
 
 /// Whether `text` needs a fenced code block: a line long enough that Feishu's
@@ -4276,7 +4274,11 @@ Index: /x/src/main.rs
 \\ No newline at end of file";
         let (header, style, body) = format_tool_output("edit", diff);
         assert_eq!(header.as_deref(), Some("+1 −1"), "count header: {:?}", header);
-        assert_eq!(style, BodyStyle::Code(None), "edit hunks are fenced");
+        assert_eq!(
+            style,
+            BodyStyle::Code(Some("rust")),
+            "the hunks take the edited file's language"
+        );
         assert!(body.contains("@@ -10,3 +10,3 @@"), "hunk header kept: {}", body);
         assert!(body.contains("-let b = 2;"), "removed line kept: {}", body);
         assert!(body.contains("+let b = 3;"), "added line kept: {}", body);
@@ -4339,8 +4341,9 @@ Index: src/main.rs
             md
         );
         assert!(md.contains("**Output**\n\n+1 −1"), "count header: {}", md);
-        // Hunks render inside a fenced code block (monospace, no wrapping).
-        assert!(md.contains("```\n@@ -1,4 +1,4 @@"), "fenced hunk: {}", md);
+        // Hunks render inside a fenced code block (monospace, no wrapping),
+        // with the edited file's own language so the syntax is coloured.
+        assert!(md.contains("```rust\n@@ -1,4 +1,4 @@"), "fenced hunk: {}", md);
         assert!(md.contains("-fn main() {}"), "removed line: {}", md);
         assert!(md.contains("+fn main() { println"), "added line: {}", md);
         assert!(!md.contains("use std::fs;"), "context line dropped: {}", md);
@@ -4411,7 +4414,7 @@ Index: .config/opencode/AGENTS.md
             "file in input: {md}"
         );
         assert!(md.contains("**Output**\n\n+1 −3"), "count header: {md}");
-        assert!(md.contains("```\n@@ -1,6 +1,4 @@"), "fenced hunk: {md}");
+        assert!(md.contains("```markdown\n@@ -1,6 +1,4 @@"), "fenced hunk: {md}");
         assert!(md.contains("-# English Learning Rule"), "removed line: {md}");
         assert!(md.contains("+# Interaction Rules"), "added line: {md}");
         assert!(!md.contains("(1 replacement)"), "generated summary dropped: {md}");
@@ -4513,7 +4516,7 @@ Index: /x/one.rs
             .expect("panel markdown content");
         assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
         assert!(
-            md.contains("```\nIndex: /x/one.rs"),
+            md.contains("```rust\nIndex: /x/one.rs"),
             "fenced body with the patched file: {md}"
         );
         assert!(md.contains("-let b = 2;"), "removed line: {md}");
@@ -4598,13 +4601,40 @@ Index: /a/two.rs
 +y";
         let (header, style, body) = format_tool_output("apply_patch", diff);
         assert_eq!(header.as_deref(), Some("+2 −2"), "count header: {header:?}");
-        assert_eq!(style, BodyStyle::Code(None), "hunks are fenced");
+        assert_eq!(
+            style,
+            BodyStyle::Code(Some("rust")),
+            "both touched files share one language"
+        );
         assert!(body.contains("Index: /a/one.rs"), "first file named: {body}");
         assert!(body.contains("Index: /a/two.rs"), "second file named: {body}");
         assert!(body.contains("+let b = 3;"), "hunk kept: {body}");
         assert!(body.contains("+y"), "second hunk kept: {body}");
         assert!(!body.contains("let a = 1;"), "context dropped: {body}");
         assert!(!body.contains("+++"), "file header noise dropped: {body}");
+    }
+
+    /// A patch that touches two languages has no honest grammar to fence with:
+    /// it stays plain rather than colouring one file's hunks with the other's.
+    #[test]
+    fn a_mixed_language_patch_stays_plain() {
+        let diff = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-old
++new
+Index: /a/two.md
+===================================================================
+--- /a/two.md
++++ /a/two.md
+@@ -1 +1 @@
+-old
++new";
+        let (_, style, _) = format_tool_output("apply_patch", diff);
+        assert_eq!(style, BodyStyle::Code(Some(PLAIN_TEXT)));
     }
 
     /// #202 review: the bridge appends the tool's LSP note after the diff; the
@@ -4970,13 +5000,26 @@ LSP errors detected in a.rs, please fix:
         assert!(out.contains(body), "content must be preserved");
     }
 
+    /// A `read` panel fences with the shared language table, so an extension
+    /// the old panel map never knew (`kt`, `cs`) still highlights, and one with
+    /// no honest token falls back to `plain_text`.
     #[test]
-    fn code_lang_for_path_maps_common_extensions() {
-        assert_eq!(code_lang_for_path("src/main.rs"), Some("rust"));
-        assert_eq!(code_lang_for_path("x.py"), Some("python"));
-        assert_eq!(code_lang_for_path("f.sh"), Some("bash"));
-        assert_eq!(code_lang_for_path("noext"), None);
-        assert_eq!(code_lang_for_path("f.unknownext"), Some("text"));
+    fn read_panel_uses_the_shared_language_table() {
+        for (path, token) in [
+            ("/x/Main.kt", "kotlin"),
+            ("/x/A.cs", "cs"),
+            ("/x/a.rs", "rust"),
+            ("/x/notes.unknownext", PLAIN_TEXT),
+            ("/x/noext", PLAIN_TEXT),
+        ] {
+            let output = format!("Read file {path}, lines 1-1\n1: x");
+            let (_, style, _) = format_tool_output("read", &output);
+            assert_eq!(
+                style,
+                BodyStyle::Code(Some(token)),
+                "`{path}` must fence as `{token}`"
+            );
+        }
     }
 
     #[test]
@@ -5361,7 +5404,7 @@ Index: /a/one.rs
         let md = panel_md(tool);
         assert!(md.contains("**Input**\n📄 `/a/one.rs`"), "file in input: {md}");
         assert!(md.contains("**Output**\n\n+1 −1"), "count header: {md}");
-        assert!(md.contains("```\nIndex: /a/one.rs"), "fenced hunks: {md}");
+        assert!(md.contains("```rust\nIndex: /a/one.rs"), "fenced hunks: {md}");
         assert!(
             md.contains("-let b = 2;") && md.contains("+let b = 3;"),
             "hunks: {md}"
