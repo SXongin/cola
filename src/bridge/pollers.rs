@@ -146,8 +146,9 @@ pub(crate) async fn wait_for_server_ready(
 
 /// One pass of the server-ownership reconcile (ADR-0013, ADR-0085): attach to
 /// the canonical default-store server (Shared Service first, then a Coexistent
-/// Server over cola's Owned), lazily spawn an Owned Server when `allow_spawn`
-/// and none exists, and reap a leftover Owned Server once another server is
+/// Server over cola's Owned), lazily start a server when `allow_spawn` and none
+/// exists (the machine-wide Shared Service first, else an Owned
+/// `serve --port`), and reap a leftover Owned Server once another server is
 /// the pick. A migration — the yield included — is deferred while a turn is in
 /// flight AND the attached server is still alive, so an appearing Service (or
 /// a preferred sibling) never truncates a streaming generation; a dead
@@ -160,8 +161,8 @@ pub(crate) async fn wait_for_server_ready(
 ///
 /// Returns whether a server is attached (or was just started).
 ///
-/// `heal_when_busy` lets a poll (not a new message) spawn an Owned Server when a
-/// turn is already in flight and the attached server died — the mid-stream
+/// `heal_when_busy` lets a poll (not a new message) start a server when a turn
+/// is already in flight and the attached server died — the mid-stream
 /// generation's next poll should find a live server instead of 502ing forever.
 /// Spawns only if `allow_spawn` OR (`heal_when_busy` and a turn is busy), and
 /// only when the policy allows it (`Never` never spawns).
@@ -173,9 +174,9 @@ async fn reconcile(
     let candidates = discovery::scan_processes();
     let self_pid = discovery::self_spawned_pid();
     let Some(server) = discovery::pick_server(&candidates, handles.server.preferred_port, self_pid) else {
-        // No default-store server at all. Lazy Start: spawn an Owned Server on
-        // demand; otherwise stay serverless (the caller replies that OpenCode
-        // is unavailable).
+        // No default-store server at all. Lazy Start: start a server on demand
+        // (the Shared Service first, else an Owned `serve --port`); otherwise
+        // stay serverless (the caller replies that OpenCode is unavailable).
         let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(&handles.flow.waits).await);
         if want_spawn && handles.server.start_policy.spawns_when_needed() {
             let spawned =
@@ -210,13 +211,13 @@ async fn reconcile(
             }
             if allow_spawn {
                 tracing::info!(
-                    "lazily started own OpenCode server at {} (generation={})",
+                    "lazily started an OpenCode server at {} (generation={})",
                     spawned.url,
                     spawned.generation.as_str()
                 );
             } else {
                 tracing::warn!(
-                    "attached server died mid-turn; started own OpenCode server at {} (generation={})",
+                    "attached server died mid-turn; started an OpenCode server at {} (generation={})",
                     spawned.url,
                     spawned.generation.as_str()
                 );

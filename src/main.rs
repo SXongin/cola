@@ -188,19 +188,23 @@ async fn resolve_opencode_server(
         match bridge::discovery::spawn_own_server(cfg.preferred_port(), cfg.generation).await {
             Ok(spawned) => {
                 tracing::info!(
-                    "Started cola's own OpenCode server at {} — generation={} (self-started `opencode serve`)",
+                    "Started cola's OpenCode server at {} — generation={} (Shared Service when one could be raised, else self-started `opencode serve`)",
                     spawned.url,
                     spawned.generation.as_str()
                 );
                 return Ok(Some(spawned));
             }
-            // A live child whose generation has not resolved yet (e.g. a V2
-            // store migration answering 503) is treated exactly like an
-            // inconclusive attach: stay serverless and let the reconnect loop
-            // attach once the probe classifies, instead of taking the bot down
-            // at boot. A spawn that never came up (no live child) stays loud.
-            Err(e) if bridge::discovery::self_spawned_pid().is_some_and(bridge::discovery::process_alive) => {
-                tracing::warn!("eager spawn could not resolve a generation yet; staying serverless: {e}");
+            // A live server whose generation has not resolved yet (e.g. a V2
+            // store migration answering 503, or a Shared Service whose probe is
+            // momentarily inconclusive) is treated exactly like an inconclusive
+            // attach: stay serverless and let the reconnect loop attach once the
+            // probe classifies, instead of taking the bot down at boot. The test
+            // is "any default-store server is alive in the scan", not "our own
+            // child is alive": a Shared Service is never owned and writes no
+            // `self-opencode.pid` (ADR-0085). A spawn that never came up (no
+            // live default-store server at all) stays loud.
+            Err(e) if bridge::discovery::has_live_default_store_server() => {
+                tracing::warn!("eager start could not resolve a generation yet; staying serverless: {e}");
                 return Ok(None);
             }
             Err(e) => return Err(e),
