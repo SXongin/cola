@@ -1255,26 +1255,45 @@ trait ServerStarter: Send + Sync {
 }
 
 /// The real legs: the Shared Service through its registration file, the Owned
-/// Server through `spawn_self_server`.
-struct OpencodeStarter;
+/// Server through `spawn_self_server`. The host, the two paths and the probe
+/// transport are fields — production's values are the real ones — so a test
+/// drives the REAL `start_service` (the ownership boundary's own code) against
+/// a scripted host (ticket #809).
+struct OpencodeStarter<H: ServiceHost> {
+    host: H,
+    registration_path: std::path::PathBuf,
+    log_path: std::path::PathBuf,
+    /// How the adopted candidate's probe transport is built. Production passes
+    /// [`attach::candidate_transport`]; a test substitutes a loopback transport
+    /// so its fake server is reachable without a developer shell's `http_proxy`
+    /// in the way (the wire-test pattern, ADR-0031 — production attach
+    /// transports keep honoring env proxies by design, ticket 09).
+    probe_transport: fn(&ServerCandidate) -> Transport,
+}
+
+impl OpencodeStarter<RealServiceHost> {
+    fn new() -> Self {
+        Self {
+            host: RealServiceHost,
+            registration_path: own_service_registration_path(),
+            log_path: service_log_path(),
+            probe_transport: attach::candidate_transport,
+        }
+    }
+}
 
 #[async_trait]
-impl ServerStarter for OpencodeStarter {
+impl<H: ServiceHost> ServerStarter for OpencodeStarter<H> {
     async fn start_service(
         &self,
         generation_override: GenerationOverride,
     ) -> Result<ResolvedServer, ServiceStartFailure> {
-        let candidate = start_shared_service(
-            &RealServiceHost,
-            &own_service_registration_path(),
-            &service_log_path(),
-        )
-        .await?;
+        let candidate = start_shared_service(&self.host, &self.registration_path, &self.log_path).await?;
         // Resolved through the SAME attach path as any discovered server: the
         // generation is probed, never assumed (#380). The service is NOT
         // recorded as self-spawned — it is never an Owned Server and the yield
         // must never reap it (ADR-0085).
-        let transport = attach::candidate_transport(&candidate);
+        let transport = (self.probe_transport)(&candidate);
         match resolve_spawned_server_over(
             &transport,
             &candidate,
@@ -1352,7 +1371,13 @@ pub async fn spawn_own_server(
     generation_override: GenerationOverride,
 ) -> anyhow::Result<ResolvedServer> {
     let disabled = service_disabled_at(&own_service_config_path());
-    spawn_own_server_over(preferred_port, generation_override, disabled, &OpencodeStarter).await
+    spawn_own_server_over(
+        preferred_port,
+        generation_override,
+        disabled,
+        &OpencodeStarter::new(),
+    )
+    .await
 }
 
 /// [`spawn_own_server`] over an injectable pair of legs. `disabled` is
@@ -2441,6 +2466,17 @@ mod tests {
         port_from_url(&server.base_url()).expect("the fake server URL has a port")
     }
 
+    /// The probe transport the real starter is given in tests: loopback, with
+    /// the env proxy disabled, so a developer shell's `http_proxy` cannot
+    /// intercept the fake server (the wire-test pattern, ADR-0031).
+    fn no_proxy_probe(candidate: &ServerCandidate) -> Transport {
+        Transport::new_loopback(
+            Some(candidate.username.as_str()),
+            Some(candidate.password.as_str()),
+            candidate.url(),
+        )
+    }
+
     /// A transport pointing at the fake server with the env proxy disabled, so
     /// a developer shell's `http_proxy` cannot intercept loopback.
     fn spawn_test_transport(server: &crate::test_http::TestHttpServer, password: &str) -> Transport {
@@ -3090,25 +3126,40 @@ mod tests {
         assert_eq!(host.calls(), vec!["spawn"]);
     }
 
-    /// The ownership boundary (ADR-0085): the service is started and attached,
-    /// but cola never records it as its own — `self-opencode.pid` is the Owned
+    /// The ownership boundary (ADR-0085) lives in `OpencodeStarter::start_service`,
+    /// so the REAL start path is driven here against a scripted host: the
+    /// service is adopted and its generation resolved (or the start fails), but
+    /// cola never records it as its own — `self-opencode.pid` is the Owned
     /// Server's record, and Yield must never reap a machine-wide rendezvous.
-    #[tokio::test(start_paused = true)]
+    /// A regression that records the service pid anywhere on this path fails
+    /// the test.
+    #[tokio::test]
     async fn starting_the_shared_service_never_records_a_self_spawned_pid() {
+        // A far-out pid is dead everywhere (see
+        // `process_alive_detects_own_process`), so the generation never
+        // resolves and the start reports `Exited` — the outcome does not
+        // matter here, only that the real path ran without recording a pid.
+        let dead_pid = i32::MAX - 1;
         let pid_path = self_spawned_pid_path();
         let before = std::fs::read(&pid_path).ok();
         let host = FakeServiceHost::new()
-            .registration(&service_registration_json(4242, 49374, "reg-pw"))
-            .live(4242, &["opencode", "serve", "--service"]);
+            .registration(&service_registration_json(dead_pid, 49374, "reg-pw"))
+            .live(dead_pid, &["opencode", "serve", "--service"]);
+        let starter = OpencodeStarter {
+            host,
+            registration_path: std::path::PathBuf::from("/state/opencode/service.json"),
+            log_path: std::path::PathBuf::from("/log/opencode-service.log"),
+            probe_transport: no_proxy_probe,
+        };
 
-        let candidate = start_shared_service(
-            &host,
-            std::path::Path::new("/state/opencode/service.json"),
-            std::path::Path::new("/log/opencode-service.log"),
-        )
-        .await
-        .expect("the service resolves");
-        assert_eq!(candidate.pid, 4242);
+        let failure = starter
+            .start_service(GenerationOverride::Auto)
+            .await
+            .expect_err("a dead service cannot be attached");
+        assert!(
+            matches!(failure, ServiceStartFailure::Exited(_)),
+            "the real path must reach the service's resolution: {failure:?}"
+        );
 
         assert_eq!(
             std::fs::read(&pid_path).ok(),
@@ -3117,7 +3168,57 @@ mod tests {
             pid_path.display()
         );
         assert!(
-            !is_self_spawned_record(&pid_path, candidate.pid),
+            !is_self_spawned_record(&pid_path, dead_pid),
+            "a Shared Service is never an Owned Server"
+        );
+    }
+
+    /// The same boundary on the SUCCESS path: a service that resolves is
+    /// adopted and still never recorded (a regression that records only on the
+    /// Ok arm fails here). The registration is pointed at the fake HTTP server
+    /// so the generation probe classifies V2.
+    #[tokio::test]
+    async fn an_adopted_shared_service_is_never_recorded_as_an_owned_server() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route_raw(
+            "GET",
+            "/api/info",
+            200,
+            "application/json",
+            r#"{"version":"2.0.18","pid":7494,"urls":["http://127.0.0.1:49374"]}"#,
+        );
+        // A live stand-in for the daemon: the test process itself.
+        let pid = std::process::id() as i32;
+        let pid_path = self_spawned_pid_path();
+        let before = std::fs::read(&pid_path).ok();
+        let host = FakeServiceHost::new()
+            .registration(&service_registration_json(
+                pid,
+                spawn_test_port(&server),
+                "reg-pw",
+            ))
+            .live(pid, &["opencode", "serve", "--service"]);
+        let starter = OpencodeStarter {
+            host,
+            registration_path: std::path::PathBuf::from("/state/opencode/service.json"),
+            log_path: std::path::PathBuf::from("/log/opencode-service.log"),
+            probe_transport: no_proxy_probe,
+        };
+
+        let resolved = starter
+            .start_service(GenerationOverride::Auto)
+            .await
+            .expect("the live service resolves");
+        assert_eq!(resolved.pid, Some(pid));
+
+        assert_eq!(
+            std::fs::read(&pid_path).ok(),
+            before,
+            "the service must not be written into {}",
+            pid_path.display()
+        );
+        assert!(
+            !is_self_spawned_record(&pid_path, pid),
             "a Shared Service is never an Owned Server"
         );
     }
