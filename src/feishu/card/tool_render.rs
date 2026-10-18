@@ -1618,14 +1618,22 @@ fn format_tool_output(name: &str, output: &str) -> (Option<String>, BodyStyle, S
             return (Some(format!("🔎 {} 条结果", count)), BodyStyle::Markdown, body);
         }
     }
-    if name == "read" && !output.contains("<path>") {
+    // V1's read output *starts* with the `<path>…</path>` wrapper; V2's carries
+    // no wrapper at all. The test is on the **head**, not the whole output: a V2
+    // read whose body merely *mentions* the literal `<path>` (any file quoting
+    // it, e.g. a README documenting `--config <path>`) must still take the V2
+    // branch below, or its path header, language token and first body line are
+    // all lost. `trim_start` matches the V1 loop treating a leading blank line
+    // as decoration.
+    let v1_read_wrapper = name == "read" && output.trim_start().starts_with("<path>");
+    if name == "read" && !v1_read_wrapper {
         // V2's read output carries no XML wrapper: a header line over numbered
         // lines or a directory listing. Anything else falls through to raw.
         if let Some(parsed) = parse_v2_read_output(output) {
             return parsed;
         }
     }
-    if name != "read" || !output.contains("<path>") {
+    if !v1_read_wrapper {
         return (None, BodyStyle::Auto, output.to_string());
     }
     let mut path = String::new();
@@ -4026,6 +4034,40 @@ mod tests {
         assert_eq!(format_tool_output("bash", raw).0, None);
         // Even a read-named tool without the wrapper is left alone.
         assert_eq!(format_tool_output("read", "no wrapper here").2, "no wrapper here");
+    }
+
+    /// #783: the V1-vs-V2 read decision keys off the output's **head**, not a
+    /// whole-output `<path>` search. A V2 read whose body merely quotes the
+    /// literal `<path>` (any file documenting it, this repo's README included)
+    /// must keep its path header, its language token and its V2 first line out
+    /// of the body — the old `contains("<path>")` test sent it down the V1
+    /// branch, whose line scan found no wrapper and dropped all three.
+    #[test]
+    fn read_v2_output_with_path_literal_in_body_stays_v2() {
+        let raw = "Read file /root/workspace/dev/cola/README.md, lines 1-2\n\
+                   1: see `cola --config <path>`\n\
+                   2: done";
+        let (header, style, body) = format_tool_output("read", raw);
+        assert_eq!(
+            header.as_deref(),
+            Some("📄 `/root/workspace/dev/cola/README.md`"),
+            "path header comes from the V2 first line, not empty"
+        );
+        assert_eq!(
+            style,
+            BodyStyle::Code(Some("markdown")),
+            "language token from .md must not be lost"
+        );
+        assert!(
+            !body.contains("Read file "),
+            "the V2 header line must not leak into the body: {}",
+            body
+        );
+        assert!(
+            body.contains("<path>"),
+            "the body's own literal must still be rendered: {}",
+            body
+        );
     }
 
     /// #202: a `task` output is an XML envelope (`<task id state>`) around the
