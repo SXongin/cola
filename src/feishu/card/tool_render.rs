@@ -3,7 +3,7 @@ use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::{AwaitingAction, exceeds_md_budget, fenced_code, truncate_md};
+use super::{AwaitingAction, exceeds_md_budget, fenced_code, first_n_chars_bytes, truncate_md};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
@@ -19,12 +19,12 @@ const V1_DIRECTORY_TYPE_TAG: &str = "<type>directory</type>";
 /// where a file's opens `Read file `; the same verdict in V2's wire shape.
 const V2_DIRECTORY_HEADER_PREFIX: &str = "Read directory ";
 
-/// The line a `read` panel appends under a body its budget CLIPPED
-/// (ADR-0083 §8 amendment, #770): the panel is a
+/// The line a `read` or `write` panel appends under a body its budget CLIPPED
+/// (ADR-0083 §8 amendment, #770/#788): the panel is a
 /// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says so where
 /// the reader can act on it — the way-in button inside the fold (「📂 打开」, or
 /// 「🌐 预览网页」 for an HTML page, #778).
-const READ_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
+const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整文件）_";
 
 /// A Tool Panel: the typed tool call as the card renders it (ADR-0053).
 ///
@@ -1076,44 +1076,105 @@ pub(crate) fn tool_open_button_estimate(tool: &ToolPanel, session_id: Option<&st
         .unwrap_or(0)
 }
 
-/// The note a `read` panel appends under a body its budget CLIPPED (ADR-0083 §8
-/// amendment, #770): the body is a [`TOOL_OUTPUT_MAX_CHARS`]-character preview,
-/// so a clipped one says what it is and names the way to the rest. It renders
-/// IFF that way renders — the panel carries a way-in button
-/// ([`tool_open_button_element`]: a file read, and a Session to route the click
-/// by) — so the note never promises a control a directory read, an image read
-/// or a routeless panel does not have, and the size estimate can charge exactly
-/// the bytes it adds. `None` for every other panel and for a body that fits.
-fn read_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
+/// The note a `read` or `write` panel appends under a body its budget CLIPPED
+/// (ADR-0083 §8 amendment, #770/#788): the body is a
+/// [`TOOL_OUTPUT_MAX_CHARS`]-character preview, so a clipped one says what it
+/// is and names the way to the rest. It renders IFF that way renders — the
+/// panel carries a way-in button ([`tool_open_button_element`]: a `write`, a
+/// file read, and a Session to route the click by) — so the note never promises
+/// a control an unopenable panel does not have, and the size estimate can charge
+/// exactly the bytes it adds. `None` for every other panel and for a body that
+/// fits.
+fn preview_truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
     // The button first: a panel without one (a directory read, an image read, a
     // routeless panel) leaves without assembling the body at all.
     tool_open_button_element(tool, session_id)?;
-    read_body_clipped(tool).then_some(READ_TRUNCATION_NOTE)
+    preview_body_clipped(tool).then_some(PREVIEW_TRUNCATION_NOTE)
 }
 
-/// Whether a `read` panel's rendered body is clipped by its own budget — the
-/// clamp [`tool_panel_element`] applies ([`truncate_md`] at
-/// [`TOOL_OUTPUT_MAX_CHARS`]) — re-derived through the same formatter, the way
-/// every size estimate here re-derives its render, so the note
-/// [`read_truncation_note`] renders is the one charged. `false` for every other
-/// tool and for a call with no output.
-fn read_body_clipped(tool: &ToolPanel) -> bool {
-    tool.name() == "read"
-        && tool
-            .output()
-            .map(|raw| format_tool_output("read", &raw).2)
-            .is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
+/// Whether a `read`/`write` panel's rendered body is clipped by its own budget
+/// — the clamp [`tool_panel_element`] applies ([`truncate_md`] at
+/// [`TOOL_OUTPUT_MAX_CHARS`]) — measured from the same body the render shows,
+/// the way every size estimate here re-derives its render, so the note
+/// [`preview_truncation_note`] renders is the one charged. `false` for every
+/// other tool (an `edit` diff carries no note) and for a call with no body.
+fn preview_body_clipped(tool: &ToolPanel) -> bool {
+    matches!(tool.name(), "read" | "write")
+        && panel_output_body(tool).is_some_and(|body| exceeds_md_budget(&body, TOOL_OUTPUT_MAX_CHARS))
 }
 
-/// The serialized byte length the truncation note [`read_truncation_note`]
-/// appends to a `read` panel's body (ADR-0083 §8 amendment, #770), for a
-/// card-size estimate that must charge exactly what the panel writes — a note
-/// the estimate missed would let a clipped read pass the split check while the
-/// serialized card still carries bytes nothing counted. `0` when the note does
-/// not render. Kept beside the render so the two cannot drift.
-pub(crate) fn read_truncation_note_estimate(tool: &ToolPanel, session_id: Option<&str>) -> usize {
-    read_truncation_note(tool, session_id)
+/// The serialized byte length the truncation note [`preview_truncation_note`]
+/// appends to a `read`/`write` panel's body (ADR-0083 §8 amendment,
+/// #770/#788), for a card-size estimate that must charge exactly what the panel
+/// writes — a note the estimate missed would let a clipped body pass the split
+/// check while the serialized card still carries bytes nothing counted. `0` when
+/// the note does not render. Kept beside the render so the two cannot drift.
+pub(crate) fn preview_truncation_note_estimate(tool: &ToolPanel, session_id: Option<&str>) -> usize {
+    preview_truncation_note(tool, session_id)
         .map(|note| json_escaped_len(&CardMarkdown::new().element(note)))
+        .unwrap_or(0)
+}
+
+/// The Output triple a panel renders: `execute`'s nested-call body, a `write`
+/// call's own `content` ([`write_body`]), or the tool's output text through the
+/// per-tool formatter. One function, because the render and the size estimate
+/// must agree on which body a panel shows.
+fn panel_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
+    if tool.is_code_mode() {
+        execute_output(tool)
+    } else if let Some(write) = write_body(tool) {
+        Some(write)
+    } else {
+        tool.output().map(|raw| format_tool_output(tool.name(), &raw))
+    }
+}
+
+/// The body text [`panel_output`] renders, without its header or style — what
+/// the truncation-note predicate measures against the panel's own clamp.
+fn panel_output_body(tool: &ToolPanel) -> Option<String> {
+    panel_output(tool).map(|(_, _, body)| body)
+}
+
+/// The body a `write` panel renders in place of its success sentence (#788):
+/// the call's own `content` input — the file it produced, which is what a reader
+/// wants and what the panel's 「📂 打开」 already opens the way to — with the
+/// tool's trailing note (V1's diagnostics after the success summary) kept on its
+/// own paragraph, exactly as [`edit_tool_output`] treats an edit's tail.
+///
+/// `None` — the panel then renders its output text as before — for a call that
+/// FAILED (its error text is the body) and for one whose input carries no usable
+/// `content` string. The header is the same `📄 <path>` shape the `read` panel's
+/// body carries, and the fence takes the touched file's language
+/// ([`language_for_path`]), so a written `.md` previews its SOURCE like the
+/// viewer's default.
+fn write_body(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
+    if tool.name() != "write" || tool.status() == &ToolStatus::Error {
+        return None;
+    }
+    let obj = tool.input()?.as_object()?;
+    let content = obj.get("content")?.as_str()?;
+    let path = input_path(obj).filter(|path| !path.trim().is_empty());
+    let mut body = content.to_string();
+    if let Some(tail) = tool.output().as_deref().and_then(summary_tail) {
+        body.push_str("\n\n");
+        body.push_str(tail);
+    }
+    let header = path.map(|path| format!("📄 `{path}`"));
+    let lang = path.map(language_for_path).unwrap_or(PLAIN_TEXT);
+    Some((header, BodyStyle::Code(Some(lang)), body))
+}
+
+/// The serialized byte length the Output body a panel renders contributes to
+/// its card size (#788): a `write` call's own `content` ([`write_body`], which
+/// the output text does not carry), else the tool's output text — the body the
+/// render shows, capped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's own
+/// clamp. Kept beside the render so the estimate cannot charge a body the panel
+/// never writes, nor miss the file a `write` just produced.
+pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
+    write_body(tool)
+        .map(|(_, _, body)| body)
+        .or_else(|| tool.output())
+        .map(|body| first_n_chars_bytes(&body, TOOL_OUTPUT_MAX_CHARS))
         .unwrap_or(0)
 }
 
@@ -1143,15 +1204,12 @@ pub(super) fn tool_panel_element(
     // formatter's dispatch, the todo section's detection, and the input
     // formatter's dispatch.
     let name = tool.name();
-    // `execute` assembles its body from the call's nested-call metadata as well
-    // as its text output, so it has its own output builder; every other tool's
-    // body is its output text through the per-tool formatter. The result-count
-    // header (glob/grep) is metadata-side, so it is applied over either path.
-    let output = if tool.is_code_mode() {
-        execute_output(tool)
-    } else {
-        tool.output().map(|raw| format_tool_output(name, &raw))
-    };
+    // `execute` assembles its body from the call's nested-call metadata, and a
+    // `write` renders its own `content` input, so those have their own builders;
+    // every other tool's body is its output text through the per-tool formatter
+    // (see [`panel_output`]). The result-count header (glob/grep) is
+    // metadata-side, so it is applied over either path.
+    let output = panel_output(tool);
     let output = output
         .map(|(header, style, body)| (search_count_header(name, tool.metadata()).or(header), style, body));
     // The todo panel is a status section, not a transcript: a parsed list is
@@ -1220,11 +1278,11 @@ pub(super) fn tool_panel_element(
                 }
                 BodyStyle::Auto => content.push_str(&body),
             }
-            // A clipped `read` body says so, naming the button above it
-            // (ADR-0083 §8 amendment, #770). Only a `read` gets it: it is the
-            // panel whose clip hides a file the viewer can show whole, and the
-            // note appears exactly when that button does.
-            if let Some(note) = read_truncation_note(tool, session_id) {
+            // A clipped `read`/`write` body says so, naming the button above it
+            // (ADR-0083 §8 amendment, #770/#788). Only those two get it: they
+            // are the panels whose clip hides a file the viewer can show whole,
+            // and the note appears exactly when that button does.
+            if let Some(note) = preview_truncation_note(tool, session_id) {
                 content.push_str(&format!("\n\n{note}"));
             }
         }
@@ -2985,17 +3043,17 @@ mod tests {
             )),
         );
         assert!(clipped.file_open_path().is_some());
-        assert!(read_truncation_note(&clipped, Some("ses_1")).is_some());
+        assert!(preview_truncation_note(&clipped, Some("ses_1")).is_some());
         // The note is plain text — nothing in it is sanitizer-expanded or
         // JSON-escaped — so its charge is its own byte length.
         assert_eq!(
-            read_truncation_note_estimate(&clipped, Some("ses_1")),
-            READ_TRUNCATION_NOTE.len(),
+            preview_truncation_note_estimate(&clipped, Some("ses_1")),
+            PREVIEW_TRUNCATION_NOTE.len(),
             "the note's bytes are charged"
         );
         let md = panel_md_with_session(clipped.clone(), "ses_1");
         assert!(
-            md.ends_with(&format!("\n\n{READ_TRUNCATION_NOTE}")),
+            md.ends_with(&format!("\n\n{PREVIEW_TRUNCATION_NOTE}")),
             "the note closes a clipped body: {md}"
         );
         assert!(md.contains('…'), "the clipped body is marked: {md}");
@@ -3014,7 +3072,7 @@ mod tests {
         );
         let md = panel_md_with_session(panel, "ses_1");
         assert!(
-            md.ends_with(&format!("\n\n{READ_TRUNCATION_NOTE}")),
+            md.ends_with(&format!("\n\n{PREVIEW_TRUNCATION_NOTE}")),
             "V1 clips too: {md}"
         );
 
@@ -3024,9 +3082,9 @@ mod tests {
             Some(json!({"path": "/x/small.rs"})),
             Some("Read file /x/small.rs, lines 1-1\n1: fn main() {}"),
         );
-        assert_eq!(read_truncation_note_estimate(&small, Some("ses_1")), 0);
+        assert_eq!(preview_truncation_note_estimate(&small, Some("ses_1")), 0);
         let md = panel_md_with_session(small, "ses_1");
-        assert!(!md.contains(READ_TRUNCATION_NOTE), "nothing was cut: {md}");
+        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "nothing was cut: {md}");
 
         let directory = ToolPanel::for_test(
             "read",
@@ -3037,13 +3095,16 @@ mod tests {
                 long_read_lines()
             )),
         );
-        assert_eq!(read_truncation_note_estimate(&directory, Some("ses_1")), 0);
+        assert_eq!(preview_truncation_note_estimate(&directory, Some("ses_1")), 0);
         let md = panel_md_with_session(directory, "ses_1");
-        assert!(!md.contains(READ_TRUNCATION_NOTE), "no button, no promise: {md}");
+        assert!(
+            !md.contains(PREVIEW_TRUNCATION_NOTE),
+            "no button, no promise: {md}"
+        );
 
-        assert_eq!(read_truncation_note_estimate(&clipped, None), 0);
+        assert_eq!(preview_truncation_note_estimate(&clipped, None), 0);
         let md = panel_md(clipped);
-        assert!(!md.contains(READ_TRUNCATION_NOTE), "no button, no note: {md}");
+        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no button, no note: {md}");
     }
 
     /// 300 numbered lines of well over [`TOOL_OUTPUT_MAX_CHARS`] characters — a
@@ -3051,6 +3112,167 @@ mod tests {
     /// (ADR-0083 §8 amendment, #770).
     fn long_read_lines() -> String {
         (1..=300).map(|n| format!("{n}: {}\n", "x".repeat(40))).collect()
+    }
+
+    /// #788: a `write` panel renders the call's own `content` as its body —
+    /// fenced with the touched file's language from the shared table — instead
+    /// of the tool's bare success sentence, so the file the agent just produced
+    /// is on the card. The body names the file (`📄 <path>`, the `read` panel's
+    /// shape), the call's own Input line stays, and the folded header and
+    /// 「📂 打开」 are unchanged.
+    #[test]
+    fn a_write_panels_content_renders_as_a_fenced_body() {
+        // V1's `filePath` and V2's `path`; the fence follows the extension — a
+        // known one, a `.md` (its SOURCE, like the viewer's default) and an
+        // unknown one that stays plain.
+        for (input, path, lang) in [
+            (
+                json!({"filePath": "src/main.rs", "content": "line one\nline two"}),
+                "src/main.rs",
+                "rust",
+            ),
+            (
+                json!({"path": "notes.md", "content": "line one\nline two"}),
+                "notes.md",
+                "markdown",
+            ),
+            (
+                json!({"filePath": "data.unknownext", "content": "line one\nline two"}),
+                "data.unknownext",
+                "plain_text",
+            ),
+        ] {
+            let panel = ToolPanel::for_test(
+                "write",
+                ToolStatus::Completed,
+                Some(input),
+                Some("Wrote file successfully."),
+            );
+            let md = panel_md_with_session(panel.clone(), "ses_1");
+            assert!(md.contains("line one\nline two"), "the content is the body: {md}");
+            assert!(
+                !md.contains("Wrote file successfully."),
+                "the success sentence is dropped as noise: {md}"
+            );
+            assert!(
+                md.contains(&format!("📄 `{path}`")),
+                "the body names the file: {md}"
+            );
+            assert!(
+                md.contains(&format!("```{lang}")),
+                "the fence follows the extension: {md}"
+            );
+            assert!(md.contains("**Input**"), "the call's own Input line stays: {md}");
+            assert_eq!(panel.file_open_path(), Some(path), "the way in is unchanged");
+            assert!(
+                tool_open_button_element(&panel, Some("ses_1")).is_some(),
+                "the open button still renders"
+            );
+        }
+    }
+
+    /// A `write` body is clipped to [`TOOL_OUTPUT_MAX_CHARS`] exactly like a
+    /// `read` preview, and says so through the same note — and only when the
+    /// panel carries the way-in button, so a Session-less one promises nothing
+    /// (ADR-0083 §8 amendment, #770/#788).
+    #[test]
+    fn a_clipped_write_body_says_the_preview_was_clipped() {
+        let content = "x".repeat(TOOL_OUTPUT_MAX_CHARS + 1_000);
+        let clipped = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"path": "/x/big.rs", "content": content})),
+            Some("Wrote file successfully."),
+        );
+        assert!(preview_truncation_note(&clipped, Some("ses_1")).is_some());
+        assert_eq!(
+            preview_truncation_note_estimate(&clipped, Some("ses_1")),
+            PREVIEW_TRUNCATION_NOTE.len(),
+            "the note's bytes are charged"
+        );
+        let md = panel_md_with_session(clipped.clone(), "ses_1");
+        assert!(
+            md.ends_with(&format!("\n\n{PREVIEW_TRUNCATION_NOTE}")),
+            "the note closes a clipped write body: {md}"
+        );
+        assert!(md.contains('…'), "the clipped body is marked: {md}");
+        assert!(
+            !md.contains("Wrote file successfully."),
+            "a clipped body still drops the success sentence: {md}"
+        );
+
+        // A body that fits carries nothing.
+        let small = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"path": "/x/small.rs", "content": "fn main() {}"})),
+            Some("Wrote file successfully."),
+        );
+        assert_eq!(preview_truncation_note_estimate(&small, Some("ses_1")), 0);
+        let md = panel_md_with_session(small, "ses_1");
+        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "nothing was cut: {md}");
+
+        // No Session to route the button by: no button, no note.
+        assert_eq!(preview_truncation_note_estimate(&clipped, None), 0);
+        let md = panel_md(clipped);
+        assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no button, no note: {md}");
+    }
+
+    /// The body is only replaced by the content when a `write` really carries
+    /// one (#788): a call with no usable `content` — and a FAILED write, whose
+    /// error text is the body — keeps today's output panel, while a trailing
+    /// note the tool reported after its success summary is kept below the fenced
+    /// content, the way [`edit_tool_output`] treats an edit's tail.
+    #[test]
+    fn a_write_falls_back_to_its_output_when_it_has_no_content() {
+        // No `content`: today's panel, the output text and all.
+        let bare = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "report.md"})),
+            Some("Wrote file successfully."),
+        );
+        let md = panel_md_with_session(bare, "ses_1");
+        assert!(
+            md.contains("Wrote file successfully."),
+            "the output text stays: {md}"
+        );
+        assert!(!md.contains("```"), "no content, no fence: {md}");
+
+        // A FAILED write keeps its error rather than content it never wrote.
+        let failed = ToolPanel::for_test(
+            "write",
+            ToolStatus::Error,
+            Some(json!({"filePath": "report.md", "content": "secret"})),
+            Some("Unable to write report.md"),
+        );
+        let md = panel_md_with_session(failed, "ses_1");
+        assert!(
+            md.contains("Unable to write report.md"),
+            "the error is the body: {md}"
+        );
+        assert!(
+            !md.contains("secret"),
+            "the content cannot replace an error: {md}"
+        );
+
+        // The tool's trailing note survives beside the fenced content.
+        let noted = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "src/main.rs", "content": "fn main() {}"})),
+            Some("Wrote file successfully.\n\nLSP errors detected in this file, please fix:"),
+        );
+        let md = panel_md_with_session(noted, "ses_1");
+        assert!(md.contains("fn main() {}"), "the content is the body: {md}");
+        assert!(
+            md.contains("LSP errors detected"),
+            "the trailing note is kept: {md}"
+        );
+        assert!(
+            !md.contains("Wrote file successfully."),
+            "the summary is still dropped: {md}"
+        );
     }
 
     /// A call whose path is absent or unusable carries no button rather than a

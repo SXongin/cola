@@ -527,12 +527,13 @@ pub(super) struct GapCoverage {
 
 /// Estimated serialized size (bytes) of one collapsible tool panel, mirroring
 /// [`StreamAccumulator::estimate_split_index`]'s accounting (element overhead
-/// plus the capped input and output the renderer keeps, plus the File Content
-/// tracking block the panel body appends, one `img` element per embedded image,
-/// the compact file marker the folded header carries — ADR-0076 — the folded
-/// header's file detail, the 「📂 打开」 button a `write`/`edit`/file-`read`
-/// panel carries inside the fold, and the note a clipped `read` body appends
-/// beside it, ADR-0083 §8 amendment, #766/#770). Shared by the timeline's tool
+/// plus the capped input and output the renderer keeps — the output a `write`
+/// call's own `content` body, #788 — plus the File Content tracking block the
+/// panel body appends, one `img` element per embedded image, the compact file
+/// marker the folded header carries — ADR-0076 — the folded header's file
+/// detail, the 「📂 打开」 button a `write`/`edit`/file-`read` panel carries
+/// inside the fold, and the note a clipped `read`/`write` body appends beside
+/// it, ADR-0083 §8 amendment, #766/#770/#788). Shared by the timeline's tool
 /// items and the todo tail reserve, so every place a panel's bytes are summed
 /// charges its images, its header marker, its file detail, its button and its
 /// truncation note too.
@@ -544,10 +545,7 @@ fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
         .map(|x| x.to_string())
         .map(|s| first_n_chars_bytes(&s, 400))
         .unwrap_or(0);
-    let output = p
-        .output()
-        .map(|s| first_n_chars_bytes(&s, crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS))
-        .unwrap_or(0);
+    let output = crate::feishu::card::tool_render::panel_output_estimate(p);
     400 + input
         + output
         + crate::feishu::card::tool_render::file_tracking_estimate(p)
@@ -555,7 +553,7 @@ fn panel_estimate(p: &ToolPanel, session_id: Option<&str>) -> usize {
         + crate::feishu::card::tool_render::file_header_marker_estimate(p)
         + crate::feishu::card::tool_render::panel_file_detail_estimate(p)
         + crate::feishu::card::tool_render::tool_open_button_estimate(p, session_id)
-        + crate::feishu::card::tool_render::read_truncation_note_estimate(p, session_id)
+        + crate::feishu::card::tool_render::preview_truncation_note_estimate(p, session_id)
 }
 
 /// The content hash of one panel's File Content at `index` (ADR-0076), or
@@ -5602,7 +5600,8 @@ mod tests {
             Some(&format!("Read file /x/big.rs, lines 1-1\n{}", "x".repeat(4_000))),
         );
         let button = crate::feishu::card::tool_render::tool_open_button_estimate(&clipped, Some("ses_1"));
-        let note = crate::feishu::card::tool_render::read_truncation_note_estimate(&clipped, Some("ses_1"));
+        let note =
+            crate::feishu::card::tool_render::preview_truncation_note_estimate(&clipped, Some("ses_1"));
         assert!(button > 0, "a file read's button has a byte cost");
         assert!(note > 0, "and its clipped body's note has one too");
         assert_eq!(
@@ -5620,7 +5619,7 @@ mod tests {
         );
         let button = crate::feishu::card::tool_render::tool_open_button_estimate(&small, Some("ses_1"));
         assert_eq!(
-            crate::feishu::card::tool_render::read_truncation_note_estimate(&small, Some("ses_1")),
+            crate::feishu::card::tool_render::preview_truncation_note_estimate(&small, Some("ses_1")),
             0,
             "nothing was clipped, no note to charge"
         );
@@ -5628,6 +5627,41 @@ mod tests {
             panel_estimate(&small, Some("ses_1")),
             panel_estimate(&small, None) + button,
             "the button alone is charged"
+        );
+    }
+
+    /// #788: a `write` panel's Output section is the call's own `content`, not
+    /// its one-line success sentence, so `panel_estimate` must charge those
+    /// bytes — the raw input cap alone would leave up to `TOOL_OUTPUT_MAX_CHARS`
+    /// uncharged, and a card of written files could exceed Feishu's size cap
+    /// instead of splitting.
+    #[test]
+    fn panel_estimate_charges_a_write_panels_content_body() {
+        let write = |content: &str| {
+            ToolPanel::for_test(
+                "write",
+                ToolStatus::Completed,
+                Some(serde_json::json!({"filePath": "big.rs", "content": content})),
+                Some("Wrote file successfully."),
+            )
+        };
+        let max = crate::feishu::card::tool_render::TOOL_OUTPUT_MAX_CHARS;
+        let long = write(&"x".repeat(max));
+        let short = write("x");
+        let body = crate::feishu::card::tool_render::panel_output_estimate(&long)
+            - crate::feishu::card::tool_render::panel_output_estimate(&short);
+        assert!(body >= max - 1, "the rendered content body is charged: {body}");
+        assert!(
+            panel_estimate(&long, None) - panel_estimate(&short, None) >= body,
+            "panel_estimate must carry the content body's bytes"
+        );
+        // The Session adds only the button: the body charge is routing-neutral,
+        // and a body at the cap renders no truncation note.
+        assert_eq!(
+            panel_estimate(&long, Some("ses_1")),
+            panel_estimate(&long, None)
+                + crate::feishu::card::tool_render::tool_open_button_estimate(&long, Some("ses_1")),
+            "the content body is charged exactly once, whatever the Session"
         );
     }
 
