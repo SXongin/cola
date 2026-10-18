@@ -90,6 +90,11 @@ impl ServerCandidate {
             _ => ServerClass::Coexistent,
         }
     }
+
+    /// Whether this process is a V2 Shared Service.
+    pub fn is_service(&self) -> bool {
+        self.class == ServerClass::Service
+    }
 }
 
 /// The loopback URL of a server port (`http://localhost:4096`).
@@ -386,6 +391,28 @@ pub fn pick_server(
     preferred_port
         .and_then(|p| class.iter().find(|c| c.port == p).copied())
         .or_else(|| class.first().copied())
+}
+
+/// The eligible default-store servers the canonical pick leaves out, in
+/// deterministic order (selection priority, then port, then pid). The
+/// multi-server visibility of `reconcile`, `cola status` and `cola doctor`
+/// reads this; when it is empty there is exactly one shared server.
+pub fn other_servers<'a>(
+    candidates: &'a [ServerCandidate],
+    canonical: &ServerCandidate,
+) -> Vec<&'a ServerCandidate> {
+    let mut others: Vec<&ServerCandidate> = candidates
+        .iter()
+        .filter(|c| is_eligible(c) && c.pid != canonical.pid)
+        .collect();
+    others.sort_by(|a, b| {
+        a.class
+            .rank()
+            .cmp(&b.class.rank())
+            .then_with(|| a.port.cmp(&b.port))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    others
 }
 
 /// The command cola runs to start its own OpenCode server on the default store.
@@ -1014,6 +1041,22 @@ mod tests {
             1,
             "the owned server is the last resort"
         );
+    }
+
+    #[test]
+    fn other_servers_lists_eligible_non_canonical_servers_deterministically() {
+        let service = service_cand(1, 49374);
+        let coexist = cand(2, 4001, "x", true);
+        let owned = cand(3, 4096, "cola-secret", true);
+        let custom = cand(4, 3000, "custom", false);
+        let private = cand(5, 0, "stdio", true);
+        let all = [private, custom, owned, coexist, service.clone()];
+        // Selection priority, then port: coexistent (pid 2) precedes owned
+        // (pid 3). Custom-store and port-0 candidates are not servers cola
+        // could attach to at all.
+        let others = other_servers(&all, &service);
+        assert_eq!(others.iter().map(|c| c.pid).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(other_servers(std::slice::from_ref(&service), &service).is_empty());
     }
 
     #[test]

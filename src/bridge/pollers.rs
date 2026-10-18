@@ -136,12 +136,15 @@ pub(crate) async fn wait_for_server_ready(
     }
 }
 
-/// One pass of the server-ownership reconcile (ADR-0013): attach to the
-/// preferred default-store server (a Coexistent Server over cola's Owned),
-/// lazily spawn an Owned Server when `allow_spawn` and none exists, and reap a
-/// leftover Owned Server once a Coexistent Server is the pick. The reconnect
-/// loop runs this with `allow_spawn=false` on a cadence; the Lazy Start hook
-/// runs it with `allow_spawn=true` at the moment a server is needed.
+/// One pass of the server-ownership reconcile (ADR-0013, ADR-0085): attach to
+/// the canonical default-store server (Shared Service first, then a Coexistent
+/// Server over cola's Owned), lazily spawn an Owned Server when `allow_spawn`
+/// and none exists, and reap a leftover Owned Server once another server is
+/// the pick. When more than one eligible server exists, the pass also WARNs
+/// once naming the canonical and every ignored server, so the choice is
+/// visible without attempting to sync two servers. The reconnect loop runs
+/// this with `allow_spawn=false` on a cadence; the Lazy Start hook runs it with
+/// `allow_spawn=true` at the moment a server is needed.
 ///
 /// Returns whether a server is attached (or was just started).
 ///
@@ -218,6 +221,31 @@ async fn reconcile(
         return Ok(false);
     };
     let url = server.url();
+    let ignored = discovery::other_servers(&candidates, server);
+    if !ignored.is_empty() {
+        // One server is the premise of real-time sync (ADR-0085). cola cannot
+        // aggregate two servers, so make the choice and the ignored servers
+        // visible every pass instead of silently flapping.
+        tracing::warn!(
+            "multiple default-store OpenCode servers; canonical {} (pid {}); ignoring {}",
+            url,
+            server.pid,
+            ignored
+                .iter()
+                .map(|c| format!(
+                    "{} (pid {}, {})",
+                    c.url(),
+                    c.pid,
+                    if c.is_service() {
+                        "service"
+                    } else {
+                        "not a service"
+                    }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let current = handles.flow.backend.base_url();
     let attached_pid = handles.flow.backend.attached_server_pid();
     let pick_is_owned = self_pid == Some(server.pid);
@@ -255,8 +283,9 @@ async fn reconcile(
         handles.flow.backend.reconnect(Some(&resolved)).await?;
     }
 
-    // Attached to the preferred server. If it's a Coexistent Server, reap a
-    // leftover Owned Server (the yield) — but never while a turn is in flight.
+    // Attached to the canonical server. If it is not cola's Owned Server
+    // (Shared Service or Coexistent), reap a leftover Owned Server (the yield)
+    // — but never while a turn is in flight.
     if !pick_is_owned {
         if busy(&handles.flow.waits).await {
             return Ok(true);
