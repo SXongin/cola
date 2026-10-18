@@ -525,7 +525,7 @@ fn tool_output(call: &ToolCall) -> Option<String> {
             out.push_str(text);
         }
     }
-    if call.status == ToolStatus::Error
+    if call.status.is_failure()
         && let Some(error) = &call.output.error
     {
         if !out.is_empty() {
@@ -1160,17 +1160,11 @@ fn write_body(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
 }
 
 /// Whether the call settled as a FAILURE, by the same rule its status icon
-/// draws ([`ToolPanel::status_icon`]): the typed `Error`, a status this build
-/// does not model but the server named `failed`, or runtime metadata that
-/// reports one. A failed `write` keeps its error text rather than the content it
-/// never wrote (#788).
+/// draws ([`ToolPanel::status_icon`]): [`ToolStatus::is_failure`], or runtime
+/// metadata that reports one. A failed `write` keeps its error text rather than
+/// the content it never wrote (#788).
 fn call_failed(tool: &ToolPanel) -> bool {
-    tool.metadata_failure()
-        || match tool.status() {
-            ToolStatus::Error => true,
-            ToolStatus::Other(status) => status == "failed",
-            _ => false,
-        }
+    tool.metadata_failure() || tool.status().is_failure()
 }
 
 /// The character cap on a `write` panel's trailing note (#788). The note is a
@@ -1210,22 +1204,31 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 
 /// The serialized byte length the Output body a panel renders contributes to
 /// its card size (#788): a `write` call's own `content` ([`write_body`], which
-/// the output text does not carry), else the tool's output text — the body the
-/// render shows, clipped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's
-/// own clamp, measured JSON-ESCAPED (the form the body takes inside the card's
-/// `content` string, each newline and quote costing its extra byte) and with the
-/// dynamic fence [`fenced_overhead`] charges for a body full of backticks. Kept
-/// beside the render so the estimate cannot charge a body the panel never
-/// writes, nor miss the file a `write` just produced.
+/// the output text does not carry) together with the `📄 <path>` header that
+/// body renders — the path is not part of the content, and every other panel's
+/// header rides its charged output text — else the tool's output text. The body
+/// is clipped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's own clamp,
+/// measured JSON-ESCAPED (the form it takes inside the card's `content` string,
+/// each newline and quote costing its extra byte) and with the dynamic fence
+/// [`fenced_overhead`] charges for a body full of backticks. Kept beside the
+/// render so the estimate cannot charge a body the panel never writes, nor miss
+/// the file a `write` just produced.
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
-    write_body(tool)
+    let write = write_body(tool);
+    let header = write
+        .as_ref()
+        .and_then(|(header, _, _)| header.as_deref())
+        .map(json_escaped_len)
+        .unwrap_or(0);
+    let body = write
         .map(|(_, _, body)| body)
         .or_else(|| tool.output())
         .map(|body| {
             let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
             json_escaped_len(&body) + fenced_overhead(&body)
         })
-        .unwrap_or(0)
+        .unwrap_or(0);
+    header + body
 }
 
 /// One tool panel as a folded collapsible element. `at_ms` is the part's
@@ -3330,6 +3333,34 @@ mod tests {
             "the content cannot replace a failure: {md}"
         );
 
+        // The wire shape an error-only `"failed"` call carries (V2's
+        // `state.error`, no text block): the error still reaches the panel —
+        // suppressing the content must not lose it (#788).
+        let error_only = ToolPanel::new(crate::backend::ToolCall {
+            identity: crate::backend::ToolIdentity {
+                name: "write".into(),
+                call_id: "call_write".into(),
+            },
+            status: ToolStatus::Other("failed".into()),
+            started_at: None,
+            input: Some(json!({"path": "src/main.rs", "content": "fn main() {}"})),
+            metadata: None,
+            output: crate::backend::ToolOutput {
+                raw: None,
+                blocks: Vec::new(),
+                error: Some("permission denied".into()),
+            },
+        });
+        let md = panel_md_with_session(error_only, "ses_1");
+        assert!(
+            md.contains("permission denied"),
+            "the error reaches the panel: {md}"
+        );
+        assert!(
+            !md.contains("fn main() {}"),
+            "the content cannot replace the error: {md}"
+        );
+
         // A long FAILED-write error is not a file preview: its panel carries no
         // "open the full file" note, whatever its length (#788).
         let long_error = format!("write failed: {}", "e".repeat(TOOL_OUTPUT_MAX_CHARS * 2));
@@ -3425,8 +3456,27 @@ mod tests {
         );
         assert_eq!(
             panel_output_estimate(&panel),
-            TOOL_OUTPUT_MAX_CHARS + fenced_overhead(&content),
+            TOOL_OUTPUT_MAX_CHARS + fenced_overhead(&content) + json_escaped_len("📄 `notes.md`"),
             "the fence beyond the minimum is charged"
+        );
+    }
+
+    /// A `write` panel's Output section renders its own `📄 <path>` header, and
+    /// that path is not part of the content: a long path is charged beside the
+    /// body, or a turn heavy on deep paths would undercount its cards (#788).
+    #[test]
+    fn the_write_body_estimate_charges_the_output_header_path() {
+        let long_path = format!("{}.rs", "dir/".repeat(1_000));
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": long_path, "content": "x"})),
+            Some("Wrote file successfully."),
+        );
+        assert_eq!(
+            panel_output_estimate(&panel),
+            json_escaped_len(&format!("📄 `{long_path}`")) + 1,
+            "the header's path and the one-char body are both charged"
         );
     }
 
@@ -3446,7 +3496,7 @@ mod tests {
         );
         assert_eq!(
             panel_output_estimate(&panel),
-            2 * 1_000,
+            2 * 1_000 + json_escaped_len("📄 `src/main.rs`"),
             "each newline costs its escaped byte pair inside the card"
         );
         assert!(
