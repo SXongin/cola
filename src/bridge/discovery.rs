@@ -180,6 +180,11 @@ fn service_registration_credentials(env: &[String], pid: i32) -> Option<(u16, St
 /// (`serve --service`) has no `--port`; its registration file is the fallback
 /// attach path (spec #364 §2), and its username is fixed at `opencode` so a
 /// poisoned `OPENCODE_SERVER_USERNAME` cannot break the attach.
+///
+/// `--port 0` (`serve --stdio --port 0`, as `opencode --standalone` and
+/// `opencode acp` start) is not an endpoint: the OS assigns the real port and
+/// the server publishes it only on stdout, so `localhost:0` can never be
+/// attached to. Such a process is not a candidate at all (issue #748).
 fn resolve_credentials(args: &[String], env: &[String], pid: i32) -> Option<(u16, String, String)> {
     if let Some(port) = args
         .iter()
@@ -187,6 +192,9 @@ fn resolve_credentials(args: &[String], env: &[String], pid: i32) -> Option<(u16
         .and_then(|idx| args.get(idx + 1))
         .and_then(|p| p.parse::<u16>().ok())
     {
+        if port == 0 {
+            return None;
+        }
         let password = env
             .iter()
             .find_map(|kv| kv.strip_prefix("OPENCODE_SERVER_PASSWORD="))
@@ -279,18 +287,23 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
 ///
 /// Only default-store servers are eligible (a custom-store server is someone
 /// else's data — attaching would both break sharing and couple cola to that
-/// runtime). Among eligible servers a Coexistent Server (pid != `self_pid`)
-/// always wins over cola's Owned Server (pid == `self_pid`), so cola steps
-/// aside as soon as OpenChamber (or a manual `opencode serve`) raises one;
-/// within the winning class the configured port wins, else the lowest port.
-/// Deterministic — the reconnect loop never flaps between two default-store
-/// servers.
+/// runtime). A candidate on port 0 is never eligible: that port is not an
+/// endpoint (see [`resolve_credentials`]), so it could only ever send the
+/// reconnect loop into a probe that cannot succeed (issue #748). Among eligible
+/// servers a Coexistent Server (pid != `self_pid`) always wins over cola's
+/// Owned Server (pid == `self_pid`), so cola steps aside as soon as OpenChamber
+/// (or a manual `opencode serve`) raises one; within the winning class the
+/// configured port wins, else the lowest port. Deterministic — the reconnect
+/// loop never flaps between two default-store servers.
 pub fn pick_server(
     candidates: &[ServerCandidate],
     preferred_port: Option<u16>,
     self_pid: Option<i32>,
 ) -> Option<&ServerCandidate> {
-    let mut eligible: Vec<&ServerCandidate> = candidates.iter().filter(|c| c.uses_default_store).collect();
+    let mut eligible: Vec<&ServerCandidate> = candidates
+        .iter()
+        .filter(|c| c.uses_default_store && c.port != 0)
+        .collect();
     // Deterministic across scans: sysinfo enumerates processes in randomized
     // order, so taking `first()` unsorted would make the reconnect loop flap
     // between two servers of the same class (ADR-0013).
@@ -825,6 +838,28 @@ mod tests {
     }
 
     #[test]
+    fn pick_server_never_picks_a_port_zero_candidate() {
+        // Port 0 is never an endpoint: a candidate carrying it must not win
+        // over an attachable one (nor be returned alone), even when the
+        // configured tiebreaker names it (issue #748).
+        let private = cand(1, 0, "stdio", true);
+        let healthy = cand(2, 4096, "x", true);
+        assert_eq!(
+            pick_server(&[private.clone(), healthy.clone()], None, None)
+                .unwrap()
+                .port,
+            4096
+        );
+        assert_eq!(
+            pick_server(&[healthy, private.clone()], Some(0), None)
+                .unwrap()
+                .port,
+            4096
+        );
+        assert!(pick_server(&[private], None, None).is_none());
+    }
+
+    #[test]
     fn self_start_command_spawns_default_store_server() {
         let cmd = self_start_command(4096, "secret");
         assert_eq!(
@@ -953,6 +988,20 @@ mod tests {
             resolve_credentials(&args, &env, 7),
             Some((4096, "admin".to_string(), "secret".to_string()))
         );
+    }
+
+    /// `opencode --standalone` and `opencode acp` start `serve --stdio --port
+    /// 0`: the OS assigns the real port and the server publishes it only on
+    /// stdout. The argv port is therefore not an endpoint — `localhost:0` can
+    /// never be attached to — so such a process is not a candidate at all
+    /// (issue #748).
+    #[test]
+    fn an_os_assigned_stdio_server_is_not_a_candidate() {
+        let args: Vec<String> = ["opencode", "serve", "--stdio", "--port", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(resolve_credentials(&args, &[], 42), None);
     }
 
     /// The V2 managed service has no `--port` flag: its registration file is
