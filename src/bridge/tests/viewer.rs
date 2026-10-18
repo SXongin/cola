@@ -538,12 +538,12 @@ async fn cat_accepts_an_absolute_path_outside_the_session_directory() {
     let card = first_card(&platform).await;
     let text = card_text(&card);
     assert!(
-        text.contains("# notes"),
-        "a .md file leads with its rendered text (#781): {text}"
+        text.contains("```markdown") && text.contains("# notes"),
+        "a .md file opens on its source (#781): {text}"
     );
     assert!(
-        !text.contains("```markdown"),
-        "the rendered view carries no source fence: {text}"
+        card_buttons(&card).iter().any(|b| b["value"]["op"] == "view"),
+        "the source view offers its render: {text}"
     );
     assert!(
         text.contains(&canonical(&outside)),
@@ -2347,25 +2347,25 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
     .await;
 
     let card = first_card(&platform).await;
-    let rendered = card_text(&card);
+    let source = card_text(&card);
     assert!(
-        rendered.contains("# Title"),
-        "the default view renders: {rendered}"
+        source.contains("```markdown") && source.contains("# Title"),
+        "the default view is the source: {source}"
     );
-    let to_source = card_buttons(&card)
+    let to_render = card_buttons(&card)
         .into_iter()
         .find(|b| b["value"]["op"] == "view")
         .expect("the view toggle is on the card")["value"]
         .clone();
-    assert_eq!(to_source["viewer_view"], "source");
+    assert_eq!(to_render["viewer_view"], "rendered");
 
     // The toggle PATCHes the clicked card: no second message, no File Message.
     let files_before = file_messages(&platform).await.len();
-    let source_card = drive_viewer_rebuild(&app, &platform, to_source, "msg_md_viewer").await;
-    let source = card_text(&source_card);
+    let rendered_card = drive_viewer_rebuild(&app, &platform, to_render, "msg_md_viewer").await;
+    let rendered = card_text(&rendered_card);
     assert!(
-        source.contains("```markdown"),
-        "the source view renders: {source}"
+        rendered.contains("# Title") && !rendered.contains("```markdown"),
+        "the rendered view is one markdown element: {rendered}"
     );
     assert_eq!(
         patches_to(&platform, "msg_md_viewer").await.len(),
@@ -2378,27 +2378,11 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
         "the view toggle sends nothing"
     );
 
-    // And back: the payload alone restores the rendered view exactly.
-    let to_render = card_buttons(&source_card)
-        .into_iter()
-        .find(|b| b["value"]["op"] == "view")
-        .expect("the render toggle is on the source card")["value"]
-        .clone();
-    assert_eq!(to_render["viewer_view"], "rendered");
-    let back = drive_viewer_rebuild(&app, &platform, to_render, "msg_md_viewer").await;
-    assert_eq!(
-        card_text(&back),
-        rendered,
-        "the payload alone restores the rendered view"
-    );
-
-    // The OTHER two rebuild controls carry the view too (#781): a re-read and a
-    // transfer each PATCH the card they were clicked on, so neither may reset a
-    // source view to the default.
-    let source_card = drive_viewer_rebuild(
+    // And back: the payload alone restores the source view exactly.
+    let back = drive_viewer_rebuild(
         &app,
         &platform,
-        card_buttons(&back)
+        card_buttons(&rendered_card)
             .into_iter()
             .find(|b| b["value"]["op"] == "view")
             .expect("the source toggle")["value"]
@@ -2406,23 +2390,43 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
         "msg_md_viewer",
     )
     .await;
-    assert!(card_text(&source_card).contains("```markdown"));
+    assert_eq!(
+        card_text(&back),
+        source,
+        "the payload alone restores the source view"
+    );
 
-    let reread = card_buttons(&source_card)
+    // The OTHER two rebuild controls carry the view too (#781): a re-read and a
+    // transfer each PATCH the card they were clicked on, so neither may reset an
+    // explicit Rendered view to the default source.
+    let rendered_card = drive_viewer_rebuild(
+        &app,
+        &platform,
+        card_buttons(&back)
+            .into_iter()
+            .find(|b| b["value"]["op"] == "view")
+            .expect("the render toggle")["value"]
+            .clone(),
+        "msg_md_viewer",
+    )
+    .await;
+    assert!(!card_text(&rendered_card).contains("```markdown"));
+
+    let reread = card_buttons(&rendered_card)
         .into_iter()
         .find(|b| b["text"]["content"] == "🔄 重新读取")
         .expect("the re-read button")["value"]
         .clone();
-    assert_eq!(reread["viewer_view"], "source", "{reread}");
+    assert_eq!(reread["viewer_view"], "rendered", "{reread}");
     let reread_card = drive_viewer_rebuild(&app, &platform, reread, "msg_md_viewer").await;
     assert!(
-        card_text(&reread_card).contains("```markdown"),
-        "the re-read keeps the source view: {}",
+        !card_text(&reread_card).contains("```markdown") && card_text(&reread_card).contains("# Title"),
+        "the re-read keeps the rendered view: {}",
         card_text(&reread_card)
     );
 
     let mut transfer = send_as_file_payload(&reread_card);
-    assert_eq!(transfer["viewer_view"], "source", "{transfer}");
+    assert_eq!(transfer["viewer_view"], "rendered", "{transfer}");
     transfer["open_message_id"] = serde_json::json!("msg_md_viewer");
     let result = app
         .host_action(transfer)
@@ -2431,7 +2435,7 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
     assert!(result.card.is_none());
     wait_for_card_update(
         &platform,
-        "markdown source transfer",
+        "markdown rendered transfer",
         CardUpdates::Latest,
         |card| card_text(card).contains("已发送为文件消息"),
     )
@@ -2443,8 +2447,8 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
         .expect("the transfer patch");
     let sent_text = card_text(&sent);
     assert!(
-        sent_text.contains("```markdown"),
-        "the transfer keeps the source view: {sent_text}"
+        !sent_text.contains("```markdown") && sent_text.contains("# Title"),
+        "the transfer keeps the rendered view: {sent_text}"
     );
     assert!(sent_text.contains("已发送为文件消息"), "{sent_text}");
     assert_eq!(
@@ -2454,12 +2458,10 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
     );
 }
 
-/// #781, the discriminating case: a markdown file whose RENDER fits while its
-/// fenced SOURCE pages. A flip carries `viewer_view`, and page 2 proves it end
-/// to end — drop the view in the handler and the rebuilt page renders instead
-/// (no fence, no pager).
+/// #781: a long markdown file opens on its paged SOURCE, and a flip keeps it —
+/// page 2 is the source's second window, not the rendered text.
 #[tokio::test]
-async fn viewer_markdown_source_view_survives_a_page_flip() {
+async fn viewer_markdown_source_pages_and_the_flip_stays_on_it() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let body = format!("{}\n{}\n", "`".repeat(500), "x".repeat(20_000));
@@ -2481,31 +2483,22 @@ async fn viewer_markdown_source_view_survives_a_page_flip() {
     .await;
 
     let card = first_card(&platform).await;
-    let rendered = card_text(&card);
+    let source = card_text(&card);
     assert!(
-        !rendered.contains("```markdown") && pager_label(&card).is_none(),
-        "the default view renders (no fence, no pager): {rendered}"
+        source.contains("```markdown"),
+        "the default view is the source: {source}"
+    );
+    assert!(pager_label(&card).is_some(), "the source pages: {source}");
+    assert!(
+        card_buttons(&card).iter().any(|b| b["value"]["op"] == "view"),
+        "the render fits, so it is still offered: {source}"
     );
 
-    let to_source = card_buttons(&card)
-        .into_iter()
-        .find(|b| b["value"]["op"] == "view")
-        .expect("the rendered view offers its source")["value"]
-        .clone();
-    let source = drive_viewer_rebuild(&app, &platform, to_source, "msg_paged").await;
-    let source_text = card_text(&source);
-    assert!(
-        source_text.contains("```markdown"),
-        "the source renders: {source_text}"
-    );
-    let next = card_buttons(&source)
+    let next = card_buttons(&card)
         .into_iter()
         .find(|b| b["value"]["op"] == "page" && b["text"]["content"] == "下一页")
         .expect("the source pages")["value"]
         .clone();
-    assert_eq!(next["viewer_view"], "source", "{next}");
-    assert_eq!(next["page"], 2, "{next}");
-
     let page2 = drive_viewer_rebuild(&app, &platform, next, "msg_paged").await;
     let page2_text = card_text(&page2);
     assert!(
@@ -2515,6 +2508,10 @@ async fn viewer_markdown_source_view_survives_a_page_flip() {
     assert!(
         pager_label(&page2).is_some_and(|label| label.contains("第 2/")),
         "the source pager names page 2: {page2_text}"
+    );
+    assert!(
+        card_buttons(&page2).iter().any(|b| b["value"]["op"] == "view"),
+        "page 2 still offers the render: {page2_text}"
     );
 }
 
