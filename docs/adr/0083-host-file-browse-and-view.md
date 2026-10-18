@@ -428,3 +428,48 @@ else:
 
 The callback grammar gains one `op` value; the open lane, the viewer's own lane, and every other
 file kind are unchanged.
+
+## Amendment (2026-10-18, #781): a markdown file's viewer leads with its rendered text
+
+The #774 amendment ended by deferring exactly this: *"rendering markdown inside the card … is
+viable — the card `markdown` element already renders that family — but it is a separate change (a
+preview/source toggle is a new card state), and decision 10's blanket 'no rich-text rendering'
+sentence is narrowed here only to the extent measured above."* The measurement it rested on
+settled that a `.md` file's client preview, a card `markdown` element and a `post` `md` tag render
+**equivalently** — so for a markdown document the card IS a renderer, and no File Message hop is
+needed to read one. That capability now leads.
+
+- **The rendered text leads; the faithful source is one tap away.** A `.md`/`.markdown`/`.mark`
+  text file's preview is the file's own text cleaned by the card's existing markdown sanitizer
+  (one `markdown` element, no fence), and the card's first button is 「查看源码」 — the source
+  block exactly as every text file rendered it before. Unlike HTML, whose only renderer is the
+  client's File Message preview (#774), a markdown document renders *in the card*: no extra
+  message, no upload.
+- **The toggle is the pager's rebuild, not new machinery.** `op: "view"` (payload word
+  `viewer_view`, `"rendered"`/`"source"`) rides the `op: "page"` path end to end: a bounded
+  re-read off the callback, an in-place PATCH of the clicked card, and **no** per-card state
+  (ADR-0052). Every rebuild control now shares one carried-state helper
+  (`viewer_carry_fields`) — path, path scope, the browse listing, the snapshot identity, the
+  whole-bytes lane and the chosen view — so a page flip, a re-read or a transfer's PATCH cannot
+  drop the view, the way back, or a completed transfer.
+- **A render the card cannot hold is not rendered.** The default is gated on the render fitting
+  the preview budget — `serialized_len(text)` plus the element wrapper against
+  [`PREVIEW_JSON_BUDGET`], the same measure the fenced gate always used (the sanitizer's `<`→
+  `&#60;` expansion is already in it) — and a card over that budget keeps today's source view and
+  offers **no** toggle. The complete, uncapped render stays the 「发为文件」 File Message's own
+  client preview, which is also why this amendment needs no new overflow lane: a markdown table
+  past the card's table budget degrades to a fenced block *inside* the render, through the
+  sanitizer's existing rule, and the whole document remains one tap away in the File Message. A
+  `.md` file whose source outgrows one card still pages, and the pager carries the view so a flip
+  stays in the view it was showing.
+- **The extension still never decides the KIND (§6).** `is_markdown_path` (the three extensions
+  the Drive import accepts, and the `markdown` code token's partners) selects the RENDER only: a
+  `.md`-named binary keeps the ordinary row, exactly as a `.html`-named one does (#774), and
+  `.rs`, `.txt` and every other text kind are untouched.
+- **The transfer is untouched.** A markdown file keeps 「发为文件」, and the transfer's card PATCH
+  keeps the chosen view the same way it keeps the page (`transfer_value` carries both).
+
+Not in this amendment: rendering any non-markdown text kind as markdown (the extension rule is the
+markdown trio alone), and any per-table authoring of source vs render — the sanitizer's existing
+budget behaviour is the whole of it.
+
