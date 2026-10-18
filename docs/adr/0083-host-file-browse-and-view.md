@@ -487,8 +487,9 @@ panel already renders the file it read:
   Output section's body, in place of the success sentence, which is dropped as noise the way `edit`
   drops its summary. A trailing note the tool reported after that summary (V1's "LSP errors
   detected …") is kept as its own paragraph AFTER the fenced content, outside the preview budget so
-  a long note is never clipped by the content's clamp, and is itself clamped to
-  `TOOL_OUTPUT_MAX_CHARS` so one panel stays bounded. The Input line and the folded header are
+  a long note is never clipped by the content's clamp, and is itself clamped to its own
+  `WRITE_TAIL_MAX_CHARS` so one panel — which cannot be split — stays inside the card budget even
+  when both sections carry the widest JSON escape. The Input line and the folded header are
   unchanged, and the body's `📄 <path>` header is the `read` panel's shape.
 - **The fence takes the touched file's language.** `language_for_path` (the one measured table the
   File Viewer and a `read` panel share, #786) reads the call's own `filePath`/`path` through the
