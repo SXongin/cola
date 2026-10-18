@@ -15,7 +15,7 @@ use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::turn::Turn;
 use crate::feishu::card::lang::language_for_path;
 use crate::feishu::card::tool_render::{
-    DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, parse_edit_diff,
+    DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
 };
 use crate::opencode;
 
@@ -1547,18 +1547,13 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
         }
     }
 
-    // An edit/patch/apply_patch permission carries its unified diff (metadata
-    // `{filepath, diff}` from OpenCode's edit tool) — that IS the request, so
-    // show the actual changed lines instead of dumping raw metadata JSON (which
-    // used to make the card show a wall of escaped diff text).
-    let diff = p
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("diff"))
-        .and_then(|v| v.as_str())
-        .filter(|d| !d.is_empty());
+    // An edit/patch/apply_patch permission carries its unified diff — V1's
+    // `{filepath, diff}`, V2's `{files: [{file, patch, …}]}` — and that IS the
+    // request, so show the actual changed lines instead of dumping raw metadata
+    // JSON (which used to make the card show a wall of escaped diff text).
+    let diff = diff_from_metadata(p.metadata.as_ref());
     if matches!(action, "edit" | "patch" | "apply_patch")
-        && let Some(diff) = diff
+        && let Some(diff) = diff.as_deref()
     {
         let parsed = parse_edit_diff(diff);
         let metadata_filepath = p
@@ -1686,6 +1681,84 @@ Index: /proj/src/main.rs
         );
         // The diff must not leak as escaped raw JSON metadata.
         assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
+    }
+
+    /// V2's `edit` records `{files: [{file, patch, status, additions,
+    /// deletions}]}` with NO top-level `diff`. The permission card must read
+    /// that shape, or the approve-an-edit card shows no change at all.
+    #[test]
+    fn describe_v2_edit_permission_renders_the_files_patch() {
+        let p = perm(
+            "edit",
+            serde_json::json!({
+                "files": [{
+                    "file": "/proj/src/main.rs",
+                    "patch": "===\n--- /proj/src/main.rs\n+++ /proj/src/main.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n context",
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 1
+                }]
+            }),
+        );
+        let s = describe_permission(&p);
+        assert!(
+            s.contains("**改动**: 📄 `/proj/src/main.rs` (+1 −1)"),
+            "the header names the file and its patch's counts: {s}"
+        );
+        assert!(
+            s.contains("```rust\n@@ -1,2 +1,2 @@"),
+            "the patch is fenced with the file's language: {s}"
+        );
+        assert!(s.contains("-old") && s.contains("+new"), "hunks shown: {s}");
+        assert!(
+            !s.contains("**详情**"),
+            "the diff never falls through to the generic metadata dump: {s}"
+        );
+    }
+
+    /// A V2 edit can record several files: their patches join in file order and
+    /// parse as one diff.
+    #[test]
+    fn describe_v2_edit_permission_joins_multiple_file_patches() {
+        let p = perm(
+            "edit",
+            serde_json::json!({
+                "files": [
+                    {
+                        "file": "/proj/src/a.rs",
+                        "patch": "===\n--- /proj/src/a.rs\n+++ /proj/src/a.rs\n@@ -1 +1 @@\n-a\n+a2",
+                        "status": "modified"
+                    },
+                    {
+                        "file": "/proj/src/b.rs",
+                        "patch": "===\n--- /proj/src/b.rs\n+++ /proj/src/b.rs\n@@ -1 +1 @@\n-b\n+b2",
+                        "status": "modified"
+                    }
+                ]
+            }),
+        );
+        let s = describe_permission(&p);
+        assert!(
+            s.contains("**改动**: 📄 `/proj/src/a.rs` (+2 −2)"),
+            "the joined patches count both files: {s}"
+        );
+        for line in ["-a", "+a2", "-b", "+b2"] {
+            assert!(s.contains(line), "`{line}` from the joined patches: {s}");
+        }
+        assert!(s.contains("```rust\n"), "one shared language: {s}");
+    }
+
+    /// With no patch anywhere — neither `diff` nor a non-empty `files[].patch`
+    /// — an `edit` permission keeps the generic metadata rendering.
+    #[test]
+    fn describe_edit_permission_without_any_diff_keeps_generic_metadata() {
+        let p = perm(
+            "edit",
+            serde_json::json!({ "files": [{ "file": "/proj/x.rs", "status": "modified" }] }),
+        );
+        let s = describe_permission(&p);
+        assert!(s.contains("**详情**"), "generic metadata branch: {s}");
+        assert!(!s.contains("```"), "no empty diff fence: {s}");
     }
 
     #[test]

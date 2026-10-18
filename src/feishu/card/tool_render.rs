@@ -599,12 +599,23 @@ fn summary_tail(output: &str) -> Option<&str> {
 }
 
 /// The unified diff a file-editing call recorded, whichever generation wrote
-/// it: V1 stores one plain string at `metadata.diff`; V2 stores
-/// `metadata.files[]`, one `{file, patch, …}` per touched file, whose patches
-/// join here in file order. Each patch keeps its own `Index:` header —
-/// `apply_patch`'s multi-file parser reads those for per-file attribution.
+/// it: see [`diff_from_metadata`]. `None` when the call carries no metadata.
 fn recorded_diff(call: &ToolCall) -> Option<String> {
-    let metadata = call.metadata.as_ref()?;
+    diff_from_metadata(call.metadata.as_ref())
+}
+
+/// The diff a raw metadata payload carries: V1 stores one plain string at
+/// `metadata.diff`; V2 stores `metadata.files[]`, one `{file, patch, …}` per
+/// touched file, whose patches join here in file order. Each patch keeps its
+/// own `Index:` header — `apply_patch`'s multi-file parser reads those for
+/// per-file attribution.
+///
+/// Shared with the permission card (#794): V2's `edit` permission carries the
+/// same `{files: [FileDiff]}` metadata and no top-level `diff`, so reading only
+/// `metadata.diff` would render no change on the card where the reader decides
+/// whether to approve it.
+pub(crate) fn diff_from_metadata(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let metadata = metadata?;
     if let Some(diff) = metadata
         .get("diff")
         .and_then(serde_json::Value::as_str)
