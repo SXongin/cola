@@ -2391,6 +2391,67 @@ async fn viewer_markdown_view_toggle_rebuilds_the_card_from_its_payload() {
         rendered,
         "the payload alone restores the rendered view"
     );
+
+    // The OTHER two rebuild controls carry the view too (#781): a re-read and a
+    // transfer each PATCH the card they were clicked on, so neither may reset a
+    // source view to the default.
+    let source_card = drive_viewer_rebuild(
+        &app,
+        &platform,
+        card_buttons(&back)
+            .into_iter()
+            .find(|b| b["value"]["op"] == "view")
+            .expect("the source toggle")["value"]
+            .clone(),
+        "msg_md_viewer",
+    )
+    .await;
+    assert!(card_text(&source_card).contains("```markdown"));
+
+    let reread = card_buttons(&source_card)
+        .into_iter()
+        .find(|b| b["text"]["content"] == "🔄 重新读取")
+        .expect("the re-read button")["value"]
+        .clone();
+    assert_eq!(reread["viewer_view"], "source", "{reread}");
+    let reread_card = drive_viewer_rebuild(&app, &platform, reread, "msg_md_viewer").await;
+    assert!(
+        card_text(&reread_card).contains("```markdown"),
+        "the re-read keeps the source view: {}",
+        card_text(&reread_card)
+    );
+
+    let mut transfer = send_as_file_payload(&reread_card);
+    assert_eq!(transfer["viewer_view"], "source", "{transfer}");
+    transfer["open_message_id"] = serde_json::json!("msg_md_viewer");
+    let result = app
+        .host_action(transfer)
+        .await
+        .expect("the transfer callback is acknowledged");
+    assert!(result.card.is_none());
+    wait_for_card_update(
+        &platform,
+        "markdown source transfer",
+        CardUpdates::Latest,
+        |card| card_text(card).contains("已发送为文件消息"),
+    )
+    .await;
+    let sent = patches_to(&platform, "msg_md_viewer")
+        .await
+        .last()
+        .cloned()
+        .expect("the transfer patch");
+    let sent_text = card_text(&sent);
+    assert!(
+        sent_text.contains("```markdown"),
+        "the transfer keeps the source view: {sent_text}"
+    );
+    assert!(sent_text.contains("已发送为文件消息"), "{sent_text}");
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        files_before + 1,
+        "the transfer posts exactly one File Message"
+    );
 }
 
 /// A preview that fits one card renders NO pager — no 上一页/下一页 buttons,
