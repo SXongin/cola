@@ -501,6 +501,13 @@ panel already renders the file it read:
   (ADR-0083 §8 amendment, #770). The byte charge follows: `panel_estimate` sums
   `panel_output_estimate` — the rendered content body, JSON-escaped like the card serializes it —
   and `write_tail_estimate` in place of the output text it would otherwise count.
+- **A clipped fenced body carries NO `…`.** Measured on a live card (#788): the `…` `truncate_md`
+  appends immediately before the closing fence stops Feishu rendering the block as code at all —
+  the same body without the marker keeps its syntax colour, and a newline after the `…` does not
+  rescue it (a trailing non-ASCII *character*, by contrast, is fine: a clip landing mid-Chinese
+  still highlights). So a fenced body that carries the truncation note clips bare (`clip_md`), the
+  note below the fence being the "clipped" signal; every other clip keeps the marker, which is the
+  only signal a body without a note has. This repairs the same defect in a clipped `read` panel.
 - **A body only where one exists.** A FAILED `write` keeps its error text, and a call whose input
   carries no usable `content` keeps today's output panel; nothing is invented. A `write` carries no
   File Content block (ADR-0076), so this adds none.
