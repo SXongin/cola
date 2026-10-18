@@ -1459,7 +1459,8 @@ pub(super) fn tool_panel_element(
 /// `createTwoFilesPatch` emits the whole file with at most four context lines
 /// per side, so the context is already bounded — and it is what puts a change
 /// in its place and says whether neighbouring changes are one run or two. Only
-/// the `Index:`/`===`/`---`/`+++` header noise before a hunk is dropped.
+/// the header block before a hunk (`Index:`, `===`, `diff --git`, `index`,
+/// `---`, `+++`) is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EditDiff {
     pub path: Option<String>,
@@ -1563,6 +1564,13 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
             // hunk (a real hunk line always starts with `+`, `-`, or a space,
             // so this marker can never be content).
             in_hunk = false;
+        } else if l.starts_with("index ") {
+            // A Git patch's `index <old>..<new> <mode>` line sits between the
+            // `diff --git` marker and the `---`/`+++` pair. It names no file
+            // (the headers do) and can never be hunk content, so it is header
+            // noise, and it also ends the previous hunk of a joined patch —
+            // without this branch it starts the tail and swallows the file.
+            in_hunk = false;
         } else if !in_hunk && (l.starts_with("--- ") || l.starts_with("+++ ")) {
             // The old/new file headers of a unified diff. A V2 `edit` patch has
             // no `Index:`, so the header is the only place its target is named.
@@ -1631,6 +1639,13 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
 /// spells out `===` / `index` / `---` / `+++` next, where a note that merely
 /// quotes a line starting with `Index: …` does not. Requiring both keeps such
 /// a note in `tail`, as the spec's blank-line boundary demands.
+///
+/// One shape is accepted as ambiguous rather than guessed at: a note that opens
+/// with a **complete** synthetic file block (`Index: …` followed by `---`/`+++`,
+/// or a whole quoted Git diff) is textually identical to a real second file.
+/// The bridge appends a tail after the whole diff and no tool note opens with a
+/// full file-block shape today, so this check reads it as a file; separating
+/// the two would need the producer's intent, which the text does not carry.
 fn opens_file_block(lines: &[&str], from: usize) -> bool {
     let mut block = lines
         .get(from..)
@@ -5405,13 +5420,16 @@ Index: /a/two.rs
     }
 
     /// Review #791: a joined Git-style patch opens its next file with
-    /// `diff --git` after the blank separator. That marker must end the
-    /// previous hunk, or the next file's `---`/`+++` headers are counted as a
-    /// deletion and an addition and land in the body.
+    /// `diff --git` (then `index <old>..<new> <mode>`) after the blank
+    /// separator. That header block must end the previous hunk, or the next
+    /// file's `---`/`+++` headers are counted as a deletion and an addition
+    /// and land in the body — and the unrecognized `index` line must be
+    /// header noise, not the note's start.
     #[test]
     fn a_joined_git_patch_ends_the_previous_hunk_at_diff_git() {
         let first = "\
 diff --git a/src/one.rs b/src/one.rs
+index 1111111..2222222 100644
 --- a/src/one.rs
 +++ b/src/one.rs
 @@ -1 +1 @@
@@ -5420,6 +5438,7 @@ diff --git a/src/one.rs b/src/one.rs
 ";
         let second = "\
 diff --git a/src/two.rs b/src/two.rs
+index 3333333..4444444 100644
 --- a/src/two.rs
 +++ b/src/two.rs
 @@ -1,2 +1,2 @@
@@ -5440,6 +5459,11 @@ diff --git a/src/two.rs b/src/two.rs
         assert!(
             !d.body.contains("+++ b/src/two.rs") && !d.body.contains("--- a/src/two.rs"),
             "second file's headers stay out of the body: {:?}",
+            d.body
+        );
+        assert!(
+            !d.body.contains("index "),
+            "index lines are header noise: {:?}",
             d.body
         );
         assert!(d.tail.is_empty(), "no note: {:?}", d.tail);
