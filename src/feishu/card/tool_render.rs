@@ -3,7 +3,7 @@ use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::{AwaitingAction, exceeds_md_budget, fenced_code, truncate_md};
+use super::{AwaitingAction, exceeds_md_budget, fenced_code, fenced_overhead, truncate_md};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
@@ -1175,14 +1175,15 @@ fn call_failed(tool: &ToolPanel) -> bool {
 /// text the tool reported after its success summary (V1's diagnostics), shown as
 /// its own paragraph OUTSIDE the content's [`TOOL_OUTPUT_MAX_CHARS`] preview
 /// budget, so a long note is never clipped by the content's clamp nor mistaken
-/// for a clipped content. `None` whenever the panel renders no content body
-/// ([`write_body`]), or the tool reported no note.
+/// for a clipped content — while its own budget keeps a single panel bounded
+/// (a lone panel cannot split). `None` whenever the panel renders no content
+/// body ([`write_body`]), or the tool reported no note.
 fn write_tail(tool: &ToolPanel) -> Option<String> {
     write_body(tool)?;
     tool.output()
         .as_deref()
         .and_then(summary_tail)
-        .map(str::to_string)
+        .map(|tail| truncate_md(tail, TOOL_OUTPUT_MAX_CHARS))
 }
 
 /// The serialized byte length the trailing note [`write_tail`] appends to a
@@ -1200,15 +1201,19 @@ pub(crate) fn write_tail_estimate(tool: &ToolPanel) -> usize {
 /// its card size (#788): a `write` call's own `content` ([`write_body`], which
 /// the output text does not carry), else the tool's output text — the body the
 /// render shows, clipped at [`TOOL_OUTPUT_MAX_CHARS`] exactly like the panel's
-/// own clamp and measured JSON-ESCAPED, the form the body takes inside the
-/// card's `content` string (each newline and quote costs its extra byte). Kept
+/// own clamp, measured JSON-ESCAPED (the form the body takes inside the card's
+/// `content` string, each newline and quote costing its extra byte) and with the
+/// dynamic fence [`fenced_overhead`] charges for a body full of backticks. Kept
 /// beside the render so the estimate cannot charge a body the panel never
 /// writes, nor miss the file a `write` just produced.
 pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
     write_body(tool)
         .map(|(_, _, body)| body)
         .or_else(|| tool.output())
-        .map(|body| json_escaped_len(&truncate_md(&body, TOOL_OUTPUT_MAX_CHARS)))
+        .map(|body| {
+            let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
+            json_escaped_len(&body) + fenced_overhead(&body)
+        })
         .unwrap_or(0)
 }
 
@@ -3350,6 +3355,47 @@ mod tests {
         let md = panel_md_with_session(noted, "ses_1");
         assert!(md.contains(&long_tail), "the note is not clipped: {md}");
         assert!(!md.contains(PREVIEW_TRUNCATION_NOTE), "no clip, no note: {md}");
+
+        // A note past the panel's own budget is clipped there, not rendered
+        // whole: a lone panel cannot split, so one panel must stay bounded.
+        let huge_tail = "N".repeat(4 * TOOL_OUTPUT_MAX_CHARS);
+        let noted = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "src/main.rs", "content": "fn main() {}"})),
+            Some(&format!("Wrote file successfully.\n\n{huge_tail}")),
+        );
+        assert_eq!(
+            write_tail_estimate(&noted),
+            json_escaped_len(&truncate_md(&huge_tail, TOOL_OUTPUT_MAX_CHARS)),
+            "the clipped note's bytes are charged"
+        );
+        let md = panel_md_with_session(noted, "ses_1");
+        assert!(!md.contains(&huge_tail), "the whole note is not rendered: {md}");
+        assert!(md.contains('…'), "the oversized note is marked as clipped: {md}");
+    }
+
+    /// A body full of backticks sizes a fence longer than its content, and the
+    /// estimate charges that fence: a 3,000-backtick content renders ~6 KB of
+    /// fence nothing counted, letting a near-budget card evade the split (#788).
+    #[test]
+    fn the_write_body_estimate_charges_the_dynamic_fence() {
+        let content = "`".repeat(TOOL_OUTPUT_MAX_CHARS);
+        let panel = ToolPanel::for_test(
+            "write",
+            ToolStatus::Completed,
+            Some(json!({"filePath": "notes.md", "content": content.clone()})),
+            Some("Wrote file successfully."),
+        );
+        assert!(
+            fenced_overhead(&content) > TOOL_OUTPUT_MAX_CHARS,
+            "the fence dwarfs the body it wraps"
+        );
+        assert_eq!(
+            panel_output_estimate(&panel),
+            TOOL_OUTPUT_MAX_CHARS + fenced_overhead(&content),
+            "the fence beyond the minimum is charged"
+        );
     }
 
     /// The body charge is the JSON-ESCAPED length the card serializes, not the
