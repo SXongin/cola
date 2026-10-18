@@ -793,8 +793,10 @@ pub enum RestartOutcome {
 /// to), never a lower-priority one it is about to yield.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RestartPlan {
-    /// Restart the V2 Shared Service via the `opencode service` CLI.
-    Service,
+    /// Restart the V2 Shared Service via the `opencode service` CLI. The port
+    /// identifies WHICH service to wait for — a restart keeps its port, so a
+    /// second, unrelated service cannot satisfy the wait.
+    Service { port: u16 },
     /// Re-raise cola's Owned Server on the same port and password.
     Owned { pid: i32, port: u16, password: String },
     /// The canonical server is someone else's classic `serve --port`.
@@ -810,7 +812,7 @@ fn restart_plan(candidates: &[ServerCandidate], self_pid: Option<i32>) -> Restar
         return RestartPlan::NoServer;
     };
     match server.class_against(self_pid) {
-        ServerClass::Service => RestartPlan::Service,
+        ServerClass::Service => RestartPlan::Service { port: server.port },
         ServerClass::Owned => RestartPlan::Owned {
             pid: server.pid,
             port: server.port,
@@ -837,7 +839,7 @@ pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
     match restart_plan(&candidates, self_spawned_pid()) {
         RestartPlan::NoServer => Ok(RestartOutcome::NoServer),
         RestartPlan::NotOwned => Ok(RestartOutcome::NotOwned),
-        RestartPlan::Service => restart_managed_service().await,
+        RestartPlan::Service { port } => restart_managed_service(port).await,
         RestartPlan::Owned { pid, port, password } => {
             // Confirm ownership against the live process before killing: the
             // record must still name this pid AND it must be a real
@@ -851,9 +853,9 @@ pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
 }
 
 /// Restart the V2 Shared Service without taking ownership of it. The daemon
-/// rewrites its registration file; cola waits, bounded, until a live
-/// `serve --service` matching that registration accepts connections again.
-async fn restart_managed_service() -> anyhow::Result<RestartOutcome> {
+/// rewrites its registration file; cola waits, bounded, until the live
+/// `serve --service` on `port` accepts connections again.
+async fn restart_managed_service(port: u16) -> anyhow::Result<RestartOutcome> {
     tracing::info!("restarting the V2 Shared Service (`opencode service restart`)");
     let status = std::process::Command::new("opencode")
         .args(["service", "restart"])
@@ -861,22 +863,26 @@ async fn restart_managed_service() -> anyhow::Result<RestartOutcome> {
     if !status.success() {
         anyhow::bail!("`opencode service restart` exited with {status}");
     }
-    wait_for_live_service(SERVICE_RESTART_TIMEOUT).await?;
+    wait_for_live_service(port, SERVICE_RESTART_TIMEOUT).await?;
     tracing::info!("shared OpenCode service is serving again");
     Ok(RestartOutcome::RestartedService)
 }
 
-/// Poll until the registration file describes a live `serve --service` whose
-/// port accepts connections. `scan_processes` already refuses a stale
-/// registration pid, so a hit here is the service the CLI just raised.
-async fn wait_for_live_service(timeout: std::time::Duration) -> anyhow::Result<()> {
+/// Poll until the registration file describes a live `serve --service` on
+/// `port` whose endpoint accepts connections. `scan_processes` already refuses
+/// a stale registration pid, so a hit here is a service the CLI just raised.
+///
+/// The port is the identity: a restart keeps it, while matching only "some
+/// service" would let a second Shared Service on another port satisfy the wait
+/// before the restarted one is up.
+async fn wait_for_live_service(port: u16, timeout: std::time::Duration) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let live = scan_processes().into_iter().find(|c| c.is_service());
+        let live = scan_processes()
+            .into_iter()
+            .find(|c| c.is_service() && c.port == port);
         let reachable = match live {
-            Some(service) => tokio::net::TcpStream::connect(("127.0.0.1", service.port))
-                .await
-                .is_ok(),
+            Some(_) => tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
             None => false,
         };
         if reachable {
@@ -884,7 +890,7 @@ async fn wait_for_live_service(timeout: std::time::Duration) -> anyhow::Result<(
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "the OpenCode service did not accept connections within {}s of restarting",
+                "the OpenCode service on port {port} did not accept connections within {}s of restarting",
                 timeout.as_secs()
             );
         }
@@ -1164,7 +1170,15 @@ mod tests {
     fn restart_plan_restarts_the_shared_service() {
         let owned = cand(1, 4096, "cola-secret", true);
         let service = service_cand(2, 49374);
-        assert_eq!(restart_plan(&[owned, service], Some(1)), RestartPlan::Service);
+        assert_eq!(
+            restart_plan(&[owned, service], Some(1)),
+            RestartPlan::Service { port: 49374 }
+        );
+        // The port pins WHICH service the wait targets: a second service on
+        // another port cannot satisfy it.
+        let a = service_cand(3, 49374);
+        let b = service_cand(4, 49375);
+        assert_eq!(restart_plan(&[b, a], None), RestartPlan::Service { port: 49374 });
     }
 
     #[test]
