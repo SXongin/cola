@@ -1580,9 +1580,19 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
             None => s.push_str(&format!("**改动**: 📄 `{}`\n", truncate(path, 200))),
         }
         let body = parsed.map(|d| d.body).unwrap_or_else(|| diff.to_string());
-        let body = crate::feishu::card::truncate_md(&body, PERMISSION_DIFF_MAX_CHARS);
+        // Clip BARE, then say so outside the fence: the `…` `truncate_md`
+        // appends immediately before the closing fence stops Feishu rendering
+        // the block as code at all (#788) — and this is the card where a reader
+        // decides whether to approve the change, so losing the code block is
+        // worse here than anywhere.
+        let clipped = crate::feishu::card::exceeds_md_budget(&body, PERMISSION_DIFF_MAX_CHARS);
+        let body = crate::feishu::card::clip_md(&body, PERMISSION_DIFF_MAX_CHARS);
         s.push_str(&crate::feishu::card::fenced_code(&body, None));
         s.push('\n');
+        if clipped {
+            s.push_str(crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE);
+            s.push('\n');
+        }
     } else if let Some(meta) = &p.metadata {
         // Metadata often carries richer context (e.g. bash command, tool input)
         let mut shown = 0;
@@ -1658,6 +1668,31 @@ Index: /proj/src/main.rs
         assert!(s.contains("是否允许"), "closing prompt: {}", s);
         // The diff must not leak as escaped raw JSON metadata.
         assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
+    }
+
+    /// #788: a permission diff past the cap clips BARE and says so after the
+    /// fence. The `…` inside a fenced body stops Feishu rendering it as code —
+    /// and this card is where the reader decides whether to approve.
+    #[test]
+    fn a_clipped_permission_diff_keeps_its_code_block_and_says_so() {
+        let mut diff = String::from(
+            "Index: /proj/src/main.rs\n===\n--- /proj/src/main.rs\n+++ /proj/src/main.rs\n@@ -1,1 +1,400 @@\n",
+        );
+        for n in 1..=400 {
+            diff.push_str(&format!("+let value_{n} = compute({n});\n"));
+        }
+        let p = perm(
+            "edit",
+            serde_json::json!({ "filepath": "/proj/src/main.rs", "diff": diff }),
+        );
+        let s = describe_permission(&p);
+        let note = crate::feishu::card::tool_render::DIFF_TRUNCATION_NOTE;
+        assert!(
+            s.contains(&format!("```\n{note}")),
+            "the fence closes bare, right before the note: {s}"
+        );
+        assert!(!s.contains('…'), "no ellipsis inside the fence: {s}");
+        assert!(s.contains("是否允许"), "closing prompt still present: {s}");
     }
 
     #[test]
