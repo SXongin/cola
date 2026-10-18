@@ -1453,12 +1453,13 @@ pub(super) fn tool_panel_element(
 }
 
 /// The meaningful parts of a unified file diff (a file-editing tool's recorded
-/// diff, or an edit permission request's `diff`): the target path and the hunk
-/// lines (`@@`, `-`, `+`) plus the counted change. The `Index:`, `===`, `---`,
-/// `+++` header noise and unchanged context lines (starting with a space) are
-/// dropped — oldString/newString are often near-identical full-block snapshots
-/// whose context would otherwise render as walls of repeated text around a few
-/// changed lines.
+/// diff, or an edit permission request's `diff`): the target path, the hunk
+/// lines the producer wrote (`@@`, context, `-`, `+`) and the counted change.
+/// The hunks keep their context lines byte-for-byte: upstream's
+/// `createTwoFilesPatch` emits the whole file with at most four context lines
+/// per side, so the context is already bounded — and it is what puts a change
+/// in its place and says whether neighbouring changes are one run or two. Only
+/// the `Index:`/`===`/`---`/`+++` header noise before a hunk is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EditDiff {
     pub path: Option<String>,
@@ -1492,6 +1493,13 @@ fn parse_multi_file_diff(diff: &str) -> Option<EditDiff> {
     parse_diff(diff, true)
 }
 
+/// Scan a unified diff into an [`EditDiff`]: the file headers name the target,
+/// and each hunk's own lines — `@@`, ` ` context, `-`, `+` — are copied
+/// **verbatim**. No `trim_end` runs, because a context line's leading space is
+/// diff syntax and its trailing spaces are file content. A truly empty line
+/// inside a hunk starts the tool's trailing note (a real blank context line is
+/// the single space `" "`); a joined patch's blank line between files is a
+/// boundary instead — see [`opens_file_block`].
 fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     let mut path = None;
     let mut paths: Vec<String> = Vec::new();
@@ -1505,15 +1513,29 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     // line whose text starts with `-- ` (Lua/YAML `--` comments) renders as
     // `--- …` and must stay a removal, not be mistaken for a header.
     let mut in_hunk = false;
-    // Once a non-diff line shows up (the bridge appended the tool's LSP note
-    // after the diff), everything after it is that note — even a line that
-    // happens to start like diff syntax (a diagnostic quoting `+`/`-` code).
+    // Once the tool's trailing note starts (the bridge appends the LSP
+    // diagnostics after a blank line), everything after it is that note — even
+    // a line that happens to start like diff syntax (a diagnostic quoting
+    // `+`/`-` code).
     let mut in_tail = false;
-    for line in diff.lines() {
-        let l = line.trim_end();
+    let lines: Vec<&str> = diff.lines().collect();
+    for (index, raw) in lines.iter().enumerate() {
+        // Only a CRLF's carriage return is dropped: `lines()` already splits
+        // CRLF, and this keeps a stray trailing `\r` out of the body. A
+        // context line's own trailing spaces are content, so no `trim_end`.
+        let l = raw.strip_suffix('\r').unwrap_or(raw);
         if in_tail {
             tail.push_str(l);
             tail.push('\n');
+            continue;
+        }
+        if in_hunk && l.is_empty() && !opens_file_block(&lines, index + 1) {
+            // A unified hunk cannot hold a truly empty line: a blank source
+            // line is the context line `" "`. So a real empty line is the
+            // note's boundary — unless it separates two files of a joined
+            // patch (`recorded_diff` joins per-file strings that end in `\n`
+            // with `\n`), where the next line opens the next file.
+            in_tail = true;
             continue;
         }
         if let Some(p) = l.strip_prefix("Index: ") {
@@ -1565,15 +1587,21 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
             changed = true;
             body.push_str(l);
             body.push('\n');
+        } else if in_hunk && l.starts_with(' ') {
+            // An unchanged context line: copied byte-for-byte, leading space
+            // included. It is what places the change in the file.
+            body.push_str(l);
+            body.push('\n');
         } else if !l.is_empty() && !l.starts_with(' ') && !l.starts_with('\\') {
             // Not diff syntax and not an (indented) context line: the start of
-            // the trailing note. Blank lines (the separator) and the
-            // `\ No newline…` marker are not it.
+            // the trailing note. Blank lines and the `\ No newline…` marker are
+            // not it. An indented note line reaches here only after the blank
+            // boundary above already set `in_tail`.
             in_tail = true;
             tail.push_str(l);
             tail.push('\n');
         }
-        // Anything else (context lines, "\ No newline…") is dropped.
+        // Anything else (a pre-hunk blank line, "\ No newline…") is dropped.
     }
     if !changed {
         return None;
@@ -1586,6 +1614,25 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
         body,
         tail,
     })
+}
+
+/// Whether the next non-empty line at or after `from` opens another file's
+/// header block in a concatenated patch: an `Index:` line, a `===` underline,
+/// or a `diff --git` line. [`recorded_diff`] joins per-file patch strings —
+/// each ending in `\n` — with `\n`, so a joined multi-file patch carries a real
+/// blank line between files. That line is a file boundary, not the trailing
+/// note's start; reading it as one would swallow every file after the first
+/// into [`EditDiff::tail`].
+fn opens_file_block(lines: &[&str], from: usize) -> bool {
+    lines
+        .get(from..)
+        .unwrap_or_default()
+        .iter()
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.starts_with("Index: ") || line.starts_with("===") || line.starts_with("diff --git ")
+        })
 }
 
 /// The file a `---`/`+++` header names, without a git `a/`/`b/` prefix or a
@@ -4823,11 +4870,11 @@ more text";
     }
 
     #[test]
-    fn edit_tool_output_reduces_diff_to_hunks() {
+    fn edit_tool_output_keeps_hunks_and_their_context() {
         // A real OpenCode edit diff (from state.metadata.diff). The card should
-        // keep the @@ / + / - lines with the change count and drop the header
-        // noise plus the unchanged context, so a small edit in a large block
-        // doesn't read as two walls of repeated file content.
+        // keep the @@ / context / + / - lines with the change count and drop the
+        // header noise, so a change reads in place — the leading space of a
+        // context line is diff syntax and stays.
         let diff = "\
 Index: /x/src/main.rs
 ===================================================================
@@ -4849,8 +4896,8 @@ Index: /x/src/main.rs
         assert!(body.contains("@@ -10,3 +10,3 @@"), "hunk header kept: {}", body);
         assert!(body.contains("-let b = 2;"), "removed line kept: {}", body);
         assert!(body.contains("+let b = 3;"), "added line kept: {}", body);
-        assert!(!body.contains("let a = 1;"), "context line dropped: {}", body);
-        assert!(!body.contains("let c = 4;"), "context line dropped: {}", body);
+        assert!(body.contains(" let a = 1;"), "context line kept: {}", body);
+        assert!(body.contains(" let c = 4;"), "context line kept: {}", body);
         assert!(!body.contains("Index:"), "header noise dropped: {}", body);
         assert!(!body.contains("+++"), "header noise dropped: {}", body);
     }
@@ -4918,7 +4965,7 @@ Index: src/main.rs
         assert!(md.contains("```rust\n@@ -1,4 +1,4 @@"), "fenced hunk: {}", md);
         assert!(md.contains("-fn main() {}"), "removed line: {}", md);
         assert!(md.contains("+fn main() { println"), "added line: {}", md);
-        assert!(!md.contains("use std::fs;"), "context line dropped: {}", md);
+        assert!(md.contains(" use std::fs;"), "context line kept: {}", md);
         assert!(md.contains("\n```"), "closing fence: {}", md);
     }
 
@@ -5182,7 +5229,7 @@ Index: /x/one.rs
         );
         assert!(md.contains("-let b = 2;"), "removed line: {md}");
         assert!(md.contains("+let b = 3;"), "added line: {md}");
-        assert!(!md.contains("let a = 1;"), "context line dropped: {md}");
+        assert!(md.contains(" let a = 1;"), "context line kept: {md}");
         assert!(
             md.contains("LSP errors detected in /x/one.rs"),
             "LSP note on the card: {md}"
@@ -5214,6 +5261,130 @@ Index: /a/b.rs
             d.body
         );
         assert!(!d.body.contains("b.rs"), "header lines not in body");
+    }
+
+    /// A hunk keeps its context lines byte-for-byte (#791): the leading space
+    /// is diff syntax, trailing spaces are file content, and an empty context
+    /// line is a single space — not the blank line a trailing note starts with.
+    #[test]
+    fn parse_edit_diff_keeps_hunk_context_verbatim() {
+        let diff = concat!(
+            "Index: /a/b.rs\n",
+            "===================================================================\n",
+            "--- /a/b.rs\n",
+            "+++ /a/b.rs\n",
+            "@@ -1,4 +1,4 @@\n",
+            " let a = 1;  \n",
+            " \n",
+            "-let b = 2;\n",
+            "+let b = 3;\n",
+            " let c = 4;",
+        );
+        let d = parse_edit_diff(diff).expect("diff parsed");
+        assert_eq!(
+            d.body, "@@ -1,4 +1,4 @@\n let a = 1;  \n \n-let b = 2;\n+let b = 3;\n let c = 4;\n",
+            "context keeps its leading space, its trailing spaces and an empty \
+             context line as one space"
+        );
+        assert_eq!((d.additions, d.deletions), (1, 1));
+        assert!(d.tail.is_empty(), "no note: {:?}", d.tail);
+    }
+
+    /// A CRLF diff loses only the `\r`: the context line's own trailing space
+    /// is content and stays.
+    #[test]
+    fn parse_edit_diff_strips_crlf_but_keeps_content_spaces() {
+        let diff = concat!(
+            "Index: /a/b.rs\r\n",
+            "===================================================================\r\n",
+            "--- /a/b.rs\r\n",
+            "+++ /a/b.rs\r\n",
+            "@@ -1,2 +1,2 @@\r\n",
+            " keep me \r\n",
+            "-old\r\n",
+            "+new\r\n",
+        );
+        let d = parse_edit_diff(diff).expect("diff parsed");
+        assert_eq!(d.body, "@@ -1,2 +1,2 @@\n keep me \n-old\n+new\n");
+        assert!(!d.body.contains('\r'), "no carriage return: {:?}", d.body);
+    }
+
+    /// The blank line is the note's boundary, so the note's own first line may
+    /// start with a space — it is a note, not a context line.
+    #[test]
+    fn parse_edit_diff_keeps_an_indented_note_first_line() {
+        let diff = "\
+Index: /a/b.rs
+===================================================================
+--- /a/b.rs
++++ /a/b.rs
+@@ -1,2 +1,2 @@
+ keep
+-old
++new
+
+  LSP errors detected in /a/b.rs
+ - a diagnostic that looks like a removal";
+        let d = parse_edit_diff(diff).expect("diff parsed");
+        assert_eq!(d.body, "@@ -1,2 +1,2 @@\n keep\n-old\n+new\n");
+        assert!(
+            d.tail.contains("  LSP errors detected"),
+            "indented note kept: {:?}",
+            d.tail
+        );
+        assert!(!d.body.contains("LSP"), "note not in hunks: {:?}", d.body);
+    }
+
+    /// `recorded_diff` joins per-file patch strings — each ending in `\n` —
+    /// with `\n`, so a joined multi-file patch carries a real blank line
+    /// between files. That line is a boundary, not the note's start: reading it
+    /// as one would swallow every file after the first into `tail`.
+    #[test]
+    fn a_joined_patch_blank_line_is_a_file_boundary_not_the_note_start() {
+        let with_index = "\
+Index: /a/one.rs
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let second_index = "\
+Index: /a/two.rs
+===================================================================
+--- /a/two.rs
++++ /a/two.rs
+@@ -1 +1 @@
+-c
++d";
+        let d = parse_edit_diff(&format!("{with_index}\n{second_index}")).expect("parsed");
+        assert_eq!(d.paths, vec!["/a/one.rs", "/a/two.rs"]);
+        assert_eq!((d.additions, d.deletions), (2, 2));
+        assert!(d.body.contains("+d"), "second hunk kept: {:?}", d.body);
+        assert!(d.tail.is_empty(), "no note: {:?}", d.tail);
+
+        // V2's header-only shape: no `Index:`, so the joined patch's next file
+        // starts at its `===` underline.
+        let header_only = "\
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let second_header_only = "\
+===================================================================
+--- /a/two.rs
++++ /a/two.rs
+@@ -1 +1 @@
+-c
++d";
+        let d = parse_edit_diff(&format!("{header_only}\n{second_header_only}")).expect("parsed");
+        assert_eq!(d.paths, vec!["/a/one.rs", "/a/two.rs"]);
+        assert!(d.body.contains("+d"), "second hunk kept: {:?}", d.body);
+        assert!(d.tail.is_empty(), "no note: {:?}", d.tail);
     }
 
     /// V2's `edit` metadata is `createTwoFilesPatch` output, which has no
@@ -5291,7 +5462,7 @@ Index: /a/lua.lua
         assert_eq!(d.deletions, 1);
         assert!(d.body.contains("--- old comment"), "removal kept: {}", d.body);
         assert!(d.body.contains("+-- new comment"), "addition kept: {}", d.body);
-        assert!(!d.body.contains("return 1"), "context dropped: {}", d.body);
+        assert!(d.body.contains(" return 1"), "context kept: {}", d.body);
     }
 
     /// #202: an `apply_patch` can touch several files, so its hunks keep each
@@ -5327,7 +5498,7 @@ Index: /a/two.rs
         assert!(body.contains("Index: /a/two.rs"), "second file named: {body}");
         assert!(body.contains("+let b = 3;"), "hunk kept: {body}");
         assert!(body.contains("+y"), "second hunk kept: {body}");
-        assert!(!body.contains("let a = 1;"), "context dropped: {body}");
+        assert!(body.contains(" let a = 1;"), "context kept: {body}");
         assert!(!body.contains("+++"), "file header noise dropped: {body}");
     }
 
@@ -6126,7 +6297,7 @@ Index: /a/one.rs
             md.contains("-let b = 2;") && md.contains("+let b = 3;"),
             "hunks: {md}"
         );
-        assert!(!md.contains("let a = 1;"), "context dropped: {md}");
+        assert!(md.contains(" let a = 1;"), "context kept: {md}");
         assert!(!md.contains("Success. Updated"), "summary dropped: {md}");
 
         // Several files: the input names the first and counts the rest.
