@@ -22,6 +22,11 @@ terminal and Web UI.
 
 ## Decision
 
+This ADR extends ADR-0013: its Owned/Coexistent/Yield model, the Lazy Start
+rule, and the "one server per Shared Store" invariant stand unchanged. What
+follows adds the Service class ahead of both existing classes and the ownership
+boundary around it.
+
 - **Selection priority**: Shared Service > Coexistent > Owned. `ServerCandidate`
   gains a `ServerClass` set from argv (`--service`); Owned is resolved against
   cola's recorded pid, and a Service is never Owned. Within the winning class
