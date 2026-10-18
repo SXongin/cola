@@ -509,6 +509,20 @@ pub(crate) fn truncate_md(text: &str, max_len: usize) -> String {
     }
 }
 
+/// [`truncate_md`] with NO truncation marker: the bare clip a FENCED code body
+/// takes when the note below the fence already says it was clipped. An ellipsis
+/// immediately before a closing fence stops Feishu rendering the block as code
+/// at all — measured on a live card (#788): the same body with the `…` renders
+/// plain, without it the syntax colour returns — so a fenced body that carries a
+/// truncation note clips bare, and every other clip keeps the marker.
+pub(crate) fn clip_md(text: &str, max_len: usize) -> String {
+    if exceeds_md_budget(text, max_len) {
+        text.chars().take(max_len).collect()
+    } else {
+        text.to_string()
+    }
+}
+
 /// Byte length of the first `n` characters of `s` — what a render that clips
 /// at `n` characters contributes to the card's serialized size. Card budgets
 /// count UTF-8 bytes (Feishu rejects on bytes, not characters) while every

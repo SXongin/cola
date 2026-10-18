@@ -3,7 +3,7 @@ use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 use super::lang::{PLAIN_TEXT, language_for_path};
 use super::sanitize::CardMarkdown;
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
-use super::{AwaitingAction, exceeds_md_budget, fenced_code, fenced_overhead, truncate_md};
+use super::{AwaitingAction, clip_md, exceeds_md_budget, fenced_code, fenced_overhead, truncate_md};
 
 /// Cap for a tool's OUTPUT shown inside its collapsible panel. Higher than the
 /// old 800: code-wrapped output renders without line wrapping, so a file or
@@ -1318,7 +1318,18 @@ pub(super) fn tool_panel_element(
             } else if let Some(h) = &header {
                 content.push_str(&format!("{}\n\n", h));
             }
-            let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
+            // A fenced code body that carries the truncation note below the
+            // fence clips WITHOUT the `…`: the ellipsis immediately before the
+            // closing fence stops Feishu rendering the block as code at all
+            // (measured, #788), and the note already says it was clipped. Every
+            // other body keeps `truncate_md`'s marker — the only signal a body
+            // without a note has.
+            let note = preview_truncation_note(tool, session_id);
+            let body = if note.is_some() && matches!(style, BodyStyle::Code(_)) {
+                clip_md(&body, TOOL_OUTPUT_MAX_CHARS)
+            } else {
+                truncate_md(&body, TOOL_OUTPUT_MAX_CHARS)
+            };
             // File content (read) and edit/apply_patch hunks always render as a
             // fenced code block; a `Markdown` body (websearch results) never
             // does; anything else fences when Feishu markdown would wrap a long
@@ -1341,7 +1352,7 @@ pub(super) fn tool_panel_element(
             // (ADR-0083 §8 amendment, #770/#788). Only those two get it: they
             // are the panels whose clip hides a file the viewer can show whole,
             // and the note appears exactly when that button does.
-            if let Some(note) = preview_truncation_note(tool, session_id) {
+            if let Some(note) = note {
                 content.push_str(&format!("\n\n{note}"));
             }
         }
@@ -3115,7 +3126,15 @@ mod tests {
             md.ends_with(&format!("\n\n{PREVIEW_TRUNCATION_NOTE}")),
             "the note closes a clipped body: {md}"
         );
-        assert!(md.contains('…'), "the clipped body is marked: {md}");
+        assert!(
+            !md.contains('…'),
+            "a clipped fenced body carries NO `…`: the marker stops Feishu \
+             rendering the block as code (#788), so the note is the signal: {md}"
+        );
+        assert!(
+            md.contains(&format!("```\n\n{PREVIEW_TRUNCATION_NOTE}")),
+            "the fence closes bare, right before the note: {md}"
+        );
 
         // V1's envelope clips the same way: the note is the body's, not the
         // generation's.
@@ -3254,7 +3273,11 @@ mod tests {
             md.ends_with(&format!("\n\n{PREVIEW_TRUNCATION_NOTE}")),
             "the note closes a clipped write body: {md}"
         );
-        assert!(md.contains('…'), "the clipped body is marked: {md}");
+        assert!(
+            !md.contains('…'),
+            "a clipped fenced body carries NO `…`: the marker stops Feishu \
+             rendering the block as code (#788), so the note is the signal: {md}"
+        );
         assert!(
             !md.contains("Wrote file successfully."),
             "a clipped body still drops the success sentence: {md}"
