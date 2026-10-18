@@ -61,6 +61,17 @@ pub struct ServerStatus {
     pub generation: Option<String>,
     /// The probe's evidence — the detail line when the generation is unknown.
     pub evidence: String,
+    /// Other eligible default-store servers cola is *not* attached to, in
+    /// deterministic order. Non-empty means more than one shared server is
+    /// running; cola picks one canonical and never aggregates (ADR-0085).
+    pub other_servers: Vec<OtherServer>,
+}
+
+/// One eligible default-store server that is not the canonical pick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OtherServer {
+    pub url: String,
+    pub pid: i32,
 }
 
 /// The install channel as a stable CLI spelling.
@@ -145,6 +156,13 @@ async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
     let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default();
     let candidates = discovery::scan_processes();
     let candidate = discovery::pick_server(&candidates, preferred_port, discovery::self_spawned_pid())?;
+    let other_servers: Vec<OtherServer> = discovery::other_servers(&candidates, candidate)
+        .into_iter()
+        .map(|c| OtherServer {
+            url: c.url(),
+            pid: c.pid,
+        })
+        .collect();
     // The probe carries Basic credentials and the endpoint is always loopback,
     // so it must bypass any env proxy (ADR-0081) — `new_loopback`, not the
     // production attach transport.
@@ -159,12 +177,14 @@ async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
             pid: candidate.pid,
             generation: Some(resolved.generation.as_str().to_string()),
             evidence: String::new(),
+            other_servers,
         }),
         Err(evidence) => Some(ServerStatus {
             url: candidate.url(),
             pid: candidate.pid,
             generation: None,
             evidence,
+            other_servers,
         }),
     }
 }
@@ -224,17 +244,36 @@ fn claimed_line(s: &Status) -> String {
 fn server_line(server: Option<&ServerStatus>, generation_override: &str) -> String {
     match server {
         None => format!("未发现共享服务器（LAZY 启动或 attach-only），覆盖 {generation_override}"),
-        Some(s) => match &s.generation {
-            Some(g) => format!(
-                "{} (PID {}, 世代 {}，覆盖 {})",
-                s.url, s.pid, g, generation_override
-            ),
-            None => format!(
-                "{} (PID {}, 世代未知：{}；覆盖 {})",
-                s.url, s.pid, s.evidence, generation_override
-            ),
-        },
+        Some(s) => {
+            let canonical = match &s.generation {
+                Some(g) => format!(
+                    "{} (PID {}, 世代 {}，覆盖 {})",
+                    s.url, s.pid, g, generation_override
+                ),
+                None => format!(
+                    "{} (PID {}, 世代未知：{}；覆盖 {})",
+                    s.url, s.pid, s.evidence, generation_override
+                ),
+            };
+            if s.other_servers.is_empty() {
+                canonical
+            } else {
+                format!(
+                    "{canonical}\n其他 OpenCode 服务器（未连接）: {}",
+                    server_list(&s.other_servers)
+                )
+            }
+        }
     }
+}
+
+/// `url (PID n), …` for the servers cola is not attached to.
+fn server_list(servers: &[OtherServer]) -> String {
+    servers
+        .iter()
+        .map(|o| format!("{} (PID {})", o.url, o.pid))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `cola status --json` payload — the same facts, stable keys for scripts.
@@ -259,6 +298,10 @@ pub fn render_json(s: &Status) -> serde_json::Value {
             "pid": s.pid,
             "generation": s.generation,
             "evidence": s.evidence,
+            "other_servers": s.other_servers.iter().map(|o| serde_json::json!({
+                "url": o.url,
+                "pid": o.pid,
+            })).collect::<Vec<_>>(),
         })),
     })
 }
@@ -383,6 +426,7 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
             "未发现（federated 服务器未运行；LAZY 启动或 attach-only）".to_string(),
         )),
     }
+    checks.push(multiple_servers_check(server.as_ref()));
 
     checks.push(lock_check(crate::lock_state()));
     checks.push(log_check(log_path));
@@ -452,6 +496,28 @@ async fn feishu_check(client: &crate::feishu::client::Client, app_id: &str) -> C
                 format!("app {app_id} 可取 token，但读取 bot 信息失败：{e}"),
             ),
         },
+    }
+}
+
+/// Report whether more than one eligible default-store server is running.
+/// cola attaches to exactly one (the canonical pick); the rest are invisible
+/// to it, so a multi-server machine gets a WARNING naming both sides rather
+/// than silently splitting real-time sync across processes (ADR-0085).
+fn multiple_servers_check(server: Option<&ServerStatus>) -> Check {
+    match server {
+        None => Check::pass("多个默认存储服务器", "未发现共享服务器"),
+        Some(s) if s.other_servers.is_empty() => {
+            Check::pass("多个默认存储服务器", format!("仅 {} (PID {})", s.url, s.pid))
+        }
+        Some(s) => Check::warn(
+            "多个默认存储服务器",
+            format!(
+                "canonical {} (PID {})；忽略 {}",
+                s.url,
+                s.pid,
+                server_list(&s.other_servers)
+            ),
+        ),
     }
 }
 
@@ -565,6 +631,7 @@ mod tests {
                 pid: 99,
                 generation: Some("v2".into()),
                 evidence: String::new(),
+                other_servers: Vec::new(),
             }),
         }
     }
@@ -624,6 +691,7 @@ mod tests {
                 pid: 7,
                 generation: None,
                 evidence: "GET /api/info -> 503 (migrating)".into(),
+                other_servers: Vec::new(),
             }),
             ..sample_status()
         };
@@ -660,6 +728,73 @@ mod tests {
         assert!(v["opencode"].is_null());
         // The override is still readable with no server running.
         assert_eq!(v["generation_override"], "auto");
+    }
+
+    #[test]
+    fn render_lists_other_default_store_servers() {
+        let s = Status {
+            server: Some(ServerStatus {
+                url: "http://localhost:49374".into(),
+                pid: 7,
+                generation: Some("v2".into()),
+                evidence: String::new(),
+                other_servers: vec![OtherServer {
+                    url: "http://localhost:4096".into(),
+                    pid: 9,
+                }],
+            }),
+            ..sample_status()
+        };
+        let text = render(&s);
+        assert!(text.contains("http://localhost:49374 (PID 7, 世代 v2"));
+        assert!(text.contains("其他 OpenCode 服务器（未连接）"));
+        assert!(text.contains("http://localhost:4096 (PID 9)"));
+    }
+
+    #[test]
+    fn render_json_carries_other_servers() {
+        let s = Status {
+            server: Some(ServerStatus {
+                url: "http://localhost:49374".into(),
+                pid: 7,
+                generation: Some("v2".into()),
+                evidence: String::new(),
+                other_servers: vec![OtherServer {
+                    url: "http://localhost:4096".into(),
+                    pid: 9,
+                }],
+            }),
+            ..sample_status()
+        };
+        let v = render_json(&s);
+        assert_eq!(v["opencode"]["other_servers"][0]["url"], "http://localhost:4096");
+        assert_eq!(v["opencode"]["other_servers"][0]["pid"], 9);
+        // One server is still the normal case: an empty list, not a missing key.
+        let one = render_json(&sample_status());
+        assert_eq!(one["opencode"]["other_servers"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn multiple_servers_check_warns_only_above_one() {
+        assert_eq!(multiple_servers_check(None).status, CheckStatus::Pass);
+        assert_eq!(
+            multiple_servers_check(Some(&sample_status().server.unwrap())).status,
+            CheckStatus::Pass
+        );
+        let many = ServerStatus {
+            url: "http://localhost:49374".into(),
+            pid: 7,
+            generation: Some("v2".into()),
+            evidence: String::new(),
+            other_servers: vec![OtherServer {
+                url: "http://localhost:4096".into(),
+                pid: 9,
+            }],
+        };
+        let check = multiple_servers_check(Some(&many));
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("canonical http://localhost:49374 (PID 7)"));
+        assert!(check.detail.contains("http://localhost:4096 (PID 9)"));
     }
 
     #[test]
