@@ -1298,6 +1298,11 @@ pub(super) fn tool_panel_element(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EditDiff {
     pub path: Option<String>,
+    /// Every file the diff names, in order (an `Index:` line, else the
+    /// `---`/`+++` header). A V2 `edit` patch has no `Index:`, so the header is
+    /// the only place its target is named; the list is what lets a multi-file
+    /// patch agree on one language.
+    pub paths: Vec<String>,
     pub additions: usize,
     pub deletions: usize,
     pub body: String,
@@ -1325,6 +1330,7 @@ fn parse_multi_file_diff(diff: &str) -> Option<EditDiff> {
 
 fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     let mut path = None;
+    let mut paths: Vec<String> = Vec::new();
     let mut additions = 0usize;
     let mut deletions = 0usize;
     let mut body = String::new();
@@ -1352,21 +1358,34 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
             // earlier file's hunks (a concatenated multi-file patch), so its
             // `---`/`+++` lines are headers again, not content.
             in_hunk = false;
+            if !paths.iter().any(|seen| seen == p) {
+                paths.push(p.to_string());
+            }
             if keep_file_headers {
                 body.push_str(l);
                 body.push('\n');
             }
+        } else if l.starts_with("===") {
+            // A concatenated patch's file boundary. V2's `edit` metadata joins
+            // per-file diffs that carry no `Index:` — the `====` separator is
+            // the only thing that says the next `---`/`+++` pair is a header
+            // again, not `+`/`-` hunk content.
+            in_hunk = false;
         } else if !in_hunk && l.starts_with("diff --git ") {
             // `a/old b/new` — the explicit Index/filepath carries the target.
-        } else if !in_hunk
-            && (l.starts_with("--- ")
-                || l.starts_with("+++ ")
-                || l == "---"
-                || l == "+++"
-                || l.starts_with("==="))
-        {
-            // The old/new file headers of a unified diff (`--- path` / `+++ path`)
-            // plus the `====` separator.
+        } else if !in_hunk && (l.starts_with("--- ") || l.starts_with("+++ ")) {
+            // The old/new file headers of a unified diff. A V2 `edit` patch has
+            // no `Index:`, so the header is the only place its target is named.
+            if let Some(p) = diff_header_path(l) {
+                if path.is_none() {
+                    path = Some(p.clone());
+                }
+                if !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        } else if !in_hunk && (l == "---" || l == "+++") {
+            // A bare header line with no path.
         } else if l.starts_with("@@") {
             in_hunk = true;
             changed = true;
@@ -1397,6 +1416,7 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     }
     Some(EditDiff {
         path,
+        paths,
         additions,
         deletions,
         body,
@@ -1404,31 +1424,37 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
     })
 }
 
+/// The file a `---`/`+++` header names, without a git `a/`/`b/` prefix or a
+/// trailing timestamp. `None` for `/dev/null` (an add/delete's empty side) and
+/// a pathless header.
+fn diff_header_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("--- ").or_else(|| line.strip_prefix("+++ "))?;
+    let path = rest.split('\t').next().unwrap_or(rest).trim();
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    (!path.is_empty() && path != "/dev/null").then(|| path.to_string())
+}
+
 /// The language token a diff's hunks are fenced with (measured 2026-10-18: a
 /// `rust` fence colours the keywords and strings inside a `+`/`-` hunk, where
 /// Feishu's documented `diff` token renders plain).
 ///
-/// A multi-file patch uses the one language every touched file shares — the
-/// `Index:` lines the multi-file body keeps — and [`PLAIN_TEXT`] when they
-/// disagree, so a `.rs` hunk is never coloured with a `.md` file's grammar.
-/// A single-file `edit` names its target only in `path`, because its body has
-/// no `Index:` line.
+/// A multi-file patch uses the one language every touched file shares, and
+/// [`PLAIN_TEXT`] when they disagree, so a `.rs` hunk is never coloured with a
+/// `.md` file's grammar. The paths come from [`EditDiff::paths`] — an `Index:`
+/// line when the patch has one, else the `---`/`+++` header (V2's `edit`).
 fn diff_language(diff: &EditDiff) -> &'static str {
-    let mut shared: Option<&'static str> = None;
-    for line in diff.body.lines() {
-        let Some(path) = line.strip_prefix("Index: ") else {
-            continue;
-        };
-        let lang = language_for_path(path);
-        match shared {
-            None => shared = Some(lang),
-            Some(seen) if seen != lang => return PLAIN_TEXT,
-            _ => {}
-        }
+    let mut langs = diff.paths.iter().map(|path| language_for_path(path));
+    let Some(first) = langs.next() else {
+        return diff.path.as_deref().map(language_for_path).unwrap_or(PLAIN_TEXT);
+    };
+    if langs.any(|lang| lang != first) {
+        PLAIN_TEXT
+    } else {
+        first
     }
-    shared
-        .or_else(|| diff.path.as_deref().map(language_for_path))
-        .unwrap_or(PLAIN_TEXT)
 }
 
 /// One item of a `todowrite` tool payload (OpenCode's `Todo.Info`). The
@@ -4543,6 +4569,7 @@ Index: /a/b.rs
 +z2";
         let d = parse_edit_diff(diff).expect("diff parsed");
         assert_eq!(d.path.as_deref(), Some("/a/b.rs"));
+        assert_eq!(d.paths, vec!["/a/b.rs"]);
         assert_eq!(d.additions, 3, "one +y plus two added z lines");
         assert_eq!(d.deletions, 1);
         assert_eq!(
@@ -4552,6 +4579,61 @@ Index: /a/b.rs
             d.body
         );
         assert!(!d.body.contains("b.rs"), "header lines not in body");
+    }
+
+    /// V2's `edit` metadata is `createTwoFilesPatch` output, which has no
+    /// `Index:` line: the `---`/`+++` header is the only place the target is
+    /// named. The hunk must still take the file's language, and a concatenated
+    /// multi-file patch must not count the next file's header as an addition —
+    /// the `====` boundary is what ends the previous hunk.
+    #[test]
+    fn a_header_only_v2_patch_names_its_files_and_keeps_their_language() {
+        let one = "\
+===================================================================
+--- /a/one.rs
++++ /a/one.rs
+@@ -1,3 +1,3 @@
+ fn main() {}
+-let x = 1;
++let x = 2;";
+        let d = parse_edit_diff(one).expect("parsed");
+        assert_eq!(d.path.as_deref(), Some("/a/one.rs"));
+        assert_eq!(d.paths, vec!["/a/one.rs"]);
+        let (_, style, _) = format_tool_output("edit", one);
+        assert_eq!(style, BodyStyle::Code(Some("rust")));
+
+        let two = format!(
+            "{one}\n===================================================================\n\
+             --- /a/two.md\n+++ /a/two.md\n@@ -1 +1 @@\n-old\n+new"
+        );
+        let d = parse_edit_diff(&two).expect("parsed");
+        assert_eq!(d.paths, vec!["/a/one.rs", "/a/two.md"]);
+        assert_eq!(
+            (d.additions, d.deletions),
+            (2, 2),
+            "the second file's header is not a +/- line"
+        );
+        let (header, style, _) = format_tool_output("apply_patch", &two);
+        assert_eq!(header.as_deref(), Some("+2 −2"));
+        assert_eq!(
+            style,
+            BodyStyle::Code(Some(PLAIN_TEXT)),
+            "mixed languages stay plain"
+        );
+    }
+
+    /// A git-style header's `a/`/`b/` prefix is not part of the path, and an
+    /// add/delete's `/dev/null` side names nothing.
+    #[test]
+    fn diff_header_paths_drop_git_prefixes_and_dev_null() {
+        assert_eq!(diff_header_path("--- a/src/x.rs"), Some("src/x.rs".into()));
+        assert_eq!(diff_header_path("+++ b/src/x.rs"), Some("src/x.rs".into()));
+        assert_eq!(
+            diff_header_path("--- /a/b.rs\t2026-10-18"),
+            Some("/a/b.rs".into())
+        );
+        assert_eq!(diff_header_path("+++ /dev/null"), None);
+        assert_eq!(diff_header_path("---"), None);
     }
 
     /// A removed line whose own content starts with `--` renders as `--- …` in
