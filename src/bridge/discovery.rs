@@ -16,6 +16,7 @@
 //! and private password come from the registration file its state dir holds —
 //! the official client's discovery contract.
 
+use async_trait::async_trait;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::bridge::attach;
@@ -189,6 +190,49 @@ fn state_home_from_env(env: &[String]) -> std::path::PathBuf {
         })
 }
 
+/// The path a V2 managed service registers itself at under a state home:
+/// `$XDG_STATE_HOME/opencode/service.json` (spec #364 §2). The one spelling of
+/// the registration location, for a server's environment and for cola's own.
+fn service_registration_path(state_home: &std::path::Path) -> std::path::PathBuf {
+    state_home.join("opencode").join("service.json")
+}
+
+/// The state home cola's OWN environment resolves — the one a service cola
+/// starts inherits, so this is where its registration lands. The same
+/// xdg-basedir rule [`state_home_from_env`] applies to a server's environment,
+/// applied to ours.
+fn own_state_home() -> std::path::PathBuf {
+    let env: Vec<String> = std::env::vars_os()
+        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+        .collect();
+    state_home_from_env(&env)
+}
+
+/// Where the Shared Service cola starts (or adopts) registers itself.
+fn own_service_registration_path() -> std::path::PathBuf {
+    service_registration_path(&own_state_home())
+}
+
+/// The config home cola's own environment resolves (xdg-basedir:
+/// `$XDG_CONFIG_HOME` if set, else `~/.config`). OpenCode keeps its own
+/// `service.json` — the `disabled` flag and the daemon's persisted port and
+/// password — there.
+fn own_config_home() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join(".config")
+        })
+}
+
+/// OpenCode's own service config: `$XDG_CONFIG_HOME/opencode/service.json`.
+fn own_service_config_path() -> std::path::PathBuf {
+    own_config_home().join("opencode").join("service.json")
+}
+
 /// A V2 managed service's registration file (`{id, version, url, pid,
 /// password}`, mode 0600), the official client's discovery contract (spec #364
 /// §2). Only the fields discovery needs are parsed; `id`/`version` are ignored.
@@ -210,7 +254,7 @@ struct ServiceRegistration {
 /// The username is NOT taken from anywhere: it is always `opencode` (the only
 /// one V2 accepts).
 fn service_registration_credentials(env: &[String], pid: i32) -> Option<(u16, String)> {
-    let path = state_home_from_env(env).join("opencode").join("service.json");
+    let path = service_registration_path(&state_home_from_env(env));
     let raw = std::fs::read_to_string(&path).ok()?;
     let registration: ServiceRegistration = serde_json::from_str(&raw).ok()?;
     if registration.pid.is_some_and(|registered| registered != pid) {
@@ -418,6 +462,16 @@ pub fn other_servers<'a>(
     others
 }
 
+/// Whether any default-store server is live in a fresh scan — whoever started
+/// it, cola included. The eager boot uses this to decide "stay serverless"
+/// after a start that did not classify: a V2 Shared Service writes no
+/// `self-opencode.pid` (it is never owned, ADR-0085), so the old
+/// self-pid-based guard would take the bot down at boot whenever a live
+/// service's probe was temporarily inconclusive.
+pub fn has_live_default_store_server() -> bool {
+    scan_processes().iter().any(is_eligible)
+}
+
 /// The command cola runs to start its own OpenCode server on the default store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {
@@ -457,6 +511,30 @@ pub fn self_start_command(port: u16, password: &str) -> SpawnCommand {
     }
 }
 
+/// Build the command that starts the machine-wide V2 **Shared Service**
+/// (`opencode serve --service`) — the rendezvous the TUI, the desktop app and
+/// the Web UI resolve through the registration file (ADR-0085).
+///
+/// No `--port`: the daemon honors its own `opencode service set port`. No
+/// password either — the service keeps one private credential across restarts
+/// in its own config and echoes it in the registration file, which is what cola
+/// reads. The child KEEPS `XDG_STATE_HOME` (the registration must land where
+/// every client looks for it) and drops `XDG_DATA_HOME` plus the credential
+/// variables cola may have inherited, so the daemon lands on the default store
+/// with its own auth rather than cola's.
+pub fn service_start_command() -> SpawnCommand {
+    SpawnCommand {
+        args: vec!["serve".to_string(), "--service".to_string()],
+        env: Vec::new(),
+        remove_env: vec![
+            "XDG_DATA_HOME".to_string(),
+            "OPENCODE_SERVER_USERNAME".to_string(),
+            "OPENCODE_PASSWORD".to_string(),
+            "OPENCODE_SERVER_PASSWORD".to_string(),
+        ],
+    }
+}
+
 /// The file recording the pid of the OpenCode server cola itself spawned.
 /// Written when cola starts its own server; read by `/restart-opencode` to
 /// decide whether cola owns the running server and may restart it. Persisted so
@@ -466,10 +544,22 @@ fn self_spawned_pid_path_in(state_dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn self_spawned_pid_path() -> std::path::PathBuf {
-    let state_dir = dirs::home_dir()
+    self_spawned_pid_path_in(&cola_state_dir())
+}
+
+/// cola's own state directory (`~/.cola`): the Owned Server's pid record, the
+/// singleton lock, and the Shared Service's log.
+fn cola_state_dir() -> std::path::PathBuf {
+    dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cola");
-    self_spawned_pid_path_in(&state_dir)
+        .join(".cola")
+}
+
+/// Where a detached `serve --service` child's stdout/stderr is appended. Its
+/// output is the only diagnostic when a start fails, so it goes to a file —
+/// never an unread pipe, which would block the daemon on its first write.
+fn service_log_path() -> std::path::PathBuf {
+    cola_state_dir().join("opencode-service.log")
 }
 
 /// Record the pid of the OpenCode server cola just spawned.
@@ -695,58 +785,505 @@ pub async fn wait_for_port(port: u16) -> anyhow::Result<()> {
 /// a child that exited is forgotten immediately and fails the spawn at once.
 const SELF_START_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Start cola's own `opencode serve` on the default store, skipping ports
-/// already held by a running server, wait until it accepts connections, and
-/// resolve its generation by probing — the `opencode` binary may be the V1 or
-/// the V2 lineage (spec #364 §2). Used at boot (`eager`) and by Lazy Start
-/// (`auto`); `/restart-opencode` re-raises through [`spawn_self_server`] and
-/// the reconnect loop's own re-probe. The result is a [`ResolvedServer`] like
-/// any other — an Owned Server is just the endpoint cola attaches to
+/// The startup budget for a fresh Shared Service to publish a registration for
+/// a live `serve --service`. A warm daemon lands in well under a second; a cold
+/// one has to boot its store. Bounded so Lazy Start's first prompt and cola's
+/// eager boot never hang on a service that will not come up.
+const SERVICE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Grace after a service attempt exits without a registration. The daemon
+/// writes its registration a beat after the spawn returns, and a contender that
+/// found an incumbent exits cleanly — in that case the incumbent's registration
+/// is already on disk and is adopted, not waited out.
+const SERVICE_START_EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Grace between SIGTERM and SIGKILL when a failed attempt must be reaped.
+const SERVICE_START_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why the service-first start did not produce an attachable server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceStartFailure {
+    /// The child could not be spawned at all (no `opencode` on `PATH`, the log
+    /// directory unwritable).
+    Spawn(String),
+    /// No live `serve --service` registration appeared in time; the attempt was
+    /// terminated. The `serve --port` fallback follows.
+    NoRegistration { child_pid: i32 },
+    /// A registration appeared but the server never classified for the attach.
+    /// Deliberately NOT a fallback: a live rendezvous exists, and raising an
+    /// Owned Server beside it would put two servers on one store
+    /// (ADR-0013, ADR-0085). The reconnect loop attaches once the probe
+    /// classifies.
+    Attach(String),
+}
+
+impl std::fmt::Display for ServiceStartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(e) => write!(f, "`opencode serve --service` could not be spawned: {e}"),
+            Self::NoRegistration { child_pid } => write!(
+                f,
+                "no live `serve --service` registration appeared within {}s (attempt pid {child_pid})",
+                SERVICE_START_TIMEOUT.as_secs()
+            ),
+            Self::Attach(evidence) => write!(
+                f,
+                "the shared service registered but its generation never resolved: {evidence}"
+            ),
+        }
+    }
+}
+
+/// Whether a command line really is the V2 managed service: an `opencode`
+/// binary running the `serve` subcommand in `--service` mode. A registration
+/// pid that no longer matches this is stale — the pid died and was recycled, or
+/// another program owns it now — so it is never attached to, and never killed.
+///
+/// Kept local rather than folded into [`is_live_opencode_serve`]: that
+/// predicate is the Owned Server's `serve --port` check (and the dev-launch
+/// argv widening is #812's), while this one is the service's own identity.
+fn is_opencode_service_cmd(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a.contains("opencode"))
+        && args.iter().skip(1).any(|a| a == "serve")
+        && args.iter().skip(1).any(|a| a == "--service")
+}
+
+/// The candidate a registration file describes, when it names a LIVE
+/// `serve --service`: the recorded pid must be alive, its command line must
+/// really be `opencode ... serve --service`, and `url` must carry a port. Pure
+/// over the file's contents and the two process lookups, so the
+/// matching-pid-accepted / stale-pid-rejected rule is unit-tested without a
+/// filesystem or a process.
+///
+/// The registration is the service's own identity, not cola's record of it:
+/// the class is always [`ServerClass::Service`], the username is always
+/// `opencode` (the only one V2 accepts) and the store is the default one.
+fn registration_service_candidate(
+    raw: &str,
+    alive: &dyn Fn(i32) -> bool,
+    cmd: &dyn Fn(i32) -> Option<Vec<String>>,
+) -> Option<ServerCandidate> {
+    let registration: ServiceRegistration = serde_json::from_str(raw).ok()?;
+    // Without a pid there is nothing to verify liveness against, so the
+    // registration cannot be adopted.
+    let pid = registration.pid?;
+    if !alive(pid) || !cmd(pid).is_some_and(|args| is_opencode_service_cmd(&args)) {
+        return None;
+    }
+    let port = port_from_url(&registration.url)?;
+    Some(ServerCandidate {
+        pid,
+        port,
+        password: registration.password,
+        username: DEFAULT_SERVER_USERNAME.to_string(),
+        uses_default_store: true,
+        class: ServerClass::Service,
+    })
+}
+
+/// [`registration_service_candidate`] over the real registration file.
+fn live_service_registration(host: &dyn ServiceHost, path: &std::path::Path) -> Option<ServerCandidate> {
+    let raw = host.registration(path)?;
+    registration_service_candidate(&raw, &|pid| host.alive(pid), &|pid| host.cmd(pid))
+}
+
+/// Whether OpenCode's own config disables the managed service
+/// (`{"disabled": true}`). A missing or malformed file means "not disabled" —
+/// the default OpenCode itself applies, and a config cola cannot parse must
+/// never stop the start path.
+fn service_disabled_at(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|raw| parse_service_disabled(&raw))
+        .unwrap_or(false)
+}
+
+/// The `disabled` flag of a service config file, pure so the skip is
+/// unit-tested without a filesystem.
+fn parse_service_disabled(raw: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct ServiceConfig {
+        #[serde(default)]
+        disabled: bool,
+    }
+    serde_json::from_str::<ServiceConfig>(raw)
+        .map(|c| c.disabled)
+        .unwrap_or(false)
+}
+
+/// What the start path does first (ADR-0085): raise the Shared Service, or go
+/// straight to the Owned `serve --port` server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceStartPlan {
+    TryService,
+    /// Skip the service, with the reason for the log.
+    PortOnly(ServiceStartSkip),
+}
+
+/// Why the service is not attempted at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceStartSkip {
+    /// `[opencode] generation = "v1"`: V1 has no `serve --service` (spec #809).
+    V1Generation,
+    /// OpenCode's own `service.json` says `disabled: true`.
+    Disabled,
+}
+
+impl std::fmt::Display for ServiceStartSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::V1Generation => write!(f, "`[opencode] generation = \"v1\"`"),
+            Self::Disabled => write!(f, "OpenCode's own service config says `disabled: true`"),
+        }
+    }
+}
+
+/// The service-first decision — a pure function of the generation override and
+/// OpenCode's own `disabled` flag, so both skip branches are unit-tested.
+/// Under `auto` the service IS attempted: a V1 binary fails the attempt on its
+/// own and falls back, which is exactly the "自然回退" the spec asks for.
+fn service_start_plan(generation_override: GenerationOverride, disabled: bool) -> ServiceStartPlan {
+    if generation_override == GenerationOverride::V1 {
+        return ServiceStartPlan::PortOnly(ServiceStartSkip::V1Generation);
+    }
+    if disabled {
+        return ServiceStartPlan::PortOnly(ServiceStartSkip::Disabled);
+    }
+    ServiceStartPlan::TryService
+}
+
+/// The process-side view the Shared Service start path needs. Real code uses
+/// [`RealServiceHost`]; a test substitutes every operation, so no process is
+/// started and no real registration is read.
+trait ServiceHost: Send + Sync {
+    /// Spawn `opencode serve --service` detached, its output appended to the
+    /// service log; the child's pid.
+    fn spawn_service(&self, log_path: &std::path::Path) -> anyhow::Result<i32>;
+    /// The registration file's raw contents, when it exists.
+    fn registration(&self, path: &std::path::Path) -> Option<String>;
+    /// Whether a pid is a live process.
+    fn alive(&self, pid: i32) -> bool;
+    /// A pid's command line.
+    fn cmd(&self, pid: i32) -> Option<Vec<String>>;
+    /// Ask a process to exit (SIGTERM on unix).
+    fn terminate(&self, pid: i32) -> anyhow::Result<()>;
+    /// Kill a process that ignored SIGTERM (SIGKILL on unix).
+    fn force_kill(&self, pid: i32) -> anyhow::Result<()>;
+}
+
+/// The real operations: a detached `opencode serve --service` child, its
+/// registration file, and the machine's process table.
+struct RealServiceHost;
+
+impl ServiceHost for RealServiceHost {
+    fn spawn_service(&self, log_path: &std::path::Path) -> anyhow::Result<i32> {
+        spawn_service_detached(log_path)
+    }
+
+    fn registration(&self, path: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn alive(&self, pid: i32) -> bool {
+        process_alive(pid)
+    }
+
+    fn cmd(&self, pid: i32) -> Option<Vec<String>> {
+        process_cmd(pid)
+    }
+
+    fn terminate(&self, pid: i32) -> anyhow::Result<()> {
+        terminate_process(pid)
+    }
+
+    fn force_kill(&self, pid: i32) -> anyhow::Result<()> {
+        force_kill(pid)
+    }
+}
+
+/// Spawn `opencode serve --service` so the daemon OUTLIVES cola: detached from
+/// cola's process group, stdin closed, and stdout/stderr appended to the
+/// service log — never a pipe nobody reads, which would block the daemon on its
+/// first log line.
+///
+/// The child keeps its inherited `XDG_STATE_HOME` (its registration must land
+/// where the clients look) and has cola's data-home/credential variables
+/// stripped by [`service_start_command`].
+fn spawn_service_detached(log_path: &std::path::Path) -> anyhow::Result<i32> {
+    let cmd = service_start_command();
+    let mut command = std::process::Command::new("opencode");
+    command.args(&cmd.args).envs(cmd.env.iter().cloned());
+    for key in &cmd.remove_env {
+        command.env_remove(key);
+    }
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // A NEW PROCESS GROUP detaches the daemon from cola's: a signal aimed at
+        // cola's group (Ctrl-C at its terminal, a supervisor's group kill) never
+        // reaches the service. `setsid` is not reachable here — `pre_exec` is
+        // the only std route to it and this crate forbids `unsafe` outside tests
+        // (`#![cfg_attr(not(test), forbid(unsafe_code))]`). The difference is
+        // the session, and it cannot bite: the child's stdin is closed and its
+        // stdout/stderr are files, so it never touches the controlling terminal
+        // and is not in the foreground group the terminal's hangup signals
+        // (SIGHUP, SIGTTIN/SIGTTOU) are sent to.
+        command.process_group(0);
+    }
+    // Windows has no POSIX session to leave: a new process group plus
+    // DETACHED_PROCESS (no console) is the equivalent. The two flags are
+    // declared here rather than pulled from a crate for one call.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    Ok(command.spawn()?.id() as i32)
+}
+
+/// Start (or adopt) the machine-wide Shared Service and return the candidate
+/// its registration describes.
+///
+/// The daemon writes `service.json` when it starts listening, so the wait is
+/// for a registration that names a LIVE `serve --service` — a stale file (dead
+/// or recycled pid) keeps the wait going rather than being attached to. A
+/// contender that exits because an incumbent already serves the machine is
+/// accepted: the incumbent's registration is live, which is all cola needs. An
+/// attempt that never registers is terminated (SIGTERM, a bounded wait, then
+/// SIGKILL) and reported as a failure, which is what sends the caller to the
+/// `serve --port` fallback.
+async fn start_shared_service(
+    host: &dyn ServiceHost,
+    registration_path: &std::path::Path,
+    log_path: &std::path::Path,
+) -> Result<ServerCandidate, ServiceStartFailure> {
+    let child_pid = host
+        .spawn_service(log_path)
+        .map_err(|e| ServiceStartFailure::Spawn(e.to_string()))?;
+    let deadline = tokio::time::Instant::now() + SERVICE_START_TIMEOUT;
+    let mut exited_at: Option<tokio::time::Instant> = None;
+    loop {
+        if let Some(candidate) = live_service_registration(host, registration_path) {
+            return Ok(candidate);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            reap_failed_service_attempt(host, child_pid).await;
+            return Err(ServiceStartFailure::NoRegistration { child_pid });
+        }
+        // A child that exits without a live registration failed the attempt (a
+        // V1 binary has no `serve --service`) — after the grace the daemon gets
+        // to publish the file it writes a beat after the spawn returns.
+        if !host.alive(child_pid) {
+            let exited = *exited_at.get_or_insert(now);
+            if now.duration_since(exited) >= SERVICE_START_EXIT_GRACE {
+                reap_failed_service_attempt(host, child_pid).await;
+                return Err(ServiceStartFailure::NoRegistration { child_pid });
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Terminate a service attempt that never registered: SIGTERM, a bounded wait,
+/// then SIGKILL. Nothing is sent unless the pid is still a live
+/// `opencode ... serve --service` — an exited pid may have been recycled, and
+/// cola must never kill an unrelated process (the same guard the Owned Server
+/// path applies before it kills).
+async fn reap_failed_service_attempt(host: &dyn ServiceHost, child_pid: i32) {
+    let is_our_service = host.alive(child_pid)
+        && host
+            .cmd(child_pid)
+            .is_some_and(|args| is_opencode_service_cmd(&args));
+    if !is_our_service {
+        return;
+    }
+    let _ = host.terminate(child_pid);
+    let deadline = tokio::time::Instant::now() + SERVICE_START_KILL_GRACE;
+    while host.alive(child_pid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if host.alive(child_pid) {
+        tracing::warn!("OpenCode service attempt (pid {child_pid}) ignored SIGTERM; killing it");
+        let _ = host.force_kill(child_pid);
+    }
+}
+
+/// The two ways cola gets a server when none is running: the machine-wide
+/// Shared Service rendezvous (preferred, ADR-0085) and the classic Owned
+/// `serve --port` fallback. Behind a trait so the service-first ordering and
+/// its fallback are unit-tested without spawning anything.
+#[async_trait]
+trait ServerStarter: Send + Sync {
+    /// Start (or adopt) the V2 Shared Service and resolve the attach to it.
+    async fn start_service(
+        &self,
+        generation_override: GenerationOverride,
+    ) -> Result<ResolvedServer, ServiceStartFailure>;
+
+    /// The classic Owned Server path: `serve --port`, wait, resolve.
+    async fn start_port(
+        &self,
+        preferred_port: Option<u16>,
+        generation_override: GenerationOverride,
+    ) -> anyhow::Result<ResolvedServer>;
+}
+
+/// The real legs: the Shared Service through its registration file, the Owned
+/// Server through `spawn_self_server`.
+struct OpencodeStarter;
+
+#[async_trait]
+impl ServerStarter for OpencodeStarter {
+    async fn start_service(
+        &self,
+        generation_override: GenerationOverride,
+    ) -> Result<ResolvedServer, ServiceStartFailure> {
+        let candidate = start_shared_service(
+            &RealServiceHost,
+            &own_service_registration_path(),
+            &service_log_path(),
+        )
+        .await?;
+        // Resolved through the SAME attach path as any discovered server: the
+        // generation is probed, never assumed (#380). The service is NOT
+        // recorded as self-spawned — it is never an Owned Server and the yield
+        // must never reap it (ADR-0085).
+        let transport = attach::candidate_transport(&candidate);
+        resolve_spawned_server_over(
+            &transport,
+            &candidate,
+            generation_override,
+            SELF_START_PROBE_TIMEOUT,
+        )
+        .await
+        .map_err(ServiceStartFailure::Attach)
+    }
+
+    async fn start_port(
+        &self,
+        preferred_port: Option<u16>,
+        generation_override: GenerationOverride,
+    ) -> anyhow::Result<ResolvedServer> {
+        let candidates = scan_processes();
+        let mut port = preferred_port.unwrap_or(4096);
+        // Skip ports already held by a custom-store server (someone else's data).
+        while candidates.iter().any(|c| c.port == port) {
+            port += 1;
+        }
+        let password = "cola-secret".to_string();
+        let pid = spawn_self_server(port, &password)?;
+        wait_for_port(port).await?;
+        // The Owned Server is described as a candidate and resolved through the
+        // SAME attach path as any discovered server: the `opencode` binary's
+        // lineage is not fixed (#380), so the generation is probed, never assumed.
+        let candidate = ServerCandidate {
+            pid,
+            port,
+            password,
+            username: DEFAULT_SERVER_USERNAME.to_string(),
+            uses_default_store: true,
+            // A spawned `serve --port` is cola's Owned Server by pid; the field
+            // only records what the command line says (ADR-0013).
+            class: ServerClass::Coexistent,
+        };
+        let transport = attach::candidate_transport(&candidate);
+        resolve_spawned_server_over(
+            &transport,
+            &candidate,
+            generation_override,
+            SELF_START_PROBE_TIMEOUT,
+        )
+        .await
+        .map_err(|evidence| {
+            anyhow::anyhow!("spawned OpenCode server's generation could not be resolved: {evidence}")
+        })
+    }
+}
+
+/// Start cola's own OpenCode server on the default store. The FIRST step is
+/// the machine-wide Shared Service (`opencode serve --service`, ADR-0085): the
+/// terminal, the desktop app and the Web UI all resolve that rendezvous from
+/// zero arguments, so starting it means every client lands on one server and
+/// the real-time sync holds. Only when no service can be raised does cola fall
+/// back to the classic Owned `serve --port` path — skipping ports already held
+/// by a running server, waiting until it accepts connections, and resolving its
+/// generation by probing (the `opencode` binary may be the V1 or the V2 lineage,
+/// spec #364 §2).
+///
+/// Used at boot (`eager`) and by Lazy Start (`auto`); `/restart-opencode`
+/// re-raises through [`spawn_self_server`] and the reconnect loop's own
+/// re-probe. The result is a [`ResolvedServer`] like any other — a Shared
+/// Service and an Owned Server are both just the endpoint cola attaches to
 /// (ADR-0013).
 pub async fn spawn_own_server(
     preferred_port: Option<u16>,
     generation_override: GenerationOverride,
 ) -> anyhow::Result<ResolvedServer> {
-    let candidates = scan_processes();
-    let mut port = preferred_port.unwrap_or(4096);
-    // Skip ports already held by a custom-store server (someone else's data).
-    while candidates.iter().any(|c| c.port == port) {
-        port += 1;
-    }
-    let password = "cola-secret".to_string();
-    let pid = spawn_self_server(port, &password)?;
-    wait_for_port(port).await?;
-    // The Owned Server is described as a candidate and resolved through the
-    // SAME attach path as any discovered server: the `opencode` binary's
-    // lineage is not fixed (#380), so the generation is probed, never assumed.
-    let candidate = ServerCandidate {
-        pid,
-        port,
-        password,
-        username: DEFAULT_SERVER_USERNAME.to_string(),
-        uses_default_store: true,
-        // A spawned `serve --port` is cola's Owned Server by pid; the field
-        // only records what the command line says (ADR-0013).
-        class: ServerClass::Coexistent,
-    };
-    let transport = attach::candidate_transport(&candidate);
-    resolve_spawned_server_over(
-        &transport,
-        &candidate,
-        generation_override,
-        SELF_START_PROBE_TIMEOUT,
-    )
-    .await
-    .map_err(|evidence| {
-        anyhow::anyhow!("spawned OpenCode server's generation could not be resolved: {evidence}")
-    })
+    let disabled = service_disabled_at(&own_service_config_path());
+    spawn_own_server_over(preferred_port, generation_override, disabled, &OpencodeStarter).await
 }
 
-/// The retry loop around the attach decision for a just-spawned Owned Server:
-/// the startup window answers nothing, or answers unclassifiably (V2's
-/// 503-while-migrating), so inconclusive probes are retried until `timeout` or
-/// the child dies. The last probe evidence travels on failure; the credential
-/// never does (the attach path's promise).
+/// [`spawn_own_server`] over an injectable pair of legs. `disabled` is
+/// OpenCode's own `disabled` flag, read by the caller so the decision here
+/// stays a pure function of it.
+async fn spawn_own_server_over(
+    preferred_port: Option<u16>,
+    generation_override: GenerationOverride,
+    disabled: bool,
+    starter: &dyn ServerStarter,
+) -> anyhow::Result<ResolvedServer> {
+    match service_start_plan(generation_override, disabled) {
+        ServiceStartPlan::TryService => match starter.start_service(generation_override).await {
+            Ok(resolved) => {
+                tracing::info!(
+                    "started the shared OpenCode service at {} (pid {}) — generation={}",
+                    resolved.url,
+                    resolved
+                        .pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "unknown".into()),
+                    resolved.generation.as_str()
+                );
+                return Ok(resolved);
+            }
+            // Only "the service is not there" falls back. A registration that
+            // appeared but never classified is a LIVE rendezvous: raising an
+            // Owned Server beside it would put two servers on one store, which
+            // is exactly what ADR-0013/ADR-0085 exist to prevent.
+            Err(failure @ (ServiceStartFailure::Spawn(_) | ServiceStartFailure::NoRegistration { .. })) => {
+                tracing::warn!(
+                    "could not start the OpenCode service ({failure}); falling back to `opencode serve --port`"
+                );
+            }
+            Err(failure) => return Err(anyhow::anyhow!("{failure}")),
+        },
+        ServiceStartPlan::PortOnly(skip) => {
+            tracing::debug!("skipping the shared OpenCode service: {skip}");
+        }
+    }
+    starter.start_port(preferred_port, generation_override).await
+}
+
+/// The retry loop around the attach decision for a just-started server (the
+/// Shared Service or an Owned Server): the startup window answers nothing, or
+/// answers unclassifiably (V2's 503-while-migrating), so inconclusive probes are
+/// retried until `timeout` or the child dies. The last probe evidence travels on
+/// failure; the credential never does (the attach path's promise).
 async fn resolve_spawned_server_over(
     transport: &Transport,
     candidate: &ServerCandidate,
@@ -1640,5 +2177,570 @@ mod tests {
         let transport = Transport::new(Some(DEFAULT_SERVER_USERNAME), Some(password), server.base_url());
         transport.disable_env_proxy(Some(DEFAULT_SERVER_USERNAME), Some(password));
         transport
+    }
+
+    // --- Shared Service start (ADR-0085, ticket #810) ---------------------
+
+    /// A scripted [`ServiceHost`]: nothing is spawned, the registration is a
+    /// sequence of strings the test controls, liveness/cmdline are lookup
+    /// tables, and terminate/kill are recorded. The sequence models a daemon
+    /// that registers a beat after the spawn returns (and a stale file it
+    /// replaces).
+    struct FakeServiceHost {
+        spawn: Result<i32, String>,
+        /// What each successive `registration()` call sees; the last entry
+        /// repeats. Empty means "no file".
+        registrations: Vec<Option<String>>,
+        reads: std::sync::atomic::AtomicUsize,
+        alive: std::sync::Mutex<Vec<i32>>,
+        /// Whether a SIGTERM actually ends the attempt (the graceful case).
+        dies_on_terminate: bool,
+        cmd: Vec<(i32, Vec<String>)>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeServiceHost {
+        fn new() -> Self {
+            Self {
+                spawn: Ok(4242),
+                registrations: Vec::new(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                alive: std::sync::Mutex::new(Vec::new()),
+                dies_on_terminate: false,
+                cmd: Vec::new(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn spawn_error(mut self, message: &str) -> Self {
+            self.spawn = Err(message.to_string());
+            self
+        }
+
+        fn registration(mut self, raw: &str) -> Self {
+            self.registrations.push(Some(raw.to_string()));
+            self
+        }
+
+        fn registrations(mut self, raws: &[Option<&str>]) -> Self {
+            self.registrations = raws.iter().map(|r| r.map(|raw| raw.to_string())).collect();
+            self
+        }
+
+        /// A pid the host reports alive with the given command line.
+        fn live(mut self, pid: i32, args: &[&str]) -> Self {
+            self.alive.lock().unwrap().push(pid);
+            self.cmd.push((pid, args.iter().map(|s| s.to_string()).collect()));
+            self
+        }
+
+        /// The attempt exits on SIGTERM (the graceful daemon).
+        fn dies_on_terminate(mut self) -> Self {
+            self.dies_on_terminate = true;
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ServiceHost for FakeServiceHost {
+        fn spawn_service(&self, _log_path: &std::path::Path) -> anyhow::Result<i32> {
+            self.calls.lock().unwrap().push("spawn".to_string());
+            match &self.spawn {
+                Ok(pid) => Ok(*pid),
+                Err(message) => anyhow::bail!("{message}"),
+            }
+        }
+
+        fn registration(&self, _path: &std::path::Path) -> Option<String> {
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.registrations.is_empty() {
+                return None;
+            }
+            let index = read.min(self.registrations.len() - 1);
+            self.registrations[index].clone()
+        }
+
+        fn alive(&self, pid: i32) -> bool {
+            self.alive.lock().unwrap().contains(&pid)
+        }
+
+        fn cmd(&self, pid: i32) -> Option<Vec<String>> {
+            self.cmd
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, args)| args.clone())
+        }
+
+        fn terminate(&self, pid: i32) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("terminate {pid}"));
+            if self.dies_on_terminate {
+                self.alive.lock().unwrap().retain(|p| *p != pid);
+            }
+            Ok(())
+        }
+
+        fn force_kill(&self, pid: i32) -> anyhow::Result<()> {
+            self.calls.lock().unwrap().push(format!("kill {pid}"));
+            self.alive.lock().unwrap().retain(|p| *p != pid);
+            Ok(())
+        }
+    }
+
+    /// A live service's registration file, as the daemon writes it.
+    fn service_registration_json(pid: i32, port: u16, password: &str) -> String {
+        format!(
+            r#"{{"id":"reg","version":"2.0.18","url":"http://127.0.0.1:{port}","pid":{pid},"password":"{password}"}}"#
+        )
+    }
+
+    fn service_argv() -> Vec<String> {
+        ["opencode", "serve", "--service"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn service_start_command_spawns_the_rendezvous_without_a_port_or_password() {
+        let cmd = service_start_command();
+        // No `--port`: the daemon honors `opencode service set port`. No
+        // password: it keeps its own persisted one and echoes it in the
+        // registration file cola reads (ADR-0085).
+        assert_eq!(cmd.args, vec!["serve", "--service"]);
+        assert!(
+            cmd.env.is_empty(),
+            "the service must not be handed a password: {:?}",
+            cmd.env
+        );
+        // The daemon must land on the DEFAULT store and use its own auth …
+        for key in [
+            "XDG_DATA_HOME",
+            "OPENCODE_SERVER_USERNAME",
+            "OPENCODE_PASSWORD",
+            "OPENCODE_SERVER_PASSWORD",
+        ] {
+            assert!(
+                cmd.remove_env.contains(&key.to_string()),
+                "{key} must be stripped"
+            );
+        }
+        // … while KEEPING the state home: the registration file has to land
+        // where every default client looks for it.
+        assert!(!cmd.remove_env.contains(&"XDG_STATE_HOME".to_string()));
+    }
+
+    #[test]
+    fn registration_service_candidate_adopts_a_matching_live_service() {
+        let raw = service_registration_json(4242, 49374, "reg-pw");
+        let candidate =
+            registration_service_candidate(&raw, &|pid| pid == 4242, &|pid| (pid == 4242).then(service_argv))
+                .expect("a live registration is attachable");
+
+        assert_eq!(candidate.pid, 4242);
+        assert_eq!(candidate.port, 49374);
+        assert_eq!(candidate.password, "reg-pw");
+        // The username is never taken from anywhere: V2 accepts only `opencode`.
+        assert_eq!(candidate.username, DEFAULT_SERVER_USERNAME);
+        assert!(candidate.uses_default_store);
+        assert_eq!(candidate.class, ServerClass::Service);
+        assert!(candidate.is_service());
+    }
+
+    #[test]
+    fn registration_service_candidate_rejects_a_stale_registration() {
+        let raw = service_registration_json(4242, 49374, "reg-pw");
+        // The recorded pid is dead (a leftover registration): never attached to
+        // through another instance's credentials.
+        assert_eq!(
+            registration_service_candidate(&raw, &|_| false, &|_| Some(service_argv())),
+            None
+        );
+        // Alive, but the pid now runs something else (recycled): not the daemon.
+        assert_eq!(
+            registration_service_candidate(&raw, &|_| true, &|_| Some(vec!["/usr/bin/cola".to_string()])),
+            None
+        );
+        // Alive and an `opencode serve`, but NOT the service mode.
+        assert_eq!(
+            registration_service_candidate(&raw, &|_| true, &|_| Some(
+                ["opencode", "serve", "--port", "4096"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            )),
+            None
+        );
+        // No pid to verify liveness against, and a url without a port.
+        assert_eq!(
+            registration_service_candidate(
+                r#"{"url":"http://127.0.0.1:49374","password":"pw"}"#,
+                &|_| true,
+                &|_| Some(service_argv())
+            ),
+            None
+        );
+        assert_eq!(
+            registration_service_candidate(
+                r#"{"url":"http://127.0.0.1","password":"pw","pid":4242}"#,
+                &|_| true,
+                &|_| Some(service_argv())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn service_start_plan_skips_the_service_for_v1_and_for_a_disabled_service() {
+        assert_eq!(
+            service_start_plan(GenerationOverride::Auto, false),
+            ServiceStartPlan::TryService
+        );
+        assert_eq!(
+            service_start_plan(GenerationOverride::V2, false),
+            ServiceStartPlan::TryService
+        );
+        // V1 has no `serve --service` (spec #809) — never attempted, whatever
+        // the config says.
+        assert_eq!(
+            service_start_plan(GenerationOverride::V1, false),
+            ServiceStartPlan::PortOnly(ServiceStartSkip::V1Generation)
+        );
+        assert_eq!(
+            service_start_plan(GenerationOverride::V1, true),
+            ServiceStartPlan::PortOnly(ServiceStartSkip::V1Generation)
+        );
+        // OpenCode's own `disabled: true` goes straight to `serve --port`.
+        assert_eq!(
+            service_start_plan(GenerationOverride::Auto, true),
+            ServiceStartPlan::PortOnly(ServiceStartSkip::Disabled)
+        );
+    }
+
+    /// The registration must land under the STATE home the daemon inherits
+    /// (that is where every default client looks for it), and the daemon's
+    /// output goes to cola's own state dir — never a pipe.
+    #[test]
+    fn the_service_registers_under_colas_state_home_and_logs_to_colas_dir() {
+        let state = own_state_home();
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+            assert_eq!(state, std::path::PathBuf::from(xdg));
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            assert_eq!(own_config_home(), std::path::PathBuf::from(xdg));
+        }
+        // The registration file is the discovery contract's spelling, under
+        // the state home the daemon inherits from cola.
+        assert_eq!(
+            own_service_registration_path(),
+            state.join("opencode").join("service.json")
+        );
+        assert!(
+            own_service_config_path().ends_with("opencode/service.json"),
+            "{:?}",
+            own_service_config_path()
+        );
+        assert!(
+            service_log_path().ends_with(".cola/opencode-service.log"),
+            "{:?}",
+            service_log_path()
+        );
+    }
+
+    #[test]
+    fn service_disabled_reads_opencodes_own_flag() {
+        assert!(parse_service_disabled(r#"{"disabled":true}"#));
+        assert!(!parse_service_disabled(r#"{"disabled":false}"#));
+        // A config without the key, an empty object and a malformed file all
+        // mean "not disabled": a config cola cannot parse must never stop the
+        // start path.
+        assert!(!parse_service_disabled(r#"{"port":49374}"#));
+        assert!(!parse_service_disabled("{}"));
+        assert!(!parse_service_disabled("not json"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode").join("service.json");
+        // Absent file: not disabled.
+        assert!(!service_disabled_at(&path));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"disabled":true}"#).unwrap();
+        assert!(service_disabled_at(&path));
+    }
+
+    /// A scripted [`ServerStarter`]: records which leg ran and returns canned
+    /// results, so the service-first ordering and the fallback are asserted
+    /// without a process.
+    struct FakeStarter {
+        service: Result<ResolvedServer, ServiceStartFailure>,
+        port: Result<ResolvedServer, String>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeStarter {
+        fn new() -> Self {
+            Self {
+                service: Ok(resolved_server(49374, Generation::V2)),
+                port: Ok(resolved_server(4096, Generation::V2)),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn service_fails(mut self, failure: ServiceStartFailure) -> Self {
+            self.service = Err(failure);
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ServerStarter for FakeStarter {
+        async fn start_service(
+            &self,
+            _generation_override: GenerationOverride,
+        ) -> Result<ResolvedServer, ServiceStartFailure> {
+            self.calls.lock().unwrap().push("service".to_string());
+            self.service.clone()
+        }
+
+        async fn start_port(
+            &self,
+            _preferred_port: Option<u16>,
+            _generation_override: GenerationOverride,
+        ) -> anyhow::Result<ResolvedServer> {
+            self.calls.lock().unwrap().push("port".to_string());
+            match &self.port {
+                Ok(resolved) => Ok(resolved.clone()),
+                Err(message) => anyhow::bail!("{message}"),
+            }
+        }
+    }
+
+    fn resolved_server(port: u16, generation: Generation) -> ResolvedServer {
+        ResolvedServer {
+            url: local_url(port),
+            username: DEFAULT_SERVER_USERNAME.to_string(),
+            password: "pw".to_string(),
+            pid: Some(7),
+            generation,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_own_server_prefers_the_shared_service() {
+        let starter = FakeStarter::new();
+        let resolved = spawn_own_server_over(None, GenerationOverride::Auto, false, &starter)
+            .await
+            .expect("the service leg resolves");
+
+        assert_eq!(starter.calls(), vec!["service"], "the service is the first step");
+        assert_eq!(resolved.url, local_url(49374));
+    }
+
+    #[tokio::test]
+    async fn spawn_own_server_falls_back_to_the_port_path_when_no_service_registers() {
+        let starter =
+            FakeStarter::new().service_fails(ServiceStartFailure::NoRegistration { child_pid: 4242 });
+        let resolved = spawn_own_server_over(None, GenerationOverride::Auto, false, &starter)
+            .await
+            .expect("the port leg resolves");
+
+        assert_eq!(starter.calls(), vec!["service", "port"]);
+        assert_eq!(resolved.url, local_url(4096));
+    }
+
+    #[tokio::test]
+    async fn spawn_own_server_falls_back_when_the_service_cannot_be_spawned() {
+        let starter = FakeStarter::new().service_fails(ServiceStartFailure::Spawn("no opencode".into()));
+        let resolved = spawn_own_server_over(Some(4096), GenerationOverride::Auto, false, &starter)
+            .await
+            .expect("the port leg resolves");
+
+        assert_eq!(starter.calls(), vec!["service", "port"]);
+        assert_eq!(resolved.url, local_url(4096));
+    }
+
+    /// A registration that appeared but never classified is a LIVE rendezvous:
+    /// raising an Owned Server beside it would put two servers on one store
+    /// (ADR-0013, ADR-0085), so this is the one failure that does NOT fall
+    /// back.
+    #[tokio::test]
+    async fn spawn_own_server_does_not_fall_back_when_a_live_service_never_classifies() {
+        let starter = FakeStarter::new().service_fails(ServiceStartFailure::Attach("503".into()));
+        let error = spawn_own_server_over(None, GenerationOverride::Auto, false, &starter)
+            .await
+            .expect_err("a live but unclassified service must not be joined by a second server");
+
+        assert_eq!(starter.calls(), vec!["service"]);
+        assert!(error.to_string().contains("never resolved"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn spawn_own_server_skips_the_service_for_v1_and_when_disabled() {
+        // `generation = "v1"`: V1 has no `serve --service`.
+        let v1 = FakeStarter::new();
+        let resolved = spawn_own_server_over(None, GenerationOverride::V1, false, &v1)
+            .await
+            .expect("the port leg resolves");
+        assert_eq!(v1.calls(), vec!["port"]);
+        assert_eq!(resolved.url, local_url(4096));
+
+        // OpenCode's own `disabled: true`.
+        let disabled = FakeStarter::new();
+        spawn_own_server_over(None, GenerationOverride::Auto, true, &disabled)
+            .await
+            .expect("the port leg resolves");
+        assert_eq!(disabled.calls(), vec!["port"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_shared_service_waits_for_a_live_registration() {
+        // First read: the daemon has not published yet. Second: its file lands.
+        let host = FakeServiceHost::new()
+            .registrations(&[None, Some(&service_registration_json(4242, 49374, "reg-pw"))])
+            .live(4242, &["opencode", "serve", "--service"]);
+        let candidate = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect("the second read sees the live service");
+
+        assert_eq!(candidate.pid, 4242);
+        assert_eq!(candidate.port, 49374);
+        assert_eq!(candidate.class, ServerClass::Service);
+        assert_eq!(host.calls(), vec!["spawn"], "a live registration is never reaped");
+    }
+
+    /// A child that exits because an INCUMBENT service already serves the
+    /// machine is not a failure: the incumbent's registration is live and is
+    /// adopted (ticket #810 §2).
+    #[tokio::test(start_paused = true)]
+    async fn an_incumbent_registration_is_adopted_when_the_attempt_exits() {
+        let host = FakeServiceHost::new()
+            .registration(&service_registration_json(999, 49374, "incumbent-pw"))
+            // Our own child (4242) exited; the incumbent (999) is live.
+            .live(999, &["opencode", "serve", "--service"]);
+        let candidate = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect("the incumbent is accepted");
+
+        assert_eq!(candidate.pid, 999);
+        assert_eq!(candidate.password, "incumbent-pw");
+        assert_eq!(host.calls(), vec!["spawn"]);
+    }
+
+    /// No registration in time: the attempt is terminated (SIGTERM) and the
+    /// caller falls back to `serve --port`.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_never_registers_is_reaped_and_reported() {
+        let host = FakeServiceHost::new()
+            .live(4242, &["opencode", "serve", "--service"])
+            .dies_on_terminate();
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("nothing registered");
+
+        assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242"]);
+        assert!(failure.to_string().contains("serve --service"), "{failure}");
+    }
+
+    /// A child that ignores SIGTERM is force-killed.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_ignores_sigterm_is_force_killed() {
+        // `alive` never loses the pid, so the SIGTERM grace runs out.
+        let host = FakeServiceHost::new().live(4242, &["opencode", "serve", "--service"]);
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("nothing registered");
+
+        assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "kill 4242"]);
+    }
+
+    /// A child that exited without registering fails the attempt after a short
+    /// grace — it must not wait out the whole budget (a V1 binary answers
+    /// `serve --service` with an error at once). A dead pid is never signalled:
+    /// it may have been recycled.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_attempt_that_exited_without_registering_fails_fast() {
+        let host = FakeServiceHost::new();
+        let started = std::time::Instant::now();
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("a dead child cannot register");
+
+        assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
+        assert_eq!(host.calls(), vec!["spawn"], "a dead pid is never signalled");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_cannot_be_spawned_reports_it() {
+        let host = FakeServiceHost::new().spawn_error("opencode not found");
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("no child");
+
+        assert_eq!(failure, ServiceStartFailure::Spawn("opencode not found".into()));
+        assert_eq!(host.calls(), vec!["spawn"]);
+    }
+
+    /// The ownership boundary (ADR-0085): the service is started and attached,
+    /// but cola never records it as its own — `self-opencode.pid` is the Owned
+    /// Server's record, and Yield must never reap a machine-wide rendezvous.
+    #[tokio::test(start_paused = true)]
+    async fn starting_the_shared_service_never_records_a_self_spawned_pid() {
+        let pid_path = self_spawned_pid_path();
+        let before = std::fs::read(&pid_path).ok();
+        let host = FakeServiceHost::new()
+            .registration(&service_registration_json(4242, 49374, "reg-pw"))
+            .live(4242, &["opencode", "serve", "--service"]);
+
+        let candidate = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect("the service resolves");
+        assert_eq!(candidate.pid, 4242);
+
+        assert_eq!(
+            std::fs::read(&pid_path).ok(),
+            before,
+            "the service must not be written into {}",
+            pid_path.display()
+        );
+        assert!(
+            !is_self_spawned_record(&pid_path, candidate.pid),
+            "a Shared Service is never an Owned Server"
+        );
     }
 }
