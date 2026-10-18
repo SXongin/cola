@@ -181,7 +181,7 @@ start_server = "auto"            # auto (default) | never | eager
 - **`url`** — only a *preferred* port. cola attaches to whatever `opencode
   serve` is already running on the **shared store** automatically (username and
   password are read from the running server itself — its environment, or a V2
-  managed service's registration file — so nothing to configure), so `url` is a
+  Shared Service's registration file — so nothing to configure), so `url` is a
   tiebreaker among several servers of the same kind — and the fallback
   port when cola starts its own server. Among the servers cola can attach to,
   the priority is **Shared Service > Coexistent Server > Owned Server**: the V2
@@ -293,12 +293,14 @@ reading the registration file, so it does not sync until you point it at the
 service:
 
 ```bash
-OPENCODE_HOST=$(jq -r .url ~/.local/state/opencode/service.json) \
-OPENCODE_SERVER_PASSWORD=$(jq -r .password ~/.local/state/opencode/service.json) \
+OPENCODE_HOST=$(jq -r .url "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json") \
+OPENCODE_SERVER_PASSWORD=$(jq -r .password "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json") \
 OPENCODE_SKIP_START=true openchamber
 ```
 
-`OPENCODE_HOST` must carry an explicit port and no path.
+The registration lives under `$XDG_STATE_HOME` (default `~/.local/state`) —
+the state home the daemon resolved when it registered itself, which is the same
+one cola reads. `OPENCODE_HOST` must carry an explicit port and no path.
 `OPENCODE_SERVER_PASSWORD` is the name OpenChamber reads for the server's
 password (OpenCode's server also accepts `OPENCODE_PASSWORD`, but OpenChamber
 does not). `OPENCODE_SKIP_START=true` makes OpenChamber attach instead of
@@ -498,7 +500,7 @@ detailed help for any of these.
 | `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and a `#<id>` that matches no skill stays plain text (`#644`, `C#caveman` and `##foreman` are never skill tokens). A bare `/skill` opens the skill picker — searchable by id/name/description and paged 20 rows at a time — and `/skill <id>` is an alias for ids the `#` form cannot type (`2fa-helper`, `web_scrape`) |
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
-| `/restart-opencode` | Restart the OpenCode server (cola's Owned Server or the V2 managed service) |
+| `/restart-opencode` | Restart the OpenCode server (cola's Owned Server or the V2 Shared Service) |
 | `/update` | Update cola via its install channel (GitHub Releases self-update, or the cargo command for `cargo install`/`cargo binstall` installs) |
 | `/version` | Show cola version and build provenance (release / crates.io / dev build) |
 | `/help [command]` | List commands, or show detailed help for one |
@@ -616,7 +618,7 @@ Notes:
   session's own selection, else `[opencode] model`, else what the server
   recorded). `/compact` and `/stop` need a real session and keep their
   "还没有会话" replies on a pending.
-- `/restart-opencode` restarts an Owned Server or the V2 managed service
+- `/restart-opencode` restarts an Owned Server or the V2 Shared Service
   (`opencode service restart`); a server launched by another tool is left alone
   (`NotOwned`).
 - Topic rule: inside a topic already bound to a session, `/switch`, `/new`,
