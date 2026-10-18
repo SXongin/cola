@@ -126,7 +126,7 @@ start_server = "auto"            # auto (default) | never | eager
 
 - **`url`** —— 只是一个*首选*端口。cola 会自动连接到**共享存储**上已在运行的
   `opencode serve`（用户名与密码直接读自运行中的服务器本身——它的环境变量，
-  或 V2 托管服务的注册文件——所以无需配置），因此 `url` 只是同类多个服务器
+  或 V2 Shared Service 的注册文件——所以无需配置），因此 `url` 只是同类多个服务器
   之间的优先级选择——也是 cola 启动自己的服务器时的回退端口。在 cola 可连接的
   服务器中，优先级是 **Shared Service > Coexistent Server > Owned Server**：
   V2 的 `serve --service` 最优先，其次是其他工具启动的服务器，最后才是
@@ -220,12 +220,14 @@ cola 不为任何客户端做适配：同步发生在**服务器 + 共享存储 
 因此在把它指向 service 之前不会同步：
 
 ```bash
-OPENCODE_HOST=$(jq -r .url ~/.local/state/opencode/service.json) \
-OPENCODE_SERVER_PASSWORD=$(jq -r .password ~/.local/state/opencode/service.json) \
+OPENCODE_HOST=$(jq -r .url "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json") \
+OPENCODE_SERVER_PASSWORD=$(jq -r .password "${XDG_STATE_HOME:-$HOME/.local/state}/opencode/service.json") \
 OPENCODE_SKIP_START=true openchamber
 ```
 
-`OPENCODE_HOST` 必须带显式端口、不能带 path。`OPENCODE_SERVER_PASSWORD` 是
+注册文件位于 `$XDG_STATE_HOME`（默认 `~/.local/state`）——即守护进程注册时
+解析到的 state home，也就是 cola 读取的那一个。`OPENCODE_HOST` 必须带显式端口、
+不能带 path。`OPENCODE_SERVER_PASSWORD` 是
 OpenChamber 读取服务器密码所用的名字（OpenCode 服务器也接受
 `OPENCODE_PASSWORD`，但 OpenChamber 不读它）。`OPENCODE_SKIP_START=true`
 让 OpenChamber 附加而不是自起服务器；去掉它就会重新启动那个随机端口的
@@ -402,7 +404,7 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 | `#<id> [#<id> …] [text]` | 把 OpenCode 技能加载进本条消息的提示词（如 `#implement-spec 644`）；整段消息原样提交，匹配不到技能的 `#<id>` 原样保留为正文（`#644`、`C#caveman`、`##foreman` 都不是技能记号）。裸 `/skill` 打开技能选择卡片——可按 id/名称/描述搜索、每页 20 个翻页——`/skill <id>` 是别名，用于 `#` 形式打不出的 id（`2fa-helper`、`web_scrape`） |
 | `/autoaccept [on\|off]` | 查看/切换本会话是否自动放行工具权限请求 |
 | `/restart` | 重启 cola（保留启动参数与日志重定向） |
-| `/restart-opencode` | 重启 OpenCode 服务器（cola 自有的服务器或 V2 托管服务） |
+| `/restart-opencode` | 重启 OpenCode 服务器（cola 自有的服务器或 V2 Shared Service） |
 | `/update` | 按安装渠道更新 cola（GitHub Releases 自更新，或 `cargo install`/`cargo binstall` 安装的 cargo 命令） |
 | `/version` | 显示 cola 版本与构建来源（release / crates.io / dev 构建） |
 | `/help [command]` | 列出命令，或显示某一条的详细帮助 |
@@ -488,7 +490,7 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
   provider → model 选择卡片，其说明会显示下一条消息实际将运行的模型（会话
   自身的选择，否则 `[opencode] model`，否则服务器记录的值）。`/compact` 与
   `/stop` 需要真实会话，对待建状态保持它们的「还没有会话」回复。
-- `/restart-opencode` 会重启 Owned Server 或 V2 托管服务（`opencode service
+- `/restart-opencode` 会重启 Owned Server 或 V2 Shared Service（`opencode service
   restart`）；由其他工具启动的服务器不会被动（`NotOwned`）。
 - 话题规则：在已绑定会话的话题里，`/switch`、`/new`、`/dir` 与 `/sub attach`
   会被拒绝——请回到主聊天操作。从未绑定过会话的话题（包括 `/topic` 打开、
