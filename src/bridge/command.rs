@@ -1332,7 +1332,7 @@ pub(crate) async fn handle_command(
             // A server launched by another tool is never touched: cola has
             // no record of its configuration, and killing it could take
             // down another application's runtime.
-            match crate::bridge::discovery::restart_self_spawned_server().await {
+            match crate::bridge::discovery::restart_self_spawned_server(handles.preferred_port).await {
                 Ok(crate::bridge::discovery::RestartOutcome::Restarted) => {
                     handles
                         .flow

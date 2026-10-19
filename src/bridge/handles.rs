@@ -1662,6 +1662,11 @@ pub(crate) struct CommandHandles {
     pub(crate) flow: FlowHandles,
     pub(crate) config: TurnConfig,
     pub(crate) external: Arc<ExternalFlow>,
+    /// Preferred port from `[opencode] url` — the same tiebreaker
+    /// [`crate::bridge::discovery::pick_server`] applies, so
+    /// `/restart-opencode` restarts the canonical server among several of one
+    /// class rather than a lower-port sibling (spec #809, ADR-0085).
+    pub(crate) preferred_port: Option<u16>,
 }
 
 impl CommandHandles {

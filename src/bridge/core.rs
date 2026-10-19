@@ -440,6 +440,7 @@ impl SharedCore {
             flow: self.flow_handles(),
             config: self.turn_config(),
             external: Arc::clone(&self.external),
+            preferred_port: self.preferred_port,
         }
     }
 
