@@ -265,6 +265,17 @@ start_server = "auto"            # auto (default) | never | eager
   notify on every turn via `group_completion_notice`.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
 
+### `[review]` — all optional
+
+```toml
+[review]
+# base = "origin/main"
+```
+
+- **`base`** — the base ref `/diff` compares the working tree against when the
+  command names none. Unset resolves `origin/main`, then `main`, and errors if
+  neither exists. `/diff --base <ref>` overrides it for that call.
+
 ## Run
 
 ```bash
@@ -489,6 +500,7 @@ detailed help for any of these.
 | `/dir <path> [name]` | Declare a new session rooted at `<path>` — created by the next message |
 | `/claim <code>` | Claim this cola as Host (private chat only; code from the startup log) |
 | `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint (a markdown file keeps its source and offers a 「📖 渲染预览」 toggle), `.csv`/`.tsv` uses a markdown table, and images are embedded when Feishu's limits allow. Other binary files, images beyond those limits and text beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB upload cap; above it, nothing is sent and the card says 未发送. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths resolve as absolute paths, including outside the session directory |
+| `/diff [--base <ref>]` | Send this branch's **repository review** as one self-contained HTML File Message: committed changes since the fork point, uncommitted tracked changes, and untracked files. The base is `--base`, else `[review] base`, else `origin/main`, else `main`; cola never fetches and never touches the index. Runs in the conversation's current project directory and replies to the command message (its chat or topic). An empty review answers `分支 <branch> 相对 <base> 没有改动`; non-git directories and missing bases answer their own readable error. One `/diff` per chat per 10 seconds (`稍后再试`) |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
@@ -565,6 +577,13 @@ Notes:
   a Host opens. The Access List (`/claim`) gates who may **act** in cola (send
   commands or drive a session), not who may **read**: card content is visible to
   everyone in the chat.
+- `/diff` answers with a single self-contained `.html` **File Message** (no
+  card): open it to read the branch review, with per-file folds and red/green
+  hunk shading. The artifact is generated fresh on every call and sent into the
+  command's own chat or topic; an empty review sends no file, and a send whose
+  outcome is unknown is not retried (a retry could duplicate the message). The
+  10-second per-chat cooldown exists to stop a double click from uploading the
+  same review twice, so a deliberate re-run after an edit needs a short wait.
 - `/new`, `/dir` and `/topic` only **declare** the session — the conversation's
   next non-command message creates it in the chosen directory and maps it here,
   so a mistaken `/new`, `/dir` or `/topic` can be corrected with another `/new`,

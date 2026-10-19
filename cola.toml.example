@@ -67,3 +67,10 @@ app_secret = "your-app-secret"
 # instant_reminder = true
 # How many days of rotated daily logs to keep (default 14).
 # log_days = 14
+
+# Repository review (`/diff`). Optional.
+# The base ref /diff compares the working tree against. Leave it commented to
+# use the default chain: origin/main, then main. `/diff --base <ref>` overrides
+# this per call.
+# [review]
+# base = "origin/main"
