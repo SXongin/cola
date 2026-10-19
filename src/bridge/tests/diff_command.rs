@@ -401,6 +401,33 @@ async fn an_unborn_repository_is_named_unborn_unborn_html() {
     assert!(name.ends_with(".html"), "{name}");
 }
 
+/// An empty unborn repository (no commit, no files) has nothing to compare;
+/// naming `unborn` relative to `unborn` would read like an error, so it answers
+/// the no-commit line and sends no file.
+#[tokio::test]
+async fn an_empty_unborn_repository_answers_no_commits() {
+    let repo = tempfile::tempdir().unwrap();
+    git_in(repo.path(), &["init", "-b", "main"]);
+    git_in(repo.path(), &["config", "user.email", "test@example.com"]);
+    git_in(repo.path(), &["config", "user.name", "test"]);
+
+    let fx = diff_fixture(repo.path(), "chat_diff_unborn_empty", "chat_diff_unborn_empty").await;
+    fx.send("/diff", "msg_diff_unborn_empty", ConversationKind::P2p)
+        .await;
+
+    let calls = fx.calls().await;
+    assert!(uploads(&calls).is_empty(), "no file: {calls:?}");
+    assert!(file_messages(&calls).is_empty(), "no file: {calls:?}");
+    let texts = text_replies(&calls);
+    assert_eq!(texts.len(), 1, "{calls:?}");
+    assert_eq!(texts[0], "仓库还没有提交，没有可对比的改动。");
+    assert!(
+        !texts[0].contains("unborn"),
+        "the sentinel never reaches the user: {}",
+        texts[0]
+    );
+}
+
 /// An ambiguous send answers the shared unknown-send line, keeps its single
 /// upload, and never retries (a retry could duplicate the File Message).
 #[tokio::test]
