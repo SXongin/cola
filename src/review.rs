@@ -4,8 +4,10 @@
 //! The module answers one question — "what does this working tree change
 //! relative to the fork point with a base branch?" — and returns both the
 //! generic [`DiffDocument`] (#798) and the metadata the command needs to name
-//! the artifact and phrase an empty result (ticket #804). Nothing here writes
-//! to the repository: no fetch, no `git add`, no index mutation.
+//! the artifact and phrase an empty result (ticket #804). Nothing here stages
+//! or changes the repository: no fetch, no `git add`/`git add -N`, no staged
+//! entry and no tracked content is modified. `git diff` may refresh the index's
+//! stat cache, which is not a content change.
 //!
 //! Two caps are deliberately separate. This producer bounds the **raw patch**
 //! bytes (2 MiB for an untracked file's synthesized patch, 8 MiB in total) as a
@@ -1093,7 +1095,7 @@ mod tests {
 
     /// Acceptance: committed + unstaged + untracked changes all appear; the
     /// tracked counts are `git diff --numstat`'s, and git does not count
-    /// untracked files (they are separate additions). The index is untouched.
+    /// untracked files (they are separate additions). No staged entry changes.
     #[tokio::test]
     async fn mixed_committed_unstaged_and_untracked_changes() {
         let repo = Repo::init();
@@ -1114,7 +1116,7 @@ mod tests {
         let index_after = repo.git(&["ls-files", "-s", "-z"]);
         assert_eq!(
             index_before, index_after,
-            "review_diff must never touch the index"
+            "review_diff must never change the staged entries"
         );
 
         assert_eq!(review.base, "main");
