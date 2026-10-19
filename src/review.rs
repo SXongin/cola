@@ -18,6 +18,7 @@
 //!
 //! [`render_diff_html`]: crate::backend::render_diff_html
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -70,9 +71,16 @@ const MAX_TOTAL_PATCH_BYTES: usize = 8 * 1024 * 1024;
 /// One git invocation's wall-clock bound.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One untracked file's read bound. A stalled network filesystem must not keep
-/// the review pending; the entry degrades to [`UNREADABLE_NOTE`].
+/// One untracked file's inspection+read bound. A stalled network filesystem
+/// must not keep the review pending; the entry degrades to
+/// [`UNREADABLE_NOTE`].
 const UNTRACKED_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The whole untracked phase's bound. The per-entry bound alone does not bound
+/// the total: a large listing on a slow mount would otherwise wait an entry's
+/// timeout at a time. Once this expires the remaining entries are omitted as a
+/// group instead of being read one by one.
+const UNTRACKED_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// stdout bound for commands whose output is metadata, never a patch.
 const SMALL_STDOUT_BYTES: usize = 64 * 1024;
@@ -261,11 +269,33 @@ async fn assemble_files(
     complete_sections: usize,
     untracked: &[String],
 ) -> Result<(Vec<DiffFile>, Option<String>), ReviewError> {
+    assemble_files_with_timeout(
+        root,
+        entries,
+        sections,
+        complete_sections,
+        untracked,
+        UNTRACKED_TOTAL_TIMEOUT,
+    )
+    .await
+}
+
+/// [`assemble_files`] with an injectable total untracked budget, so the
+/// deadline is testable without waiting 30 s.
+async fn assemble_files_with_timeout(
+    root: &str,
+    entries: &[NumStatEntry],
+    sections: &[&str],
+    complete_sections: usize,
+    untracked: &[String],
+    untracked_budget: Duration,
+) -> Result<(Vec<DiffFile>, Option<String>), ReviewError> {
     let mut files = Vec::new();
     let mut used = 0usize;
     let mut omitted = 0usize;
     let mut stopped = false;
     let mut stopped_by_cap = false;
+    let mut stopped_by_time = false;
     // A cut tail is itself evidence of an incomplete read, even when the total
     // cap stops the entry loop before that tail's entry is reached.
     let mut stopped_by_stream = complete_sections < sections.len();
@@ -321,13 +351,25 @@ async fn assemble_files(
         omitted += by_path.len();
     }
 
+    // ONE total deadline for the whole untracked phase: per-entry timeouts
+    // alone would let a large listing on a slow mount wait indefinitely. Once
+    // it expires, the remaining entries are omitted as a group, never noted
+    // one by one.
+    let untracked_deadline = tokio::time::Instant::now() + untracked_budget;
     let root_path = Path::new(root);
-    for path in untracked {
+    for (index, path) in untracked.iter().enumerate() {
         if stopped {
             omitted += 1;
             continue;
         }
-        let file = match untracked_file(root_path, path).await {
+        let remaining = untracked_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            stopped_by_time = true;
+            omitted += untracked.len() - index;
+            break;
+        }
+        let budget = remaining.min(UNTRACKED_READ_TIMEOUT);
+        let file = match untracked_file(root_path, path, budget).await {
             // One entry that vanished or cannot be read is a note for that
             // path; it must never abort the whole review.
             Ok(file) => file,
@@ -346,7 +388,7 @@ async fn assemble_files(
     let truncated = (omitted > 0).then(|| {
         format!(
             "已省略 {omitted} 个文件（{}）",
-            omission_reason(stopped_by_cap, stopped_by_stream)
+            omission_reason(stopped_by_cap, stopped_by_stream, stopped_by_time)
         )
     });
     Ok((files, truncated))
@@ -354,16 +396,23 @@ async fn assemble_files(
 
 /// The readable cause of an omitted-file note. The byte cap is cola's bound;
 /// an incomplete stream is git's output ending early (or a section without a
-/// numstat row). They are distinct causes, so the note must not name the cap
-/// when the stream was what stopped the read.
-fn omission_reason(stopped_by_cap: bool, stopped_by_stream: bool) -> &'static str {
+/// numstat row); the untracked total deadline is the phase's time bound. They
+/// are distinct causes, so the note must name the one that actually stopped the
+/// loop — the time bound wins when it fired.
+fn omission_reason(stopped_by_cap: bool, stopped_by_stream: bool, stopped_by_time: bool) -> String {
+    if stopped_by_time {
+        return format!(
+            "未跟踪文件的读取超过 {} 秒总时限",
+            UNTRACKED_TOTAL_TIMEOUT.as_secs()
+        );
+    }
     match (stopped_by_cap, stopped_by_stream) {
-        (true, true) => "git 输出不完整或超出 8 MB 上限",
-        (true, false) => "原始 patch 超过 8 MB 上限",
-        (false, true) => "git 输出不完整",
+        (true, true) => "git 输出不完整或超出 8 MB 上限".to_string(),
+        (true, false) => "原始 patch 超过 8 MB 上限".to_string(),
+        (false, true) => "git 输出不完整".to_string(),
         // `assemble_files` only increments the omission counter under one of
-        // the two causes; keep a truthful fallback instead of an empty reason.
-        (false, false) => "超出上限",
+        // the causes above; keep a truthful fallback instead of an empty reason.
+        (false, false) => "超出上限".to_string(),
     }
 }
 
@@ -733,12 +782,13 @@ fn inspect_untracked(root: &Path, path: &str) -> Result<Inspected, ReviewError> 
     }
 }
 
-/// Build an untracked file's new-file patch. The whole inspection (metadata,
-/// symlink target, open and handle checks) runs in one blocking task under
-/// [`UNTRACKED_READ_TIMEOUT`]; only the returned regular file is read
-/// afterwards, under its own bounded read.
-async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError> {
-    match inspect_within(root, path, UNTRACKED_READ_TIMEOUT).await? {
+/// Build an untracked file's new-file patch. `budget` covers the whole entry:
+/// the inspection (metadata, symlink target, open and handle checks) runs in
+/// one blocking task under it, and the returned regular file is read under
+/// whatever remains. The caller passes `min(remaining total, per-entry cap)`.
+async fn untracked_file(root: &Path, path: &str, budget: Duration) -> Result<DiffFile, ReviewError> {
+    let entry_deadline = tokio::time::Instant::now() + budget;
+    match inspect_within(root, path, budget).await? {
         Inspected::Symlink(target) => {
             // The link's content is its target path; the target has no
             // trailing newline, which is why the synthesized line is fed one.
@@ -746,7 +796,8 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
             Ok(added_file(path.to_string(), patch, additions))
         }
         Inspected::File(file) => {
-            let bytes = match read_opened_within(file, UNTRACKED_READ_TIMEOUT).await {
+            let remaining = entry_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let bytes = match read_opened_within(file, remaining).await {
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => return Ok(note_file(path, UNREADABLE_NOTE)),
                 Err(error) => return Err(error),
@@ -1029,13 +1080,58 @@ fn note_file(path: &str, note: &str) -> DiffFile {
 }
 
 fn binary_added(path: &str) -> DiffFile {
-    note_file(path, &format!("Binary files /dev/null and b/{path} differ"))
+    note_file(
+        path,
+        &format!(
+            "Binary files /dev/null and {} differ",
+            quote_path(&format!("b/{path}"))
+        ),
+    )
+}
+
+/// Quote a synthesized-path field the way `git diff` does when it contains a
+/// control character, `"` or `\`; an ordinary path is returned unchanged. The
+/// document's [`DiffFile::path`] stays raw — only the patch headers are quoted,
+/// so a filename can never fabricate a hunk line.
+fn quote_path(path: &str) -> Cow<'_, str> {
+    let needs_quoting = path.chars().any(quoted_char);
+    if !needs_quoting {
+        return Cow::Borrowed(path);
+    }
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for ch in path.chars() {
+        match ch {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\x07' => quoted.push_str("\\a"),
+            '\x08' => quoted.push_str("\\b"),
+            '\t' => quoted.push_str("\\t"),
+            '\n' => quoted.push_str("\\n"),
+            '\x0b' => quoted.push_str("\\v"),
+            '\x0c' => quoted.push_str("\\f"),
+            '\r' => quoted.push_str("\\r"),
+            ch if quoted_char(ch) => quoted.push_str(&format!("\\{:03o}", ch as u32)),
+            ch => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    Cow::Owned(quoted)
+}
+
+/// Whether git's C-quoting escapes this character: ASCII controls (including
+/// DEL), `"` and `\` (with `core.quotepath=false`, non-ASCII stays raw).
+fn quoted_char(ch: char) -> bool {
+    ch == '"' || ch == '\\' || (ch as u32) < 0x20 || ch == '\x7f'
 }
 
 /// A new file's unified patch: the headers the renderer drops, one hunk and one
 /// `+` line per content line. Returns the patch and its added-line count.
 fn new_file_patch(path: &str, text: &str) -> (String, usize) {
-    let mut patch = format!("Index: {path}\n--- /dev/null\n+++ b/{path}\n");
+    let index = quote_path(path);
+    let prefixed = format!("b/{path}");
+    let destination = quote_path(&prefixed);
+    let mut patch = format!("Index: {index}\n--- /dev/null\n+++ {destination}\n");
     if text.is_empty() {
         return (patch, 0);
     }
@@ -1989,6 +2085,41 @@ mod tests {
         assert!(!file.patch.contains('\0'));
     }
 
+    /// A filename with a newline cannot fabricate a hunk: the synthesized
+    /// headers are C-quoted, while the document keeps the raw path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_untracked_name_cannot_fabricate_a_hunk() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        let name = "evil\n@@ -0,0 +1,1 @@\n+fake";
+        repo.write(name, "real\n");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let file = find(&review, name);
+        assert_eq!(file.path, name, "the document keeps the raw path");
+        assert!(
+            file.patch.contains("Index: \"evil\\n@@ -0,0 +1,1 @@\\n+fake\""),
+            "{}",
+            file.patch
+        );
+        assert!(
+            file.patch.contains("+++ \"b/evil\\n@@ -0,0 +1,1 @@\\n+fake\""),
+            "{}",
+            file.patch
+        );
+
+        let html = crate::backend::render_diff_html(&review.document);
+        assert_eq!(
+            html.matches("<span class=\"line add\">").count(),
+            1,
+            "only the real content line is an addition"
+        );
+        assert!(html.contains("<span class=\"code\">+real"));
+        assert!(!html.contains("<span class=\"code\">+fake"));
+    }
+
     /// Untracked text becomes a new-file patch; a binary or an oversized
     /// untracked file is one note line with no payload.
     #[tokio::test]
@@ -2361,11 +2492,20 @@ mod tests {
     /// git's output was cut.
     #[test]
     fn omission_reason_names_the_real_cause() {
-        assert_eq!(omission_reason(true, false), "原始 patch 超过 8 MB 上限");
-        assert_eq!(omission_reason(false, true), "git 输出不完整");
-        let both = omission_reason(true, true);
+        assert_eq!(omission_reason(true, false, false), "原始 patch 超过 8 MB 上限");
+        assert_eq!(omission_reason(false, true, false), "git 输出不完整");
+        let both = omission_reason(true, true, false);
         assert!(both.contains("git 输出不完整"), "{both}");
         assert!(both.contains("8 MB"), "{both}");
+
+        // The time bound wins when it is what stopped the loop, even if the
+        // byte cap or the stream also contributed.
+        for cap in [false, true] {
+            for stream in [false, true] {
+                let timed = omission_reason(cap, stream, true);
+                assert!(timed.contains("30 秒总时限"), "{timed}");
+            }
+        }
     }
 
     #[test]
@@ -2507,6 +2647,38 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.txt");
         assert!(truncated.unwrap().contains("git 输出不完整"));
+    }
+
+    /// The untracked phase has ONE total deadline: with no budget left no
+    /// entry is read, and the remaining entries are omitted as a group with a
+    /// time note, not one note each.
+    #[tokio::test]
+    async fn the_untracked_phase_has_one_total_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("readable.txt"), "content\n").unwrap();
+        let paths: Vec<String> = (0..5)
+            .map(|index| format!("entry{index}.txt"))
+            .chain(std::iter::once("readable.txt".to_string()))
+            .collect();
+
+        let (files, truncated) = assemble_files_with_timeout(
+            dir.path().to_str().unwrap(),
+            &[],
+            &[],
+            0,
+            &paths,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            files.is_empty(),
+            "no untracked entry may be read past the total deadline"
+        );
+        let note = truncated.expect("the total deadline must be reported");
+        assert!(note.contains("6 个文件"), "{note}");
+        assert!(note.contains("30 秒总时限"), "{note}");
     }
 
     /// The untracked read is time-bounded: an exhausted budget is the
