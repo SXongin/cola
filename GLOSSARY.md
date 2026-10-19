@@ -296,6 +296,18 @@ _Avoid_: File preview, viewer card, /cat card (the command is `/cat`; the thing 
 How a user-supplied path resolves on the Host machine: relative to the **Session**'s directory (the conversation's current **Project** while the **Session** is still **Pending**), `~` expanded, absolute paths passed through (ADR-0083). It is a **privacy hint, not a security control** — the **Directory Browser** has always had the same reach, and a sound boundary needs fd-relative traversal (#673). The **Access List** gates who may act; the readers of a card are gated not at all.
 _Avoid_: Browse root, sandbox, jail, allowed paths (each claims a boundary this is not)
 
+**Terminal Command** (终端命令):
+One shell command the **Host** runs on the Host machine from Feishu without the model in the loop: a single child process, one `sh -c`, its cwd on the **Path Scope**'s base, its output going straight into a **Terminal Log** (ADR-0086). Entered as the `/run <cmd>` **Command**, or by a message whose first character is `!` followed by non-empty text — `!` is a message prefix, not a **Command**. One-shot by design: no `cd`/`export` state carries between commands, and its output never enters the Session Transcript.
+_Avoid_: Shell command (that is the Backend's `shell`/`bash` **Built-in Tool**), execution (the Backend's own unit), bash (one shell, not the concept), terminal session (there is no session)
+
+**Terminal Card** (终端命令卡):
+The **Command** card rendering one **Terminal Command** (ADR-0086): a header naming the resolved cwd and the command, a live tail of the newest output lines while it runs, and on settle the exit code and elapsed time. A member of the *command card* family like the **File Viewer** — standalone, joins no **Card Chain**, never written to the **Chain Record**, never reaped — and it carries 「⏹ 终止」, 「↻ 重跑」, 「📄 完整输出」 and 「问 AI」. A command whose cola died mid-run is marked 已失去跟踪 and never claims to be running (that wording is load-bearing: a supervised cola's restart takes the child with it, a hand-launched one's does not).
+_Avoid_: Terminal panel, console card, output card
+
+**Terminal Log** (终端日志):
+The file a **Terminal Command**'s merged stdout and stderr are written to directly — `~/.cola/terminal/<id>.log` — which the **Terminal Card** tails and 「📄 完整输出」 delivers (ADR-0086). Distinct from cola's **application log** (`cola-YYYY-MM-DD.log`, swept by `[bridge] log_days`): it is command output, which is where credentials leak, so it is bounded and swept by age rather than kept.
+_Avoid_: Log (unqualified — it collides with the application log), output buffer, console log
+
 **Rich Text Message** (富文本消息):
 The Feishu `post` message carrying an `md` tag that cola posts when a card structurally cannot hold a preview — past the element budget, the five-table cap or the 49-row table cap (ADR-0083). CommonMark 0.31 + GFM: headings, lists, footnotes, fenced code blocks and tables, and it is **reported** to carry none of the card's element and table caps — a claim the research marks unverified, so a failure degrades to a **File Message** (ADR-0083, decisions 5 and 6). The same 30 KB body cap as a card, and editable in place under the platform's own edit limit. It is not a **Card** — no buttons, no interactivity — and deliberately not the overflow lane for size alone; contrast a **File Message**, which carries the whole bytes.
 _UI label_: none — it renders as an ordinary chat message.
