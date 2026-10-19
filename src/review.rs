@@ -19,7 +19,7 @@
 //! [`render_diff_html`]: crate::backend::render_diff_html
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -34,10 +34,12 @@ const DEFAULT_BASES: [&str; 2] = ["origin/main", "main"];
 /// The deterministic diff configuration shared by the patch and `--numstat`
 /// calls: user config must not rewrite the output, and renames are detected.
 /// `--ignore-submodules=none` overrides a user's `diff.ignoreSubmodules=all`,
-/// which would otherwise omit changed submodules from both calls. The patch
-/// call adds `-U3`; the numstat call must not (it would also request patch
-/// output).
-const DIFF_FLAGS: [&str; 8] = [
+/// which would otherwise omit changed submodules from both calls. The explicit
+/// `a/`/`b/` prefixes override `diff.mnemonicPrefix` and `diff.noprefix`, so
+/// section paths stay in the form [`section_path`] strips and still pair with
+/// `--numstat`. The patch call adds `-U3`; the numstat call must not (it would
+/// also request patch output).
+const DIFF_FLAGS: [&str; 10] = [
     "-c",
     "core.quotepath=false",
     "diff",
@@ -45,6 +47,8 @@ const DIFF_FLAGS: [&str; 8] = [
     "--no-ext-diff",
     "--no-textconv",
     "--ignore-submodules=none",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
     "-M",
 ];
 
@@ -702,8 +706,11 @@ fn inspect_untracked(root: &Path, path: &str) -> Result<Inspected, ReviewError> 
     let full = root.join(path);
     let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
     if meta.file_type().is_symlink() {
-        let Ok(target) = std::fs::read_link(&full) else {
-            return Ok(Inspected::Note(UNREADABLE_NOTE));
+        // Read the link through the same component walk as a file open: a
+        // parent swapped for a symlink must not redirect the read to an
+        // outside target.
+        let Some(target) = read_link_beneath(root, path)? else {
+            return Ok(Inspected::Note(IRREGULAR_NOTE));
         };
         let target = target.to_string_lossy();
         if target.len() > MAX_FILE_PATCH_BYTES {
@@ -775,6 +782,73 @@ fn beneath_components(relative: &str) -> Option<Vec<&str>> {
             .iter()
             .any(|component| component.is_empty() || *component == "." || *component == ".."))
     .then_some(components)
+}
+
+/// Read a symlink's target without following any path component: the parent
+/// directories are walked with `openat(O_NOFOLLOW)` and the final component is
+/// resolved with `readlinkat`. A parent swapped for a symlink, a missing
+/// component, or a final entry that is no longer a symlink is `None` (the
+/// caller emits the one-line note).
+#[cfg(unix)]
+fn read_link_beneath(root: &Path, relative: &str) -> Result<Option<PathBuf>, ReviewError> {
+    use rustix::fs::{CWD, Mode, OFlags};
+    use std::os::unix::ffi::OsStringExt;
+
+    let Some(components) = beneath_components(relative) else {
+        return Ok(None);
+    };
+    let Some((name, parents)) = components.split_last() else {
+        return Ok(None);
+    };
+
+    let root_dir = rustix::fs::openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| map_io_error(error.into()))?;
+
+    let mut dir = root_dir;
+    for component in parents {
+        let opened = match rustix::fs::openat(
+            &dir,
+            *component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                return match error {
+                    rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT => {
+                        Ok(None)
+                    }
+                    _ => Err(map_io_error(error.into())),
+                };
+            }
+        };
+        dir = opened;
+    }
+
+    match rustix::fs::readlinkat(&dir, *name, Vec::new()) {
+        Ok(target) => Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
+            target.into_bytes(),
+        )))),
+        Err(error) => match error {
+            rustix::io::Errno::LOOP
+            | rustix::io::Errno::NOTDIR
+            | rustix::io::Errno::NOENT
+            | rustix::io::Errno::INVAL => Ok(None),
+            _ => Err(map_io_error(error.into())),
+        },
+    }
+}
+
+/// A component-verified link read needs `readlinkat`; without it, an untracked
+/// symlink becomes the one-line note rather than a parent-following read.
+#[cfg(not(unix))]
+fn read_link_beneath(_root: &Path, _relative: &str) -> Result<Option<PathBuf>, ReviewError> {
+    Ok(None)
 }
 
 /// Open an untracked file for reading without leaving the repository root.
@@ -1645,6 +1719,56 @@ mod tests {
         assert!(file.patch.contains("+CHANGED"));
     }
 
+    /// User prefix config must not break path pairing: the command line pins
+    /// `a/`/`b/`, overriding both `diff.mnemonicPrefix` and `diff.noprefix`.
+    #[tokio::test]
+    async fn explicit_prefixes_ignore_mnemonic_and_noprefix_config() {
+        let repo = Repo::init();
+        repo.git(&["config", "diff.mnemonicPrefix", "true"]);
+        repo.git(&["config", "diff.noprefix", "true"]);
+
+        repo.write("tracked.txt", "one\n");
+        let original: String = (0..10).map(|line| format!("line{line}\n")).collect();
+        repo.write("old.txt", &original);
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("tracked.txt", "one\ntwo\n");
+        repo.git(&["add", "tracked.txt"]);
+        repo.git(&["mv", "old.txt", "new.txt"]);
+        repo.write("new.txt", original.replace("line5\n", "CHANGED\n"));
+        repo.git(&["add", "new.txt"]);
+
+        let assert_paired = |review: &ReviewDiff| {
+            assert!(
+                review.document.truncated.is_none(),
+                "sections must pair with their numstat rows: {:?}",
+                review.document.truncated
+            );
+            assert_eq!(review.document.files.len(), 2);
+
+            let tracked = find(review, "tracked.txt");
+            assert_eq!(tracked.status, "modified");
+            assert_eq!((tracked.additions, tracked.deletions), (1, 0));
+            assert!(tracked.patch.contains("--- a/tracked.txt"));
+            assert!(tracked.patch.contains("+++ b/tracked.txt"));
+
+            let renamed = find(review, "new.txt");
+            assert_eq!(renamed.status, "renamed");
+            assert_eq!((renamed.additions, renamed.deletions), (1, 1));
+            assert!(renamed.patch.contains("rename from old.txt"));
+            assert!(renamed.patch.contains("rename to new.txt"));
+        };
+
+        // Both keys set (`noprefix` normally wins), and then mnemonic prefixes
+        // alone, whose `w/` spelling would otherwise never pair.
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_paired(&review);
+
+        repo.git(&["config", "diff.noprefix", "false"]);
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_paired(&review);
+    }
+
     /// Acceptance: a binary file keeps its status but no payload — one
     /// `Binary files … differ` line.
     #[tokio::test]
@@ -1963,6 +2087,33 @@ mod tests {
             )
         );
         assert!(!link.patch.contains("OUTSIDE-SECRET"));
+    }
+
+    /// A link listed while its parent was real, with the parent then swapped
+    /// for a symlink to an outside directory, must not leak the outside
+    /// link's target: the component walk refuses the parent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_behind_a_swapped_parent_is_a_note_not_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("dir")).unwrap();
+        std::os::unix::fs::symlink("/outside/secret-target", outside.path().join("dir/link")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("dir"), root.path().join("dir")).unwrap();
+
+        let (files, truncated) = assemble_files(
+            root.path().to_str().unwrap(),
+            &[],
+            &[],
+            0,
+            &["dir/link".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(truncated.is_none());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].patch, IRREGULAR_NOTE);
+        assert!(!files[0].patch.contains("/outside/secret-target"));
     }
 
     /// base resolution prefers `origin/main` over `main`, and an explicit base
