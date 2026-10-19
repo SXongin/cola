@@ -28,10 +28,12 @@ pub struct TurnDiff(pub Vec<TurnDiffFile>);
 
 impl TurnDiff {
     /// The index line's counts: the number of files and the line totals, read
-    /// from exactly the entries the complete-diff artifact renders. Every
-    /// producer dedupes by path before building the view (#800's tool-metadata
-    /// aggregation keeps the final state of a file edited twice), so folding
-    /// here can never count one file twice.
+    /// from exactly the entries this view carries. Every producer dedupes by
+    /// path before building the view (#800's tool-metadata aggregation keeps
+    /// the final recorded state of a file edited twice), so folding here can
+    /// never count one file twice. #477's card index folds this transcript-side
+    /// estimate; on V2 the opened artifact is the authoritative `session.diff`
+    /// and may show more, so a consumer must not present the two as one read.
     pub fn stats(&self) -> TurnDiffStats {
         TurnDiffStats {
             files: self.0.len(),
@@ -48,8 +50,9 @@ impl TurnDiff {
 }
 
 /// The compact counts the Turn's index line shows (#477): `N files · +A −D`,
-/// derived from a [`TurnDiff`]'s deduped entries so the index and the artifact
-/// cannot disagree.
+/// derived from a [`TurnDiff`]'s deduped entries. The card index folds the #800
+/// transcript-side estimate; on V2 the artifact reads `session.diff` and is
+/// authoritative, so the two are allowed to differ (see the card module).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnDiffStats {
     pub files: usize,

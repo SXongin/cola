@@ -6,13 +6,24 @@
 //! complete red/green diff is the HTML artifact (spec decision 1), so no patch
 //! body ever rides the card.
 //!
-//! The counts are the [`TurnDiff::stats`](crate::backend::TurnDiff::stats) fold
-//! over the #800 aggregation — the same deduped entries the artifact renders —
-//! so the index and what the reader opens cannot disagree. The button's payload
-//! names the Turn by its [`TurnAnchor`](crate::backend::TurnAnchor) user message
-//! (`from`), which is exactly the `session.diff` range the click asks for; a
-//! card with no anchor renders neither element, because an entry that cannot
-//! name its Turn would open another Turn's diff.
+//! The counts are a **transcript-side estimate**, not the artifact's read: the
+//! [`TurnDiff::stats`](crate::backend::TurnDiff::stats) fold over #800's
+//! aggregation of the Turn's recorded tool patches, deduped by path with the
+//! last recorded patch per path winning. #477 forbids a network read at render
+//! time, so on V2 this is deliberately not the same source the click uses:
+//! opening the button fetches the authoritative `session.diff` for the Turn
+//! (turn start → now), and that artifact can report larger counts when a file
+//! was edited more than once or changed outside a file-editing tool (a
+//! formatter or `git checkout` in `bash`). V1's artifact falls back to this
+//! same aggregation, so only V2 has the gap. The artifact's numbers are the
+//! ones that count; the index pays this fidelity for a render that never waits
+//! on the server.
+//!
+//! The button's payload names the Turn by its
+//! [`TurnAnchor`](crate::backend::TurnAnchor) user message (`from`), which is
+//! exactly the `session.diff` range the click asks for; a card with no anchor
+//! renders neither element, because an entry that cannot name its Turn would
+//! open another Turn's diff.
 //!
 //! [`index_elements`] is the one renderer and [`index_estimate`] measures its
 //! own output (`serde_json` bytes), so the card-size estimate charges exactly
@@ -32,7 +43,8 @@ pub(crate) const TURN_DIFF_OP: &str = "turn_diff";
 /// button. The split estimator charges them together, never one alone.
 pub(crate) const INDEX_COMPONENTS: usize = 2;
 
-/// The index line, from the deduped stats the artifact also uses.
+/// The index line, from the transcript-side estimate (#800 aggregation, last
+/// recorded patch per path) — the artifact's own read may be larger on V2.
 pub(crate) fn index_line(stats: TurnDiffStats) -> String {
     format!(
         "📝 本次改动 · {} files · +{} −{}",

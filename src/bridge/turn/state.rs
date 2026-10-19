@@ -2169,8 +2169,12 @@ impl StreamAccumulator {
     /// Refresh the Turn's change-index counts from a transcript read (spec
     /// #797, ticket #477): the #800 aggregation folds the Turn's settled
     /// file-editing calls into one [`TurnDiff`](crate::backend::TurnDiff),
-    /// deduped by path, and its stats are exactly what the complete-diff
-    /// artifact will render. The walk is local — no backend request — so a card
+    /// deduped by path with the last recorded patch per path winning. This is
+    /// an ESTIMATE, not the artifact's source: the card renders it without a
+    /// network read (#477's rule), while V2's opened artifact is the
+    /// authoritative `session.diff` for the Turn and can report larger counts
+    /// when a file was edited more than once or changed outside a
+    /// file-editing tool. The walk is local — no backend request — so a card
     /// render can always read the stored counts. Returns whether the rendered
     /// counts changed: a newly settled edit is rendered content and owes its
     /// flush. An empty diff stores zeroes, and the card then renders neither

@@ -5,10 +5,14 @@
 //! unified patches the file-editing tools recorded on their calls: an `edit`
 //! call's `metadata.diff`, an `apply_patch` / `patch` call's
 //! `metadata.files[].patch`. [`turn_diff_from_tools`] folds those into the same
-//! neutral [`TurnDiff`] V2's `session.diff` produces, so neither the #477 index
-//! line nor #801's artifact branches on a Generation, and [`TurnDiff::stats`]
-//! gives the index its `N files · +A −D` from exactly the entries the artifact
-//! renders.
+//! neutral [`TurnDiff`] V2's `session.diff` produces, so the #477 index line
+//! never branches on a Generation, and [`TurnDiff::stats`] gives it its
+//! `N files · +A −D`. The index is an ESTIMATE from the recorded patches: on V1
+//! the artifact's fallback reads this same aggregation, while on V2 the
+//! artifact is the authoritative `session.diff` for the Turn and may report
+//! more when a file was edited more than once or changed outside a file-editing
+//! tool. #477's no-network render rule is why the card does not read
+//! `session.diff` itself; see the card module for the documented trade.
 //!
 //! **What this view means — and does not.** It is "what the tools recorded
 //! they did", not "what the working tree finally became". A `bash` call that
