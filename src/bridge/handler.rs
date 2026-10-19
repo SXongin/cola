@@ -221,6 +221,71 @@ enum ViewerFileTransferStatus {
     OutcomeUnknown,
 }
 
+/// The process-local state of one Turn Diff delivery (#801), keyed by
+/// `(session_id, from)` — the card's exact Turn identity. `Sending` is the
+/// single-flight claim (a concurrent click is a no-op); `Sent` and
+/// `OutcomeUnknown` are terminal and make every later click a no-op. A
+/// definite failure removes the entry, because nothing was sent and a retry is
+/// not a duplicate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnDiffSendState {
+    Sending,
+    Sent,
+    OutcomeUnknown,
+}
+
+/// One Turn Diff callback's whole routing payload, owned by the spawned task.
+struct TurnDiffClick {
+    session_id: String,
+    /// The Turn anchor's user-message id (empty is allowed for future entries;
+    /// V2 then asks for the latest Turn, while V1 cannot aggregate without it).
+    from: String,
+    /// The per-child-session routing key the #477 button carries.
+    directory: String,
+    /// The clicked Turn card, which the File Message replies under
+    /// (`open_message_id` — never part of the card's own JSON).
+    message_id: String,
+}
+
+/// RAII claim for one in-flight Turn Diff delivery. A duplicate click is
+/// acknowledged without spawning a second one; Drop releases the claim —
+/// removing a `Sending` entry so a failed or cancelled attempt stays retryable.
+struct TurnDiffClaim {
+    sends: Arc<std::sync::Mutex<indexmap::IndexMap<(String, String), TurnDiffSendState>>>,
+    key: (String, String),
+}
+
+impl Drop for TurnDiffClaim {
+    fn drop(&mut self) {
+        let mut sends = self
+            .sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sends.get(&self.key) == Some(&TurnDiffSendState::Sending) {
+            sends.shift_remove(&self.key);
+        }
+    }
+}
+
+/// What an empty Turn's click answers (spec #797 decision 7). No file is
+/// generated for a Turn that changed nothing.
+const TURN_DIFF_EMPTY_TEXT: &str = "本 turn 没有文件改动";
+
+/// What a failed fetch, render or upload answers. The click is never silent,
+/// and a definite failure is not retried to the caller's timeout.
+const TURN_DIFF_FAILURE_TEXT: &str = "生成完整 diff 失败，请稍后重试。";
+
+/// What an ambiguous File Message send answers: the request may have reached
+/// Feishu, so retrying could duplicate it (the viewer's same words).
+const TURN_DIFF_UNKNOWN_TEXT: &str = "发送结果未知，为避免重复未重试。";
+
+/// The artifact's `title`: what the reader opens from the Turn card.
+const TURN_DIFF_TITLE: &str = "本次改动的完整 diff";
+
+/// The V1 provenance marker (spec #797 decision 8): the aggregated tool
+/// metadata says what the tools did, not what the working tree became.
+const TURN_DIFF_V1_SUBTITLE: &str = "按工具记录聚合";
+
 /// The bridge coordinator. Owns the state shared by every flow ([`SharedCore`])
 /// plus the per-flow modules that hold their own private state. `Deref`s to the
 /// shared core so the coordinator's own code can reach the aggregate; flows
@@ -238,6 +303,10 @@ pub struct App {
     /// either a confirmed send or an ambiguous timeout.
     viewer_file_transfers_sent:
         Arc<std::sync::Mutex<indexmap::IndexMap<ViewerFileTransferKey, ViewerFileTransferStatus>>>,
+    /// Turn Diff deliveries, keyed by `(session_id, from)` and bounded like the
+    /// File Message guard (#801): one artifact per Turn per process, with the
+    /// `Sending` claim making concurrent clicks a no-op.
+    turn_diff_sends: Arc<std::sync::Mutex<indexmap::IndexMap<(String, String), TurnDiffSendState>>>,
     /// Weak self-reference, set once inside `run` (which holds the Arc). Lets
     /// the `EventSink` trait impl (which only has `&self`) recover a
     /// `&Arc<App>` to hand to the inherent methods. `Weak` so it never keeps
@@ -788,6 +857,54 @@ fn viewer_preview_failure_reason(size: u64) -> &'static str {
 /// and a silent ambiguous outcome reads as a silent failure.
 const VIEWER_PREVIEW_UNKNOWN_LINE: &str = "⚠️ 发送结果未知，为避免重复未重试。";
 
+/// The Toast a Turn Diff delivery's stored state answers a repeated click with.
+fn turn_diff_state_toast(state: TurnDiffSendState) -> &'static str {
+    match state {
+        TurnDiffSendState::Sending => "正在生成完整 diff…",
+        TurnDiffSendState::Sent => "已发送",
+        TurnDiffSendState::OutcomeUnknown => TURN_DIFF_UNKNOWN_TEXT,
+    }
+}
+
+/// Build the artifact's document from the neutral Turn Diff. `from_tools` marks
+/// the V1 aggregation (spec #797 decision 8): the subtitle names the source as
+/// 「按工具记录聚合」, because it says what the tools recorded, not what the
+/// working tree became.
+fn turn_diff_document(
+    diff: &crate::backend::TurnDiff,
+    click: &TurnDiffClick,
+    from_tools: bool,
+) -> crate::backend::DiffDocument {
+    let turn = if click.from.is_empty() {
+        "最新 turn"
+    } else {
+        click.from.as_str()
+    };
+    let mut subtitle = format!("Session {} · {}", click.session_id, turn);
+    if !click.directory.is_empty() {
+        subtitle.push_str(" · ");
+        subtitle.push_str(&click.directory);
+    }
+    if from_tools {
+        subtitle.push_str(" · ");
+        subtitle.push_str(TURN_DIFF_V1_SUBTITLE);
+    }
+    crate::backend::DiffDocument::from_turn_diff(diff.clone(), TURN_DIFF_TITLE, subtitle)
+}
+
+/// The artifact's filename: ASCII, short and reproducible from the Turn's
+/// identity (`session_id`, `from`), so the same click names the same file and a
+/// client's extension-based preview always routes to the HTML renderer. FNV-1a
+/// is spelled out because the name must not depend on a process's hash seed.
+fn turn_diff_file_name(session_id: &str, from: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in session_id.bytes().chain([0]).chain(from.bytes()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("diff-{:012x}.html", hash & 0x0000_ffff_ffff_ffff)
+}
+
 /// RAII claim for one in-flight File Viewer action. A duplicate callback gets
 /// acknowledged without spawning another sender; Drop releases even if the
 /// spawned task is cancelled or unwinds.
@@ -1121,6 +1238,7 @@ impl App {
             access,
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
+            turn_diff_sends: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
         })
     }
 
@@ -2147,9 +2265,16 @@ impl App {
             return Some(refusal);
         }
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let (session_id, thread_key) = self.card_action_span_context(&value).await;
         let action_span = span::action(session_id.as_deref(), thread_key.as_ref());
         let dispatch = async {
+            // The Turn card's 「🔍 查看完整改动」 carries `op` and NO `action`
+            // (#477/spec #797): route it before the action match, without
+            // widening the button's exact four-key payload.
+            if op == crate::feishu::card::turn_diff::TURN_DIFF_OP {
+                return self.handle_turn_diff_action(&value).await;
+            }
             match action {
                 "perm" => {
                     self.permission
@@ -4335,6 +4460,271 @@ impl App {
         })
     }
 
+    /// Handle the Turn card's 「🔍 查看完整改动」 click (spec #797, ticket #801).
+    ///
+    /// Feishu's card callback has a 3 s, no-retry budget (ADR-0078) and a diff
+    /// fetch + HTML upload cannot fit it, so the click claims the Turn, spawns
+    /// the delivery and returns a Toast immediately. The in-process guard is
+    /// keyed by `(session_id, from)` — the card's exact Turn identity — and is
+    /// bounded like the File Message once-guard: a later click is a no-op
+    /// (「已发送」, or the ambiguous-send wording) and never generates or uploads
+    /// again. Distinct Turns are distinct keys.
+    async fn handle_turn_diff_action(
+        self: &Arc<Self>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let session_id = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let from = value
+            .get("from")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let directory = value
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let message_id = value
+            .get("open_message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if session_id.is_empty() || message_id.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        }
+        let key = (session_id.clone(), from.clone());
+        {
+            let sends = self
+                .turn_diff_sends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(state) = sends.get(&key) {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(turn_diff_state_toast(*state).to_string()),
+                });
+            }
+        }
+        let Some(claim) = self.claim_turn_diff(&key) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("正在生成完整 diff…".to_string()),
+            });
+        };
+        let click = TurnDiffClick {
+            session_id,
+            from,
+            directory,
+            message_id,
+        };
+        let app = Arc::clone(self);
+        tokio::spawn(async move {
+            let _claim = claim;
+            app.run_turn_diff_delivery(click).await;
+        });
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在生成完整 diff…".to_string()),
+        })
+    }
+
+    /// Claim one Turn Diff delivery. `None` means a delivery for the same
+    /// Turn is already in flight (the guard's Drop releases a failed one).
+    fn claim_turn_diff(&self, key: &(String, String)) -> Option<TurnDiffClaim> {
+        let mut sends = self
+            .turn_diff_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if sends.contains_key(key) {
+            return None;
+        }
+        while sends.len() >= crate::bridge::handles::FILE_MESSAGE_SENDS_CAP
+            && crate::bridge::handles::evict_oldest_idle(&mut sends, |state| {
+                *state != TurnDiffSendState::Sending
+            })
+        {}
+        sends.insert(key.clone(), TurnDiffSendState::Sending);
+        Some(TurnDiffClaim {
+            sends: Arc::clone(&self.turn_diff_sends),
+            key: key.clone(),
+        })
+    }
+
+    /// Mark a delivery's terminal state. The RAII claim leaves terminal states
+    /// in place (only `Sending` is removed on drop).
+    fn set_turn_diff_state(&self, key: &(String, String), state: TurnDiffSendState) {
+        let mut sends = self
+            .turn_diff_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = sends.get_mut(key) {
+            *entry = state;
+        }
+    }
+
+    /// The off-callback Turn Diff delivery (#801): read the Turn's diff (V2's
+    /// `session.diff`, or V1's tool-metadata aggregation), render the
+    /// self-contained HTML artifact, upload it once and post exactly ONE File
+    /// Message under the clicked Turn card. Every network step is bounded by
+    /// the viewer transfer's bound; every failure is spoken, never dropped.
+    async fn run_turn_diff_delivery(self: &Arc<Self>, click: TurnDiffClick) {
+        let key = (click.session_id.clone(), click.from.clone());
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let diff = match self.read_turn_diff(&click, timeout_ms).await {
+            Ok((diff, from_tools)) => (diff, from_tools),
+            Err(()) => {
+                self.reply_turn_diff_line(&click.message_id, TURN_DIFF_FAILURE_TEXT, timeout_ms)
+                    .await;
+                return;
+            }
+        };
+        let (diff, from_tools) = diff;
+        if diff.is_empty() {
+            self.reply_turn_diff_line(&click.message_id, TURN_DIFF_EMPTY_TEXT, timeout_ms)
+                .await;
+            return;
+        }
+        let document = turn_diff_document(&diff, &click, from_tools);
+        let html = crate::backend::render_diff_html(&document);
+        let name = turn_diff_file_name(&click.session_id, &click.from);
+        let content = crate::backend::FileContent::from_bytes("text/html", &name, html.into_bytes());
+        let hash = crate::bridge::handles::content_identity_hash(
+            &content.mime,
+            &content.name,
+            content.data.as_deref().unwrap_or_default(),
+        );
+        let delivery = crate::bridge::viewer::send_file_message(
+            &self.feishu,
+            &self.cards_handle(),
+            &click.message_id,
+            &content,
+            hash,
+            timeout_ms,
+        )
+        .await;
+        match delivery {
+            crate::feishu::card::tool_render::FileDelivery::SentAsFile => {
+                self.set_turn_diff_state(&key, TurnDiffSendState::Sent);
+            }
+            crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
+                self.set_turn_diff_state(&key, TurnDiffSendState::OutcomeUnknown);
+                self.reply_turn_diff_line(&click.message_id, TURN_DIFF_UNKNOWN_TEXT, timeout_ms)
+                    .await;
+            }
+            _ => {
+                // A definite non-send: the RAII claim removes the `Sending`
+                // entry, so a later click may retry — nothing escaped.
+                self.reply_turn_diff_line(&click.message_id, TURN_DIFF_FAILURE_TEXT, timeout_ms)
+                    .await;
+            }
+        }
+    }
+
+    /// Read one Turn Diff. V2's session diff (scoped to the Turn's snapshot by
+    /// `from`) is the source; `Ok(None)` sends us to #800's aggregation over
+    /// the Turn's tool metadata, carrying the `from_tools` marker the artifact
+    /// must name. `Err` is a failed read the caller speaks as a failure.
+    async fn read_turn_diff(
+        self: &Arc<Self>,
+        click: &TurnDiffClick,
+        timeout_ms: u64,
+    ) -> std::result::Result<(crate::backend::TurnDiff, bool), ()> {
+        let from = (!click.from.is_empty()).then_some(click.from.as_str());
+        match crate::bridge::bounded_call(
+            "turn diff read",
+            timeout_ms,
+            self.opencode.session_diff(&click.session_id, from, None, Some(3)),
+        )
+        .await
+        {
+            Some(Ok(Some(diff))) => Ok((diff, false)),
+            // V1 has no session diff endpoint: aggregate the Turn's tool
+            // metadata instead. The payload carries the directory for the
+            // child-session routing the Turn card came from.
+            Some(Ok(None)) => {
+                tracing::debug!(
+                    "turn diff: V1 aggregation for {} (directory {:?})",
+                    click.session_id,
+                    click.directory
+                );
+                self.read_turn_diff_from_tools(click, timeout_ms).await
+            }
+            Some(Err(error)) => {
+                tracing::warn!("turn diff: session diff read failed: {error}");
+                Err(())
+            }
+            None => Err(()),
+        }
+    }
+
+    /// The V1 arm: resolve the Turn's user-message anchor in the transcript and
+    /// fold the settled file-edit calls into the same neutral `TurnDiff`
+    /// (#800). No anchor means the click cannot name a Turn — a failure, never
+    /// another Turn's diff.
+    async fn read_turn_diff_from_tools(
+        self: &Arc<Self>,
+        click: &TurnDiffClick,
+        timeout_ms: u64,
+    ) -> std::result::Result<(crate::backend::TurnDiff, bool), ()> {
+        if click.from.is_empty() {
+            tracing::warn!("turn diff: V1 aggregation without a Turn anchor");
+            return Err(());
+        }
+        let transcript = match crate::bridge::bounded_call(
+            "turn diff transcript",
+            timeout_ms,
+            self.opencode.transcript(&click.session_id),
+        )
+        .await
+        {
+            Some(Ok(transcript)) => transcript,
+            Some(Err(error)) => {
+                tracing::warn!("turn diff: transcript read failed: {error}");
+                return Err(());
+            }
+            None => return Err(()),
+        };
+        let Some(anchor) = transcript.anchor_of_user(&click.from) else {
+            tracing::warn!(
+                "turn diff: {} is not a user message in {}",
+                click.from,
+                click.session_id
+            );
+            return Err(());
+        };
+        Ok((
+            crate::bridge::turn_diff::turn_diff_from_tools(&transcript, &anchor),
+            true,
+        ))
+    }
+
+    /// Speak a Turn Diff outcome under the clicked card, bounded like every
+    /// other delivery network step.
+    async fn reply_turn_diff_line(self: &Arc<Self>, message_id: &str, line: &str, timeout_ms: u64) {
+        if !matches!(
+            crate::bridge::bounded_call(
+                "turn diff reply",
+                timeout_ms,
+                self.feishu.reply_text(message_id, line),
+            )
+            .await,
+            Some(Ok(_))
+        ) {
+            tracing::warn!("turn diff: reply for {message_id} did not land");
+        }
+    }
+
     /// Handle the **File Viewer** card's 「发为文件」 click (ADR-0083 §5) — and,
     /// since #778, a Tool Panel's 「🌐 预览网页」 click (`.html`/`.htm`, `op:
     /// "preview"`). The card callback must ack within Feishu's 3 s, no-retry
@@ -5215,6 +5605,86 @@ impl App {
             // message still runs; whoever owns the card renders it.
             crate::bridge::turn::Turn::release_recovery_claim(&handles.cards, &session_id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_diff_delivery_helpers {
+    use super::{
+        TURN_DIFF_TITLE, TURN_DIFF_V1_SUBTITLE, TurnDiffClick, TurnDiffSendState, turn_diff_document,
+        turn_diff_file_name, turn_diff_state_toast,
+    };
+    use crate::backend::{TurnDiff, TurnDiffFile};
+
+    fn click() -> TurnDiffClick {
+        TurnDiffClick {
+            session_id: "ses_1".to_string(),
+            from: "msg_user_1".to_string(),
+            directory: "/repo/cola".to_string(),
+            message_id: "msg_card".to_string(),
+        }
+    }
+
+    fn diff() -> TurnDiff {
+        TurnDiff(vec![TurnDiffFile {
+            path: "src/main.rs".to_string(),
+            patch: "@@ -1 +1 @@\n-a\n+b\n".to_string(),
+            additions: 1,
+            deletions: 1,
+            status: "modified".to_string(),
+        }])
+    }
+
+    /// V1's aggregation says what the tools recorded, not what the working tree
+    /// became, so the artifact's subtitle must name it (spec #797 decision 8).
+    #[test]
+    fn the_v1_document_names_the_tool_metadata_source() {
+        let document = turn_diff_document(&diff(), &click(), true);
+        assert_eq!(document.title, TURN_DIFF_TITLE);
+        assert!(
+            document.subtitle.contains(TURN_DIFF_V1_SUBTITLE),
+            "subtitle: {}",
+            document.subtitle
+        );
+        assert_eq!(document.files.len(), 1);
+    }
+
+    /// The V2 read is the working tree's own diff: it must not wear the V1
+    /// marker.
+    #[test]
+    fn the_v2_document_does_not_name_the_v1_source() {
+        let document = turn_diff_document(&diff(), &click(), false);
+        assert!(!document.subtitle.contains(TURN_DIFF_V1_SUBTITLE));
+        assert!(document.subtitle.contains("ses_1"));
+        assert!(document.subtitle.contains("msg_user_1"));
+        assert!(document.subtitle.contains("/repo/cola"));
+    }
+
+    /// The filename is reproducible from the Turn's identity, ASCII, short and
+    /// ends in `.html` (the client preview routes by extension).
+    #[test]
+    fn the_file_name_is_ascii_short_reproducible_html() {
+        let name = turn_diff_file_name("ses_1", "msg_user_1");
+        assert_eq!(name, turn_diff_file_name("ses_1", "msg_user_1"));
+        assert_ne!(name, turn_diff_file_name("ses_1", "msg_user_2"));
+        assert!(name.is_ascii(), "ASCII only: {name}");
+        assert!(name.starts_with("diff-"), "diff- prefix: {name}");
+        assert!(name.ends_with(".html"), "html extension: {name}");
+        assert!(name.len() <= 40, "short: {name}");
+    }
+
+    /// A repeated click's toast is the stored state, not a fresh send.
+    #[test]
+    fn the_stored_states_speak_distinct_toasts() {
+        assert_eq!(
+            turn_diff_state_toast(TurnDiffSendState::Sending),
+            "正在生成完整 diff…"
+        );
+        assert_eq!(turn_diff_state_toast(TurnDiffSendState::Sent), "已发送");
+        assert_eq!(
+            turn_diff_state_toast(TurnDiffSendState::OutcomeUnknown),
+            super::TURN_DIFF_UNKNOWN_TEXT
+        );
     }
 }
 
