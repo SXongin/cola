@@ -879,12 +879,6 @@ fn viewer_preview_failure_reason(size: u64) -> &'static str {
     }
 }
 
-/// The line a Tool Panel preview replies when the File Message timed out after
-/// the request may have reached Feishu (#778): the same words the stale-click
-/// Toast uses, because there is no card of cola's own to state `发送结果未知` on
-/// and a silent ambiguous outcome reads as a silent failure.
-const VIEWER_PREVIEW_UNKNOWN_LINE: &str = "⚠️ 发送结果未知，为避免重复未重试。";
-
 /// The Toast a Turn Diff delivery's stored state answers a repeated click with.
 fn turn_diff_state_toast(state: TurnDiffSendState) -> &'static str {
     match state {
@@ -5169,7 +5163,11 @@ impl App {
                 lane.delivery,
                 crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown
             ) {
-                self.reply_viewer_preview_outcome(message_id, VIEWER_PREVIEW_UNKNOWN_LINE, timeout_ms)
+                // There is no card of cola's own to state an ambiguous outcome
+                // on, and staying silent would read as a silent failure. The
+                // shared line carries this surface's warning prefix.
+                let line = format!("⚠️ {}", crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT);
+                self.reply_viewer_preview_outcome(message_id, &line, timeout_ms)
                     .await;
             }
             return;

@@ -42,17 +42,58 @@ fn short_head(repo: &tempfile::TempDir) -> String {
         .collect()
 }
 
-/// Seed a session whose directory is `repo` for `key`.
-async fn seed_repo_session(
-    app: &std::sync::Arc<crate::bridge::App>,
+/// One `/diff` test fixture: a command app whose session is rooted at a test
+/// directory, plus the recording platform. `chat_id` stays unique per test (it
+/// also keys the cooldown bucket); `thread_id` differs from it only in the
+/// topic test. The config dir must outlive the app's session writes.
+struct DiffFixture {
+    _config_dir: tempfile::TempDir,
+    app: std::sync::Arc<crate::bridge::App>,
+    platform: std::sync::Arc<RecordingPlatform>,
     key: ThreadKey,
-    repo: &tempfile::TempDir,
-) {
+}
+
+impl DiffFixture {
+    /// Send one command through the production parse → gate → dispatch seam.
+    async fn send(&self, text: &str, message_id: &str, kind: ConversationKind) {
+        send_command_in(&self.app, text, self.key.clone(), message_id, kind).await;
+    }
+
+    async fn calls(&self) -> Vec<PlatformCall> {
+        self.platform.calls.lock().await.clone()
+    }
+}
+
+/// Build a fixture whose session is rooted at `directory`, applying
+/// `configure` to the test config before the app is built (`[review] base`
+/// tests). Each caller keeps its own chat id.
+async fn diff_fixture_with(
+    directory: &std::path::Path,
+    chat_id: &str,
+    thread_id: &str,
+    configure: impl FnOnce(&mut crate::config::Config),
+) -> DiffFixture {
+    let config_dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&config_dir.path().join("sessions.json"));
+    configure(&mut cfg);
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = ThreadKey::new(chat_id.to_string(), thread_id.to_string());
     seed_entry(
-        app,
-        SessionEntry::new(key, "ses_diff", repo.path().to_string_lossy().to_string()),
+        &app,
+        SessionEntry::new(key.clone(), "ses_diff", directory.to_string_lossy().to_string()),
     )
     .await;
+    DiffFixture {
+        _config_dir: config_dir,
+        app,
+        platform,
+        key,
+    }
+}
+
+/// [`diff_fixture_with`] on the default test config.
+async fn diff_fixture(directory: &std::path::Path, chat_id: &str, thread_id: &str) -> DiffFixture {
+    diff_fixture_with(directory, chat_id, thread_id, |_| {}).await
 }
 
 fn file_messages(calls: &[PlatformCall]) -> Vec<&PlatformCall> {
@@ -85,22 +126,11 @@ fn text_replies(calls: &[PlatformCall]) -> Vec<&str> {
 #[tokio::test]
 async fn diff_sends_one_html_file_into_the_command_container() {
     let repo = mixed_change_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_topic", "omt_diff_topic").await;
+    fx.send("/diff --base main", "msg_diff_topic", ConversationKind::Topic)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_topic".into(), "omt_diff_topic".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_topic",
-        ConversationKind::Topic,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     let files = file_messages(&calls);
     assert_eq!(files.len(), 1, "exactly one File Message: {calls:?}");
     match files[0] {
@@ -150,23 +180,14 @@ async fn diff_sends_one_html_file_into_the_command_container() {
 #[tokio::test]
 async fn explicit_base_overrides_the_configured_base() {
     let repo = mixed_change_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.review.base = Some("does-not-exist".into());
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    let key = ThreadKey::new("chat_diff_base".into(), "chat_diff_base".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_base",
-        ConversationKind::P2p,
-    )
+    let fx = diff_fixture_with(repo.path(), "chat_diff_base", "chat_diff_base", |cfg| {
+        cfg.review.base = Some("does-not-exist".into());
+    })
     .await;
+    fx.send("/diff --base main", "msg_diff_base", ConversationKind::P2p)
+        .await;
 
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
     let html = match uploads(&calls)[0] {
         PlatformCall::UploadFile { content, .. } => String::from_utf8_lossy(content).into_owned(),
@@ -188,16 +209,13 @@ async fn explicit_base_overrides_the_configured_base() {
 #[tokio::test]
 async fn configured_base_is_used_without_a_flag() {
     let repo = mixed_change_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.review.base = Some("dev".into());
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture_with(repo.path(), "chat_diff_cfg", "chat_diff_cfg", |cfg| {
+        cfg.review.base = Some("dev".into());
+    })
+    .await;
+    fx.send("/diff", "msg_diff_cfg", ConversationKind::P2p).await;
 
-    let key = ThreadKey::new("chat_diff_cfg".into(), "chat_diff_cfg".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(&app, "/diff", key, "msg_diff_cfg", ConversationKind::P2p).await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
     let html = match uploads(&calls)[0] {
         PlatformCall::UploadFile { content, .. } => String::from_utf8_lossy(content).into_owned(),
@@ -217,22 +235,11 @@ async fn configured_base_is_used_without_a_flag() {
 #[tokio::test]
 async fn a_clean_repository_answers_text_with_no_file() {
     let repo = git_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_clean", "chat_diff_clean").await;
+    fx.send("/diff --base main", "msg_diff_clean", ConversationKind::P2p)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_clean".into(), "chat_diff_clean".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_clean",
-        ConversationKind::P2p,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert!(uploads(&calls).is_empty(), "no file: {calls:?}");
     assert!(file_messages(&calls).is_empty(), "no file: {calls:?}");
     let texts = text_replies(&calls);
@@ -245,15 +252,10 @@ async fn a_clean_repository_answers_text_with_no_file() {
 #[tokio::test]
 async fn a_non_git_directory_answers_its_error_with_no_file() {
     let repo = tempfile::tempdir().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_nongit", "chat_diff_nongit").await;
+    fx.send("/diff", "msg_diff_nongit", ConversationKind::P2p).await;
 
-    let key = ThreadKey::new("chat_diff_nongit".into(), "chat_diff_nongit".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(&app, "/diff", key, "msg_diff_nongit", ConversationKind::P2p).await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert!(uploads(&calls).is_empty(), "{calls:?}");
     assert!(file_messages(&calls).is_empty(), "{calls:?}");
     let texts = text_replies(&calls);
@@ -265,22 +267,15 @@ async fn a_non_git_directory_answers_its_error_with_no_file() {
 #[tokio::test]
 async fn a_missing_base_answers_its_error_with_no_file() {
     let repo = git_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    let key = ThreadKey::new("chat_diff_nobase".into(), "chat_diff_nobase".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
+    let fx = diff_fixture(repo.path(), "chat_diff_nobase", "chat_diff_nobase").await;
+    fx.send(
         "/diff --base no-such-base",
-        key,
         "msg_diff_nobase",
         ConversationKind::P2p,
     )
     .await;
 
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert!(uploads(&calls).is_empty(), "{calls:?}");
     assert!(file_messages(&calls).is_empty(), "{calls:?}");
     let texts = text_replies(&calls);
@@ -293,30 +288,13 @@ async fn a_missing_base_answers_its_error_with_no_file() {
 #[tokio::test]
 async fn a_repeat_inside_the_cooldown_sends_no_second_file() {
     let repo = mixed_change_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_repeat", "chat_diff_repeat").await;
+    fx.send("/diff --base main", "msg_diff_first", ConversationKind::P2p)
+        .await;
+    fx.send("/diff --base main", "msg_diff_second", ConversationKind::P2p)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_repeat".into(), "chat_diff_repeat".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key.clone(),
-        "msg_diff_first",
-        ConversationKind::P2p,
-    )
-    .await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_second",
-        ConversationKind::P2p,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(uploads(&calls).len(), 1, "one upload only: {calls:?}");
     assert_eq!(file_messages(&calls).len(), 1, "one file only: {calls:?}");
     let texts = text_replies(&calls);
@@ -328,31 +306,17 @@ async fn a_repeat_inside_the_cooldown_sends_no_second_file() {
 /// or the platform's file lane.
 #[tokio::test]
 async fn unsupported_arguments_answer_usage_only() {
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    let key = ThreadKey::new("chat_diff_usage".into(), "chat_diff_usage".into());
-    seed_entry(
-        &app,
-        SessionEntry::new(key.clone(), "ses_diff", dir.path().to_string_lossy().to_string()),
-    )
-    .await;
+    let repo = tempfile::tempdir().unwrap();
+    let fx = diff_fixture(repo.path(), "chat_diff_usage", "chat_diff_usage").await;
     for (i, text) in ["/diff --other", "/diff --base", "/diff extra words"]
         .iter()
         .enumerate()
     {
-        send_command_in(
-            &app,
-            text,
-            key.clone(),
-            &format!("msg_diff_usage_{i}"),
-            ConversationKind::P2p,
-        )
-        .await;
+        fx.send(text, &format!("msg_diff_usage_{i}"), ConversationKind::P2p)
+            .await;
     }
 
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert!(uploads(&calls).is_empty(), "{calls:?}");
     assert!(file_messages(&calls).is_empty(), "{calls:?}");
     let texts = text_replies(&calls);
@@ -375,22 +339,11 @@ async fn a_branch_with_a_slash_is_sanitized_in_the_file_name() {
     git_in(repo.path(), &["add", "a.txt"]);
     git_in(repo.path(), &["commit", "-m", "branch change"]);
 
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_slash", "chat_diff_slash").await;
+    fx.send("/diff --base main", "msg_diff_slash", ConversationKind::P2p)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_slash".into(), "chat_diff_slash".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_slash",
-        ConversationKind::P2p,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
     let name = match uploads(&calls)[0] {
         PlatformCall::UploadFile { name, .. } => name,
@@ -410,22 +363,11 @@ async fn a_detached_head_is_named_detached_html() {
     let repo = mixed_change_repo();
     git_in(repo.path(), &["checkout", "--detach", "HEAD"]);
 
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_detached", "chat_diff_detached").await;
+    fx.send("/diff --base main", "msg_diff_detached", ConversationKind::P2p)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_detached".into(), "chat_diff_detached".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_detached",
-        ConversationKind::P2p,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
     let name = match uploads(&calls)[0] {
         PlatformCall::UploadFile { name, .. } => name,
@@ -446,15 +388,10 @@ async fn an_unborn_repository_is_named_unborn_unborn_html() {
     std::fs::write(repo.path().join("first.txt"), "first\n").unwrap();
     git_in(repo.path(), &["add", "first.txt"]);
 
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let fx = diff_fixture(repo.path(), "chat_diff_unborn", "chat_diff_unborn").await;
+    fx.send("/diff", "msg_diff_unborn", ConversationKind::P2p).await;
 
-    let key = ThreadKey::new("chat_diff_unborn".into(), "chat_diff_unborn".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(&app, "/diff", key, "msg_diff_unborn", ConversationKind::P2p).await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
     let name = match uploads(&calls)[0] {
         PlatformCall::UploadFile { name, .. } => name,
@@ -469,25 +406,14 @@ async fn an_unborn_repository_is_named_unborn_unborn_html() {
 #[tokio::test]
 async fn an_ambiguous_send_answers_unknown_and_does_not_retry() {
     let repo = mixed_change_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    platform
+    let fx = diff_fixture(repo.path(), "chat_diff_unknown", "chat_diff_unknown").await;
+    fx.platform
         .ambiguous_send_message_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.send("/diff --base main", "msg_diff_unknown", ConversationKind::P2p)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_unknown".into(), "chat_diff_unknown".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_unknown",
-        ConversationKind::P2p,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert_eq!(uploads(&calls).len(), 1, "exactly one upload: {calls:?}");
     assert!(
         file_messages(&calls).is_empty(),
@@ -503,25 +429,14 @@ async fn an_ambiguous_send_answers_unknown_and_does_not_retry() {
 #[tokio::test]
 async fn a_definite_send_failure_answers_the_failure_line() {
     let repo = mixed_change_repo();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    platform
+    let fx = diff_fixture(repo.path(), "chat_diff_failed", "chat_diff_failed").await;
+    fx.platform
         .fail_upload_file_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
+    fx.send("/diff --base main", "msg_diff_failed", ConversationKind::P2p)
+        .await;
 
-    let key = ThreadKey::new("chat_diff_failed".into(), "chat_diff_failed".into());
-    seed_repo_session(&app, key.clone(), &repo).await;
-    send_command_in(
-        &app,
-        "/diff --base main",
-        key,
-        "msg_diff_failed",
-        ConversationKind::P2p,
-    )
-    .await;
-
-    let calls = platform.calls.lock().await.clone();
+    let calls = fx.calls().await;
     assert!(file_messages(&calls).is_empty(), "{calls:?}");
     let texts = text_replies(&calls);
     assert_eq!(texts.len(), 1, "{calls:?}");
