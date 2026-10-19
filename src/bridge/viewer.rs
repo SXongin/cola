@@ -1137,7 +1137,8 @@ async fn deliver(
 
 /// Upload `content` once (content-hash cached) and post exactly ONE File Message
 /// carrying its key under `reply_target`. `Undelivered` past Feishu's 30MB cap,
-/// on a failed upload or definite send refusal. A timed-out send is ambiguous:
+/// on a failed upload or definite send refusal. A timed-out send — or one that
+/// failed at transport/5xx after the request went out — is ambiguous:
 /// it may have landed, so its identity must not be retried.
 pub(crate) async fn send_file_message(
     platform: &Arc<dyn Platform>,
@@ -1183,7 +1184,15 @@ pub(crate) async fn send_file_message(
         Some(Ok(_)) => FileDelivery::SentAsFile,
         Some(Err(error)) => {
             tracing::warn!("viewer File Message send failed: {error}");
-            FileDelivery::Undelivered
+            // A transport/5xx/parse failure may have landed after Feishu
+            // accepted the reply: only a definite refusal proves nothing was
+            // created. Keeping an ambiguous send terminal is what stops a
+            // retry from duplicating the File Message.
+            if error.is_definite_non_delivery() {
+                FileDelivery::Undelivered
+            } else {
+                FileDelivery::FileSendOutcomeUnknown
+            }
         }
         None => FileDelivery::FileSendOutcomeUnknown,
     }

@@ -478,6 +478,10 @@ pub struct RecordingPlatform {
     /// The next N `reply_message` calls fail with a Feishu error (tests that a
     /// File Message failure degrades to `未发送` and never blocks the card).
     pub fail_send_message_count: std::sync::atomic::AtomicUsize,
+    /// The next N `reply_message` calls fail ambiguously after the request
+    /// went out (a 5xx/transport-shaped error): the send may have landed, so a
+    /// caller must treat the outcome as unknown rather than retry.
+    pub ambiguous_send_message_count: std::sync::atomic::AtomicUsize,
     /// The next N non-card message edits are definitively refused by Feishu.
     pub refuse_edit_message_count: std::sync::atomic::AtomicUsize,
     /// The next N non-card edits simulate Feishu's 230020 frequency-limit refusal.
@@ -528,6 +532,7 @@ impl RecordingPlatform {
             file_key: std::sync::Mutex::new("file_test".into()),
             fail_upload_file_count: std::sync::atomic::AtomicUsize::new(0),
             fail_send_message_count: std::sync::atomic::AtomicUsize::new(0),
+            ambiguous_send_message_count: std::sync::atomic::AtomicUsize::new(0),
             refuse_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
             reject_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
             fail_edit_message_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1310,6 +1315,18 @@ impl feishu::Platform for RecordingPlatform {
         msg_type: &str,
         content: &serde_json::Value,
     ) -> crate::error::Result<(String, Option<String>)> {
+        if self
+            .ambiguous_send_message_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.ambiguous_send_message_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::FeishuHttp {
+                status: 503,
+                detail: "simulated post-accept send failure".into(),
+            });
+        }
         if self
             .fail_send_message_count
             .load(std::sync::atomic::Ordering::SeqCst)
