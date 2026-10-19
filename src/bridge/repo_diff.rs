@@ -83,10 +83,7 @@ pub(crate) async fn run(
         handles
             .flow
             .platform
-            .reply_text(
-                message_id,
-                &format!("分支 {} 相对 {} 没有改动", review.branch, review.base),
-            )
+            .reply_text(message_id, &empty_reply(&review.branch, &review.base))
             .await?;
         return Ok(());
     }
@@ -129,6 +126,17 @@ pub(crate) async fn run(
         }
     }
     Ok(())
+}
+
+/// The one-line answer for an empty review. An unborn repository has no commit
+/// to compare, so naming `unborn` relative to `unborn` would read like an
+/// error; it says there are no commits instead.
+fn empty_reply(branch: &str, base: &str) -> String {
+    if branch == "unborn" {
+        "仓库还没有提交，没有可对比的改动。".to_string()
+    } else {
+        format!("分支 {branch} 相对 {base} 没有改动")
+    }
 }
 
 /// Claim `chat_id` in the shared cooldown. The tiny lock is held only for the
@@ -211,6 +219,15 @@ mod tests {
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    #[test]
+    fn an_unborn_repository_names_the_missing_commits() {
+        assert_eq!(
+            empty_reply("unborn", "unborn"),
+            "仓库还没有提交，没有可对比的改动。"
+        );
+        assert_eq!(empty_reply("feature", "main"), "分支 feature 相对 main 没有改动");
     }
 
     #[test]
