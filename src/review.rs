@@ -1677,6 +1677,59 @@ mod tests {
         );
     }
 
+    /// The producer's raw cap and the renderer's HTML cap are independent
+    /// guarantees. This document trips both: the raw patch drops a tracked file
+    /// and the escaped artifact cannot hold the admitted ones, so each note
+    /// appears once, names its own cap, and the HTML stays under its bound.
+    #[tokio::test]
+    async fn both_the_raw_and_html_caps_report_their_own_omission() {
+        let repo = Repo::init();
+        let old = "x".repeat(1_500_000);
+        // `<` escapes to `&lt;`, so the HTML is larger than the raw patch and
+        // the renderer's cap (not the producer's) decides what fits.
+        let new = "<".repeat(1_500_000);
+        for index in 0..3 {
+            repo.write(&format!("big{index}.txt"), format!("{old}\n"));
+        }
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        for index in 0..3 {
+            repo.write(&format!("big{index}.txt"), format!("{new}\n"));
+        }
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let producer_note = review
+            .document
+            .truncated
+            .as_deref()
+            .expect("the raw cap must omit a file")
+            .to_string();
+        assert!(
+            producer_note.contains("原始 patch") && producer_note.contains("8 MB"),
+            "the producer note names the raw cap: {producer_note}"
+        );
+
+        let html = crate::backend::render_diff_html(&review.document);
+        assert!(
+            html.contains(&producer_note),
+            "the producer note reaches the artifact: {producer_note}"
+        );
+        assert!(
+            html.contains("超出预览上限"),
+            "the renderer's own omission note is present"
+        );
+        assert_eq!(
+            html.matches("已省略").count(),
+            2,
+            "one note per cap, neither contradicting the other"
+        );
+        assert!(
+            html.len() < crate::backend::MAX_DIFF_HTML_BYTES,
+            "the artifact stays under the HTML cap: {}",
+            html.len()
+        );
+    }
+
     /// Added/deleted gitlinks have no `160000` suffix on their `index` line;
     /// the mode header still identifies them, so all three shapes collapse.
     #[test]
