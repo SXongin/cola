@@ -16,11 +16,13 @@
 
 pub mod file_content;
 pub mod transcript;
+pub mod turn_diff;
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
 pub use file_content::*;
 pub use transcript::*;
+pub use turn_diff::*;
 
 use std::sync::Arc;
 
@@ -331,6 +333,27 @@ pub trait Backend: Send + Sync {
     /// Bridge consumes (ADR-0053). The adapter's wire envelope never reaches
     /// the caller.
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript>;
+
+    /// One Turn's complete file diff ([`TurnDiff`]), where the generation
+    /// serves a session diff endpoint (V2's `GET /api/session/{id}/diff`).
+    /// `from` is the Turn anchor's user-message id — V2 scopes the diff to
+    /// that turn's snapshot, so later edits cannot drift into it; `to` and
+    /// `context` are the endpoint's other axes and are omitted from the query
+    /// when `None`. `Ok(None)` is strictly "this generation has no session diff
+    /// endpoint" (V1), never an empty diff: the caller then aggregates the
+    /// Turn's tool metadata (#800), so no call site branches on a Generation.
+    ///
+    /// No Bridge path reads a Turn Diff yet (#801 lands the button). Like
+    /// [`Self::delete_session`], the allow keeps this trait method live so the
+    /// adapter and strategy reads are reachable through it.
+    #[allow(dead_code)]
+    async fn session_diff(
+        &self,
+        session_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        context: Option<u32>,
+    ) -> Result<Option<TurnDiff>>;
 
     /// The server's live run state for one session (`GET /session/status`).
     /// `directory` selects the instance (ADR-0010). A successful read always

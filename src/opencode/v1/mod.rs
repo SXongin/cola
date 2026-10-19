@@ -434,6 +434,20 @@ impl GenerationStrategy for V1Strategy {
         Ok(TaskRuntime::default())
     }
 
+    /// V1 has no session diff endpoint: the read answers `Ok(None)` without a
+    /// request, and the caller aggregates the Turn's tool metadata instead
+    /// (#800).
+    async fn session_diff(
+        &self,
+        _http: &Transport,
+        _session_id: &str,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        _context: Option<u32>,
+    ) -> Result<Option<crate::backend::TurnDiff>> {
+        Ok(None)
+    }
+
     /// V1 carries no shell records: no output without a request, exactly
     /// like its empty runtime verdict (spec #588, #592).
     async fn shell_output(

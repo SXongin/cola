@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
+use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime, TurnDiff};
 use crate::error::Result;
 
 use super::transport::Transport;
@@ -113,6 +113,23 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     ) -> Result<()>;
 
     async fn transcript(&self, http: &Transport, session_id: &str) -> Result<SessionTranscript>;
+
+    /// One Turn's file diff (`GET /api/session/{id}/diff` on V2): each changed
+    /// file's unified patch, line counts and status. `from` is the Turn's
+    /// anchor user-message id (V2 scopes the diff to that turn's snapshot, so
+    /// it does not drift with later edits); `to` and `context` are the
+    /// endpoint's other axes and are omitted from the query when `None`.
+    /// `Ok(None)` means the generation has no session diff endpoint (V1), not
+    /// an empty diff — the caller then aggregates the Turn's tool metadata
+    /// (#800).
+    async fn session_diff(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        context: Option<u32>,
+    ) -> Result<Option<TurnDiff>>;
 
     /// The session's durable model/agent selection (`GET /api/session/{id}` on
     /// V2). V1 has no session-scoped selection — its picks ride each prompt —

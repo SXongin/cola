@@ -125,6 +125,16 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::transcript(self, session_id).await
     }
 
+    async fn session_diff(
+        &self,
+        session_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        context: Option<u32>,
+    ) -> Result<Option<crate::backend::TurnDiff>> {
+        OpenCodeBackend::session_diff(self, session_id, from, to, context).await
+    }
+
     async fn session_selection(
         &self,
         session_id: &str,
