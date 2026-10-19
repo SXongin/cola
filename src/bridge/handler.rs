@@ -4755,8 +4755,26 @@ impl App {
                     );
                     return Err(());
                 };
+                // Scope the V1 aggregation like V2's `session.diff`: repo files
+                // only. The payload normally carries the directory; a stale or
+                // future caller without it falls back to the mapped session.
+                let root = if click.directory.is_empty() {
+                    self.sessions
+                        .lock()
+                        .await
+                        .directory_for_session(&click.session_id)
+                } else {
+                    Some(click.directory.clone())
+                };
+                let Some(root) = root.filter(|root| !root.is_empty()) else {
+                    tracing::warn!(
+                        "turn diff: no working directory for {}; cannot scope the V1 aggregation",
+                        click.session_id
+                    );
+                    return Err(());
+                };
                 Ok(TurnDiffRead {
-                    diff: crate::bridge::turn_diff::turn_diff_from_tools(transcript, &anchor),
+                    diff: crate::bridge::turn_diff::turn_diff_from_tools_in(transcript, &anchor, Some(&root)),
                     source: TurnDiffSource::ToolMetadata,
                     anchor_ms: Some(anchor.created_ms),
                 })

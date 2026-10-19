@@ -339,6 +339,28 @@ async fn v1_click_with_an_empty_from_uses_the_newest_user_message() {
     assert_eq!(file_uploads(&platform).await.len(), 1);
 }
 
+/// The V1 fallback must fail loudly when it has no working directory to scope
+/// the aggregation: without a root it cannot prove a recorded path belongs to
+/// the repository, and an unscoped diff would offer the dead entry this fix
+/// removes.
+#[tokio::test]
+async fn v1_click_without_a_working_directory_fails_loudly() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.given_transcript("ses_test", vec![anchored_edit_transcript("src/v1.rs")]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let mut payload = click();
+    payload["directory"] = serde_json::json!("");
+    app.host_action_on_message(payload, CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    wait_for_reply_containing(&platform, "生成完整 diff 失败").await;
+
+    assert!(file_uploads(&platform).await.is_empty(), "no upload");
+    assert!(file_messages(&platform).await.is_empty(), "no File Message");
+}
+
 /// Repeated clicks are a no-op after the artifact was sent: the in-process
 /// `(session, from)` guard answers 「已发送」 and posts nothing again.
 #[tokio::test]

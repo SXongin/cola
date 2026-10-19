@@ -10156,6 +10156,32 @@ Index: /x/src/main.rs
         assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
 
+    /// A Turn whose only file write is outside the working directory (a
+    /// `/tmp` scratch file) has no repository change: the card offers no index,
+    /// matching the V2 artifact, which cannot see that file.
+    #[test]
+    fn a_turn_that_only_writes_outside_the_work_directory_offers_no_entry() {
+        let transcript = anchored_transcript(vec![tool(
+            "write",
+            "call_write_tmp",
+            ToolStatus::Completed,
+            Some(1_100),
+            Some(serde_json::json!({
+                "filePath": "/tmp/opencode/comment.md",
+                "content": "temporary\n",
+            })),
+            Some("Wrote file successfully."),
+        )]);
+        let mut acc = anchored_accumulator();
+        acc.set_card_state(CardState::Done);
+
+        render_new_turn_parts(&mut acc, &transcript);
+        let card = acc.build_card_with_split().0;
+
+        assert!(!card_text(&card).contains("📝 本次改动"), "{card}");
+        assert!(turn_diff_button(&card).is_none(), "{card}");
+    }
+
     /// Acceptance: a read/bash-only Turn recorded no file edit, so the card
     /// offers neither the line nor the button — no dead entry.
     #[test]

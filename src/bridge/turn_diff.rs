@@ -22,6 +22,15 @@
 //! final recorded state for that path). Only Turns that actually recorded a
 //! file edit produce a non-empty diff; a read/bash-only Turn produces an empty
 //! one, which is what keeps the card from offering a dead entry.
+//!
+//! **Scope matches `session.diff`.** The aggregation counts only paths inside
+//! the Turn's working directory. V2's `session.diff` is repository-scoped
+//! (tracked changes plus untracked files inside the repo) and never sees a
+//! tool's write to `/tmp` or to another checkout; an unscoped index would then
+//! offer a card entry whose artifact is empty. Shell-created files remain a
+//! gap: `session.diff` sees them, this transcript-side estimate cannot.
+
+use std::path::{Component, Path, PathBuf};
 
 use crate::backend::{Part, SessionTranscript, ToolCall, ToolStatus, TurnAnchor, TurnDiff, TurnDiffFile};
 use crate::feishu::card::tool_render::{diff_header_path, opens_file_block, recorded_diff};
@@ -35,8 +44,136 @@ fn records_a_file_edit(name: &str) -> bool {
     matches!(name, "edit" | "apply_patch" | "patch" | "write")
 }
 
+/// Whether `path` names a file inside the Turn's working directory.
+///
+/// The V2 artifact (`session.diff`) is scoped to the session's repository,
+/// untracked files included, and never contains a write outside it (a scratch
+/// file in `/tmp`, another checkout). The transcript-side index and the V1
+/// fallback must use the same domain, or the card offers an entry whose
+/// artifact is empty.
+fn path_in_work_dir(path: &str, root: &str) -> bool {
+    if path.is_empty() || root.is_empty() {
+        return false;
+    }
+    let root = strip_verbatim(root);
+    let root = normalize_path(Path::new(&root));
+    let path = strip_verbatim(path);
+    let path = Path::new(&path);
+    let candidate = if path.is_absolute() || path.has_root() || has_prefix(path) {
+        normalize_path(path)
+    } else {
+        normalize_path(&root.join(path))
+    };
+    // A rooted Windows path without a drive (`\repo\src`) belongs to the
+    // current drive; the session's drive is the root's.
+    let candidate = with_root_drive(candidate, &root);
+    within(&candidate, &root)
+}
+
+/// Strip Windows' verbatim prefix and normalize separators, so
+/// `\\?\C:\repo` and `C:/repo` compare as the same path.
+#[cfg(windows)]
+fn strip_verbatim(path: &str) -> String {
+    let path = path.replace('/', "\\");
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return rest.to_string();
+    }
+    // Other verbatim namespaces (`\\?\Volume{GUID}\…`, `\\?\GLOBALROOT\…`)
+    // stay prefixed: stripping them would turn an absolute volume path into
+    // a relative one and let it join the repository root.
+    path
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim(path: &str) -> String {
+    path.to_string()
+}
+
+#[cfg(windows)]
+fn has_prefix(path: &Path) -> bool {
+    matches!(path.components().next(), Some(Component::Prefix(_)))
+}
+
+#[cfg(not(windows))]
+fn has_prefix(_path: &Path) -> bool {
+    false
+}
+
+/// Lexically normalize `.`/`..` without touching the filesystem, so an
+/// out-of-tree path cannot sneak through as `root/src/../../tmp/x`.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Give a rooted Windows path without a drive the root's drive, so
+/// `\repo\src` compares against `C:\repo`.
+#[cfg(windows)]
+fn with_root_drive(candidate: PathBuf, root: &Path) -> PathBuf {
+    if has_prefix(&candidate) || !candidate.has_root() {
+        return candidate;
+    }
+    let Some(Component::Prefix(prefix)) = root.components().next() else {
+        return candidate;
+    };
+    PathBuf::from(format!(
+        "{}{}",
+        prefix.as_os_str().to_string_lossy(),
+        candidate.to_string_lossy()
+    ))
+}
+
+#[cfg(not(windows))]
+fn with_root_drive(candidate: PathBuf, _root: &Path) -> PathBuf {
+    candidate
+}
+
+/// Component-aware containment. Windows file names are case-insensitive, and
+/// `starts_with` on `Path` is not; compare lowercased text with a separator
+/// boundary there.
+#[cfg(windows)]
+fn within(candidate: &Path, root: &Path) -> bool {
+    let candidate = candidate.to_string_lossy().to_lowercase();
+    let root = root.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    candidate == root
+        || candidate
+            .strip_prefix(&root)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+#[cfg(not(windows))]
+fn within(candidate: &Path, root: &Path) -> bool {
+    candidate.starts_with(root)
+}
+
+/// Unit-test entry: aggregate against a fixed `/repo` working directory. The
+/// tests' fixture paths are repo-relative; production callers pass the Turn's
+/// real directory to [`turn_diff_from_tools_in`].
+#[cfg(test)]
+pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &TurnAnchor) -> TurnDiff {
+    turn_diff_from_tools_in(transcript, anchor, Some("/repo"))
+}
+
 /// Aggregate the file edits the Turn anchored at `anchor` recorded on its tool
-/// calls into one neutral [`TurnDiff`].
+/// calls into one neutral [`TurnDiff`], counting only paths inside `root`.
+/// A missing/empty root yields an empty diff: without a scope there is no way
+/// to prove a recorded path belongs to the repository, and a false positive is
+/// exactly the dead entry (a button whose artifact is empty) this guards
+/// against. Production callers pass the Turn's session directory.
 ///
 /// Calls are read in transcript order and only the file-editing tools count:
 /// `edit`, `apply_patch`, `patch`, and `write` (whose full-content patch the
@@ -54,7 +191,14 @@ fn records_a_file_edit(name: &str) -> bool {
 /// omit the status while the call is still pending, and carrying that patch
 /// would offer a change that may never exist. The index and the V1 artifact
 /// prefer a missing entry over an unconfirmed one.
-pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &TurnAnchor) -> TurnDiff {
+pub(crate) fn turn_diff_from_tools_in(
+    transcript: &SessionTranscript,
+    anchor: &TurnAnchor,
+    root: Option<&str>,
+) -> TurnDiff {
+    let Some(root) = root.filter(|root| !root.is_empty()) else {
+        return TurnDiff::default();
+    };
     let mut files: IndexMap<String, TurnDiffFile> = IndexMap::new();
     for call in transcript
         .turn_for_user(anchor)
@@ -79,6 +223,11 @@ pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &Turn
             None => Vec::new(),
         };
         for file in recorded {
+            // Out-of-tree edits (a scratch file in `/tmp`, another checkout)
+            // are not part of the repository diff the artifact reads.
+            if !path_in_work_dir(&file.path, root) {
+                continue;
+            }
             // A later occurrence overwrites the earlier one but keeps the
             // path's first position: the Turn's final state for that file,
             // counted once.
@@ -458,6 +607,12 @@ mod tests {
 
     fn paths(diff: &TurnDiff) -> Vec<&str> {
         diff.0.iter().map(|file| file.path.as_str()).collect()
+    }
+
+    fn edit_patch(path: &str) -> String {
+        format!(
+            "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n"
+        )
     }
 
     #[test]
@@ -978,5 +1133,88 @@ Index: src/main.rs
 
         assert_eq!(paths(&diff), ["src/main.rs"]);
         assert_eq!(diff.0[0].status, "modified");
+    }
+
+    /// Containment is component-aware: `/repo2` is not inside `/repo`, a
+    /// relative path resolves under the root, and `..` cannot escape it.
+    #[test]
+    fn path_scope_is_component_aware_and_escape_safe() {
+        assert!(path_in_work_dir("src/a.rs", "/repo"));
+        assert!(path_in_work_dir("/repo/src/a.rs", "/repo"));
+        assert!(!path_in_work_dir("/repo2/src/a.rs", "/repo"));
+        assert!(!path_in_work_dir("../outside.rs", "/repo"));
+        assert!(!path_in_work_dir("src/../../outside.rs", "/repo"));
+        assert!(!path_in_work_dir("", "/repo"));
+        assert!(!path_in_work_dir("src/a.rs", ""));
+        assert!(path_in_work_dir("/repo", "/repo"));
+        assert!(path_in_work_dir("src/./a.rs", "/repo/"));
+        assert!(path_in_work_dir("/tmp/a.rs", "/"));
+    }
+
+    /// Windows stores canonical session directories with the `\\?\` verbatim
+    /// prefix while tool metadata may use a plain drive path; a rooted path
+    /// without a drive belongs to the root's drive.
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_and_drive_paths_match() {
+        assert!(path_in_work_dir(r"C:\repo\src\a.rs", r"\\?\C:\repo"));
+        assert!(path_in_work_dir(r"\repo\src\a.rs", r"C:\repo"));
+        assert!(path_in_work_dir(r"c:\REPO\src\a.rs", r"C:\repo"));
+        assert!(!path_in_work_dir(r"C:\other\a.rs", r"C:\repo"));
+        assert!(!path_in_work_dir(r"D:\repo\src\a.rs", r"C:\repo"));
+        assert!(!path_in_work_dir(
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\outside.txt",
+            r"C:\repo"
+        ));
+    }
+
+    /// The Turn Diff shares `session.diff`'s domain: an edit outside the
+    /// working directory (a `/tmp` scratch file) is not a repository change,
+    /// even though the tool recorded a patch for it.
+    #[test]
+    fn an_out_of_tree_edit_is_not_a_turn_change() {
+        let inside = call("edit", Some(json!({ "diff": edit_patch("src/a.rs") })));
+        let outside = call("edit", Some(json!({ "diff": edit_patch("/tmp/scratch.md") })));
+
+        let diff = turn_diff_from_tools_in(&transcript(vec![inside, outside]), &anchor(), Some("/repo"));
+
+        assert_eq!(paths(&diff), ["src/a.rs"]);
+    }
+
+    /// A relative path that escapes the working directory is filtered too; it
+    /// cannot be admitted by string-prefix luck after lexical normalization.
+    #[test]
+    fn a_relative_path_escaping_the_work_directory_does_not_count() {
+        let escape = call("edit", Some(json!({ "diff": edit_patch("../outside.rs") })));
+
+        let diff = turn_diff_from_tools_in(&transcript(vec![escape]), &anchor(), Some("/repo"));
+
+        assert!(diff.is_empty());
+    }
+
+    /// A `write` to a scratch file outside the repo does not produce an index
+    /// entry or a V1 artifact row.
+    #[test]
+    fn a_write_outside_the_work_directory_does_not_count() {
+        let mut write = call(
+            "write",
+            Some(json!({ "filepath": "/tmp/note.md", "exists": false })),
+        );
+        write.input = Some(json!({ "filePath": "/tmp/note.md", "content": "x\n" }));
+
+        let diff = turn_diff_from_tools_in(&transcript(vec![write]), &anchor(), Some("/repo"));
+
+        assert!(diff.is_empty());
+    }
+
+    /// An absolute path INSIDE the work directory is still the repository's
+    /// file and counts, matching what `session.diff` reports for it.
+    #[test]
+    fn an_absolute_path_inside_the_work_directory_counts() {
+        let inside = call("edit", Some(json!({ "diff": edit_patch("/repo/src/a.rs") })));
+
+        let diff = turn_diff_from_tools_in(&transcript(vec![inside]), &anchor(), Some("/repo"));
+
+        assert_eq!(paths(&diff), ["/repo/src/a.rs"]);
     }
 }
