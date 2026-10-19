@@ -167,10 +167,8 @@ fn split_patch(patch: &str) -> Vec<TurnDiffFile> {
         .map(|raw| raw.strip_suffix('\r').unwrap_or(raw))
         .collect::<Vec<_>>();
     let mut splitter = PatchSplitter::default();
-    for (index, line) in lines.iter().enumerate() {
-        // The panel parser's own evidence for a joined patch's next file: the
-        // blank line before it is a separator, not the tool's trailing note.
-        splitter.push(line, opens_file_block(&lines, index + 1));
+    for index in 0..lines.len() {
+        splitter.push(&lines, index);
     }
     splitter.finish()
 }
@@ -184,6 +182,9 @@ struct PatchSplitter {
     /// patch: its `-`/`+` lines are diagnostics (or prose), not code changes,
     /// so nothing after this point is counted or emitted.
     in_tail: bool,
+    /// A blank line has already been evaluated for the current blank run:
+    /// only the run's FIRST blank owns the `opens_file_block` lookahead.
+    blank_run_seen: bool,
     saw_old_header: bool,
 }
 
@@ -193,6 +194,7 @@ impl PatchSplitter {
         self.current = Some(PatchFile::new(path, path_from_index));
         self.in_hunk = false;
         self.in_tail = false;
+        self.blank_run_seen = false;
         self.saw_old_header = false;
     }
 
@@ -204,7 +206,8 @@ impl PatchSplitter {
         }
     }
 
-    fn push(&mut self, line: &str, next_opens_a_file: bool) {
+    fn push(&mut self, lines: &[&str], index: usize) {
+        let line = lines[index];
         if self.in_tail {
             // Everything after the note's blank boundary is the note, even a
             // line that looks like a diff header (the panel parser's rule).
@@ -217,11 +220,18 @@ impl PatchSplitter {
             // file — `opens_file_block` carries the panel parser's evidence —
             // or the start of the tool's trailing note. Neither is patch
             // content, so the line itself is dropped too.
-            if self.in_hunk && !next_opens_a_file {
+            //
+            // Only the first blank of a run asks for that evidence: the
+            // helper skips blanks and reads the same next non-empty lines for
+            // every blank in the run, so asking per blank would rescan the run
+            // once per blank — quadratic on a long blank run.
+            if self.in_hunk && !self.blank_run_seen && !opens_file_block(lines, index + 1) {
                 self.in_tail = true;
             }
+            self.blank_run_seen = true;
             return;
         }
+        self.blank_run_seen = false;
         if let Some(path) = line.strip_prefix("Index: ") {
             self.start(Some(path.trim().to_string()), true);
             self.line(line);
@@ -790,6 +800,56 @@ LSP errors detected in a.rs, please fix:
         assert_eq!(paths(&diff), ["a.rs", "b.rs"]);
         assert_eq!((diff.0[0].additions, diff.0[0].deletions), (1, 1));
         assert_eq!((diff.0[1].additions, diff.0[1].deletions), (1, 0));
+        assert_eq!(
+            diff.stats(),
+            crate::backend::TurnDiffStats {
+                files: 2,
+                additions: 2,
+                deletions: 1,
+            }
+        );
+    }
+
+    /// A run of blank lines is one boundary, not one per line: the first
+    /// blank's `opens_file_block` verdict covers the run, so a joined file
+    /// after several blanks still survives, and a note after several blanks is
+    /// still excluded.
+    #[test]
+    fn a_blank_run_keeps_the_joined_file_and_still_ends_at_the_note() {
+        let patch = "\
+===================================================================
+--- a.rs
++++ a.rs
+@@ -1 +1 @@
+-a
++A
+
+
+
+===================================================================
+--- b.rs
++++ b.rs
+@@ -1 +1,2 @@
+ b
++B
+
+
+LSP errors detected in b.rs, please fix:
+- a diagnostic that starts like a removal
++ a diagnostic that starts like an addition";
+        let diff = turn_diff_from_tools(
+            &transcript(vec![call("patch", Some(json!({ "diff": patch })))]),
+            &anchor(),
+        );
+
+        assert_eq!(paths(&diff), ["a.rs", "b.rs"]);
+        assert_eq!((diff.0[0].additions, diff.0[0].deletions), (1, 1));
+        assert_eq!((diff.0[1].additions, diff.0[1].deletions), (1, 0));
+        assert!(
+            !diff.0[1].patch.contains("LSP") && !diff.0[1].patch.contains("diagnostic"),
+            "the note after a blank run stays out: {:?}",
+            diff.0[1].patch
+        );
         assert_eq!(
             diff.stats(),
             crate::backend::TurnDiffStats {
