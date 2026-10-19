@@ -41,6 +41,23 @@ fn diff_file(path: &str, additions: usize, deletions: usize) -> TurnDiffFile {
     }
 }
 
+/// A transcript whose only message is the Turn's user anchor at `created_ms` —
+/// the server time the artifact header must show.
+fn anchor_transcript(created_ms: i64) -> SessionTranscript {
+    SessionTranscript::new(vec![TranscriptMessage {
+        id: MessageId::new(TURN_FROM),
+        role: MessageRole::User,
+        time: Some(MessageTime {
+            created: created_ms,
+            completed: Some(created_ms),
+        }),
+        model: None,
+        tokens: None,
+        error: None,
+        parts: Vec::new(),
+    }])
+}
+
 /// Every File Message the platform posted (`msg_type: "file"`), in call order.
 async fn file_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
     platform
@@ -183,6 +200,8 @@ async fn one_click_uploads_once_and_posts_one_html_file_message() {
         diff_file("src/a.rs", 2, 1),
         diff_file("src/b.rs", 1, 0),
     ]));
+    let anchor_ms = crate::feishu::card::test_local_ms(2026, 10, 19, 14, 30);
+    backend.given_transcript("ses_test", vec![anchor_transcript(anchor_ms)]);
     let (app, platform, backend) = app_with_backend(cfg, backend);
 
     let ack = app
@@ -215,12 +234,24 @@ async fn one_click_uploads_once_and_posts_one_html_file_message() {
     let uploads = file_uploads(&platform).await;
     assert_eq!(uploads.len(), 1, "exactly one upload: {uploads:?}");
     match &uploads[0] {
-        PlatformCall::UploadFile { name, mime, size } => {
+        PlatformCall::UploadFile {
+            name,
+            mime,
+            size,
+            content,
+        } => {
             assert_eq!(mime, "text/html");
             assert!(*size > 0, "the artifact carries bytes");
             let suffix = name.rsplit_once('.').map(|(_, suffix)| suffix);
             assert_eq!(suffix, Some("html"), "the preview routes by extension: {name}");
             assert_turn_diff_file_name(name);
+            // #798's header wants title, turn time, stats: the delivered
+            // artifact must carry the anchor's server time.
+            let html = String::from_utf8_lossy(content);
+            assert!(
+                html.contains("10-19 14:30"),
+                "the artifact header carries the turn time: {html}"
+            );
         }
         other => panic!("expected a file upload, got {other:?}"),
     }
@@ -435,6 +466,37 @@ async fn an_ambiguous_send_is_terminal_and_never_duplicated() {
         1,
         "the ambiguous outcome is terminal: no second diff read"
     );
+}
+
+/// A failed transcript read does not lose the artifact on V2: the header states
+/// the time as unknown and the File Message still lands.
+#[tokio::test]
+async fn a_failed_transcript_still_delivers_with_an_unknown_time() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.given_session_diff(TurnDiff(vec![diff_file("src/a.rs", 1, 0)]));
+    backend
+        .fail_transcript_reads
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform, _backend) = app_with_backend(cfg, backend);
+
+    app.host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    wait_for_file_message(&platform).await;
+
+    let uploads = file_uploads(&platform).await;
+    match &uploads[0] {
+        PlatformCall::UploadFile { content, .. } => {
+            let html = String::from_utf8_lossy(content);
+            assert!(
+                html.contains("时间未知"),
+                "a failed transcript states the gap instead of failing: {html}"
+            );
+            assert!(html.contains("src/a.rs"), "the diff still renders");
+        }
+        other => panic!("expected a file upload, got {other:?}"),
+    }
 }
 
 /// The callback acknowledges before the delivery does any work: with the
