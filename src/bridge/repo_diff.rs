@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::sync::PoisonError;
 use std::time::{Duration, Instant};
 
+use crate::backend::DiffDocument;
 use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
 use crate::feishu::card::tool_render::FileDelivery;
@@ -79,7 +80,7 @@ pub(crate) async fn run(
         }
     };
 
-    if review.document.files.is_empty() && review.document.truncated.is_none() {
+    if is_empty_review(&review.document) {
         handles
             .flow
             .platform
@@ -126,6 +127,13 @@ pub(crate) async fn run(
         }
     }
     Ok(())
+}
+
+/// Whether the review has nothing to show. A document with no files but a
+/// truncation note is NOT empty: every file was omitted, the note explains it,
+/// and the artifact (with the note, and no "没有文件改动") must still be sent.
+fn is_empty_review(document: &DiffDocument) -> bool {
+    document.files.is_empty() && document.truncated.is_none()
 }
 
 /// The one-line answer for an empty review. An unborn repository has no commit
@@ -216,9 +224,32 @@ impl DiffCooldown {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::DiffFile;
 
     fn t0() -> Instant {
         Instant::now()
+    }
+
+    /// An empty document with a truncation note is not "no changes": the
+    /// omission note must reach the reader, so the file is still sent.
+    #[test]
+    fn an_empty_document_with_a_truncation_note_is_not_no_changes() {
+        assert!(is_empty_review(&DiffDocument::default()));
+
+        let omitted = DiffDocument {
+            truncated: Some("已省略 1 个文件（原始 patch 超过 8 MB 上限）".to_string()),
+            ..DiffDocument::default()
+        };
+        assert!(
+            !is_empty_review(&omitted),
+            "a note proves files existed and must be sent"
+        );
+
+        let with_files = DiffDocument {
+            files: vec![DiffFile::default()],
+            ..DiffDocument::default()
+        };
+        assert!(!is_empty_review(&with_files));
     }
 
     #[test]
