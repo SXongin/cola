@@ -39,11 +39,16 @@ const DEFAULT_BASES: [&str; 2] = ["origin/main", "main"];
 /// which would otherwise omit changed submodules from both calls. The explicit
 /// `a/`/`b/` prefixes override `diff.mnemonicPrefix` and `diff.noprefix`, so
 /// section paths stay in the form [`section_path`] strips and still pair with
-/// `--numstat`. The patch call adds `-U3`; the numstat call must not (it would
-/// also request patch output).
-const DIFF_FLAGS: [&str; 10] = [
+/// `--numstat`. `diff.autoRefreshIndex=false` stops `git diff` from refreshing
+/// `.git/index` when cached stat data is stale: `--no-optional-locks` alone
+/// does not guard `git diff`'s stat refresh, and the diff's content is
+/// identical without it. The patch call adds `-U3`; the numstat call must not
+/// (it would also request patch output).
+const DIFF_FLAGS: [&str; 12] = [
     "-c",
     "core.quotepath=false",
+    "-c",
+    "diff.autoRefreshIndex=false",
     "diff",
     "--no-color",
     "--no-ext-diff",
@@ -1483,13 +1488,18 @@ struct GitOutput {
     stdout_truncated: bool,
 }
 
-/// Run `git -C dir <args>` with a timeout and capped stdout/stderr. stdout is
-/// read to `stdout_cap`; when it is cut, the child is killed so a writer blocked
-/// on a full pipe cannot hold the call. stderr is always drained (only the
-/// first [`MAX_STDERR_BYTES`] are kept), so neither pipe can deadlock the other.
+/// Run `git --no-optional-locks -C dir <args>` with a timeout and capped
+/// stdout/stderr. `--no-optional-locks` disables optional lock writes; the
+/// diff calls additionally pin `diff.autoRefreshIndex=false` (see
+/// [`DIFF_FLAGS`]) because `git diff`'s own stat refresh is not gated by that
+/// flag. stdout is read to `stdout_cap`; when it is cut, the child is killed so
+/// a writer blocked on a full pipe cannot hold the call. stderr is always
+/// drained (only the first [`MAX_STDERR_BYTES`] are kept), so neither pipe can
+/// deadlock the other.
 async fn run_git(dir: &str, args: &[&str], stdout_cap: usize) -> Result<GitOutput, ReviewError> {
     let mut command = Command::new("git");
     command
+        .arg("--no-optional-locks")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -1778,6 +1788,59 @@ mod tests {
             !numstat.contains("untracked.txt"),
             "git never counts untracked files in --numstat"
         );
+    }
+
+    /// `/diff` is read-only for repository metadata: a stale cached stat must
+    /// not let `git diff` refresh and rewrite `.git/index`. The effective guard
+    /// is `diff.autoRefreshIndex=false`; `--no-optional-locks` alone does not
+    /// cover `git diff`'s stat refresh.
+    #[tokio::test]
+    async fn review_does_not_refresh_the_index() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let repo = Repo::init();
+        repo.write("touched.txt", "content\n");
+        repo.write("other.txt", "other\n");
+        repo.commit("base");
+
+        // A distinct old mtime on the index itself makes a rewrite visible.
+        let old = UNIX_EPOCH + Duration::from_secs(3_600);
+        let index = repo.path().join(".git/index");
+        let index_mtime_set = std::fs::File::options()
+            .write(true)
+            .open(&index)
+            .and_then(|file| file.set_modified(old))
+            .is_ok();
+
+        // An unchanged tracked file whose mtime moved far into the past gives
+        // Git a stale cached stat: a plain `git diff` re-hashes it, refreshes
+        // the entry and writes the index.
+        let tracked = repo.path().join("touched.txt");
+        let tracked_mtime_set = std::fs::File::options()
+            .write(true)
+            .open(&tracked)
+            .and_then(|file| file.set_modified(old))
+            .is_ok();
+
+        let before = std::fs::metadata(&index).unwrap().modified().ok();
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert!(
+            review.document.files.is_empty(),
+            "a touched-but-unchanged file is not a change"
+        );
+
+        assert!(
+            !repo.path().join(".git/index.lock").exists(),
+            "the review must not leave an index lock behind"
+        );
+        if index_mtime_set && tracked_mtime_set {
+            let after = std::fs::metadata(&index).unwrap().modified().ok();
+            assert_eq!(after, before, "the review must not rewrite .git/index");
+        } else {
+            // The platform or mount refused a distinct mtime; the mtime proof
+            // would be meaningless, so it is skipped rather than passing
+            // falsely. The lock and content checks above still ran.
+        }
     }
 
     /// The document's header sums every file, including untracked additions,
