@@ -684,58 +684,97 @@ fn binary_note(section: &str, path: &str) -> String {
         .unwrap_or_else(|| format!("Binary files a/{path} and b/{path} differ"))
 }
 
-/// Build an untracked file's new-file patch. A symlink is an ordinary new-file
-/// patch whose content is its target string — read with `read_link`, never
-/// opened or followed. Any other non-regular entry is one note line, and a
-/// file or link target over the per-file cap keeps one note line.
-async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError> {
+/// What the blocking untracked inspection found: a symlink's target (which
+/// becomes a new-file patch), an opened regular file to read, or a one-line
+/// note for an entry that cannot be content.
+enum Inspected {
+    Symlink(String),
+    File(std::fs::File),
+    Note(&'static str),
+}
+
+/// Inspect one untracked entry's filesystem state. Everything that can stall on
+/// a network filesystem (metadata, a symlink read, the open and its handle
+/// checks) lives here, so the caller runs it on the blocking pool under one
+/// deadline. A symlink is read with `read_link` and never followed; a regular
+/// file is opened with [`open_beneath`].
+fn inspect_untracked(root: &Path, path: &str) -> Result<Inspected, ReviewError> {
     let full = root.join(path);
-    let meta = tokio::fs::symlink_metadata(&full).await.map_err(map_io_error)?;
+    let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
     if meta.file_type().is_symlink() {
-        // The link's content is its target path; reading the link itself never
-        // follows it, so no outside file is opened. The target has no trailing
-        // newline, which is why the synthesized line is fed with one.
-        let Ok(target) = tokio::fs::read_link(&full).await else {
-            return Ok(note_file(path, IRREGULAR_NOTE));
+        let Ok(target) = std::fs::read_link(&full) else {
+            return Ok(Inspected::Note(UNREADABLE_NOTE));
         };
         let target = target.to_string_lossy();
         if target.len() > MAX_FILE_PATCH_BYTES {
-            return Ok(note_file(path, OVERSIZE_NOTE));
+            return Ok(Inspected::Note(OVERSIZE_NOTE));
         }
-        let (patch, additions) = new_file_patch(path, &format!("{target}\n"));
-        return Ok(added_file(path.to_string(), patch, additions));
+        return Ok(Inspected::Symlink(target.into_owned()));
     }
     if !meta.file_type().is_file() {
-        return Ok(note_file(path, IRREGULAR_NOTE));
+        return Ok(Inspected::Note(IRREGULAR_NOTE));
     }
     if meta.len() > MAX_FILE_PATCH_BYTES as u64 {
-        return Ok(note_file(path, OVERSIZE_NOTE));
+        return Ok(Inspected::Note(OVERSIZE_NOTE));
     }
 
     // Every component is re-opened beneath the root: a parent directory swapped
     // for a symlink (or a final symlink/FIFO) is refused, not followed.
-    let Some(file) = open_beneath(root, path)? else {
-        return Ok(note_file(path, IRREGULAR_NOTE));
-    };
-    let bytes = match read_opened_within(file, UNTRACKED_READ_TIMEOUT).await {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Ok(note_file(path, UNREADABLE_NOTE)),
-        Err(error) => return Err(error),
-    };
-    if bytes.len() > MAX_FILE_PATCH_BYTES {
-        return Ok(note_file(path, OVERSIZE_NOTE));
+    match open_beneath(root, path)? {
+        Some(file) => Ok(Inspected::File(file)),
+        None => Ok(Inspected::Note(IRREGULAR_NOTE)),
     }
-    // Git's binary test over the whole (bounded) read window: a NUL anywhere
-    // means binary. Scanning only the first 8 KB would let later NUL-containing
-    // content reach the patch as text.
-    if bytes.contains(&0) {
-        return Ok(binary_added(path));
+}
+
+/// Build an untracked file's new-file patch. The whole inspection (metadata,
+/// symlink target, open and handle checks) runs in one blocking task under
+/// [`UNTRACKED_READ_TIMEOUT`]; only the returned regular file is read
+/// afterwards, under its own bounded read.
+async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError> {
+    match inspect_within(root, path, UNTRACKED_READ_TIMEOUT).await? {
+        Inspected::Symlink(target) => {
+            // The link's content is its target path; the target has no
+            // trailing newline, which is why the synthesized line is fed one.
+            let (patch, additions) = new_file_patch(path, &format!("{target}\n"));
+            Ok(added_file(path.to_string(), patch, additions))
+        }
+        Inspected::File(file) => {
+            let bytes = match read_opened_within(file, UNTRACKED_READ_TIMEOUT).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return Ok(note_file(path, UNREADABLE_NOTE)),
+                Err(error) => return Err(error),
+            };
+            if bytes.len() > MAX_FILE_PATCH_BYTES {
+                return Ok(note_file(path, OVERSIZE_NOTE));
+            }
+            // Git's binary test over the whole (bounded) read window: a NUL
+            // anywhere means binary. Scanning only the first 8 KB would let
+            // later NUL-containing content reach the patch as text.
+            if bytes.contains(&0) {
+                return Ok(binary_added(path));
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                return Ok(binary_added(path));
+            };
+            let (patch, additions) = new_file_patch(path, &text);
+            Ok(added_file(path.to_string(), patch, additions))
+        }
+        Inspected::Note(note) => Ok(note_file(path, note)),
     }
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Ok(binary_added(path));
-    };
-    let (patch, additions) = new_file_patch(path, &text);
-    Ok(added_file(path.to_string(), patch, additions))
+}
+
+/// Split an untracked path into components that are safe to open beneath the
+/// root: no absolute path and no empty, `.` or `..` component.
+fn beneath_components(relative: &str) -> Option<Vec<&str>> {
+    if Path::new(relative).is_absolute() {
+        return None;
+    }
+    let components: Vec<&str> = relative.split('/').collect();
+    (!components.is_empty()
+        && !components
+            .iter()
+            .any(|component| component.is_empty() || *component == "." || *component == ".."))
+    .then_some(components)
 }
 
 /// Open an untracked file for reading without leaving the repository root.
@@ -748,14 +787,9 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
 fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
     use rustix::fs::{CWD, Mode, OFlags};
 
-    let components: Vec<&str> = relative.split('/').collect();
-    if components.is_empty()
-        || components
-            .iter()
-            .any(|component| component.is_empty() || *component == "." || *component == "..")
-    {
+    let Some(components) = beneath_components(relative) else {
         return Ok(None);
-    }
+    };
 
     let root_dir = rustix::fs::openat(
         CWD,
@@ -797,40 +831,81 @@ fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, Re
     Ok(None)
 }
 
-/// Best effort where std has no `openat`: canonicalize the parent and require
-/// it to stay under the canonicalized root, then refuse a final symlink. The
-/// per-component walk above is Unix-only.
-#[cfg(not(unix))]
+/// Windows has no `openat`, so the opened handle is instead proved to be the
+/// canonical repository file: the resolved path must stay under the canonical
+/// root, and the handle's volume/file identity must match the resolved path's.
+/// That closes both the parent-directory swap (after `canonicalize`) and the
+/// final-file swap (after `open`).
+#[cfg(windows)]
 fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
-    let components: Vec<&str> = relative.split('/').collect();
-    if components.is_empty()
-        || components
-            .iter()
-            .any(|component| component.is_empty() || *component == "." || *component == "..")
-    {
+    if beneath_components(relative).is_none() {
         return Ok(None);
     }
     let full = root.join(relative);
-    let Some(parent) = full.parent() else {
-        return Ok(None);
-    };
-    let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
-    let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
-        return Ok(None);
-    };
-    if !canonical_parent.starts_with(&canonical_root) {
-        return Ok(None);
-    }
-    let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
-    if !meta.file_type().is_file() {
-        return Ok(None);
-    }
     let file = std::fs::File::open(&full).map_err(map_io_error)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
+    if !opened_stays_beneath(&canonical_root, &full, &file).map_err(map_io_error)? {
+        return Ok(None);
+    }
     let meta = file.metadata().map_err(map_io_error)?;
     if !meta.is_file() || meta.len() > MAX_FILE_PATCH_BYTES as u64 {
         return Ok(None);
     }
     Ok(Some(file))
+}
+
+/// Whether `file` is the file `full` resolves to, and that resolution is under
+/// `canonical_root`. `same-file` compares the handle's volume serial and file
+/// index (the `MetadataExt` accessors for those are still unstable); a handle
+/// that resolves outside the root, or names a different file than the opened
+/// handle, is refused.
+#[cfg(windows)]
+fn opened_stays_beneath(canonical_root: &Path, full: &Path, file: &std::fs::File) -> std::io::Result<bool> {
+    let resolved = std::fs::canonicalize(full)?;
+    if !resolved.starts_with(canonical_root) {
+        return Ok(false);
+    }
+    let opened = same_file::Handle::from_file(file.try_clone()?)?;
+    let named = same_file::Handle::from_path(&resolved)?;
+    Ok(opened == named)
+}
+
+/// No verified beneath-root open exists on this target (no `openat` and no
+/// file identity): the entry becomes the one-line note rather than risking a
+/// read outside the repository.
+#[cfg(all(not(unix), not(windows)))]
+fn open_beneath(_root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
+    let _ = beneath_components(relative);
+    Ok(None)
+}
+
+/// Run the whole synchronous untracked inspection on the blocking pool under
+/// one deadline. A timed-out or panicked blocking task is DETACHED, not
+/// awaited: the review must not wait on a stalled filesystem, and the entry
+/// becomes the unreadable note.
+async fn inspect_within(root: &Path, path: &str, timeout: Duration) -> Result<Inspected, ReviewError> {
+    let root = root.to_path_buf();
+    let path = path.to_string();
+    deadline(timeout, move || inspect_untracked(&root, &path)).await
+}
+
+async fn deadline<F>(timeout: Duration, inspect: F) -> Result<Inspected, ReviewError>
+where
+    F: FnOnce() -> Result<Inspected, ReviewError> + Send + 'static,
+{
+    // A zero budget can never complete an inspection; answering without
+    // spawning keeps that result deterministic.
+    if timeout.is_zero() {
+        return Ok(Inspected::Note(UNREADABLE_NOTE));
+    }
+    let task = tokio::task::spawn_blocking(inspect);
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(Ok(inspected))) => Ok(inspected),
+        Ok(Ok(Err(error))) => Err(error),
+        // A JoinError (the inspector panicked) or an expired deadline: one bad
+        // entry is a note, never a failed review.
+        Ok(Err(_)) | Err(_) => Ok(Inspected::Note(UNREADABLE_NOTE)),
+    }
 }
 
 /// Read one opened untracked file, bounded in bytes and in time. `None` is the
@@ -2299,6 +2374,40 @@ mod tests {
         );
     }
 
+    /// The inspection (metadata, symlink read, open, handle checks) is bounded
+    /// too: an exhausted budget is the unreadable note, not a pending review.
+    #[tokio::test]
+    async fn an_untracked_inspection_timeout_is_an_unreadable_note() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+        match inspect_within(dir.path(), "file.txt", std::time::Duration::ZERO)
+            .await
+            .unwrap()
+        {
+            Inspected::Note(note) => assert_eq!(note, UNREADABLE_NOTE),
+            _ => panic!("a zero inspection budget must be the unreadable note"),
+        }
+    }
+
+    /// A slow inspection against a short deadline is the unreadable note. This
+    /// fails if the timeout wrapper is removed: the closure would then finish
+    /// and return its own note.
+    #[tokio::test]
+    async fn a_slow_untracked_inspection_hits_the_deadline() {
+        let inspected = deadline(std::time::Duration::from_millis(1), || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(Inspected::Note(IRREGULAR_NOTE))
+        })
+        .await
+        .unwrap();
+
+        match inspected {
+            Inspected::Note(note) => assert_eq!(note, UNREADABLE_NOTE),
+            _ => panic!("a stalled inspection must be the unreadable note"),
+        }
+    }
+
     /// Only a genuinely unknown revision takes the not-found/unborn path; a
     /// permission or repository failure keeps its distinct error.
     #[test]
@@ -2393,6 +2502,22 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].patch, IRREGULAR_NOTE);
         assert!(!files[0].patch.contains("OUTSIDE-SECRET"));
+    }
+
+    /// The Windows identity check accepts the very file the resolved path
+    /// names; real handles only, no fabricated metadata.
+    #[cfg(windows)]
+    #[test]
+    fn opened_stays_beneath_accepts_the_named_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "content").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(
+            opened_stays_beneath(&canonical_root, &path, &file).unwrap(),
+            "the opened handle is the resolved repository file"
+        );
     }
 
     /// git missing / permission / other I/O each map to their own readable

@@ -303,6 +303,7 @@ dependencies = [
  "libc",
  "reqwest",
  "rustix",
+ "same-file",
  "semver",
  "serde",
  "serde_json",
