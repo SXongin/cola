@@ -1769,7 +1769,7 @@ async fn the_transfer_labels_the_bytes_it_uploads() {
     let recorded = uploads(&platform).await;
     assert_eq!(recorded.len(), 1, "exactly one upload: {recorded:?}");
     match &recorded[0] {
-        PlatformCall::UploadFile { name, mime, size } => {
+        PlatformCall::UploadFile { name, mime, size, .. } => {
             assert_eq!(name, "notes.txt");
             assert_eq!(
                 mime, "application/pdf",
