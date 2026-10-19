@@ -4743,7 +4743,11 @@ impl App {
                     tracing::warn!("turn diff: V1 aggregation without a readable transcript");
                     return Err(());
                 };
-                let Some(anchor) = transcript.anchor_of_user(&click.from) else {
+                // An empty `from` is the payload's "latest Turn" compatibility
+                // path (#801): `turn_diff_anchor` resolves the newest user
+                // message, the same rule the V2 read gets from an omitted
+                // `from`.
+                let Some(anchor) = turn_diff_anchor(transcript, &click.from) else {
                     tracing::warn!(
                         "turn diff: {} is not a user message in {}",
                         click.from,

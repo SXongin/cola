@@ -309,6 +309,36 @@ async fn v1_click_falls_back_to_the_tool_metadata_aggregation() {
     assert_eq!(file_uploads(&platform).await.len(), 1);
 }
 
+/// The payload's empty `from` compatibility path (#801) works on V1 too: the
+/// backend read omits `from`, and the aggregation resolves the newest user
+/// message instead of failing on the empty string.
+#[tokio::test]
+async fn v1_click_with_an_empty_from_uses_the_newest_user_message() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.given_transcript("ses_test", vec![anchored_edit_transcript("src/v1.rs")]);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let mut payload = click();
+    payload["from"] = serde_json::json!("");
+    app.host_action_on_message(payload, CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+
+    let message = wait_for_file_message(&platform).await;
+    assert!(
+        matches!(
+            message,
+            PlatformCall::SendMessageReply {
+                msg_type: ref ty,
+                ..
+            } if ty == "file"
+        ),
+        "an empty from still resolves the Turn and sends a File Message: {message:?}"
+    );
+    assert_eq!(file_uploads(&platform).await.len(), 1);
+}
+
 /// Repeated clicks are a no-op after the artifact was sent: the in-process
 /// `(session, from)` guard answers 「已发送」 and posts nothing again.
 #[tokio::test]
