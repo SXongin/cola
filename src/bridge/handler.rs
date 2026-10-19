@@ -299,8 +299,9 @@ const TURN_DIFF_EMPTY_TEXT: &str = "本 turn 没有文件改动";
 const TURN_DIFF_FAILURE_TEXT: &str = "生成完整 diff 失败，请稍后重试。";
 
 /// What an ambiguous File Message send answers: the request may have reached
-/// Feishu, so retrying could duplicate it (the viewer's same words).
-const TURN_DIFF_UNKNOWN_TEXT: &str = "发送结果未知，为避免重复未重试。";
+/// Feishu, so retrying could duplicate it. One text shared with `/diff`
+/// (`viewer::FILE_SEND_UNKNOWN_TEXT`).
+const TURN_DIFF_UNKNOWN_TEXT: &str = crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT;
 
 /// The artifact's `title`: what the reader opens from the Turn card.
 const TURN_DIFF_TITLE: &str = "本次改动的完整 diff";
@@ -4667,18 +4668,12 @@ impl App {
         let document = turn_diff_document(&turn.diff, &click, turn.source, turn.anchor_ms);
         let html = crate::backend::render_diff_html(&document);
         let name = turn_diff_file_name(&click.session_id, &click.from);
-        let content = crate::backend::FileContent::from_bytes("text/html", &name, html.into_bytes());
-        let hash = crate::bridge::handles::content_identity_hash(
-            &content.mime,
-            &content.name,
-            content.data.as_deref().unwrap_or_default(),
-        );
-        let delivery = crate::bridge::viewer::send_file_message(
+        let delivery = crate::bridge::viewer::send_html_file(
             &self.feishu,
             &self.cards_handle(),
             &click.message_id,
-            &content,
-            hash,
+            &name,
+            html,
             timeout_ms,
         )
         .await;
