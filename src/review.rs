@@ -82,6 +82,11 @@ const OVERSIZE_NOTE: &str = "文件超过 2 MB，未包含改动内容";
 /// opened; it is summarised by this one line.
 const IRREGULAR_NOTE: &str = "不是常规文件，未包含内容";
 
+/// An untracked entry that vanished or could not be read between `git ls-files`
+/// and the read (a build removed it, an editor replaced it, its path is not
+/// UTF-8) is summarised by this one line; it must not sink the whole review.
+const UNREADABLE_NOTE: &str = "无法读取该文件，未包含内容";
+
 /// The distinct, readable failures of a repository review. Every one of them is
 /// a real error: the producer never returns an empty document pretending the
 /// working tree had no changes.
@@ -265,7 +270,12 @@ async fn assemble_files(
             omitted += 1;
             continue;
         }
-        let file = untracked_file(root_path, path).await?;
+        let file = match untracked_file(root_path, path).await {
+            // One entry that vanished or cannot be read is a note for that
+            // path; it must never abort the whole review.
+            Ok(file) => file,
+            Err(_) => note_file(path, UNREADABLE_NOTE),
+        };
         if used.saturating_add(file.patch.len()) > MAX_TOTAL_PATCH_BYTES {
             stopped = true;
             stopped_by_cap = true;
@@ -1430,6 +1440,42 @@ mod tests {
 
         let huge = find(&review, "huge.txt");
         assert_eq!(huge.patch, OVERSIZE_NOTE);
+    }
+
+    /// One untracked entry that vanished between `git ls-files` and the read is
+    /// a note for that path, never an error for the whole review.
+    #[tokio::test]
+    async fn a_vanished_untracked_entry_is_a_note_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let (files, truncated) = assemble_files(root, &[], &[], 0, &["vanished.txt".to_string()])
+            .await
+            .expect("a per-entry read failure must not fail the review");
+
+        assert!(truncated.is_none());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "vanished.txt");
+        assert_eq!(files[0].status, "added");
+        assert_eq!(files[0].patch, UNREADABLE_NOTE);
+    }
+
+    /// A non-UTF-8 path survives `ls-files -z`'s lossy decode but cannot be
+    /// reopened by its lossy spelling: the review still finishes with a note
+    /// instead of failing the command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_non_utf8_untracked_name_is_a_note_not_an_error() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        let name = std::ffi::OsStr::from_bytes(b"bad\xffname.txt");
+        std::fs::write(repo.path().join(name), "content\n").unwrap();
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.document.files.len(), 1);
+        assert_eq!(review.document.files[0].patch, UNREADABLE_NOTE);
     }
 
     /// An untracked symlink is a new-file patch whose single content line is
