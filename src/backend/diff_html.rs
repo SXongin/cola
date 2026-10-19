@@ -18,9 +18,25 @@ use crate::backend::{TurnDiff, TurnDiffFile};
 
 /// The most bytes the rendered artifact may occupy: 8 MB. Feishu's File
 /// Message preview tolerance was measured at 12 MB (spec #797), and the margin
-/// absorbs client-side decoding and framing. Past this bound files are omitted
-/// **with a visible note**, never silently truncated.
+/// absorbs client-side decoding and framing.
+///
+/// The bound is a hard guarantee on the **whole** returned string, not just its
+/// file blocks: the title, subtitle and omission notes are escaped and clipped
+/// to `MAX_HEADER_TEXT_BYTES`/`MAX_NOTE_TEXT_BYTES` with a visible `…`
+/// marker before the page is assembled, and files are admitted whole only while
+/// they fit the remaining budget. Past it files are omitted **with a visible
+/// note**, never silently truncated.
 pub const MAX_DIFF_HTML_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most bytes one escaped header field (the title or the subtitle) may
+/// contribute. A larger field is clipped at a character boundary and ends with
+/// `…`, so an enormous or hostile header cannot crowd the diff out of the page
+/// or push the page past [`MAX_DIFF_HTML_BYTES`].
+const MAX_HEADER_TEXT_BYTES: usize = 8 * 1024;
+
+/// The most bytes one escaped omission note may contribute. Applies to both the
+/// caller's `truncated` note and the renderer's own cap note.
+const MAX_NOTE_TEXT_BYTES: usize = 8 * 1024;
 
 /// One file in a [`DiffDocument`]: the repository-relative path, the unified
 /// patch kept verbatim, the source's reported line counts and its status
@@ -82,43 +98,144 @@ impl From<TurnDiffFile> for DiffFile {
 /// before it enters the artifact; a bare `format!` with a path, patch line,
 /// status or stat is a security bug.
 pub fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
+    let mut escaped = String::with_capacity(escaped_len(text));
+    push_escaped_into(&mut escaped, text);
+    escaped
+}
+
+/// The length [`escape_html`] will produce, without allocating the result. A
+/// bounded renderer asks this before escaping so an oversized patch line is
+/// rejected without ever being expanded into a second huge string.
+fn escaped_len(text: &str) -> usize {
+    text.chars().map(escaped_char_len).sum()
+}
+
+fn escaped_char_len(ch: char) -> usize {
+    match ch {
+        '&' => "&amp;".len(),
+        '<' | '>' => "&lt;".len(),
+        '"' => "&quot;".len(),
+        '\'' => "&#39;".len(),
+        _ => ch.len_utf8(),
+    }
+}
+
+fn push_escaped_into(out: &mut String, text: &str) {
     for ch in text.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
+        push_escaped_char(out, ch);
+    }
+}
+
+/// Escape `text` and, when the escaped form would exceed `max_bytes`, clip it
+/// at a character boundary and append a visible `…`. Used for the page's header
+/// fields and notes, whose size is caller-controlled; file blocks use
+/// [`BoundedHtml`], which admits a whole block or none of it.
+fn escape_clipped(text: &str, max_bytes: usize) -> String {
+    if escaped_len(text) <= max_bytes {
+        return escape_html(text);
+    }
+    const MARKER: &str = "…";
+    let limit = max_bytes.saturating_sub(MARKER.len());
+    let mut escaped = String::with_capacity(max_bytes);
+    for ch in text.chars() {
+        let len = escaped_char_len(ch);
+        if escaped.len() + len > limit {
+            break;
+        }
+        push_escaped_char(&mut escaped, ch);
+    }
+    escaped.push_str(MARKER);
+    escaped
+}
+
+fn push_escaped_char(out: &mut String, ch: char) {
+    match ch {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&#39;"),
+        _ => out.push(ch),
+    }
+}
+
+/// A string that refuses to grow past a byte bound. [`push_escaped`] measures
+/// the escaped form first, so a line or patch larger than the bound is never
+/// expanded only to be discarded.
+///
+/// [`push_escaped`]: BoundedHtml::push_escaped
+struct BoundedHtml {
+    html: String,
+    max: usize,
+}
+
+impl BoundedHtml {
+    fn new(max: usize) -> Self {
+        Self {
+            html: String::new(),
+            max,
         }
     }
-    escaped
+
+    fn push(&mut self, text: &str) -> bool {
+        if self.html.len().saturating_add(text.len()) > self.max {
+            return false;
+        }
+        self.html.push_str(text);
+        true
+    }
+
+    fn push_escaped(&mut self, text: &str) -> bool {
+        if self.html.len().saturating_add(escaped_len(text)) > self.max {
+            return false;
+        }
+        push_escaped_into(&mut self.html, text);
+        true
+    }
+
+    fn into_html(self) -> String {
+        self.html
+    }
 }
 
 /// Render `doc` as a self-contained HTML page: one `<details>` per file (the
 /// first open), one `<pre>` per hunk with old/new line numbers and red/green
 /// line classes, and a dark-mode variable set.
+///
+/// The whole returned string is below [`MAX_DIFF_HTML_BYTES`] for **any**
+/// input, including an enormous title, subtitle or `truncated` note: the header
+/// fields and notes are escaped and clipped with a visible `…`, then the
+/// remaining budget admits files whole in order. The "没有文件改动" wording is
+/// reserved for a genuinely empty document (no files and no supplied omission
+/// note); a document whose files were all omitted still shows the note.
 pub fn render_diff_html(doc: &DiffDocument) -> String {
     let head = render_head(doc);
+    let caller_note = doc.truncated.as_deref().map(note_html).unwrap_or_default();
+
     if doc.files.is_empty() {
-        return format!("{head}<p class=\"empty\">没有文件改动</p>\n{CLOSING}");
+        let html = if doc.truncated.is_some() {
+            // The caller pre-omitted every file: the note is the honest answer,
+            // not "no changes".
+            format!("{head}{caller_note}{CLOSING}")
+        } else {
+            format!("{head}<p class=\"empty\">没有文件改动</p>\n{CLOSING}")
+        };
+        debug_assert!(html.len() < MAX_DIFF_HTML_BYTES);
+        return html;
     }
 
-    // Reserve the closing tag, a caller-supplied omission note and room for the
+    // Reserve the closing tag, the caller's note and room for the renderer's
     // cap note BEFORE accepting a file block: a file is included whole or not
     // at all, so the artifact never ends mid-file and never exceeds the cap.
-    let caller_note = doc.truncated.as_deref().map(note_html).unwrap_or_default();
     let budget =
         MAX_DIFF_HTML_BYTES.saturating_sub(head.len() + caller_note.len() + CLOSING.len() + CAP_NOTE_RESERVE);
 
     let mut body = String::new();
     let mut included = 0usize;
     for (index, file) in doc.files.iter().enumerate() {
-        let block = render_file(file, index == 0);
-        if body.len() + block.len() > budget {
+        let Some(block) = render_file(file, index == 0, budget.saturating_sub(body.len())) else {
             break;
-        }
+        };
         body.push_str(&block);
         included += 1;
     }
@@ -128,7 +245,9 @@ pub fn render_diff_html(doc: &DiffDocument) -> String {
     if omitted > 0 {
         notes.push_str(&note_html(&format!("已省略 {omitted} 个文件（超出预览上限）")));
     }
-    format!("{head}{body}{notes}{CLOSING}")
+    let html = format!("{head}{body}{notes}{CLOSING}");
+    debug_assert!(html.len() < MAX_DIFF_HTML_BYTES);
+    html
 }
 
 /// The closing of every page. Kept out of the head so the cap can count it.
@@ -139,12 +258,19 @@ const CLOSING: &str = "</main>\n</body>\n</html>\n";
 const CAP_NOTE_RESERVE: usize = 1024;
 
 /// The page shell and header: doctype, the inline style sheet, the title and
-/// the `N files · +A −D` totals. Every dynamic field is escaped.
+/// the `N files · +A −D` totals. Every dynamic header field is escaped and
+/// clipped to the header bound.
 fn render_head(doc: &DiffDocument) -> String {
-    let title = escape_html(&doc.title);
-    let subtitle = escape_html(&doc.subtitle);
-    let additions: usize = doc.files.iter().map(|file| file.additions).sum();
-    let deletions: usize = doc.files.iter().map(|file| file.deletions).sum();
+    let title = escape_clipped(&doc.title, MAX_HEADER_TEXT_BYTES);
+    let subtitle = escape_clipped(&doc.subtitle, MAX_HEADER_TEXT_BYTES);
+    let additions = doc
+        .files
+        .iter()
+        .fold(0usize, |total, file| total.saturating_add(file.additions));
+    let deletions = doc
+        .files
+        .iter()
+        .fold(0usize, |total, file| total.saturating_add(file.deletions));
     let files = escape_html(&doc.files.len().to_string());
     format!(
         "<!DOCTYPE html>\n\
@@ -168,42 +294,83 @@ fn render_head(doc: &DiffDocument) -> String {
 }
 
 /// One file's fold. The first file opens; every later one starts folded.
-fn render_file(file: &DiffFile, open: bool) -> String {
-    let mut html = String::from("<details class=\"file\"");
-    if open {
-        html.push_str(" open");
+/// `None` when the block does not fit `max_bytes` — the block is rendered into a
+/// bounded buffer, so an oversized patch is never expanded into a huge string
+/// only to be dropped.
+fn render_file(file: &DiffFile, open: bool, max_bytes: usize) -> Option<String> {
+    let mut html = BoundedHtml::new(max_bytes);
+    if !html.push("<details class=\"file\"") {
+        return None;
     }
-    html.push_str(">\n<summary><span class=\"path\">");
-    html.push_str(&escape_html(&file.path));
-    html.push_str("</span><span class=\"counts\"><span class=\"add\">+");
-    html.push_str(&escape_html(&file.additions.to_string()));
-    html.push_str("</span> <span class=\"del\">−");
-    html.push_str(&escape_html(&file.deletions.to_string()));
-    html.push_str("</span></span>");
+    if open && !html.push(" open") {
+        return None;
+    }
+    if !html.push(">\n<summary><span class=\"path\">") {
+        return None;
+    }
+    if !html.push_escaped(&file.path) {
+        return None;
+    }
+    if !html.push("</span><span class=\"counts\"><span class=\"add\">+") {
+        return None;
+    }
+    if !html.push_escaped(&file.additions.to_string()) {
+        return None;
+    }
+    if !html.push("</span> <span class=\"del\">−") {
+        return None;
+    }
+    if !html.push_escaped(&file.deletions.to_string()) {
+        return None;
+    }
+    if !html.push("</span></span>") {
+        return None;
+    }
     if !file.status.is_empty() {
-        html.push_str("<span class=\"status\">");
-        html.push_str(&escape_html(&file.status));
-        html.push_str("</span>");
+        if !html.push("<span class=\"status\">") {
+            return None;
+        }
+        if !html.push_escaped(&file.status) {
+            return None;
+        }
+        if !html.push("</span>") {
+            return None;
+        }
     }
-    html.push_str("</summary>\n");
+    if !html.push("</summary>\n") {
+        return None;
+    }
     for hunk in parse_hunks(&file.patch) {
-        html.push_str(&render_hunk(&hunk));
+        if !render_hunk(&hunk, &mut html) {
+            return None;
+        }
     }
-    html.push_str("</details>\n");
-    html
+    if !html.push("</details>\n") {
+        return None;
+    }
+    Some(html.into_html())
 }
 
 /// One hunk (or a loose run of non-header lines) as a `<pre>`: the `@@` header,
 /// then one block row per line with old/new line-number columns and the source
-/// line verbatim, prefix included.
-fn render_hunk(hunk: &Hunk) -> String {
-    let mut html = String::from("<pre class=\"hunk\">");
+/// line verbatim, prefix included. `false` when the hunk outgrows the block's
+/// bound.
+fn render_hunk(hunk: &Hunk<'_>, html: &mut BoundedHtml) -> bool {
+    if !html.push("<pre class=\"hunk\">") {
+        return false;
+    }
     if !hunk.header.is_empty() {
-        html.push_str(
+        if !html.push(
             "<span class=\"line hunk\"><span class=\"ln old\"></span><span class=\"ln new\"></span><span class=\"code\">",
-        );
-        html.push_str(&escape_html(&hunk.header));
-        html.push_str("</span></span>");
+        ) {
+            return false;
+        }
+        if !html.push_escaped(hunk.header) {
+            return false;
+        }
+        if !html.push("</span></span>") {
+            return false;
+        }
     }
     for line in &hunk.lines {
         let class = match line.kind {
@@ -213,26 +380,46 @@ fn render_hunk(hunk: &Hunk) -> String {
             LineKind::Note => "note",
             LineKind::Other => "other",
         };
-        html.push_str("<span class=\"line ");
-        html.push_str(class);
-        html.push_str("\"><span class=\"ln old\">");
-        if let Some(number) = line.old {
-            html.push_str(&escape_html(&number.to_string()));
+        if !html.push("<span class=\"line ") {
+            return false;
         }
-        html.push_str("</span><span class=\"ln new\">");
-        if let Some(number) = line.new {
-            html.push_str(&escape_html(&number.to_string()));
+        if !html.push(class) {
+            return false;
         }
-        html.push_str("</span><span class=\"code\">");
-        html.push_str(&escape_html(&line.text));
-        html.push_str("</span></span>");
+        if !html.push("\"><span class=\"ln old\">") {
+            return false;
+        }
+        if let Some(number) = line.old
+            && !html.push_escaped(&number.to_string())
+        {
+            return false;
+        }
+        if !html.push("</span><span class=\"ln new\">") {
+            return false;
+        }
+        if let Some(number) = line.new
+            && !html.push_escaped(&number.to_string())
+        {
+            return false;
+        }
+        if !html.push("</span><span class=\"code\">") {
+            return false;
+        }
+        if !html.push_escaped(line.text) {
+            return false;
+        }
+        if !html.push("</span></span>") {
+            return false;
+        }
     }
-    html.push_str("</pre>\n");
-    html
+    html.push("</pre>\n")
 }
 
 fn note_html(note: &str) -> String {
-    format!("<p class=\"note\">{}</p>\n", escape_html(note))
+    format!(
+        "<p class=\"note\">{}</p>\n",
+        escape_clipped(note, MAX_NOTE_TEXT_BYTES)
+    )
 }
 
 /// The class of one parsed patch line.
@@ -247,17 +434,19 @@ enum LineKind {
     Other,
 }
 
-struct ParsedLine {
+struct ParsedLine<'a> {
     kind: LineKind,
-    text: String,
+    /// Borrowed from the patch: a huge line is never cloned just to be size-
+    /// checked and dropped.
+    text: &'a str,
     old: Option<usize>,
     new: Option<usize>,
 }
 
-struct Hunk {
+struct Hunk<'a> {
     /// The raw `@@ … @@` line, empty for a loose run outside a hunk.
-    header: String,
-    lines: Vec<ParsedLine>,
+    header: &'a str,
+    lines: Vec<ParsedLine<'a>>,
 }
 
 /// Split one file's patch into hunks, KEEPING the `@@` header, every context
@@ -269,8 +458,8 @@ struct Hunk {
 /// `+`-prefixed addition. Before the first hunk those four prefixes are always
 /// headers, which is what a V1 `recorded_diff` starts with. A blank line is
 /// not a file header and is preserved rather than silently dropped.
-fn parse_hunks(patch: &str) -> Vec<Hunk> {
-    let mut hunks: Vec<Hunk> = Vec::new();
+fn parse_hunks(patch: &str) -> Vec<Hunk<'_>> {
+    let mut hunks: Vec<Hunk<'_>> = Vec::new();
     let mut in_hunk = false;
     let mut loose_open = false;
     let mut old_remaining = 0usize;
@@ -291,7 +480,7 @@ fn parse_hunks(patch: &str) -> Vec<Hunk> {
             in_hunk = true;
             loose_open = false;
             hunks.push(Hunk {
-                header: line.to_string(),
+                header: line,
                 lines: Vec::new(),
             });
             continue;
@@ -303,7 +492,7 @@ fn parse_hunks(patch: &str) -> Vec<Hunk> {
             if let Some(hunk) = hunks.last_mut() {
                 hunk.lines.push(ParsedLine {
                     kind: LineKind::Note,
-                    text: line.to_string(),
+                    text: line,
                     old: None,
                     new: None,
                 });
@@ -321,7 +510,7 @@ fn parse_hunks(patch: &str) -> Vec<Hunk> {
             }
             if !loose_open {
                 hunks.push(Hunk {
-                    header: String::new(),
+                    header: "",
                     lines: Vec::new(),
                 });
                 loose_open = true;
@@ -329,7 +518,7 @@ fn parse_hunks(patch: &str) -> Vec<Hunk> {
             if let Some(hunk) = hunks.last_mut() {
                 hunk.lines.push(ParsedLine {
                     kind: LineKind::Other,
-                    text: line.to_string(),
+                    text: line,
                     old: None,
                     new: None,
                 });
@@ -361,7 +550,7 @@ fn parse_hunks(patch: &str) -> Vec<Hunk> {
         if let Some(hunk) = hunks.last_mut() {
             hunk.lines.push(ParsedLine {
                 kind,
-                text: line.to_string(),
+                text: line,
                 old,
                 new,
             });
@@ -629,6 +818,57 @@ mod tests {
         assert!(html.contains("class=\"line add\""));
         assert!(!html.contains("--- a/src/a.rs"));
         assert!(!html.contains("+++ b/src/a.rs"));
+    }
+
+    /// The hard bound covers caller-controlled header and note text too: a
+    /// field larger than the whole artifact is escaped-and-clipped with `…`,
+    /// never inserted at full size.
+    #[test]
+    fn huge_header_and_notes_stay_under_the_cap() {
+        let huge = "x".repeat(MAX_DIFF_HTML_BYTES + 1);
+        let html = render_diff_html(&DiffDocument {
+            title: huge.clone(),
+            subtitle: huge.clone(),
+            files: vec![file("src/a.rs", "@@ -1 +1 @@\n-a\n+b\n", 1, 1)],
+            truncated: Some(huge),
+        });
+
+        assert!(html.len() < MAX_DIFF_HTML_BYTES);
+        assert!(html.contains('…'));
+        assert!(html.contains("<details"));
+        assert!(html.contains("src/a.rs"));
+    }
+
+    /// A file too large for the remaining budget is omitted whole, and a
+    /// document whose every file was omitted reports the omission — never
+    /// "没有文件改动", which is reserved for a genuinely empty diff.
+    #[test]
+    fn cap_omitting_every_file_shows_the_note_not_no_changes() {
+        let huge = "x".repeat(MAX_DIFF_HTML_BYTES + 1);
+        let patch = format!("@@ -1,1 +1,1 @@\n+{huge}\n");
+        let html = render_diff_html(&doc(vec![file("src/huge.rs", &patch, 1, 0)]));
+
+        assert!(!html.contains("<details"));
+        assert!(!html.contains("src/huge.rs"));
+        assert!(html.contains("已省略 1 个文件（超出预览上限）"));
+        assert!(!html.contains("没有文件改动"));
+        assert!(html.len() < MAX_DIFF_HTML_BYTES);
+    }
+
+    /// A caller who already omitted every file still gets its explanation; the
+    /// empty-diff wording must not claim there were no changes.
+    #[test]
+    fn empty_files_with_a_supplied_note_keeps_the_note() {
+        let html = render_diff_html(&DiffDocument {
+            title: "本次改动".to_string(),
+            subtitle: "session ses_1".to_string(),
+            files: Vec::new(),
+            truncated: Some("已省略 3 个文件（超出预览上限）".to_string()),
+        });
+
+        assert!(html.contains("已省略 3 个文件（超出预览上限）"));
+        assert!(!html.contains("没有文件改动"));
+        assert!(html.len() < MAX_DIFF_HTML_BYTES);
     }
 
     /// Acceptance: a patch past the cap drops whole files in order, says so
