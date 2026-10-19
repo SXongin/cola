@@ -14,12 +14,21 @@
 //! HTTP adapter ([`crate::opencode::client::OpenCodeBackend`]) and the test mock
 //! implement them.
 
+// #801 (the turn card's button) and #803 (repository review) are this
+// generator's consumers; until one lands, nothing in the binary names it and a
+// bin crate's dead-code lint would flag the whole module.
+#[allow(dead_code)]
+pub mod diff_html;
 pub mod file_content;
 pub mod transcript;
 pub mod turn_diff;
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
+// No consumer lands in the generator's own ticket; the re-export is the
+// contract root #801/#803 import from, not dead surface.
+#[allow(unused_imports)]
+pub use diff_html::*;
 pub use file_content::*;
 pub use transcript::*;
 pub use turn_diff::*;
