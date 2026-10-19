@@ -1530,9 +1530,16 @@ enum RestartPlan {
 }
 
 /// The restart decision — a pure function so Service / Owned / Coexistent /
-/// none are unit-tested without touching a process.
-fn restart_plan(candidates: &[ServerCandidate], self_pid: Option<i32>) -> RestartPlan {
-    let Some(server) = pick_server(candidates, None, self_pid) else {
+/// none are unit-tested without touching a process. `preferred_port` is the
+/// `[opencode] url` tiebreaker [`pick_server`] applies, so the plan restarts
+/// the SAME canonical server cola is attached to (spec #809: "同类多个：配置的
+/// `[opencode] url` 端口优先，否则端口最小"; ADR-0085).
+fn restart_plan(
+    candidates: &[ServerCandidate],
+    preferred_port: Option<u16>,
+    self_pid: Option<i32>,
+) -> RestartPlan {
+    let Some(server) = pick_server(candidates, preferred_port, self_pid) else {
         return RestartPlan::NoServer;
     };
     match server.class_against(self_pid) {
@@ -1564,9 +1571,13 @@ const SERVICE_RESTART_CLI_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// re-raise on the same port/password, wait for it to accept. Any other
 /// server is someone else's — `NotOwned` tells the caller to ask for a manual
 /// restart, because cola has no record of how it was configured.
-pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
+///
+/// `preferred_port` is the `[opencode] url` tiebreaker: the restart follows
+/// the canonical pick, so among several servers of one class it restarts the
+/// configured one rather than a lower-port sibling (spec #809, ADR-0085).
+pub async fn restart_self_spawned_server(preferred_port: Option<u16>) -> anyhow::Result<RestartOutcome> {
     let candidates = scan_processes();
-    match restart_plan(&candidates, self_spawned_pid()) {
+    match restart_plan(&candidates, preferred_port, self_spawned_pid()) {
         RestartPlan::NoServer => Ok(RestartOutcome::NoServer),
         RestartPlan::NotOwned => Ok(RestartOutcome::NotOwned),
         RestartPlan::Service { port } => restart_managed_service(port).await,
@@ -1927,14 +1938,37 @@ mod tests {
         let owned = cand(1, 4096, "cola-secret", true);
         let service = service_cand(2, 49374);
         assert_eq!(
-            restart_plan(&[owned, service], Some(1)),
+            restart_plan(&[owned, service], None, Some(1)),
             RestartPlan::Service { port: 49374 }
         );
         // The port pins WHICH service the wait targets: a second service on
         // another port cannot satisfy it.
         let a = service_cand(3, 49374);
         let b = service_cand(4, 49375);
-        assert_eq!(restart_plan(&[b, a], None), RestartPlan::Service { port: 49374 });
+        assert_eq!(
+            restart_plan(&[b, a], None, None),
+            RestartPlan::Service { port: 49374 }
+        );
+    }
+
+    /// The restart follows the SAME canonical pick as the attach, preferred
+    /// port included: with two Shared Services and `[opencode] url` naming the
+    /// higher port, `/restart-opencode` must restart the one cola is attached
+    /// to, not the lower-port sibling (spec #809: "同类多个：配置的
+    /// `[opencode] url` 端口优先，否则端口最小"; ADR-0085).
+    #[test]
+    fn restart_plan_honors_the_preferred_port_among_services() {
+        let low = service_cand(3, 49374);
+        let high = service_cand(4, 49375);
+        assert_eq!(
+            restart_plan(&[low.clone(), high.clone()], Some(49375), None),
+            RestartPlan::Service { port: 49375 }
+        );
+        // No preference keeps the lowest port, unchanged.
+        assert_eq!(
+            restart_plan(&[high, low], None, None),
+            RestartPlan::Service { port: 49374 }
+        );
     }
 
     /// Write an executable `sh` stub for the `opencode service restart` tests.
@@ -1995,7 +2029,7 @@ mod tests {
     fn restart_plan_restarts_the_owned_server_on_its_own_port_and_password() {
         let owned = cand(1, 4096, "cola-secret", true);
         assert_eq!(
-            restart_plan(&[owned], Some(1)),
+            restart_plan(&[owned], None, Some(1)),
             RestartPlan::Owned {
                 pid: 1,
                 port: 4096,
@@ -2007,21 +2041,24 @@ mod tests {
     #[test]
     fn restart_plan_reports_not_owned_for_a_coexistent_server() {
         let coexist = cand(2, 52137, "openchamber", true);
-        assert_eq!(restart_plan(&[coexist], None), RestartPlan::NotOwned);
+        assert_eq!(restart_plan(&[coexist], None, None), RestartPlan::NotOwned);
         // The plan follows the canonical pick: an Owned Server that the
         // Coexistent one outranks is about to be yielded, not restarted.
         let owned = cand(1, 4096, "cola-secret", true);
         let coexist = cand(2, 52137, "openchamber", true);
-        assert_eq!(restart_plan(&[owned, coexist], Some(1)), RestartPlan::NotOwned);
+        assert_eq!(
+            restart_plan(&[owned, coexist], None, Some(1)),
+            RestartPlan::NotOwned
+        );
     }
 
     #[test]
     fn restart_plan_reports_no_server() {
-        assert_eq!(restart_plan(&[], None), RestartPlan::NoServer);
+        assert_eq!(restart_plan(&[], None, None), RestartPlan::NoServer);
         let custom = cand(1, 4096, "x", false);
-        assert_eq!(restart_plan(&[custom], None), RestartPlan::NoServer);
+        assert_eq!(restart_plan(&[custom], None, None), RestartPlan::NoServer);
         let private = cand(2, 0, "stdio", true);
-        assert_eq!(restart_plan(&[private], None), RestartPlan::NoServer);
+        assert_eq!(restart_plan(&[private], None, None), RestartPlan::NoServer);
     }
 
     #[test]
