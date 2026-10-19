@@ -2224,8 +2224,10 @@ async fn a_half_megabyte_minified_text_file_uses_the_viewer_pager() {
 }
 
 /// A page callback's lane belongs to the old snapshot. When the file changes
-/// from paged text to an image, the rebuild reports the fresh image as
-/// undelivered rather than attaching the stale text-delivery status.
+/// from paged text to an image, the rebuild drops the stale text-delivery lane
+/// and says the file changed — it must not report `未发送` for a transfer this
+/// navigation pass never attempted (#750). The fresh bytes stay one
+/// 「重新读取」 away, and 「发为文件」 is offered again.
 #[tokio::test]
 async fn flipping_a_page_after_a_kind_change_replaces_the_stale_lane() {
     let _wd = test_work_dir();
@@ -2267,22 +2269,95 @@ async fn flipping_a_page_after_a_kind_change_replaces_the_stale_lane() {
         "the fresh content is classified: {text}"
     );
     assert!(
-        text.contains("未发送"),
-        "the fresh lane is stated honestly: {text}"
+        text.contains("文件在打开后已变化"),
+        "the rebuild names the change instead of a delivery outcome: {text}"
     );
     assert!(
-        !text.contains("已发送为文件消息"),
-        "the stale delivery line is gone: {text}"
+        !text.contains("未发送"),
+        "navigation attempted no transfer, so it says no such thing: {text}"
+    );
+    assert!(
+        !text.contains("已发送为文件消息") && !text.contains("image/png"),
+        "the stale delivery line and its lane are gone: {text}"
     );
     assert!(
         !text.contains("文本（") && !text.contains("line 3000"),
         "stale preview is gone: {text}"
     );
-    assert!(
-        text.contains("image/png"),
-        "the tracking line names the new bytes: {text}"
-    );
     assert_eq!(updated.to_string().matches("\"tag\":\"img\"").count(), 0);
+    assert!(
+        card_buttons(&updated)
+            .iter()
+            .any(|button| button["value"]["op"] == "send"),
+        "the new bytes can be delivered: {text}"
+    );
+    assert!(
+        updated.to_string().find("viewer_lane_mime").is_none(),
+        "no stale lane rides the rebuilt payload: {updated}"
+    );
+}
+
+/// The same rule when the file stays text: the payload's `已发送` lane describes
+/// the OLD bytes, so a flip that re-reads different bytes drops it and names the
+/// change instead of `未发送` (#750). The pager itself survives — the content is
+/// still text and the new window is what the reader asked for.
+#[tokio::test]
+async fn flipping_a_page_after_a_text_change_drops_the_stale_lane() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("long.txt");
+    std::fs::write(&file, numbered_lines(3000)).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat long.txt",
+        key,
+        "m_changed_text_page",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    app.host_action_on_message(send_as_file_payload(&original), "msg_changed_text_page")
+        .await
+        .expect("transfer from the paged text viewer acknowledges");
+    wait_for_card_update(&platform, "text file transfer", CardUpdates::Latest, |card| {
+        card_text(card).contains("已发送为文件消息")
+    })
+    .await;
+    let transferred = platform.updated_cards().await.pop().expect("transfer patch");
+    let next = pager_button(&transferred, "下一页")["value"].clone();
+
+    // Same MIME and same byte length: only the content identity moves.
+    std::fs::write(&file, numbered_lines(3000).replace("line ", "LINE ")).unwrap();
+    let updated = drive_viewer_rebuild(&app, &platform, next, "msg_changed_text_page").await;
+    let text = card_text(&updated);
+    assert!(
+        text.contains("文件在打开后已变化"),
+        "the rebuild names the change instead of a delivery outcome: {text}"
+    );
+    assert!(
+        !text.contains("未发送"),
+        "navigation attempted no transfer, so it says no such thing: {text}"
+    );
+    assert!(
+        !text.contains("已发送为文件消息"),
+        "the delivery status for the old bytes is gone: {text}"
+    );
+    assert!(
+        text.contains("LINE ") && !text.contains("line "),
+        "the fresh window is rendered: {text}"
+    );
+    assert!(pager_label(&updated).is_some(), "text still pages: {text}");
+    assert!(
+        card_buttons(&updated)
+            .iter()
+            .any(|button| button["value"]["op"] == "send"),
+        "the new bytes can be delivered: {text}"
+    );
 }
 
 /// Page state round-trips through the button payload (ADR-0052): the viewer

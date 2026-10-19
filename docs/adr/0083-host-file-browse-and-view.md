@@ -120,7 +120,12 @@ loop.
    **except a delimited-text file (`.csv`, `.tsv`), whose preview is a markdown table**, since
    a table is what those bytes *are* and the platform renders one natively; that lane is
    where the card's table caps bite, so a table too big for the card takes the Rich Text
-   Message lane above rather than being silently cut to five rows. An image within Feishu's
+   Message lane above rather than being silently cut to five rows. A pager flip re-reads the
+   file before rendering its window; when those bytes no longer match the MIME, size or
+   content identity the clicked payload carried, the flip drops that stale delivery lane and
+   states that the file changed. A flip is navigation, not a re-read (#740), so it never
+   delivers — and it must not report `未发送` for a transfer it never attempted; 「重新读取」
+   runs the real lane decision. An image within Feishu's
    caps is embedded by ADR-0076's image path and reuses its content-hash upload cache, so
    opening the same image twice uploads once.
 6. **Type detection is local, explicit, and bounded.** Magic bytes (`infer`) decide image and

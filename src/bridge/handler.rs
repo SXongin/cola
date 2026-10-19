@@ -902,16 +902,35 @@ fn viewer_page(value: &serde_json::Value) -> usize {
     page.max(1) as usize
 }
 
+/// What a pager rebuild keeps of the lane its payload carried.
+struct ViewerPageLane {
+    /// The carried lane, when it still describes the file the rebuild read.
+    lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
+    /// The fresh read no longer matches the carried lane, so the lane was
+    /// dropped and the card states the change instead of a delivery outcome.
+    changed: bool,
+}
+
 /// A pager payload can outlive the file snapshot it described. Keep its lane
-/// only while the fresh read still matches its MIME and size; otherwise show the
-/// newly classified file as undelivered rather than carrying stale status or
-/// an image key across a kind change.
+/// only while the fresh read still matches its MIME, size and content identity;
+/// otherwise drop it rather than carrying stale status or an image key across a
+/// kind change — and report that the file changed.
+///
+/// Dropping it (rather than rebuilding it as `Undelivered`) matters because a
+/// flip is navigation, not a re-read (#740): this pass delivers nothing, so
+/// `未发送` would read as a failed send. The card says the file changed and
+/// points at the one control that runs the real lane decision.
 fn reconcile_viewer_page_lane(
     lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
     classified: &crate::bridge::viewer::Classified,
     path: &std::path::Path,
-) -> Option<crate::feishu::card::viewer::ViewerFileLane> {
-    let lane = lane?;
+) -> ViewerPageLane {
+    let Some(lane) = lane else {
+        return ViewerPageLane {
+            lane: None,
+            changed: false,
+        };
+    };
     let fresh_identity = classified
         .bytes
         .as_deref()
@@ -927,18 +946,15 @@ fn reconcile_viewer_page_lane(
         .content_identity
         .is_none_or(|identity| fresh_identity == Some(identity));
     if lane.mime == classified.mime && lane.size == classified.size && identity_matches {
-        return Some(lane);
+        return ViewerPageLane {
+            lane: Some(lane),
+            changed: false,
+        };
     }
-    Some(crate::feishu::card::viewer::ViewerFileLane {
-        mime: classified.mime.clone(),
-        name: crate::feishu::card::command::file_display_name(path),
-        size: classified.size,
-        delivery: crate::feishu::card::tool_render::FileDelivery::Undelivered,
-        content_identity: None,
-        embedded_image_key: None,
-        rich_message_id: None,
-        refresh_failed: false,
-    })
+    ViewerPageLane {
+        lane: None,
+        changed: true,
+    }
 }
 
 /// Declare (or replace) the conversation's Pending Session at `directory` — the
@@ -3381,7 +3397,7 @@ impl App {
             keyword: &return_to.keyword,
             page: return_to.page,
         });
-        let lane = reconcile_viewer_page_lane(lane, &classified, &resolved);
+        let ViewerPageLane { lane, changed } = reconcile_viewer_page_lane(lane, &classified, &resolved);
         let card = crate::feishu::card::command::build_viewer_for_classified(
             &thread_key,
             &resolved,
@@ -3393,6 +3409,7 @@ impl App {
                 overflowed: false,
                 session_dir: session_dir.as_deref(),
                 view,
+                notice: changed.then_some(crate::feishu::card::viewer::PAGE_CONTENT_CHANGED_NOTE),
             },
         );
         if !matches!(
@@ -3500,6 +3517,7 @@ impl App {
                 overflowed,
                 session_dir: session_dir.as_deref(),
                 view,
+                notice: None,
             },
         );
         if !matches!(
@@ -3678,6 +3696,7 @@ impl App {
                         // rendered markdown for a `.md` file that fits, source
                         // otherwise.
                         view: None,
+                        notice: None,
                     },
                 )
             }
@@ -4569,6 +4588,7 @@ impl App {
                         // The transfer's PATCH rebuilds the card it was clicked
                         // on: keep the markdown view the reader chose (#781).
                         view: crate::feishu::card::viewer::ViewerView::from_payload(&value),
+                        notice: None,
                     },
                 )
             }

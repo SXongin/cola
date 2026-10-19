@@ -405,6 +405,7 @@ pub(crate) async fn send_cat_card(
                     session_dir: Some(&session_dir),
                     // A `/cat` open leads with the default view (#781).
                     view: None,
+                    notice: None,
                 },
             );
             platform.reply_card(message_id, &card).await?;
@@ -452,6 +453,10 @@ pub(crate) struct ViewerBuildOptions<'a> {
     /// The markdown view to show (#781), or `None` for the default (rendered
     /// when the render fits the card, source otherwise).
     pub(crate) view: Option<super::viewer::ViewerView>,
+    /// A one-line notice when a rebuild found the file changed under it (a
+    /// pager flip whose payload's lane no longer matches the fresh bytes), or
+    /// `None`. Rendered where the tracking line would be.
+    pub(crate) notice: Option<&'a str>,
 }
 
 pub(crate) fn build_viewer_for_classified(
@@ -471,6 +476,7 @@ pub(crate) fn build_viewer_for_classified(
         overflowed,
         session_dir,
         view,
+        notice,
     } = options;
     let kind = match classified.kind {
         ClassifiedKind::Image => ViewerKind::Image,
@@ -503,6 +509,7 @@ pub(crate) fn build_viewer_for_classified(
             return_to,
             lane,
             overflowed,
+            notice,
         },
     )
 }

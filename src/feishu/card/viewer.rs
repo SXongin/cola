@@ -391,7 +391,21 @@ pub(crate) struct ViewerCard<'a> {
     /// preview, honest cut note and rescue button, with the tracking line
     /// stating the content was not delivered.
     pub(crate) overflowed: bool,
+    /// A one-line notice rendered where the tracking line would be, when a
+    /// rebuild discovered the file changed under it: a pager flip drops the
+    /// payload's stale lane and says so instead of reporting `未发送` for a
+    /// transfer this pass never attempted (see
+    /// [`PAGE_CONTENT_CHANGED_NOTE`]). `None` on every ordinary card.
+    pub(crate) notice: Option<&'a str>,
 }
+
+/// What a pager flip says when the file no longer matches the snapshot the
+/// clicked payload carried (its MIME, size or content identity moved).
+///
+/// A flip is navigation, not a re-read (#740), so it delivers nothing — but
+/// `未发送` would describe a transfer that never happened. The notice names the
+/// one control that rebuilds through the real lane decision.
+pub(crate) const PAGE_CONTENT_CHANGED_NOTE: &str = "⚠️ 文件在打开后已变化；点「🔄 重新读取」查看最新内容。";
 
 /// Build the File Viewer card (ADR-0083 §3).
 pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) -> serde_json::Value {
@@ -539,6 +553,16 @@ pub(crate) fn build_viewer_card(thread_key: &ThreadKey, view: ViewerCard<'_>) ->
                 "content": format!("_（过长的单元格已截断，每格最多 {MAX_CELL_CHARS} 字）_"),
             }));
         }
+    }
+
+    // A rebuild that found the file changed under it states that where the
+    // tracking line would be: it delivered nothing this pass, so the lane it
+    // dropped must not resurface as `未发送`.
+    if let Some(notice) = view.notice {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean(notice),
+        }));
     }
 
     // The whole-bytes lane's tracking line: names the file and says where its
@@ -1708,6 +1732,7 @@ mod tests {
             return_to: None,
             lane: None,
             overflowed: false,
+            notice: None,
         }
     }
 
@@ -2291,6 +2316,19 @@ mod tests {
         assert_eq!(images.len(), 1, "exactly one embedded image: {card}");
         assert_eq!(images[0]["img_key"], "img_v2_shot");
         assert_eq!(images[0]["preview"], true, "a click enlarges it");
+    }
+
+    /// A pager rebuild whose file changed renders the change notice where the
+    /// tracking line would be (#750): the stale lane was dropped, so no line
+    /// claims a send — least of all `未发送`.
+    #[test]
+    fn a_changed_page_renders_the_notice_not_a_lane_line() {
+        let mut view = view("/tmp/notes.txt", ViewerKind::Text, Some("txt"), "line\n");
+        view.notice = Some(PAGE_CONTENT_CHANGED_NOTE);
+        let text = card_text(&build_viewer_card(&key(), view));
+        assert!(text.contains("文件在打开后已变化"), "{text}");
+        assert!(!text.contains("📎"), "no lane line: {text}");
+        assert!(!text.contains("未发送"), "no delivery outcome: {text}");
     }
 
     #[test]
