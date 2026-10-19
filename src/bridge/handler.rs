@@ -688,6 +688,11 @@ struct ViewerPage {
     /// target the toggle named.
     view: Option<crate::feishu::card::viewer::ViewerView>,
     lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
+    /// The content identity the clicked card displayed when the payload was
+    /// built. A lane that never recorded its own bytes (the Rich Text
+    /// delivery) still belongs to this snapshot, so the rebuild compares it
+    /// too — otherwise a same-MIME/same-size edit would keep the stale lane.
+    payload_identity: Option<u64>,
     in_flight_guard: ViewerActionGuard,
 }
 
@@ -922,6 +927,7 @@ struct ViewerPageLane {
 /// points at the one control that runs the real lane decision.
 fn reconcile_viewer_page_lane(
     lane: Option<crate::feishu::card::viewer::ViewerFileLane>,
+    payload_identity: Option<u64>,
     classified: &crate::bridge::viewer::Classified,
     path: &std::path::Path,
 ) -> ViewerPageLane {
@@ -942,9 +948,16 @@ fn reconcile_viewer_page_lane(
                 bytes,
             )
         });
-    let identity_matches = lane
-        .content_identity
-        .is_none_or(|identity| fresh_identity == Some(identity));
+    // A lane that recorded no identity of its own (the Rich Text delivery) was
+    // still built from the card's snapshot, which the payload carries: compare
+    // that, so a same-MIME/same-size edit cannot keep a stale lane.
+    let carried_identity = lane.content_identity.or(payload_identity);
+    let identity_matches = match carried_identity {
+        Some(identity) => fresh_identity == Some(identity),
+        // Nothing identifies the old snapshot. Only an unreadable file (no
+        // fresh identity either) may keep its lane without proof.
+        None => fresh_identity.is_none(),
+    };
     if lane.mime == classified.mime && lane.size == classified.size && identity_matches {
         return ViewerPageLane {
             lane: Some(lane),
@@ -3201,6 +3214,10 @@ impl App {
                 page,
                 view: crate::feishu::card::viewer::ViewerView::from_payload(value),
                 lane: crate::feishu::card::viewer::lane_from_page_payload(value),
+                payload_identity: value
+                    .get("viewer_file_identity")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|identity| identity.parse().ok()),
                 in_flight_guard,
             };
             tokio::spawn(async move { app.run_viewer_page(page).await });
@@ -3353,6 +3370,7 @@ impl App {
             page,
             view,
             lane,
+            payload_identity,
             in_flight_guard,
         } = page;
         let _in_flight_guard = in_flight_guard;
@@ -3397,7 +3415,8 @@ impl App {
             keyword: &return_to.keyword,
             page: return_to.page,
         });
-        let ViewerPageLane { lane, changed } = reconcile_viewer_page_lane(lane, &classified, &resolved);
+        let ViewerPageLane { lane, changed } =
+            reconcile_viewer_page_lane(lane, payload_identity, &classified, &resolved);
         let card = crate::feishu::card::command::build_viewer_for_classified(
             &thread_key,
             &resolved,
