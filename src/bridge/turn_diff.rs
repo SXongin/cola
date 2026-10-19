@@ -20,7 +20,7 @@
 //! one, which is what keeps the card from offering a dead entry.
 
 use crate::backend::{Part, SessionTranscript, ToolCall, TurnAnchor, TurnDiff, TurnDiffFile};
-use crate::feishu::card::tool_render::{diff_header_path, recorded_diff};
+use crate::feishu::card::tool_render::{diff_header_path, opens_file_block, recorded_diff};
 use indexmap::IndexMap;
 
 /// The tools whose calls can record a file change. `write` records no patch on
@@ -162,9 +162,15 @@ impl PatchFile {
 /// [`recorded_diff`]); extending `parse_diff` to emit per-file slices would
 /// rewrite the panel's delicate parser for this ticket only.
 fn split_patch(patch: &str) -> Vec<TurnDiffFile> {
+    let lines = patch
+        .lines()
+        .map(|raw| raw.strip_suffix('\r').unwrap_or(raw))
+        .collect::<Vec<_>>();
     let mut splitter = PatchSplitter::default();
-    for raw in patch.lines() {
-        splitter.push(raw.strip_suffix('\r').unwrap_or(raw));
+    for (index, line) in lines.iter().enumerate() {
+        // The panel parser's own evidence for a joined patch's next file: the
+        // blank line before it is a separator, not the tool's trailing note.
+        splitter.push(line, opens_file_block(&lines, index + 1));
     }
     splitter.finish()
 }
@@ -174,6 +180,10 @@ struct PatchSplitter {
     files: Vec<TurnDiffFile>,
     current: Option<PatchFile>,
     in_hunk: bool,
+    /// The tool's trailing note has started. It is not part of any file's
+    /// patch: its `-`/`+` lines are diagnostics (or prose), not code changes,
+    /// so nothing after this point is counted or emitted.
+    in_tail: bool,
     saw_old_header: bool,
 }
 
@@ -182,6 +192,7 @@ impl PatchSplitter {
         self.flush();
         self.current = Some(PatchFile::new(path, path_from_index));
         self.in_hunk = false;
+        self.in_tail = false;
         self.saw_old_header = false;
     }
 
@@ -193,7 +204,24 @@ impl PatchSplitter {
         }
     }
 
-    fn push(&mut self, line: &str) {
+    fn push(&mut self, line: &str, next_opens_a_file: bool) {
+        if self.in_tail {
+            // Everything after the note's blank boundary is the note, even a
+            // line that looks like a diff header (the panel parser's rule).
+            return;
+        }
+        if line.is_empty() {
+            // A unified hunk cannot hold a truly empty line (a blank source
+            // line is the context line `" "`), so a blank line inside a hunk
+            // ends it. It is either the separator before a joined patch's next
+            // file — `opens_file_block` carries the panel parser's evidence —
+            // or the start of the tool's trailing note. Neither is patch
+            // content, so the line itself is dropped too.
+            if self.in_hunk && !next_opens_a_file {
+                self.in_tail = true;
+            }
+            return;
+        }
         if let Some(path) = line.strip_prefix("Index: ") {
             self.start(Some(path.trim().to_string()), true);
             self.line(line);
@@ -693,6 +721,83 @@ Index: src/notes.lua
 
         assert_eq!(paths(&diff), ["src/notes.lua"]);
         assert_eq!((diff.0[0].additions, diff.0[0].deletions), (1, 2));
+    }
+
+    /// The V1 edit shape the Tool Panel already knows: after the hunks, a blank
+    /// line then the LSP diagnostic note, whose `-`/`+` lines look like hunk
+    /// content. The note is neither patch content nor a code change, so the
+    /// artifact does not show it and #477's stats do not count it.
+    #[test]
+    fn a_trailing_lsp_note_is_not_part_of_the_patch_or_its_counts() {
+        let patch = "\
+Index: a.rs
+===================================================================
+--- a.rs
++++ a.rs
+@@ -1 +1 @@
+-old
++new
+
+LSP errors detected in a.rs, please fix:
+- a diagnostic that starts like a removal
++ a diagnostic that starts like an addition";
+        let diff = turn_diff_from_tools(
+            &transcript(vec![call("edit", Some(json!({ "diff": patch })))]),
+            &anchor(),
+        );
+
+        assert_eq!(paths(&diff), ["a.rs"]);
+        assert_eq!((diff.0[0].additions, diff.0[0].deletions), (1, 1));
+        assert!(
+            !diff.0[0].patch.contains("LSP") && !diff.0[0].patch.contains("diagnostic"),
+            "the note must not reach the artifact's patch: {:?}",
+            diff.0[0].patch
+        );
+        assert_eq!(
+            diff.0[0].patch.trim_end(),
+            "Index: a.rs\n===================================================================\n--- a.rs\n+++ a.rs\n@@ -1 +1 @@\n-old\n+new",
+            "the file's patch ends with its last hunk line"
+        );
+        assert_eq!(
+            diff.stats(),
+            crate::backend::TurnDiffStats {
+                files: 1,
+                additions: 1,
+                deletions: 1,
+            },
+            "the index folds the note-free counts"
+        );
+    }
+
+    /// A blank line between joined per-file patches is a file boundary, not the
+    /// note's start: the panel parser's `opens_file_block` evidence keeps the
+    /// second file (and its counts) intact.
+    #[test]
+    fn a_blank_between_joined_files_does_not_swallow_the_second_file() {
+        let first = "===================================================================\n--- a.rs\n+++ a.rs\n@@ -1 +1 @@\n-a\n+A\n";
+        let second = "===================================================================\n--- b.rs\n+++ b.rs\n@@ -1 +1,2 @@\n b\n+B\n";
+        let diff = turn_diff_from_tools(
+            &transcript(vec![call(
+                "patch",
+                Some(json!({ "files": [
+                    { "file": "a.rs", "patch": first },
+                    { "file": "b.rs", "patch": second },
+                ] })),
+            )]),
+            &anchor(),
+        );
+
+        assert_eq!(paths(&diff), ["a.rs", "b.rs"]);
+        assert_eq!((diff.0[0].additions, diff.0[0].deletions), (1, 1));
+        assert_eq!((diff.0[1].additions, diff.0[1].deletions), (1, 0));
+        assert_eq!(
+            diff.stats(),
+            crate::backend::TurnDiffStats {
+                files: 2,
+                additions: 2,
+                deletions: 1,
+            }
+        );
     }
 
     /// V2's `write` input spells the path `path` and records no `exists` (and
