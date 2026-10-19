@@ -297,7 +297,7 @@ How a user-supplied path resolves on the Host machine: relative to the **Session
 _Avoid_: Browse root, sandbox, jail, allowed paths (each claims a boundary this is not)
 
 **Terminal Command** (终端命令):
-One shell command the **Host** runs on the Host machine from Feishu without the model in the loop: a single child process, one `sh -c`, its cwd on the **Path Scope**'s base, its output going straight into a **Terminal Log** (ADR-0086). Entered as the `/run <cmd>` **Command**, or by a message whose first character is `!` followed by non-empty text — `!` is a message prefix, not a **Command**. One-shot by design: no `cd`/`export` state carries between commands, and its output never enters the Session Transcript.
+One shell command the **Host** runs on the Host machine from Feishu without the model in the loop: a single child process, one `sh -c`, its cwd on the **Path Scope**'s base, its output going straight into a **Terminal Log** (ADR-0086). Entered as the `/run <cmd>` **Command**, or by a message whose first character is `!` followed by non-empty text — `!` is a message prefix, not a **Command**. One-shot by design: no `cd`/`export` state carries between commands, and its output never enters the Session Transcript. Line-oriented, never screen-oriented: there is no pseudo-terminal, so a full-screen program fails fast rather than half-rendering.
 _Avoid_: Shell command (that is the Backend's `shell`/`bash` **Built-in Tool**), execution (the Backend's own unit), bash (one shell, not the concept), terminal session (there is no session)
 
 **Terminal Card** (终端命令卡):
