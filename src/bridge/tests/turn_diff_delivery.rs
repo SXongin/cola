@@ -156,6 +156,22 @@ fn app_config() -> (tempfile::TempDir, crate::config::Config) {
     (dir, cfg)
 }
 
+/// Build an app while keeping the `MockBackend` handle, so a test can assert
+/// the exact arguments a callback passed to a backend read.
+fn app_with_backend(
+    cfg: crate::config::Config,
+    backend: MockBackend,
+) -> (
+    std::sync::Arc<crate::bridge::App>,
+    std::sync::Arc<RecordingPlatform>,
+    std::sync::Arc<MockBackend>,
+) {
+    let backend = std::sync::Arc::new(backend);
+    let platform = std::sync::Arc::new(RecordingPlatform::new());
+    let app = std::sync::Arc::new(crate::bridge::App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    (app, platform, backend)
+}
+
 /// Acceptance: one click is ONE `upload_file` and ONE `msg_type=file` message
 /// under the clicked card, carrying the platform's key and an ASCII `.html`
 /// name the client previews by extension.
@@ -167,7 +183,7 @@ async fn one_click_uploads_once_and_posts_one_html_file_message() {
         diff_file("src/a.rs", 2, 1),
         diff_file("src/b.rs", 1, 0),
     ]));
-    let (app, platform) = build_app(cfg, backend).await;
+    let (app, platform, backend) = app_with_backend(cfg, backend);
 
     let ack = app
         .host_action_on_message(click(), CARD_MESSAGE)
@@ -208,6 +224,15 @@ async fn one_click_uploads_once_and_posts_one_html_file_message() {
         }
         other => panic!("expected a file upload, got {other:?}"),
     }
+
+    // The Turn range is the button's own anchor: the exact `from`, no `to`,
+    // and `context=3` (spec #797 decision 1). A wrong argument would open
+    // another Turn's diff, so the test pins it at the backend seam.
+    let calls = backend.session_diff_calls.lock().await;
+    assert_eq!(
+        calls.as_slice(),
+        &[("ses_test".to_string(), Some(TURN_FROM.to_string()), None, Some(3))]
+    );
 }
 
 /// The filename contract: ASCII, short, and `diff-<short>.html`.
@@ -267,22 +292,35 @@ async fn a_second_click_after_the_send_is_a_no_op() {
         .expect("the first click is acknowledged");
     wait_for_file_message(&platform).await;
 
-    let repeated = app
-        .host_action_on_message(click(), CARD_MESSAGE)
-        .await
-        .expect("a repeated click is acknowledged");
-    assert_eq!(repeated.toast.as_deref(), Some("已发送"));
+    // The send is recorded before the delivery marks the Turn `Sent`; retry
+    // the duplicate click until that terminal state is observable (each
+    // intermediate click is itself a harmless no-op).
+    let mut toast = None;
+    for _ in 0..200 {
+        let repeated = app
+            .host_action_on_message(click(), CARD_MESSAGE)
+            .await
+            .expect("a repeated click is acknowledged");
+        toast = repeated.toast;
+        if toast.as_deref() == Some("已发送") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(toast.as_deref(), Some("已发送"));
     assert_eq!(file_uploads(&platform).await.len(), 1, "no second upload");
     assert_eq!(file_messages(&platform).await.len(), 1, "no second File Message");
 }
 
-/// A Turn that changed no file replies the exact sentence and sends no file.
+/// A Turn that changed no file replies the exact sentence and sends no file;
+/// the empty answer is terminal, so a repeated click neither re-reads the diff
+/// nor repeats the reply.
 #[tokio::test]
-async fn an_empty_turn_replies_text_and_sends_no_file() {
+async fn an_empty_turn_replies_text_once_and_sends_no_file() {
     let (_dir, cfg) = app_config();
     let mut backend = MockBackend::new(Vec::new());
     backend.given_session_diff(TurnDiff::default());
-    let (app, platform) = build_app(cfg, backend).await;
+    let (app, platform, backend) = app_with_backend(cfg, backend);
 
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
@@ -291,6 +329,22 @@ async fn an_empty_turn_replies_text_and_sends_no_file() {
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
+
+    let repeated = app
+        .host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("a repeated click is acknowledged");
+    assert_eq!(repeated.toast.as_deref(), Some("本 turn 没有文件改动"));
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        1,
+        "the empty outcome is terminal: no second diff read"
+    );
+    assert_eq!(
+        text_replies(&platform).await.len(),
+        1,
+        "the empty answer is not repeated"
+    );
 }
 
 /// A failed upload speaks an actionable error, never panics or retries to the
@@ -300,7 +354,7 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
     let (_dir, cfg) = app_config();
     let mut backend = MockBackend::new(Vec::new());
     backend.given_session_diff(TurnDiff(vec![diff_file("src/a.rs", 1, 0)]));
-    let (app, platform) = build_app(cfg, backend).await;
+    let (app, platform, backend) = app_with_backend(cfg, backend);
     platform
         .fail_upload_file_count
         .store(1, std::sync::atomic::Ordering::SeqCst);
@@ -317,11 +371,70 @@ async fn an_upload_failure_replies_an_error_and_stays_retryable() {
     );
 
     // A retry is allowed: the failure sent nothing, so it is not a duplicate.
-    app.host_action_on_message(click(), CARD_MESSAGE)
-        .await
-        .expect("the retry is acknowledged");
+    // The failed delivery's claim is released as its task returns, so retry
+    // until one click actually re-enters the read (the reply being recorded
+    // does not yet mean the claim was dropped).
+    for _ in 0..200 {
+        app.host_action_on_message(click(), CARD_MESSAGE)
+            .await
+            .expect("the retry is acknowledged");
+        if backend.session_diff_calls.lock().await.len() > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     wait_for_file_message(&platform).await;
     assert_eq!(file_messages(&platform).await.len(), 1);
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        2,
+        "a definite failure is retryable: the second click re-reads the diff"
+    );
+}
+
+/// An ambiguous File Message send (Feishu accepted it, the response timed out)
+/// is terminal: the outcome is spoken once and a later click sends nothing —
+/// the artifact cannot be retracted, so a retry could duplicate it.
+#[tokio::test]
+async fn an_ambiguous_send_is_terminal_and_never_duplicated() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.given_session_diff(TurnDiff(vec![diff_file("src/a.rs", 1, 0)]));
+    let (app, platform, backend) = app_with_backend(cfg, backend);
+    // A bound short enough that the parked File Message send cannot answer.
+    app.viewer_transfer_timeout_ms
+        .store(400, std::sync::atomic::Ordering::Relaxed);
+
+    let (entered, _release) = platform.pause_after_accept("send_message", CARD_MESSAGE);
+    app.host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the spawned delivery reaches the File Message send");
+    wait_for_reply_containing(&platform, "发送结果未知").await;
+
+    assert_eq!(
+        file_messages(&platform).await.len(),
+        1,
+        "the accepted File Message is recorded once"
+    );
+
+    let repeated = app
+        .host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("a repeated click is acknowledged");
+    assert_eq!(
+        repeated.toast.as_deref(),
+        Some("发送结果未知，为避免重复未重试。")
+    );
+    assert_eq!(file_uploads(&platform).await.len(), 1, "no second upload");
+    assert_eq!(file_messages(&platform).await.len(), 1, "no second File Message");
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        1,
+        "the ambiguous outcome is terminal: no second diff read"
+    );
 }
 
 /// The callback acknowledges before the delivery does any work: with the

@@ -223,15 +223,28 @@ enum ViewerFileTransferStatus {
 
 /// The process-local state of one Turn Diff delivery (#801), keyed by
 /// `(session_id, from)` — the card's exact Turn identity. `Sending` is the
-/// single-flight claim (a concurrent click is a no-op); `Sent` and
-/// `OutcomeUnknown` are terminal and make every later click a no-op. A
-/// definite failure removes the entry, because nothing was sent and a retry is
-/// not a duplicate.
+/// single-flight claim (a concurrent click is a no-op); `Sent`,
+/// `OutcomeUnknown` and `Empty` are terminal and make every later click a
+/// no-op. A definite failure removes the entry, because nothing was sent and a
+/// retry is not a duplicate.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TurnDiffSendState {
     Sending,
     Sent,
     OutcomeUnknown,
+    /// The Turn changed no file: the answer is terminal even though no file
+    /// was sent, so repeated clicks do not re-read the diff or repeat the
+    /// reply.
+    Empty,
+}
+
+/// Which source produced a Turn Diff: V2's session diff, or V1's aggregation
+/// over the Turn's tool metadata. The latter must name itself in the artifact
+/// (spec #797 decision 8), so the provenance is a value, not a bare bool.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnDiffSource {
+    SessionDiff,
+    ToolMetadata,
 }
 
 /// One Turn Diff callback's whole routing payload, owned by the spawned task.
@@ -863,17 +876,18 @@ fn turn_diff_state_toast(state: TurnDiffSendState) -> &'static str {
         TurnDiffSendState::Sending => "正在生成完整 diff…",
         TurnDiffSendState::Sent => "已发送",
         TurnDiffSendState::OutcomeUnknown => TURN_DIFF_UNKNOWN_TEXT,
+        TurnDiffSendState::Empty => TURN_DIFF_EMPTY_TEXT,
     }
 }
 
-/// Build the artifact's document from the neutral Turn Diff. `from_tools` marks
-/// the V1 aggregation (spec #797 decision 8): the subtitle names the source as
+/// Build the artifact's document from the neutral Turn Diff. `source` names the
+/// provenance: the V1 aggregation (spec #797 decision 8) must say
 /// 「按工具记录聚合」, because it says what the tools recorded, not what the
 /// working tree became.
 fn turn_diff_document(
     diff: &crate::backend::TurnDiff,
     click: &TurnDiffClick,
-    from_tools: bool,
+    source: TurnDiffSource,
 ) -> crate::backend::DiffDocument {
     let turn = if click.from.is_empty() {
         "最新 turn"
@@ -885,7 +899,7 @@ fn turn_diff_document(
         subtitle.push_str(" · ");
         subtitle.push_str(&click.directory);
     }
-    if from_tools {
+    if source == TurnDiffSource::ToolMetadata {
         subtitle.push_str(" · ");
         subtitle.push_str(TURN_DIFF_V1_SUBTITLE);
     }
@@ -4582,20 +4596,23 @@ impl App {
             .viewer_transfer_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         let diff = match self.read_turn_diff(&click, timeout_ms).await {
-            Ok((diff, from_tools)) => (diff, from_tools),
+            Ok((diff, source)) => (diff, source),
             Err(()) => {
                 self.reply_turn_diff_line(&click.message_id, TURN_DIFF_FAILURE_TEXT, timeout_ms)
                     .await;
                 return;
             }
         };
-        let (diff, from_tools) = diff;
+        let (diff, source) = diff;
         if diff.is_empty() {
+            // The empty answer is terminal for this Turn: mark it before the
+            // reply, so a repeated click is a no-op instead of a second read.
+            self.set_turn_diff_state(&key, TurnDiffSendState::Empty);
             self.reply_turn_diff_line(&click.message_id, TURN_DIFF_EMPTY_TEXT, timeout_ms)
                 .await;
             return;
         }
-        let document = turn_diff_document(&diff, &click, from_tools);
+        let document = turn_diff_document(&diff, &click, source);
         let html = crate::backend::render_diff_html(&document);
         let name = turn_diff_file_name(&click.session_id, &click.from);
         let content = crate::backend::FileContent::from_bytes("text/html", &name, html.into_bytes());
@@ -4639,7 +4656,7 @@ impl App {
         self: &Arc<Self>,
         click: &TurnDiffClick,
         timeout_ms: u64,
-    ) -> std::result::Result<(crate::backend::TurnDiff, bool), ()> {
+    ) -> std::result::Result<(crate::backend::TurnDiff, TurnDiffSource), ()> {
         let from = (!click.from.is_empty()).then_some(click.from.as_str());
         match crate::bridge::bounded_call(
             "turn diff read",
@@ -4648,7 +4665,7 @@ impl App {
         )
         .await
         {
-            Some(Ok(Some(diff))) => Ok((diff, false)),
+            Some(Ok(Some(diff))) => Ok((diff, TurnDiffSource::SessionDiff)),
             // V1 has no session diff endpoint: aggregate the Turn's tool
             // metadata instead. The payload carries the directory for the
             // child-session routing the Turn card came from.
@@ -4676,7 +4693,7 @@ impl App {
         self: &Arc<Self>,
         click: &TurnDiffClick,
         timeout_ms: u64,
-    ) -> std::result::Result<(crate::backend::TurnDiff, bool), ()> {
+    ) -> std::result::Result<(crate::backend::TurnDiff, TurnDiffSource), ()> {
         if click.from.is_empty() {
             tracing::warn!("turn diff: V1 aggregation without a Turn anchor");
             return Err(());
@@ -4705,7 +4722,7 @@ impl App {
         };
         Ok((
             crate::bridge::turn_diff::turn_diff_from_tools(&transcript, &anchor),
-            true,
+            TurnDiffSource::ToolMetadata,
         ))
     }
 
@@ -5611,8 +5628,8 @@ impl App {
 #[cfg(test)]
 mod turn_diff_delivery_helpers {
     use super::{
-        TURN_DIFF_TITLE, TURN_DIFF_V1_SUBTITLE, TurnDiffClick, TurnDiffSendState, turn_diff_document,
-        turn_diff_file_name, turn_diff_state_toast,
+        TURN_DIFF_TITLE, TURN_DIFF_V1_SUBTITLE, TurnDiffClick, TurnDiffSendState, TurnDiffSource,
+        turn_diff_document, turn_diff_file_name, turn_diff_state_toast,
     };
     use crate::backend::{TurnDiff, TurnDiffFile};
 
@@ -5639,7 +5656,7 @@ mod turn_diff_delivery_helpers {
     /// became, so the artifact's subtitle must name it (spec #797 decision 8).
     #[test]
     fn the_v1_document_names_the_tool_metadata_source() {
-        let document = turn_diff_document(&diff(), &click(), true);
+        let document = turn_diff_document(&diff(), &click(), TurnDiffSource::ToolMetadata);
         assert_eq!(document.title, TURN_DIFF_TITLE);
         assert!(
             document.subtitle.contains(TURN_DIFF_V1_SUBTITLE),
@@ -5653,7 +5670,7 @@ mod turn_diff_delivery_helpers {
     /// marker.
     #[test]
     fn the_v2_document_does_not_name_the_v1_source() {
-        let document = turn_diff_document(&diff(), &click(), false);
+        let document = turn_diff_document(&diff(), &click(), TurnDiffSource::SessionDiff);
         assert!(!document.subtitle.contains(TURN_DIFF_V1_SUBTITLE));
         assert!(document.subtitle.contains("ses_1"));
         assert!(document.subtitle.contains("msg_user_1"));
@@ -5684,6 +5701,10 @@ mod turn_diff_delivery_helpers {
         assert_eq!(
             turn_diff_state_toast(TurnDiffSendState::OutcomeUnknown),
             super::TURN_DIFF_UNKNOWN_TEXT
+        );
+        assert_eq!(
+            turn_diff_state_toast(TurnDiffSendState::Empty),
+            super::TURN_DIFF_EMPTY_TEXT
         );
     }
 }
