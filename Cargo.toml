@@ -83,4 +83,7 @@ flate2 = "1"
 tar = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# Safe handle-identity comparison (`opened_stays_beneath`): the stable
+# `MetadataExt` volume/file-index accessors are still nightly-only.
+same-file = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
