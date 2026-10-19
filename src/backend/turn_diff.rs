@@ -25,3 +25,77 @@ pub struct TurnDiffFile {
 /// One Turn's complete file diff, in the source's order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TurnDiff(pub Vec<TurnDiffFile>);
+
+impl TurnDiff {
+    /// The index line's counts: the number of files and the line totals, read
+    /// from exactly the entries the complete-diff artifact renders. Every
+    /// producer dedupes by path before building the view (#800's tool-metadata
+    /// aggregation keeps the final state of a file edited twice), so folding
+    /// here can never count one file twice.
+    // #477's index line lands the first caller; like `Backend::session_diff`,
+    // the shared seam is live before it.
+    #[allow(dead_code)]
+    pub fn stats(&self) -> TurnDiffStats {
+        TurnDiffStats {
+            files: self.0.len(),
+            additions: self.0.iter().map(|file| file.additions).sum(),
+            deletions: self.0.iter().map(|file| file.deletions).sum(),
+        }
+    }
+
+    /// Whether the Turn changed no file. A read/bash-only Turn yields an empty
+    /// diff, and the card must then render no index line and no button.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The compact counts the Turn's index line shows (#477): `N files · +A −D`,
+/// derived from a [`TurnDiff`]'s deduped entries so the index and the artifact
+/// cannot disagree.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnDiffStats {
+    pub files: usize,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str, additions: usize, deletions: usize) -> TurnDiffFile {
+        TurnDiffFile {
+            path: path.to_string(),
+            patch: String::new(),
+            additions,
+            deletions,
+            status: "modified".to_string(),
+        }
+    }
+
+    /// The card's index line and the artifact read the SAME deduped entries,
+    /// so the totals are a fold over them — never a second count that could
+    /// disagree with what the reader opens.
+    #[test]
+    fn stats_fold_the_reported_files_and_their_final_counts() {
+        let diff = TurnDiff(vec![file("a.rs", 2, 1), file("b.rs", 0, 3)]);
+        assert_eq!(
+            diff.stats(),
+            TurnDiffStats {
+                files: 2,
+                additions: 2,
+                deletions: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_diff_has_zero_stats_and_says_so() {
+        assert_eq!(TurnDiff::default().stats(), TurnDiffStats::default());
+        assert!(TurnDiff::default().is_empty());
+        assert!(!TurnDiff(vec![file("a.rs", 1, 0)]).is_empty());
+    }
+}
