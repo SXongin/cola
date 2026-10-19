@@ -1,10 +1,16 @@
 //! The neutral Turn Diff model (spec #797, ticket #799).
 //!
-//! One Turn's changed files as the Bridge renders them: the index line's
-//! `N files · +A −D` and the complete-diff HTML both read this view, so the two
-//! surfaces cannot disagree. V2 reads it from `session.diff`; V1 has no such
-//! endpoint and aggregates the Turn's tool metadata instead (#800). Both paths
-//! produce this one type, so no caller branches on a Generation.
+//! One Turn's changed files in a neutral shape. V2's complete-diff artifact
+//! reads it from `session.diff`; V1 has no such endpoint and #800's aggregation
+//! builds it from the Turn's tool metadata. Both paths produce this one type,
+//! so no caller branches on a Generation.
+//!
+//! The card index (#477) is a separate, transcript-side estimate: it folds
+//! #800's aggregation on both generations because a card render may not hit the
+//! network. On V2 the opened artifact is the authoritative `session.diff`
+//! (turn start → now) and can show larger counts after a file is edited more
+//! than once or changed outside a file-editing tool; the two surfaces are
+//! deliberately allowed to differ.
 
 /// One file in a Turn Diff: the path the wire calls `file`, the unified patch
 /// (kept verbatim for the HTML artifact) and its reported line counts.
@@ -12,7 +18,8 @@
 pub struct TurnDiffFile {
     /// The repository-relative path the diff names.
     pub path: String,
-    /// The unified diff body exactly as the source carried it.
+    /// The unified diff body the source carried, with only line endings and a
+    /// trailing newline normalized for rendering.
     pub patch: String,
     /// The added-line count the source reported.
     pub additions: usize,
