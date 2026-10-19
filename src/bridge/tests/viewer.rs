@@ -2360,6 +2360,61 @@ async fn flipping_a_page_after_a_text_change_drops_the_stale_lane() {
     );
 }
 
+/// A lane that recorded no identity of its own (the Rich Text delivery) still
+/// belongs to the card's snapshot, and the payload carries that identity. A
+/// same-MIME/same-size edit must drop the lane — comparing MIME and size alone
+/// would keep it (#750, gate finding).
+#[tokio::test]
+async fn a_lane_without_its_own_identity_still_compares_the_payload_identity() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let file = proj.path().join("long.txt");
+    std::fs::write(&file, numbered_lines(3000)).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, seeded_entry(&key, &proj.path().to_string_lossy())).await;
+    send_command_in(
+        &app,
+        "/cat long.txt",
+        key,
+        "m_identityless_lane",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let original = first_card(&platform).await;
+    let mut next = pager_button(&original, "下一页")["value"].clone();
+    // A Rich Text lane carries no content identity of its own; the card's
+    // snapshot identity is the only proof of which bytes it describes.
+    next["viewer_lane_mime"] = serde_json::json!("text/plain");
+    next["viewer_lane_name"] = serde_json::json!("long.txt");
+    next["viewer_lane_size"] = serde_json::json!(std::fs::metadata(&file).unwrap().len().to_string());
+    next["viewer_lane_delivery"] = serde_json::json!("sent_as_rich_text");
+    assert!(
+        next.get("viewer_file_identity").is_some(),
+        "the card carries its snapshot identity: {next}"
+    );
+    assert!(
+        next.get("viewer_lane_content_identity").is_none(),
+        "the lane itself carries none: {next}"
+    );
+
+    // Same MIME and same byte length: only the content identity moves.
+    std::fs::write(&file, numbered_lines(3000).replace("line ", "LINE ")).unwrap();
+    let updated = drive_viewer_rebuild(&app, &platform, next, "msg_identityless_lane").await;
+    let text = card_text(&updated);
+    assert!(
+        text.contains("文件在打开后已变化"),
+        "the identityless lane is compared against the payload: {text}"
+    );
+    assert!(!text.contains("📎"), "the stale lane is gone: {text}");
+    assert!(
+        !text.contains("未发送") && !text.contains("富文本"),
+        "no delivery outcome this pass never produced: {text}"
+    );
+}
+
 /// Page state round-trips through the button payload (ADR-0052): the viewer
 /// keeps no per-card state, so each payload rebuilds its target window.
 #[tokio::test]
