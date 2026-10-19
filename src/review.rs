@@ -479,19 +479,15 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
         // The link's content is its target path; reading the link itself never
         // follows it, so no outside file is opened. The target has no trailing
         // newline, which is why the synthesized line is fed with one.
-        let target = std::fs::read_link(&full).map_err(map_io_error)?;
+        let Ok(target) = tokio::fs::read_link(&full).await else {
+            return Ok(note_file(path, IRREGULAR_NOTE));
+        };
         let target = target.to_string_lossy();
         if target.len() > MAX_FILE_PATCH_BYTES {
             return Ok(note_file(path, OVERSIZE_NOTE));
         }
         let (patch, additions) = new_file_patch(path, &format!("{target}\n"));
-        return Ok(DiffFile {
-            path: path.to_string(),
-            patch,
-            additions,
-            deletions: 0,
-            status: "added".to_string(),
-        });
+        return Ok(added_file(path.to_string(), patch, additions));
     }
     if !meta.file_type().is_file() {
         return Ok(note_file(path, IRREGULAR_NOTE));
@@ -519,13 +515,7 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
         return Ok(binary_added(path));
     };
     let (patch, additions) = new_file_patch(path, &text);
-    Ok(DiffFile {
-        path: path.to_string(),
-        patch,
-        additions,
-        deletions: 0,
-        status: "added".to_string(),
-    })
+    Ok(added_file(path.to_string(), patch, additions))
 }
 
 /// Open an untracked file for reading without following a symlink and without
@@ -579,14 +569,20 @@ async fn read_opened(file: std::fs::File) -> Result<Vec<u8>, ReviewError> {
     Ok(bytes)
 }
 
-fn note_file(path: &str, note: &str) -> DiffFile {
+/// One untracked entry's `added` file. Every synthesized entry has this shape:
+/// untracked synthesis only ever adds and never deletes.
+fn added_file(path: String, patch: String, additions: usize) -> DiffFile {
     DiffFile {
-        path: path.to_string(),
-        patch: note.to_string(),
-        additions: 0,
+        path,
+        patch,
+        additions,
         deletions: 0,
         status: "added".to_string(),
     }
+}
+
+fn note_file(path: &str, note: &str) -> DiffFile {
+    added_file(path.to_string(), note.to_string(), 0)
 }
 
 fn binary_added(path: &str) -> DiffFile {
