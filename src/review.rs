@@ -855,3 +855,620 @@ fn map_io_error(error: std::io::Error) -> ReviewError {
         _ => ReviewError::Io(error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::process::Command as StdCommand;
+    use tempfile::TempDir;
+
+    /// A hermetic local repository: no remote is contacted, no global config
+    /// (signing, line endings) is allowed to change the output.
+    struct Repo {
+        dir: TempDir,
+    }
+
+    impl Repo {
+        fn init() -> Self {
+            let repo = Repo {
+                dir: tempfile::tempdir().unwrap(),
+            };
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.git(&["config", "user.email", "review@example.com"]);
+            repo.git(&["config", "user.name", "review"]);
+            repo.git(&["config", "commit.gpgsign", "false"]);
+            repo.git(&["config", "core.autocrlf", "false"]);
+            repo
+        }
+
+        fn path(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn path_str(&self) -> String {
+            self.dir.path().to_string_lossy().into_owned()
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let out = StdCommand::new("git")
+                .arg("-C")
+                .arg(self.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+        }
+
+        fn write(&self, name: &str, content: impl AsRef<[u8]>) {
+            let path = self.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+
+        fn commit(&self, message: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+    }
+
+    fn find<'a>(review: &'a ReviewDiff, path: &str) -> &'a DiffFile {
+        review
+            .document
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing {path:?}; present: {:?}",
+                    review
+                        .document
+                        .files
+                        .iter()
+                        .map(|file| &file.path)
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    #[tokio::test]
+    async fn non_git_directory_is_a_distinct_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = review_diff(dir.path().to_str().unwrap(), None).await.unwrap_err();
+        assert!(
+            matches!(err, ReviewError::NotARepository(_)),
+            "expected NotARepository, got {err:?}"
+        );
+        assert!(err.to_string().contains("不是 git 仓库"));
+    }
+
+    #[tokio::test]
+    async fn missing_base_is_a_distinct_error() {
+        let repo = Repo::init();
+        // A branch that is neither origin/main nor main.
+        repo.git(&["symbolic-ref", "HEAD", "refs/heads/work"]);
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+
+        let err = review_diff(&repo.path_str(), None).await.unwrap_err();
+        assert!(
+            matches!(err, ReviewError::BaseNotFound(_)),
+            "expected BaseNotFound, got {err:?}"
+        );
+        assert!(err.to_string().contains("origin/main"));
+
+        let err = review_diff(&repo.path_str(), Some("nope")).await.unwrap_err();
+        assert!(matches!(err, ReviewError::BaseNotFound(_)));
+        assert!(err.to_string().contains("nope"));
+    }
+
+    #[tokio::test]
+    async fn clean_tree_at_the_base_is_an_empty_document() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.base, "main");
+        assert_eq!(review.branch, "main");
+        assert_eq!(review.short_sha.len(), 7);
+        assert_eq!(review.merge_base, repo.git(&["rev-parse", "HEAD"]));
+        assert!(review.document.files.is_empty());
+        assert!(review.document.truncated.is_none());
+    }
+
+    /// Acceptance: committed + unstaged + untracked changes all appear; the
+    /// tracked counts are `git diff --numstat`'s, and git does not count
+    /// untracked files (they are separate additions). The index is untouched.
+    #[tokio::test]
+    async fn mixed_committed_unstaged_and_untracked_changes() {
+        let repo = Repo::init();
+        repo.write("committed.txt", "a\nb\nc\n");
+        repo.write("tracked.txt", "one\n");
+        repo.write("gone.txt", "bye\n");
+        repo.commit("base");
+
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("committed.txt", "a\nB\nc\nd\n");
+        repo.commit("committed change");
+        repo.git(&["rm", "-q", "gone.txt"]);
+        repo.write("tracked.txt", "one\nunstaged\n");
+        repo.write("dir/untracked.txt", "hello\nworld\n");
+
+        let index_before = repo.git(&["ls-files", "-s", "-z"]);
+        let review = review_diff(&repo.path_str(), None).await.unwrap();
+        let index_after = repo.git(&["ls-files", "-s", "-z"]);
+        assert_eq!(
+            index_before, index_after,
+            "review_diff must never touch the index"
+        );
+
+        assert_eq!(review.base, "main");
+        assert_eq!(review.branch, "feature");
+        assert_eq!(review.document.files.len(), 4);
+
+        let committed = find(&review, "committed.txt");
+        assert_eq!(committed.status, "modified");
+        assert_eq!((committed.additions, committed.deletions), (2, 1));
+        assert!(committed.patch.contains("+B"));
+
+        let gone = find(&review, "gone.txt");
+        assert_eq!(gone.status, "deleted");
+        assert_eq!((gone.additions, gone.deletions), (0, 1));
+        assert!(gone.patch.contains("-bye"));
+
+        let tracked = find(&review, "tracked.txt");
+        assert_eq!(tracked.status, "modified");
+        assert_eq!((tracked.additions, tracked.deletions), (1, 0));
+
+        let untracked = find(&review, "dir/untracked.txt");
+        assert_eq!(untracked.status, "added");
+        assert_eq!((untracked.additions, untracked.deletions), (2, 0));
+        assert!(untracked.patch.contains("@@ -0,0 +1,2 @@"));
+        assert!(untracked.patch.contains("+hello"));
+
+        let numstat = repo.git(&["diff", "--numstat", "main"]);
+        assert!(numstat.contains("2\t1\tcommitted.txt"));
+        assert!(numstat.contains("0\t1\tgone.txt"));
+        assert!(numstat.contains("1\t0\ttracked.txt"));
+        assert!(
+            !numstat.contains("untracked.txt"),
+            "git never counts untracked files in --numstat"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_head_still_compares_against_the_merge_base() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("a.txt", "a\ncommitted\n");
+        repo.commit("feature change");
+        repo.git(&["checkout", "-q", "--detach"]);
+        repo.write("a.txt", "a\ncommitted\nunstaged\n");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.branch, "detached");
+        assert_eq!(review.short_sha.len(), 7);
+        assert_eq!(review.base, "main");
+        let file = find(&review, "a.txt");
+        assert_eq!((file.additions, file.deletions), (2, 0));
+    }
+
+    /// Acceptance: a brand-new repository (no HEAD at all) treats every tracked
+    /// file as an addition against the empty tree.
+    #[tokio::test]
+    async fn unborn_head_uses_the_empty_tree() {
+        let repo = Repo::init();
+        repo.write("a.txt", "hi\n");
+        repo.write("d/b.txt", "there\n");
+        repo.git(&["add", "-A"]);
+
+        let review = review_diff(&repo.path_str(), None).await.unwrap();
+        assert_eq!(review.branch, "unborn");
+        assert_eq!(review.short_sha, "unborn");
+        assert_eq!(review.base, "unborn");
+        assert_eq!(review.merge_base, EMPTY_TREE);
+        assert!(review.document.subtitle.contains("HEAD unborn"));
+        assert_eq!(review.document.files.len(), 2);
+
+        let a = find(&review, "a.txt");
+        assert_eq!(a.status, "added");
+        assert_eq!((a.additions, a.deletions), (1, 0));
+        assert!(a.patch.contains("+hi"));
+        assert_eq!(find(&review, "d/b.txt").status, "added");
+    }
+
+    /// An orphan checkout keeps an unborn HEAD while a real base ref exists, so
+    /// the empty-tree fallback and normal base resolution coexist.
+    #[tokio::test]
+    async fn unborn_head_with_a_base_ref_still_uses_the_empty_tree() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        let base_sha = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["update-ref", "refs/remotes/origin/main", &base_sha]);
+        repo.git(&["checkout", "-q", "--orphan", "new"]);
+        repo.write("b.txt", "b\n");
+        repo.git(&["add", "-A"]);
+
+        let review = review_diff(&repo.path_str(), None).await.unwrap();
+        assert_eq!(review.base, "origin/main");
+        assert_eq!(review.branch, "unborn");
+        assert_eq!(review.merge_base, EMPTY_TREE);
+        assert_eq!(review.document.files.len(), 2);
+        assert_eq!(find(&review, "a.txt").status, "added");
+        assert_eq!(find(&review, "b.txt").status, "added");
+    }
+
+    /// Acceptance: a rename is one `renamed` file at its new path, not a
+    /// delete + add, and its patch keeps the rename headers.
+    #[tokio::test]
+    async fn rename_is_one_renamed_file() {
+        let repo = Repo::init();
+        repo.write("old.txt", "one\ntwo\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.git(&["mv", "old.txt", "new.txt"]);
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.document.files.len(), 1);
+        let file = &review.document.files[0];
+        assert_eq!(file.path, "new.txt");
+        assert_eq!(file.status, "renamed");
+        assert_eq!((file.additions, file.deletions), (0, 0));
+        assert!(file.patch.contains("rename from old.txt"));
+        assert!(file.patch.contains("rename to new.txt"));
+    }
+
+    /// Acceptance: a binary file keeps its status but no payload — one
+    /// `Binary files … differ` line.
+    #[tokio::test]
+    async fn binary_file_has_no_payload() {
+        let repo = Repo::init();
+        repo.write("bin.dat", b"BIN\0SECRETBYTES\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("bin.dat", b"BIN\0CHANGED\n");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let file = &review.document.files[0];
+        assert_eq!(file.path, "bin.dat");
+        assert_eq!(file.status, "modified");
+        assert_eq!(file.patch.lines().count(), 1);
+        assert!(file.patch.starts_with("Binary files "));
+        assert!(!file.patch.contains("SECRETBYTES"));
+        assert!(!file.patch.contains('\0'));
+    }
+
+    /// Acceptance: a submodule is one `子模块 <path> <old> → <new>` line.
+    #[tokio::test]
+    async fn submodule_is_one_note_line() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("one");
+        let first = repo.git(&["rev-parse", "HEAD"]);
+        repo.write("b.txt", "b\n");
+        repo.commit("two");
+        repo.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{first},sub"),
+        ]);
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        repo.commit("add sub");
+        let main_sub = repo.git(&["rev-parse", "HEAD"]);
+
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.git(&["update-index", "--cacheinfo", &format!("160000,{main_sub},sub")]);
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.document.files.len(), 1);
+        let file = &review.document.files[0];
+        assert_eq!(file.path, "sub");
+        assert_eq!(file.status, "modified");
+        assert_eq!(file.patch, format!("子模块 sub {first} → {main_sub}"));
+        assert!(!file.patch.contains("Subproject commit"));
+        assert!(!file.patch.contains('\0'));
+    }
+
+    /// Acceptance: the raw patch is capped at 8 MB, files are kept in order and
+    /// the rest are omitted with `truncated` set.
+    #[tokio::test]
+    async fn total_cap_omits_files_in_order_and_sets_truncated() {
+        let repo = Repo::init();
+        let big = "x".repeat(1_500_000);
+        for index in 0..6 {
+            repo.write(&format!("big{index}.txt"), format!("{big}\n"));
+        }
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        for index in 0..6 {
+            repo.write(&format!("big{index}.txt"), format!("changed-{index}\n"));
+        }
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let truncated = review
+            .document
+            .truncated
+            .as_deref()
+            .expect("the total cap must set truncated");
+        assert!(truncated.contains("8 MB"));
+        assert!(
+            review.document.files.len() < 6,
+            "files past the cap must be omitted"
+        );
+        let total: usize = review.document.files.iter().map(|file| file.patch.len()).sum();
+        assert!(total <= MAX_TOTAL_PATCH_BYTES);
+        for (index, file) in review.document.files.iter().enumerate() {
+            assert_eq!(file.path, format!("big{index}.txt"), "order is preserved");
+        }
+    }
+
+    /// A single file over the per-file cap keeps its numstat counts but becomes
+    /// one note line — never 2 MB of content.
+    #[tokio::test]
+    async fn single_file_over_the_per_file_cap_is_a_note() {
+        let repo = Repo::init();
+        repo.write("huge.txt", format!("{}\n", "x".repeat(2_500_000)));
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("huge.txt", "small\n");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let file = find(&review, "huge.txt");
+        assert_eq!(file.patch, OVERSIZE_NOTE);
+        assert!(file.patch.len() < MAX_FILE_PATCH_BYTES);
+        assert_eq!((file.additions, file.deletions), (1, 1));
+        assert_eq!(file.status, "modified");
+    }
+
+    /// Untracked text becomes a new-file patch; a binary or an oversized
+    /// untracked file is one note line with no payload.
+    #[tokio::test]
+    async fn untracked_text_binary_and_oversize_shapes() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        repo.write("untracked.txt", "hello\nworld\n");
+        repo.write("nolf.txt", "no newline");
+        repo.write("binary.dat", b"BIN\0SECRET\n");
+        repo.write("huge.txt", format!("{}\n", "y".repeat(2_500_000)));
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.document.files.len(), 4);
+
+        let text = find(&review, "untracked.txt");
+        assert_eq!(text.status, "added");
+        assert_eq!((text.additions, text.deletions), (2, 0));
+        assert!(text.patch.contains("@@ -0,0 +1,2 @@"));
+        assert!(text.patch.contains("+hello"));
+
+        let nolf = find(&review, "nolf.txt");
+        assert_eq!((nolf.additions, nolf.deletions), (1, 0));
+        assert!(nolf.patch.contains("+no newline"));
+        assert!(nolf.patch.contains("\\ No newline at end of file"));
+
+        let binary = find(&review, "binary.dat");
+        assert_eq!(binary.status, "added");
+        assert_eq!(binary.patch, "Binary files /dev/null and b/binary.dat differ");
+        assert!(!binary.patch.contains("SECRET"));
+
+        let huge = find(&review, "huge.txt");
+        assert_eq!(huge.patch, OVERSIZE_NOTE);
+    }
+
+    /// base resolution prefers `origin/main` over `main`, and an explicit base
+    /// over both. A remote URL pointing at a closed port proves no fetch is
+    /// attempted: any network call would fail (or hang) instead of succeeding.
+    #[tokio::test]
+    async fn base_chain_prefers_origin_main_and_never_fetches() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        let base_commit = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&["remote", "add", "origin", "http://127.0.0.1:1/nope.git"]);
+        repo.git(&["update-ref", "refs/remotes/origin/main", &base_commit]);
+
+        repo.write("b.txt", "b\n");
+        repo.commit("second");
+
+        let review = review_diff(&repo.path_str(), None).await.unwrap();
+        assert_eq!(review.base, "origin/main");
+        assert_eq!(review.merge_base, base_commit);
+        assert_eq!(review.document.files.len(), 1);
+        assert_eq!(review.document.files[0].path, "b.txt");
+        assert_eq!(review.document.files[0].status, "added");
+
+        let explicit = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(explicit.base, "main");
+        assert!(explicit.document.files.is_empty());
+    }
+
+    /// An unrelated history has no merge base: that is its own readable error,
+    /// not an empty diff.
+    #[tokio::test]
+    async fn merge_base_failure_is_a_distinct_error() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("one");
+        repo.git(&["checkout", "-q", "--orphan", "other"]);
+        repo.write("b.txt", "b\n");
+        repo.commit("unrelated root");
+
+        let err = review_diff(&repo.path_str(), None).await.unwrap_err();
+        assert!(
+            matches!(err, ReviewError::MergeBaseFailed { .. }),
+            "expected MergeBaseFailed, got {err:?}"
+        );
+        assert!(err.to_string().contains("merge-base"));
+    }
+
+    /// Acceptance: every patch shape this producer emits renders through #798
+    /// without panicking, with no binary payload and the right path/status.
+    #[tokio::test]
+    async fn every_patch_shape_renders_through_diff_html() {
+        let repo = Repo::init();
+        repo.write("old.txt", "one\ntwo\n");
+        repo.write("bin.dat", b"BIN\0SECRETBYTES\n");
+        repo.commit("base");
+        let first = repo.git(&["rev-parse", "HEAD"]);
+        repo.git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{first},sub"),
+        ]);
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        repo.commit("add sub");
+        let second = repo.git(&["rev-parse", "HEAD"]);
+
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.git(&["mv", "old.txt", "new.txt"]);
+        repo.write("bin.dat", b"BIN\0CHANGED\n");
+        repo.write("untracked.txt", "hello\n");
+        repo.git(&["update-index", "--cacheinfo", &format!("160000,{second},sub")]);
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.document.files.len(), 4);
+        assert_eq!(find(&review, "new.txt").status, "renamed");
+        assert!(find(&review, "new.txt").patch.contains("rename from old.txt"));
+        assert_eq!(find(&review, "bin.dat").status, "modified");
+        assert!(find(&review, "bin.dat").patch.starts_with("Binary files "));
+        assert_eq!(find(&review, "sub").status, "modified");
+        assert!(find(&review, "sub").patch.starts_with("子模块 sub "));
+        assert_eq!(find(&review, "untracked.txt").status, "added");
+
+        let html = crate::backend::render_diff_html(&review.document);
+        assert_eq!(html.matches("<details").count(), 4);
+        for path in ["new.txt", "bin.dat", "sub", "untracked.txt"] {
+            assert!(html.contains(path), "rendered HTML is missing {path}");
+        }
+        assert!(html.contains("rename from old.txt"));
+        assert!(html.contains("Binary files "));
+        assert!(html.contains("子模块 sub "));
+        assert!(html.contains("hello"));
+        assert!(
+            !html.contains("SECRETBYTES"),
+            "binary payload must never reach the artifact"
+        );
+        assert!(!html.contains('\0'));
+    }
+
+    /// The patch stream itself is capped: past it the child is killed rather
+    /// than buffered, and the document still reports the omission instead of
+    /// hanging on a blocked pipe.
+    #[tokio::test]
+    async fn a_patch_stream_past_the_read_cap_is_cut() {
+        let repo = Repo::init();
+        let big = "x".repeat(1_500_000);
+        for index in 0..8 {
+            repo.write(&format!("big{index}.txt"), format!("{big}\n"));
+        }
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        for index in 0..8 {
+            repo.write(&format!("big{index}.txt"), format!("changed-{index}\n"));
+        }
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert!(review.document.truncated.is_some());
+        assert!(review.document.files.len() <= 5);
+        let total: usize = review.document.files.iter().map(|file| file.patch.len()).sum();
+        assert!(total <= MAX_TOTAL_PATCH_BYTES);
+    }
+
+    /// Added/deleted gitlinks have no `160000` suffix on their `index` line;
+    /// the mode header still identifies them, so all three shapes collapse.
+    #[test]
+    fn submodule_sections_cover_add_modify_delete() {
+        let modify = "diff --git a/sub b/sub\nindex aaa..bbb 160000\n--- a/sub\n+++ b/sub\n\
+                      @@ -1 +1 @@\n-Subproject commit aaa\n+Subproject commit bbb\n";
+        assert_eq!(
+            submodule_pair(modify),
+            Some(("aaa".to_string(), "bbb".to_string()))
+        );
+
+        let added = "diff --git a/sub b/sub\nnew file mode 160000\nindex 0000000..bbb\n\
+                     --- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit bbb\n";
+        assert_eq!(
+            submodule_pair(added),
+            Some(("0000000".to_string(), "bbb".to_string()))
+        );
+
+        let deleted = "diff --git a/sub b/sub\ndeleted file mode 160000\nindex aaa..0000000\n\
+                       --- a/sub\n+++ /dev/null\n@@ -1 +0,0 @@\n-Subproject commit aaa\n";
+        assert_eq!(
+            submodule_pair(deleted),
+            Some(("aaa".to_string(), "0000000".to_string()))
+        );
+
+        let ordinary = "diff --git a/a.txt b/a.txt\nindex aaa..bbb 100644\n--- a/a.txt\n+++ b/a.txt\n\
+                        @@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(submodule_pair(ordinary), None);
+    }
+
+    #[test]
+    fn numstat_z_aligns_the_rename_shape() {
+        let raw = "1\t2\ta.txt\x00-\t-\tb.bin\x000\t0\t\x00old.txt\x00new.txt\x00";
+        let entries = parse_numstat(raw);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0],
+            NumStatEntry {
+                additions: 1,
+                deletions: 2,
+                path: "a.txt".to_string(),
+                renamed: false,
+                binary: false,
+            }
+        );
+        assert!(entries[1].binary);
+        assert_eq!(entries[1].path, "b.bin");
+        assert!(entries[2].renamed);
+        assert_eq!(entries[2].path, "new.txt");
+    }
+
+    #[test]
+    fn sections_split_only_at_column_zero_headers() {
+        let patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n\
+                     +diff --git a/fake b/fake\n diff --git a/fake2 b/fake2\n\
+                     diff --git a/b b/b\n@@ -1 +1 @@\n+x\n";
+        let sections = split_sections(patch);
+        assert_eq!(sections.len(), 2);
+        assert!(sections[0].contains("+diff --git a/fake"));
+        assert!(sections[1].starts_with("diff --git a/b b/b"));
+    }
+
+    /// git missing / permission / other I/O each map to their own readable
+    /// error — the runner never collapses them into "no changes".
+    #[test]
+    fn io_failures_keep_their_identity() {
+        assert!(matches!(
+            map_spawn_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ReviewError::GitNotFound
+        ));
+        assert!(matches!(
+            map_spawn_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            ReviewError::PermissionDenied(_)
+        ));
+        // A file that vanished while reading is I/O, not a missing git binary.
+        assert!(matches!(
+            map_io_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ReviewError::Io(_)
+        ));
+        assert!(matches!(
+            map_io_error(std::io::Error::other("boom")),
+            ReviewError::Io(_)
+        ));
+    }
+}
