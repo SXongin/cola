@@ -19,12 +19,6 @@
 //! file edit produce a non-empty diff; a read/bash-only Turn produces an empty
 //! one, which is what keeps the card from offering a dead entry.
 
-// The consumers land in the two follow-up tickets this one feeds — #477's
-// index line and #801's complete-diff artifact — so the shared seam is
-// deliberately live before them, like `Backend::session_diff` (#799). The
-// tests below exercise both entry points.
-#![allow(dead_code)]
-
 use crate::backend::{Part, SessionTranscript, ToolCall, TurnAnchor, TurnDiff, TurnDiffFile};
 use crate::feishu::card::tool_render::{diff_header_path, recorded_diff};
 use indexmap::IndexMap;

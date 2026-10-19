@@ -32,9 +32,6 @@ impl TurnDiff {
     /// producer dedupes by path before building the view (#800's tool-metadata
     /// aggregation keeps the final state of a file edited twice), so folding
     /// here can never count one file twice.
-    // #477's index line lands the first caller; like `Backend::session_diff`,
-    // the shared seam is live before it.
-    #[allow(dead_code)]
     pub fn stats(&self) -> TurnDiffStats {
         TurnDiffStats {
             files: self.0.len(),
@@ -45,7 +42,6 @@ impl TurnDiff {
 
     /// Whether the Turn changed no file. A read/bash-only Turn yields an empty
     /// diff, and the card must then render no index line and no button.
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -54,7 +50,6 @@ impl TurnDiff {
 /// The compact counts the Turn's index line shows (#477): `N files · +A −D`,
 /// derived from a [`TurnDiff`]'s deduped entries so the index and the artifact
 /// cannot disagree.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TurnDiffStats {
     pub files: usize,
