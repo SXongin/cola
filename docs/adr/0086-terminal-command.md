@@ -46,6 +46,44 @@ with no model in the loop, no approval card, and no entry into the Session Trans
   their own machine (ADR-0035). Arbitrary commands are defensible *because* of that model,
   not in spite of it.
 
+## The no-terminal constraint
+
+There is no pseudo-terminal, and that is a shape constraint, not an implementation detail:
+`/run` is **line-oriented, not screen-oriented**. Measured on a Host with stdin `/dev/null`,
+stdout to a file, and `setsid` (the configuration decision 2 describes):
+
+| Command | Result |
+|---|---|
+| `top` | exit 1, **0 bytes** of stdout, stderr `top: failed tty get` |
+| `more file` | degrades to `cat` (adds a `::::::` banner) |
+| `git log` | does **not** page — git disables its pager for a non-tty stdout |
+| `git commit` | exit 1: `unable to start editor 'vi'` / `supply the message using -m or -F` |
+| `ssh -t` | exit 255: `Pseudo-terminal will not be allocated because stdin is not a terminal` |
+| reading `/dev/tty` | `No such device or address` |
+
+The last row is the load-bearing one: with no controlling terminal, `sudo`, `ssh-add` and
+`gpg` fail **fast** instead of prompting. Without `setsid` they would inherit cola's
+controlling terminal — and when cola was started by hand from a desktop terminal, the prompt
+would appear *there*, invisible from Feishu, with the command apparently hung until its cap.
+So `setsid` is not only decision 5's process-group handle; it is what makes a password prompt
+an error instead of a ghost.
+
+Two practical consequences the implementation must carry:
+
+- **A progress bar writes one unbounded line.** 50 frames of `\r`-overwritten progress measured
+  **691 bytes and zero newlines**, so a newline-only tail would render a single enormous line.
+  The tail splits on `\n` and treats a `\r` inside a line as an overwrite, keeping the last
+  frame.
+- **Some programs ignore `isatty`** and write `ESC[2J` / cursor-positioning into the file
+  anyway. ANSI and control sequences are stripped for display and kept in the **Terminal Log**
+  as evidence; a screen that has been flattened into a stream is not content, which is the
+  honest reason a TUI has no home here.
+
+A command that genuinely needs a screen has a correct answer that is not cola's: let another
+program own the PTY — `tmux new -d -s x 'htop'`, then `tmux capture-pane -pt x` turns the
+screen back into lines. `script -q -c …` also fakes a TTY, and its output is exactly the
+escape soup this section refuses.
+
 ## Decision
 
 1. **Two entry points, one act.** `/run <cmd>`; or a message whose **first character** is `!`
@@ -58,9 +96,12 @@ with no model in the loop, no approval card, and no entry into the Session Trans
 2. **One command, one child process, no carried state.** `sh -c`, cwd on the **Path Scope**'s
    base (the **Session**'s directory, the current **Project** while the Session is still
    **Pending**), stdin closed (`Stdio::null`) so a password prompt, a pager or an editor
-   fails fast instead of hanging forever, stdout and stderr merged. There is no persistent
-   shell and no `cd`/`export` carry between commands — a second truth about "where am I"
-   is worse than typing `cd x && …`. The card names the cwd it actually used.
+   fails fast instead of hanging forever, stdout and stderr merged. The child is placed in its
+   own session (`setsid`), which serves two purposes at once: it is decision 5's process-group
+   handle, and it removes the controlling terminal — the difference between `sudo` failing
+   with an error and `sudo` prompting on a desktop terminal nobody is looking at. There is no
+   persistent shell and no `cd`/`export` carry between commands — a second truth about "where
+   am I" is worse than typing `cd x && …`. The card names the cwd it actually used.
 3. **The output goes to a file, not through cola.** The child's stdout and stderr are
    redirected straight into its **Terminal Log**, and cola tails that file's delta on the
    render cadence. This is not only bookkeeping: on a pipe, cola's own death closes the read
@@ -71,12 +112,18 @@ with no model in the loop, no approval card, and no entry into the Session Trans
 4. **The result is a Terminal Card, and it is a command card.** A standalone member of the
    `/dir`-`/switch`-`/help`-`File Viewer` family (ADR-0083 §3): it joins no **Card Chain**,
    is never written to the **Chain Record**, and is never reaped. It shows the resolved cwd,
-   the command, a live tail (the newest ~40 lines, ANSI stripped, non-UTF-8 read lossily) and,
-   once settled, the exit code and elapsed time; the full output beyond the card rides
-   ADR-0076/ADR-0083's **File Message** ladder under a bounded cap. It carries 「⏹ 终止」,
-   「↻ 重跑」, 「📄 完整输出」 and 「问 AI」. 「重跑」 carries the command string inside its own
-   payload, so the button still works after a cola restart — no durable history is needed for
-   it, and none is kept: the in-memory cache only feeds the button.
+   the command, a live tail and, once settled, the exit code and elapsed time; the full output
+   beyond the card rides ADR-0076/ADR-0083's **File Message** ladder under a bounded cap. The
+   tail keeps the newest ~40 lines, splits on `\n` with `\r` treated as an overwrite (a
+   progress bar is one line, never a megabyte of frames), strips ANSI and control sequences
+   for display, and reads non-UTF-8 lossily. A failure whose stderr matches a known no-tty
+   signature — `failed tty get`, `not a terminal`, `unable to start editor`, `the input device
+   is not a TTY`, `No such device or address` — gains one line pointing at `tmux` or at the
+   command's non-interactive flag (`top -b`, `git commit -m`); that is a fixed mapping, not a
+   heuristic over the command text. The card carries 「⏹ 终止」, 「↻ 重跑」, 「📄 完整输出」 and
+   「问 AI」. 「重跑」 carries the command string inside its own payload, so the button still
+   works after a cola restart — no durable history is needed for it, and none is kept: the
+   in-memory cache only feeds the button.
 5. **Serial, bounded, and killable.** One Terminal Command per **Chat**/**Topic** at a time; a
    second is refused with the running card's 「⏹ 终止」 named in the reply — a hidden queue
    would land a forgotten command in the working tree minutes later. The default hard cap is
