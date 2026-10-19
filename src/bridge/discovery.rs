@@ -509,7 +509,9 @@ pub fn has_live_default_store_server() -> bool {
     scan_processes().iter().any(is_eligible)
 }
 
-/// The command cola runs to start its own OpenCode server on the default store.
+/// A child process command cola builds before spawning it: the `opencode serve`
+/// commands it starts its own servers with, and the `opencode service restart`
+/// CLI it hands a service restart to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnCommand {
     pub args: Vec<String>,
@@ -1684,10 +1686,12 @@ pub enum RestartOutcome {
 /// to), never a lower-priority one it is about to yield.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RestartPlan {
-    /// Restart the V2 Shared Service via the `opencode service` CLI. The port
-    /// identifies WHICH service to wait for — a restart keeps its port, so a
-    /// second, unrelated service cannot satisfy the wait.
-    Service { port: u16 },
+    /// Restart the V2 Shared Service via the `opencode service` CLI. `pid` is
+    /// the daemon the plan selected — its environment names the state home the
+    /// CLI must operate in, and it is the process the wait must see replaced.
+    /// `port` identifies WHICH service to wait for — a restart keeps its port,
+    /// so a second, unrelated service cannot satisfy the wait.
+    Service { pid: i32, port: u16 },
     /// Re-raise cola's Owned Server on the same port and password.
     Owned { pid: i32, port: u16, password: String },
     /// The canonical server is someone else's classic `serve --port`.
@@ -1710,7 +1714,10 @@ fn restart_plan(
         return RestartPlan::NoServer;
     };
     match server.class_against(self_pid) {
-        ServerClass::Service => RestartPlan::Service { port: server.port },
+        ServerClass::Service => RestartPlan::Service {
+            pid: server.pid,
+            port: server.port,
+        },
         ServerClass::Owned => RestartPlan::Owned {
             pid: server.pid,
             port: server.port,
@@ -1747,7 +1754,9 @@ pub async fn restart_self_spawned_server(preferred_port: Option<u16>) -> anyhow:
     match restart_plan(&candidates, preferred_port, self_spawned_pid()) {
         RestartPlan::NoServer => Ok(RestartOutcome::NoServer),
         RestartPlan::NotOwned => Ok(RestartOutcome::NotOwned),
-        RestartPlan::Service { port } => restart_managed_service(port).await,
+        RestartPlan::Service { pid, port } => {
+            restart_managed_service(&RealServiceRestartHost, pid, port).await
+        }
         RestartPlan::Owned { pid, port, password } => {
             // Confirm ownership against the live process before killing: the
             // record must still name this pid AND it must be a real
@@ -1760,13 +1769,94 @@ pub async fn restart_self_spawned_server(preferred_port: Option<u16>) -> anyhow:
     }
 }
 
+/// The outside world the Shared Service restart path touches: the daemon's own
+/// environment (which names its state home), the `opencode service restart`
+/// CLI, and the probe that decides whether the daemon actually changed.
+/// Injected so both the state-home choice and the "did it really restart?"
+/// check are unit-tested without a process, a socket, or the real binary
+/// (ticket #809). Real code uses [`RealServiceRestartHost`].
+#[async_trait]
+trait ServiceRestartHost: Send + Sync {
+    /// A pid's environment lines, when visible.
+    fn environ(&self, pid: i32) -> Option<Vec<String>>;
+    /// Run the `opencode service restart` command, bounded by
+    /// [`SERVICE_RESTART_CLI_TIMEOUT`].
+    async fn run_restart_cli(&self, cmd: &SpawnCommand) -> anyhow::Result<()>;
+    /// The pid of a live `serve --service` on `port` whose endpoint accepts
+    /// connections, when there is one.
+    async fn serving_service_pid(&self, port: u16) -> Option<i32>;
+}
+
+/// The real operations: [`process_environ`], the real `opencode` binary, and a
+/// [`scan_processes`] + TCP probe.
+struct RealServiceRestartHost;
+
+#[async_trait]
+impl ServiceRestartHost for RealServiceRestartHost {
+    fn environ(&self, pid: i32) -> Option<Vec<String>> {
+        process_environ(pid)
+    }
+
+    async fn run_restart_cli(&self, cmd: &SpawnCommand) -> anyhow::Result<()> {
+        run_service_restart_cli("opencode", cmd, SERVICE_RESTART_CLI_TIMEOUT).await
+    }
+
+    async fn serving_service_pid(&self, port: u16) -> Option<i32> {
+        let live = scan_processes()
+            .into_iter()
+            .find(|c| c.is_service() && c.port == port)?;
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            Some(live.pid)
+        } else {
+            None
+        }
+    }
+}
+
+/// The `opencode service restart` command, with `XDG_STATE_HOME` pinned to the
+/// SELECTED service's state home.
+///
+/// `opencode service` acts on the registration under the CLI's OWN
+/// `XDG_STATE_HOME`, so a restart that inherited cola's environment would drive
+/// whatever registration lives in cola's state home — a different service
+/// whenever the selected one was started under another state home, leaving the
+/// selected daemon untouched (ticket #809). The service's own value is set when
+/// its environment carries a non-empty `XDG_STATE_HOME`; cola's inherited value
+/// is always stripped, so a service with none of its own keeps the default
+/// `~/.local/state`, which is where that service actually registered
+/// (xdg-basedir, spec #364 §2). The strip is applied before the set — the last
+/// write wins — so the service's value is the one the CLI sees.
+fn service_restart_command(service_env: Option<&[String]>) -> SpawnCommand {
+    let state_home = service_env
+        .and_then(|env| env.iter().find_map(|kv| kv.strip_prefix("XDG_STATE_HOME=")))
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    SpawnCommand {
+        args: vec!["service".to_string(), "restart".to_string()],
+        env: state_home
+            .map(|home| vec![("XDG_STATE_HOME".to_string(), home)])
+            .unwrap_or_default(),
+        remove_env: vec!["XDG_STATE_HOME".to_string()],
+    }
+}
+
 /// Restart the V2 Shared Service without taking ownership of it. The daemon
-/// rewrites its registration file; cola waits, bounded, until the live
-/// `serve --service` on `port` accepts connections again.
-async fn restart_managed_service(port: u16) -> anyhow::Result<RestartOutcome> {
+/// rewrites its registration file; cola waits, bounded, until a DIFFERENT live
+/// `serve --service` accepts connections on `port` again.
+///
+/// `pid` is the service the plan selected, and it is used twice: its environment
+/// names the state home the CLI must run in ([`service_restart_command`]), and
+/// it is the daemon the wait must see REPLACED — `opencode service restart` is
+/// `stop` + `ensure`, so a successful restart always leaves a new daemon behind.
+async fn restart_managed_service(
+    host: &dyn ServiceRestartHost,
+    pid: i32,
+    port: u16,
+) -> anyhow::Result<RestartOutcome> {
     tracing::info!("restarting the V2 Shared Service (`opencode service restart`)");
-    run_service_restart_cli("opencode", SERVICE_RESTART_CLI_TIMEOUT).await?;
-    wait_for_live_service(port, SERVICE_RESTART_TIMEOUT).await?;
+    let cmd = service_restart_command(host.environ(pid).as_deref());
+    host.run_restart_cli(&cmd).await?;
+    wait_for_live_service(host, pid, port, SERVICE_RESTART_TIMEOUT).await?;
     tracing::info!("shared OpenCode service is serving again");
     Ok(RestartOutcome::RestartedService)
 }
@@ -1779,11 +1869,20 @@ async fn restart_managed_service(port: u16) -> anyhow::Result<RestartOutcome> {
 /// reaped (`Child::kill` waits it out) and a clear error is returned; a
 /// non-zero exit is still reported as before. `kill_on_drop` covers the one
 /// remaining escape — the enclosing future being cancelled mid-wait.
-async fn run_service_restart_cli(program: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
-    let mut child = tokio::process::Command::new(program)
-        .args(["service", "restart"])
-        .kill_on_drop(true)
-        .spawn()?;
+async fn run_service_restart_cli(
+    program: &str,
+    cmd: &SpawnCommand,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
+    let mut command = tokio::process::Command::new(program);
+    command.args(&cmd.args).kill_on_drop(true);
+    for key in &cmd.remove_env {
+        command.env_remove(key);
+    }
+    for (key, value) in &cmd.env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn()?;
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => {
             let status = status?;
@@ -1802,27 +1901,38 @@ async fn run_service_restart_cli(program: &str, timeout: std::time::Duration) ->
     }
 }
 
-/// Poll until the registration file describes a live `serve --service` on
-/// `port` whose endpoint accepts connections. `scan_processes` already refuses
+/// Poll until a live `serve --service` on `port` accepts connections AND is not
+/// the daemon the restart was meant to replace. `scan_processes` already refuses
 /// a stale registration pid, so a hit here is a service the CLI just raised.
 ///
 /// The port is the identity: a restart keeps it, while matching only "some
 /// service" would let a second Shared Service on another port satisfy the wait
 /// before the restarted one is up.
-async fn wait_for_live_service(port: u16, timeout: std::time::Duration) -> anyhow::Result<()> {
+///
+/// The pid is the second half of the identity: `opencode service restart` can
+/// exit 0 while `pre_pid` — the daemon selected before the CLI ran — is still
+/// the one serving (the CLI drove another state home's registration, or the
+/// service ignored the request). Reporting `RestartedService` then would tell
+/// the user a restart happened that did not, so the wait keeps polling until
+/// the daemon changes and fails with that finding if it never does.
+async fn wait_for_live_service(
+    host: &dyn ServiceRestartHost,
+    pre_pid: i32,
+    port: u16,
+    timeout: std::time::Duration,
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        let live = scan_processes()
-            .into_iter()
-            .find(|c| c.is_service() && c.port == port);
-        let reachable = match live {
-            Some(_) => tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok(),
-            None => false,
-        };
-        if reachable {
+        let serving = host.serving_service_pid(port).await;
+        if serving.is_some_and(|pid| pid != pre_pid) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
+            if serving == Some(pre_pid) {
+                anyhow::bail!(
+                    "`opencode service restart` returned success, but the OpenCode service on port {port} is still pid {pre_pid}: the daemon did not change, so the restart cannot be confirmed"
+                );
+            }
             anyhow::bail!(
                 "the OpenCode service on port {port} did not accept connections within {}s of restarting",
                 timeout.as_secs()
@@ -2106,7 +2216,7 @@ mod tests {
         let service = service_cand(2, 49374);
         assert_eq!(
             restart_plan(&[owned, service], None, Some(1)),
-            RestartPlan::Service { port: 49374 }
+            RestartPlan::Service { pid: 2, port: 49374 }
         );
         // The port pins WHICH service the wait targets: a second service on
         // another port cannot satisfy it.
@@ -2114,7 +2224,7 @@ mod tests {
         let b = service_cand(4, 49375);
         assert_eq!(
             restart_plan(&[b, a], None, None),
-            RestartPlan::Service { port: 49374 }
+            RestartPlan::Service { pid: 3, port: 49374 }
         );
     }
 
@@ -2129,12 +2239,12 @@ mod tests {
         let high = service_cand(4, 49375);
         assert_eq!(
             restart_plan(&[low.clone(), high.clone()], Some(49375), None),
-            RestartPlan::Service { port: 49375 }
+            RestartPlan::Service { pid: 4, port: 49375 }
         );
         // No preference keeps the lowest port, unchanged.
         assert_eq!(
             restart_plan(&[high, low], None, None),
-            RestartPlan::Service { port: 49374 }
+            RestartPlan::Service { pid: 3, port: 49374 }
         );
     }
 
@@ -2162,9 +2272,13 @@ mod tests {
         // `exec` so the killed child IS the sleeper — no orphaned `sleep` left.
         let cli = stub_cli(dir.path(), "opencode", "exec sleep 5");
         let started = std::time::Instant::now();
-        let error = run_service_restart_cli(cli.to_str().unwrap(), std::time::Duration::from_millis(200))
-            .await
-            .expect_err("a stalling CLI must not be waited on forever");
+        let error = run_service_restart_cli(
+            cli.to_str().unwrap(),
+            &service_restart_command(None),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect_err("a stalling CLI must not be waited on forever");
 
         assert!(error.to_string().contains("did not exit"), "{error}");
         // The bound — not the child's own 5s sleep — ends the wait.
@@ -2181,15 +2295,216 @@ mod tests {
     async fn a_service_restart_cli_reports_its_exit_status() {
         let dir = tempfile::tempdir().unwrap();
         let ok = stub_cli(dir.path(), "opencode-ok", "exit 0");
-        run_service_restart_cli(ok.to_str().unwrap(), std::time::Duration::from_secs(5))
-            .await
-            .expect("a clean exit is a successful restart");
+        run_service_restart_cli(
+            ok.to_str().unwrap(),
+            &service_restart_command(None),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a clean exit is a successful restart");
 
         let bad = stub_cli(dir.path(), "opencode-bad", "exit 3");
-        let error = run_service_restart_cli(bad.to_str().unwrap(), std::time::Duration::from_secs(5))
-            .await
-            .expect_err("a non-zero exit is a failed restart");
+        let error = run_service_restart_cli(
+            bad.to_str().unwrap(),
+            &service_restart_command(None),
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a non-zero exit is a failed restart");
         assert!(error.to_string().contains("exited with"), "{error}");
+    }
+
+    /// The restart CLI acts on the registration under ITS `XDG_STATE_HOME`, so
+    /// the command must carry the SELECTED service's own value: a restart that
+    /// inherited cola's would drive a different registration and leave the
+    /// selected daemon untouched (ticket #809).
+    #[test]
+    fn service_restart_command_pins_the_services_state_home() {
+        let cmd = service_restart_command(Some(&env_lines(&[
+            ("XDG_STATE_HOME", "/srv/state"),
+            ("PATH", "/usr/bin"),
+        ])));
+        assert_eq!(cmd.args, argv(&["service", "restart"]));
+        assert_eq!(
+            cmd.env,
+            vec![("XDG_STATE_HOME".to_string(), "/srv/state".to_string())]
+        );
+        // cola's own inherited value is stripped even when the service has one
+        // to set, so only the service's state home can ever reach the CLI.
+        assert_eq!(cmd.remove_env, vec!["XDG_STATE_HOME".to_string()]);
+    }
+
+    /// A service with no `XDG_STATE_HOME` of its own registered under the
+    /// default `~/.local/state`, which is where the CLI looks once cola's value
+    /// is stripped — so no replacement is set. An empty value and an unreadable
+    /// environment are the same case (xdg-basedir, spec #364 §2).
+    #[test]
+    fn service_restart_command_falls_back_to_the_default_state_home() {
+        let no_value = service_restart_command(Some(&env_lines(&[("PATH", "/usr/bin")])));
+        let empty = service_restart_command(Some(&env_lines(&[("XDG_STATE_HOME", "")])));
+        let unreadable = service_restart_command(None);
+        for cmd in [&no_value, &empty, &unreadable] {
+            assert!(cmd.env.is_empty(), "no state home may be set: {:?}", cmd.env);
+            assert_eq!(cmd.remove_env, vec!["XDG_STATE_HOME".to_string()]);
+            assert_eq!(cmd.args, argv(&["service", "restart"]));
+        }
+    }
+
+    /// The built command's environment actually reaches the child process: the
+    /// service's state home is set, and cola's inherited value never survives.
+    /// Without this the choice above could be made and then dropped on the way
+    /// to the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_restart_cli_receives_the_services_state_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("state-home.txt");
+        let cli = stub_cli(
+            dir.path(),
+            "opencode",
+            &format!("printf '%s' \"${{XDG_STATE_HOME-unset}}\" > {}", out.display()),
+        );
+
+        let with_home = service_restart_command(Some(&env_lines(&[("XDG_STATE_HOME", "/srv/state")])));
+        run_service_restart_cli(
+            cli.to_str().unwrap(),
+            &with_home,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("a clean exit is a successful restart");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "/srv/state");
+
+        let without = service_restart_command(None);
+        run_service_restart_cli(cli.to_str().unwrap(), &without, std::time::Duration::from_secs(5))
+            .await
+            .expect("a clean exit is a successful restart");
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "unset",
+            "cola's own XDG_STATE_HOME must not reach the CLI"
+        );
+    }
+
+    /// A restart host with every operation scripted: the daemon's environment,
+    /// the CLI's outcome, and the pid (if any) serving afterwards. Nothing is
+    /// spawned, no socket is opened, and no real registration is touched.
+    struct FakeServiceRestartHost {
+        /// Each pid's environment lines; a pid absent here is "unreadable".
+        environ: Vec<(i32, Vec<String>)>,
+        /// The pid a live `serve --service` on the port reports after the
+        /// restart; `None` means nothing is serving.
+        serving: Option<i32>,
+        /// Every restart command the path ran.
+        commands: std::sync::Mutex<Vec<SpawnCommand>>,
+    }
+
+    impl FakeServiceRestartHost {
+        fn new(serving: Option<i32>) -> Self {
+            Self {
+                environ: Vec::new(),
+                serving,
+                commands: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_env(mut self, pid: i32, env: Vec<String>) -> Self {
+            self.environ.push((pid, env));
+            self
+        }
+
+        fn commands(&self) -> Vec<SpawnCommand> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ServiceRestartHost for FakeServiceRestartHost {
+        fn environ(&self, pid: i32) -> Option<Vec<String>> {
+            self.environ
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, env)| env.clone())
+        }
+
+        async fn run_restart_cli(&self, cmd: &SpawnCommand) -> anyhow::Result<()> {
+            self.commands.lock().unwrap().push(cmd.clone());
+            Ok(())
+        }
+
+        async fn serving_service_pid(&self, _port: u16) -> Option<i32> {
+            self.serving
+        }
+    }
+
+    /// The whole restart path runs the CLI in the SELECTED service's state home
+    /// — the daemon's own environment decides, not cola's (ticket #809).
+    #[tokio::test]
+    async fn restarting_the_service_runs_the_cli_in_the_services_state_home() {
+        let host = FakeServiceRestartHost::new(Some(99))
+            .with_env(42, env_lines(&[("XDG_STATE_HOME", "/srv/state")]));
+        let outcome = restart_managed_service(&host, 42, 49374)
+            .await
+            .expect("a different pid serving on the port is a confirmed restart");
+
+        assert_eq!(outcome, RestartOutcome::RestartedService);
+        let commands = host.commands();
+        assert_eq!(commands.len(), 1, "exactly one restart CLI run");
+        assert_eq!(commands[0].args, argv(&["service", "restart"]));
+        assert_eq!(
+            commands[0].env,
+            vec![("XDG_STATE_HOME".to_string(), "/srv/state".to_string())]
+        );
+        assert_eq!(commands[0].remove_env, vec!["XDG_STATE_HOME".to_string()]);
+    }
+
+    /// A service whose environment carries no `XDG_STATE_HOME` is restarted
+    /// with cola's own value stripped and none set, so the CLI keeps the
+    /// default `~/.local/state` — where that service registered (ticket #809).
+    #[tokio::test]
+    async fn restarting_the_service_strips_colas_own_state_home() {
+        let host = FakeServiceRestartHost::new(Some(99)).with_env(42, env_lines(&[("PATH", "/usr/bin")]));
+        restart_managed_service(&host, 42, 49374)
+            .await
+            .expect("a different pid serving on the port is a confirmed restart");
+
+        let commands = host.commands();
+        assert!(commands[0].env.is_empty(), "{:?}", commands[0].env);
+        assert_eq!(commands[0].remove_env, vec!["XDG_STATE_HOME".to_string()]);
+    }
+
+    /// `opencode service restart` can exit 0 while the daemon it was meant to
+    /// replace is still the one serving — the CLI drove another state home, or
+    /// the service ignored the request. Reporting `RestartedService` then tells
+    /// the user a restart happened that did not, so the wait requires the
+    /// daemon to have CHANGED (ticket #809). Paused time keeps the bounded wait
+    /// off the wall clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_did_not_change_is_not_reported_as_restarted() {
+        let host = FakeServiceRestartHost::new(Some(42));
+        let error = restart_managed_service(&host, 42, 49374)
+            .await
+            .expect_err("the same pid still serving is not a restart");
+
+        let message = error.to_string();
+        assert!(message.contains("did not change"), "{message}");
+        assert!(message.contains("pid 42"), "{message}");
+        assert_eq!(host.commands().len(), 1, "the CLI still ran");
+    }
+
+    /// The pid check does not swallow the other failure: a port nothing serves
+    /// on still reports the timeout it always did.
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_never_comes_back_reports_the_timeout() {
+        let host = FakeServiceRestartHost::new(None);
+        let error = restart_managed_service(&host, 42, 49374)
+            .await
+            .expect_err("nothing serving on the port is not a restart");
+
+        assert!(
+            error.to_string().contains("did not accept connections"),
+            "{error}"
+        );
     }
 
     #[test]
