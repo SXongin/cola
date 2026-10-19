@@ -8,10 +8,11 @@
 //! to the repository: no fetch, no `git add`, no index mutation.
 //!
 //! Two caps are deliberately separate. This producer bounds the **raw patch**
-//! bytes (2 MiB per file, 8 MiB in total) as a read/memory guarantee and says
-//! so through [`DiffDocument::truncated`]; [`render_diff_html`] owns the final
-//! **HTML** 8 MiB bound and appends its own note. A raw 8 MiB patch never
-//! renders to under 8 MiB of HTML, so the two guarantees cannot be one number.
+//! bytes (2 MiB for an untracked file's synthesized patch, 8 MiB in total) as a
+//! read/memory guarantee and says so through [`DiffDocument::truncated`];
+//! [`render_diff_html`] owns the final **HTML** 8 MiB bound and appends its own
+//! note. A raw 8 MiB patch never renders to under 8 MiB of HTML, so the two
+//! guarantees cannot be one number.
 //!
 //! [`render_diff_html`]: crate::backend::render_diff_html
 
@@ -27,12 +28,28 @@ use crate::backend::{DiffDocument, DiffFile};
 /// The base refs tried, in order, when the caller names none.
 const DEFAULT_BASES: [&str; 2] = ["origin/main", "main"];
 
+/// The deterministic diff configuration shared by the patch and `--numstat`
+/// calls: user config must not rewrite the output, and renames are detected.
+/// The patch call adds `-U3`; the numstat call must not (it would also request
+/// patch output).
+const DIFF_FLAGS: [&str; 7] = [
+    "-c",
+    "core.quotepath=false",
+    "diff",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "-M",
+];
+
 /// Git's empty tree object id: the comparison base of an unborn HEAD, where no
 /// commit exists to fork from.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
-/// The most raw patch bytes one file may contribute (2 MiB). A larger file is
-/// represented by one note line instead of its content.
+/// The most bytes one untracked file's synthesized patch may contribute
+/// (2 MiB); a larger untracked file is one note line instead of its content.
+/// Tracked patches are bounded only by the total raw cap below, as the ticket
+/// specifies.
 const MAX_FILE_PATCH_BYTES: usize = 2 * 1024 * 1024;
 
 /// The most raw patch bytes the whole document may carry (8 MiB). Files are
@@ -139,17 +156,9 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
         None => EMPTY_TREE.to_string(),
     };
 
-    let patch_args = [
-        "-c",
-        "core.quotepath=false",
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "-M",
-        "-U3",
-        merge_base.as_str(),
-    ];
+    let mut patch_args = DIFF_FLAGS.to_vec();
+    patch_args.push("-U3");
+    patch_args.push(merge_base.as_str());
     let patch_out = run_git(&root, &patch_args, PATCH_STDOUT_BYTES).await?;
     // A cut stream is killed by this module, so its non-zero status is the
     // expected outcome of the cap — not a git failure.
@@ -158,20 +167,11 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
     }
 
     // `-U3` (like `-p`) requests patch output, so it must NOT ride along with
-    // `--numstat`: git would emit the numstat rows AND the 8 MB patch. The
-    // counts need only the same rename detection and deterministic config.
-    let numstat_args = [
-        "-c",
-        "core.quotepath=false",
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        "-M",
-        "--numstat",
-        "-z",
-        merge_base.as_str(),
-    ];
+    // `--numstat`: git would emit the numstat rows AND the whole patch.
+    let mut numstat_args = DIFF_FLAGS.to_vec();
+    numstat_args.push("--numstat");
+    numstat_args.push("-z");
+    numstat_args.push(merge_base.as_str());
     let numstat_out = run_git(&root, &numstat_args, LISTING_STDOUT_BYTES).await?;
     require_success(&numstat_out, "diff --numstat")?;
     if numstat_out.stdout_truncated {
@@ -378,7 +378,9 @@ fn split_sections(patch: &str) -> Vec<&str> {
 /// Build one tracked file's [`DiffFile`] from its numstat entry and raw patch
 /// section. Submodules and binaries collapse to one line; everything else keeps
 /// the section verbatim (renames therefore keep their `rename from`/`rename to`
-/// headers), subject to the per-file cap.
+/// headers). A tracked patch is never replaced by a note: it is admitted whole
+/// while it fits the total raw cap, and the total cap's omission is what
+/// `truncated` reports.
 fn tracked_file(entry: &NumStatEntry, section: &str) -> DiffFile {
     let mut status = section_status(section);
     if entry.renamed {
@@ -388,8 +390,6 @@ fn tracked_file(entry: &NumStatEntry, section: &str) -> DiffFile {
         format!("子模块 {} {old} → {new}", entry.path)
     } else if entry.binary {
         binary_note(section, &entry.path)
-    } else if section.len() > MAX_FILE_PATCH_BYTES {
-        OVERSIZE_NOTE.to_string()
     } else {
         section.to_string()
     };
@@ -468,24 +468,12 @@ fn binary_note(section: &str, path: &str) -> String {
         .unwrap_or_else(|| format!("Binary files a/{path} and b/{path} differ"))
 }
 
-/// Build an untracked file's new-file patch. Symlinks are summarised by their
-/// target (never followed), non-regular entries are never opened, and a file
-/// over the per-file cap keeps one note line.
+/// Build an untracked file's new-file patch. A symlink or any other
+/// non-regular entry is summed up by one note line (never followed, never
+/// opened as a stream), and a file over the per-file cap keeps one note line.
 async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError> {
     let full = root.join(path);
     let meta = tokio::fs::symlink_metadata(&full).await.map_err(map_io_error)?;
-    if meta.file_type().is_symlink() {
-        let target = tokio::fs::read_link(&full).await.map_err(map_io_error)?;
-        let text = target.to_string_lossy();
-        let (patch, additions) = new_file_patch(path, &text);
-        return Ok(DiffFile {
-            path: path.to_string(),
-            patch,
-            additions,
-            deletions: 0,
-            status: "added".to_string(),
-        });
-    }
     if !meta.file_type().is_file() {
         return Ok(note_file(path, IRREGULAR_NOTE));
     }
@@ -493,16 +481,24 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
         return Ok(note_file(path, OVERSIZE_NOTE));
     }
 
-    let bytes = read_file_capped(&full).await?;
+    // The path may have been replaced since `symlink_metadata`; the opened
+    // handle is the authority, so a symlink (ELOOP) or a FIFO is refused here.
+    let Some(file) = open_regular_bounded(&full)? else {
+        return Ok(note_file(path, IRREGULAR_NOTE));
+    };
+    let bytes = read_opened(file).await?;
     if bytes.len() > MAX_FILE_PATCH_BYTES {
         return Ok(note_file(path, OVERSIZE_NOTE));
+    }
+    // Git's binary test over the whole (bounded) read window: a NUL anywhere
+    // means binary. Scanning only the first 8 KB would let later NUL-containing
+    // content reach the patch as text.
+    if bytes.contains(&0) {
+        return Ok(binary_added(path));
     }
     let Ok(text) = String::from_utf8(bytes) else {
         return Ok(binary_added(path));
     };
-    if text.as_bytes().iter().take(8000).any(|byte| *byte == 0) {
-        return Ok(binary_added(path));
-    }
     let (patch, additions) = new_file_patch(path, &text);
     Ok(DiffFile {
         path: path.to_string(),
@@ -511,6 +507,57 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
         deletions: 0,
         status: "added".to_string(),
     })
+}
+
+/// Open an untracked file for reading without following a symlink and without
+/// blocking on a FIFO. The OPENED handle's metadata is re-checked for
+/// regular-file type and the cap, so a path swapped between
+/// `symlink_metadata` and `open` cannot smuggle outside contents or an
+/// unbounded stream into the patch. `None` means "not a regular, bounded file":
+/// the caller emits the one-line note instead.
+fn open_regular_bounded(path: &Path) -> Result<Option<std::fs::File>, ReviewError> {
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(path);
+
+    let file = match opened {
+        Ok(file) => file,
+        // `O_NOFOLLOW` refuses a symlink that replaced the regular file.
+        Err(error) if is_no_follow_refusal(&error) => return Ok(None),
+        Err(error) => return Err(map_io_error(error)),
+    };
+    let meta = file.metadata().map_err(map_io_error)?;
+    if !meta.is_file() || meta.len() > MAX_FILE_PATCH_BYTES as u64 {
+        return Ok(None);
+    }
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn is_no_follow_refusal(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_no_follow_refusal(_error: &std::io::Error) -> bool {
+    false
+}
+
+async fn read_opened(file: std::fs::File) -> Result<Vec<u8>, ReviewError> {
+    let mut bytes = Vec::new();
+    tokio::fs::File::from_std(file)
+        .take(MAX_FILE_PATCH_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(map_io_error)?;
+    Ok(bytes)
 }
 
 fn note_file(path: &str, note: &str) -> DiffFile {
@@ -552,16 +599,6 @@ fn new_file_patch(path: &str, text: &str) -> (String, usize) {
     (patch, count)
 }
 
-async fn read_file_capped(path: &Path) -> Result<Vec<u8>, ReviewError> {
-    let file = tokio::fs::File::open(path).await.map_err(map_io_error)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE_PATCH_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(map_io_error)?;
-    Ok(bytes)
-}
-
 /// The untracked files git would show, sorted as git lists them.
 async fn list_untracked(root: &str) -> Result<Vec<String>, ReviewError> {
     let out = run_git(
@@ -589,23 +626,24 @@ struct HeadState {
 }
 
 async fn read_head(dir: &str) -> Result<HeadState, ReviewError> {
-    let head = run_git(
-        dir,
-        &["rev-parse", "--verify", "--quiet", "HEAD"],
-        SMALL_STDOUT_BYTES,
-    )
-    .await?;
-    let sha = head
-        .success
-        .then(|| first_line(&head.stdout))
-        .filter(|sha| !sha.is_empty());
-    let Some(sha) = sha else {
-        return Ok(HeadState {
-            branch: "unborn".to_string(),
-            short_sha: "unborn".to_string(),
-            sha: None,
-        });
-    };
+    let head = run_git(dir, &["rev-parse", "--verify", "HEAD"], SMALL_STDOUT_BYTES).await?;
+    if !head.success {
+        // Only the documented unknown-revision result is an unborn HEAD. A
+        // permission or repository failure must stay an error instead of
+        // turning into a misleading "all files added" diff.
+        if is_unknown_revision(&head) {
+            return Ok(HeadState {
+                branch: "unborn".to_string(),
+                short_sha: "unborn".to_string(),
+                sha: None,
+            });
+        }
+        return Err(status_error(&head, "rev-parse HEAD"));
+    }
+    let sha = first_line(&head.stdout);
+    if sha.is_empty() {
+        return Err(ReviewError::GitFailed("git rev-parse HEAD 没有输出".to_string()));
+    }
     let symbolic = run_git(
         dir,
         &["symbolic-ref", "--short", "-q", "HEAD"],
@@ -660,20 +698,33 @@ async fn resolve_base(
 
 async fn resolve_commit(dir: &str, rev: &str) -> Result<Option<String>, ReviewError> {
     let spec = format!("{rev}^{{commit}}");
-    let out = run_git(
-        dir,
-        &["rev-parse", "--verify", "--quiet", &spec],
-        SMALL_STDOUT_BYTES,
-    )
-    .await?;
+    let out = run_git(dir, &["rev-parse", "--verify", &spec], SMALL_STDOUT_BYTES).await?;
     if out.stdout_truncated {
         return Err(ReviewError::GitFailed("git rev-parse 输出超出上限".to_string()));
     }
     if !out.success {
-        return Ok(None);
+        // Only a genuinely unknown ref is "not found". A permission, I/O or
+        // object failure must not silently fall through to another base.
+        if is_unknown_revision(&out) {
+            return Ok(None);
+        }
+        return Err(status_error(&out, "rev-parse"));
     }
     let sha = first_line(&out.stdout);
     Ok((!sha.is_empty()).then_some(sha))
+}
+
+/// Whether `git rev-parse --verify` failed because the revision does not exist
+/// — the only failure that means "unknown ref" or "unborn HEAD" — rather than
+/// because git could not read the repository or a ref. `--verify` spells an
+/// unknown revision as `fatal: Needed a single revision`, and a plain unknown
+/// name as an unknown revision.
+fn is_unknown_revision(out: &GitOutput) -> bool {
+    if out.success || !out.stdout.is_empty() {
+        return false;
+    }
+    let lower = out.stderr.to_ascii_lowercase();
+    lower.contains("needed a single revision") || lower.contains("unknown revision")
 }
 
 async fn merge_base(dir: &str, base: &str, base_sha: Option<&str>) -> Result<String, ReviewError> {
@@ -729,15 +780,22 @@ fn require_success(out: &GitOutput, what: &str) -> Result<(), ReviewError> {
     if out.success {
         return Ok(());
     }
+    Err(status_error(out, what))
+}
+
+/// Map a failed git command to its distinct readable error. A refusal the OS
+/// made keeps [`ReviewError::PermissionDenied`]; everything else is a git
+/// failure carrying git's own diagnostic.
+fn status_error(out: &GitOutput, what: &str) -> ReviewError {
     if out.stderr.to_ascii_lowercase().contains("permission denied") {
-        return Err(ReviewError::PermissionDenied(out.stderr.clone()));
+        return ReviewError::PermissionDenied(out.stderr.clone());
     }
     let detail = if out.stderr.is_empty() {
         format!("`git {what}` 退出码非零")
     } else {
         out.stderr.clone()
     };
-    Err(ReviewError::GitFailed(detail))
+    ReviewError::GitFailed(detail)
 }
 
 fn first_line(stdout: &[u8]) -> String {
@@ -1214,22 +1272,83 @@ mod tests {
         }
     }
 
-    /// A single file over the per-file cap keeps its numstat counts but becomes
-    /// one note line — never 2 MB of content.
+    /// The 2 MB per-file cap is for untracked synthesis only: a larger TRACKED
+    /// patch is admitted whole while it fits the total raw cap (the ticket
+    /// bounds tracked patches by the 8 MB total, not a per-file substitution).
     #[tokio::test]
-    async fn single_file_over_the_per_file_cap_is_a_note() {
+    async fn a_tracked_patch_over_two_mb_is_included_whole() {
         let repo = Repo::init();
-        repo.write("huge.txt", format!("{}\n", "x".repeat(2_500_000)));
+        repo.write("big.txt", format!("{}\n", "x".repeat(2_500_000)));
         repo.commit("base");
         repo.git(&["checkout", "-q", "-b", "feature"]);
-        repo.write("huge.txt", "small\n");
+        repo.write("big.txt", "small\n");
 
         let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
-        let file = find(&review, "huge.txt");
-        assert_eq!(file.patch, OVERSIZE_NOTE);
-        assert!(file.patch.len() < MAX_FILE_PATCH_BYTES);
+        let file = find(&review, "big.txt");
+        assert!(review.document.truncated.is_none());
+        assert!(
+            file.patch.len() > MAX_FILE_PATCH_BYTES,
+            "tracked patches are not per-file capped"
+        );
+        assert!(file.patch.starts_with("diff --git "));
+        assert!(file.patch.contains(&"x".repeat(1024)));
         assert_eq!((file.additions, file.deletions), (1, 1));
         assert_eq!(file.status, "modified");
+    }
+
+    /// When the total raw cap drops a tracked file, the document says so:
+    /// `truncated` names the omission and no included patch is a note
+    /// substitute. The note talks about the RAW cap, never the HTML cap.
+    #[tokio::test]
+    async fn total_cap_omitting_a_tracked_file_sets_truncated() {
+        let repo = Repo::init();
+        for index in 0..3 {
+            repo.write(&format!("big{index}.txt"), format!("{}\n", "x".repeat(2_500_000)));
+        }
+        repo.write("big3.txt", format!("{}\n", "x".repeat(1_500_000)));
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        for index in 0..4 {
+            repo.write(&format!("big{index}.txt"), format!("small-{index}\n"));
+        }
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let truncated = review
+            .document
+            .truncated
+            .as_deref()
+            .expect("the total cap must set truncated");
+        assert!(truncated.contains("8 MB"));
+        assert!(truncated.contains("原始 patch"), "the note names the raw cap");
+        assert_eq!(review.document.files.len(), 3);
+        assert!(
+            review.document.files.iter().all(|file| file.path != "big3.txt"),
+            "the file past the total cap is omitted"
+        );
+        for file in &review.document.files {
+            assert!(file.patch.starts_with("diff --git "));
+            assert!(file.patch.len() > MAX_FILE_PATCH_BYTES);
+        }
+    }
+
+    /// A NUL anywhere in the (bounded) read window marks an untracked file
+    /// binary — including one after the first 8 KB, which the old check missed.
+    #[tokio::test]
+    async fn untracked_late_nul_is_binary_and_has_no_payload() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        let mut content = vec![b'a'; 10_000];
+        content.push(0);
+        content.extend_from_slice(b"SECRET-AFTER-THE-NUL");
+        repo.write("late-nul.txt", &content);
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let file = find(&review, "late-nul.txt");
+        assert_eq!(file.status, "added");
+        assert_eq!(file.patch, "Binary files /dev/null and b/late-nul.txt differ");
+        assert!(!file.patch.contains("SECRET-AFTER-THE-NUL"));
+        assert!(!file.patch.contains('\0'));
     }
 
     /// Untracked text becomes a new-file patch; a binary or an oversized
@@ -1265,6 +1384,25 @@ mod tests {
 
         let huge = find(&review, "huge.txt");
         assert_eq!(huge.patch, OVERSIZE_NOTE);
+    }
+
+    /// An untracked symlink is never followed: it is one note line, and no
+    /// target content (inside or outside the repository) reaches the patch.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn untracked_symlink_is_a_note_and_never_followed() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-SECRET\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), repo.path().join("link.txt")).unwrap();
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let link = find(&review, "link.txt");
+        assert_eq!(link.status, "added");
+        assert_eq!(link.patch, IRREGULAR_NOTE);
+        assert!(!link.patch.contains("OUTSIDE-SECRET"));
     }
 
     /// base resolution prefers `origin/main` over `main`, and an explicit base
@@ -1311,6 +1449,31 @@ mod tests {
             "expected MergeBaseFailed, got {err:?}"
         );
         assert!(err.to_string().contains("merge-base"));
+    }
+
+    /// A HEAD that names a missing object is a git error, never the empty-tree
+    /// path (which would report the whole worktree as additions).
+    #[tokio::test]
+    async fn head_pointing_at_a_missing_object_is_an_error() {
+        let repo = Repo::init();
+        repo.write("a.txt", "a\n");
+        repo.commit("base");
+        // A detached HEAD naming an object that does not exist: `rev-parse`
+        // prints the raw id, so the merge-base step is where it must fail.
+        std::fs::write(
+            repo.path().join(".git/HEAD"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let err = review_diff(&repo.path_str(), Some("main")).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ReviewError::MergeBaseFailed { .. } | ReviewError::GitFailed(_)
+            ),
+            "expected a git/merge-base error, got {err:?}"
+        );
     }
 
     /// Acceptance: every patch shape this producer emits renders through #798
@@ -1447,6 +1610,74 @@ mod tests {
         assert_eq!(sections.len(), 2);
         assert!(sections[0].contains("+diff --git a/fake"));
         assert!(sections[1].starts_with("diff --git a/b b/b"));
+    }
+
+    /// Only a genuinely unknown revision takes the not-found/unborn path; a
+    /// permission or repository failure keeps its distinct error.
+    #[test]
+    fn unknown_revisions_are_separated_from_git_failures() {
+        let failed = |stderr: &str| GitOutput {
+            success: false,
+            stdout: Vec::new(),
+            stderr: stderr.to_string(),
+            stdout_truncated: false,
+        };
+
+        assert!(is_unknown_revision(&failed("fatal: Needed a single revision")));
+        assert!(is_unknown_revision(&failed(
+            "fatal: ambiguous argument 'nope': unknown revision or path not in the working tree."
+        )));
+        assert!(!is_unknown_revision(&failed(
+            "fatal: could not open '.git/refs/heads/main': Permission denied"
+        )));
+        assert!(!is_unknown_revision(&GitOutput {
+            success: true,
+            stdout: b"abc".to_vec(),
+            stderr: String::new(),
+            stdout_truncated: false,
+        }));
+
+        assert!(matches!(
+            status_error(
+                &failed("fatal: could not open '.git/refs/heads/main': Permission denied"),
+                "rev-parse"
+            ),
+            ReviewError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            status_error(&failed("fatal: Needed a single revision"), "rev-parse"),
+            ReviewError::GitFailed(_)
+        ));
+    }
+
+    /// The untracked open refuses a symlink (O_NOFOLLOW) and a FIFO (opened
+    /// non-blocking, then rejected by the opened handle's type) without reading
+    /// either. The race this guards: a regular path replaced after the
+    /// `symlink_metadata` check.
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_bounded_rejects_symlinks_and_fifos() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "target").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_regular_bounded(&link).unwrap().is_none());
+
+        let fifo = dir.path().join("pipe");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated path inside an existing dir.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(
+            open_regular_bounded(&fifo).unwrap().is_none(),
+            "a FIFO must be a note, not a blocking read"
+        );
+
+        let regular = dir.path().join("regular.txt");
+        std::fs::write(&regular, "ok").unwrap();
+        assert!(open_regular_bounded(&regular).unwrap().is_some());
     }
 
     /// git missing / permission / other I/O each map to their own readable
