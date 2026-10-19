@@ -23,7 +23,7 @@
 //! file edit produce a non-empty diff; a read/bash-only Turn produces an empty
 //! one, which is what keeps the card from offering a dead entry.
 
-use crate::backend::{Part, SessionTranscript, ToolCall, TurnAnchor, TurnDiff, TurnDiffFile};
+use crate::backend::{Part, SessionTranscript, ToolCall, ToolStatus, TurnAnchor, TurnDiff, TurnDiffFile};
 use crate::feishu::card::tool_render::{diff_header_path, opens_file_block, recorded_diff};
 use indexmap::IndexMap;
 
@@ -45,14 +45,15 @@ fn records_a_file_edit(name: &str) -> bool {
 /// patch, because the Turn's final recorded state is what the reader wants to
 /// review.
 ///
-/// Only SETTLED calls contribute. A call still `Pending`/`Running` is skipped
-/// even when it already carries a patch: V1's `edit` records the diff while it
-/// is still asking permission, and nothing has changed on disk until the call
-/// completes — exposing it would offer a change the user may yet deny. A
-/// failed call is skipped too (it applied nothing). `ToolStatus::Unknown` and a
-/// non-failed `Other` count as settled: the transcript's own `is_live` /
-/// `is_failure` verdicts are the whole rule, so a call the decoder could not
-/// classify is not treated as live forever.
+/// Only a call that settled successfully contributes: `ToolStatus::Completed`.
+/// Pending/running calls are skipped even when they already carry a patch —
+/// V1's `edit` records the diff while it is still asking permission, and
+/// nothing has changed on disk until the call completes. Failed calls are
+/// skipped too (they applied nothing). A status the transcript did not classify
+/// (`Unknown`, or a non-failed `Other`) is also skipped: a partial V1 read can
+/// omit the status while the call is still pending, and carrying that patch
+/// would offer a change that may never exist. The index and the V1 artifact
+/// prefer a missing entry over an unconfirmed one.
 pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &TurnAnchor) -> TurnDiff {
     let mut files: IndexMap<String, TurnDiffFile> = IndexMap::new();
     for call in transcript
@@ -65,7 +66,7 @@ pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &Turn
             _ => None,
         })
     {
-        if call.status.is_live() || call.status.is_failure() || !records_a_file_edit(&call.identity.name) {
+        if call.status != ToolStatus::Completed || !records_a_file_edit(&call.identity.name) {
             continue;
         }
         let recorded = match recorded_diff(call) {
@@ -939,11 +940,12 @@ Index: src/main.rs
         );
     }
 
-    /// A status the decoder could not classify is not live: `Unknown` and a
-    /// non-failed `Other` are settled by the transcript's own `is_live` /
-    /// `is_failure` verdicts, so a recorded patch on one still counts.
+    /// A status the transcript did not classify is not proof that an edit
+    /// settled: `Unknown` and a non-failed `Other` contribute nothing, even
+    /// when the call carries a diff (a partial V1 read can omit the status on a
+    /// pending permission ask).
     #[test]
-    fn an_unclassified_but_settled_status_still_counts() {
+    fn an_unclassified_status_does_not_contribute() {
         let patch = "\
 Index: src/main.rs
 ===================================================================
@@ -955,9 +957,9 @@ Index: src/main.rs
 ";
         for status in [ToolStatus::Unknown, ToolStatus::Other("done".into())] {
             let mut edit = call("edit", Some(json!({ "diff": patch })));
-            edit.status = status;
+            edit.status = status.clone();
             let diff = turn_diff_from_tools(&transcript(vec![edit]), &anchor());
-            assert_eq!(paths(&diff), ["src/main.rs"]);
+            assert!(diff.is_empty(), "{status:?} is not a confirmed edit");
         }
     }
 
