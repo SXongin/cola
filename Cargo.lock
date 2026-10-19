@@ -302,6 +302,7 @@ dependencies = [
  "infer",
  "libc",
  "reqwest",
+ "rustix",
  "semver",
  "serde",
  "serde_json",

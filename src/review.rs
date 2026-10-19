@@ -18,6 +18,7 @@
 //!
 //! [`render_diff_html`]: crate::backend::render_diff_html
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -32,15 +33,18 @@ const DEFAULT_BASES: [&str; 2] = ["origin/main", "main"];
 
 /// The deterministic diff configuration shared by the patch and `--numstat`
 /// calls: user config must not rewrite the output, and renames are detected.
-/// The patch call adds `-U3`; the numstat call must not (it would also request
-/// patch output).
-const DIFF_FLAGS: [&str; 7] = [
+/// `--ignore-submodules=none` overrides a user's `diff.ignoreSubmodules=all`,
+/// which would otherwise omit changed submodules from both calls. The patch
+/// call adds `-U3`; the numstat call must not (it would also request patch
+/// output).
+const DIFF_FLAGS: [&str; 8] = [
     "-c",
     "core.quotepath=false",
     "diff",
     "--no-color",
     "--no-ext-diff",
     "--no-textconv",
+    "--ignore-submodules=none",
     "-M",
 ];
 
@@ -61,6 +65,10 @@ const MAX_TOTAL_PATCH_BYTES: usize = 8 * 1024 * 1024;
 
 /// One git invocation's wall-clock bound.
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One untracked file's read bound. A stalled network filesystem must not keep
+/// the review pending; the entry degrades to [`UNREADABLE_NOTE`].
+const UNTRACKED_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// stdout bound for commands whose output is metadata, never a patch.
 const SMALL_STDOUT_BYTES: usize = 64 * 1024;
@@ -236,9 +244,12 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
 }
 
 /// Build the document's files in source order under the two raw-patch caps.
-/// `complete_sections` is how many patch sections were read whole; entries past
-/// it (and everything after the first file that does not fit the total budget)
-/// are omitted and counted.
+/// Patch sections are paired with numstat entries by **path**, never by index:
+/// the two invocations can see different trees if a file is renamed between
+/// them, and one file's patch labelled with another's counts is worse than an
+/// honest omission. `complete_sections` is how many sections were read whole;
+/// a cut tail is inserted as an unusable match so its entry, if any, is counted
+/// once as omitted.
 async fn assemble_files(
     root: &str,
     entries: &[NumStatEntry],
@@ -251,16 +262,45 @@ async fn assemble_files(
     let mut omitted = 0usize;
     let mut stopped = false;
     let mut stopped_by_cap = false;
+    // A cut tail is itself evidence of an incomplete read, even when the total
+    // cap stops the entry loop before that tail's entry is reached.
     let mut stopped_by_stream = complete_sections < sections.len();
 
-    for (index, entry) in entries.iter().enumerate() {
-        if stopped || index >= complete_sections {
-            stopped = true;
-            stopped_by_stream = stopped_by_stream || index >= complete_sections;
+    // `Some(section)` is usable; `None` marks a section cut by the stream cap.
+    let mut by_path: HashMap<String, Option<&str>> = HashMap::new();
+    for (index, section) in sections.iter().enumerate() {
+        let whole = index < complete_sections;
+        match section_path(section) {
+            Some(path) => {
+                let value = whole.then_some(*section);
+                if by_path.insert(path, value).is_some() {
+                    // The same path twice cannot be paired unambiguously.
+                    stopped_by_stream = true;
+                    omitted += 1;
+                }
+            }
+            None => {
+                // A section whose path cannot be read is never guessed at.
+                stopped_by_stream = true;
+                omitted += 1;
+            }
+        }
+    }
+
+    for entry in entries {
+        let section = by_path.remove(entry.path.as_str());
+        if stopped {
             omitted += 1;
             continue;
         }
-        let file = tracked_file(entry, sections[index]);
+        let Some(Some(section)) = section else {
+            // No usable section for this entry: an incomplete read, never a
+            // different file's patch.
+            stopped_by_stream = true;
+            omitted += 1;
+            continue;
+        };
+        let file = tracked_file(entry, section);
         if used.saturating_add(file.patch.len()) > MAX_TOTAL_PATCH_BYTES {
             stopped = true;
             stopped_by_cap = true;
@@ -271,12 +311,10 @@ async fn assemble_files(
         files.push(file);
     }
 
-    // Patch sections without a numstat row would be dropped without a trace;
-    // report that as an incomplete read instead of a clean document.
-    if !stopped && sections.len() > entries.len() {
-        stopped = true;
+    // Sections no numstat entry claimed are likewise incomplete.
+    if !by_path.is_empty() {
         stopped_by_stream = true;
-        omitted += sections.len() - entries.len();
+        omitted += by_path.len();
     }
 
     let root_path = Path::new(root);
@@ -413,6 +451,146 @@ fn split_sections(patch: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The path a raw patch section is about, from its headers only (hunk content
+/// is never consulted): `rename to` first, then `+++ b/<path>` (or the old side
+/// of a deletion), and finally a `diff --git` header when both sides spell the
+/// same path. A C-quoted field is unquoted; `core.quotepath=false` still quotes
+/// control characters.
+fn section_path(section: &str) -> Option<String> {
+    let mut rename_to = None;
+    let mut plus = None;
+    let mut minus = None;
+    let mut diff_git = None;
+    for line in section.lines() {
+        // File headers precede the first hunk. A removed line whose text begins
+        // `-- ` renders as `--- …` inside a hunk and must not be read as one.
+        if line.starts_with("@@") {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("rename to ") {
+            rename_to = Some(unquote_path(rest));
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            plus = Some(unquote_path(rest));
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            minus = Some(unquote_path(rest));
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            diff_git = Some(rest.to_string());
+        }
+    }
+
+    if let Some(path) = rename_to {
+        return Some(path);
+    }
+    if let Some(path) = plus
+        && path != "/dev/null"
+    {
+        return Some(strip_prefix_component(&path));
+    }
+    if let Some(path) = minus
+        && path != "/dev/null"
+    {
+        // A deletion (`+++ /dev/null`) is keyed by its old path.
+        return Some(strip_prefix_component(&path));
+    }
+    diff_git_path(&diff_git?)
+}
+
+/// Strip git's `a/` or `b/` side prefix. `diff.noprefix` leaves the path as-is.
+fn strip_prefix_component(path: &str) -> String {
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Undo git's C quoting for a path field. With `core.quotepath=false` only
+/// control characters, quotes and backslashes are quoted, but octal escapes
+/// still encode arbitrary bytes.
+fn unquote_path(raw: &str) -> String {
+    let Some(inner) = raw.strip_prefix('"').and_then(|raw| raw.strip_suffix('"')) else {
+        return raw.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' || index + 1 >= bytes.len() {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let escaped = bytes[index + 1];
+        let mut step = 2usize;
+        match escaped {
+            b'n' => out.push(b'\n'),
+            b't' => out.push(b'\t'),
+            b'r' => out.push(b'\r'),
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'0'..=b'7' => {
+                let mut value = u16::from(escaped - b'0');
+                let mut consumed = 1usize;
+                while consumed < 3
+                    && index + 1 + consumed < bytes.len()
+                    && let digit @ b'0'..=b'7' = bytes[index + 1 + consumed]
+                {
+                    value = value * 8 + u16::from(digit - b'0');
+                    consumed += 1;
+                }
+                out.push(value as u8);
+                step = 1 + consumed;
+            }
+            other => out.push(other),
+        }
+        index += step;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The path from a `diff --git a/<p> b/<p>` header, accepted only when both
+/// sides spell the same path. A rename spells two different paths and carries
+/// a `rename to` header instead, so it never reaches this fallback.
+fn diff_git_path(rest: &str) -> Option<String> {
+    if rest.starts_with('"') {
+        let (first, remainder) = take_quoted(rest)?;
+        let (second, _) = take_quoted(remainder.trim_start())?;
+        let first = strip_prefix_component(&unquote_path(first));
+        let second = strip_prefix_component(&unquote_path(second));
+        return (first == second).then_some(first);
+    }
+    // Unquoted paths may contain spaces, so try every split and accept only one
+    // where both sides name the same path.
+    for (index, _) in rest.match_indices(' ') {
+        let left = strip_prefix_component(&rest[..index]);
+        let right = strip_prefix_component(rest[index + 1..].trim_start());
+        if !left.is_empty() && left == right {
+            return Some(left);
+        }
+    }
+    None
+}
+
+/// Take one C-quoted field (quotes included) and the remainder after it.
+fn take_quoted(text: &str) -> Option<(&str, &str)> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
+    }
+    let mut index = 1usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return Some((&text[..=index], &text[index + 1..])),
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 /// Build one tracked file's [`DiffFile`] from its numstat entry and raw patch
 /// section. Submodules and binaries collapse to one line; everything else keeps
 /// the section verbatim (renames therefore keep their `rename from`/`rename to`
@@ -534,12 +712,16 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
         return Ok(note_file(path, OVERSIZE_NOTE));
     }
 
-    // The path may have been replaced since `symlink_metadata`; the opened
-    // handle is the authority, so a symlink (ELOOP) or a FIFO is refused here.
-    let Some(file) = open_regular_bounded(&full)? else {
+    // Every component is re-opened beneath the root: a parent directory swapped
+    // for a symlink (or a final symlink/FIFO) is refused, not followed.
+    let Some(file) = open_beneath(root, path)? else {
         return Ok(note_file(path, IRREGULAR_NOTE));
     };
-    let bytes = read_opened(file).await?;
+    let bytes = match read_opened_within(file, UNTRACKED_READ_TIMEOUT).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(note_file(path, UNREADABLE_NOTE)),
+        Err(error) => return Err(error),
+    };
     if bytes.len() > MAX_FILE_PATCH_BYTES {
         return Ok(note_file(path, OVERSIZE_NOTE));
     }
@@ -556,30 +738,94 @@ async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError
     Ok(added_file(path.to_string(), patch, additions))
 }
 
-/// Open an untracked file for reading without following a symlink and without
-/// blocking on a FIFO. The OPENED handle's metadata is re-checked for
-/// regular-file type and the cap, so a path swapped between
-/// `symlink_metadata` and `open` cannot smuggle outside contents or an
-/// unbounded stream into the patch. `None` means "not a regular, bounded file":
-/// the caller emits the one-line note instead.
-fn open_regular_bounded(path: &Path) -> Result<Option<std::fs::File>, ReviewError> {
-    #[cfg(unix)]
-    let opened = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let opened = std::fs::File::open(path);
+/// Open an untracked file for reading without leaving the repository root.
+/// On Unix every component is opened relative to the previous directory with
+/// `O_NOFOLLOW`, so neither a parent swapped for a symlink nor a final
+/// symlink/FIFO can redirect (or block) the read. The opened handle's metadata
+/// is re-checked for regular-file type and the 2 MB cap. `None` means "not a
+/// regular, bounded file": the caller emits the one-line note instead.
+#[cfg(unix)]
+fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
+    use rustix::fs::{CWD, Mode, OFlags};
 
-    let file = match opened {
-        Ok(file) => file,
-        // `O_NOFOLLOW` refuses a symlink that replaced the regular file.
-        Err(error) if is_no_follow_refusal(&error) => return Ok(None),
-        Err(error) => return Err(map_io_error(error)),
+    let components: Vec<&str> = relative.split('/').collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return Ok(None);
+    }
+
+    let root_dir = rustix::fs::openat(
+        CWD,
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| map_io_error(error.into()))?;
+
+    let mut dir = root_dir;
+    let last = components.len() - 1;
+    for (index, component) in components.iter().enumerate() {
+        let flags = if index == last {
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        } else {
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        };
+        let opened = match rustix::fs::openat(&dir, *component, flags, Mode::empty()) {
+            Ok(opened) => opened,
+            Err(error) => {
+                return match error {
+                    rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR | rustix::io::Errno::NOENT => {
+                        Ok(None)
+                    }
+                    _ => Err(map_io_error(error.into())),
+                };
+            }
+        };
+        if index == last {
+            let file = std::fs::File::from(opened);
+            let meta = file.metadata().map_err(map_io_error)?;
+            if !meta.is_file() || meta.len() > MAX_FILE_PATCH_BYTES as u64 {
+                return Ok(None);
+            }
+            return Ok(Some(file));
+        }
+        dir = opened;
+    }
+    Ok(None)
+}
+
+/// Best effort where std has no `openat`: canonicalize the parent and require
+/// it to stay under the canonicalized root, then refuse a final symlink. The
+/// per-component walk above is Unix-only.
+#[cfg(not(unix))]
+fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
+    let components: Vec<&str> = relative.split('/').collect();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| component.is_empty() || *component == "." || *component == "..")
+    {
+        return Ok(None);
+    }
+    let full = root.join(relative);
+    let Some(parent) = full.parent() else {
+        return Ok(None);
     };
+    let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
+    let Ok(canonical_parent) = std::fs::canonicalize(parent) else {
+        return Ok(None);
+    };
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Ok(None);
+    }
+    let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(&full).map_err(map_io_error)?;
     let meta = file.metadata().map_err(map_io_error)?;
     if !meta.is_file() || meta.len() > MAX_FILE_PATCH_BYTES as u64 {
         return Ok(None);
@@ -587,14 +833,24 @@ fn open_regular_bounded(path: &Path) -> Result<Option<std::fs::File>, ReviewErro
     Ok(Some(file))
 }
 
-#[cfg(unix)]
-fn is_no_follow_refusal(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ELOOP)
+/// Read one opened untracked file, bounded in bytes and in time. `None` is the
+/// timeout: the caller emits the unreadable note instead of keeping the review
+/// pending on a stalled filesystem.
+async fn read_opened_within(file: std::fs::File, timeout: Duration) -> Result<Option<Vec<u8>>, ReviewError> {
+    within(timeout, read_opened(file)).await
 }
 
-#[cfg(not(unix))]
-fn is_no_follow_refusal(_error: &std::io::Error) -> bool {
-    false
+/// Apply the read budget to any byte-read future. Kept generic so the timeout
+/// seam is testable without a stalled filesystem.
+async fn within<F>(timeout: Duration, future: F) -> Result<Option<Vec<u8>>, ReviewError>
+where
+    F: std::future::Future<Output = Result<Vec<u8>, ReviewError>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(bytes)) => Ok(Some(bytes)),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 async fn read_opened(file: std::fs::File) -> Result<Vec<u8>, ReviewError> {
@@ -939,9 +1195,13 @@ async fn finish_child(mut child: Child, stdout_cap: usize) -> std::io::Result<Gi
             }
         }
         if stdout_truncated {
-            // The writer may be blocked on a full stdout pipe; the stream is
-            // already over budget, so stop it and let stderr reach EOF.
+            // The stream is already over budget: stop the writer and stop
+            // reading. Waiting for stderr EOF here can hang on Windows when a
+            // grandchild inherited the write end after the direct child was
+            // killed; the bytes collected so far are enough for the omission
+            // note, and normal exits still drain stderr above.
             let _ = child.kill().await;
+            break;
         }
     }
 
@@ -1286,23 +1546,28 @@ mod tests {
     }
 
     /// Acceptance: a rename is one `renamed` file at its new path, not a
-    /// delete + add, and its patch keeps the rename headers.
+    /// delete + add. Path-keyed pairing keeps the new path's counts with the
+    /// new path's patch, and the patch keeps the rename headers.
     #[tokio::test]
     async fn rename_is_one_renamed_file() {
         let repo = Repo::init();
-        repo.write("old.txt", "one\ntwo\n");
+        let original: String = (0..10).map(|line| format!("line{line}\n")).collect();
+        repo.write("old.txt", &original);
         repo.commit("base");
         repo.git(&["checkout", "-q", "-b", "feature"]);
         repo.git(&["mv", "old.txt", "new.txt"]);
+        repo.write("new.txt", original.replace("line5\n", "CHANGED\n"));
+        repo.git(&["add", "new.txt"]);
 
         let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
         assert_eq!(review.document.files.len(), 1);
         let file = &review.document.files[0];
         assert_eq!(file.path, "new.txt");
         assert_eq!(file.status, "renamed");
-        assert_eq!((file.additions, file.deletions), (0, 0));
+        assert_eq!((file.additions, file.deletions), (1, 1));
         assert!(file.patch.contains("rename from old.txt"));
         assert!(file.patch.contains("rename to new.txt"));
+        assert!(file.patch.contains("+CHANGED"));
     }
 
     /// Acceptance: a binary file keeps its status but no payload — one
@@ -1325,9 +1590,9 @@ mod tests {
         assert!(!file.patch.contains('\0'));
     }
 
-    /// Acceptance: a submodule is one `子模块 <path> <old> → <new>` line.
-    #[tokio::test]
-    async fn submodule_is_one_note_line() {
+    /// A repo whose `main` commit has a gitlink `sub` pointing at `first`, with
+    /// `feature` checked out and its gitlink moved to `main_sub`.
+    fn repo_with_changed_submodule() -> (Repo, String, String) {
         let repo = Repo::init();
         repo.write("a.txt", "a\n");
         repo.commit("one");
@@ -1346,6 +1611,13 @@ mod tests {
 
         repo.git(&["checkout", "-q", "-b", "feature"]);
         repo.git(&["update-index", "--cacheinfo", &format!("160000,{main_sub},sub")]);
+        (repo, first, main_sub)
+    }
+
+    /// Acceptance: a submodule is one `子模块 <path> <old> → <new>` line.
+    #[tokio::test]
+    async fn submodule_is_one_note_line() {
+        let (repo, first, main_sub) = repo_with_changed_submodule();
 
         let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
         assert_eq!(review.document.files.len(), 1);
@@ -1355,6 +1627,21 @@ mod tests {
         assert_eq!(file.patch, format!("子模块 sub {first} → {main_sub}"));
         assert!(!file.patch.contains("Subproject commit"));
         assert!(!file.patch.contains('\0'));
+    }
+
+    /// A user's `diff.ignoreSubmodules=all` must not hide a changed submodule:
+    /// the deterministic call passes `--ignore-submodules=none`.
+    #[tokio::test]
+    async fn submodule_is_not_hidden_by_ignore_submodules_config() {
+        let (repo, first, main_sub) = repo_with_changed_submodule();
+        repo.git(&["config", "diff.ignoreSubmodules", "all"]);
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        assert_eq!(review.document.files.len(), 1);
+        let file = &review.document.files[0];
+        assert_eq!(file.path, "sub");
+        assert_eq!(file.status, "modified");
+        assert_eq!(file.patch, format!("子模块 sub {first} → {main_sub}"));
     }
 
     /// A tracked text file whose changed lines happen to read
@@ -1557,8 +1844,9 @@ mod tests {
 
     /// A non-UTF-8 path survives `ls-files -z`'s lossy decode but cannot be
     /// reopened by its lossy spelling: the review still finishes with a note
-    /// instead of failing the command.
-    #[cfg(unix)]
+    /// instead of failing the command. APFS refuses such a filename outright
+    /// (EILSEQ), so the fixture can only exist on Linux.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_non_utf8_untracked_name_is_a_note_not_an_error() {
         use std::os::unix::ffi::OsStrExt;
@@ -1886,6 +2174,131 @@ mod tests {
         assert!(sections[1].starts_with("diff --git a/b b/b"));
     }
 
+    /// Every patch shape yields the path its numstat row uses: the new path for
+    /// a rename, the old path for a deletion, and never hunk content.
+    #[test]
+    fn section_path_reads_each_shape() {
+        let modified =
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(section_path(modified).as_deref(), Some("src/a.rs"));
+
+        let added = "diff --git a/new.txt b/new.txt\nnew file mode 100644\n\
+                     --- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n";
+        assert_eq!(section_path(added).as_deref(), Some("new.txt"));
+
+        let deleted = "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n\
+                       --- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n";
+        assert_eq!(section_path(deleted).as_deref(), Some("gone.txt"));
+
+        let renamed = "diff --git a/old.txt b/new.txt\nsimilarity index 100%\n\
+                       rename from old.txt\nrename to new.txt\n";
+        assert_eq!(section_path(renamed).as_deref(), Some("new.txt"));
+
+        // A removed line whose text begins `-- ` renders as `--- …` INSIDE the
+        // hunk; it must never be read as the file header.
+        let lookalike = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n\
+                         --- old comment\n+++ new comment\n";
+        assert_eq!(section_path(lookalike).as_deref(), Some("x"));
+
+        // C-quoted control characters are unquoted before the side prefix goes.
+        let quoted = "diff --git \"a/tab\\tname\" \"b/tab\\tname\"\n\
+                      --- \"a/tab\\tname\"\n+++ \"b/tab\\tname\"\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(section_path(quoted).as_deref(), Some("tab\tname"));
+
+        // The `diff --git` fallback only accepts a path both sides agree on.
+        assert_eq!(
+            section_path("diff --git a/same b/same\n").as_deref(),
+            Some("same")
+        );
+        assert_eq!(section_path("diff --git a/old b/new\n"), None);
+
+        assert_eq!(unquote_path("\"a\\101b\""), "aAb");
+        assert_eq!(unquote_path("\"a\\\\b\\\"c\""), "a\\b\"c");
+    }
+
+    /// Pairing is by path: sections in a different order from the numstat rows
+    /// still get their own patch and counts.
+    #[tokio::test]
+    async fn sections_pair_with_entries_by_path_not_index() {
+        let entries = vec![
+            NumStatEntry {
+                additions: 1,
+                deletions: 0,
+                path: "a.txt".to_string(),
+                renamed: false,
+                binary: false,
+            },
+            NumStatEntry {
+                additions: 2,
+                deletions: 0,
+                path: "b.txt".to_string(),
+                renamed: false,
+                binary: false,
+            },
+        ];
+        let a = "diff --git a/a.txt b/a.txt\nnew file mode 100644\n\
+                 --- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+A\n";
+        let b = "diff --git a/b.txt b/b.txt\nnew file mode 100644\n\
+                 --- /dev/null\n+++ b/b.txt\n@@ -0,0 +1,2 @@\n+B1\n+B2\n";
+        let sections = vec![b, a];
+
+        let (files, truncated) = assemble_files("/tmp", &entries, &sections, 2, &[]).await.unwrap();
+        assert!(truncated.is_none());
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "a.txt");
+        assert_eq!(files[0].additions, 1);
+        assert!(files[0].patch.contains("diff --git a/a.txt b/a.txt"));
+        assert_eq!(files[1].path, "b.txt");
+        assert_eq!(files[1].additions, 2);
+        assert!(files[1].patch.contains("diff --git a/b.txt b/b.txt"));
+    }
+
+    /// An entry with no section, or a section with no entry, is an incomplete
+    /// read: it is omitted with the stream note, never paired with a different
+    /// file's patch.
+    #[tokio::test]
+    async fn a_missing_or_extra_section_is_reported_incomplete() {
+        let entry = |path: &str| NumStatEntry {
+            additions: 1,
+            deletions: 0,
+            path: path.to_string(),
+            renamed: false,
+            binary: false,
+        };
+        let a = "diff --git a/a.txt b/a.txt\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+A\n";
+        let b = "diff --git a/b.txt b/b.txt\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+B\n";
+
+        let (files, truncated) = assemble_files("/tmp", &[entry("a.txt"), entry("b.txt")], &[a], 1, &[])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        assert!(truncated.unwrap().contains("git 输出不完整"));
+
+        let (files, truncated) = assemble_files("/tmp", &[entry("a.txt")], &[a, b], 2, &[])
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "a.txt");
+        assert!(truncated.unwrap().contains("git 输出不完整"));
+    }
+
+    /// The untracked read is time-bounded: an exhausted budget is the
+    /// unreadable note, not a pending review. A slow future against a zero
+    /// budget is deterministic, and fails if the timeout wrapper is removed
+    /// (the future then completes and returns its bytes).
+    #[tokio::test]
+    async fn an_untracked_read_timeout_is_an_unreadable_note() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(Vec::new())
+        };
+        assert!(
+            within(std::time::Duration::ZERO, slow).await.unwrap().is_none(),
+            "an exhausted read budget must surface as a timeout"
+        );
+    }
+
     /// Only a genuinely unknown revision takes the not-found/unborn path; a
     /// permission or repository failure keeps its distinct error.
     #[test]
@@ -1924,13 +2337,13 @@ mod tests {
         ));
     }
 
-    /// The untracked open refuses a symlink (O_NOFOLLOW) and a FIFO (opened
-    /// non-blocking, then rejected by the opened handle's type) without reading
-    /// either. The race this guards: a regular path replaced after the
+    /// The untracked open refuses a final symlink (O_NOFOLLOW) and a FIFO
+    /// (opened non-blocking, then rejected by the opened handle's type) without
+    /// reading either. The race this guards: a regular path replaced after the
     /// `symlink_metadata` check.
     #[cfg(unix)]
     #[test]
-    fn open_regular_bounded_rejects_symlinks_and_fifos() {
+    fn open_beneath_rejects_symlinks_and_fifos() {
         use std::os::unix::ffi::OsStrExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1938,20 +2351,48 @@ mod tests {
         std::fs::write(&target, "target").unwrap();
         let link = dir.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(open_regular_bounded(&link).unwrap().is_none());
+        assert!(open_beneath(dir.path(), "link.txt").unwrap().is_none());
 
         let fifo = dir.path().join("pipe");
         let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: `path` is a valid NUL-terminated path inside an existing dir.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(
-            open_regular_bounded(&fifo).unwrap().is_none(),
+            open_beneath(dir.path(), "pipe").unwrap().is_none(),
             "a FIFO must be a note, not a blocking read"
         );
 
         let regular = dir.path().join("regular.txt");
         std::fs::write(&regular, "ok").unwrap();
-        assert!(open_regular_bounded(&regular).unwrap().is_some());
+        assert!(open_beneath(dir.path(), "regular.txt").unwrap().is_some());
+    }
+
+    /// A parent directory swapped for a symlink must not let the read escape:
+    /// the entry becomes a note and the outside bytes never appear.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_parent_directory_is_a_note_not_an_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join("dir")).unwrap();
+        std::fs::write(outside.path().join("dir/secret.txt"), "OUTSIDE-SECRET\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("dir"), root.path().join("dir")).unwrap();
+
+        assert!(open_beneath(root.path(), "dir/secret.txt").unwrap().is_none());
+        // And the review's per-entry path turns it into the note.
+        let (files, truncated) = assemble_files(
+            root.path().to_str().unwrap(),
+            &[],
+            &[],
+            0,
+            &["dir/secret.txt".to_string()],
+        )
+        .await
+        .unwrap();
+        assert!(truncated.is_none());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].patch, IRREGULAR_NOTE);
+        assert!(!files[0].patch.contains("OUTSIDE-SECRET"));
     }
 
     /// git missing / permission / other I/O each map to their own readable
