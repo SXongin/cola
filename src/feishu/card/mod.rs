@@ -11,6 +11,7 @@ pub(crate) mod session;
 pub(crate) mod shell;
 pub(crate) mod skill;
 pub(crate) mod tool_render;
+pub(crate) mod turn_diff;
 pub(crate) mod viewer;
 
 /// Set the given callback fields on a button's callback payload (overwriting

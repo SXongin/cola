@@ -1613,6 +1613,11 @@ pub(super) fn render_turn_parts(
     let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
+    // The Turn's change index (#477) is refreshed from the same read, before
+    // the parts render: the #800 aggregation is local, and a newly settled edit
+    // becomes a rendered change that owes its flush. An anchorless card never
+    // reaches here, which is also why it can never offer the button.
+    rendered_any |= acc.refresh_turn_diff(transcript);
     // A merged Wake's completion entry (spec #593) is planned and committed by
     // the caller — [`plan_ledger_entries`] + [`read_planned_outputs`] +
     // [`commit_planned_entries`] — so its output read happens outside the cards
@@ -10034,5 +10039,250 @@ Index: /x/src/main.rs
             Some(3),
             "growth still renders only the tail"
         );
+    }
+
+    // --- The Turn's change index (spec #797, ticket #477) -------------------
+
+    /// One completed `edit` call carrying the recorded patch the #800
+    /// aggregation folds. Both generations' settled shapes end here, so the
+    /// fixture speaks only the neutral one.
+    fn edit_part(call_id: &str, at_ms: i64, path: &str, plus: &str) -> Part {
+        let patch = format!(
+            "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1,2 @@\n-old {path}\n+{plus}\n+more {path}\n"
+        );
+        Part::Tool(ToolCall {
+            identity: ToolIdentity {
+                name: "edit".to_string(),
+                call_id: call_id.to_string(),
+            },
+            status: ToolStatus::Completed,
+            started_at: Some(at_ms),
+            input: None,
+            metadata: Some(serde_json::json!({ "diff": patch })),
+            output: ToolOutput::default(),
+        })
+    }
+
+    /// The Turn anchored at `msg_user_9`, with the given assistant parts.
+    fn anchored_transcript(parts: Vec<Part>) -> SessionTranscript {
+        SessionTranscript::new(vec![
+            typed_message(
+                "msg_user_9",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("改一下这两个文件")],
+            ),
+            message("msg_assistant", 1_100, parts),
+        ])
+    }
+
+    /// A live accumulator carrying the session routing the button payload
+    /// needs, anchored on the fixture user message.
+    fn anchored_accumulator() -> StreamAccumulator {
+        let mut acc = StreamAccumulator::new("proj");
+        acc.set_session("ses_test");
+        acc.apply_work_context(crate::bridge::turn::state::WorkContext {
+            directory: "/tmp/cola-demo".to_string(),
+            project_name: Some("cola-demo".to_string()),
+            git: Default::default(),
+        });
+        acc.repoint_turn_anchor(&TurnAnchor {
+            message_id: MessageId::new("msg_user_9"),
+            created_ms: 1_000,
+        });
+        acc
+    }
+
+    fn turn_diff_button(card: &serde_json::Value) -> Option<&serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()?
+            .iter()
+            .find(|element| element["tag"] == "button" && element["value"]["op"] == "turn_diff")
+    }
+
+    /// Acceptance: a Turn that edited two files renders the index line and the
+    /// complete-diff button, with the footer still last. The button names the
+    /// Turn by its anchor (`from` = the user message id) and carries the exact
+    /// `op`/`session_id`/`directory` routing the click needs.
+    #[test]
+    fn a_turn_that_edited_two_files_renders_the_index_line_and_button() {
+        let transcript = anchored_transcript(vec![
+            edit_part("call_edit_a", 1_100, "src/a.rs", "A"),
+            edit_part("call_edit_b", 1_200, "src/b.rs", "B"),
+        ]);
+        let mut acc = anchored_accumulator();
+        acc.set_card_state(CardState::Done);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let (card, full) = acc.build_card_with_split();
+        assert!(!full, "a two-file edit fits one card");
+
+        let text = card_text(&card);
+        assert!(
+            text.contains("📝 本次改动 · 2 files · +4 −2"),
+            "the index line names both deduped files and their counts: {text}"
+        );
+
+        let button = turn_diff_button(&card).expect("the complete-diff button renders");
+        assert_eq!(button["text"]["content"], "🔍 查看完整改动");
+        assert_eq!(
+            button["value"],
+            serde_json::json!({
+                "op": "turn_diff",
+                "session_id": "ses_test",
+                "from": "msg_user_9",
+                "directory": "/tmp/cola-demo",
+            })
+        );
+
+        // The footer keeps its place: hr + footer, both after the button.
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let button_pos = elements
+            .iter()
+            .position(|element| element == button)
+            .expect("the button is a body element");
+        let footer_pos = elements.len() - 1;
+        assert_eq!(elements[footer_pos - 1]["tag"], "hr");
+        assert!(
+            elements[footer_pos]["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("📁 cola-demo")),
+            "the footer stays last: {:?}",
+            elements[footer_pos]
+        );
+        assert!(button_pos < footer_pos, "the index precedes the footer");
+
+        // A re-read of the same settled state adds no counts and owes no flush.
+        assert!(!render_new_turn_parts(&mut acc, &transcript));
+    }
+
+    /// Acceptance: a read/bash-only Turn recorded no file edit, so the card
+    /// offers neither the line nor the button — no dead entry.
+    #[test]
+    fn a_read_and_bash_only_turn_renders_no_index_and_no_button() {
+        let transcript = anchored_transcript(vec![
+            tool(
+                "read",
+                "call_read",
+                ToolStatus::Completed,
+                Some(1_100),
+                Some(serde_json::json!({ "filePath": "src/a.rs" })),
+                Some("fn main() {}"),
+            ),
+            tool(
+                "bash",
+                "call_bash",
+                ToolStatus::Completed,
+                Some(1_200),
+                Some(serde_json::json!({ "command": "cargo test" })),
+                Some("ok"),
+            ),
+        ]);
+        let mut acc = anchored_accumulator();
+        acc.set_card_state(CardState::Done);
+
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+        let card = acc.build_card_with_split().0;
+        let text = card_text(&card);
+
+        assert!(!text.contains("📝 本次改动"), "no index line: {text}");
+        assert!(!text.contains("查看完整改动"), "no button copy: {text}");
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            !elements
+                .iter()
+                .any(|element| element["value"]["op"] == "turn_diff"),
+            "no turn_diff payload: {card}"
+        );
+    }
+
+    /// Acceptance: when the Turn splits, only the last (live) card carries the
+    /// index line and the button; a finalized prefix must not offer an entry.
+    #[test]
+    fn only_the_last_split_card_carries_the_index_and_button() {
+        let mut parts: Vec<Part> = (0..60)
+            .map(|i| {
+                tool(
+                    "read",
+                    &format!("call_read_{i}"),
+                    ToolStatus::Completed,
+                    Some(1_100 + i),
+                    Some(serde_json::json!({ "filePath": format!("src/{i}.rs") })),
+                    Some("content"),
+                )
+            })
+            .collect();
+        parts.push(edit_part("call_edit_a", 2_000, "src/a.rs", "A"));
+        parts.push(edit_part("call_edit_b", 2_100, "src/b.rs", "B"));
+
+        let mut acc = anchored_accumulator();
+        acc.set_card_state(CardState::Done);
+        assert!(render_new_turn_parts(&mut acc, &anchored_transcript(parts)));
+
+        let mut cards = Vec::new();
+        loop {
+            let (card, full) = acc.build_card_with_split();
+            cards.push(card);
+            if !full {
+                break;
+            }
+            assert!(cards.len() < 10, "the fixture must terminate");
+        }
+        assert!(cards.len() > 1, "the fixture must split");
+
+        for (i, card) in cards[..cards.len() - 1].iter().enumerate() {
+            assert!(
+                turn_diff_button(card).is_none(),
+                "finalized card {i} must not offer the button: {card}"
+            );
+            assert!(
+                !card_text(card).contains("📝 本次改动"),
+                "finalized card {i} must not offer the index line: {card}"
+            );
+        }
+
+        let last = cards.last().unwrap();
+        assert!(
+            card_text(last).contains("📝 本次改动 · 2 files · +4 −2"),
+            "the live chunk carries the index line: {last}"
+        );
+        let button = turn_diff_button(last).expect("the live chunk carries the button");
+        assert_eq!(button["value"]["from"], "msg_user_9");
+    }
+
+    /// Acceptance: an anchorless card renders no button even when counts were
+    /// captured — an entry that cannot name its Turn would open another
+    /// Turn's diff.
+    #[test]
+    fn an_anchorless_card_renders_no_index_and_no_button() {
+        // Counts present, anchor absent: a card that never captured its user
+        // message must not offer an entry it cannot scope to its own Turn.
+        let mut acc = StreamAccumulator::new("proj");
+        acc.set_session("ses_test");
+        acc.apply_work_context(crate::bridge::turn::state::WorkContext {
+            directory: "/tmp/cola-demo".to_string(),
+            project_name: Some("cola-demo".to_string()),
+            git: Default::default(),
+        });
+        acc.set_turn_diff_for_test(crate::backend::TurnDiffStats {
+            files: 1,
+            additions: 1,
+            deletions: 1,
+        });
+        acc.set_card_state(CardState::Done);
+
+        let card = acc.build_card_with_split().0;
+        assert!(!card_text(&card).contains("📝 本次改动"));
+        assert!(turn_diff_button(&card).is_none());
+
+        // The same counts WITH the anchor do render: the guard is the anchor,
+        // not the stats.
+        acc.repoint_turn_anchor(&TurnAnchor {
+            message_id: MessageId::new("msg_user_9"),
+            created_ms: 1_000,
+        });
+        let anchored = acc.build_card();
+        assert!(card_text(&anchored).contains("📝 本次改动 · 1 files · +1 −1"));
+        assert!(turn_diff_button(&anchored).is_some());
     }
 }

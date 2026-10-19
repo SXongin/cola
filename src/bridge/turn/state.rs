@@ -10,6 +10,7 @@
 use super::disposition::Disposition;
 use crate::backend::{
     Compaction, FileContent, MessageId, Part, PromptSkill, SessionTranscript, ToolCall, TurnAnchor,
+    TurnDiffStats,
 };
 use crate::bridge::chain::{CursorFrontier, CursorPartKind, EndingKey, RenderedCursor, TaskEndingClass};
 use crate::bridge::handles::CardsHandle;
@@ -1543,6 +1544,15 @@ pub(super) struct StreamAccumulator {
     /// the rendering fixtures. Read through [`Self::turn_anchor`] /
     /// [`Self::has_turn_anchor`].
     turn_anchor: Option<TurnAnchor>,
+    /// The Turn's change-index counts (spec #797, ticket #477): the
+    /// [`TurnDiffStats`] fold over the #800 tool-metadata aggregation, deduped
+    /// by path, refreshed from each transcript read. The card's live tail
+    /// renders `N files · +A −D` and the complete-diff button from this stored
+    /// fact — the render itself never hits the network. Default (zero files)
+    /// means the Turn recorded no file edit, so neither element renders.
+    /// Private to this module: written by [`Self::refresh_turn_diff`]; read by
+    /// the card build and its split estimate through [`Self::turn_diff_index`].
+    turn_diff_stats: TurnDiffStats,
     /// Whether this card has already shown the neutral waiting line
     /// 「⏳ 等待当前运行接收…」 (ADR-0062): the unreceived watch pushes it
     /// exactly once while the Session reads live but the submitted message
@@ -1993,6 +2003,14 @@ impl StreamAccumulator {
         self.card_state = state;
     }
 
+    /// Stamp the Turn's change-index counts directly: a test seam for the
+    /// anchorless/empty render cases, standing in for the read that
+    /// [`Self::refresh_turn_diff`] would perform.
+    #[cfg(test)]
+    pub(super) fn set_turn_diff_for_test(&mut self, stats: TurnDiffStats) {
+        self.turn_diff_stats = stats;
+    }
+
     /// Record a failure line directly: a test seam standing in for a failure
     /// ending, so a clearing ending is visible as a change.
     #[cfg(test)]
@@ -2146,6 +2164,45 @@ impl StreamAccumulator {
     #[cfg(test)]
     pub(super) fn repoint_turn_anchor(&mut self, anchor: &TurnAnchor) {
         self.turn_anchor = Some(anchor.clone());
+    }
+
+    /// Refresh the Turn's change-index counts from a transcript read (spec
+    /// #797, ticket #477): the #800 aggregation folds the Turn's settled
+    /// file-editing calls into one [`TurnDiff`](crate::backend::TurnDiff),
+    /// deduped by path, and its stats are exactly what the complete-diff
+    /// artifact will render. The walk is local — no backend request — so a card
+    /// render can always read the stored counts. Returns whether the rendered
+    /// counts changed: a newly settled edit is rendered content and owes its
+    /// flush. An empty diff stores zeroes, and the card then renders neither
+    /// the line nor the button (a read/bash-only Turn offers no dead entry).
+    pub(super) fn refresh_turn_diff(&mut self, transcript: &SessionTranscript) -> bool {
+        let Some(anchor) = self.turn_anchor.clone() else {
+            return false;
+        };
+        let diff = crate::bridge::turn_diff::turn_diff_from_tools(transcript, &anchor);
+        let stats = if diff.is_empty() {
+            TurnDiffStats::default()
+        } else {
+            diff.stats()
+        };
+        if stats == self.turn_diff_stats {
+            return false;
+        }
+        self.turn_diff_stats = stats;
+        true
+    }
+
+    /// The change-index facts the live card tail renders (#477), or `None` when
+    /// it must render neither element: the Turn recorded no file edit (zero
+    /// files), the card has no [`TurnAnchor`] to name the Turn by (`from`), or
+    /// no session id to route the click — an entry it could not make work is
+    /// exactly the dead button the ticket forbids.
+    fn turn_diff_index(&self) -> Option<(TurnDiffStats, &TurnAnchor)> {
+        let anchor = self.turn_anchor.as_ref()?;
+        if self.session_id.as_deref().is_none_or(str::is_empty) {
+            return None;
+        }
+        (self.turn_diff_stats.files > 0).then_some((self.turn_diff_stats, anchor))
     }
 
     /// When the Turn that owns this chain started, if recorded — the Completion
@@ -4239,6 +4296,20 @@ impl StreamAccumulator {
                     size += panel_estimate(panel, session);
                 }
             }
+            // The Turn's change index (#477) rides this same tail: one markdown
+            // line plus the complete-diff button, charged from the elements the
+            // build actually renders so a near-budget card splits instead of
+            // being rejected by Feishu. Absent when the build renders neither
+            // element ([`Self::turn_diff_index`]).
+            if let Some((stats, anchor)) = self.turn_diff_index() {
+                comps += crate::feishu::card::turn_diff::INDEX_COMPONENTS;
+                size += crate::feishu::card::turn_diff::index_estimate(
+                    stats,
+                    self.session_id.as_deref().unwrap_or_default(),
+                    anchor.message_id.as_str(),
+                    self.directory.as_deref().unwrap_or_default(),
+                );
+            }
         }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {
             let (c, s, t) = match &item.kind {
@@ -4584,6 +4655,23 @@ impl StreamAccumulator {
                 };
                 if let Some(button) = button {
                     builder = builder.with_recovery_buttons(vec![button]);
+                }
+            }
+
+            // The Turn's change index (spec #797, ticket #477): the counts line
+            // and the complete-diff entry, after every tool panel and before
+            // the footer (which `build` appends below, keeping the recovery
+            // buttons after it). A split's finalized prefix carries no tail, so
+            // only the live (last) card offers the button; a read/bash-only or
+            // anchorless Turn renders neither element.
+            if let Some((stats, anchor)) = self.turn_diff_index() {
+                for element in crate::feishu::card::turn_diff::index_elements(
+                    stats,
+                    self.session_id.as_deref().unwrap_or_default(),
+                    anchor.message_id.as_str(),
+                    self.directory.as_deref().unwrap_or_default(),
+                ) {
+                    builder = builder.with_element(element);
                 }
             }
         }
@@ -7537,5 +7625,92 @@ mod tests {
             vec![(ending_run("call_1"), TaskEndingClass::Evidence)],
             "the continuation claims the ending it renders"
         );
+    }
+
+    /// Ticket #477's size-budget acceptance: a card near the JSON budget stays
+    /// whole WITHOUT the change index and splits once the index line and
+    /// button are charged — proving `estimate_split_index` counts exactly the
+    /// elements the build renders (the split decision cannot regress by
+    /// forgetting them).
+    #[test]
+    fn the_turn_diff_index_is_charged_to_the_tail_budget() {
+        let stats = TurnDiffStats {
+            files: 2,
+            additions: 3,
+            deletions: 1,
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.set_card_state(CardState::Done);
+        acc.set_session("ses_test");
+        acc.directory = Some("/repo/cola".into());
+        acc.repoint_turn_anchor(&TurnAnchor {
+            message_id: MessageId::new("msg_user"),
+            created_ms: 1_000,
+        });
+
+        let index =
+            crate::feishu::card::turn_diff::index_estimate(stats, "ses_test", "msg_user", "/repo/cola");
+        assert!(index > 0, "the index elements have a measurable size");
+
+        // One receipt whose estimate leaves the index's bytes as the only
+        // thing between the card and the JSON budget (a receipt's estimate is
+        // its own length plus the element overhead).
+        let line_len = crate::feishu::card::MAX_CARD_JSON_CHARS - index + 10 - 40;
+        acc.push_receipt(&"x".repeat(line_len));
+
+        acc.set_turn_diff_for_test(TurnDiffStats::default());
+        assert_eq!(
+            acc.estimate_split_index(0, true),
+            1,
+            "the near-budget card fits without the change index"
+        );
+
+        acc.set_turn_diff_for_test(stats);
+        assert_eq!(
+            acc.estimate_split_index(0, true),
+            0,
+            "the index line and button must push the same card over the budget"
+        );
+    }
+
+    /// Ticket #477's ordering acceptance: the index row sits after the content
+    /// and before the footer, and the footer/recovery-button order is
+    /// untouched — hr + footer first, the Error card's retry last.
+    #[test]
+    fn the_change_index_precedes_the_footer_and_the_recovery_button() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.card_state = CardState::Error;
+        acc.prompt = Some("请重试".into());
+        acc.set_session("ses_test");
+        acc.directory = Some("/repo/cola".into());
+        acc.repoint_turn_anchor(&TurnAnchor {
+            message_id: MessageId::new("msg_user"),
+            created_ms: 1_000,
+        });
+        acc.set_turn_diff_for_test(TurnDiffStats {
+            files: 2,
+            additions: 3,
+            deletions: 1,
+        });
+        acc.push_text("失败的尝试");
+
+        let card = acc.build_card();
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let position = |predicate: &dyn Fn(&serde_json::Value) -> bool| {
+            elements.iter().position(predicate).expect("element renders")
+        };
+        let index = position(&|element| element["value"]["op"] == "turn_diff");
+        let hr = position(&|element| element["tag"] == "hr");
+        let footer = position(&|element| {
+            element["content"]
+                .as_str()
+                .is_some_and(|content| content.starts_with("📁 /repo/cola"))
+        });
+        let retry = position(&|element| element["text"]["content"] == "🔄 重试");
+
+        assert!(index < hr, "the index precedes the footer's hr");
+        assert!(hr < footer, "hr precedes the footer line");
+        assert!(footer < retry, "recovery buttons stay after the footer");
+        assert_eq!(elements.len(), footer + 2, "footer and retry end the card");
     }
 }
