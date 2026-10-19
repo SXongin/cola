@@ -298,6 +298,19 @@ fn render_head(doc: &DiffDocument) -> String {
 /// bounded buffer, so an oversized patch is never expanded into a huge string
 /// only to be dropped.
 fn render_file(file: &DiffFile, open: bool, max_bytes: usize) -> Option<String> {
+    // Bound the parse, not only the output. `parse_hunks` keeps one entry per
+    // patch line, so admitting a file with millions of short lines would
+    // allocate far past the output cap before the bounded buffer could reject
+    // it. A patch whose raw bytes already exceed the block bound cannot fit
+    // (every rendered line is at least as large as its source), and no line
+    // renders smaller than this floor — every line carries two number columns,
+    // the code span and the row markup. Both checks are allocation-free and
+    // reject an over-cap file before it reaches the parser.
+    const MIN_RENDERED_LINE_BYTES: usize = 48;
+    if file.patch.len() >= max_bytes || file.patch.lines().count() > max_bytes / MIN_RENDERED_LINE_BYTES {
+        return None;
+    }
+
     let mut html = BoundedHtml::new(max_bytes);
     if !html.push("<details class=\"file\"") {
         return None;
@@ -1017,6 +1030,21 @@ mod tests {
         assert_eq!(parse_hunk_range("-3"), Some((3, 1)));
         assert_eq!(parse_hunk_range("3"), None);
         assert_eq!(parse_hunk_range("-x"), None);
+    }
+
+    /// A patch with more lines than the output bound can ever hold is rejected
+    /// before the parser allocates one entry per line, and the omission is
+    /// stated rather than silently truncating.
+    #[test]
+    fn a_patch_with_too_many_lines_is_omitted_before_parsing() {
+        // Far more rows than `MAX_DIFF_HTML_BYTES / MIN_RENDERED_LINE_BYTES`,
+        // yet well under the raw byte cap: the line count is the only signal.
+        let patch = "+a\n".repeat(200_000);
+        let html = render_diff_html(&doc(vec![file("src/huge.rs", &patch, 200_000, 0)]));
+
+        assert!(!html.contains("<details"));
+        assert!(html.contains("已省略 1 个文件（超出预览上限）"));
+        assert!(html.len() < MAX_DIFF_HTML_BYTES);
     }
 
     /// Hunk parsing keeps the `@@` header, context, additions, removals and
