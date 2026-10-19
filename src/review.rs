@@ -287,14 +287,27 @@ async fn assemble_files(
     }
 
     let truncated = (omitted > 0).then(|| {
-        let reason = if stopped_by_cap || stopped_by_stream {
-            "原始 patch 超过 8 MB 上限"
-        } else {
-            "git 输出不完整"
-        };
-        format!("已省略 {omitted} 个文件（{reason}）")
+        format!(
+            "已省略 {omitted} 个文件（{}）",
+            omission_reason(stopped_by_cap, stopped_by_stream)
+        )
     });
     Ok((files, truncated))
+}
+
+/// The readable cause of an omitted-file note. The byte cap is cola's bound;
+/// an incomplete stream is git's output ending early (or a section without a
+/// numstat row). They are distinct causes, so the note must not name the cap
+/// when the stream was what stopped the read.
+fn omission_reason(stopped_by_cap: bool, stopped_by_stream: bool) -> &'static str {
+    match (stopped_by_cap, stopped_by_stream) {
+        (true, true) => "git 输出不完整或超出 8 MB 上限",
+        (true, false) => "原始 patch 超过 8 MB 上限",
+        (false, true) => "git 输出不完整",
+        // `assemble_files` only increments the omission counter under one of
+        // the two causes; keep a truthful fallback instead of an empty reason.
+        (false, false) => "超出上限",
+    }
 }
 
 /// One entry of `git diff --numstat -z`.
@@ -1318,6 +1331,10 @@ mod tests {
             .expect("the total cap must set truncated");
         assert!(truncated.contains("8 MB"));
         assert!(
+            !truncated.contains("git 输出不完整"),
+            "the stream was read whole: {truncated}"
+        );
+        assert!(
             review.document.files.len() < 6,
             "files past the cap must be omitted"
         );
@@ -1375,6 +1392,10 @@ mod tests {
             .as_deref()
             .expect("the total cap must set truncated");
         assert!(truncated.contains("8 MB"));
+        assert!(
+            !truncated.contains("git 输出不完整"),
+            "the stream was read whole: {truncated}"
+        );
         assert!(truncated.contains("原始 patch"), "the note names the raw cap");
         assert_eq!(review.document.files.len(), 3);
         assert!(
@@ -1649,6 +1670,11 @@ mod tests {
         assert!(review.document.files.len() <= 5);
         let total: usize = review.document.files.iter().map(|file| file.patch.len()).sum();
         assert!(total <= MAX_TOTAL_PATCH_BYTES);
+        let truncated = review.document.truncated.as_deref().unwrap();
+        assert!(
+            truncated.contains("git 输出不完整"),
+            "a cut stream names the stream, not only the cap: {truncated}"
+        );
     }
 
     /// Added/deleted gitlinks have no `160000` suffix on their `index` line;
@@ -1686,6 +1712,18 @@ mod tests {
                          --- a/log.txt\n+++ b/log.txt\n@@ -1 +1 @@\n\
                          -Subproject commit aaa\n+Subproject commit bbb\n";
         assert_eq!(submodule_pair(lookalike), None);
+    }
+
+    /// The omission note names the cause that actually stopped the read: the
+    /// byte cap, an incomplete git stream, or both — never the cap alone when
+    /// git's output was cut.
+    #[test]
+    fn omission_reason_names_the_real_cause() {
+        assert_eq!(omission_reason(true, false), "原始 patch 超过 8 MB 上限");
+        assert_eq!(omission_reason(false, true), "git 输出不完整");
+        let both = omission_reason(true, true);
+        assert!(both.contains("git 输出不完整"), "{both}");
+        assert!(both.contains("8 MB"), "{both}");
     }
 
     #[test]
