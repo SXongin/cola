@@ -1547,6 +1547,12 @@ fn restart_plan(candidates: &[ServerCandidate], self_pid: Option<i32>) -> Restar
 /// How long `/restart-opencode` waits for the managed service to serve again.
 const SERVICE_RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long the `opencode service restart` CLI itself may take before it is
+/// killed. Bounded so a wedged CLI (a stalled daemon supervisor, a hung lock)
+/// cannot hang the handler short of the bounded service wait below or its
+/// reply — the restart is a helper, not the thing being waited for.
+const SERVICE_RESTART_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Restart the running OpenCode server according to [`restart_plan`].
 ///
 /// A V2 Shared Service is restarted through its own CLI
@@ -1579,15 +1585,41 @@ pub async fn restart_self_spawned_server() -> anyhow::Result<RestartOutcome> {
 /// `serve --service` on `port` accepts connections again.
 async fn restart_managed_service(port: u16) -> anyhow::Result<RestartOutcome> {
     tracing::info!("restarting the V2 Shared Service (`opencode service restart`)");
-    let status = std::process::Command::new("opencode")
-        .args(["service", "restart"])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("`opencode service restart` exited with {status}");
-    }
+    run_service_restart_cli("opencode", SERVICE_RESTART_CLI_TIMEOUT).await?;
     wait_for_live_service(port, SERVICE_RESTART_TIMEOUT).await?;
     tracing::info!("shared OpenCode service is serving again");
     Ok(RestartOutcome::RestartedService)
+}
+
+/// Run `opencode service restart` and wait for it, bounded by `timeout`.
+///
+/// The CLI is a child process like any other: if it stalls, an unbounded
+/// `.status()`/`wait()` would hold `/restart-opencode` before it ever reaches
+/// the bounded service wait (or replies). On timeout the child is killed AND
+/// reaped (`Child::kill` waits it out) and a clear error is returned; a
+/// non-zero exit is still reported as before. `kill_on_drop` covers the one
+/// remaining escape — the enclosing future being cancelled mid-wait.
+async fn run_service_restart_cli(program: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
+    let mut child = tokio::process::Command::new(program)
+        .args(["service", "restart"])
+        .kill_on_drop(true)
+        .spawn()?;
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(status) => {
+            let status = status?;
+            if !status.success() {
+                anyhow::bail!("`opencode service restart` exited with {status}");
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "`opencode service restart` did not exit within {}s; killed",
+                timeout.as_secs()
+            )
+        }
+    }
 }
 
 /// Poll until the registration file describes a live `serve --service` on
@@ -1901,6 +1933,60 @@ mod tests {
         let a = service_cand(3, 49374);
         let b = service_cand(4, 49375);
         assert_eq!(restart_plan(&[b, a], None), RestartPlan::Service { port: 49374 });
+    }
+
+    /// Write an executable `sh` stub for the `opencode service restart` tests.
+    /// The stub receives the real `service restart` args and ignores them: these
+    /// tests exercise the bound and the exit status, not the CLI's behavior.
+    #[cfg(unix)]
+    fn stub_cli(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    /// A `service restart` CLI that stalls must be killed and reaped at its
+    /// bound, not waited on forever: `/restart-opencode` still owes the caller
+    /// the bounded service wait and a reply.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_service_restart_cli_is_killed_at_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        // `exec` so the killed child IS the sleeper — no orphaned `sleep` left.
+        let cli = stub_cli(dir.path(), "opencode", "exec sleep 5");
+        let started = std::time::Instant::now();
+        let error = run_service_restart_cli(cli.to_str().unwrap(), std::time::Duration::from_millis(200))
+            .await
+            .expect_err("a stalling CLI must not be waited on forever");
+
+        assert!(error.to_string().contains("did not exit"), "{error}");
+        // The bound — not the child's own 5s sleep — ends the wait.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "the CLI bound did not fire: waited {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A non-zero exit is still a failed restart, and a clean exit succeeds.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_service_restart_cli_reports_its_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = stub_cli(dir.path(), "opencode-ok", "exit 0");
+        run_service_restart_cli(ok.to_str().unwrap(), std::time::Duration::from_secs(5))
+            .await
+            .expect("a clean exit is a successful restart");
+
+        let bad = stub_cli(dir.path(), "opencode-bad", "exit 3");
+        let error = run_service_restart_cli(bad.to_str().unwrap(), std::time::Duration::from_secs(5))
+            .await
+            .expect_err("a non-zero exit is a failed restart");
+        assert!(error.to_string().contains("exited with"), "{error}");
     }
 
     #[test]
