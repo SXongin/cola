@@ -377,6 +377,17 @@ fn is_eligible(candidate: &ServerCandidate) -> bool {
     candidate.uses_default_store && candidate.port != 0
 }
 
+/// Whether a process's environment lines (as sysinfo returns them) say it reads
+/// the DEFAULT store: no `XDG_DATA_HOME`, or one equal to the default. Reading
+/// another process's env is best-effort (macOS/Windows limit it to same-user
+/// processes), so an unreadable env degrades to "assume default store".
+fn env_uses_default_store(env: Option<&[String]>, default_store: &str) -> bool {
+    match env.and_then(|lines| lines.iter().find_map(|kv| kv.strip_prefix("XDG_DATA_HOME="))) {
+        None => true,
+        Some(home) => home == default_store,
+    }
+}
+
 /// Scan for running `opencode serve` processes. Thin I/O — the interesting
 /// decisions live in [`select_server`].
 ///
@@ -409,19 +420,10 @@ pub fn scan_processes() -> Vec<ServerCandidate> {
                 .collect();
             let pid = proc_.pid().as_u32() as i32;
             let (port, username, password) = resolve_credentials(&args, &env, pid)?;
-            let xdg = env
-                .iter()
-                .find_map(|kv| kv.strip_prefix("XDG_DATA_HOME="))
-                .map(|s| s.to_string());
             // A server reads the default store when the directory it uses
-            // equals the default data home. Unset XDG_DATA_HOME means OpenCode
-            // used `~/.local/share`; reading another process's env is
-            // best-effort (macOS/Windows limit it to same-user processes), so
-            // an unreadable env degrades to "assume default store".
-            let uses_default_store = match xdg {
-                None => true,
-                Some(home) => home == default_store,
-            };
+            // equals the default data home (unset means OpenCode used
+            // `~/.local/share`).
+            let uses_default_store = env_uses_default_store(Some(&env), &default_store);
             Some(ServerCandidate {
                 pid,
                 port,
@@ -921,18 +923,30 @@ fn is_opencode_service_cmd(args: &[String]) -> bool {
 /// filesystem or a process.
 ///
 /// The registration is the service's own identity, not cola's record of it:
-/// the class is always [`ServerClass::Service`], the username is always
-/// `opencode` (the only one V2 accepts) and the store is the default one.
+/// the class is always [`ServerClass::Service`] and the username is always
+/// `opencode` (the only one V2 accepts). The store is NOT taken on trust: the
+/// daemon's own `XDG_DATA_HOME` must read the default store, exactly as
+/// [`scan_processes`] requires of a discovered server. A registration whose
+/// daemon serves a custom store — an incumbent that shares cola's state home
+/// but not its data home — is not the canonical service and must never be
+/// adopted (spec #809: eligible = `uses_default_store && port != 0`), so the
+/// start path keeps waiting and falls back to `serve --port` on the default
+/// store.
 fn registration_service_candidate(
     raw: &str,
     alive: &dyn Fn(i32) -> bool,
     cmd: &dyn Fn(i32) -> Option<Vec<String>>,
+    environ: &dyn Fn(i32) -> Option<Vec<String>>,
 ) -> Option<ServerCandidate> {
     let registration: ServiceRegistration = serde_json::from_str(raw).ok()?;
     // Without a pid there is nothing to verify liveness against, so the
     // registration cannot be adopted.
     let pid = registration.pid?;
     if !alive(pid) || !cmd(pid).is_some_and(|args| is_opencode_service_cmd(&args)) {
+        return None;
+    }
+    let default_store = default_data_home().to_string_lossy().into_owned();
+    if !env_uses_default_store(environ(pid).as_deref(), &default_store) {
         return None;
     }
     let port = port_from_url(&registration.url)?;
@@ -949,7 +963,9 @@ fn registration_service_candidate(
 /// [`registration_service_candidate`] over the real registration file.
 fn live_service_registration(host: &dyn ServiceHost, path: &std::path::Path) -> Option<ServerCandidate> {
     let raw = host.registration(path)?;
-    registration_service_candidate(&raw, &|pid| host.alive(pid), &|pid| host.cmd(pid))
+    registration_service_candidate(&raw, &|pid| host.alive(pid), &|pid| host.cmd(pid), &|pid| {
+        host.environ(pid)
+    })
 }
 
 /// Whether OpenCode's own config disables the managed service
@@ -1042,6 +1058,9 @@ trait ServiceHost: Send + Sync {
     fn alive(&self, pid: i32) -> bool;
     /// A pid's command line.
     fn cmd(&self, pid: i32) -> Option<Vec<String>>;
+    /// A pid's environment lines, when visible — the store check reads the
+    /// daemon's own `XDG_DATA_HOME` from them.
+    fn environ(&self, pid: i32) -> Option<Vec<String>>;
     /// Ask a process to exit (SIGTERM on unix).
     fn terminate(&self, pid: i32) -> anyhow::Result<()>;
     /// Kill a process that ignored SIGTERM (SIGKILL on unix).
@@ -1067,6 +1086,10 @@ impl ServiceHost for RealServiceHost {
 
     fn cmd(&self, pid: i32) -> Option<Vec<String>> {
         process_cmd(pid)
+    }
+
+    fn environ(&self, pid: i32) -> Option<Vec<String>> {
+        process_environ(pid)
     }
 
     fn terminate(&self, pid: i32) -> anyhow::Result<()> {
@@ -2731,6 +2754,9 @@ mod tests {
         /// cannot confirm it gone.
         survives_kill: bool,
         cmd: Vec<(i32, Vec<String>)>,
+        /// Each pid's environment lines; a pid absent here is "unreadable",
+        /// which degrades to the default store.
+        environ: Vec<(i32, Vec<String>)>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         /// Whether the spawned attempt's process has exited and can be waited
         /// out: SIGTERM/SIGKILL flip it when the test scripts the death, and
@@ -2749,6 +2775,7 @@ mod tests {
                 dies_on_terminate: false,
                 survives_kill: false,
                 cmd: Vec::new(),
+                environ: Vec::new(),
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 attempt_exited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
@@ -2780,6 +2807,14 @@ mod tests {
         fn live(mut self, pid: i32, args: &[&str]) -> Self {
             self.alive.lock().unwrap().push(pid);
             self.cmd.push((pid, args.iter().map(|s| s.to_string()).collect()));
+            self
+        }
+
+        /// The environment lines the host reports for a pid (a daemon's store
+        /// comes from its `XDG_DATA_HOME`).
+        fn with_env(mut self, pid: i32, env: &[&str]) -> Self {
+            self.environ
+                .push((pid, env.iter().map(|s| s.to_string()).collect()));
             self
         }
 
@@ -2858,6 +2893,13 @@ mod tests {
                 .map(|(_, args)| args.clone())
         }
 
+        fn environ(&self, pid: i32) -> Option<Vec<String>> {
+            self.environ
+                .iter()
+                .find(|(p, _)| *p == pid)
+                .map(|(_, env)| env.clone())
+        }
+
         fn terminate(&self, pid: i32) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("terminate {pid}"));
             if self.dies_on_terminate {
@@ -2934,9 +2976,13 @@ mod tests {
     #[test]
     fn registration_service_candidate_adopts_a_matching_live_service() {
         let raw = service_registration_json(4242, 49374, "reg-pw");
-        let candidate =
-            registration_service_candidate(&raw, &|pid| pid == 4242, &|pid| (pid == 4242).then(service_argv))
-                .expect("a live registration is attachable");
+        let candidate = registration_service_candidate(
+            &raw,
+            &|pid| pid == 4242,
+            &|pid| (pid == 4242).then(service_argv),
+            &|_| None,
+        )
+        .expect("a live registration is attachable");
 
         assert_eq!(candidate.pid, 4242);
         assert_eq!(candidate.port, 49374);
@@ -2949,7 +2995,7 @@ mod tests {
 
         // The dev launch is adopted too: the identity check is the shared
         // serve predicate plus `--service`, never `argv[0]` (issue #812).
-        let dev = registration_service_candidate(&raw, &|_| true, &|_| Some(dev_service_argv()))
+        let dev = registration_service_candidate(&raw, &|_| true, &|_| Some(dev_service_argv()), &|_| None)
             .expect("a dev-launched service is the service");
         assert_eq!(dev.pid, 4242);
         assert_eq!(dev.class, ServerClass::Service);
@@ -2961,22 +3007,32 @@ mod tests {
         // The recorded pid is dead (a leftover registration): never attached to
         // through another instance's credentials.
         assert_eq!(
-            registration_service_candidate(&raw, &|_| false, &|_| Some(service_argv())),
+            registration_service_candidate(&raw, &|_| false, &|_| Some(service_argv()), &|_| None),
             None
         );
         // Alive, but the pid now runs something else (recycled): not the daemon.
         assert_eq!(
-            registration_service_candidate(&raw, &|_| true, &|_| Some(vec!["/usr/bin/cola".to_string()])),
+            registration_service_candidate(
+                &raw,
+                &|_| true,
+                &|_| Some(vec!["/usr/bin/cola".to_string()]),
+                &|_| None
+            ),
             None
         );
         // Alive and an `opencode serve`, but NOT the service mode.
         assert_eq!(
-            registration_service_candidate(&raw, &|_| true, &|_| Some(
-                ["opencode", "serve", "--port", "4096"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            )),
+            registration_service_candidate(
+                &raw,
+                &|_| true,
+                &|_| Some(
+                    ["opencode", "serve", "--port", "4096"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                ),
+                &|_| None
+            ),
             None
         );
         // No pid to verify liveness against, and a url without a port.
@@ -2984,7 +3040,8 @@ mod tests {
             registration_service_candidate(
                 r#"{"url":"http://127.0.0.1:49374","password":"pw"}"#,
                 &|_| true,
-                &|_| Some(service_argv())
+                &|_| Some(service_argv()),
+                &|_| None
             ),
             None
         );
@@ -2992,10 +3049,46 @@ mod tests {
             registration_service_candidate(
                 r#"{"url":"http://127.0.0.1","password":"pw","pid":4242}"#,
                 &|_| true,
-                &|_| Some(service_argv())
+                &|_| Some(service_argv()),
+                &|_| None
             ),
             None
         );
+    }
+
+    /// The store is part of the service's identity, not a cola assumption: a
+    /// registration is only the canonical service when its daemon reads the
+    /// DEFAULT store — the same rule [`scan_processes`] applies to every
+    /// discovered server. An incumbent on a custom data home that shares cola's
+    /// state home must NOT be adopted, or cola would attach to the wrong store
+    /// (spec #809: eligible = `uses_default_store && port != 0`).
+    #[test]
+    fn registration_service_candidate_requires_the_default_store() {
+        let raw = service_registration_json(4242, 49374, "reg-pw");
+        let live = &|pid: i32| pid == 4242;
+        let cmd = &|pid: i32| (pid == 4242).then(service_argv);
+
+        // A custom data home is another store: the incumbent is not adopted.
+        assert_eq!(
+            registration_service_candidate(&raw, live, cmd, &|_| Some(vec![
+                "XDG_DATA_HOME=/custom".to_string()
+            ]),),
+            None
+        );
+
+        // Unset (no variable, or an env cola cannot read) and an explicit
+        // default are both the default store: adopted.
+        let default = default_data_home().to_string_lossy().into_owned();
+        for env in [
+            None,
+            Some(vec![format!("XDG_DATA_HOME={default}")]),
+            Some(vec!["PATH=/usr/bin".to_string()]),
+        ] {
+            let candidate = registration_service_candidate(&raw, live, cmd, &|_| env.clone())
+                .expect("the default store is adoptable");
+            assert!(candidate.uses_default_store);
+            assert_eq!(candidate.pid, 4242);
+        }
     }
 
     #[test]
@@ -3255,6 +3348,32 @@ mod tests {
         assert_eq!(candidate.port, 49374);
         assert_eq!(candidate.class, ServerClass::Service);
         assert_eq!(host.calls(), vec!["spawn"], "a live registration is never reaped");
+    }
+
+    /// A registration whose daemon reads a CUSTOM store is not the canonical
+    /// service: the wait must not adopt it — it keeps waiting, then falls back
+    /// on the default store — so an incumbent that shares cola's state home but
+    /// not its data home can never pull cola onto the wrong store (spec #809:
+    /// eligible = `uses_default_store && port != 0`).
+    #[tokio::test(start_paused = true)]
+    async fn a_custom_store_registration_is_not_adopted() {
+        let host = FakeServiceHost::new()
+            .registration(&service_registration_json(999, 49374, "incumbent-pw"))
+            .live(999, &["opencode", "serve", "--service"])
+            .with_env(999, &["XDG_DATA_HOME=/custom"])
+            .live(4242, &["opencode", "serve", "--service"])
+            .dies_on_terminate();
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("a custom-store incumbent is not the canonical service");
+
+        assert_eq!(failure, ServiceStartFailure::NoRegistration { child_pid: 4242 });
+        // The incumbent (999) was never adopted; cola's own attempt was reaped.
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "reap 4242"]);
     }
 
     /// A child that exits because an INCUMBENT service already serves the
