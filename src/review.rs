@@ -468,12 +468,31 @@ fn binary_note(section: &str, path: &str) -> String {
         .unwrap_or_else(|| format!("Binary files a/{path} and b/{path} differ"))
 }
 
-/// Build an untracked file's new-file patch. A symlink or any other
-/// non-regular entry is summed up by one note line (never followed, never
-/// opened as a stream), and a file over the per-file cap keeps one note line.
+/// Build an untracked file's new-file patch. A symlink is an ordinary new-file
+/// patch whose content is its target string — read with `read_link`, never
+/// opened or followed. Any other non-regular entry is one note line, and a
+/// file or link target over the per-file cap keeps one note line.
 async fn untracked_file(root: &Path, path: &str) -> Result<DiffFile, ReviewError> {
     let full = root.join(path);
     let meta = tokio::fs::symlink_metadata(&full).await.map_err(map_io_error)?;
+    if meta.file_type().is_symlink() {
+        // The link's content is its target path; reading the link itself never
+        // follows it, so no outside file is opened. The target has no trailing
+        // newline, which is why the synthesized line is fed with one.
+        let target = std::fs::read_link(&full).map_err(map_io_error)?;
+        let target = target.to_string_lossy();
+        if target.len() > MAX_FILE_PATCH_BYTES {
+            return Ok(note_file(path, OVERSIZE_NOTE));
+        }
+        let (patch, additions) = new_file_patch(path, &format!("{target}\n"));
+        return Ok(DiffFile {
+            path: path.to_string(),
+            patch,
+            additions,
+            deletions: 0,
+            status: "added".to_string(),
+        });
+    }
     if !meta.file_type().is_file() {
         return Ok(note_file(path, IRREGULAR_NOTE));
     }
@@ -587,7 +606,12 @@ fn new_file_patch(path: &str, text: &str) -> (String, usize) {
         lines.pop();
     }
     let count = lines.len();
-    patch.push_str(&format!("@@ -0,0 +1,{count} @@\n"));
+    // Unified diff omits a count of exactly 1, as `git diff` does.
+    if count == 1 {
+        patch.push_str("@@ -0,0 +1 @@\n");
+    } else {
+        patch.push_str(&format!("@@ -0,0 +1,{count} @@\n"));
+    }
     for line in &lines {
         patch.push('+');
         patch.push_str(line);
@@ -1386,22 +1410,31 @@ mod tests {
         assert_eq!(huge.patch, OVERSIZE_NOTE);
     }
 
-    /// An untracked symlink is never followed: it is one note line, and no
-    /// target content (inside or outside the repository) reaches the patch.
+    /// An untracked symlink is a new-file patch whose single content line is
+    /// the link target (read with `read_link`, never followed) — the outside
+    /// file's contents must never reach the patch.
     #[cfg(unix)]
     #[tokio::test]
-    async fn untracked_symlink_is_a_note_and_never_followed() {
+    async fn untracked_symlink_is_a_new_file_patch_and_never_followed() {
         let repo = Repo::init();
         repo.write("a.txt", "a\n");
         repo.commit("base");
         let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-SECRET\n").unwrap();
-        std::os::unix::fs::symlink(outside.path().join("secret.txt"), repo.path().join("link.txt")).unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "OUTSIDE-SECRET\n").unwrap();
+        std::os::unix::fs::symlink(&secret, repo.path().join("link.txt")).unwrap();
 
         let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
         let link = find(&review, "link.txt");
         assert_eq!(link.status, "added");
-        assert_eq!(link.patch, IRREGULAR_NOTE);
+        assert_eq!((link.additions, link.deletions), (1, 0));
+        assert_eq!(
+            link.patch,
+            format!(
+                "Index: link.txt\n--- /dev/null\n+++ b/link.txt\n@@ -0,0 +1 @@\n+{}\n",
+                secret.to_string_lossy()
+            )
+        );
         assert!(!link.patch.contains("OUTSIDE-SECRET"));
     }
 
