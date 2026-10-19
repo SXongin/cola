@@ -257,6 +257,10 @@ type QuestionReplyRecord = (String, Vec<Vec<String>>);
 /// A recorded keyed `reply_question` call: (request_id, form answers).
 type KeyedQuestionReply = (String, Vec<opencode::types::FormAnswer>);
 
+/// One `session_diff` read's arguments, in call order: `(session_id, from,
+/// to, context)` (#801).
+pub(crate) type SessionDiffCall = (String, Option<String>, Option<String>, Option<u32>);
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // the recording adapter captures full call details for assertions
 pub enum PlatformCall {
@@ -1470,6 +1474,10 @@ pub struct MockBackend {
     /// [`Self::session_diff_available`] is set; `None` reads as an empty diff
     /// (a Turn that changed no file).
     pub session_diff: Arc<std::sync::Mutex<Option<crate::backend::TurnDiff>>>,
+    /// Every `session_diff` read's arguments: `(session_id, from, to,
+    /// context)`, in call order (#801). Lets a test pin the exact Turn range
+    /// the callback asks for instead of only its effect.
+    pub session_diff_calls: Arc<tokio::sync::Mutex<Vec<SessionDiffCall>>>,
     /// Session ids whose `transcript` read fails with a 500 (spec #501): the
     /// child-read failure the ledger's activity carry-over pins — a failed
     /// gather leaves the row's last successful fragment in place, its age
@@ -1801,6 +1809,7 @@ impl MockBackend {
             transcript_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_diff_available: std::sync::atomic::AtomicBool::new(false),
             session_diff: Arc::new(std::sync::Mutex::new(None)),
+            session_diff_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             hang_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             fail_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2871,11 +2880,17 @@ impl crate::backend::Backend for MockBackend {
     /// the diff the read serves.
     async fn session_diff(
         &self,
-        _session_id: &str,
-        _from: Option<&str>,
-        _to: Option<&str>,
-        _context: Option<u32>,
+        session_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        context: Option<u32>,
     ) -> crate::error::Result<Option<crate::backend::TurnDiff>> {
+        self.session_diff_calls.lock().await.push((
+            session_id.to_string(),
+            from.map(str::to_string),
+            to.map(str::to_string),
+            context,
+        ));
         if !self
             .session_diff_available
             .load(std::sync::atomic::Ordering::SeqCst)
