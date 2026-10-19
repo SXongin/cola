@@ -2368,3 +2368,41 @@ async fn session_diff_surfaces_a_failed_read() {
     assert!(message.contains("session diff failed"), "unexpected: {message}");
     assert!(message.contains("409"), "unexpected: {message}");
 }
+
+/// `FileDiff.Info` requires all five fields, so an incomplete entry is a decode
+/// error naming what is missing — never an empty/zero value that would present
+/// a misleading diff (spec #797, ticket #799).
+#[tokio::test]
+async fn session_diff_rejects_an_entry_missing_a_required_field() {
+    for field in ["file", "patch", "additions", "deletions", "status"] {
+        let server = TestHttpServer::start().await;
+        let mut entry = serde_json::json!({
+            "file": "src/main.rs",
+            "patch": "@@ -1 +1 @@\n-a\n+b\n",
+            "additions": 1,
+            "deletions": 1,
+            "status": "modified",
+        });
+        entry
+            .as_object_mut()
+            .expect("the entry is a JSON object")
+            .remove(field);
+        server.route(
+            "GET",
+            "/api/session/ses_1/diff",
+            200,
+            serde_json::json!({"data": [entry]}).to_string(),
+        );
+
+        let message = opencode_error(
+            v2_wire_client(&server)
+                .session_diff("ses_1", Some("msg_user"), None, Some(3))
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("session diff parse") && message.contains(field),
+            "a missing `{field}` must fail the decode: {message}"
+        );
+    }
+}
