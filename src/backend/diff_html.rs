@@ -40,7 +40,7 @@ const MAX_NOTE_TEXT_BYTES: usize = 8 * 1024;
 
 /// One file in a [`DiffDocument`]: the repository-relative path, the unified
 /// patch kept verbatim, the source's reported line counts and its status
-/// spelling (`modified` / `added` / `deleted`).
+/// spelling (`modified` / `added` / `deleted` / `renamed`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiffFile {
     pub path: String,
