@@ -600,7 +600,9 @@ fn summary_tail(output: &str) -> Option<&str> {
 
 /// The unified diff a file-editing call recorded, whichever generation wrote
 /// it: see [`diff_from_metadata`]. `None` when the call carries no metadata.
-fn recorded_diff(call: &ToolCall) -> Option<String> {
+/// Shared with the Turn Diff aggregation (#800), which folds these patches into
+/// the one neutral view V1 has no `session.diff` for.
+pub(crate) fn recorded_diff(call: &ToolCall) -> Option<String> {
     diff_from_metadata(call.metadata.as_ref())
 }
 
@@ -1857,8 +1859,9 @@ fn opens_file_block(lines: &[&str], from: usize) -> bool {
 
 /// The file a `---`/`+++` header names, without a git `a/`/`b/` prefix or a
 /// trailing timestamp. `None` for `/dev/null` (an add/delete's empty side) and
-/// a pathless header.
-fn diff_header_path(line: &str) -> Option<String> {
+/// a pathless header. Shared with the Turn Diff aggregation (#800), so a patch
+/// path is read by one rule on the panel and in the Turn's index.
+pub(crate) fn diff_header_path(line: &str) -> Option<String> {
     let rest = line.strip_prefix("--- ").or_else(|| line.strip_prefix("+++ "))?;
     let path = rest.split('\t').next().unwrap_or(rest).trim();
     let path = path
