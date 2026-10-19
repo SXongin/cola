@@ -1302,6 +1302,28 @@ async fn shell_output_is_none_without_a_v1_request() {
     );
 }
 
+/// V1 has no session diff endpoint: the read answers `Ok(None)` without a
+/// request, and the caller's tool-metadata aggregation fills in (#800).
+#[tokio::test]
+async fn session_diff_is_none_without_a_v1_request() {
+    let server = TestHttpServer::start().await;
+    let client = v1_wire_client(&server, None);
+
+    assert_eq!(
+        client
+            .session_diff("ses_1", Some("msg_user"), None, Some(3))
+            .await
+            .unwrap(),
+        None,
+        "V1 never serves a session diff"
+    );
+    assert!(
+        server.requests().is_empty(),
+        "V1's session diff must not reach the wire: {:?}",
+        server.requests()
+    );
+}
+
 /// V1 carries no Background Tasks (no child sessions), so the child-evidence
 /// read answers no evidence without a request (#591, issue #464). The caller's
 /// subagent list is empty there anyway; this arm exists so the trait has no

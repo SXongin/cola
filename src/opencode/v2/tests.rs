@@ -6,7 +6,7 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
-use crate::backend::{ChildEvidence, ChildRuntime, ShellEnd, ShellRuntime};
+use crate::backend::{ChildEvidence, ChildRuntime, ShellEnd, ShellRuntime, TurnDiff, TurnDiffFile};
 use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
@@ -2245,4 +2245,126 @@ async fn reject_question_deletes_the_session_scoped_form() {
         let error = client.reject_question("ses_1", id, None).await.unwrap_err();
         assert!(error.is_not_found(), "{id} must read as handled: {error:?}");
     }
+}
+
+/// A Turn's file diff (`GET /api/session/{id}/diff`): every query axis the
+/// caller set rides the URL, and the `{data: FileDiff.Info[]}` envelope decodes
+/// into the neutral model — the wire's `file` becomes `path`, while the counts
+/// and status stay verbatim.
+#[tokio::test]
+async fn session_diff_encodes_the_query_and_decodes_the_files() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_1/diff",
+        200,
+        serde_json::json!({
+            "data": [
+                {
+                    "file": "src/main.rs",
+                    "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c\n",
+                    "additions": 1,
+                    "deletions": 0,
+                    "status": "modified",
+                },
+                {
+                    "file": "src/new.rs",
+                    "patch": "@@ -0,0 +1,2 @@\n+x\n+y\n",
+                    "additions": 2,
+                    "deletions": 0,
+                    "status": "added",
+                },
+            ],
+        })
+        .to_string(),
+    );
+    let client = v2_wire_client(&server);
+
+    let diff = client
+        .session_diff("ses_1", Some("msg_user"), Some("msg_to"), Some(3))
+        .await
+        .unwrap()
+        .expect("V2 serves the session diff read");
+    assert_eq!(
+        diff,
+        TurnDiff(vec![
+            TurnDiffFile {
+                path: "src/main.rs".into(),
+                patch: "@@ -1,2 +1,3 @@\n a\n+b\n c\n".into(),
+                additions: 1,
+                deletions: 0,
+                status: "modified".into(),
+            },
+            TurnDiffFile {
+                path: "src/new.rs".into(),
+                patch: "@@ -0,0 +1,2 @@\n+x\n+y\n".into(),
+                additions: 2,
+                deletions: 0,
+                status: "added".into(),
+            },
+        ])
+    );
+
+    let request = last_request(&server);
+    assert_eq!(request.method, "GET");
+    assert_eq!(request.path, "/api/session/ses_1/diff");
+    assert_eq!(request.query_param("from").as_deref(), Some("msg_user"));
+    assert_eq!(request.query_param("to").as_deref(), Some("msg_to"));
+    assert_eq!(request.query_param("context").as_deref(), Some("3"));
+}
+
+/// An unset query axis is omitted, not sent empty: the server's defaults then
+/// apply (`from` defaults to the latest user message's turn).
+#[tokio::test]
+async fn session_diff_omits_an_unset_query_axis() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/diff", 200, r#"{"data":[]}"#);
+    let client = v2_wire_client(&server);
+
+    client.session_diff("ses_1", None, None, None).await.unwrap();
+
+    let request = last_request(&server);
+    assert_eq!(request.path, "/api/session/ses_1/diff");
+    assert_eq!(request.query, "", "unset axes must not reach the query");
+}
+
+/// An empty `data: []` is a successful read of a turn with no file changes —
+/// an empty diff, never an error.
+#[tokio::test]
+async fn session_diff_decodes_an_empty_data_array_as_an_empty_diff() {
+    let server = TestHttpServer::start().await;
+    server.route("GET", "/api/session/ses_1/diff", 200, r#"{"data":[]}"#);
+    let client = v2_wire_client(&server);
+
+    let diff = client
+        .session_diff("ses_1", Some("msg_user"), None, Some(3))
+        .await
+        .unwrap()
+        .expect("V2 serves the session diff read");
+
+    assert_eq!(diff, TurnDiff(Vec::new()));
+}
+
+/// A rejected read (a missing session, a message that is not a user message,
+/// a location change that invalidates the turn range) is the shared readable
+/// error mapping, naming the read and its status.
+#[tokio::test]
+async fn session_diff_surfaces_a_failed_read() {
+    let server = TestHttpServer::start().await;
+    server.route(
+        "GET",
+        "/api/session/ses_1/diff",
+        409,
+        r#"{"_tag":"InvalidTurnRangeError","message":"from is not a user message"}"#,
+    );
+    let client = v2_wire_client(&server);
+
+    let message = opencode_error(
+        client
+            .session_diff("ses_1", Some("msg_assistant"), None, Some(3))
+            .await
+            .unwrap_err(),
+    );
+    assert!(message.contains("session diff failed"), "unexpected: {message}");
+    assert!(message.contains("409"), "unexpected: {message}");
 }
