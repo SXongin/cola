@@ -15,6 +15,9 @@ use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 /// untracked file.
 fn mixed_change_repo() -> tempfile::TempDir {
     let repo = git_repo();
+    // A second base ref at the earlier (initial) commit, so the configured-base
+    // test can prove `[review] base` is read instead of the `main` fallback.
+    git_in(repo.path(), &["branch", "dev"]);
     git_in(repo.path(), &["checkout", "-b", "feature"]);
     std::fs::write(repo.path().join("a.txt"), "hello\ncommitted").unwrap();
     git_in(repo.path(), &["add", "a.txt"]);
@@ -179,13 +182,15 @@ async fn explicit_base_overrides_the_configured_base() {
     );
 }
 
-/// With no `--base`, `[review] base` is the base the command uses.
+/// With no `--base`, `[review] base` is the base the command uses. The fixture
+/// has an earlier `dev` ref, so this fails if the config is ignored and the
+/// producer falls back to `main`.
 #[tokio::test]
 async fn configured_base_is_used_without_a_flag() {
     let repo = mixed_change_repo();
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&dir.path().join("sessions.json"));
-    cfg.review.base = Some("main".into());
+    cfg.review.base = Some("dev".into());
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
 
     let key = ThreadKey::new("chat_diff_cfg".into(), "chat_diff_cfg".into());
@@ -198,7 +203,14 @@ async fn configured_base_is_used_without_a_flag() {
         PlatformCall::UploadFile { content, .. } => String::from_utf8_lossy(content).into_owned(),
         _ => unreachable!(),
     };
-    assert!(html.contains("main @"), "{html}");
+    assert!(
+        html.contains("dev @"),
+        "the configured base names the subtitle: {html}"
+    );
+    assert!(
+        !html.contains("main @"),
+        "the `main` fallback must not win over `[review] base`: {html}"
+    );
 }
 
 /// A clean repository answers one line and sends nothing.
@@ -390,4 +402,128 @@ async fn a_branch_with_a_slash_is_sanitized_in_the_file_name() {
         "the slash is sanitized and .html is kept"
     );
     assert!(name.ends_with(".html"), "{name}");
+}
+
+/// A detached HEAD is named `detached-<short>` and still ends `.html`.
+#[tokio::test]
+async fn a_detached_head_is_named_detached_html() {
+    let repo = mixed_change_repo();
+    git_in(repo.path(), &["checkout", "--detach", "HEAD"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let key = ThreadKey::new("chat_diff_detached".into(), "chat_diff_detached".into());
+    seed_repo_session(&app, key.clone(), &repo).await;
+    send_command_in(
+        &app,
+        "/diff --base main",
+        key,
+        "msg_diff_detached",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
+    let name = match uploads(&calls)[0] {
+        PlatformCall::UploadFile { name, .. } => name,
+        _ => unreachable!(),
+    };
+    assert_eq!(name, &format!("review-detached-{}.html", short_head(&repo)));
+    assert!(name.ends_with(".html"), "{name}");
+}
+
+/// An unborn repository (no commit yet) is named `unborn-unborn` and still
+/// ends `.html`; its staged file makes the review non-empty.
+#[tokio::test]
+async fn an_unborn_repository_is_named_unborn_unborn_html() {
+    let repo = tempfile::tempdir().unwrap();
+    git_in(repo.path(), &["init", "-b", "main"]);
+    git_in(repo.path(), &["config", "user.email", "test@example.com"]);
+    git_in(repo.path(), &["config", "user.name", "test"]);
+    std::fs::write(repo.path().join("first.txt"), "first\n").unwrap();
+    git_in(repo.path(), &["add", "first.txt"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let key = ThreadKey::new("chat_diff_unborn".into(), "chat_diff_unborn".into());
+    seed_repo_session(&app, key.clone(), &repo).await;
+    send_command_in(&app, "/diff", key, "msg_diff_unborn", ConversationKind::P2p).await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
+    let name = match uploads(&calls)[0] {
+        PlatformCall::UploadFile { name, .. } => name,
+        _ => unreachable!(),
+    };
+    assert_eq!(name, "review-unborn-unborn.html");
+    assert!(name.ends_with(".html"), "{name}");
+}
+
+/// An ambiguous send answers the shared unknown-send line, keeps its single
+/// upload, and never retries (a retry could duplicate the File Message).
+#[tokio::test]
+async fn an_ambiguous_send_answers_unknown_and_does_not_retry() {
+    let repo = mixed_change_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    platform
+        .ambiguous_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let key = ThreadKey::new("chat_diff_unknown".into(), "chat_diff_unknown".into());
+    seed_repo_session(&app, key.clone(), &repo).await;
+    send_command_in(
+        &app,
+        "/diff --base main",
+        key,
+        "msg_diff_unknown",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert_eq!(uploads(&calls).len(), 1, "exactly one upload: {calls:?}");
+    assert!(
+        file_messages(&calls).is_empty(),
+        "the ambiguous send records no accepted file: {calls:?}"
+    );
+    let texts = text_replies(&calls);
+    assert_eq!(texts.len(), 1, "{calls:?}");
+    assert_eq!(texts[0], crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT);
+}
+
+/// A definite upload failure answers one readable failure line and sends no
+/// file.
+#[tokio::test]
+async fn a_definite_send_failure_answers_the_failure_line() {
+    let repo = mixed_change_repo();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    platform
+        .fail_upload_file_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let key = ThreadKey::new("chat_diff_failed".into(), "chat_diff_failed".into());
+    seed_repo_session(&app, key.clone(), &repo).await;
+    send_command_in(
+        &app,
+        "/diff --base main",
+        key,
+        "msg_diff_failed",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert!(file_messages(&calls).is_empty(), "{calls:?}");
+    let texts = text_replies(&calls);
+    assert_eq!(texts.len(), 1, "{calls:?}");
+    assert_eq!(texts[0], "⚠️ 文件发送失败，请稍后重试。");
 }
