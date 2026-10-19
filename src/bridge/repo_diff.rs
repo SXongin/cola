@@ -36,11 +36,6 @@ pub(crate) const DIFF_COOLDOWN: Duration = Duration::from_secs(10);
 /// The reply when the chat is still inside its cooldown window.
 const COOLDOWN_REPLY: &str = "⏳ 操作太频繁，请稍后再试。";
 
-/// The reply when a File Message send timed out after the request may have
-/// reached Feishu. Retrying could duplicate it, so the command says so and
-/// stops (the same words the viewer and turn diff use).
-const SEND_UNKNOWN_REPLY: &str = "发送结果未知，为避免重复未重试。";
-
 /// The reply for a definite non-send (over Feishu's upload cap, or a failed
 /// upload/send).
 const SEND_FAILED_REPLY: &str = "⚠️ 文件发送失败，请稍后重试。";
@@ -105,20 +100,14 @@ pub(crate) async fn run(
     );
     let html = crate::backend::render_diff_html(&review.document);
     let name = diff_file_name(&review.branch, &review.short_sha);
-    let content = crate::backend::FileContent::from_bytes("text/html", &name, html.into_bytes());
-    let hash = crate::bridge::handles::content_identity_hash(
-        &content.mime,
-        &content.name,
-        content.data.as_deref().unwrap_or_default(),
-    );
     // The reply target is the command message only (no `reply_in_thread`,
     // ADR-0076), so the file lands in the command's own chat/topic.
-    let delivery = crate::bridge::viewer::send_file_message(
+    let delivery = crate::bridge::viewer::send_html_file(
         &handles.flow.platform,
         &handles.flow.cards,
         message_id,
-        &content,
-        hash,
+        &name,
+        html,
         handles.flow.cards.viewer_transfer_timeout_ms(),
     )
     .await;
@@ -128,7 +117,7 @@ pub(crate) async fn run(
             handles
                 .flow
                 .platform
-                .reply_text(message_id, SEND_UNKNOWN_REPLY)
+                .reply_text(message_id, crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT)
                 .await?;
         }
         _ => {

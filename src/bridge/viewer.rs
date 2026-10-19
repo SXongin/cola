@@ -1135,6 +1135,12 @@ async fn deliver(
     send_file_message(platform, cards, reply_target, &content, hash, timeout_ms).await
 }
 
+/// The bare answer for an ambiguous File Message send: the request may have
+/// reached Feishu, so retrying could duplicate the message. Shared by every
+/// artifact surface (the Turn diff card, #801, and `/diff`, #804); a surface
+/// that wants a warning prefix wraps this text rather than restating it.
+pub(crate) const FILE_SEND_UNKNOWN_TEXT: &str = "发送结果未知，为避免重复未重试。";
+
 /// Upload `content` once (content-hash cached) and post exactly ONE File Message
 /// carrying its key under `reply_target`. `Undelivered` past Feishu's 30MB cap,
 /// on a failed upload or definite send refusal. A timed-out send — or one that
@@ -1196,6 +1202,27 @@ pub(crate) async fn send_file_message(
         }
         None => FileDelivery::FileSendOutcomeUnknown,
     }
+}
+
+/// Deliver a rendered, self-contained HTML artifact as one File Message: build
+/// the `text/html` File Content from `html`, hash its identity, and go through
+/// [`send_file_message`]. The shared lane for the Turn diff card (#801) and the
+/// repository review (`/diff`, #804).
+pub(crate) async fn send_html_file(
+    platform: &Arc<dyn Platform>,
+    cards: &CardsHandle,
+    reply_target: &str,
+    name: &str,
+    html: String,
+    timeout_ms: u64,
+) -> FileDelivery {
+    let content = FileContent::from_bytes("text/html", name, html.into_bytes());
+    let hash = content_identity_hash(
+        &content.mime,
+        &content.name,
+        content.data.as_deref().unwrap_or_default(),
+    );
+    send_file_message(platform, cards, reply_target, &content, hash, timeout_ms).await
 }
 
 /// What a bounded read saw: `Whole` when the file holds at most the limit,
