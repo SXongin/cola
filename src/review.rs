@@ -91,7 +91,9 @@ const UNREADABLE_NOTE: &str = "无法读取该文件，未包含内容";
 
 /// The distinct, readable failures of a repository review. Every one of them is
 /// a real error: the producer never returns an empty document pretending the
-/// working tree had no changes.
+/// working tree had no changes. A per-entry untracked file's stat/read failure
+/// is deliberately not one of them: it becomes a note line for that path so one
+/// bad entry cannot lose the review.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReviewError {
     /// `dir` is not inside a git work tree.
@@ -110,7 +112,9 @@ pub(crate) enum ReviewError {
     #[error("未找到 git 可执行文件，请确认 git 已安装并在 PATH 中")]
     GitNotFound,
 
-    /// The OS refused access to the repository or one of its files.
+    /// The OS refused access on a required git call (a repository or ref read,
+    /// or a git invocation). A per-entry untracked file refusal is a note
+    /// instead, never this error.
     #[error("git 无权限访问：{0}")]
     PermissionDenied(String),
 
@@ -122,7 +126,8 @@ pub(crate) enum ReviewError {
     #[error("git 执行超时（{} 秒）", GIT_TIMEOUT.as_secs())]
     Timeout,
 
-    /// Reading an untracked file failed.
+    /// A pipe or other I/O failure outside the per-entry untracked path (those
+    /// degrade to a note line instead of escaping).
     #[error("读取文件失败：{0}")]
     Io(String),
 }
@@ -209,7 +214,9 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
     let mut subtitle = format!("{base_display} · merge-base {}", short_sha(&merge_base));
     if !untracked.is_empty() {
         // git's `--stat` never counts untracked files, so the header numbers
-        // (which do include them) need this marker.
+        // (which do include them) need this marker. It keys off the listing:
+        // the entries are in the review scope even if one is later omitted by
+        // the raw cap or becomes a note.
         subtitle.push_str(" · 含未跟踪文件");
     }
     let document = DiffDocument {
