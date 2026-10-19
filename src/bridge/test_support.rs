@@ -3380,6 +3380,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             instant_reminder: false,
             log_days: 14,
         },
+        review: crate::config::ReviewConfig::default(),
     };
     // A test config comes claimed for TEST_HOST: the suite's apps are ready to
     // use. The gate tests build an unclaimed config explicitly.

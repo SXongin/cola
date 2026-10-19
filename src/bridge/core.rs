@@ -159,6 +159,11 @@ pub struct SharedCore {
     pub cover_titles: Arc<Mutex<HashMap<String, CoverTitle>>>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     pub work_dir: Option<String>,
+    /// The configured base ref for `/diff` (`[review] base`, spec #803).
+    pub review_base: Option<String>,
+    /// `/diff`'s process-internal cooldown (spec #803): keyed by chat id,
+    /// claimed before any git/render/upload work.
+    pub diff_cooldown: Arc<std::sync::Mutex<crate::bridge::repo_diff::DiffCooldown>>,
     /// New sessions cola creates start with Auto-Accept on (from
     /// `[bridge] default_auto_accept`, #513). Adoptions ignore it and keep
     /// the session's own state.
@@ -337,6 +342,10 @@ impl SharedCore {
                 .work_dir
                 .clone()
                 .map(|p| p.to_string_lossy().to_string()),
+            review_base: cfg.review.base.clone(),
+            diff_cooldown: Arc::new(std::sync::Mutex::new(
+                crate::bridge::repo_diff::DiffCooldown::default(),
+            )),
             default_auto_accept: cfg.bridge.default_auto_accept,
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
@@ -441,6 +450,7 @@ impl SharedCore {
             config: self.turn_config(),
             external: Arc::clone(&self.external),
             preferred_port: self.preferred_port,
+            diff_cooldown: Arc::clone(&self.diff_cooldown),
         }
     }
 
@@ -506,6 +516,7 @@ impl SharedCore {
             Arc::clone(&self.turn_follow_read_timeout_ms),
             Arc::clone(&self.completion_notice_delay_ms),
             self.work_dir.clone(),
+            self.review_base.clone(),
         )
     }
 

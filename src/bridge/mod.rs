@@ -15,6 +15,7 @@ pub mod poll;
 pub mod pollers;
 pub mod question;
 pub mod reminder;
+pub(crate) mod repo_diff;
 pub mod request;
 pub(crate) mod runtime;
 pub mod session;
