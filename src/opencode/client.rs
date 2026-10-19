@@ -405,6 +405,21 @@ impl OpenCodeBackend {
         Ok(transcript)
     }
 
+    /// One Turn's file diff where the generation serves a session diff
+    /// endpoint (V2's `GET /api/session/{id}/diff`); `None` on V1, whose caller
+    /// aggregates the Turn's tool metadata instead (#800).
+    pub async fn session_diff(
+        &self,
+        session_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        context: Option<u32>,
+    ) -> crate::error::Result<Option<crate::backend::TurnDiff>> {
+        self.strategy()
+            .session_diff(&self.transport, session_id, from, to, context)
+            .await
+    }
+
     /// The Background Task State handle every [`Self::transcript`] read applies
     /// the liveness tier through ([`TasksHandle`], issue #454, review #588).
     /// The Bridge reaches the SAME handle through

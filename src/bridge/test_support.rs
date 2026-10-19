@@ -2840,6 +2840,18 @@ impl crate::backend::Backend for MockBackend {
         Ok(transcript)
     }
 
+    /// No scripted session diff yet: the mock answers the V1 arm, leaving the
+    /// tool-metadata aggregation (#800) as the caller's path.
+    async fn session_diff(
+        &self,
+        _session_id: &str,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        _context: Option<u32>,
+    ) -> crate::error::Result<Option<crate::backend::TurnDiff>> {
+        Ok(None)
+    }
+
     async fn list_permissions(
         &self,
         _d: Option<&str>,

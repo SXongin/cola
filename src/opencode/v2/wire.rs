@@ -33,7 +33,7 @@ use crate::backend::{
     ContentBlock, DEFAULT_FILE_MIME, Execution, ExecutionOutcome, FileContent, FinishReason, MessageId,
     MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd,
     ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
-    ToolStatus, TranscriptMessage, Wake, WakeSource,
+    ToolStatus, TranscriptMessage, TurnDiffFile, Wake, WakeSource,
 };
 use crate::opencode::types::{
     AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
@@ -45,6 +45,36 @@ use crate::opencode::types::{
 #[derive(Debug, Deserialize)]
 pub(super) struct DataEnvelope<T> {
     pub(super) data: T,
+}
+
+/// `GET /api/session/{id}/diff` — one `FileDiff.Info` entry. The wire spells
+/// the path `file`; the neutral model calls it `path`. A missing optional field
+/// decodes as empty/zero rather than failing the whole read (ADR-0053).
+#[derive(Debug, Deserialize)]
+pub(super) struct RawTurnDiffFile {
+    pub(super) file: String,
+    #[serde(default)]
+    pub(super) patch: String,
+    #[serde(default)]
+    pub(super) additions: usize,
+    #[serde(default)]
+    pub(super) deletions: usize,
+    #[serde(default)]
+    pub(super) status: String,
+}
+
+impl RawTurnDiffFile {
+    /// The neutral per-file view: `file` → `path`, the patch and counts kept
+    /// verbatim.
+    pub(super) fn into_neutral(self) -> TurnDiffFile {
+        TurnDiffFile {
+            path: self.file,
+            patch: self.patch,
+            additions: self.additions,
+            deletions: self.deletions,
+            status: self.status,
+        }
+    }
 }
 
 /// `GET /api/session` — `{data: Session.Info[], cursor: {previous?, next?}}`.

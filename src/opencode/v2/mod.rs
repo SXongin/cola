@@ -39,6 +39,7 @@ use async_trait::async_trait;
 
 use crate::backend::{
     ChildEvidence, ChildRuntime, PromptSkill, SessionTranscript, ShellRuntime, SkillInfo, TaskRuntime,
+    TurnDiff,
 };
 use crate::error::Result;
 
@@ -91,6 +92,9 @@ const SHELL_OUTPUT_BOUNDARY_BYTES: u64 = 4;
 /// The per-session projected-message read: the S4b transcript decode and, for
 /// active sessions, the run state's retry derivation.
 const SESSION_MESSAGES_SUFFIX: &str = "/message";
+/// The per-session Turn diff (`GET /api/session/{id}/diff`): the changed files
+/// of one Turn, scoped by the anchor user message's id.
+const SESSION_DIFF_SUFFIX: &str = "/diff";
 /// The location-scoped pending-permission list (`GET
 /// /api/permission/request?location[directory]=…`).
 const PERMISSION_REQUEST: &str = "/api/permission/request";
@@ -475,6 +479,54 @@ impl GenerationStrategy for V2Strategy {
         transcript.truncated = truncated;
         self.progress.apply(session_id, &mut transcript);
         Ok(transcript)
+    }
+
+    /// One Turn's file diff (`GET /api/session/{id}/diff`), decoding V2's
+    /// `{data: FileDiff.Info[]}` envelope into the neutral [`TurnDiff`]. The
+    /// caller-supplied `from` / `to` / `context` ride the query only when set;
+    /// `from` — the Turn anchor's user-message id — makes the read that Turn's
+    /// snapshot, so later edits cannot drift into it. A failed read names
+    /// itself and carries a body preview, like the module's other reads.
+    async fn session_diff(
+        &self,
+        http: &Transport,
+        session_id: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        context: Option<u32>,
+    ) -> Result<Option<TurnDiff>> {
+        let mut url =
+            reqwest::Url::parse(&http.url(&format!("{SESSION}/{session_id}{SESSION_DIFF_SUFFIX}")))?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(from) = from {
+                query.append_pair("from", from);
+            }
+            if let Some(to) = to {
+                query.append_pair("to", to);
+            }
+            if let Some(context) = context {
+                query.append_pair("context", &context.to_string());
+            }
+        }
+        let resp = http.client().get(url).send().await?;
+        if !resp.status().is_success() {
+            return Err(read_failure(resp, "session diff").await);
+        }
+        let text = resp.text().await?;
+        let body: wire::DataEnvelope<Vec<wire::RawTurnDiffFile>> =
+            serde_json::from_str(&text).map_err(|e| {
+                crate::error::BridgeError::OpenCode(format!(
+                    "session diff parse: {e} — body: {}",
+                    body_preview(&text)
+                ))
+            })?;
+        Ok(Some(TurnDiff(
+            body.data
+                .into_iter()
+                .map(wire::RawTurnDiffFile::into_neutral)
+                .collect(),
+        )))
     }
 
     /// The run state for ONE session (V2 `GET /api/session/active`), with the
