@@ -2867,6 +2867,14 @@ mod tests {
             skill.contains("#implement-spec #foreman"),
             "the skill help documents the repeated-token form: {skill}"
         );
+        assert!(
+            help_text().contains("/diff [--base <ref>]"),
+            "/diff is listed in the command index: {}",
+            help_text()
+        );
+        let diff = command_help("diff").expect("diff has a help topic");
+        assert!(diff.contains("/diff [--base <ref>]"), "{diff}");
+        assert!(diff.contains("稍后再试"), "the cooldown is documented: {diff}");
         assert_eq!(command_help("nonexistent"), None);
         // The retired text-list form has no help topic of its own.
         assert_eq!(command_help("list"), None);
