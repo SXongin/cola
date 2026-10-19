@@ -942,4 +942,106 @@ mod tests {
         assert!(html.contains("src/new.rs"));
         assert!(html.contains(">added<"));
     }
+
+    /// The single escape rule handles every HTML metacharacter, and the
+    /// allocation estimate agrees with the escaped string byte for byte.
+    #[test]
+    fn escape_html_covers_every_metacharacter() {
+        let text = "&<>\"' 汉字";
+        let escaped = escape_html(text);
+        assert_eq!(escaped, "&amp;&lt;&gt;&quot;&#39; 汉字");
+        assert_eq!(escaped_len(text), escaped.len());
+        assert_eq!(escape_html(""), "");
+    }
+
+    /// Header clipping stops on a character boundary, marks the cut visibly,
+    /// and never runs past its byte bound.
+    #[test]
+    fn escape_clipped_marks_the_cut_and_respects_the_bound() {
+        assert_eq!(escape_clipped("abc", 10), "abc");
+        assert_eq!(escape_clipped("<", 4), "&lt;");
+        assert_eq!(escape_clipped("<", 3), "…");
+        assert_eq!(escape_clipped("abcdef", 5), "ab…");
+
+        let clipped = escape_clipped("汉字汉字", 8);
+        assert!(clipped.ends_with('…'));
+        assert!(clipped.len() <= 8);
+        // The cut never leaves half a multi-byte character behind.
+        assert!(clipped.chars().all(|ch| "汉字…".contains(ch)));
+    }
+
+    /// A whole file block is admitted or rejected: a partial block can never
+    /// reach the document, and the escaped form is measured before it is built.
+    #[test]
+    fn bounded_html_admits_a_block_whole_or_not_at_all() {
+        let mut fits = BoundedHtml::new(4);
+        assert!(fits.push("abcd"));
+        assert!(!fits.push("e"));
+        assert_eq!(fits.into_html(), "abcd");
+
+        let mut escaped = BoundedHtml::new(4);
+        assert!(!escaped.push_escaped("<>"));
+        assert!(escaped.push_escaped("<"));
+        assert_eq!(escaped.into_html(), "&lt;");
+    }
+
+    /// A caller-supplied omission note is escaped like every other
+    /// repository-derived string.
+    #[test]
+    fn note_html_escapes_its_text() {
+        let note = note_html("<b>omitted</b>");
+        assert_eq!(note, "<p class=\"note\">&lt;b&gt;omitted&lt;/b&gt;</p>\n");
+    }
+
+    /// The four dropped file headers are recognised, and ordinary content that
+    /// merely starts like one is not.
+    #[test]
+    fn file_headers_are_recognised_without_swallowing_content() {
+        for header in ["Index: a.rs", "====", "---", "--- a/a.rs", "+++", "+++ b/a.rs"] {
+            assert!(is_file_header(header), "{header:?}");
+        }
+        for content in ["Indexing", "-- removed", "++ added", " context"] {
+            assert!(!is_file_header(content), "{content:?}");
+        }
+    }
+
+    /// Hunk headers accept an omitted count (unified diff's default 1) and
+    /// reject malformed ranges instead of inventing one.
+    #[test]
+    fn hunk_headers_read_ranges_and_omitted_counts() {
+        assert_eq!(parse_hunk_header("@@ -3 +7,2 @@"), Some((3, 1, 7, 2)));
+        assert_eq!(parse_hunk_header("@@ -0,0 +1,4 @@"), Some((0, 0, 1, 4)));
+        assert_eq!(parse_hunk_header("not a hunk"), None);
+        assert_eq!(parse_hunk_header("@@ -3 +x @@"), None);
+        assert_eq!(parse_hunk_range("+7,2"), Some((7, 2)));
+        assert_eq!(parse_hunk_range("-3"), Some((3, 1)));
+        assert_eq!(parse_hunk_range("3"), None);
+        assert_eq!(parse_hunk_range("-x"), None);
+    }
+
+    /// Hunk parsing keeps the `@@` header, context, additions, removals and
+    /// the no-newline marker typed and numbered, and drops a later file header.
+    #[test]
+    fn parse_hunks_types_lines_and_ends_at_spent_counts() {
+        let hunks = parse_hunks(
+            "Index: a.rs\n=== \n--- a/a.rs\n+++ b/a.rs\n\
+             @@ -1,2 +1,2 @@\n context\n-old\n+new\n\
+             \\ No newline at end of file\n+++ b/next.rs\n",
+        );
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].header, "@@ -1,2 +1,2 @@");
+        let kinds: Vec<_> = hunks[0].lines.iter().map(|line| line.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LineKind::Context,
+                LineKind::Removed,
+                LineKind::Added,
+                LineKind::Note,
+            ]
+        );
+        assert_eq!((hunks[0].lines[0].old, hunks[0].lines[0].new), (Some(1), Some(1)));
+        assert_eq!((hunks[0].lines[1].old, hunks[0].lines[1].new), (Some(2), None));
+        assert_eq!((hunks[0].lines[2].old, hunks[0].lines[2].new), (None, Some(2)));
+    }
 }
