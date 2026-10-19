@@ -857,7 +857,7 @@ enum ServiceStartFailure {
     /// directory unwritable).
     Spawn(String),
     /// No live `serve --service` registration appeared in time; the attempt was
-    /// terminated. The `serve --port` fallback follows.
+    /// terminated AND confirmed exited. The `serve --port` fallback follows.
     NoRegistration { child_pid: i32 },
     /// A registration appeared, but the process exited before its generation
     /// resolved. Nothing is left to attach to, so the `serve --port` fallback
@@ -869,6 +869,13 @@ enum ServiceStartFailure {
     /// servers on one store (ADR-0013, ADR-0085). The reconnect loop attaches
     /// once the probe classifies.
     Attach(String),
+    /// The attempt never registered and could NOT be confirmed exited: it
+    /// ignored SIGTERM and survived SIGKILL. Deliberately NOT a fallback — a
+    /// possibly-live service on the store means raising an Owned Server beside
+    /// it would put two servers on one store (ADR-0013, ADR-0085), which is
+    /// the same hazard as [`Self::Attach`]. cola stays serverless and the
+    /// reconnect loop attaches once the service registers.
+    NotReaped { child_pid: i32 },
 }
 
 impl std::fmt::Display for ServiceStartFailure {
@@ -887,6 +894,10 @@ impl std::fmt::Display for ServiceStartFailure {
             Self::Attach(evidence) => write!(
                 f,
                 "the shared service registered but its generation never resolved: {evidence}"
+            ),
+            Self::NotReaped { child_pid } => write!(
+                f,
+                "the `serve --service` attempt (pid {child_pid}) could not be confirmed exited; not falling back to `serve --port`"
             ),
         }
     }
@@ -1164,8 +1175,10 @@ impl ServiceAttempt for RealServiceAttempt {
 /// contender that exits because an incumbent already serves the machine is
 /// accepted: the incumbent's registration is live, which is all cola needs. An
 /// attempt that never registers is terminated (SIGTERM, a bounded wait, then
-/// SIGKILL) and reported as a failure, which is what sends the caller to the
-/// `serve --port` fallback.
+/// SIGKILL) and reported as a failure: [`ServiceStartFailure::NoRegistration`]
+/// once it is confirmed exited — which is what sends the caller to the
+/// `serve --port` fallback — and [`ServiceStartFailure::NotReaped`] when it is
+/// not, so no fallback is raised beside a possibly-live service.
 async fn start_shared_service(
     host: &dyn ServiceHost,
     registration_path: &std::path::Path,
@@ -1187,8 +1200,15 @@ async fn start_shared_service(
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            reap_failed_service_attempt(host, &mut *attempt).await;
-            return Err(ServiceStartFailure::NoRegistration { child_pid });
+            let reaped = reap_failed_service_attempt(host, &mut *attempt).await;
+            return Err(if reaped {
+                ServiceStartFailure::NoRegistration { child_pid }
+            } else {
+                // The attempt survived SIGKILL: it may still be serving the
+                // store, so this must NOT be fallback-eligible (ADR-0013,
+                // ADR-0085).
+                ServiceStartFailure::NotReaped { child_pid }
+            });
         }
         // A child that exits without a live registration failed the attempt (a
         // V1 binary has no `serve --service`) — after the grace the daemon gets
@@ -1210,30 +1230,45 @@ async fn start_shared_service(
 /// cola must never kill an unrelated process (the same guard the Owned Server
 /// path applies before it kills).
 ///
+/// Returns whether the attempt is CONFIRMED gone (exited and waited out, or no
+/// longer a live `serve --service`). `false` means cola cannot rule out a live
+/// service on the store, so the caller must NOT fall back to `serve --port`:
+/// a second server beside it is the two-server hazard ADR-0013/ADR-0085
+/// prevent.
+///
 /// Whichever way it goes, the attempt's own child is waited out: a failed start
 /// must leave no service child behind, and an un-waited one lingers as a zombie
 /// for as long as cola runs (ticket #809).
-async fn reap_failed_service_attempt(host: &dyn ServiceHost, attempt: &mut dyn ServiceAttempt) {
+async fn reap_failed_service_attempt(host: &dyn ServiceHost, attempt: &mut dyn ServiceAttempt) -> bool {
     let child_pid = attempt.pid();
     let is_our_service = host.alive(child_pid)
         && host
             .cmd(child_pid)
             .is_some_and(|args| is_opencode_service_cmd(&args));
     if !is_our_service {
-        attempt.try_reap();
-        return;
+        // Nothing of ours to signal: the child already exited (a V1 binary, or
+        // a contender that found an incumbent), or the pid is now another
+        // program's. Either way a pid the process table reports dead cannot be
+        // serving the store; a still-live pid cola cannot identify is not
+        // confirmed gone.
+        let reaped = attempt.try_reap();
+        return reaped || !host.alive(child_pid);
     }
     let _ = host.terminate(child_pid);
     if wait_for_attempt_exit(attempt, SERVICE_START_KILL_GRACE).await {
-        return;
+        return true;
     }
     if host.alive(child_pid) {
         tracing::warn!("OpenCode service attempt (pid {child_pid}) ignored SIGTERM; killing it");
         let _ = host.force_kill(child_pid);
     }
-    if !wait_for_attempt_exit(attempt, SERVICE_START_KILL_GRACE).await {
-        tracing::warn!("OpenCode service attempt (pid {child_pid}) could not be reaped");
+    if wait_for_attempt_exit(attempt, SERVICE_START_KILL_GRACE).await {
+        return true;
     }
+    tracing::warn!(
+        "OpenCode service attempt (pid {child_pid}) could not be confirmed exited; NOT falling back to `opencode serve --port` — a possibly-live service on the store means a second server would be the two-server hazard (ADR-0013, ADR-0085)"
+    );
+    false
 }
 
 /// Poll the attempt's process handle until the child has exited and been waited
@@ -1423,9 +1458,11 @@ async fn spawn_own_server_over(
             }
             // Only "the service is not there" falls back — never started, never
             // registered, or registered and then GONE. A registration whose
-            // process is still alive but never classified is a LIVE rendezvous:
-            // raising an Owned Server beside it would put two servers on one
-            // store, which is exactly what ADR-0013/ADR-0085 exist to prevent.
+            // process is still alive but never classified (`Attach`) and an
+            // attempt that survived SIGKILL (`NotReaped`) are both left to the
+            // reconnect loop: raising an Owned Server beside a possibly-live
+            // service would put two servers on one store, which is exactly what
+            // ADR-0013/ADR-0085 exist to prevent.
             Err(
                 failure @ (ServiceStartFailure::Spawn(_)
                 | ServiceStartFailure::NoRegistration { .. }
@@ -2689,6 +2726,10 @@ mod tests {
         alive: std::sync::Mutex<Vec<i32>>,
         /// Whether a SIGTERM actually ends the attempt (the graceful case).
         dies_on_terminate: bool,
+        /// Whether the attempt survives SIGKILL too (a wedged daemon): `alive`
+        /// keeps the pid and the process handle never reports exit, so the reap
+        /// cannot confirm it gone.
+        survives_kill: bool,
         cmd: Vec<(i32, Vec<String>)>,
         calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         /// Whether the spawned attempt's process has exited and can be waited
@@ -2706,6 +2747,7 @@ mod tests {
                 reads: std::sync::atomic::AtomicUsize::new(0),
                 alive: std::sync::Mutex::new(Vec::new()),
                 dies_on_terminate: false,
+                survives_kill: false,
                 cmd: Vec::new(),
                 calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 attempt_exited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2744,6 +2786,13 @@ mod tests {
         /// The attempt exits on SIGTERM (the graceful daemon).
         fn dies_on_terminate(mut self) -> Self {
             self.dies_on_terminate = true;
+            self
+        }
+
+        /// The attempt ignores SIGKILL as well: the process stays alive and the
+        /// handle never reports exit, so the reap cannot confirm it gone.
+        fn survives_kill(mut self) -> Self {
+            self.survives_kill = true;
             self
         }
 
@@ -2821,9 +2870,11 @@ mod tests {
 
         fn force_kill(&self, pid: i32) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("kill {pid}"));
-            self.alive.lock().unwrap().retain(|p| *p != pid);
-            self.attempt_exited
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if !self.survives_kill {
+                self.alive.lock().unwrap().retain(|p| *p != pid);
+                self.attempt_exited
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             Ok(())
         }
     }
@@ -3150,6 +3201,24 @@ mod tests {
         assert!(error.to_string().contains("never resolved"), "{error}");
     }
 
+    /// An attempt that survived SIGKILL may still be running on the store, so
+    /// `NotReaped` is not fallback-eligible either: `serve --port` would put a
+    /// second server on the same store (ADR-0013, ADR-0085). The `serve --port`
+    /// fallback only runs when the attempt is confirmed gone.
+    #[tokio::test]
+    async fn spawn_own_server_does_not_fall_back_when_the_attempt_survived_kill() {
+        let starter = FakeStarter::new().service_fails(ServiceStartFailure::NotReaped { child_pid: 4242 });
+        let error = spawn_own_server_over(None, GenerationOverride::Auto, false, &starter)
+            .await
+            .expect_err("a possibly-live service must not be joined by a second server");
+
+        assert_eq!(starter.calls(), vec!["service"]);
+        assert!(
+            error.to_string().contains("could not be confirmed exited"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_own_server_skips_the_service_for_v1_and_when_disabled() {
         // `generation = "v1"`: V1 has no `serve --service`.
@@ -3275,6 +3344,29 @@ mod tests {
             host.calls(),
             vec!["spawn", "terminate 4242", "kill 4242", "reap 4242"]
         );
+    }
+
+    /// An attempt that survives SIGKILL is NOT confirmed gone: reporting
+    /// `NoRegistration` would send the caller to `serve --port` while a
+    /// possibly-live service still holds the store — two servers on one store
+    /// (ADR-0013, ADR-0085). It reports `NotReaped` and starts no fallback.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_survives_sigkill_is_not_reported_as_reaped() {
+        let host = FakeServiceHost::new()
+            .live(4242, &["opencode", "serve", "--service"])
+            .survives_kill();
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("nothing registered");
+
+        assert_eq!(failure, ServiceStartFailure::NotReaped { child_pid: 4242 });
+        // SIGKILL was sent, but the process never reported exit — no reap.
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "kill 4242"]);
+        assert!(failure.to_string().contains("pid 4242"), "{failure}");
     }
 
     /// A child that exited without registering fails the attempt after a short
