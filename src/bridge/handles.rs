@@ -1330,6 +1330,10 @@ pub(crate) struct TurnConfig {
     pub(crate) turn_follow_read_timeout_ms: Arc<AtomicU64>,
     /// Default directory for new sessions (from `[bridge] work_dir`).
     work_dir: Option<String>,
+    /// The base ref `/diff` compares against when the command names none
+    /// (`[review] base`, spec #803). `None` leaves the producer's
+    /// `origin/main` → `main` resolution.
+    review_base: Option<String>,
 }
 
 impl TurnConfig {
@@ -1343,6 +1347,7 @@ impl TurnConfig {
         turn_follow_read_timeout_ms: Arc<AtomicU64>,
         completion_notice_delay_ms: Arc<AtomicU64>,
         work_dir: Option<String>,
+        review_base: Option<String>,
     ) -> Self {
         Self {
             group_completion_notice,
@@ -1353,7 +1358,13 @@ impl TurnConfig {
             turn_follow_read_timeout_ms,
             completion_notice_delay_ms,
             work_dir,
+            review_base,
         }
+    }
+
+    /// The configured base ref for `/diff` (`[review] base`), if any.
+    pub(crate) fn review_base(&self) -> Option<&str> {
+        self.review_base.as_deref()
     }
 
     /// The directory a brand-new session starts in: `[bridge] work_dir` when
@@ -1667,6 +1678,11 @@ pub(crate) struct CommandHandles {
     /// `/restart-opencode` restarts the canonical server among several of one
     /// class rather than a lower-port sibling (spec #809, ADR-0085).
     pub(crate) preferred_port: Option<u16>,
+    /// `/diff`'s process-internal cooldown (spec #803): one entry per chat,
+    /// claimed before any git/render/upload work. Shared with the rest of the
+    /// process through the core, so two `/diff`s in one chat cannot both run
+    /// inside the window.
+    pub(crate) diff_cooldown: Arc<std::sync::Mutex<crate::bridge::repo_diff::DiffCooldown>>,
 }
 
 impl CommandHandles {

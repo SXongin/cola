@@ -86,6 +86,14 @@ pub enum Command {
     /// resolves on the **Path Scope** (relative to the Session's directory,
     /// `~` expanded, absolute passed through) and is advisory, not a boundary.
     Cat(Option<String>),
+    /// `/diff [--base <ref>]` — render the repository review (committed +
+    /// uncommitted + untracked changes against a base ref) as one HTML File
+    /// Message (spec #803). `None` means no `--base`: the configured
+    /// `[review] base`, else the producer's `origin/main` → `main` chain.
+    Diff(Option<String>),
+    /// Any other `/diff` argument — an unknown flag, extra words, or a bare
+    /// `--base` with no value. Answered with one usage line and no git call.
+    DiffUsage,
 }
 
 /// One skill-invocation request (spec #662): the ids a message named, and which
@@ -316,6 +324,18 @@ pub fn parse_command(text: &str) -> Option<Command> {
         // browse card, and a bare `/cat` answer usage (ADR-0083 §2). The whole
         // remainder of the line is the path, so a path with spaces survives.
         "/cat" => Some(Command::Cat(arg.map(|s| s.to_string()))),
+        // `/diff [--base <ref>]` — the repository review (spec #803). Only
+        // these two forms are sanctioned; any other argument (an unknown flag,
+        // extra words, or a bare `--base` with no value) is answered with one
+        // usage line before any git call.
+        "/diff" => {
+            let words: Vec<&str> = arg.map(|a| a.split_whitespace().collect()).unwrap_or_default();
+            match words.as_slice() {
+                [] => Some(Command::Diff(None)),
+                ["--base", base] if !base.starts_with('-') => Some(Command::Diff(Some((*base).to_string()))),
+                _ => Some(Command::DiffUsage),
+            }
+        }
         "/topic" => match arg {
             Some(a) => {
                 // `/topic --adopt <keyword> [--force]` — adopt an existing
@@ -484,6 +504,7 @@ pub fn help_text() -> String {
 **cola commands**
 `/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
 `/cat <path>` · View a host file in a card (a directory opens the Directory Browser there)
+`/diff [--base <ref>]` · Send this branch's repository changes against a base ref as one HTML file
 `/switch` · Session card: browse / search / adopt / new
 `/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
 `/switch <id> [--force]` · Take over a session by id/title
@@ -519,6 +540,9 @@ pub fn command_help(name: &str) -> Option<String> {
     let text = match name.to_lowercase().as_str() {
         "cat" => {
             "/cat <path>\nOpen one host file as a File Viewer card. cola reads the bytes itself — no model, no server round-trip — so behaviour is identical on every Generation. The card names the file it shows (its RESOLVED path, size and type) and renders a text file as a fenced code block carrying the extension's language hint; an extension the platform has no token for degrades honestly to plain_text rather than being mislabelled. A delimited-text file (.csv/.tsv) previews as a markdown table, because a table is what those bytes are. The card's 「📂 所在目录」 opens the Directory Browser at the file's parent directory.\n- `/cat <directory>` — open the Directory Browser at that directory instead of erroring: `/cat` always means \"show me this path\"\n- `/cat` (no arg) — this help\nPath Scope: `~` expands, a relative path resolves against this session's directory (the conversation's current project while the session is still pending), and an absolute path — inside or outside that directory — is used as-is. The scope is a privacy hint, not a sandbox: whoever can read the chat can read the card, and who may act is the Access List's call.\nA path that does not exist, one cola cannot read, and an empty file each answer distinctly, naming the path.\nExamples: `/cat src/main.rs`, `/cat ~/notes.md`, `/cat /etc/hosts`"
+        }
+        "diff" => {
+            "/diff [--base <ref>]\nRender this branch's repository review as one self-contained HTML File Message: committed changes since the fork point, uncommitted tracked changes, and untracked files. It compares the working tree against `git merge-base <base> HEAD` (never fetches, never touches the index), so the result is stable and re-checkable across turns and restarts.\n- `/diff` — use `--base`, else `[review] base`, else `origin/main`, else `main`\n- `/diff --base <ref>` — override the base for this call\nAny other argument answers this usage line and runs no git. The command runs in this conversation's project directory (the same rule as `/cat`), and the file is replied to the command message so it stays in its chat/topic. Only one `/diff` per chat per 10 seconds; earlier repeats answer 稍后再试. An empty review answers one line and sends no file; each failure (not a git repository, base not found, git missing) answers its own readable text.\nExample: `/diff --base main`"
         }
         "dir" => {
             "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths. Its 📁 浏览目录 button opens a filesystem browser: drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, and filter the child names.\nExample: `/dir /root/proj/lib`"
@@ -787,6 +811,16 @@ pub(crate) async fn handle_command(
         }
         Command::Cat(path) => {
             crate::feishu::card::command::send_cat_card(handles, &thread_key, message_id, path.as_deref())
+                .await?;
+        }
+        Command::Diff(base) => {
+            crate::bridge::repo_diff::run(handles, &thread_key, message_id, base).await?;
+        }
+        Command::DiffUsage => {
+            handles
+                .flow
+                .platform
+                .reply_text(message_id, crate::bridge::repo_diff::DIFF_USAGE)
                 .await?;
         }
         Command::Switch(action) => {
@@ -2757,6 +2791,38 @@ mod tests {
         assert_eq!(
             parse_command("/model anthropic/claude-sonnet-4-5"),
             Some(Command::Model("anthropic/claude-sonnet-4-5".into()))
+        );
+    }
+
+    /// `/diff` has exactly two forms: no argument, or `--base <ref>` with a
+    /// value that is not itself a flag. Everything else is the usage variant,
+    /// which runs no git.
+    #[test]
+    fn parse_diff() {
+        assert_eq!(parse_command("/diff"), Some(Command::Diff(None)));
+        assert_eq!(parse_command("/diff   "), Some(Command::Diff(None)));
+        assert_eq!(
+            parse_command("/diff --base main"),
+            Some(Command::Diff(Some("main".into())))
+        );
+        assert_eq!(
+            parse_command("/diff --base foo/bar"),
+            Some(Command::Diff(Some("foo/bar".into())))
+        );
+        assert_eq!(
+            parse_command("/diff   --base   origin/main  "),
+            Some(Command::Diff(Some("origin/main".into()))),
+            "extra whitespace is not a word"
+        );
+        assert_eq!(parse_command("/diff --base"), Some(Command::DiffUsage));
+        assert_eq!(parse_command("/diff --base --other"), Some(Command::DiffUsage));
+        assert_eq!(parse_command("/diff foo"), Some(Command::DiffUsage));
+        assert_eq!(parse_command("/diff --other"), Some(Command::DiffUsage));
+        assert_eq!(parse_command("/diff --base main extra"), Some(Command::DiffUsage));
+        // Only the exact token is `/diff`.
+        assert_eq!(
+            parse_command("/diffs x"),
+            Some(Command::Forward("/diffs x".into()))
         );
     }
 

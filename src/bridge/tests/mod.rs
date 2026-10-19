@@ -12,6 +12,7 @@ pub(crate) mod collect;
 pub(crate) mod compaction;
 pub(crate) mod config_commands;
 pub(crate) mod cursor;
+pub(crate) mod diff_command;
 pub(crate) mod dir;
 pub(crate) mod drain;
 pub(crate) mod external;

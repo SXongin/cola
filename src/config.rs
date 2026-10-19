@@ -39,6 +39,19 @@ pub struct Config {
     pub feishu: FeishuConfig,
     #[serde(default)]
     pub bridge: BridgeConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
+}
+
+/// Repository review settings (spec #803, ticket #804): what `/diff` compares
+/// the working tree against.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// The base ref `/diff` uses when the command names none. `None` leaves the
+    /// producer's own resolution (`origin/main`, then `main`). `--base` on the
+    /// command always wins over this.
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 /// When cola starts an `opencode serve` of its own (ADR-0013).
@@ -478,10 +491,24 @@ mod tests {
                 app_secret: "s3cr3t".into(),
             },
             bridge: BridgeConfig::default(),
+            review: ReviewConfig::default(),
         };
         let dumped = masked_config_toml(&cfg).unwrap();
         assert!(dumped.contains("cli_abc"), "the app id is shown: {dumped}");
         assert!(!dumped.contains("s3cr3t"), "secret leaked: {dumped}");
+    }
+
+    #[test]
+    fn review_base_is_optional_and_parsed() {
+        let minimal: Config =
+            toml::from_str("[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n").unwrap();
+        assert_eq!(minimal.review.base, None, "the whole [review] table is optional");
+
+        let configured: Config = toml::from_str(
+            "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n[review]\nbase = \"upstream/dev\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured.review.base.as_deref(), Some("upstream/dev"));
     }
 
     #[test]
