@@ -10196,6 +10196,34 @@ Index: /x/src/main.rs
         );
     }
 
+    /// A running Turn shows the live counts line but no entry: the one-shot
+    /// artifact must not freeze a mid-turn snapshot. The terminal card adds
+    /// the button.
+    #[test]
+    fn a_running_card_shows_the_index_line_without_the_button() {
+        let transcript = anchored_transcript(vec![edit_part("call_edit_a", 2_000, "src/a.rs", "A")]);
+        let mut acc = anchored_accumulator();
+        acc.set_card_state(CardState::Streaming);
+        assert!(render_new_turn_parts(&mut acc, &transcript));
+
+        let running = acc.build_card_with_split().0;
+        assert!(
+            card_text(&running).contains("📝 本次改动 · 1 files · +2 −1"),
+            "the live counts line renders: {running}"
+        );
+        assert!(
+            turn_diff_button(&running).is_none(),
+            "no button until the Turn's card is terminal: {running}"
+        );
+
+        acc.set_card_state(CardState::Done);
+        let settled = acc.build_card_with_split().0;
+        assert!(
+            turn_diff_button(&settled).is_some(),
+            "the terminal card offers the one-shot entry: {settled}"
+        );
+    }
+
     /// Acceptance: when the Turn splits, only the last (live) card carries the
     /// index line and the button; a finalized prefix must not offer an entry.
     #[test]

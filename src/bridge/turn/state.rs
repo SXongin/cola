@@ -2197,10 +2197,11 @@ impl StreamAccumulator {
     }
 
     /// The change-index facts the live card tail renders (#477), or `None` when
-    /// it must render neither element: the Turn recorded no file edit (zero
-    /// files), the card has no [`TurnAnchor`] to name the Turn by (`from`), or
-    /// no session id to route the click — an entry it could not make work is
-    /// exactly the dead button the ticket forbids.
+    /// it must render nothing: the Turn recorded no file edit (zero files), the
+    /// card has no [`TurnAnchor`] to name the Turn by (`from`), or no session
+    /// id to route the click — an entry it could not make work is exactly the
+    /// dead button the ticket forbids. The counts line renders while the Turn
+    /// runs; the button is added only by a terminal card.
     fn turn_diff_index(&self) -> Option<(TurnDiffStats, &TurnAnchor)> {
         let anchor = self.turn_anchor.as_ref()?;
         if self.session_id.as_deref().is_none_or(str::is_empty) {
@@ -4300,18 +4301,22 @@ impl StreamAccumulator {
                     size += panel_estimate(panel, session);
                 }
             }
-            // The Turn's change index (#477) rides this same tail: one markdown
-            // line plus the complete-diff button, charged from the elements the
-            // build actually renders so a near-budget card splits instead of
-            // being rejected by Feishu. Absent when the build renders neither
-            // element ([`Self::turn_diff_index`]).
+            // The Turn's change index (#477) rides this same tail: the markdown
+            // line always, the complete-diff button only once the card is
+            // terminal (the artifact is one-shot, so a mid-turn click would
+            // freeze a partial snapshot). Charged from exactly the elements the
+            // build renders, so a near-budget card splits instead of being
+            // rejected by Feishu. Absent when the build renders neither element
+            // ([`Self::turn_diff_index`]).
             if let Some((stats, anchor)) = self.turn_diff_index() {
-                comps += crate::feishu::card::turn_diff::INDEX_COMPONENTS;
+                let show_button = self.card_state.is_terminal();
+                comps += crate::feishu::card::turn_diff::index_components(show_button);
                 size += crate::feishu::card::turn_diff::index_estimate(
                     stats,
                     self.session_id.as_deref().unwrap_or_default(),
                     anchor.message_id.as_str(),
                     self.directory.as_deref().unwrap_or_default(),
+                    show_button,
                 );
             }
         }
@@ -4663,17 +4668,21 @@ impl StreamAccumulator {
             }
 
             // The Turn's change index (spec #797, ticket #477): the counts line
-            // and the complete-diff entry, after every tool panel and before
-            // the footer (which `build` appends below, keeping the recovery
-            // buttons after it). A split's finalized prefix carries no tail, so
-            // only the live (last) card offers the button; a read/bash-only or
-            // anchorless Turn renders neither element.
+            // — live, from the transcript-side estimate — and the complete-diff
+            // entry only once the card is terminal, after every tool panel and
+            // before the footer (which `build` appends below, keeping the
+            // recovery buttons after it). A one-shot artifact sent mid-turn
+            // would freeze a partial snapshot that later edits cannot update,
+            // so the button waits for the end. A split's finalized prefix
+            // carries no tail; a read/bash-only or anchorless Turn renders
+            // neither element.
             if let Some((stats, anchor)) = self.turn_diff_index() {
                 for element in crate::feishu::card::turn_diff::index_elements(
                     stats,
                     self.session_id.as_deref().unwrap_or_default(),
                     anchor.message_id.as_str(),
                     self.directory.as_deref().unwrap_or_default(),
+                    self.card_state.is_terminal(),
                 ) {
                     builder = builder.with_element(element);
                 }
@@ -7653,7 +7662,7 @@ mod tests {
         });
 
         let index =
-            crate::feishu::card::turn_diff::index_estimate(stats, "ses_test", "msg_user", "/repo/cola");
+            crate::feishu::card::turn_diff::index_estimate(stats, "ses_test", "msg_user", "/repo/cola", true);
         assert!(index > 0, "the index elements have a measurable size");
 
         // One receipt whose estimate leaves the index's bytes as the only
@@ -7674,6 +7683,15 @@ mod tests {
             acc.estimate_split_index(0, true),
             0,
             "the index line and button must push the same card over the budget"
+        );
+
+        // While the Turn is still running only the line is charged: the same
+        // near-budget card fits, because the button is not rendered yet.
+        acc.set_card_state(CardState::Streaming);
+        assert_eq!(
+            acc.estimate_split_index(0, true),
+            1,
+            "a running card charges the line, not the settled button"
         );
     }
 

@@ -25,10 +25,16 @@
 //! renders neither element, because an entry that cannot name its Turn would
 //! open another Turn's diff.
 //!
+//! The counts line is live, but the **button waits for the card's terminal
+//! state**. The artifact is generated once per `(session, from)` and the first
+//! successful send is final, so offering the button mid-turn would freeze a
+//! partial snapshot that later edits cannot update. The line may keep counting
+//! while the Turn runs; only the terminal card offers the one-shot entry.
+//!
 //! [`index_elements`] is the one renderer and [`index_estimate`] measures its
 //! own output (`serde_json` bytes), so the card-size estimate charges exactly
 //! what the card carries — the split decision cannot regress by forgetting the
-//! two new elements.
+//! line or the button.
 
 use crate::backend::TurnDiffStats;
 
@@ -39,9 +45,12 @@ pub(crate) const TURN_DIFF_BUTTON_TEXT: &str = "🔍 查看完整改动";
 /// The callback op that names this button's click (`op: "turn_diff"`).
 pub(crate) const TURN_DIFF_OP: &str = "turn_diff";
 
-/// How many body elements [`index_elements`] pushes: the markdown line and the
-/// button. The split estimator charges them together, never one alone.
-pub(crate) const INDEX_COMPONENTS: usize = 2;
+/// How many body elements [`index_elements`] pushes for a settled (or still
+/// running) card: the markdown line always, the button only once the Turn's
+/// card is terminal. The split estimator charges exactly this count.
+pub(crate) fn index_components(show_button: bool) -> usize {
+    1 + usize::from(show_button)
+}
 
 /// The index line, from the transcript-side estimate (#800 aggregation, last
 /// recorded patch per path) — the artifact's own read may be larger on V2.
@@ -52,22 +61,23 @@ pub(crate) fn index_line(stats: TurnDiffStats) -> String {
     )
 }
 
-/// The card-tail elements for one Turn's change index: the line, then the
-/// complete-diff button. `session_id`, `from` (the Turn anchor's user message
-/// id) and `directory` are the click's whole routing payload — the handler
-/// needs no card lookup (spec decision 2).
+/// The card-tail elements for one Turn's change index: the line, then — only
+/// once the card is terminal — the complete-diff button. `session_id`, `from`
+/// (the Turn anchor's user message id) and `directory` are the click's whole
+/// routing payload — the handler needs no card lookup (spec decision 2).
 pub(crate) fn index_elements(
     stats: TurnDiffStats,
     session_id: &str,
     from: &str,
     directory: &str,
+    show_button: bool,
 ) -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "tag": "markdown",
-            "content": index_line(stats),
-        }),
-        serde_json::json!({
+    let mut elements = vec![serde_json::json!({
+        "tag": "markdown",
+        "content": index_line(stats),
+    })];
+    if show_button {
+        elements.push(serde_json::json!({
             "tag": "button",
             "text": { "tag": "plain_text", "content": TURN_DIFF_BUTTON_TEXT },
             "type": "default",
@@ -77,14 +87,21 @@ pub(crate) fn index_elements(
                 "from": from,
                 "directory": directory,
             },
-        }),
-    ]
+        }));
+    }
+    elements
 }
 
 /// The serialized JSON bytes [`index_elements`] adds to a card — measured from
 /// those same elements, so the estimate and the render cannot drift.
-pub(crate) fn index_estimate(stats: TurnDiffStats, session_id: &str, from: &str, directory: &str) -> usize {
-    index_elements(stats, session_id, from, directory)
+pub(crate) fn index_estimate(
+    stats: TurnDiffStats,
+    session_id: &str,
+    from: &str,
+    directory: &str,
+    show_button: bool,
+) -> usize {
+    index_elements(stats, session_id, from, directory, show_button)
         .iter()
         .filter_map(|element| serde_json::to_string(element).ok())
         .map(|serialized| serialized.len())
@@ -119,7 +136,7 @@ mod tests {
     /// anchor's user message id, and no other key rides along.
     #[test]
     fn the_button_carries_the_exact_turn_diff_payload() {
-        let elements = index_elements(stats(), "ses_123", "msg_user_9", "/repo/cola");
+        let elements = index_elements(stats(), "ses_123", "msg_user_9", "/repo/cola", true);
         let button = &elements[1];
 
         assert_eq!(button["tag"], "button");
@@ -140,22 +157,42 @@ mod tests {
         );
     }
 
+    /// A running card keeps the live counts line but offers no entry: the
+    /// one-shot artifact must not freeze a mid-turn snapshot.
+    #[test]
+    fn a_running_card_renders_the_line_without_the_button() {
+        let elements = index_elements(stats(), "ses_123", "msg_user_9", "/repo/cola", false);
+
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["tag"], "markdown");
+        assert_eq!(elements[0]["content"], index_line(stats()));
+        assert!(
+            !elements
+                .iter()
+                .any(|element| element["value"]["op"] == TURN_DIFF_OP),
+            "no button before the Turn's card is terminal"
+        );
+    }
+
     /// The estimate is measured from the rendered elements, so a split decision
-    /// charges the two new body elements (and a quote-heavy directory's JSON
-    /// escaping) exactly.
+    /// charges exactly the elements present — both on a terminal card, only the
+    /// line while the Turn is still running.
     #[test]
     fn the_estimate_charges_exactly_the_elements_it_renders() {
-        let elements = index_elements(stats(), "ses_123", "msg_user_9", "/repo/\"quoted\"");
-        let rendered: usize = elements
-            .iter()
-            .map(|element| serde_json::to_string(element).unwrap().len())
-            .sum();
+        for show_button in [false, true] {
+            let elements = index_elements(stats(), "ses_123", "msg_user_9", "/repo/\"quoted\"", show_button);
+            let rendered: usize = elements
+                .iter()
+                .map(|element| serde_json::to_string(element).unwrap().len())
+                .sum();
 
-        assert_eq!(
-            index_estimate(stats(), "ses_123", "msg_user_9", "/repo/\"quoted\""),
-            rendered
-        );
-        assert!(rendered > 0);
-        assert_eq!(INDEX_COMPONENTS, elements.len());
+            assert_eq!(
+                index_estimate(stats(), "ses_123", "msg_user_9", "/repo/\"quoted\"", show_button),
+                rendered
+            );
+            assert!(rendered > 0);
+            assert_eq!(index_components(show_button), elements.len());
+            assert_eq!(elements.len(), 1 + usize::from(show_button));
+        }
     }
 }
