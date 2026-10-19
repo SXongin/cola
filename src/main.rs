@@ -9,6 +9,11 @@ mod feishu;
 mod git;
 mod logging;
 mod opencode;
+// #804 (`/diff`) is this producer's consumer; until it lands nothing in the
+// binary names the module, so the bin crate's dead-code lint would flag the
+// whole thing — the same tolerance `backend::diff_html` carries.
+#[allow(dead_code)]
+mod review;
 mod status;
 #[cfg(test)]
 mod test_http;
