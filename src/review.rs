@@ -419,38 +419,38 @@ fn section_status(section: &str) -> &'static str {
     "modified"
 }
 
-/// A submodule's old and new gitlink commits, or None. Detection covers a
-/// modified gitlink (`index <old>..<new> 160000`), an added one
-/// (`new file mode 160000` + a `Subproject commit` line) and a deleted one.
+/// A submodule's old and new gitlink commits, or None. A gitlink **mode** is
+/// the only proof: `new file mode 160000`, `deleted file mode 160000` or an
+/// `index <old>..<new> 160000` suffix. The `Subproject commit` lines only
+/// supply the commits — a tracked text file may legitimately have those as its
+/// content, and treating them as proof would discard its real hunk.
 fn submodule_pair(section: &str) -> Option<(String, String)> {
     let mut old_commit = None;
     let mut new_commit = None;
-    let mut mode = false;
+    let mut gitlink = false;
     let mut index = None;
     for line in section.lines() {
         if line.starts_with("new file mode 160000") || line.starts_with("deleted file mode 160000") {
-            mode = true;
+            gitlink = true;
         } else if let Some(rest) = line.strip_prefix("-Subproject commit ") {
-            mode = true;
             old_commit = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("+Subproject commit ") {
-            mode = true;
             new_commit = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("index ") {
             let mut parts = rest.split_whitespace();
             let range = parts.next();
             if parts.next() == Some("160000") {
-                mode = true;
+                gitlink = true;
             }
             // An added/deleted gitlink's `index` line carries no mode suffix
             // (`index 0000000..abc`), so the mode header above is what proves
             // this is a submodule; keep the range either way.
-            if mode && let Some((old, new)) = range.and_then(|range| range.split_once("..")) {
+            if let Some((old, new)) = range.and_then(|range| range.split_once("..")) {
                 index = Some((old.to_string(), new.to_string()));
             }
         }
     }
-    if !mode {
+    if !gitlink {
         return None;
     }
     let (index_old, index_new) = index.unwrap_or_else(|| (String::new(), String::new()));
@@ -1259,6 +1259,32 @@ mod tests {
         assert!(!file.patch.contains('\0'));
     }
 
+    /// A tracked text file whose changed lines happen to read
+    /// `Subproject commit …` is an ordinary modification: only a gitlink mode
+    /// header makes a section a submodule, so the real hunk is kept and no
+    /// 子模块 note replaces it.
+    #[tokio::test]
+    async fn a_text_file_with_subproject_lines_is_not_a_submodule() {
+        let repo = Repo::init();
+        repo.write("log.txt", "Subproject commit aaa\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("log.txt", "Subproject commit bbb\n");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+        let file = find(&review, "log.txt");
+        assert_eq!(file.status, "modified");
+        assert_eq!((file.additions, file.deletions), (1, 1));
+        assert!(
+            !file.patch.contains("子模块"),
+            "a text lookalike is not a gitlink: {}",
+            file.patch
+        );
+        assert!(file.patch.contains("@@ -1 +1 @@"), "{}", file.patch);
+        assert!(file.patch.contains("-Subproject commit aaa\n"), "{}", file.patch);
+        assert!(file.patch.contains("+Subproject commit bbb\n"), "{}", file.patch);
+    }
+
     /// Acceptance: the raw patch is capped at 8 MB, files are kept in order and
     /// the rest are omitted with `truncated` set.
     #[tokio::test]
@@ -1607,6 +1633,13 @@ mod tests {
         let ordinary = "diff --git a/a.txt b/a.txt\nindex aaa..bbb 100644\n--- a/a.txt\n+++ b/a.txt\n\
                         @@ -1 +1 @@\n-a\n+b\n";
         assert_eq!(submodule_pair(ordinary), None);
+
+        // The content alone never proves a gitlink: a text file whose changed
+        // lines read as submodule commits keeps its ordinary 100644 mode.
+        let lookalike = "diff --git a/log.txt b/log.txt\nindex aaa..bbb 100644\n\
+                         --- a/log.txt\n+++ b/log.txt\n@@ -1 +1 @@\n\
+                         -Subproject commit aaa\n+Subproject commit bbb\n";
+        assert_eq!(submodule_pair(lookalike), None);
     }
 
     #[test]
