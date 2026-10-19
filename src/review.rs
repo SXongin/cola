@@ -22,6 +22,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -181,6 +182,10 @@ pub(crate) struct ReviewDiff {
 /// headers with the new path; binaries and submodules are one note line.
 pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewDiff, ReviewError> {
     let root = repo_root(dir).await?;
+    // Anchor the untracked phase to the root as it is NOW, before the listing:
+    // a later rename/replacement of the root pathname must not redirect any
+    // untracked read. Tracked git calls keep using the root string.
+    let scope = capture_untracked_scope(&root).await?;
     let head = read_head(&root).await?;
     let (base_ref, base_sha) = resolve_base(&root, base, head.sha.is_some()).await?;
     let merge_base = match &head.sha {
@@ -225,7 +230,7 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
     let untracked = list_untracked(&root).await?;
 
     let (files, truncated) =
-        assemble_files(&root, &entries, &sections, complete_sections, &untracked).await?;
+        assemble_files(&scope, &entries, &sections, complete_sections, &untracked).await?;
 
     let base_display = match &base_sha {
         Some(sha) => format!("{base_ref} @ {}", short_sha(sha)),
@@ -263,14 +268,14 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
 /// a cut tail is inserted as an unusable match so its entry, if any, is counted
 /// once as omitted.
 async fn assemble_files(
-    root: &str,
+    scope: &Arc<UntrackedScope>,
     entries: &[NumStatEntry],
     sections: &[&str],
     complete_sections: usize,
     untracked: &[String],
 ) -> Result<(Vec<DiffFile>, Option<String>), ReviewError> {
     assemble_files_with_timeout(
-        root,
+        scope,
         entries,
         sections,
         complete_sections,
@@ -283,7 +288,7 @@ async fn assemble_files(
 /// [`assemble_files`] with an injectable total untracked budget, so the
 /// deadline is testable without waiting 30 s.
 async fn assemble_files_with_timeout(
-    root: &str,
+    scope: &Arc<UntrackedScope>,
     entries: &[NumStatEntry],
     sections: &[&str],
     complete_sections: usize,
@@ -356,7 +361,6 @@ async fn assemble_files_with_timeout(
     // it expires, the remaining entries are omitted as a group, never noted
     // one by one.
     let untracked_deadline = tokio::time::Instant::now() + untracked_budget;
-    let root_path = Path::new(root);
     for (index, path) in untracked.iter().enumerate() {
         if stopped {
             omitted += 1;
@@ -369,7 +373,7 @@ async fn assemble_files_with_timeout(
             break;
         }
         let budget = remaining.min(UNTRACKED_READ_TIMEOUT);
-        let file = match untracked_file(root_path, path, budget).await {
+        let file = match untracked_file(scope, path, budget).await {
             // One entry that vanished or cannot be read is a note for that
             // path; it must never abort the whole review.
             Ok(file) => file,
@@ -737,6 +741,60 @@ fn binary_note(section: &str, path: &str) -> String {
         .unwrap_or_else(|| format!("Binary files a/{path} and b/{path} differ"))
 }
 
+/// The untracked phase's anchor, captured once before the listing. On Unix the
+/// held directory handle pins the root directory itself: renaming the root
+/// pathname (or replacing it with a symlink) cannot redirect a later walk,
+/// because every `openat`/`readlinkat` starts from this handle rather than
+/// re-resolving the path. Other targets keep the canonical path only.
+struct UntrackedScope {
+    /// The repository root as it was when the scope was captured.
+    canonical_root: PathBuf,
+    /// The open directory handle every Unix walk starts from.
+    #[cfg(unix)]
+    dir: std::fs::File,
+}
+
+impl UntrackedScope {
+    /// Capture the scope. Runs on the blocking pool (it can stall on a network
+    /// filesystem). The root is canonicalized first and then opened with
+    /// `O_NOFOLLOW`, so a root pathname already swapped for a symlink fails
+    /// instead of anchoring to the wrong directory.
+    fn capture(root: &str) -> Result<Self, ReviewError> {
+        let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
+        #[cfg(unix)]
+        let dir = {
+            use rustix::fs::{CWD, Mode, OFlags};
+            let fd = rustix::fs::openat(
+                CWD,
+                &canonical_root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| map_io_error(error.into()))?;
+            std::fs::File::from(fd)
+        };
+        Ok(Self {
+            canonical_root,
+            #[cfg(unix)]
+            dir,
+        })
+    }
+}
+
+/// Capture [`UntrackedScope`] under the per-entry bound. A failure or timeout
+/// is a `ReviewError`, never an unanchored read.
+async fn capture_untracked_scope(root: &str) -> Result<Arc<UntrackedScope>, ReviewError> {
+    let root = root.to_string();
+    let task = tokio::task::spawn_blocking(move || UntrackedScope::capture(&root));
+    match tokio::time::timeout(UNTRACKED_READ_TIMEOUT, task).await {
+        Ok(Ok(Ok(scope))) => Ok(Arc::new(scope)),
+        Ok(Ok(Err(error))) => Err(error),
+        // The blocking task is detached; without an anchor the phase must not
+        // proceed.
+        Ok(Err(_)) | Err(_) => Err(ReviewError::Io("无法在有界时间内确定仓库根目录".to_string())),
+    }
+}
+
 /// What the blocking untracked inspection found: a symlink's target (which
 /// becomes a new-file patch), an opened regular file to read, or a one-line
 /// note for an entry that cannot be content.
@@ -751,14 +809,14 @@ enum Inspected {
 /// checks) lives here, so the caller runs it on the blocking pool under one
 /// deadline. A symlink is read with `read_link` and never followed; a regular
 /// file is opened with [`open_beneath`].
-fn inspect_untracked(root: &Path, path: &str) -> Result<Inspected, ReviewError> {
-    let full = root.join(path);
+fn inspect_untracked(scope: &UntrackedScope, path: &str) -> Result<Inspected, ReviewError> {
+    let full = scope.canonical_root.join(path);
     let meta = std::fs::symlink_metadata(&full).map_err(map_io_error)?;
     if meta.file_type().is_symlink() {
         // Read the link through the same component walk as a file open: a
         // parent swapped for a symlink must not redirect the read to an
         // outside target.
-        let Some(target) = read_link_beneath(root, path)? else {
+        let Some(target) = read_link_beneath(scope, path)? else {
             return Ok(Inspected::Note(IRREGULAR_NOTE));
         };
         let target = target.to_string_lossy();
@@ -774,9 +832,10 @@ fn inspect_untracked(root: &Path, path: &str) -> Result<Inspected, ReviewError> 
         return Ok(Inspected::Note(OVERSIZE_NOTE));
     }
 
-    // Every component is re-opened beneath the root: a parent directory swapped
-    // for a symlink (or a final symlink/FIFO) is refused, not followed.
-    match open_beneath(root, path)? {
+    // Every component is re-opened beneath the held root handle: a parent
+    // directory swapped for a symlink (or a final symlink/FIFO) is refused,
+    // not followed.
+    match open_beneath(scope, path)? {
         Some(file) => Ok(Inspected::File(file)),
         None => Ok(Inspected::Note(IRREGULAR_NOTE)),
     }
@@ -786,9 +845,13 @@ fn inspect_untracked(root: &Path, path: &str) -> Result<Inspected, ReviewError> 
 /// the inspection (metadata, symlink target, open and handle checks) runs in
 /// one blocking task under it, and the returned regular file is read under
 /// whatever remains. The caller passes `min(remaining total, per-entry cap)`.
-async fn untracked_file(root: &Path, path: &str, budget: Duration) -> Result<DiffFile, ReviewError> {
+async fn untracked_file(
+    scope: &Arc<UntrackedScope>,
+    path: &str,
+    budget: Duration,
+) -> Result<DiffFile, ReviewError> {
     let entry_deadline = tokio::time::Instant::now() + budget;
-    match inspect_within(root, path, budget).await? {
+    match inspect_within(scope, path, budget).await? {
         Inspected::Symlink(target) => {
             // The link's content is its target path; the target has no
             // trailing newline, which is why the synthesized line is fed one.
@@ -841,8 +904,9 @@ fn beneath_components(relative: &str) -> Option<Vec<&str>> {
 /// component, or a final entry that is no longer a symlink is `None` (the
 /// caller emits the one-line note).
 #[cfg(unix)]
-fn read_link_beneath(root: &Path, relative: &str) -> Result<Option<PathBuf>, ReviewError> {
-    use rustix::fs::{CWD, Mode, OFlags};
+fn read_link_beneath(scope: &UntrackedScope, relative: &str) -> Result<Option<PathBuf>, ReviewError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStringExt;
 
     let Some(components) = beneath_components(relative) else {
@@ -852,18 +916,14 @@ fn read_link_beneath(root: &Path, relative: &str) -> Result<Option<PathBuf>, Rev
         return Ok(None);
     };
 
-    let root_dir = rustix::fs::openat(
-        CWD,
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| map_io_error(error.into()))?;
-
-    let mut dir = root_dir;
+    let mut dir: Option<rustix::fd::OwnedFd> = None;
     for component in parents {
+        let parent = match &dir {
+            Some(dir) => dir.as_fd(),
+            None => scope.dir.as_fd(),
+        };
         let opened = match rustix::fs::openat(
-            &dir,
+            parent,
             *component,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
@@ -878,10 +938,14 @@ fn read_link_beneath(root: &Path, relative: &str) -> Result<Option<PathBuf>, Rev
                 };
             }
         };
-        dir = opened;
+        dir = Some(opened);
     }
 
-    match rustix::fs::readlinkat(&dir, *name, Vec::new()) {
+    let parent = match &dir {
+        Some(dir) => dir.as_fd(),
+        None => scope.dir.as_fd(),
+    };
+    match rustix::fs::readlinkat(parent, *name, Vec::new()) {
         Ok(target) => Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
             target.into_bytes(),
         )))),
@@ -898,7 +962,7 @@ fn read_link_beneath(root: &Path, relative: &str) -> Result<Option<PathBuf>, Rev
 /// A component-verified link read needs `readlinkat`; without it, an untracked
 /// symlink becomes the one-line note rather than a parent-following read.
 #[cfg(not(unix))]
-fn read_link_beneath(_root: &Path, _relative: &str) -> Result<Option<PathBuf>, ReviewError> {
+fn read_link_beneath(_scope: &UntrackedScope, _relative: &str) -> Result<Option<PathBuf>, ReviewError> {
     Ok(None)
 }
 
@@ -909,22 +973,15 @@ fn read_link_beneath(_root: &Path, _relative: &str) -> Result<Option<PathBuf>, R
 /// is re-checked for regular-file type and the 2 MB cap. `None` means "not a
 /// regular, bounded file": the caller emits the one-line note instead.
 #[cfg(unix)]
-fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
-    use rustix::fs::{CWD, Mode, OFlags};
+fn open_beneath(scope: &UntrackedScope, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsFd;
 
     let Some(components) = beneath_components(relative) else {
         return Ok(None);
     };
 
-    let root_dir = rustix::fs::openat(
-        CWD,
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| map_io_error(error.into()))?;
-
-    let mut dir = root_dir;
+    let mut dir: Option<rustix::fd::OwnedFd> = None;
     let last = components.len() - 1;
     for (index, component) in components.iter().enumerate() {
         let flags = if index == last {
@@ -932,7 +989,11 @@ fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, Re
         } else {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
         };
-        let opened = match rustix::fs::openat(&dir, *component, flags, Mode::empty()) {
+        let parent = match &dir {
+            Some(dir) => dir.as_fd(),
+            None => scope.dir.as_fd(),
+        };
+        let opened = match rustix::fs::openat(parent, *component, flags, Mode::empty()) {
             Ok(opened) => opened,
             Err(error) => {
                 return match error {
@@ -951,7 +1012,7 @@ fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, Re
             }
             return Ok(Some(file));
         }
-        dir = opened;
+        dir = Some(opened);
     }
     Ok(None)
 }
@@ -962,14 +1023,16 @@ fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, Re
 /// That closes both the parent-directory swap (after `canonicalize`) and the
 /// final-file swap (after `open`).
 #[cfg(windows)]
-fn open_beneath(root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
+fn open_beneath(scope: &UntrackedScope, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
     if beneath_components(relative).is_none() {
         return Ok(None);
     }
-    let full = root.join(relative);
+    // Compare against the root captured with the scope, never a fresh
+    // canonicalization: a replaced root pathname resolves outside and is
+    // refused.
+    let full = scope.canonical_root.join(relative);
     let file = std::fs::File::open(&full).map_err(map_io_error)?;
-    let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
-    if !opened_stays_beneath(&canonical_root, &full, &file).map_err(map_io_error)? {
+    if !opened_stays_beneath(&scope.canonical_root, &full, &file).map_err(map_io_error)? {
         return Ok(None);
     }
     let meta = file.metadata().map_err(map_io_error)?;
@@ -999,7 +1062,7 @@ fn opened_stays_beneath(canonical_root: &Path, full: &Path, file: &std::fs::File
 /// file identity): the entry becomes the one-line note rather than risking a
 /// read outside the repository.
 #[cfg(all(not(unix), not(windows)))]
-fn open_beneath(_root: &Path, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
+fn open_beneath(_scope: &UntrackedScope, relative: &str) -> Result<Option<std::fs::File>, ReviewError> {
     let _ = beneath_components(relative);
     Ok(None)
 }
@@ -1008,10 +1071,14 @@ fn open_beneath(_root: &Path, relative: &str) -> Result<Option<std::fs::File>, R
 /// one deadline. A timed-out or panicked blocking task is DETACHED, not
 /// awaited: the review must not wait on a stalled filesystem, and the entry
 /// becomes the unreadable note.
-async fn inspect_within(root: &Path, path: &str, timeout: Duration) -> Result<Inspected, ReviewError> {
-    let root = root.to_path_buf();
+async fn inspect_within(
+    scope: &Arc<UntrackedScope>,
+    path: &str,
+    timeout: Duration,
+) -> Result<Inspected, ReviewError> {
+    let scope = Arc::clone(scope);
     let path = path.to_string();
-    deadline(timeout, move || inspect_untracked(&root, &path)).await
+    deadline(timeout, move || inspect_untracked(&scope, &path)).await
 }
 
 async fn deadline<F>(timeout: Duration, inspect: F) -> Result<Inspected, ReviewError>
@@ -1557,6 +1624,12 @@ mod tests {
                         .collect::<Vec<_>>()
                 )
             })
+    }
+
+    async fn scope_for(dir: &Path) -> Arc<UntrackedScope> {
+        capture_untracked_scope(dir.to_str().unwrap())
+            .await
+            .expect("capture the untracked scope")
     }
 
     #[tokio::test]
@@ -2160,8 +2233,8 @@ mod tests {
     #[tokio::test]
     async fn a_vanished_untracked_entry_is_a_note_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().to_str().unwrap();
-        let (files, truncated) = assemble_files(root, &[], &[], 0, &["vanished.txt".to_string()])
+        let scope = scope_for(dir.path()).await;
+        let (files, truncated) = assemble_files(&scope, &[], &[], 0, &["vanished.txt".to_string()])
             .await
             .expect("a per-entry read failure must not fail the review");
 
@@ -2232,15 +2305,10 @@ mod tests {
         std::os::unix::fs::symlink("/outside/secret-target", outside.path().join("dir/link")).unwrap();
         std::os::unix::fs::symlink(outside.path().join("dir"), root.path().join("dir")).unwrap();
 
-        let (files, truncated) = assemble_files(
-            root.path().to_str().unwrap(),
-            &[],
-            &[],
-            0,
-            &["dir/link".to_string()],
-        )
-        .await
-        .unwrap();
+        let scope = scope_for(root.path()).await;
+        let (files, truncated) = assemble_files(&scope, &[], &[], 0, &["dir/link".to_string()])
+            .await
+            .unwrap();
         assert!(truncated.is_none());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].patch, IRREGULAR_NOTE);
@@ -2608,7 +2676,8 @@ mod tests {
                  --- /dev/null\n+++ b/b.txt\n@@ -0,0 +1,2 @@\n+B1\n+B2\n";
         let sections = vec![b, a];
 
-        let (files, truncated) = assemble_files("/tmp", &entries, &sections, 2, &[]).await.unwrap();
+        let scope = scope_for(Path::new("/tmp")).await;
+        let (files, truncated) = assemble_files(&scope, &entries, &sections, 2, &[]).await.unwrap();
         assert!(truncated.is_none());
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path, "a.txt");
@@ -2634,14 +2703,15 @@ mod tests {
         let a = "diff --git a/a.txt b/a.txt\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+A\n";
         let b = "diff --git a/b.txt b/b.txt\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+B\n";
 
-        let (files, truncated) = assemble_files("/tmp", &[entry("a.txt"), entry("b.txt")], &[a], 1, &[])
+        let scope = scope_for(Path::new("/tmp")).await;
+        let (files, truncated) = assemble_files(&scope, &[entry("a.txt"), entry("b.txt")], &[a], 1, &[])
             .await
             .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "a.txt");
         assert!(truncated.unwrap().contains("git 输出不完整"));
 
-        let (files, truncated) = assemble_files("/tmp", &[entry("a.txt")], &[a, b], 2, &[])
+        let (files, truncated) = assemble_files(&scope, &[entry("a.txt")], &[a, b], 2, &[])
             .await
             .unwrap();
         assert_eq!(files.len(), 1);
@@ -2661,16 +2731,11 @@ mod tests {
             .chain(std::iter::once("readable.txt".to_string()))
             .collect();
 
-        let (files, truncated) = assemble_files_with_timeout(
-            dir.path().to_str().unwrap(),
-            &[],
-            &[],
-            0,
-            &paths,
-            std::time::Duration::ZERO,
-        )
-        .await
-        .unwrap();
+        let scope = scope_for(dir.path()).await;
+        let (files, truncated) =
+            assemble_files_with_timeout(&scope, &[], &[], 0, &paths, std::time::Duration::ZERO)
+                .await
+                .unwrap();
 
         assert!(
             files.is_empty(),
@@ -2703,8 +2768,9 @@ mod tests {
     async fn an_untracked_inspection_timeout_is_an_unreadable_note() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let scope = scope_for(dir.path()).await;
 
-        match inspect_within(dir.path(), "file.txt", std::time::Duration::ZERO)
+        match inspect_within(&scope, "file.txt", std::time::Duration::ZERO)
             .await
             .unwrap()
         {
@@ -2779,24 +2845,25 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
 
         let dir = tempfile::tempdir().unwrap();
+        let scope = UntrackedScope::capture(dir.path().to_str().unwrap()).unwrap();
         let target = dir.path().join("target.txt");
         std::fs::write(&target, "target").unwrap();
         let link = dir.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        assert!(open_beneath(dir.path(), "link.txt").unwrap().is_none());
+        assert!(open_beneath(&scope, "link.txt").unwrap().is_none());
 
         let fifo = dir.path().join("pipe");
         let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: `path` is a valid NUL-terminated path inside an existing dir.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(
-            open_beneath(dir.path(), "pipe").unwrap().is_none(),
+            open_beneath(&scope, "pipe").unwrap().is_none(),
             "a FIFO must be a note, not a blocking read"
         );
 
         let regular = dir.path().join("regular.txt");
         std::fs::write(&regular, "ok").unwrap();
-        assert!(open_beneath(dir.path(), "regular.txt").unwrap().is_some());
+        assert!(open_beneath(&scope, "regular.txt").unwrap().is_some());
     }
 
     /// A parent directory swapped for a symlink must not let the read escape:
@@ -2810,21 +2877,58 @@ mod tests {
         std::fs::write(outside.path().join("dir/secret.txt"), "OUTSIDE-SECRET\n").unwrap();
         std::os::unix::fs::symlink(outside.path().join("dir"), root.path().join("dir")).unwrap();
 
-        assert!(open_beneath(root.path(), "dir/secret.txt").unwrap().is_none());
+        let scope = scope_for(root.path()).await;
+        assert!(open_beneath(&scope, "dir/secret.txt").unwrap().is_none());
         // And the review's per-entry path turns it into the note.
-        let (files, truncated) = assemble_files(
-            root.path().to_str().unwrap(),
-            &[],
-            &[],
-            0,
-            &["dir/secret.txt".to_string()],
-        )
-        .await
-        .unwrap();
+        let (files, truncated) = assemble_files(&scope, &[], &[], 0, &["dir/secret.txt".to_string()])
+            .await
+            .unwrap();
         assert!(truncated.is_none());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].patch, IRREGULAR_NOTE);
         assert!(!files[0].patch.contains("OUTSIDE-SECRET"));
+    }
+
+    /// The untracked phase is anchored to the root captured before the listing:
+    /// renaming the root and replacing its pathname with a symlink to an
+    /// outside directory must not expose the outside file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_untracked_scope_stays_anchored_after_the_root_is_replaced() {
+        use std::io::Read;
+
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("secret.txt"), "ORIGINAL\n").unwrap();
+        let scope = scope_for(&repo).await;
+
+        // Rename the repository, then put a symlink at its old pathname
+        // pointing at an outside directory with a same-named secret.
+        let moved = parent.path().join("moved");
+        std::fs::rename(&repo, &moved).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-SECRET\n").unwrap();
+        std::os::unix::fs::symlink(outside.path(), &repo).unwrap();
+
+        // The held directory fd still reaches the original content (or the
+        // open is refused) — never the outside file.
+        if let Some(mut file) = open_beneath(&scope, "secret.txt").unwrap() {
+            let mut content = String::new();
+            file.read_to_string(&mut content).unwrap();
+            assert_eq!(content, "ORIGINAL\n");
+        }
+
+        // The whole per-entry path never shows the outside bytes.
+        let file = untracked_file(&scope, "secret.txt", UNTRACKED_READ_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!file.patch.contains("OUTSIDE-SECRET"), "{}", file.patch);
+        assert!(
+            file.patch.contains("ORIGINAL") || file.patch == IRREGULAR_NOTE || file.patch == UNREADABLE_NOTE,
+            "{}",
+            file.patch
+        );
     }
 
     /// The Windows identity check accepts the very file the resolved path
@@ -2840,6 +2944,30 @@ mod tests {
         assert!(
             opened_stays_beneath(&canonical_root, &path, &file).unwrap(),
             "the opened handle is the resolved repository file"
+        );
+    }
+
+    /// The captured canonical root, not a fresh canonicalization, decides
+    /// whether the opened path is beneath: a root replaced with a symlink after
+    /// capture resolves outside and is refused.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_scope_refuses_a_replaced_root() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("secret.txt"), "ORIGINAL").unwrap();
+        let scope = UntrackedScope::capture(repo.to_str().unwrap()).unwrap();
+
+        let moved = parent.path().join("moved");
+        std::fs::rename(&repo, &moved).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "OUTSIDE-SECRET").unwrap();
+        std::os::windows::fs::symlink_dir(outside.path(), &repo).unwrap();
+
+        assert!(
+            open_beneath(&scope, "secret.txt").unwrap().is_none(),
+            "a replaced root must resolve outside the captured canonical root"
         );
     }
 
