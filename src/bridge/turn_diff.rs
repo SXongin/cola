@@ -45,8 +45,16 @@ fn records_a_file_edit(name: &str) -> bool {
 /// tools do not always record — see [`write_diff`]). Each recorded patch is
 /// split at its own file headers; a path edited more than once keeps the LAST
 /// patch, because the Turn's final recorded state is what the reader wants to
-/// review. Failed calls are skipped: a call that did not settle has no applied
-/// change to show.
+/// review.
+///
+/// Only SETTLED calls contribute. A call still `Pending`/`Running` is skipped
+/// even when it already carries a patch: V1's `edit` records the diff while it
+/// is still asking permission, and nothing has changed on disk until the call
+/// completes — exposing it would offer a change the user may yet deny. A
+/// failed call is skipped too (it applied nothing). `ToolStatus::Unknown` and a
+/// non-failed `Other` count as settled: the transcript's own `is_live` /
+/// `is_failure` verdicts are the whole rule, so a call the decoder could not
+/// classify is not treated as live forever.
 pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &TurnAnchor) -> TurnDiff {
     let mut files: IndexMap<String, TurnDiffFile> = IndexMap::new();
     for call in transcript
@@ -59,7 +67,7 @@ pub(crate) fn turn_diff_from_tools(transcript: &SessionTranscript, anchor: &Turn
             _ => None,
         })
     {
-        if call.status.is_failure() || !records_a_file_edit(&call.identity.name) {
+        if call.status.is_live() || call.status.is_failure() || !records_a_file_edit(&call.identity.name) {
             continue;
         }
         let recorded = match recorded_diff(call) {
@@ -151,6 +159,14 @@ impl PatchFile {
 /// `diff --git` marker or a `===` separator starts a new block, and a
 /// `---`/`+++` pair names its file only before the first `@@` — past that any
 /// `+`/`-` line is hunk content.
+///
+/// Deliberately not `tool_render::parse_diff`: that parser returns ONE
+/// aggregated panel body with the tool's trailing note folded out, plus a
+/// deduped path list — it discards the per-file boundary and the add/delete
+/// status this view needs, and its tail/header rules are tuned to one panel.
+/// The pieces that ARE shareable are reused instead ([`diff_header_path`],
+/// [`recorded_diff`]); extending `parse_diff` to emit per-file slices would
+/// rewrite the panel's delicate parser for this ticket only.
 fn split_patch(patch: &str) -> Vec<TurnDiffFile> {
     let mut splitter = PatchSplitter::default();
     for raw in patch.lines() {
@@ -286,9 +302,15 @@ fn header_is_null(line: &str, marker: &str) -> bool {
 /// neither generation records one on a successful `write`: V1 puts the diff on
 /// the permission ask only, V2's `write` returns no diff metadata at all. The
 /// synthesized patch shows the file's whole content against an empty old side
-/// (an addition); when V1's `metadata.exists` says the file was overwritten,
-/// the entry is labelled `modified` even though there is no recorded
-/// before-state to diff against.
+/// (an addition).
+///
+/// **Best-effort status.** V1's `metadata.exists` says whether the file was
+/// overwritten (`modified`) or created (`added`). V2 sends no `exists` and no
+/// diff, so a V2 overwrite is indistinguishable from a create here and is
+/// labelled `added`; there is no reliable in-call signal without parsing the
+/// model-facing output text, which this neutral view deliberately does not do.
+/// The patch body still shows the file's final content, which is what the
+/// reader needs; only the one-word label can overstate a V2 overwrite.
 fn write_diff(call: &ToolCall) -> Option<TurnDiffFile> {
     let input = call.input.as_ref()?;
     let path = input
@@ -679,8 +701,10 @@ Index: src/notes.lua
         assert_eq!((diff.0[0].additions, diff.0[0].deletions), (1, 2));
     }
 
-    /// V2's `write` input spells the path `path` and records no `exists`, so
-    /// the entry still takes `added` — the synthesized patch has no old side.
+    /// V2's `write` input spells the path `path` and records no `exists` (and
+    /// no diff), so the entry takes `added`. This is also the best-effort
+    /// limit pinned down: a V2 OVERWRITE is indistinguishable here and gets the
+    /// same `added` label; only V1's `metadata.exists` can say `modified`.
     #[test]
     fn a_v2_write_of_a_new_file_yields_an_added_entry() {
         let mut write = call("write", None);
@@ -708,6 +732,70 @@ Index: src/notes.lua
         let diff = turn_diff_from_tools(&transcript(vec![failed]), &anchor());
 
         assert!(diff.is_empty());
+    }
+
+    /// A live call can already carry the patch it is asking permission for:
+    /// V1's `edit` records `metadata.diff` on the permission ask, before the
+    /// request is answered and before any file changed. Neither the aggregation
+    /// nor the index may expose it until the call settles; the same call once
+    /// completed contributes, and the stats fold follows.
+    #[test]
+    fn a_live_edit_contributes_only_once_it_settles() {
+        let patch = "\
+Index: src/main.rs
+===================================================================
+--- src/main.rs
++++ src/main.rs
+@@ -1 +1 @@
+-a
++b
+";
+        let mut edit = call("edit", Some(json!({ "diff": patch })));
+
+        for status in [ToolStatus::Pending, ToolStatus::Running] {
+            edit.status = status;
+            let live = turn_diff_from_tools(&transcript(vec![edit.clone()]), &anchor());
+            assert!(live.is_empty(), "a live call has no applied change: {live:?}");
+            assert_eq!(
+                live.stats(),
+                crate::backend::TurnDiffStats::default(),
+                "the index folds the same filtered view"
+            );
+        }
+
+        edit.status = ToolStatus::Completed;
+        let settled = turn_diff_from_tools(&transcript(vec![edit]), &anchor());
+        assert_eq!(paths(&settled), ["src/main.rs"]);
+        assert_eq!(
+            settled.stats(),
+            crate::backend::TurnDiffStats {
+                files: 1,
+                additions: 1,
+                deletions: 1,
+            }
+        );
+    }
+
+    /// A status the decoder could not classify is not live: `Unknown` and a
+    /// non-failed `Other` are settled by the transcript's own `is_live` /
+    /// `is_failure` verdicts, so a recorded patch on one still counts.
+    #[test]
+    fn an_unclassified_but_settled_status_still_counts() {
+        let patch = "\
+Index: src/main.rs
+===================================================================
+--- src/main.rs
++++ src/main.rs
+@@ -1 +1 @@
+-a
++b
+";
+        for status in [ToolStatus::Unknown, ToolStatus::Other("done".into())] {
+            let mut edit = call("edit", Some(json!({ "diff": patch })));
+            edit.status = status;
+            let diff = turn_diff_from_tools(&transcript(vec![edit]), &anchor());
+            assert_eq!(paths(&diff), ["src/main.rs"]);
+        }
     }
 
     /// Overwriting an existing file is still an edit; V1's `metadata.exists`
