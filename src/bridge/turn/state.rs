@@ -2183,7 +2183,8 @@ impl StreamAccumulator {
         let Some(anchor) = self.turn_anchor.clone() else {
             return false;
         };
-        let diff = crate::bridge::turn_diff::turn_diff_from_tools(transcript, &anchor);
+        let diff =
+            crate::bridge::turn_diff::turn_diff_from_tools_in(transcript, &anchor, self.directory.as_deref());
         let stats = if diff.is_empty() {
             TurnDiffStats::default()
         } else {
