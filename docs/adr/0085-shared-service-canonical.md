@@ -46,8 +46,15 @@ boundary around it.
   stdin closed and stdout/stderr redirected to the service log, rather than a
   `pre_exec`/`libc::setsid`: the crate forbids `unsafe` outside tests, so that
   route is unavailable. With no controlling-terminal access and no
-  foreground-group membership the child receives no terminal hangup, so it still
-  outlives cola — the property `setsid` was there to provide.
+  foreground-group membership the child receives no terminal hangup, so it
+  outlives cola — the property `setsid` was there to provide. The detach leaves
+  cola's **process group**, not the systemd **cgroup**: when cola itself runs
+  under its own user unit, whose default `KillMode=control-group` stops every
+  process the unit started, a unit restart (`systemctl --user restart cola`, and
+  a `/restart` the unit's process handles) stops the service too. Keeping the
+  service independent of cola means starting it outside the unit
+  (`opencode service start`) or setting `KillMode=process` on the unit; both
+  user guides document this boundary (spec #809 decision 3).
 - **Restart outcomes**: the decision is a pure `restart_plan` over the canonical
   pick. Service → `opencode service restart` + bounded wait → `RestartedService`;
   Owned → the existing terminate / re-raise on the same port and password →
@@ -80,8 +87,11 @@ boundary around it.
   restarting a process it is about to yield.
 - Restarting the service depends on the `opencode` CLI being on `PATH` — the
   same dependency Lazy Start already carries.
-- The service outliving cola is expected, not a leak; a stale registration
-  (registered pid no longer alive) is still ignored rather than attached to,
-  the ADR-0013 rule surviving unchanged.
+- A service cola started outlives cola — except under cola's own systemd user
+  unit, whose default `KillMode=control-group` stops it along with cola (a unit
+  restart, `/restart` included). That boundary is expected, not a leak, and both
+  user guides document it and the two ways to keep the service independent. A
+  stale registration (registered pid no longer alive) is still ignored rather
+  than attached to, the ADR-0013 rule surviving unchanged.
 - ADR-0013's Owned/Coexistent/Yield model is not revised; this ADR adds the
   Service class ahead of it and the ownership boundary above it.

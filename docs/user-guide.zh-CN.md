@@ -216,6 +216,14 @@ cola 不为任何客户端做适配：同步发生在**服务器 + 共享存储 
 `"eager"`）；否则附加到已在运行的那个。V1 没有 service，继续使用
 `serve --port`。
 
+**自动启动下的重启。** 当 cola 由 systemd **用户**单元（自动启动）拉起时，该单元默认的
+`KillMode=control-group` 会在 `systemctl --user restart cola` 时、以及在 `/restart`
+由该单元的进程处理时，连同 cola 一起停掉 cola 启动的 Shared Service。这是单元的 cgroup
+边界，不是 cola 的泄漏：cola 把守护进程分离到自己的进程组，但单元仍然拥有它启动的每个进程。
+要让 service 独立于 cola，请在 cola 之前自己运行 `opencode service start`（或在单元之外
+运行 cola），也可以给单元设置 `KillMode=process`，这样重启只会停掉 cola。以其他方式启动
+时，service 会比 cola 活得更久。
+
 **OpenChamber** 默认起自己的 managed 服务器（随机端口），而不读注册文件，
 因此在把它指向 service 之前不会同步：
 

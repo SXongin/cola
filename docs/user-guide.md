@@ -288,6 +288,16 @@ zero arguments — a bare `opencode` *is* that process. cola starts it when no
 server is running (`start_server = "auto"` or `"eager"`) and otherwise attaches
 to the running one. V1 has no service and keeps using `serve --port`.
 
+**Restarting under autostart.** When cola runs from its systemd **user** unit
+(autostart), the unit's default `KillMode=control-group` stops the Shared
+Service cola started along with cola — on `systemctl --user restart cola` and on
+a `/restart` the unit's process handles. That is the unit's cgroup boundary, not
+a cola leak: cola detaches the daemon into its own process group, but the unit
+still owns every process it started. To keep the service independent of cola,
+start it yourself with `opencode service start` before cola (or run cola outside
+the unit), or set `KillMode=process` on the unit so a restart stops only cola.
+Started any other way, the service outlives cola.
+
 **OpenChamber** raises its own managed server on a random port instead of
 reading the registration file, so it does not sync until you point it at the
 service:
