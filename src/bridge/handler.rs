@@ -298,11 +298,6 @@ const TURN_DIFF_EMPTY_TEXT: &str = "本 turn 没有文件改动";
 /// and a definite failure is not retried to the caller's timeout.
 const TURN_DIFF_FAILURE_TEXT: &str = "生成完整 diff 失败，请稍后重试。";
 
-/// What an ambiguous File Message send answers: the request may have reached
-/// Feishu, so retrying could duplicate it. One text shared with `/diff`
-/// (`viewer::FILE_SEND_UNKNOWN_TEXT`).
-const TURN_DIFF_UNKNOWN_TEXT: &str = crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT;
-
 /// The artifact's `title`: what the reader opens from the Turn card.
 const TURN_DIFF_TITLE: &str = "本次改动的完整 diff";
 
@@ -884,7 +879,7 @@ fn turn_diff_state_toast(state: TurnDiffSendState) -> &'static str {
     match state {
         TurnDiffSendState::Sending => "正在生成完整 diff…",
         TurnDiffSendState::Sent => "已发送",
-        TurnDiffSendState::OutcomeUnknown => TURN_DIFF_UNKNOWN_TEXT,
+        TurnDiffSendState::OutcomeUnknown => crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT,
         TurnDiffSendState::Empty => TURN_DIFF_EMPTY_TEXT,
     }
 }
@@ -4677,8 +4672,12 @@ impl App {
             }
             crate::feishu::card::tool_render::FileDelivery::FileSendOutcomeUnknown => {
                 self.set_turn_diff_state(&key, TurnDiffSendState::OutcomeUnknown);
-                self.reply_turn_diff_line(&click.message_id, TURN_DIFF_UNKNOWN_TEXT, timeout_ms)
-                    .await;
+                self.reply_turn_diff_line(
+                    &click.message_id,
+                    crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT,
+                    timeout_ms,
+                )
+                .await;
             }
             _ => {
                 // A definite non-send: the RAII claim removes the `Sending`
@@ -5813,7 +5812,7 @@ mod turn_diff_delivery_helpers {
         assert_eq!(turn_diff_state_toast(TurnDiffSendState::Sent), "已发送");
         assert_eq!(
             turn_diff_state_toast(TurnDiffSendState::OutcomeUnknown),
-            super::TURN_DIFF_UNKNOWN_TEXT
+            crate::bridge::viewer::FILE_SEND_UNKNOWN_TEXT
         );
         assert_eq!(
             turn_diff_state_toast(TurnDiffSendState::Empty),
