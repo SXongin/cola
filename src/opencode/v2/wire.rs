@@ -48,18 +48,16 @@ pub(super) struct DataEnvelope<T> {
 }
 
 /// `GET /api/session/{id}/diff` — one `FileDiff.Info` entry. The wire spells
-/// the path `file`; the neutral model calls it `path`. A missing optional field
-/// decodes as empty/zero rather than failing the whole read (ADR-0053).
+/// the path `file`; the neutral model calls it `path`. Every field is required
+/// by that schema: an incomplete entry fails the read with a decode error
+/// naming the missing field, rather than decoding to an empty/zero value that
+/// would present a misleading diff (spec #797, ticket #799).
 #[derive(Debug, Deserialize)]
 pub(super) struct RawTurnDiffFile {
     pub(super) file: String,
-    #[serde(default)]
     pub(super) patch: String,
-    #[serde(default)]
     pub(super) additions: usize,
-    #[serde(default)]
     pub(super) deletions: usize,
-    #[serde(default)]
     pub(super) status: String,
 }
 
