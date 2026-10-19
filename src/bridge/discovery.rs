@@ -1202,15 +1202,22 @@ impl ServiceAttempt for RealServiceAttempt {
 /// once it is confirmed exited — which is what sends the caller to the
 /// `serve --port` fallback — and [`ServiceStartFailure::NotReaped`] when it is
 /// not, so no fallback is raised beside a possibly-live service.
+///
+/// A CANCELLED wait (the reconnect task dropped at shutdown) is not a normal
+/// exit: the [`ServiceAttemptGuard`] then reaps the attempt on drop, so a
+/// service child that never registered cannot be leaked.
 async fn start_shared_service(
     host: &dyn ServiceHost,
     registration_path: &std::path::Path,
     log_path: &std::path::Path,
 ) -> Result<ServerCandidate, ServiceStartFailure> {
-    let mut attempt = host
+    let attempt = host
         .spawn_service(log_path)
         .map_err(|e| ServiceStartFailure::Spawn(e.to_string()))?;
     let child_pid = attempt.pid();
+    // The attempt rides the guard so a cancelled wait still reaps it; every
+    // normal exit below disarms the guard first.
+    let mut attempt = ServiceAttemptGuard::new(host, attempt);
     let deadline = tokio::time::Instant::now() + SERVICE_START_TIMEOUT;
     let mut exited_at: Option<tokio::time::Instant> = None;
     loop {
@@ -1218,12 +1225,13 @@ async fn start_shared_service(
             // The attempt itself may be the exited contender that found an
             // incumbent, so collect it before the handle is dropped — an
             // unreaped child would outlive the start as a zombie.
-            attempt.try_reap();
+            attempt.reap_and_disarm();
             return Ok(candidate);
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            let reaped = reap_failed_service_attempt(host, &mut *attempt).await;
+            let reaped = reap_failed_service_attempt(host, attempt.attempt_mut()).await;
+            attempt.disarm();
             return Err(if reaped {
                 ServiceStartFailure::NoRegistration { child_pid }
             } else {
@@ -1239,12 +1247,21 @@ async fn start_shared_service(
         if !host.alive(child_pid) {
             let exited = *exited_at.get_or_insert(now);
             if now.duration_since(exited) >= SERVICE_START_EXIT_GRACE {
-                reap_failed_service_attempt(host, &mut *attempt).await;
+                reap_failed_service_attempt(host, attempt.attempt_mut()).await;
+                attempt.disarm();
                 return Err(ServiceStartFailure::NoRegistration { child_pid });
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+/// Whether a pid is still OUR service attempt: alive AND an
+/// `opencode ... serve --service`. A pid that has exited (a V1 binary, or a
+/// contender that found an incumbent) or been recycled must never be signalled
+/// — the same guard the Owned Server path applies before it kills.
+fn is_our_service_attempt(host: &dyn ServiceHost, pid: i32) -> bool {
+    host.alive(pid) && host.cmd(pid).is_some_and(|args| is_opencode_service_cmd(&args))
 }
 
 /// Terminate a service attempt that never registered: SIGTERM, a bounded wait,
@@ -1264,11 +1281,7 @@ async fn start_shared_service(
 /// for as long as cola runs (ticket #809).
 async fn reap_failed_service_attempt(host: &dyn ServiceHost, attempt: &mut dyn ServiceAttempt) -> bool {
     let child_pid = attempt.pid();
-    let is_our_service = host.alive(child_pid)
-        && host
-            .cmd(child_pid)
-            .is_some_and(|args| is_opencode_service_cmd(&args));
-    if !is_our_service {
+    if !is_our_service_attempt(host, child_pid) {
         // Nothing of ours to signal: the child already exited (a V1 binary, or
         // a contender that found an incumbent), or the pid is now another
         // program's. Either way a pid the process table reports dead cannot be
@@ -1307,6 +1320,100 @@ async fn wait_for_attempt_exit(attempt: &mut dyn ServiceAttempt, grace: std::tim
             return false;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// [`wait_for_attempt_exit`] for a destructor: the same bounded poll, run
+/// synchronously because `Drop` cannot await (the pattern the live-server
+/// harness already uses for its child).
+fn wait_for_attempt_exit_blocking(attempt: &mut dyn ServiceAttempt, grace: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if attempt.try_reap() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// [`reap_failed_service_attempt`] for a destructor: the same SIGTERM → bounded
+/// wait → SIGKILL sequence, run synchronously. Reached only when the wait is
+/// CANCELLED before the attempt is adopted or reaped — every normal exit
+/// disarms the guard first — so its only job is to leave no service child
+/// behind.
+fn reap_failed_service_attempt_blocking(host: &dyn ServiceHost, attempt: &mut dyn ServiceAttempt) {
+    let child_pid = attempt.pid();
+    if !is_our_service_attempt(host, child_pid) {
+        // Already exited or recycled: collect the child, never signal.
+        attempt.try_reap();
+        return;
+    }
+    let _ = host.terminate(child_pid);
+    if wait_for_attempt_exit_blocking(attempt, SERVICE_START_KILL_GRACE) {
+        return;
+    }
+    if host.alive(child_pid) {
+        tracing::warn!("cancelled OpenCode service attempt (pid {child_pid}) ignored SIGTERM; killing it");
+        let _ = host.force_kill(child_pid);
+    }
+    wait_for_attempt_exit_blocking(attempt, SERVICE_START_KILL_GRACE);
+}
+
+/// The service attempt held across the registration wait, reaping it if the
+/// wait future is CANCELLED. The wait owns the attempt so a failed start can
+/// wait it out; without this guard a cancelled start (the reconnect task
+/// dropped at shutdown) would drop the handle and leave a service child that
+/// never registered alive (ticket #809). Every normal exit disarms the guard —
+/// the timeout path reaps through [`reap_failed_service_attempt`], the success
+/// path collects an exited contender — so only cancellation reaches `Drop`.
+struct ServiceAttemptGuard<'h> {
+    host: &'h dyn ServiceHost,
+    attempt: Option<Box<dyn ServiceAttempt>>,
+    armed: bool,
+}
+
+impl<'h> ServiceAttemptGuard<'h> {
+    fn new(host: &'h dyn ServiceHost, attempt: Box<dyn ServiceAttempt>) -> Self {
+        Self {
+            host,
+            attempt: Some(attempt),
+            armed: true,
+        }
+    }
+
+    /// The attempt, for the wait's own liveness and identity checks.
+    fn attempt_mut(&mut self) -> &mut dyn ServiceAttempt {
+        self.attempt
+            .as_mut()
+            .expect("the attempt is held until Drop")
+            .as_mut()
+    }
+
+    /// Wait the attempt out and stop `Drop` from reaping it — the success path
+    /// (the attempt is the adopted daemon or an exited contender).
+    fn reap_and_disarm(&mut self) -> bool {
+        let reaped = self.attempt_mut().try_reap();
+        self.armed = false;
+        reaped
+    }
+
+    /// The attempt is already reaped or handed over: `Drop` must leave it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ServiceAttemptGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(attempt) = self.attempt.as_mut() {
+            reap_failed_service_attempt_blocking(self.host, attempt.as_mut());
+        }
     }
 }
 
@@ -3523,6 +3630,32 @@ mod tests {
 
         assert_eq!(failure, ServiceStartFailure::Spawn("opencode not found".into()));
         assert_eq!(host.calls(), vec!["spawn"]);
+    }
+
+    /// A wait that is CANCELLED — the reconnect task dropped at shutdown, while
+    /// the attempt is still waiting to register — must not leak the attempt:
+    /// the guard reaps it on drop, exactly as the timeout path would have.
+    /// Without the guard the handle is dropped and a service child that never
+    /// registered stays alive (ticket #809).
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_service_start_reaps_the_attempt() {
+        let host = FakeServiceHost::new()
+            .live(4242, &["opencode", "serve", "--service"])
+            .dies_on_terminate();
+        // One poll arms the wait (the spawn plus the first registration read)
+        // and parks it at the sleep; the elapsed timeout then CANCELS it,
+        // dropping the guard while the wait is still armed.
+        let _ = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            start_shared_service(
+                &host,
+                std::path::Path::new("/state/opencode/service.json"),
+                std::path::Path::new("/log/opencode-service.log"),
+            ),
+        )
+        .await;
+
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "reap 4242"]);
     }
 
     /// The ownership boundary (ADR-0085) lives in `OpencodeStarter::start_service`,
