@@ -523,6 +523,15 @@ pub struct SpawnCommand {
 /// OpenChamber / the CLI. cola's own process may have inherited an
 /// `XDG_DATA_HOME` (e.g. from the launching shell), so the child explicitly
 /// strips it instead of pinning a private data directory.
+///
+/// The child gets the password cola will probe with under the legacy name
+/// `OPENCODE_SERVER_PASSWORD`, and the inherited `OPENCODE_PASSWORD` is
+/// stripped: OpenCode's `Env.password` prefers `OPENCODE_PASSWORD`, so a cola
+/// launched from a shell that exported it would otherwise hand the server the
+/// inherited value while cola probes with `cola-secret` — and the attach would
+/// 401 forever (#812 precedence; #810's fallback requires the `cola-secret`
+/// path to actually work). The two names never both apply to the child: the
+/// fallback is set and the preferred one is removed.
 pub fn self_start_command(port: u16, password: &str) -> SpawnCommand {
     SpawnCommand {
         args: vec![
@@ -538,10 +547,12 @@ pub fn self_start_command(port: u16, password: &str) -> SpawnCommand {
         // pinning a private one. Likewise strip an inherited username so the
         // server uses its default `opencode` — cola's client sends exactly that,
         // so a mismatched inherited username can't cause 401s against cola's
-        // own server.
+        // own server. `OPENCODE_PASSWORD` is stripped for the same
+        // probe-must-match reason: it outranks the password set above.
         remove_env: vec![
             "XDG_DATA_HOME".to_string(),
             "OPENCODE_SERVER_USERNAME".to_string(),
+            "OPENCODE_PASSWORD".to_string(),
         ],
     }
 }
@@ -789,6 +800,11 @@ pub fn spawn_self_server(port: u16, password: &str) -> anyhow::Result<i32> {
     let cmd = self_start_command(port, password);
     let mut child = std::process::Command::new("opencode");
     child.args(&cmd.args).envs(cmd.env.iter().cloned());
+    // Removals go LAST on purpose: std/tokio's `Command` lets the last call for
+    // a key win, so a stripped name always beats a value set above. Swapping
+    // these loops would silently re-add a removed credential — the
+    // `OPENCODE_PASSWORD` strip is what keeps the child on the password cola
+    // probes with (see `self_start_command`).
     for key in &cmd.remove_env {
         child.env_remove(key);
     }
@@ -1949,6 +1965,53 @@ mod tests {
         // A cola-spawned server must use the DEFAULT username `opencode`, so
         // cola's own client (which sends that) never 401s against it.
         assert!(cmd.remove_env.contains(&"OPENCODE_SERVER_USERNAME".to_string()));
+        // The inherited PREFERRED password name must be stripped: cola probes
+        // with the value it SET below, so an inherited `OPENCODE_PASSWORD`
+        // would shadow it and 401 every attach (#812 precedence).
+        assert!(cmd.remove_env.contains(&"OPENCODE_PASSWORD".to_string()));
+    }
+
+    /// The spawned Owned Server must authenticate with the password cola probes
+    /// with — never one cola merely inherited. OpenCode's `Env.password` prefers
+    /// `OPENCODE_PASSWORD` over the `OPENCODE_SERVER_PASSWORD` set here, so
+    /// without the strip a cola launched from a shell that exported it would
+    /// leave `spawn_own_server_over`'s `serve --port` fallback (#810) failing to
+    /// attach (#812 precedence).
+    #[test]
+    fn self_start_command_cannot_be_poisoned_by_an_inherited_password() {
+        let cmd = self_start_command(4096, "cola-secret");
+        // Exactly one password name is set: the fallback, with cola's value.
+        assert_eq!(
+            cmd.env
+                .iter()
+                .filter(|(k, _)| k.starts_with("OPENCODE_"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![("OPENCODE_SERVER_PASSWORD".to_string(), "cola-secret".to_string())]
+        );
+        // Exactly the other one is stripped, so the two never both apply.
+        assert!(cmd.remove_env.contains(&"OPENCODE_PASSWORD".to_string()));
+        assert!(
+            !cmd.remove_env.contains(&"OPENCODE_SERVER_PASSWORD".to_string()),
+            "the password cola probes with must not be stripped: {:?}",
+            cmd.remove_env
+        );
+        // Model the child environment `spawn_self_server` builds — `env` applied
+        // first, then `remove_env` — and resolve it the way OpenCode's
+        // `Env.password` does: preferred name, else legacy name. An inherited
+        // preferred password resolves to nothing; only cola's own value survives.
+        let effective = |key: &str| -> Option<String> {
+            if cmd.remove_env.iter().any(|k| k == key) {
+                return None;
+            }
+            cmd.env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+        let resolved = effective("OPENCODE_PASSWORD").or_else(|| effective("OPENCODE_SERVER_PASSWORD"));
+        assert_eq!(
+            resolved.as_deref(),
+            Some("cola-secret"),
+            "the Owned Server must resolve to the password cola probes with"
+        );
     }
 
     #[test]
