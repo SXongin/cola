@@ -352,10 +352,8 @@ pub trait Backend: Send + Sync {
     /// endpoint" (V1), never an empty diff: the caller then aggregates the
     /// Turn's tool metadata (#800), so no call site branches on a Generation.
     ///
-    /// No Bridge path reads a Turn Diff yet (#801 lands the button). Like
-    /// [`Self::delete_session`], the allow keeps this trait method live so the
-    /// adapter and strategy reads are reachable through it.
-    #[allow(dead_code)]
+    /// The Turn card's 「查看完整改动」 callback (#801) reads this; V1's
+    /// aggregation (#800) is the fallback behind `Ok(None)`.
     async fn session_diff(
         &self,
         session_id: &str,

@@ -1139,7 +1139,7 @@ async fn deliver(
 /// carrying its key under `reply_target`. `Undelivered` past Feishu's 30MB cap,
 /// on a failed upload or definite send refusal. A timed-out send is ambiguous:
 /// it may have landed, so its identity must not be retried.
-async fn send_file_message(
+pub(crate) async fn send_file_message(
     platform: &Arc<dyn Platform>,
     cards: &CardsHandle,
     reply_target: &str,
