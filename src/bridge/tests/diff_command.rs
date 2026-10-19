@@ -352,3 +352,42 @@ async fn unsupported_arguments_answer_usage_only() {
         );
     }
 }
+
+/// A branch carrying `/` is sanitized into the artifact's name, which still
+/// ends `.html` (the ticket's filename acceptance, end to end through `/diff`).
+#[tokio::test]
+async fn a_branch_with_a_slash_is_sanitized_in_the_file_name() {
+    let repo = git_repo();
+    git_in(repo.path(), &["checkout", "-b", "feature/diff"]);
+    std::fs::write(repo.path().join("a.txt"), "hello\nbranch").unwrap();
+    git_in(repo.path(), &["add", "a.txt"]);
+    git_in(repo.path(), &["commit", "-m", "branch change"]);
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let key = ThreadKey::new("chat_diff_slash".into(), "chat_diff_slash".into());
+    seed_repo_session(&app, key.clone(), &repo).await;
+    send_command_in(
+        &app,
+        "/diff --base main",
+        key,
+        "msg_diff_slash",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    assert_eq!(file_messages(&calls).len(), 1, "{calls:?}");
+    let name = match uploads(&calls)[0] {
+        PlatformCall::UploadFile { name, .. } => name,
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        name,
+        &format!("review-feature_diff-{}.html", short_head(&repo)),
+        "the slash is sanitized and .html is kept"
+    );
+    assert!(name.ends_with(".html"), "{name}");
+}
