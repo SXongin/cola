@@ -204,9 +204,15 @@ pub(crate) async fn review_diff(dir: &str, base: Option<&str>) -> Result<ReviewD
         Some(sha) => format!("{base_ref} @ {}", short_sha(sha)),
         None => format!("{base_ref} · HEAD unborn"),
     };
+    let mut subtitle = format!("{base_display} · merge-base {}", short_sha(&merge_base));
+    if !untracked.is_empty() {
+        // git's `--stat` never counts untracked files, so the header numbers
+        // (which do include them) need this marker.
+        subtitle.push_str(" · 含未跟踪文件");
+    }
     let document = DiffDocument {
         title: "仓库改动".to_string(),
-        subtitle: format!("{base_display} · merge-base {}", short_sha(&merge_base)),
+        subtitle,
         files,
         truncated,
     };
@@ -1114,6 +1120,11 @@ mod tests {
         assert_eq!(review.base, "main");
         assert_eq!(review.branch, "feature");
         assert_eq!(review.document.files.len(), 4);
+        assert!(
+            review.document.subtitle.ends_with("· 含未跟踪文件"),
+            "untracked files need the marker: {}",
+            review.document.subtitle
+        );
 
         let committed = find(&review, "committed.txt");
         assert_eq!(committed.status, "modified");
@@ -1142,6 +1153,61 @@ mod tests {
         assert!(
             !numstat.contains("untracked.txt"),
             "git never counts untracked files in --numstat"
+        );
+    }
+
+    /// The document's header sums every file, including untracked additions,
+    /// while `git diff --stat` counts only tracked files — so the totals are
+    /// pinned here and the subtitle carries the marker that explains them.
+    #[tokio::test]
+    async fn totals_are_tracked_numstat_plus_untracked_additions() {
+        let repo = Repo::init();
+        repo.write("edited.txt", "a\nb\nc\n");
+        repo.write("deleted.txt", "gone\n");
+        repo.commit("base");
+        repo.git(&["checkout", "-q", "-b", "feature"]);
+        repo.write("edited.txt", "a\nB\nc\nd\n");
+        repo.git(&["rm", "-q", "deleted.txt"]);
+        repo.write("fresh.txt", "one\ntwo\nthree\n");
+
+        let review = review_diff(&repo.path_str(), Some("main")).await.unwrap();
+
+        // `git diff --numstat` is the authority for tracked files.
+        let numstat = repo.git(&["diff", "--numstat", "main"]);
+        let mut tracked_additions = 0usize;
+        let mut tracked_deletions = 0usize;
+        for line in numstat.lines() {
+            let mut fields = line.split('\t');
+            let additions: usize = fields.next().unwrap().parse().unwrap();
+            let deletions: usize = fields.next().unwrap().parse().unwrap();
+            let path = fields.next().unwrap();
+            let file = find(&review, path);
+            assert_eq!(
+                (file.additions, file.deletions),
+                (additions, deletions),
+                "{path} must match git diff --numstat"
+            );
+            tracked_additions += additions;
+            tracked_deletions += deletions;
+        }
+
+        // The untracked file is a separate addition: git's `--stat` does not
+        // count it, the document does.
+        let untracked = find(&review, "fresh.txt");
+        assert_eq!((untracked.additions, untracked.deletions), (3, 0));
+        assert!(
+            !repo.git(&["diff", "--stat", "main"]).contains("fresh.txt"),
+            "git diff --stat never counts untracked files"
+        );
+
+        let document_additions: usize = review.document.files.iter().map(|file| file.additions).sum();
+        let document_deletions: usize = review.document.files.iter().map(|file| file.deletions).sum();
+        assert_eq!(document_additions, tracked_additions + 3);
+        assert_eq!(document_deletions, tracked_deletions);
+        assert!(
+            review.document.subtitle.contains("· 含未跟踪文件"),
+            "the marker explains the --stat difference: {}",
+            review.document.subtitle
         );
     }
 
