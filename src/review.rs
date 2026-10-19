@@ -741,42 +741,61 @@ fn binary_note(section: &str, path: &str) -> String {
         .unwrap_or_else(|| format!("Binary files a/{path} and b/{path} differ"))
 }
 
-/// The untracked phase's anchor, captured once before the listing. On Unix the
-/// held directory handle pins the root directory itself: renaming the root
-/// pathname (or replacing it with a symlink) cannot redirect a later walk,
-/// because every `openat`/`readlinkat` starts from this handle rather than
-/// re-resolving the path. Other targets keep the canonical path only.
+/// The untracked phase's anchor, captured once before the listing. The anchor
+/// is a HANDLE opened first, never a path re-resolved later: on Unix the held
+/// directory handle pins the root directory itself, so renaming the root
+/// pathname (or replacing it with a symlink or another ordinary directory)
+/// cannot redirect a walk. Windows stores the captured directory identity and
+/// re-checks it around every open. Other targets keep the canonical path only.
 struct UntrackedScope {
-    /// The repository root as it was when the scope was captured.
+    /// The repository root as it was when the scope was captured. Used only
+    /// for the metadata pre-check; content walks use the anchored handle.
     canonical_root: PathBuf,
     /// The open directory handle every Unix walk starts from.
     #[cfg(unix)]
     dir: std::fs::File,
+    /// The root pathname as git reported it; the Windows identity re-check
+    /// opens it to prove it still names the captured directory.
+    #[cfg(windows)]
+    root: PathBuf,
+    /// The directory identity captured before canonicalization, so a
+    /// replacement at the same pathname is never adopted.
+    #[cfg(windows)]
+    root_handle: same_file::Handle,
 }
 
 impl UntrackedScope {
     /// Capture the scope. Runs on the blocking pool (it can stall on a network
-    /// filesystem). The root is canonicalized first and then opened with
-    /// `O_NOFOLLOW`, so a root pathname already swapped for a symlink fails
-    /// instead of anchoring to the wrong directory.
+    /// filesystem). The handle is opened FIRST, from the path git gave us, with
+    /// no canonicalize→open gap: a directory swapped in at the same pathname
+    /// after capture cannot be adopted as the anchor. The canonical path is
+    /// derived afterwards only for the metadata pre-check and the Windows
+    /// prefix check.
     fn capture(root: &str) -> Result<Self, ReviewError> {
-        let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
         #[cfg(unix)]
         let dir = {
             use rustix::fs::{CWD, Mode, OFlags};
             let fd = rustix::fs::openat(
                 CWD,
-                &canonical_root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|error| map_io_error(error.into()))?;
             std::fs::File::from(fd)
         };
+        #[cfg(windows)]
+        let root_handle = same_file::Handle::from_path(root).map_err(map_io_error)?;
+
+        let canonical_root = std::fs::canonicalize(root).map_err(map_io_error)?;
         Ok(Self {
             canonical_root,
             #[cfg(unix)]
             dir,
+            #[cfg(windows)]
+            root: PathBuf::from(root),
+            #[cfg(windows)]
+            root_handle,
         })
     }
 }
@@ -1027,12 +1046,21 @@ fn open_beneath(scope: &UntrackedScope, relative: &str) -> Result<Option<std::fs
     if beneath_components(relative).is_none() {
         return Ok(None);
     }
-    // Compare against the root captured with the scope, never a fresh
-    // canonicalization: a replaced root pathname resolves outside and is
-    // refused.
+    // 1. The root pathname must still name the directory captured with the
+    //    scope. An ordinary-directory or symlink replacement fails here.
+    if !root_is_captured(scope)? {
+        return Ok(None);
+    }
+    // The resolved path must stay under the CAPTURED canonical root; a root
+    // replaced after capture resolves outside.
     let full = scope.canonical_root.join(relative);
     let file = std::fs::File::open(&full).map_err(map_io_error)?;
     if !opened_stays_beneath(&scope.canonical_root, &full, &file).map_err(map_io_error)? {
+        return Ok(None);
+    }
+    // 2. Re-check the root after the open: a replacement between the first
+    //    check and the open would otherwise be adopted as the anchor.
+    if !root_is_captured(scope)? {
         return Ok(None);
     }
     let meta = file.metadata().map_err(map_io_error)?;
@@ -1040,6 +1068,15 @@ fn open_beneath(scope: &UntrackedScope, relative: &str) -> Result<Option<std::fs
         return Ok(None);
     }
     Ok(Some(file))
+}
+
+/// Whether the root pathname still names the directory whose identity was
+/// captured with the scope. Opened before and after the file open, so neither
+/// an ordinary-directory nor a symlink replacement can be adopted.
+#[cfg(windows)]
+fn root_is_captured(scope: &UntrackedScope) -> Result<bool, ReviewError> {
+    let current = same_file::Handle::from_path(&scope.root).map_err(map_io_error)?;
+    Ok(current == scope.root_handle)
 }
 
 /// Whether `file` is the file `full` resolves to, and that resolution is under
@@ -2676,7 +2713,10 @@ mod tests {
                  --- /dev/null\n+++ b/b.txt\n@@ -0,0 +1,2 @@\n+B1\n+B2\n";
         let sections = vec![b, a];
 
-        let scope = scope_for(Path::new("/tmp")).await;
+        // A real, existing root: the scope anchors a directory handle. The
+        // synthetic sections need no files under it.
+        let dir = tempfile::tempdir().unwrap();
+        let scope = scope_for(dir.path()).await;
         let (files, truncated) = assemble_files(&scope, &entries, &sections, 2, &[]).await.unwrap();
         assert!(truncated.is_none());
         assert_eq!(files.len(), 2);
@@ -2703,7 +2743,10 @@ mod tests {
         let a = "diff --git a/a.txt b/a.txt\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+A\n";
         let b = "diff --git a/b.txt b/b.txt\n--- /dev/null\n+++ b/b.txt\n@@ -0,0 +1 @@\n+B\n";
 
-        let scope = scope_for(Path::new("/tmp")).await;
+        // A real, existing root: the scope anchors a directory handle. The
+        // synthetic sections need no files under it.
+        let dir = tempfile::tempdir().unwrap();
+        let scope = scope_for(dir.path()).await;
         let (files, truncated) = assemble_files(&scope, &[entry("a.txt"), entry("b.txt")], &[a], 1, &[])
             .await
             .unwrap();
@@ -2931,6 +2974,47 @@ mod tests {
         );
     }
 
+    /// Replacing the captured root with an ORDINARY directory (not a symlink)
+    /// must not adopt it either: the held fd keeps reading the original tree,
+    /// or the open is refused — never the replacement's bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_untracked_scope_survives_an_ordinary_root_replacement() {
+        use std::io::Read;
+
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("secret.txt"), "ORIGINAL\n").unwrap();
+        let scope = scope_for(&repo).await;
+
+        // Move the captured directory away, then put a DIFFERENT ordinary
+        // directory at the same pathname with a same-named secret.
+        let moved = parent.path().join("moved");
+        std::fs::rename(&repo, &moved).unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("secret.txt"), "REPLACEMENT-SECRET\n").unwrap();
+
+        // The held directory fd still reaches the original content (or the
+        // open is refused) — never the replacement file.
+        if let Some(mut file) = open_beneath(&scope, "secret.txt").unwrap() {
+            let mut content = String::new();
+            file.read_to_string(&mut content).unwrap();
+            assert_eq!(content, "ORIGINAL\n");
+        }
+
+        // The whole per-entry path never shows the replacement bytes.
+        let file = untracked_file(&scope, "secret.txt", UNTRACKED_READ_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!file.patch.contains("REPLACEMENT-SECRET"), "{}", file.patch);
+        assert!(
+            file.patch.contains("ORIGINAL") || file.patch == IRREGULAR_NOTE || file.patch == UNREADABLE_NOTE,
+            "{}",
+            file.patch
+        );
+    }
+
     /// The Windows identity check accepts the very file the resolved path
     /// names; real handles only, no fabricated metadata.
     #[cfg(windows)]
@@ -2968,6 +3052,28 @@ mod tests {
         assert!(
             open_beneath(&scope, "secret.txt").unwrap().is_none(),
             "a replaced root must resolve outside the captured canonical root"
+        );
+    }
+
+    /// An ordinary-directory replacement at the captured pathname is refused
+    /// by the stored root identity, not merely by a canonical prefix.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_scope_refuses_an_ordinary_directory_replacement() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo = parent.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("secret.txt"), "ORIGINAL").unwrap();
+        let scope = UntrackedScope::capture(repo.to_str().unwrap()).unwrap();
+
+        let moved = parent.path().join("moved");
+        std::fs::rename(&repo, &moved).unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("secret.txt"), "OUTSIDE-SECRET").unwrap();
+
+        assert!(
+            open_beneath(&scope, "secret.txt").unwrap().is_none(),
+            "a replaced ordinary root must fail the captured root identity"
         );
     }
 
