@@ -468,6 +468,41 @@ async fn an_ambiguous_send_is_terminal_and_never_duplicated() {
     );
 }
 
+/// A send that fails at transport/5xx after the request went out may have
+/// landed. It is spoken as unknown and the `(session, from)` guard stays
+/// terminal, so a later click cannot duplicate the File Message.
+#[tokio::test]
+async fn a_post_accept_send_error_is_terminal_and_never_duplicated() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.given_session_diff(TurnDiff(vec![diff_file("src/a.rs", 1, 0)]));
+    let (app, platform, backend) = app_with_backend(cfg, backend);
+    platform
+        .ambiguous_send_message_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    app.host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    wait_for_reply_containing(&platform, "发送结果未知").await;
+    assert_eq!(file_uploads(&platform).await.len(), 1, "one upload");
+
+    let repeated = app
+        .host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("a repeated click is acknowledged");
+    assert_eq!(
+        repeated.toast.as_deref(),
+        Some("发送结果未知，为避免重复未重试。")
+    );
+    assert_eq!(file_uploads(&platform).await.len(), 1, "no second upload");
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        1,
+        "the ambiguous outcome is terminal: no second diff read"
+    );
+}
+
 /// A failed transcript read does not lose the artifact on V2: the header states
 /// the time as unknown and the File Message still lands.
 #[tokio::test]
