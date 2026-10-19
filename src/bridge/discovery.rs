@@ -1102,8 +1102,10 @@ fn spawn_service_detached(log_path: &std::path::Path) -> anyhow::Result<Box<dyn 
     {
         // A NEW PROCESS GROUP detaches the daemon from cola's: a signal aimed at
         // cola's group (Ctrl-C at its terminal, a supervisor's group kill) never
-        // reaches the service. `setsid` is not reachable here — `pre_exec` is
-        // the only std route to it and this crate forbids `unsafe` outside tests
+        // reaches the service. This is a deliberate deviation from ticket
+        // #810's literal `setsid` (recorded in ADR-0085): `setsid` is not
+        // reachable here — `pre_exec` is the only std route to it and this
+        // crate forbids `unsafe` outside tests
         // (`#![cfg_attr(not(test), forbid(unsafe_code))]`). The difference is
         // the session, and it cannot bite: the child's stdin is closed and its
         // stdout/stderr are files, so it never touches the controlling terminal

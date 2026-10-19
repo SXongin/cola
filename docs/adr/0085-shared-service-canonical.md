@@ -41,6 +41,13 @@ boundary around it.
   connections. cola does not kill it or re-spawn it with `serve --port`, and
   does not rewrite its registration. (Starting the service when none exists is
   #810; this ADR fixes the ownership boundary that makes it possible.)
+- **Detaching the started service deviates from #810's literal `setsid`.** The
+  child leaves cola's process group through `CommandExt::process_group(0)` with
+  stdin closed and stdout/stderr redirected to the service log, rather than a
+  `pre_exec`/`libc::setsid`: the crate forbids `unsafe` outside tests, so that
+  route is unavailable. With no controlling-terminal access and no
+  foreground-group membership the child receives no terminal hangup, so it still
+  outlives cola — the property `setsid` was there to provide.
 - **Restart outcomes**: the decision is a pure `restart_plan` over the canonical
   pick. Service → `opencode service restart` + bounded wait → `RestartedService`;
   Owned → the existing terminate / re-raise on the same port and password →
