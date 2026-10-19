@@ -1836,7 +1836,11 @@ fn parse_diff(diff: &str, keep_file_headers: bool) -> Option<EditDiff> {
 /// The bridge appends a tail after the whole diff and no tool note opens with a
 /// full file-block shape today, so this check reads it as a file; separating
 /// the two would need the producer's intent, which the text does not carry.
-fn opens_file_block(lines: &[&str], from: usize) -> bool {
+///
+/// Shared with the Turn Diff aggregation (#800) so the blank-line rule for a
+/// joined multi-file patch — and for a tool's trailing note — has one source of
+/// truth.
+pub(crate) fn opens_file_block(lines: &[&str], from: usize) -> bool {
     let mut block = lines
         .get(from..)
         .unwrap_or_default()
