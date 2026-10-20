@@ -1247,14 +1247,27 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
 /// unreferenced when the chat's next run replaces the record. So the record set
 /// is the protection, and age decides among the rest.
 ///
+/// The reference set must also be **complete**: a record that could not be read
+/// may name the very file this would unlink, so an unreadable record — or an
+/// unlistable record directory — skips the sweep for this start entirely rather
+/// than deleting against a partial view. Deleting nothing is always recoverable;
+/// unlinking a log whose writer is holding it open is not.
+///
 /// Returns how many files were removed.
 pub(crate) fn sweep_logs(root: &Path, log_days: u32, records: &TerminalRunRecords) -> usize {
+    let (records_on_disk, complete) = records.scan();
+    if !complete {
+        tracing::warn!(
+            "terminal: skipping the Terminal Log age sweep — every run record must be readable \
+             before a log can be proven unreferenced"
+        );
+        return 0;
+    }
     let retention = Duration::from_secs(u64::from(log_days.max(1)) * 24 * 60 * 60);
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
-    let referenced: std::collections::HashSet<PathBuf> = records
-        .load_all()
+    let referenced: std::collections::HashSet<PathBuf> = records_on_disk
         .into_iter()
         .map(|record| PathBuf::from(record.log_path))
         .collect();
