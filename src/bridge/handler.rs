@@ -195,6 +195,21 @@ enum PromptRoute {
     },
 }
 
+/// What the prompt pipeline did with a submission, for the one caller that must
+/// report the outcome on a card of its own (the Terminal Card's 「问 AI」,
+/// ADR-0086 decision 9). Deriving it from the pipeline's own decision — rather
+/// than reading ownership a second time — is what keeps the report from ever
+/// disagreeing with the route. It deliberately says nothing about the model
+/// having answered: the new Turn's card, or the live chain's continuation,
+/// carries the answer.
+enum PromptSubmission {
+    /// No chain was owned: the message opened a new Turn whose card answers it.
+    NewTurn,
+    /// cola owned the live chain: the message merged into that Turn as its
+    /// Supplement. `submitted` is the Backend's own verdict on the send.
+    Supplement { submitted: bool },
+}
+
 /// Which `action: "file"` transfer a card click asked for (#739, #778). Both
 /// send the file's whole bytes as one File Message; they differ in the card the
 /// click landed on. [`ViewerFileOp::Send`] is the viewer's own button, so its
@@ -209,14 +224,18 @@ enum ViewerFileOp {
     Preview,
 }
 
-/// Everything a Terminal Card's 「📄 完整输出」 payload carries (ADR-0086
-/// decisions 4 and 7): the clicked card and the **Terminal Log** path, plus the
-/// settled card's own render inputs so the delivery can PATCH the outcome back
-/// onto the same card without a card-view read or a second state store.
-struct TerminalFullOutputRequest {
+/// Everything a settled Terminal Card's buttons carry (ADR-0086 decisions 4, 7
+/// and 9): the clicked card and the **Terminal Log** path, plus the settled
+/// card's own render inputs so a click's outcome can be PATCHed back onto the
+/// same card without a card-view read or a second state store.
+struct TerminalCardRequest {
     message_id: String,
     chat_id: String,
     thread_id: String,
+    /// Whether the card lives in a group chat. A click carries no chat type of
+    /// its own, and the 「问 AI」 submission needs it to rebuild the Chat/Topic
+    /// route; absent reads as group (the skill picker's fallback).
+    is_group: bool,
     path: String,
     cwd: String,
     command: String,
@@ -225,7 +244,7 @@ struct TerminalFullOutputRequest {
     output_over_limit: bool,
 }
 
-impl TerminalFullOutputRequest {
+impl TerminalCardRequest {
     /// Parse the button value; `None` when the click cannot be routed (no card
     /// id, no log path) or the payload is not one of ours.
     fn from_value(value: &serde_json::Value) -> Option<Self> {
@@ -247,6 +266,7 @@ impl TerminalFullOutputRequest {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
                 .to_string(),
+            is_group: value.get("chat_type").and_then(serde_json::Value::as_str) != Some("p2p"),
             path,
             cwd: run.get("cwd")?.as_str()?.to_string(),
             command: run.get("command")?.as_str()?.to_string(),
@@ -263,6 +283,43 @@ impl TerminalFullOutputRequest {
                 .get("output_over_limit")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
+        })
+    }
+}
+
+/// Everything the Terminal Card's 「问 AI」 button carries (ADR-0086 decisions 4
+/// and 9): the clicked card's facts plus the output window it was rendered
+/// with. The submission therefore needs neither the live process nor the
+/// **Terminal Log** on disk — a run the sweep marked lost keeps its button
+/// working.
+struct TerminalAskAiRequest {
+    card: TerminalCardRequest,
+    /// The window the card showed: already ANSI-stripped, line-capped and
+    /// bounded by the display tail budget.
+    output: String,
+    /// Whether older output existed and was omitted from that window.
+    output_truncated: bool,
+    /// The click's own actor, so a group Completion Notice can name them.
+    requester_open_id: Option<String>,
+}
+
+impl TerminalAskAiRequest {
+    /// Parse the button value; `None` when the payload is not one of ours (a
+    /// submission without a window has nothing to quote).
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let card = TerminalCardRequest::from_value(value)?;
+        Some(Self {
+            card,
+            output: value.get("output")?.as_str()?.to_string(),
+            output_truncated: value
+                .get("output_truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            requester_open_id: value
+                .get("operator_open_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
         })
     }
 }
@@ -1967,6 +2024,24 @@ impl App {
         kind: ConversationKind,
         skills: Vec<PromptSkill>,
     ) -> crate::error::Result<()> {
+        self.submit_prompt(thread_key, msg, kind, skills)
+            .await
+            .map(|_| ())
+    }
+
+    /// The pipeline itself: every prompt — a typed message, a Skill dispatch, a
+    /// Forward, and the Terminal Card's 「问 AI」 — goes through here, so none
+    /// of them can grow a second routing rule. It returns what it did with the
+    /// message for the one caller that reports the outcome on a card of its own;
+    /// `None` means nothing was submitted (no server), and the refusal was
+    /// already spoken.
+    async fn submit_prompt(
+        self: &Arc<Self>,
+        thread_key: ThreadKey,
+        msg: crate::bridge::IncomingMessage,
+        kind: ConversationKind,
+        skills: Vec<PromptSkill>,
+    ) -> crate::error::Result<Option<PromptSubmission>> {
         let crate::bridge::IncomingMessage {
             message_id,
             chat_type,
@@ -1987,7 +2062,7 @@ impl App {
         // with `/skill` the one prompt-like exception (see
         // [`Self::handle_skill_command`]).
         if !self.ensure_server_for(&message_id).await {
-            return Ok(());
+            return Ok(None);
         }
         let is_group = chat_type == "group";
         let mut text = text;
@@ -2129,7 +2204,8 @@ impl App {
                     skills,
                     advisory_live,
                 })
-                .await
+                .await?;
+                Ok(Some(PromptSubmission::NewTurn))
             }
             // Supplement path (ADR-0043, owned routing per ADR-0062): cola
             // holds the Session's live Execution, so the message does not start
@@ -2151,7 +2227,7 @@ impl App {
                 // Each supplement is its own logical user message: fresh
                 // cola-authored id (ADR-0026), never reused.
                 let cola_msg_id = crate::opencode::parsing::cola_message_id();
-                match self
+                let submitted = match self
                     .opencode
                     .prompt(
                         &session_id,
@@ -2170,6 +2246,7 @@ impl App {
                             "supplement: session {} in-flight, message queued to merge into current turn",
                             session_id
                         );
+                        true
                     }
                     Err(e) => {
                         tracing::warn!("supplement: prompt failed: {}", e);
@@ -2180,8 +2257,9 @@ impl App {
                             .feishu
                             .reply_text(&message_id, "⚠️ 补充消息发送失败，请稍后重试。")
                             .await;
+                        false
                     }
-                }
+                };
                 // The supplement landed below the live card: split the Card
                 // Chain at this message (ADR-0043). The previous card is
                 // finalized with the standard split header and keeps everything
@@ -2200,7 +2278,7 @@ impl App {
                 // is done — once the prompt is visible in the transcript, the
                 // Sync's own staleness rule takes over (#424).
                 self.waits_handle().clear_inbound(&session_id).await;
-                Ok(())
+                Ok(Some(PromptSubmission::Supplement { submitted }))
             }
         }
     }
@@ -2450,6 +2528,12 @@ impl App {
                 // ack budget.
                 "terminal" => match value.get("op").and_then(|v| v.as_str()) {
                     Some("full_output") => self.handle_terminal_full_output(&value).await,
+                    // 「问 AI」 (ADR-0086 decision 9): the ONLY path by which
+                    // terminal output reaches the model. Like the retrieval
+                    // click it leaves the callback: the normal prompt pipeline
+                    // runs off the ack, because it may ensure a server and wait
+                    // on a whole Turn.
+                    Some("ask_ai") => self.handle_terminal_ask_ai(&value).await,
                     // 「⏹ 终止」 / 「继续」 (ADR-0086 decision 6): the click
                     // only routes to the Chat/Topic's current run, whose id
                     // the button carries. A click for any other run id is
@@ -5364,7 +5448,7 @@ impl App {
         self: &Arc<Self>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
-        let Some(request) = TerminalFullOutputRequest::from_value(value) else {
+        let Some(request) = TerminalCardRequest::from_value(value) else {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("无效操作".to_string()),
@@ -5395,7 +5479,7 @@ impl App {
     /// is the log's first 30 MB plus a truncation line — the log on disk is
     /// never truncated, because the child's descriptor offset does not move
     /// back.
-    async fn run_terminal_full_output(self: &Arc<Self>, request: TerminalFullOutputRequest) {
+    async fn run_terminal_full_output(self: &Arc<Self>, request: TerminalCardRequest) {
         let timeout_ms = self
             .viewer_transfer_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -5508,6 +5592,7 @@ impl App {
                     log_path: &request.path,
                     chat_id: &request.chat_id,
                     thread_id: &request.thread_id,
+                    is_group: request.is_group,
                     exit_code: request.exit_code,
                     elapsed: request.elapsed,
                     output_over_limit: request.output_over_limit,
@@ -5557,6 +5642,135 @@ impl App {
             Some(Ok(_))
         ) {
             tracing::warn!("terminal: full-output outcome reply for {message_id} did not land");
+        }
+    }
+
+    /// The Terminal Card's 「问 AI」 click (ADR-0086 decision 9) — the ONE
+    /// explicit door by which a Terminal Command's output reaches the model.
+    /// No Terminal Command ever submits its own output, so this click is the
+    /// only path into the Session Transcript.
+    ///
+    /// The payload is self-describing: the command and the output window the
+    /// button was rendered with. The submission therefore needs neither a live
+    /// process nor the **Terminal Log** on disk, so it works on a run the startup
+    /// sweep marked lost (ADR-0086 decision 5).
+    ///
+    /// The callback must ack inside Feishu's budget, and the normal prompt
+    /// pipeline may ensure a server and wait on a whole Turn, so the click
+    /// acknowledges and spawns it. The card is PATCHed with what happened to
+    /// the *submission* — a new Turn or a Supplement — never with a claim that
+    /// the model answered; the answer belongs to the Turn's own card.
+    async fn handle_terminal_ask_ai(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
+        let Some(request) = TerminalAskAiRequest::from_value(value) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        };
+        let app = Arc::clone(self);
+        tokio::spawn(async move {
+            app.run_terminal_ask_ai(request).await;
+        });
+        Some(CardActionResult {
+            card: None,
+            toast: Some("🤖 正在把终端输出提交给 AI…".to_string()),
+        })
+    }
+
+    /// The 「问 AI」 submission itself, off the card callback: build the framed
+    /// prompt from the button's payload, hand it to the one prompt pipeline,
+    /// and PATCH the clicked card with the submission's outcome.
+    async fn run_terminal_ask_ai(self: &Arc<Self>, request: TerminalAskAiRequest) {
+        let card = &request.card;
+        // Rebuild the Chat/Topic route from the payload. A click carries no
+        // chat_type of its own, and a non-topic ThreadKey's `thread_id` IS its
+        // `chat_id`, so drop it before classifying (the skill picker's rule).
+        let thread_id =
+            (!card.thread_id.is_empty() && card.thread_id != card.chat_id).then(|| card.thread_id.clone());
+        let chat_type = if card.is_group { "group" } else { "p2p" };
+        let kind = ConversationKind::classify(chat_type, thread_id.as_deref());
+        let thread_key = kind.thread_key(&card.chat_id, thread_id.as_deref());
+        let text = crate::bridge::terminal::ask_ai_prompt(
+            &card.cwd,
+            &card.command,
+            card.exit_code,
+            &request.output,
+            request.output_truncated,
+        );
+        let msg = crate::bridge::IncomingMessage {
+            // The Turn's card replies under the clicked Terminal Card, so the
+            // answer lands next to the run it explains.
+            message_id: card.message_id.clone(),
+            chat_id: card.chat_id.clone(),
+            chat_type: chat_type.to_string(),
+            thread_id,
+            // No Quoted Context: the card's content is the submission itself,
+            // not a parent message to fetch.
+            parent_id: None,
+            text,
+            images: Vec::new(),
+            files: Vec::new(),
+            omitted: Vec::new(),
+            requester_open_id: request.requester_open_id.clone(),
+        };
+        let notice = match self.submit_prompt(thread_key, msg, kind, Vec::new()).await {
+            Ok(Some(PromptSubmission::NewTurn)) => "🤖 已作为新的对话提交给 AI（回答会出现在新的卡片上）。",
+            Ok(Some(PromptSubmission::Supplement { submitted: true })) => "🤖 已作为补充消息提交给当前运行。",
+            Ok(Some(PromptSubmission::Supplement { submitted: false })) => "⚠️ 提交给 AI 失败，请稍后重试。",
+            // Nothing was submitted: the pipeline already spoke its refusal
+            // (no server), and the card must not pretend otherwise.
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!("terminal: 问 AI submission failed: {error}");
+                "⚠️ 提交给 AI 失败，请稍后重试。"
+            }
+        };
+        let card =
+            crate::feishu::card::terminal::build_terminal_card(crate::feishu::card::terminal::TerminalCard {
+                cwd: &request.card.cwd,
+                command: &request.card.command,
+                output: &request.output,
+                output_truncated: request.output_truncated,
+                output_over_limit: request.card.output_over_limit,
+                full_output: Some(crate::feishu::card::terminal::TerminalFullOutput {
+                    log_path: &request.card.path,
+                    chat_id: &request.card.chat_id,
+                    thread_id: &request.card.thread_id,
+                    is_group: request.card.is_group,
+                    exit_code: request.card.exit_code,
+                    elapsed: request.card.elapsed,
+                    output_over_limit: request.card.output_over_limit,
+                }),
+                notice: Some(notice),
+                state: crate::feishu::card::terminal::TerminalState::Settled {
+                    exit_code: request.card.exit_code,
+                    spawn_error: None,
+                    elapsed: request.card.elapsed,
+                    // The outcome PATCH rebuilds a settled card, so the run
+                    // controls stay dead.
+                    stopped: false,
+                    survivors: false,
+                },
+                run_id: "",
+                chat_id: &request.card.chat_id,
+                thread_id: &request.card.thread_id,
+            });
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !matches!(
+            crate::bridge::bounded_call(
+                "terminal 问 AI card",
+                timeout_ms,
+                self.feishu.update_message(&request.card.message_id, &card),
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            tracing::warn!(
+                "terminal: 问 AI outcome for {} did not land",
+                request.card.message_id
+            );
         }
     }
 

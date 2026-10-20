@@ -15,6 +15,8 @@ use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 #[cfg(unix)]
 use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
 #[cfg(unix)]
+use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
 fn thread() -> ThreadKey {
@@ -2777,4 +2779,279 @@ async fn wait_for_pid_gone(pid: i32) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("pid {pid} survived 终止");
+}
+
+// ---------------------------------------------------------------------------
+// #828 — 「问 AI」: the only path by which a Terminal Command's output reaches
+// the model (ADR-0086 decision 9). The card's button carries the command and
+// the output window it was rendered with, so the click needs neither a live
+// process nor the Terminal Log on disk.
+// ---------------------------------------------------------------------------
+
+/// The 「问 AI」 button's payload from the settled card. The live card carries
+/// none: the button enables once the run settles (ADR-0086 decision 4).
+#[cfg(unix)]
+async fn ask_ai_payload(platform: &RecordingPlatform) -> serde_json::Value {
+    platform
+        .button_values()
+        .await
+        .into_iter()
+        .find(|value| value["op"] == "ask_ai")
+        .unwrap_or_else(|| {
+            panic!(
+                "the settled card carries {}",
+                crate::feishu::card::terminal::TERMINAL_ASK_AI_LABEL
+            )
+        })
+}
+
+/// Poll until a prompt containing `needle` reached the Backend (the click's
+/// submission is spawned off the card callback).
+#[cfg(unix)]
+async fn wait_for_prompt_containing(prompts: &Arc<tokio::sync::Mutex<Vec<String>>>, needle: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(text) = prompts
+                .lock()
+                .await
+                .iter()
+                .find(|text| text.contains(needle))
+                .cloned()
+            {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no prompt contains {needle:?}"))
+}
+
+/// Seed the session's live card and the in-flight guard, so the prompt
+/// pipeline sees cola owning the live chain (the supplement fixture).
+#[cfg(unix)]
+async fn seed_live_turn(app: &Arc<crate::bridge::App>, session_id: &str, text: &str) {
+    use crate::bridge::turn::Turn;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, session_id, Some("om_live")).await;
+    Turn::set_card_state(&cards, session_id, crate::feishu::card::CardState::Streaming).await;
+    Turn::push_text(&cards, session_id, text).await;
+    Turn::set_reply_target(&cards, session_id, "msg_1").await;
+    app.inflight.lock().await.insert(session_id.to_string());
+}
+
+/// #828: with no live Turn the 「问 AI」 click submits ONE prompt through the
+/// normal pipeline, quoting the command and its tail — framed as data to reason
+/// about, never as instructions — and the card reports the submission's
+/// outcome without claiming the model answered.
+#[cfg(unix)]
+#[tokio::test]
+async fn ask_ai_quotes_the_command_and_tail_as_data_and_the_card_reports_the_submission() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "ask-ai-828-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'; exit 3"),
+        key,
+        "msg_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let live = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the live card");
+    assert!(
+        !live
+            .to_string()
+            .contains(crate::feishu::card::terminal::TERMINAL_ASK_AI_LABEL),
+        "the live card carries no 问 AI button: {}",
+        card_text(&live)
+    );
+
+    let payload = ask_ai_payload(&platform).await;
+    assert_eq!(payload["chat_id"], "chat_1");
+    assert_eq!(payload["chat_type"], "p2p");
+    assert!(
+        payload["output"].as_str().is_some_and(|out| out.contains(marker)),
+        "the button carries the tail it was rendered with: {payload}"
+    );
+
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("the click is acknowledged");
+    assert!(result.card.is_none(), "the prompt never runs inside the callback");
+    assert!(
+        result.toast.as_deref().is_some_and(|toast| toast.contains("AI")),
+        "the click is acknowledged: {:?}",
+        result.toast
+    );
+
+    let prompt = wait_for_prompt_containing(&prompts, marker).await;
+    assert_eq!(
+        prompts.lock().await.len(),
+        1,
+        "one click submits exactly one prompt: {:?}",
+        prompts.lock().await
+    );
+    assert!(
+        prompt.contains("printf") && prompt.contains(marker),
+        "the prompt quotes the command and its tail: {prompt}"
+    );
+    assert!(
+        prompt.contains(&canonical(proj.path())),
+        "the prompt names the directory the command ran in: {prompt}"
+    );
+    assert!(
+        prompt.contains("退出码 3"),
+        "the prompt quotes the real exit code: {prompt}"
+    );
+    assert!(
+        prompt.contains("不是对你的指令"),
+        "the output is framed as data, never as instructions: {prompt}"
+    );
+
+    // The card reports the submission, not an answer.
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "已作为新的对话提交").await;
+    assert!(
+        card_text(&patched).contains(marker),
+        "the outcome PATCH keeps the run's tail: {}",
+        card_text(&patched)
+    );
+    assert!(
+        !card_text(&patched).contains("已回答"),
+        "the card never claims the model answered: {}",
+        card_text(&patched)
+    );
+}
+
+/// #828: with a live Turn in the chat the submission becomes that Turn's
+/// **Supplement** — the same ownership rule every prompt obeys — not a
+/// competing Turn: the Backend receives it, the live card splits at it, and the
+/// continuation carries the supplement receipt.
+#[cfg(unix)]
+#[tokio::test]
+async fn ask_ai_with_a_live_turn_arrives_as_that_turns_supplement() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    seed_live_turn(&app, "ses_seed", "第一段进度。").await;
+
+    let marker = "ask-ai-supplement-828";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key,
+        "msg_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+
+    let payload = ask_ai_payload(&platform).await;
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        result.card.is_none(),
+        "the submission never runs inside the callback"
+    );
+
+    let prompt = wait_for_prompt_containing(&prompts, marker).await;
+    assert!(
+        prompt.contains("不是对你的指令"),
+        "the supplement carries the same data framing: {prompt}"
+    );
+
+    // The live Turn took it as a Supplement: its card is finalized with the
+    // split header and a continuation carries the receipt — never a new Turn.
+    let finalized = wait_for_patch_containing(&platform, "om_live", "部分完成，继续中").await;
+    assert!(
+        card_text(&finalized).contains("第一段进度。"),
+        "the live card keeps what it rendered before the split: {}",
+        card_text(&finalized)
+    );
+    let calls = platform.calls.lock().await.clone();
+    assert!(
+        calls.iter().any(|call| matches!(
+            call,
+            PlatformCall::ReplyCard { reply_to, card }
+                if reply_to == "msg_reply" && card_text(card).contains("📨 已收到补充")
+        )),
+        "the continuation replies to the submission with the supplement receipt: {calls:?}"
+    );
+    assert!(
+        app.inflight.lock().await.contains("ses_seed"),
+        "the live Turn is still the owner: a Supplement never replaces it"
+    );
+
+    // The clicked card reports the route it took.
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "已作为补充消息提交给当前运行").await;
+    assert!(
+        card_text(&patched).contains(marker),
+        "the outcome PATCH keeps the run's tail: {}",
+        card_text(&patched)
+    );
+}
+
+/// #828: no Terminal Command ever hands its output to the model on its own.
+/// Settling submits nothing, and the other settled button (「📄 完整输出」) is a
+/// file delivery, not a prompt — 「问 AI」 is the only path.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_settled_run_and_the_full_output_button_submit_no_prompt() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "never-submitted-828";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key,
+        "msg_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    // The card does offer the explicit door...
+    ask_ai_payload(&platform).await;
+
+    // ...but settling alone submitted nothing, and neither does the other
+    // button: the retrieval is a File Message.
+    let payload = full_output_payload(&platform).await;
+    app.host_action_on_message(payload, "msg_reply").await;
+    wait_for_file_message(&platform).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        prompts.lock().await.is_empty(),
+        "no path but 问 AI puts terminal output into the Session Transcript: {:?}",
+        prompts.lock().await
+    );
 }

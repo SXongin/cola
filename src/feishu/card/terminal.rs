@@ -50,20 +50,31 @@ const LINE_CUT_MARKER: &str = " …（本行过长，已截断）";
 /// constant so the handler and its tests name the same act.
 pub(crate) const TERMINAL_FULL_OUTPUT_LABEL: &str = "📄 完整输出";
 
-/// What 「📄 完整输出」 carries: the log path and the settled card's own render
-/// inputs, so the delivery's outcome can be PATCHed back onto the card it was
-/// clicked on — and the button is self-describing after a restart (ADR-0086
-/// decision 4). Only a settled run without a spawn failure gets one: a launch
-/// that never started has no output to retrieve. The cwd and command are NOT
-/// carried here: the builder puts the text its elements actually show into the
-/// payload, so a huge command cannot bloat the card's JSON budget.
+/// The settled card's explicit door to the model (ADR-0086 decision 9): the
+/// only path by which a Terminal Command's output reaches the Session
+/// Transcript. Constant for the same reason as the retrieval label.
+pub(crate) const TERMINAL_ASK_AI_LABEL: &str = "问 AI";
+
+/// What the settled card's buttons carry: the log path, the Chat/Topic the card
+/// lives in, and the settled card's own render inputs, so a click's outcome can
+/// be PATCHed back onto the card it was clicked on — and every button is
+/// self-describing after a restart (ADR-0086 decision 4). Only a settled run
+/// without a spawn failure gets them: a launch that never started has no output
+/// to retrieve and nothing to hand over. The cwd and command are NOT carried
+/// here: the builder puts the text its elements actually show into the payload,
+/// so a huge command cannot bloat the card's JSON budget.
 pub(crate) struct TerminalFullOutput<'a> {
-    /// The **Terminal Log** the button delivers.
+    /// The **Terminal Log** the 「📄 完整输出」 button delivers.
     pub(crate) log_path: &'a str,
     /// The Chat/Topic the card lives in, for the click's route and in-flight
     /// claim.
     pub(crate) chat_id: &'a str,
     pub(crate) thread_id: &'a str,
+    /// Whether the card lives in a group chat. A click carries no chat type of
+    /// its own, and the 「问 AI」 submission needs it to rebuild the
+    /// Chat/Topic route (the group-lobby guidance and the chat type's notice
+    /// opt-in).
+    pub(crate) is_group: bool,
     pub(crate) exit_code: Option<i32>,
     pub(crate) elapsed: Duration,
     /// Whether the size probe stopped the run; the rebuilt card must still say
@@ -241,7 +252,16 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         // Clipping twice is idempotent, so the rebuilt card renders the same.
         let cwd = displayed_text("**目录**", view.cwd, false);
         let command = displayed_text("**命令**", view.command, false);
-        elements.push(full_output_row(full_output, &cwd, &command));
+        // The 「问 AI」 window is exactly the fenced element's body, so the
+        // submission quotes what the reader sees (ADR-0086 decision 9).
+        let window = displayed_text("**输出**", &output, true);
+        elements.push(settled_buttons_row(
+            full_output,
+            &cwd,
+            &command,
+            &window,
+            truncated || fence_clipped,
+        ));
     }
     if controls && !view.run_id.is_empty() {
         elements.push(run_controls_row(&view));
@@ -286,37 +306,63 @@ fn terminal_button(view: &TerminalCard<'_>, label: &str, op: &str, kind: &str) -
     })
 }
 
-/// The 「📄 完整输出」 button row (ADR-0086 decisions 4 and 7). The payload is
-/// self-describing: the log path plus the settled card's render inputs, so the
-/// click can PATCH the same card with its outcome after a restart.
-fn full_output_row(view: &TerminalFullOutput<'_>, cwd: &str, command: &str) -> serde_json::Value {
+/// The settled card's buttons (ADR-0086 decisions 4, 7 and 9) — 「📄 完整输出」
+/// and 「问 AI」 — in one row. Every payload is self-describing: the log path,
+/// the Chat/Topic route, and the settled card's render inputs, so a click can
+/// PATCH the same card with its outcome after a restart without a card-view
+/// read. The 「问 AI」 payload additionally carries the output window it was
+/// rendered with, so the submission needs neither a live process nor the log on
+/// disk: a run the sweep marked lost still hands its result over.
+fn settled_buttons_row(
+    view: &TerminalFullOutput<'_>,
+    cwd: &str,
+    command: &str,
+    output: &str,
+    output_truncated: bool,
+) -> serde_json::Value {
+    let chat_type = if view.is_group { "group" } else { "p2p" };
+    let facts = |op: &str| {
+        json!({
+            "action": "terminal",
+            "op": op,
+            "chat_id": view.chat_id,
+            "thread_id": view.thread_id,
+            "chat_type": chat_type,
+            "path": view.log_path,
+            "terminal_card": {
+                "cwd": cwd,
+                "command": command,
+                "exit_code": view.exit_code,
+                "elapsed_ms": view.elapsed.as_millis() as u64,
+                "output_over_limit": view.output_over_limit,
+            },
+        })
+    };
+    let mut ask_ai = facts("ask_ai");
+    ask_ai["output"] = json!(output);
+    ask_ai["output_truncated"] = json!(output_truncated);
     json!({
         "tag": "column_set",
         "flex_mode": "flow",
         "horizontal_spacing": "default",
-        "columns": [{
-            "tag": "column",
-            "width": "auto",
-            "vertical_align": "center",
-            "elements": [{
-                "tag": "button",
-                "type": "default",
-                "text": { "tag": "plain_text", "content": TERMINAL_FULL_OUTPUT_LABEL },
-                "value": {
-                    "action": "terminal",
-                    "op": "full_output",
-                    "chat_id": view.chat_id,
-                    "thread_id": view.thread_id,
-                    "path": view.log_path,
-                    "terminal_card": {
-                        "cwd": cwd,
-                        "command": command,
-                        "exit_code": view.exit_code,
-                        "elapsed_ms": view.elapsed.as_millis() as u64,
-                        "output_over_limit": view.output_over_limit,
-                    },
-                },
-            }],
+        "columns": [
+            button_column(TERMINAL_FULL_OUTPUT_LABEL, "default", facts("full_output")),
+            button_column(TERMINAL_ASK_AI_LABEL, "primary", ask_ai),
+        ],
+    })
+}
+
+/// One button cell of a settled card's row.
+fn button_column(label: &str, kind: &str, value: serde_json::Value) -> serde_json::Value {
+    json!({
+        "tag": "column",
+        "width": "auto",
+        "vertical_align": "center",
+        "elements": [{
+            "tag": "button",
+            "type": kind,
+            "text": { "tag": "plain_text", "content": label },
+            "value": value,
         }],
     })
 }
