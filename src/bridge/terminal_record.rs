@@ -7,7 +7,12 @@
 //! tell its readers it can no longer be tracked, and (b) let that card's
 //! 「↻ 重跑」 and 「📄 完整输出」 still know their data. It carries the run id, the
 //! card's message id and chat, the **Terminal Log** path, the command, the cwd,
-//! the timeout, the process ids and the state (`running` / `settled` / `lost`).
+//! the timeout, the process ids, the state (`running` / `settled` / `lost`), the
+//! run's ending, and two "already happened" facts nothing else can re-derive:
+//! whether the card has been told the run ended (`card_settled`) and whether
+//! 「问 AI」 already submitted the output (`ask_ai_submitted`). A restart uses
+//! them to finish a write the previous process could not — and to refuse a
+//! second submission (whole-branch review, findings 1 and 4).
 //!
 //! Two rules come from the ADR and shape every caller:
 //!
@@ -55,11 +60,34 @@ pub(crate) enum TerminalRunState {
     Running,
     /// The run ended — an exit code, a 终止, or a spawn that never happened.
     /// Kept, so the card's buttons stay usable until the next run replaces it.
+    /// [`TerminalRunRecord::card_settled`] says whether the ending write reached
+    /// the card: a settled record with it false is one a restart finishes.
     Settled,
     /// The sweep found it `running` after a restart. The command may still be
     /// alive as an orphan (hand-launched cola) or may have been taken with
     /// cola (a supervised one); cola does not guess and never signals it.
     Lost,
+}
+
+/// A run's ending (whole-branch review, finding 1), persisted **before** the
+/// card is told so a restart can repeat the write the previous process could
+/// not land. Every field is the settled card's own render input, which is why
+/// it lives in the record rather than only in the card.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TerminalRunOutcome {
+    /// The child's real exit code; `None` when a signal ended it or it never
+    /// started.
+    pub(crate) exit_code: Option<i32>,
+    /// Why the launch failed, when it did (missing cwd, no `sh`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spawn_error: Option<String>,
+    pub(crate) elapsed_ms: u64,
+    /// 终止 ended the run.
+    pub(crate) stopped: bool,
+    /// A group member outlived `sh`.
+    pub(crate) survivors: bool,
+    /// The size probe stopped the run at the observed threshold.
+    pub(crate) output_over_limit: bool,
 }
 
 /// One run's durable facts (ADR-0086 decision 5).
@@ -91,6 +119,22 @@ pub(crate) struct TerminalRunRecord {
     #[serde(default)]
     pub(crate) is_group: bool,
     pub(crate) state: TerminalRunState,
+    /// The run's ending, once it has one. Written together with
+    /// [`Self::state`] = `settled` and [`Self::card_settled`] = false, so the
+    /// three always agree; absent on a `running` record and on one written by a
+    /// build that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<TerminalRunOutcome>,
+    /// Whether the card has been told the run is over. A `settled` record with
+    /// this false is a write the previous process owed: the startup sweep
+    /// re-PATCHes the settled card from [`Self::outcome`] and sets it true.
+    #[serde(default)]
+    pub(crate) card_settled: bool,
+    /// Whether 「问 AI」 already handed this run's output to the model. The
+    /// in-memory guard is process-local, so without this a restart's click
+    /// would submit the same output again (whole-branch review, finding 4).
+    #[serde(default)]
+    pub(crate) ask_ai_submitted: bool,
 }
 
 impl TerminalRunRecord {
@@ -233,6 +277,22 @@ impl TerminalRunRecords {
         }
     }
 
+    /// Record that `run_id`'s output was submitted to the model — the durable
+    /// half of 「问 AI」's one-submission rule (ADR-0086 decision 9). Best
+    /// effort by design: a failed write leaves this process's in-memory guard as
+    /// the only suppression, which is exactly the state the record exists to
+    /// improve on, so the click is never failed by it.
+    pub(crate) fn mark_ask_ai_submitted(&self, key: &ThreadKey, run_id: &str) {
+        let Some(mut record) = self.read(key) else {
+            return;
+        };
+        if record.run_id != run_id || record.ask_ai_submitted {
+            return;
+        }
+        record.ask_ai_submitted = true;
+        self.update(&record);
+    }
+
     /// Every record on disk — the startup sweep's input. A corrupt file is
     /// skipped with a warning, never an error; callers that must know whether
     /// they saw everything use [`scan`](Self::scan).
@@ -360,6 +420,9 @@ mod tests {
             pids: vec![1234],
             is_group: true,
             state: TerminalRunState::Running,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         }
     }
 
@@ -505,5 +568,68 @@ mod tests {
         std::fs::write(records.path(&key), b"{not json").unwrap();
         assert_eq!(records.read(&key), None, "a corrupt record reads as none");
         assert!(records.load_all().is_empty(), "and it is skipped by the sweep");
+    }
+
+    /// Whole-branch review (finding 4): 「问 AI」's one-submission rule survives a
+    /// restart because the record carries it — and only for the run the record
+    /// still names.
+    #[test]
+    fn mark_ask_ai_submitted_only_marks_the_current_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let key = key("oc_chat", "oc_chat");
+        records.write(&record(&key, "run-1")).unwrap();
+        assert!(!records.read(&key).unwrap().ask_ai_submitted);
+
+        records.mark_ask_ai_submitted(&key, "run-2");
+        assert!(
+            !records.read(&key).unwrap().ask_ai_submitted,
+            "a superseded run id marks nothing"
+        );
+
+        records.mark_ask_ai_submitted(&key, "run-1");
+        assert!(
+            records.read(&key).unwrap().ask_ai_submitted,
+            "the current run records its submission"
+        );
+    }
+
+    /// Whole-branch review (finding 1): the ending a restart needs to finish the
+    /// card's last write is in the record itself — including that the card has
+    /// not been told yet.
+    #[test]
+    fn a_settled_record_round_trips_its_ending_and_the_owed_card_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let key = key("oc_chat", "oc_chat");
+        let mut settled = record(&key, "run-1");
+        settled.state = TerminalRunState::Settled;
+        settled.outcome = Some(TerminalRunOutcome {
+            exit_code: Some(3),
+            spawn_error: None,
+            elapsed_ms: 1_500,
+            stopped: false,
+            survivors: true,
+            output_over_limit: false,
+        });
+        settled.card_settled = false;
+        records.write(&settled).unwrap();
+
+        assert_eq!(records.read(&key), Some(settled.clone()));
+        let raw = std::fs::read_to_string(records.path(&key)).unwrap();
+        assert!(raw.contains("\"card_settled\":false"), "{raw}");
+        assert!(raw.contains("\"elapsed_ms\":1500"), "{raw}");
+
+        // A record from before these fields existed still reads, and its
+        // defaults say "no ending to rebuild".
+        let mut legacy = serde_json::to_value(record(&key, "run-2")).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("outcome");
+        object.remove("card_settled");
+        object.remove("ask_ai_submitted");
+        let legacy: TerminalRunRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.outcome, None);
+        assert!(!legacy.card_settled);
+        assert!(!legacy.ask_ai_submitted);
     }
 }

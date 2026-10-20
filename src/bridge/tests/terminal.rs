@@ -3530,6 +3530,9 @@ async fn a_restart_marks_a_running_run_lost_without_signalling_it() {
             pids: vec![orphan.id()],
             is_group: false,
             state: TerminalRunState::Running,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         })
         .unwrap();
 
@@ -3604,6 +3607,9 @@ async fn a_record_written_before_a_spawn_that_never_happened_is_reported_and_cle
             pids: Vec::new(),
             is_group: false,
             state: TerminalRunState::Running,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         })
         .unwrap();
 
@@ -3651,6 +3657,9 @@ async fn a_lost_run_with_an_unreadable_log_says_why_the_output_is_missing() {
             pids: Vec::new(),
             is_group: false,
             state: TerminalRunState::Running,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         })
         .unwrap();
 
@@ -4070,6 +4079,9 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
             pids: vec![4242],
             is_group: false,
             state: TerminalRunState::Running,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         })
         .unwrap();
     let (app2, platform2, prompts) = restart_app_recording(cfg, root).await;
@@ -4260,6 +4272,9 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
             pids: vec![1],
             is_group: false,
             state: TerminalRunState::Settled,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         })
         .unwrap();
     app.sweep_terminal().await;
@@ -4363,6 +4378,9 @@ async fn an_old_log_a_record_still_names_is_kept_and_its_silent_orphan_keeps_wri
             pids: vec![4242],
             is_group: false,
             state: TerminalRunState::Running,
+            outcome: None,
+            card_settled: false,
+            ask_ai_submitted: false,
         })
         .unwrap();
 
@@ -4532,5 +4550,319 @@ async fn a_live_run_is_recorded_as_running_with_its_card_and_pid() {
         app.terminal_records.read(&key).unwrap().state,
         TerminalRunState::Settled,
         "the record is marked settled when the run settles"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Whole-branch review of spec #821: the four findings that outlived the
+// per-ticket rounds.
+// ---------------------------------------------------------------------------
+
+/// Poll the chat's **Terminal Run Record** until `done` holds, so a test can
+/// observe the step between the durable write and the card's write.
+#[cfg(unix)]
+async fn wait_for_record(
+    app: &std::sync::Arc<crate::bridge::App>,
+    key: &ThreadKey,
+    done: impl Fn(&TerminalRunRecord) -> bool,
+) -> TerminalRunRecord {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(record) = app.terminal_records.read(key)
+                && done(&record)
+            {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the record never reached the expected state")
+}
+
+/// Whole-branch review, finding 1: a run whose card write never lands is not
+/// lost. The record says the run is over and that the card has not been told,
+/// so the next start re-PATCHes the settled card once — and nothing holds the
+/// chat when it does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    // Every card write fails in this process: the run ends and its record says
+    // so, while the one write that would tell the card never lands.
+    platform
+        .fail_update_count
+        .store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+
+    send_command_in(
+        &app,
+        "/run printf 'settle-gap-827\\n'",
+        key.clone(),
+        "msg_gap",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let pending = wait_for_record(&app, &key, |record| {
+        record.state == TerminalRunState::Settled && record.outcome.is_some()
+    })
+    .await;
+    assert!(!pending.card_settled, "the card was never told: {pending:?}");
+    assert_eq!(
+        pending.outcome.as_ref().and_then(|outcome| outcome.exit_code),
+        Some(0),
+        "the ending the restart must repeat: {pending:?}"
+    );
+    let card_id = pending.card_id.clone();
+    let root = log_root(&app);
+
+    // The restart: the run is over (so it is NOT reported as possibly running),
+    // and the card is owed its ending.
+    let (app2, platform2) = restart_app(cfg.clone(), root.clone()).await;
+    app2.sweep_terminal().await;
+    let patched = wait_for_patch_containing(&platform2, &card_id, "退出码 0").await;
+    let text = card_text(&patched);
+    assert!(
+        text.contains("settle-gap-827"),
+        "the log's tail survives the restart: {text}"
+    );
+    assert!(
+        !text.contains("已失去跟踪"),
+        "a run that ended is not relabelled lost: {text}"
+    );
+    assert!(
+        button_value(&patched, "rerun").is_some(),
+        "重跑 still works on the finished card: {text}"
+    );
+    let after = app2.terminal_records.read(&key).expect("the record is kept");
+    assert_eq!(after.state, TerminalRunState::Settled);
+    assert!(after.card_settled, "the owed write is now done: {after:?}");
+
+    // Cleaned: another start has nothing left to patch.
+    let (app3, platform3) = restart_app(cfg, root).await;
+    app3.sweep_terminal().await;
+    assert!(
+        platform3.updated_cards().await.is_empty(),
+        "a card already told is not told twice: {:?}",
+        platform3.updated_cards().await
+    );
+
+    // No claim is held: the restarted process accepts the chat's next command
+    // instead of refusing it as busy.
+    send_command_in(
+        &app3,
+        "/run printf 'after-gap-827\\n'",
+        key.clone(),
+        "msg_gap_two",
+        ConversationKind::P2p,
+    )
+    .await;
+    wait_for_card_update(&platform3, "the next run settles", CardUpdates::Any, |card| {
+        card_text(card).contains("after-gap-827")
+    })
+    .await;
+    let texts = platform3.texts().await;
+    assert!(
+        !texts.iter().any(|text| text.contains("已有终端命令在运行")),
+        "the finished run holds no slot: {texts:?}"
+    );
+}
+
+/// Whole-branch review, finding 2: a probe cycle already in flight when the run
+/// ends must signal nothing. The cycle is parked between its cap check and its
+/// signal; the run ends; the released cycle stands down under the gate instead
+/// of signalling a process-group id the run no longer owns.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_probe_cycle_in_flight_when_the_run_ends_signals_nothing() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    // Any output crosses the cap, and the probe looks often.
+    app.core
+        .terminal_log_cap_bytes
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    app.core
+        .terminal_size_probe_ms
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+    let hook = Arc::new(crate::bridge::terminal::TerminalProbeHook::default());
+    *app.core.terminal_probe_hook.lock().unwrap() = Some(Arc::clone(&hook));
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let run = tokio::spawn({
+        let app = Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run printf 'park-827\\n'; sleep 30",
+                key,
+                "msg_park",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+
+    // The live card gives the 终止 click its run id.
+    let live = live_card_with(&platform, "kill").await;
+    // One probe cycle parks after it has seen the cap crossed, holding the gate.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a probe cycle reaches the park");
+
+    // The run ends while that cycle is still in flight.
+    let kill = button_value(&live, "kill").expect("the live card carries 终止");
+    app.host_action(kill).await.expect("the click is acknowledged");
+
+    // Release the cycle: it must see the stand-down and signal nothing.
+    hook.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+
+    let text = card_text(&settled_card(&platform).await);
+    assert!(text.contains("已终止"), "the run ended by 终止: {text}");
+    assert!(
+        !text.contains("输出超限"),
+        "the probe did not stop a run that was already over: {text}"
+    );
+    assert_eq!(
+        hook.signals.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no probe signal may follow the run's ending"
+    );
+}
+
+/// Whole-branch review, finding 3: a launch that never started still settled,
+/// so it keeps the settled buttons. 重跑 replays the record (which exists), and
+/// 完整输出/问 AI work off the log path the card carries — none of them needs
+/// the command to have produced output.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_spawn_failure_keeps_the_settled_buttons() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    // A session directory that is not there: `sh` cannot start in it.
+    let missing = proj.path().join("gone-827");
+    seed_entry(&app, entry(&key, &missing)).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'never-827\\n'",
+        key.clone(),
+        "msg_spawn",
+        ConversationKind::P2p,
+    )
+    .await;
+    let card = settled_card(&platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("无法启动"), "{text}");
+    let rerun = button_value(&card, "rerun").expect("重跑 is offered for a failed launch");
+    assert!(
+        button_value(&card, "full_output").is_some(),
+        "完整输出 names the log the run created: {text}"
+    );
+    assert!(
+        button_value(&card, "ask_ai").is_some(),
+        "问 AI quotes the failed command: {text}"
+    );
+    let first = app
+        .terminal_records
+        .read(&key)
+        .expect("even a refused launch left a record");
+    assert_eq!(rerun["run_id"].as_str(), Some(first.run_id.as_str()));
+
+    // 重跑 replays the record rather than toasting a stale click.
+    let result = app
+        .host_action_on_message(rerun, "msg_spawn")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(toast.contains("重跑"), "the rerun click is accepted: {toast}");
+    let next = wait_for_record(&app, &key, |record| {
+        record.run_id != first.run_id && record.state == TerminalRunState::Settled
+    })
+    .await;
+    assert_eq!(next.command, first.command, "the record's command replays");
+    assert_eq!(next.cwd, first.cwd, "in the record's cwd");
+}
+
+/// Whole-branch review, finding 4: 「问 AI」's one-submission rule is durable.
+/// The in-memory flag dies with the process, so the **Terminal Run Record**
+/// carries the submission — a restart's click on the same current run is
+/// refused and nothing reaches the model twice.
+#[cfg(unix)]
+#[tokio::test]
+async fn ask_ai_submits_once_across_a_restart() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "once-827";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key.clone(),
+        "msg_once",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let ask = ask_ai_payload(&platform).await;
+
+    let result = app
+        .host_action_on_message(ask.clone(), "msg_once_card")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(toast.contains("AI"), "the first click submits: {toast}");
+    wait_for_prompt_containing(&prompts, marker).await;
+    assert_eq!(prompts.lock().await.len(), 1, "exactly one submission");
+    // The submission is durable before the process ends.
+    wait_for_record(&app, &key, |record| record.ask_ai_submitted).await;
+    let root = log_root(&app);
+
+    // The restart: memory is empty, the record is not.
+    let (app2, _platform2, prompts2) = restart_app_recording(cfg, root).await;
+    app2.sweep_terminal().await;
+    let result = app2
+        .host_action_on_message(ask, "msg_once_card")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(
+        toast.contains("已经提交"),
+        "the same run's second click is refused: {toast}"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        prompts2.lock().await.is_empty(),
+        "nothing reached the model after the restart: {:?}",
+        prompts2.lock().await
     );
 }

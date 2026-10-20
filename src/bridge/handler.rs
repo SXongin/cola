@@ -1549,10 +1549,17 @@ impl App {
     /// effect — a sweep in `App::new` would run before a test could redirect
     /// the log root and would touch the real `~/.cola/terminal`.
     pub(crate) async fn sweep_terminal(&self) {
-        let reported = crate::bridge::terminal::sweep_records(&*self.feishu, &self.terminal_records).await;
-        if reported > 0 {
+        let sweep = crate::bridge::terminal::sweep_records(&*self.feishu, &self.terminal_records).await;
+        if sweep.lost > 0 {
             tracing::warn!(
-                "terminal: marked {reported} run(s) lost after a restart (their process ids are never signalled)"
+                "terminal: marked {} run(s) lost after a restart (their process ids are never signalled)",
+                sweep.lost
+            );
+        }
+        if sweep.settled > 0 {
+            tracing::info!(
+                "terminal: told {} settled card(s) their run had ended (the previous process's last write was owed)",
+                sweep.settled
             );
         }
         let Some(root) = self
