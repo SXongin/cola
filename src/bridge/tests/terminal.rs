@@ -3772,6 +3772,72 @@ async fn ask_ai_after_a_restart_refuses_a_replaced_run_and_accepts_the_current_o
     );
 }
 
+/// #827 review (finding 1): after a restart, a record that cannot be read is
+/// NOT permission. A card whose run nothing can verify must not submit its
+/// output — missing and corrupt records both refuse — while 「📄 完整输出」, which
+/// is pure retrieval of the payload's own log path, keeps working.
+#[cfg(unix)]
+#[tokio::test]
+async fn ask_ai_after_a_restart_refuses_an_unverifiable_record_but_full_output_still_works() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "unverifiable-827";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key.clone(),
+        "msg_unverifiable",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let ask = ask_ai_payload(&platform).await;
+    let full = full_output_payload(&platform).await;
+    let root = log_root(&app);
+
+    let (app2, platform2, prompts) = restart_app_recording(cfg, root).await;
+    app2.sweep_terminal().await;
+    // A corrupt record first, then a missing one: both lose the only authority
+    // that could prove the click current.
+    std::fs::write(app2.terminal_records.path(&key), b"{ not json").unwrap();
+    for (case, payload) in [("corrupt", ask.clone()), ("missing", ask.clone())] {
+        if case == "missing" {
+            std::fs::remove_file(app2.terminal_records.path(&key)).unwrap();
+        }
+        let result = app2
+            .host_action_on_message(payload, "msg_unverifiable_card")
+            .await
+            .expect("the click is acknowledged");
+        let toast = result.toast.unwrap_or_default();
+        assert!(
+            toast.contains("无法确认"),
+            "a {case} record refuses the submission: {toast}"
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        prompts.lock().await.is_empty(),
+        "no output reached the model without a record to verify it: {:?}",
+        prompts.lock().await
+    );
+
+    // Retrieval is not gated: the payload names its own log, so a missing record
+    // is no reason to withhold it.
+    let result = app2
+        .host_action_on_message(full, "msg_unverifiable_card")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.unwrap_or_default();
+    assert!(toast.contains("完整输出"), "完整输出 still answers: {toast}");
+    wait_for_file_message(&platform2).await;
+}
+
 /// #827 acceptance: a double-clicked 「↻ 重跑」 runs one command even when the
 /// first rerun finished instantly — the record check and the claim sit together,
 /// so the second copy finds a record that no longer names it.
@@ -4027,6 +4093,78 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
     assert!(!stale.exists(), "a log past `[bridge] log_days` is swept");
     assert!(live.exists(), "a file still being written is not unlinked");
     assert!(other.exists(), "the sweep only owns .log files");
+}
+
+/// #827 review (finding 2): age alone must not unlink a log a record still
+/// names. A live orphan that keeps its descriptor open but has written nothing
+/// for longer than `log_days` has an OLD mtime — the record is what protects its
+/// file, so its later writes still land somewhere 「📄 完整输出」 can read.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_old_log_a_record_still_names_is_kept_and_its_silent_orphan_keeps_writing() {
+    use std::io::Write;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 14;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let key = thread();
+    let (app, _platform) = restart_app(cfg.clone(), root.clone()).await;
+    let path = root.join("orphan-827.log");
+    std::fs::write(&path, b"before the silence\n").unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    // The orphan's own descriptor, held across the sweep: the run wrote nothing
+    // for a month but is still alive.
+    let mut orphan = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-silent-orphan".into(),
+            chat_id: key.chat_id.clone(),
+            thread_id: key.thread_id.clone(),
+            // No card: this test is about the file, not a PATCH.
+            card_id: String::new(),
+            log_path: path.to_string_lossy().into_owned(),
+            command: "sleep 100000".into(),
+            cwd: "/tmp".into(),
+            timeout_ms: 60_000,
+            pids: vec![4242],
+            is_group: false,
+            state: TerminalRunState::Running,
+        })
+        .unwrap();
+
+    app.sweep_terminal().await;
+    assert!(
+        path.exists(),
+        "a log a record still names is never unlinked, however old its mtime"
+    );
+    orphan.write_all(b"after the silence\n").unwrap();
+    assert!(
+        std::fs::read(&path).unwrap().ends_with(b"after the silence\n"),
+        "the orphan's later write lands in the file the record points at"
+    );
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().state,
+        TerminalRunState::Lost,
+        "the record is reported, and still names the log"
+    );
+
+    // A second restart: the record is now `lost`, and its log survives too —
+    // it only becomes unreferenced when the chat's next run replaces it.
+    let (app2, _platform2) = restart_app(cfg, root).await;
+    app2.sweep_terminal().await;
+    assert!(
+        path.exists(),
+        "a lost record's log survives the age sweep as well"
+    );
 }
 
 /// #827 acceptance: the record is written BEFORE the child is spawned — a live

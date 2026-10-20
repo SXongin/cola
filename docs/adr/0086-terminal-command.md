@@ -282,6 +282,37 @@ escape soup this section refuses.
     Windows with a stated refusal rather than a half-implemented lane; the loop is its own
     ticket.
 
+## Amendment (2026-10-21): 「↻ 重跑」 carries only the run id, and the record decides staleness
+
+Decision 4 says every button carries the run id it was rendered for and that
+「↻ 重跑」 *also* carries the command, cwd and timeout, so a card is
+self-describing. Decision 5's **Terminal Run Record** makes that copy redundant,
+and keeping it is a cost: a command is whatever the Host typed (a Feishu message
+can be tens of kilobytes), the resolved cwd is long, and both would be duplicated
+into a card whose whole JSON budget is 30 KB — for a reader that never exists,
+because the click is checked against the record anyway. So:
+
+- 「↻ 重跑」's payload carries the run id and the Chat/Topic route
+  (`chat_id`, `thread_id`) and **nothing else**. The record is the single durable
+  source of the command, cwd and timeout it replays; it also carries
+  `is_group`, because a button payload has no chat type and the rerun owes the
+  same per-chat-type Completion Notice (decision 12) as the original run.
+- 「📄 完整输出」 and 「问 AI」 keep their own payloads (the log path, and the
+  output window the card rendered), which a card cannot recover from the record.
+- Staleness for the side-effecting buttons (重跑, 问 AI) is decided by the
+  record, which is the only source that survives a restart. A click whose run id
+  is not the chat's current record id is refused; and where the record cannot be
+  read at all — missing, corrupt, or past the bounded read — a click that this
+  process did not start is refused rather than accepted, because an unverifiable
+  card is exactly the old output the stale rule exists to keep out of the model.
+  「📄 完整输出」 stays ungated: it is pure retrieval of a file the payload
+  already names.
+- The **Terminal Log** age sweep (decision 10) never unlinks a log a record still
+  names — a live orphan that has produced no output for longer than `log_days`
+  keeps an old mtime while its descriptor is open, and unlinking that file would
+  send its later writes to an inode nothing can retrieve. Age decides only among
+  logs no record references.
+
 ## Why
 
 - **It is the third step of one capability ladder**, not a new subsystem: browse (ADR-0078) →
