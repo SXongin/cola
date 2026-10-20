@@ -11,7 +11,7 @@
 //! server is contacted.
 
 #[cfg(unix)]
-use crate::bridge::terminal_record::{TerminalRunRecord, TerminalRunState};
+use crate::bridge::terminal_record::{OwedSettlement, TerminalRunRecord, TerminalRunState};
 use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 #[cfg(unix)]
@@ -3530,8 +3530,6 @@ async fn a_restart_marks_a_running_run_lost_without_signalling_it() {
             pids: vec![orphan.id()],
             is_group: false,
             state: TerminalRunState::Running,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         })
         .unwrap();
@@ -3607,8 +3605,6 @@ async fn a_record_written_before_a_spawn_that_never_happened_is_reported_and_cle
             pids: Vec::new(),
             is_group: false,
             state: TerminalRunState::Running,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         })
         .unwrap();
@@ -3657,8 +3653,6 @@ async fn a_lost_run_with_an_unreadable_log_says_why_the_output_is_missing() {
             pids: Vec::new(),
             is_group: false,
             state: TerminalRunState::Running,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         })
         .unwrap();
@@ -4079,8 +4073,6 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
             pids: vec![4242],
             is_group: false,
             state: TerminalRunState::Running,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         })
         .unwrap();
@@ -4272,8 +4264,6 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
             pids: vec![1],
             is_group: false,
             state: TerminalRunState::Settled,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         })
         .unwrap();
@@ -4378,8 +4368,6 @@ async fn an_old_log_a_record_still_names_is_kept_and_its_silent_orphan_keeps_wri
             pids: vec![4242],
             is_group: false,
             state: TerminalRunState::Running,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         })
         .unwrap();
@@ -4580,10 +4568,29 @@ async fn wait_for_record(
     .expect("the record never reached the expected state")
 }
 
+/// Poll the **owed settlements** until `run_id` has one, so a test can observe
+/// the durable obligation a failed settle leaves.
+#[cfg(unix)]
+async fn wait_for_owed(app: &std::sync::Arc<crate::bridge::App>, run_id: &str) -> OwedSettlement {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (owed, _) = app.terminal_records.owed().load_all();
+            if let Some(settlement) = owed
+                .into_iter()
+                .find(|settlement| settlement.record.run_id == run_id)
+            {
+                return settlement;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the run's owed settlement never appeared")
+}
+
 /// Whole-branch review, finding 1: a run whose card write never lands is not
-/// lost. The record says the run is over and that the card has not been told,
-/// so the next start re-PATCHes the settled card once — and nothing holds the
-/// chat when it does.
+/// lost. The owed settlement is the durable obligation, so the next start
+/// re-PATCHes the settled card once — and nothing holds the chat when it does.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
@@ -4609,17 +4616,15 @@ async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
     )
     .await;
 
-    let pending = wait_for_record(&app, &key, |record| {
-        record.state == TerminalRunState::Settled && record.outcome.is_some()
-    })
-    .await;
-    assert!(!pending.card_settled, "the card was never told: {pending:?}");
-    assert_eq!(
-        pending.outcome.as_ref().and_then(|outcome| outcome.exit_code),
-        Some(0),
-        "the ending the restart must repeat: {pending:?}"
-    );
+    let pending = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
     let card_id = pending.card_id.clone();
+    let owed = wait_for_owed(&app, &pending.run_id).await;
+    assert_eq!(
+        owed.outcome.exit_code,
+        Some(0),
+        "the ending the restart must repeat: {owed:?}"
+    );
+    assert_eq!(owed.record.card_id, card_id, "the obligation names the card");
     let root = log_root(&app);
 
     // The restart: the run is over (so it is NOT reported as possibly running),
@@ -4640,9 +4645,12 @@ async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
         button_value(&patched, "rerun").is_some(),
         "重跑 still works on the finished card: {text}"
     );
+    assert!(
+        app2.terminal_records.owed().load_all().0.is_empty(),
+        "the obligation is dropped once its card landed"
+    );
     let after = app2.terminal_records.read(&key).expect("the record is kept");
     assert_eq!(after.state, TerminalRunState::Settled);
-    assert!(after.card_settled, "the owed write is now done: {after:?}");
 
     // Cleaned: another start has nothing left to patch.
     let (app3, platform3) = restart_app(cfg, root).await;
@@ -4674,10 +4682,193 @@ async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
     );
 }
 
+/// Whole-branch review (round 2, finding 1): the obligation outlives the chat's
+/// next run replacing its record. A failed settle, then a new `/run` in the same
+/// chat, then a restart: the OLD card is repaired from the owed sidecar — which
+/// the replacement could not erase — and the new run's card and record are left
+/// alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform
+        .reply_ids
+        .lock()
+        .unwrap()
+        .extend(["msg_card_old".into(), "msg_card_new".into()]);
+    platform
+        .fail_update_count
+        .store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+
+    send_command_in(
+        &app,
+        "/run printf 'old-owed-827\\n'",
+        key.clone(),
+        "msg_old",
+        ConversationKind::P2p,
+    )
+    .await;
+    let old = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
+    assert_eq!(old.card_id, "msg_card_old");
+    let owed = wait_for_owed(&app, &old.run_id).await;
+    assert_eq!(owed.outcome.exit_code, Some(0), "the ending is owed");
+
+    // The chat runs again before any restart: its pre-spawn write replaces the
+    // per-chat record. That is precisely the write the obligation must survive.
+    platform
+        .fail_update_count
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    send_command_in(
+        &app,
+        "/run printf 'new-run-827\\n'",
+        key.clone(),
+        "msg_new",
+        ConversationKind::P2p,
+    )
+    .await;
+    let new = wait_for_record(&app, &key, |record| {
+        record.run_id != old.run_id && record.state == TerminalRunState::Settled
+    })
+    .await;
+    assert_eq!(new.card_id, "msg_card_new");
+    assert_eq!(new.command, "printf 'new-run-827\\n'");
+    let (owing, complete) = app.terminal_records.owed().load_all();
+    assert!(complete);
+    assert!(
+        owing.iter().all(|entry| entry.record.run_id != new.run_id),
+        "the successful new run owes nothing"
+    );
+    assert!(
+        owing.iter().any(|entry| entry.record.run_id == old.run_id),
+        "the replaced run's obligation is still there"
+    );
+    let root = log_root(&app);
+
+    // The restart repairs the old card from the obligation, and only that one.
+    let (app2, platform2) = restart_app(cfg, root).await;
+    app2.sweep_terminal().await;
+    let repaired = wait_for_patch_containing(&platform2, "msg_card_old", "退出码 0").await;
+    let text = card_text(&repaired);
+    assert!(text.contains("old-owed-827"), "the old log's tail: {text}");
+    assert!(!text.contains("new-run-827"), "not the new run's: {text}");
+    assert!(
+        app2.terminal_records.owed().load_all().0.is_empty(),
+        "the obligation is dropped once its card landed"
+    );
+    assert!(
+        std::path::Path::new(&owed.record.log_path).exists(),
+        "the owed log survives the age sweep"
+    );
+    assert!(
+        !platform2
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("new-run-827")),
+        "the new run's card is left alone"
+    );
+    let after = app2.terminal_records.read(&key).expect("the new run's record");
+    assert_eq!(after.run_id, new.run_id, "and its record still names the new run");
+    assert_eq!(after.command, new.command);
+    assert_eq!(after.card_id, "msg_card_new");
+}
+
+/// Whole-branch review (round 2, finding 1): the owed repair needs nothing from
+/// the chat's current record. A corrupt record — the state `load_all` skips —
+/// still leaves the obligation readable, so the card is repaired and the dead
+/// record never stands in for "nothing owed".
+#[cfg(unix)]
+#[tokio::test]
+async fn an_owed_settle_is_repaired_even_when_the_current_record_is_unreadable() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform
+        .fail_update_count
+        .store(usize::MAX / 2, std::sync::atomic::Ordering::SeqCst);
+
+    send_command_in(
+        &app,
+        "/run printf 'corrupt-record-827\\n'",
+        key.clone(),
+        "msg_corrupt_record",
+        ConversationKind::P2p,
+    )
+    .await;
+    let pending = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
+    wait_for_owed(&app, &pending.run_id).await;
+    // The current record is unreadable, and its run is still owed.
+    std::fs::write(app.terminal_records.path(&key), b"{ not json").unwrap();
+    let root = log_root(&app);
+
+    let (app2, platform2) = restart_app(cfg, root).await;
+    app2.sweep_terminal().await;
+    let repaired = wait_for_patch_containing(&platform2, &pending.card_id, "退出码 0").await;
+    let text = card_text(&repaired);
+    assert!(text.contains("corrupt-record-827"), "{text}");
+    assert!(!text.contains("已失去跟踪"), "the ending was known: {text}");
+    assert!(
+        app2.terminal_records.owed().load_all().0.is_empty(),
+        "the obligation is dropped once its card landed"
+    );
+}
+
+/// Standards (round 2): the card is told a run ended only when a durable
+/// obligation says so. An obligation that cannot be persisted leaves the card
+/// exactly as it is — a truthful 「已完成」 no restart could repair would be
+/// worse than a card that still looks live.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_settle_whose_obligation_cannot_be_persisted_leaves_the_card_as_it_is() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    // A plain file where the owed directory belongs: no obligation can land.
+    std::fs::write(app.terminal_records.owed().dir(), b"not a directory").unwrap();
+
+    send_command_in(
+        &app,
+        "/run printf 'no-obligation-827\\n'",
+        key.clone(),
+        "msg_no_obligation",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    // The run ends; the settle is withheld because nothing durable records it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let texts: Vec<String> = platform.updated_cards().await.iter().map(card_text).collect();
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("退出码") || text.contains("无法启动")),
+        "no settled card may be written without a durable obligation: {texts:?}"
+    );
+    // The ended run is not left as a false promise in the record either: with no
+    // obligation and no settled mark, the next start reports it rather than
+    // pretending it settled.
+    let record = app.terminal_records.read(&key).expect("the run's record");
+    assert_eq!(record.state, TerminalRunState::Running);
+}
+
 /// Whole-branch review, finding 2: a probe cycle already in flight when the run
-/// ends must signal nothing. The cycle is parked between its cap check and its
-/// signal; the run ends; the released cycle stands down under the gate instead
-/// of signalling a process-group id the run no longer owns.
+/// ends must signal nothing. The cycle is parked before it takes the gate; the
+/// run ends; the released cycle stands down under the gate instead of signalling
+/// a process-group id the run no longer owns.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_probe_cycle_in_flight_when_the_run_ends_signals_nothing() {
@@ -4715,7 +4906,8 @@ async fn a_probe_cycle_in_flight_when_the_run_ends_signals_nothing() {
 
     // The live card gives the 终止 click its run id.
     let live = live_card_with(&platform, "kill").await;
-    // One probe cycle parks after it has seen the cap crossed, holding the gate.
+    // One probe cycle parks before it takes the gate: it is in flight, but the
+    // run can still end and stand it down.
     tokio::time::timeout(Duration::from_secs(10), async {
         while hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -4745,6 +4937,93 @@ async fn a_probe_cycle_in_flight_when_the_run_ends_signals_nothing() {
         hook.signals.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "no probe signal may follow the run's ending"
+    );
+}
+
+/// Whole-branch review (round 2, finding 2): a cycle in flight when the command
+/// exits **on its own** — no 终止 — must signal nothing. The run notices the
+/// natural exit, reaps under the gate and stands the probe down; the released
+/// cycle sees the flag and returns.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_probe_cycle_pending_at_a_natural_exit_signals_nothing() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    // Any output crosses the cap, and the probe looks often.
+    app.core
+        .terminal_log_cap_bytes
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    app.core
+        .terminal_size_probe_ms
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+    let hook = Arc::new(crate::bridge::terminal::TerminalProbeHook::default());
+    *app.core.terminal_probe_hook.lock().unwrap() = Some(Arc::clone(&hook));
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // Exits on its own after a short life, long enough for the probe to park
+    // while the run is still live.
+    let run = tokio::spawn({
+        let app = Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run printf 'natural-exit-827\\n'; sleep 0.2",
+                key,
+                "msg_natural",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let record = wait_for_record(&app, &key, |record| !record.pids.is_empty()).await;
+    let child =
+        rustix::process::Pid::from_raw(record.pids[0] as i32).expect("the recorded child id is a valid pid");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hook.parked.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("a probe cycle reaches the park while the run is live");
+
+    // The child exits on its own; the loop reaps it under the gate and stands
+    // the probe down. A reaped pid is what proves the loop got there.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                rustix::process::test_kill_process(child),
+                Err(rustix::io::Errno::SRCH)
+            ) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the loop reaps the naturally exited child");
+
+    // Release the pending cycle: the stand-down is already in force.
+    hook.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the run ends on its own")
+        .unwrap();
+
+    let text = card_text(&settled_card(&platform).await);
+    assert!(text.contains("退出码 0"), "the run settled normally: {text}");
+    assert!(
+        !text.contains("输出超限"),
+        "the probe did not stop a run that had already ended: {text}"
+    );
+    assert_eq!(
+        hook.signals.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no probe signal may follow a natural exit"
     );
 }
 

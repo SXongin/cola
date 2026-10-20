@@ -34,11 +34,12 @@
 //! - the run's **Terminal Run Record** is written **before** the child is
 //!   spawned and kept until the next run in that chat replaces it, so a
 //!   restart can report the run honestly and the card's 「↻ 重跑」 still knows
-//!   its command, cwd and timeout (#827, decision 5). It also carries the run's
-//!   ending, whether the card has been told it, and whether 「问 AI」 already
-//!   submitted — the three facts a restart cannot re-derive. The sweep at
-//!   startup never signals a recorded pid, and the Terminal Log directory is
-//!   swept by age (`[bridge] log_days`), never wholesale;
+//!   its command, cwd and timeout (#827, decision 5). A settle whose card was
+//!   never told is a separate durable obligation beside the records — one file
+//!   per run — because the chat's next run replaces the record and must not
+//!   erase that promise; the startup sweep keeps it independently. The sweep
+//!   never signals a recorded pid, and the Terminal Log directory is swept by
+//!   age (`[bridge] log_days`), never wholesale;
 //! - Unix only: Windows refuses with a stated reason and spawns nothing
 //!   (decision 13).
 
@@ -56,7 +57,7 @@ use tokio::sync::mpsc;
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
 use crate::bridge::terminal_record::{
-    TerminalRunOutcome, TerminalRunRecord, TerminalRunRecords, TerminalRunState,
+    OwedSettlement, TerminalRunOutcome, TerminalRunRecord, TerminalRunRecords, TerminalRunState,
 };
 use crate::config::ThreadKey;
 use crate::feishu::Platform;
@@ -724,8 +725,6 @@ async fn run_claimed(
         pids: Vec::new(),
         is_group: request.is_group,
         state: TerminalRunState::Running,
-        outcome: None,
-        card_settled: false,
         ask_ai_submitted: false,
     };
     if let Err(error) = handles.terminal_records.write(&record) {
@@ -739,10 +738,13 @@ async fn run_claimed(
             output_over_limit: false,
         };
         // No record names this run, so no click could prove itself current:
-        // the ending reaches the card, but 重跑 is not offered.
+        // the ending reaches the card, but 重跑 is not offered. The owed
+        // obligation still records the card's ending, so a restart can repair
+        // it even though no current record will ever carry this run.
         finish_run(
             &handles.terminal_records,
-            None,
+            &mut record,
+            false,
             platform,
             &card_id,
             &cwd,
@@ -795,7 +797,8 @@ async fn run_claimed(
         // review, finding 3).
         finish_run(
             &handles.terminal_records,
-            Some(&mut record),
+            &mut record,
+            true,
             platform,
             &card_id,
             &cwd,
@@ -1001,13 +1004,13 @@ async fn run_claimed(
         survivors,
         output_over_limit,
     };
-    // The ending is persisted BEFORE the card's last write, and the record says
-    // the card has not been told yet: a failed write — or cola dying between the
-    // two — is then a write the next start finishes, instead of a card left
-    // looking live (whole-branch review, finding 1).
+    // The ending becomes a durable obligation BEFORE the card's last write: a
+    // failed (or interrupted) write is then a promise the next start keeps, from
+    // a file the chat's next run cannot replace (whole-branch review, finding 1).
     finish_run(
         &handles.terminal_records,
-        Some(&mut record),
+        &mut record,
+        true,
         platform,
         &card_id,
         &cwd,
@@ -1250,8 +1253,8 @@ fn read_display_tail(log: &Path) -> (String, bool) {
 pub(crate) struct TerminalSweep {
     /// Records a previous process left `running`: reported lost on their card.
     pub(crate) lost: usize,
-    /// Records whose run had already ended but whose card was never told —
-    /// the last write a previous process owed (whole-branch review, finding 1).
+    /// Owed settlements whose card a restart finished telling — including ones
+    /// whose run the chat had already replaced in its current record.
     pub(crate) settled: usize,
 }
 
@@ -1262,67 +1265,79 @@ pub(crate) struct TerminalSweep {
 /// whose card cannot be told stays `running` so the next start retries it
 /// instead of leaving the card frozen for good.
 ///
-/// A record whose run had **ended** but whose card was never told is the other
-/// half (whole-branch review, finding 1): its ending and log are in the record,
-/// so the sweep rebuilds the same settled card and PATCHes it. Only after that
-/// write lands is `card_settled` set — a failure leaves it owed for the next
-/// start, and a success makes the next start do nothing. The re-PATCH is
-/// idempotent by construction: same record, same log, same card.
+/// **Owed settlements come first, and independently of the current record**
+/// (whole-branch review, finding 1). An ending the previous process could not
+/// tell its card lives in `<records>-owed/`, one file per run id, precisely so
+/// the chat's next run — which replaces the per-chat record — cannot erase it.
+/// Each entry is rebuilt into the same settled card and PATCHed; only a landed
+/// write drops it. An unreadable or replaced current record does not matter:
+/// the obligation carries everything the card needs.
+///
+/// A `running` record whose card is owed is then **not** lost — its ending is
+/// known — and an incomplete owed view never stands in for "nothing owed", so it
+/// skips the lost pass rather than relabelling a settled card.
 ///
 /// Covers the record written before a spawn that never happened too: it has a
 /// card id and no pid, and the card it left reads 「已失去跟踪」 like any other —
 /// nothing was running, but cola cannot know that from the file.
 pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRunRecords) -> TerminalSweep {
     let mut sweep = TerminalSweep::default();
+    let owed_store = records.owed();
+    let (owed, complete) = owed_store.load_all();
+    let owning: std::collections::HashSet<String> = owed
+        .iter()
+        .map(|settlement| settlement.record.run_id.clone())
+        .collect();
+    for settlement in owed {
+        let record = &settlement.record;
+        if !record.card_id.is_empty() {
+            let card = settled_card(
+                &record.cwd,
+                &record.command,
+                Path::new(&record.log_path),
+                &record.run_id,
+                &record.chat_id,
+                &record.thread_id,
+                record.is_group,
+                true,
+                &settlement.outcome,
+            );
+            if !patch_card(
+                platform,
+                &record.card_id,
+                &card,
+                "tell a settled card its run ended",
+            )
+            .await
+            {
+                // Still owed: the entry stays for the next start.
+                continue;
+            }
+            sweep.settled += 1;
+        }
+        // The chat's current record, when it still names this run, is marked
+        // settled too — a targeted merge, never a snapshot replace, so a newer
+        // run's record and a later 「问 AI」 bit survive. A failed merge keeps the
+        // obligation: dropping it would let the next start's `running` sweep
+        // relabel the card we just repaired.
+        if records.mark_settled(&record.key(), &record.run_id) {
+            owed_store.remove(&record.run_id);
+        }
+    }
+    if !complete {
+        tracing::warn!(
+            "terminal: skipping the lost sweep — an owed settle could not be read, so a `running` \
+             record may be an ending that is still owed"
+        );
+        return sweep;
+    }
     for mut record in records.load_all() {
-        if record.state == TerminalRunState::Settled {
-            if record.card_settled {
-                continue;
-            }
-            // A record written by a build that predates the ending has nothing
-            // to rebuild: the previous process patched the card itself (or
-            // could not, and nothing here can tell).
-            let Some(outcome) = record.outcome.clone() else {
-                continue;
-            };
-            let told = !record.card_id.is_empty();
-            if told {
-                let card = settled_card(
-                    &record.cwd,
-                    &record.command,
-                    Path::new(&record.log_path),
-                    &record.run_id,
-                    &record.chat_id,
-                    &record.thread_id,
-                    record.is_group,
-                    true,
-                    &outcome,
-                );
-                match patch_card(
-                    platform,
-                    &record.card_id,
-                    &card,
-                    "tell a settled card its run ended",
-                )
-                .await
-                {
-                    true => {}
-                    false => continue,
-                }
-            }
-            // Only a landed write marks it done: a failed one stays owed.
-            record.card_settled = true;
-            match records.write(&record) {
-                Ok(()) if told => sweep.settled += 1,
-                Ok(()) => {}
-                Err(error) => tracing::warn!(
-                    "terminal: could not record the settled card for run {}: {error}",
-                    record.run_id
-                ),
-            }
+        if record.state != TerminalRunState::Running {
             continue;
         }
-        if record.state != TerminalRunState::Running {
+        if owning.contains(&record.run_id) {
+            // Its ending is owed; telling its card 「已失去跟踪」 would replace a
+            // settled card with a false one.
             continue;
         }
         if !record.card_id.is_empty() {
@@ -1367,8 +1382,6 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
             }
         }
         record.state = TerminalRunState::Lost;
-        // The lost card IS this run's ending write; nothing more is owed.
-        record.card_settled = true;
         match records.write(&record) {
             Ok(()) => sweep.lost += 1,
             Err(error) => tracing::warn!("terminal: could not mark run {} lost: {error}", record.run_id),
@@ -1435,12 +1448,15 @@ pub(crate) fn sweep_logs(root: &Path, log_days: u32, records: &TerminalRunRecord
     }
     // The reference set must be COMPLETE: a record that would not parse may name
     // the very log this would unlink, and logs with nobody to reference them are
-    // not "unreferenced" — they are unwitnessed.
+    // not "unreferenced" — they are unwitnessed. An owed settlement names a log
+    // too: its card has not been told yet, so the evidence must survive until
+    // that PATCH lands.
     let (records_on_disk, complete) = records.scan();
-    if !complete || !records.dir().exists() {
+    let (owed, owed_complete) = records.owed().load_all();
+    if !complete || !owed_complete || !records.dir().exists() {
         tracing::warn!(
-            "terminal: skipping the Terminal Log age sweep — the run records must be present and \
-             all readable before a log can be proven unreferenced"
+            "terminal: skipping the Terminal Log age sweep — the run records and owed settles must \
+             be present and all readable before a log can be proven unreferenced"
         );
         return 0;
     }
@@ -1448,6 +1464,10 @@ pub(crate) fn sweep_logs(root: &Path, log_days: u32, records: &TerminalRunRecord
     let referenced: std::collections::HashSet<PathBuf> = records_on_disk
         .into_iter()
         .map(|record| PathBuf::from(record.log_path))
+        .chain(
+            owed.into_iter()
+                .map(|settlement| PathBuf::from(settlement.record.log_path)),
+        )
         .collect();
     let now = SystemTime::now();
     let mut removed = 0;
@@ -1587,18 +1607,23 @@ async fn settle(
     true
 }
 
-/// End a run: persist the ending **first**, tell the card, then record that the
-/// card was told (whole-branch review, finding 1).
+/// End a run: persist the **owed settlement** first, tell the card, then drop
+/// the obligation once its PATCH landed (whole-branch review, finding 1).
 ///
-/// A failed — or interrupted — last write is then owed, not lost: the record
-/// says the run ended and its `card_settled` still says the card has not heard,
-/// which is exactly what the next start's sweep finishes with the same builder.
-/// `record` is `None` only when no record could be written at all (the pre-spawn
-/// refusal), where nothing can vouch for the run afterwards.
+/// The obligation — not the per-chat record — is the durable promise: the record
+/// is replaced by the chat's next run, so an ending kept only there could be
+/// erased while its card still looks live. Only once the obligation is on disk
+/// may the card be told; if it cannot be persisted, the card is left exactly as
+/// it is and the failure is logged, because a card that says 「已完成」 with no
+/// durable obligation is a claim no restart could repair.
+///
+/// `durable` says whether the pre-spawn record write landed: with it, the chat's
+/// record is also marked settled (best effort — the obligation is the authority).
 #[allow(clippy::too_many_arguments)]
 async fn finish_run(
     records: &TerminalRunRecords,
-    mut record: Option<&mut TerminalRunRecord>,
+    record: &mut TerminalRunRecord,
+    durable: bool,
     platform: &dyn Platform,
     card_id: &str,
     cwd: &str,
@@ -1611,21 +1636,27 @@ async fn finish_run(
     card_write: &tokio::sync::Mutex<()>,
     outcome: &TerminalRunOutcome,
 ) -> bool {
-    if let Some(record) = record.as_deref_mut() {
-        record.state = TerminalRunState::Settled;
-        record.outcome = Some(outcome.clone());
-        record.card_settled = false;
+    record.state = TerminalRunState::Settled;
+    let owed = OwedSettlement {
+        record: record.clone(),
+        outcome: outcome.clone(),
+    };
+    if let Err(error) = records.owed().add(&owed) {
+        tracing::warn!(
+            "terminal: could not record the owed settle for run {run_id}; leaving its card as it is: {error}"
+        );
+        return false;
+    }
+    if durable {
         records.update(record);
     }
-    let recorded = record.is_some();
     let patched = settle_run(
-        platform, card_id, cwd, command, log, thread_key, is_group, run_id, recorded, settled, card_write,
+        platform, card_id, cwd, command, log, thread_key, is_group, run_id, durable, settled, card_write,
         outcome,
     )
     .await;
-    if patched && let Some(record) = record {
-        record.card_settled = true;
-        records.update(record);
+    if patched {
+        records.owed().remove(run_id);
     }
     patched
 }
@@ -1723,8 +1754,8 @@ fn spawn_live_patch(
 /// and the same write lock is taken, so the settle is the card's LAST write:
 /// no live patch can be issued after it, and an already-issued one finishes
 /// first. A timed-out settle still releases the claim — a dead card must not
-/// wedge the chat — and returns `false`, which is what leaves the record's
-/// `card_settled` false for the next start (whole-branch review, finding 1).
+/// wedge the chat — and returns `false`, which is what leaves its owed
+/// settlement in place for the next start.
 #[allow(clippy::too_many_arguments)]
 async fn settle_run(
     platform: &dyn Platform,
@@ -1735,7 +1766,7 @@ async fn settle_run(
     thread_key: &ThreadKey,
     is_group: bool,
     run_id: &str,
-    recorded: bool,
+    durable: bool,
     settled: &AtomicBool,
     card_write: &tokio::sync::Mutex<()>,
     outcome: &TerminalRunOutcome,
@@ -1745,7 +1776,7 @@ async fn settle_run(
     match tokio::time::timeout(
         Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
         settle(
-            platform, card_id, cwd, command, log, thread_key, is_group, run_id, recorded, outcome,
+            platform, card_id, cwd, command, log, thread_key, is_group, run_id, durable, outcome,
         ),
     )
     .await
@@ -1939,11 +1970,11 @@ fn observed_log_len(path: &Path) -> u64 {
 /// The probe's cycle — "has the log passed the cap?" then "kill the group" — is
 /// only sound while the group it names is still the run's. A cycle that read
 /// `stood_down` before the run ended could otherwise signal a pgid that the
-/// run's last reap has already freed for reuse. So both halves take this gate:
-/// the probe holds it across the check and the termination, and the run takes it
-/// after setting `stood_down`, around the reap that frees the id. Once
-/// `stood_down` is set, a cycle signals nothing — including one that was already
-/// in flight, because it re-reads the flag under the gate.
+/// run's last reap has already freed for reuse. So **every** write and read of
+/// the state happens under this gate: the probe holds it across its final check,
+/// the group-liveness check and the termination; the run holds it across the
+/// reap that frees the id, and `stand_down` takes it **before** setting the flag.
+/// A cycle that starts after a stand-down sees the flag and signals nothing.
 struct SizeProbeGate {
     /// Serialises one probe cycle's check-and-signal with the run's ending.
     lock: tokio::sync::Mutex<()>,
@@ -1961,12 +1992,15 @@ impl Default for SizeProbeGate {
 }
 
 impl SizeProbeGate {
-    /// Announce the run is over, then wait for a cycle already inside the gate.
-    /// The flag is set **before** the lock is taken: an in-flight cycle reads it
-    /// when it resumes, and a new cycle never starts signalling.
+    /// Announce the run is over **under the gate**. Acquiring first is what
+    /// makes "the flag is set" and "a cycle may still signal" mutually
+    /// exclusive (whole-branch review, finding 2): a cycle that started first
+    /// finishes while this waits, and every cycle that starts after sees the
+    /// flag. Setting the flag outside the gate left a cycle that had already
+    /// passed its check free to signal after stand-down began.
     async fn stand_down(&self) {
-        self.stood_down.store(true, Ordering::SeqCst);
         let _guard = self.lock.lock().await;
+        self.stood_down.store(true, Ordering::SeqCst);
     }
 
     /// Reap `child` if it has exited, holding the gate so the reap cannot
@@ -1993,9 +2027,10 @@ impl SizeProbeGate {
 }
 
 /// A test seam for [`SizeProbeGate`] — `None` in production, where the gate is
-/// exercised only by its own correctness. A test parks a cycle between the gate's
-/// check and the signal, ends the run, releases the cycle, and asserts it
-/// signalled nothing.
+/// exercised only by its own correctness. A test parks a cycle **before** it
+/// takes the gate, ends the run (by 终止 or by the command exiting on its own),
+/// releases the cycle, and asserts it signalled nothing. The seam pauses; it
+/// never performs part of the production check.
 #[cfg(test)]
 pub(crate) struct TerminalProbeHook {
     /// One permit releases one parked cycle.
@@ -2056,9 +2091,19 @@ async fn run_size_probe(probe: SizeProbe, mut stop: tokio::sync::oneshot::Receiv
             biased;
             _ = &mut stop => return,
             _ = tick.tick() => {
-                // The check and the signal it may lead to are one step: the
-                // run's ending cannot interleave, and a run that ended cannot
-                // be signalled.
+                // A test may park the cycle BEFORE it takes the gate: that is
+                // the "in flight when the run ends" window the gate exists for,
+                // and it must stay outside the gate so the run can still end
+                // (and notice its own exit) while the cycle waits.
+                #[cfg(test)]
+                if let Some(hook) = &hook {
+                    hook.parked.fetch_add(1, Ordering::SeqCst);
+                    let _permit = hook.release.acquire().await;
+                }
+                // The final check, the group-liveness check and the signal are
+                // ONE critical section under the gate: the run's ending cannot
+                // interleave with them, and a run that ended cannot be
+                // signalled. There is no second check — the gate is it.
                 let _signal = gate.lock.lock().await;
                 if gate.stood_down.load(Ordering::SeqCst) {
                     return;
@@ -2070,16 +2115,6 @@ async fn run_size_probe(probe: SizeProbe, mut stop: tokio::sync::oneshot::Receiv
                 // unrelated group after the id is reused.
                 if !group_has_members(pgid) {
                     return;
-                }
-                #[cfg(test)]
-                if let Some(hook) = &hook {
-                    hook.parked.fetch_add(1, Ordering::SeqCst);
-                    let _permit = hook.release.acquire().await;
-                    // Re-read under the gate: the run may have ended while this
-                    // cycle was parked (whole-branch review, finding 2).
-                    if gate.stood_down.load(Ordering::SeqCst) || !group_has_members(pgid) {
-                        return;
-                    }
                 }
                 // `>` is the ADR's "passes 29 MB". Whatever the single write
                 // that crossed it did is already on disk: this is an observed
@@ -2282,6 +2317,31 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
+
+    /// Whole-branch review (round 2, finding 2): `stand_down` takes the gate
+    /// **before** setting the flag, so it cannot announce "the run is over"
+    /// while a cycle is inside the gate between its check and its signal. A flag
+    /// set outside the gate would already read true here, while this stand-in
+    /// cycle still holds it.
+    #[tokio::test]
+    async fn stand_down_sets_the_flag_only_under_the_gate() {
+        let gate = std::sync::Arc::new(SizeProbeGate::default());
+        // Stands in for a cycle that has passed its check and is signalling.
+        let cycle = gate.lock.lock().await;
+        let stand = {
+            let gate = std::sync::Arc::clone(&gate);
+            tokio::spawn(async move { gate.stand_down().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !gate.stood_down.load(Ordering::SeqCst),
+            "the flag is set only while the gate is held, so no cycle can be mid-signal"
+        );
+
+        drop(cycle);
+        stand.await.unwrap();
+        assert!(gate.stood_down.load(Ordering::SeqCst));
+    }
 
     /// A command's log is written while cola reads it. The read must take a
     /// fixed-size suffix, never follow EOF into however much the producer keeps

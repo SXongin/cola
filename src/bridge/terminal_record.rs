@@ -7,12 +7,16 @@
 //! tell its readers it can no longer be tracked, and (b) let that card's
 //! 「↻ 重跑」 and 「📄 完整输出」 still know their data. It carries the run id, the
 //! card's message id and chat, the **Terminal Log** path, the command, the cwd,
-//! the timeout, the process ids, the state (`running` / `settled` / `lost`), the
-//! run's ending, and two "already happened" facts nothing else can re-derive:
-//! whether the card has been told the run ended (`card_settled`) and whether
-//! 「问 AI」 already submitted the output (`ask_ai_submitted`). A restart uses
-//! them to finish a write the previous process could not — and to refuse a
-//! second submission (whole-branch review, findings 1 and 4).
+//! the timeout, the process ids, the state (`running` / `settled` / `lost`), and
+//! the 「问 AI」 submission bit. A restart uses the state to report a run it can no
+//! longer track, and the bit to refuse a second submission (whole-branch review,
+//! finding 4).
+//!
+//! A settle whose **card has not been told** is a different kind of fact, and it
+//! does NOT live here: the chat's next run replaces this file, so an obligation
+//! kept here would be erased by that very write. It lives in
+//! [`TerminalOwedSettlements`], one file per run id beside the records, and is
+//! dropped only once its card PATCH landed (whole-branch review, finding 1).
 //!
 //! Two rules come from the ADR and shape every caller:
 //!
@@ -25,6 +29,11 @@
 //!   run is *reported*; a pid may have been reused since, so the sweep reads it
 //!   and does nothing else with it.
 //!
+//! Every write of one Chat/Topic's record takes that chat's lock, because the
+//! record is replaced whole: a late read-modify-write (the 「问 AI」 marker) must
+//! never rewrite a snapshot taken before the chat's next run existed
+//! (whole-branch review, finding 3).
+//!
 //! It is kept until the next run in that chat replaces it, which is what makes
 //! a superseded card's buttons stale clicks and keeps the newest card's usable
 //! across a restart.
@@ -33,7 +42,9 @@
 //! mechanics); only the pre-spawn write is checked, because only that one is a
 //! guarantee rather than progress.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -60,8 +71,9 @@ pub(crate) enum TerminalRunState {
     Running,
     /// The run ended — an exit code, a 终止, or a spawn that never happened.
     /// Kept, so the card's buttons stay usable until the next run replaces it.
-    /// [`TerminalRunRecord::card_settled`] says whether the ending write reached
-    /// the card: a settled record with it false is one a restart finishes.
+    /// Whether its card has been told is **not** recorded here: that obligation
+    /// lives in [`TerminalOwedSettlements`], which survives this file's
+    /// replacement.
     Settled,
     /// The sweep found it `running` after a restart. The command may still be
     /// alive as an orphan (hand-launched cola) or may have been taken with
@@ -119,17 +131,6 @@ pub(crate) struct TerminalRunRecord {
     #[serde(default)]
     pub(crate) is_group: bool,
     pub(crate) state: TerminalRunState,
-    /// The run's ending, once it has one. Written together with
-    /// [`Self::state`] = `settled` and [`Self::card_settled`] = false, so the
-    /// three always agree; absent on a `running` record and on one written by a
-    /// build that predates it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) outcome: Option<TerminalRunOutcome>,
-    /// Whether the card has been told the run is over. A `settled` record with
-    /// this false is a write the previous process owed: the startup sweep
-    /// re-PATCHes the settled card from [`Self::outcome`] and sets it true.
-    #[serde(default)]
-    pub(crate) card_settled: bool,
     /// Whether 「问 AI」 already handed this run's output to the model. The
     /// in-memory guard is process-local, so without this a restart's click
     /// would submit the same output again (whole-branch review, finding 4).
@@ -149,12 +150,33 @@ impl TerminalRunRecord {
     }
 }
 
+/// One settle whose card has not been told (whole-branch review, finding 1): the
+/// run's record snapshot and the ending to render. It is kept **outside** the
+/// per-chat current record on purpose — that file is replaced by the chat's next
+/// run, and the obligation must outlive the replacement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwedSettlement {
+    pub(crate) record: TerminalRunRecord,
+    pub(crate) outcome: TerminalRunOutcome,
+}
+
 /// The record directory: one file per **Chat**/**Topic**, beside the session
 /// mapping (`~/.cola/terminal-runs` in production, `<dir>` of
 /// `[bridge] session_file`). One file per conversation is deliberate — a write
 /// touches only its own chat, so two chats' runs never rewrite each other.
 pub(crate) struct TerminalRunRecords {
     dir: PathBuf,
+    /// One lock per Chat/Topic, taken by every write of that chat's record. The
+    /// record is replaced whole, so a read-modify-write (the 「问 AI」 marker)
+    /// that interleaved with the chat's next run could install a stale snapshot
+    /// over the new run's record (whole-branch review, finding 3).
+    locks: Mutex<HashMap<ThreadKey, Arc<Mutex<()>>>>,
+    /// Test-only: a one-shot pause inside the 「问 AI」 merge, between its
+    /// re-read and its write. It lets a test hold that merge open while the
+    /// chat's next run writes its own record — the interleave the chat lock
+    /// forbids — and assert the newer record survives.
+    #[cfg(test)]
+    merge_pause: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TerminalRunRecords {
@@ -165,7 +187,12 @@ impl TerminalRunRecords {
     }
 
     pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            merge_pause: Mutex::new(None),
+        }
     }
 
     /// The directory the records live in. The log sweep asks whether it exists
@@ -217,28 +244,7 @@ impl TerminalRunRecords {
     /// synchronously in a card callback for the stale-click guards, so it must
     /// not grow with whatever sits at the path.
     fn load_file(path: &Path) -> Option<TerminalRunRecord> {
-        use std::io::Read;
-
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                tracing::warn!("terminal record: could not read {}: {e}", path.display());
-                return None;
-            }
-        };
-        let mut raw = Vec::new();
-        if let Err(e) = file.take(TERMINAL_RECORD_MAX_BYTES + 1).read_to_end(&mut raw) {
-            tracing::warn!("terminal record: could not read {}: {e}", path.display());
-            return None;
-        }
-        if raw.len() as u64 > TERMINAL_RECORD_MAX_BYTES {
-            tracing::warn!(
-                "terminal record: {} is larger than the {TERMINAL_RECORD_MAX_BYTES}-byte bound; ignoring it",
-                path.display()
-            );
-            return None;
-        }
+        let raw = read_bounded(path)?;
         match serde_json::from_slice(&raw) {
             Ok(record) => Some(record),
             Err(e) => {
@@ -257,9 +263,28 @@ impl TerminalRunRecords {
         !run_id.is_empty() && self.read(key).is_some_and(|record| record.run_id == run_id)
     }
 
+    /// The Chat/Topic's record-write lock. Every mutation of that chat's record
+    /// takes it, so no two read-modify-write sequences can interleave.
+    fn chat_lock(&self, key: &ThreadKey) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.locks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        )
+    }
+
     /// Write `record`, **checked**: this is the one write a run's identity
     /// depends on, so the pre-spawn caller refuses to spawn when it fails.
     pub(crate) fn write(&self, record: &TerminalRunRecord) -> std::io::Result<()> {
+        let lock = self.chat_lock(&record.key());
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        self.write_locked(record)
+    }
+
+    /// [`write`](Self::write) for a caller already holding the chat's lock.
+    fn write_locked(&self, record: &TerminalRunRecord) -> std::io::Result<()> {
         let data = serde_json::to_vec(record).map_err(std::io::Error::other)?;
         sidecar::write_atomic(&self.path(&record.key()), &data)
     }
@@ -277,20 +302,102 @@ impl TerminalRunRecords {
         }
     }
 
-    /// Record that `run_id`'s output was submitted to the model — the durable
-    /// half of 「问 AI」's one-submission rule (ADR-0086 decision 9). Best
-    /// effort by design: a failed write leaves this process's in-memory guard as
-    /// the only suppression, which is exactly the state the record exists to
-    /// improve on, so the click is never failed by it.
-    pub(crate) fn mark_ask_ai_submitted(&self, key: &ThreadKey, run_id: &str) {
+    /// Mark `run_id`'s record settled, as a **targeted merge**: only when the
+    /// chat's current record still names that run, and only its state changes.
+    ///
+    /// The restart's owed-settle repair calls this after its card PATCH lands.
+    /// A blind replace would be wrong twice over: the chat may have moved on to
+    /// a newer run (whose record must not be touched), and the current record
+    /// may have learned something since the snapshot was taken — today the
+    /// 「问 AI」 bit — which a stale snapshot would silently clear.
+    ///
+    /// `true` means the obligation is discharged: the current record is absent,
+    /// names another run, is already settled, or was just written. `false` means
+    /// the write failed, so the caller must keep the obligation — otherwise the
+    /// next start's `running` sweep would relabel a settled card 「已失去跟踪」.
+    pub(crate) fn mark_settled(&self, key: &ThreadKey, run_id: &str) -> bool {
+        let lock = self.chat_lock(key);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(mut record) = self.read(key) else {
+            return true;
+        };
+        if record.run_id != run_id || record.state != TerminalRunState::Running {
+            return true;
+        }
+        record.state = TerminalRunState::Settled;
+        match self.write_locked(&record) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    "terminal record: could not mark run {run_id} settled after its owed card landed: {error}"
+                );
+                false
+            }
+        }
+    }
+
+    /// Record that `run_id`'s output was submitted to the model — the durable
+    /// half of 「问 AI」's one-submission rule (ADR-0086 decision 9).
+    ///
+    /// A **locked merge**, not a snapshot rewrite (whole-branch review, finding
+    /// 3): under the chat's lock it re-reads the record, verifies it still names
+    /// this run, and changes only the bit. If the chat has moved on, nothing is
+    /// written — the newer run's record survives with its own fields.
+    ///
+    /// Best effort by design (review finding 4): a crash between the prompt's
+    /// acceptance and this write, or a write that fails, can duplicate a
+    /// submission after a restart. That window is accepted; failing the click
+    /// over a bookkeeping write would be worse.
+    pub(crate) fn mark_ask_ai_submitted(&self, key: &ThreadKey, run_id: &str) {
+        let lock = self.chat_lock(key);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(record) = self.read(key) else {
             return;
         };
-        if record.run_id != run_id || record.ask_ai_submitted {
+        let Some(merged) = merge_ask_ai_submitted(record, run_id) else {
             return;
+        };
+        #[cfg(test)]
+        {
+            let pause = self
+                .merge_pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(pause) = pause {
+                pause();
+            }
         }
-        record.ask_ai_submitted = true;
-        self.update(&record);
+        match self.write_locked(&merged) {
+            Ok(()) => {}
+            Err(error) => tracing::warn!(
+                "terminal record: could not record the 问 AI submission of {}: {error}",
+                merged.run_id
+            ),
+        }
+    }
+
+    /// The owed-settlement store that lives **beside** these records — a sibling
+    /// directory, deliberately not inside it: the record directory being
+    /// unusable (a plain file where it belongs, say) must not also take away the
+    /// only place an ending can be recorded, or the card could never be told the
+    /// run ended at all.
+    pub(crate) fn owed(&self) -> TerminalOwedSettlements {
+        let name = self
+            .dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "terminal-runs".to_string());
+        TerminalOwedSettlements::new(self.dir.with_file_name(format!("{name}-owed")))
+    }
+
+    /// Test-only: park the next 「问 AI」 merge after its re-read and before its
+    /// write. The chat lock is held across the park, so a concurrent write of
+    /// the chat's next record has to wait behind it — which is exactly the
+    /// ordering the lock exists to guarantee.
+    #[cfg(test)]
+    pub(crate) fn pause_merge_once(&self, pause: impl FnOnce() + Send + 'static) {
+        *self.merge_pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(pause));
     }
 
     /// Every record on disk — the startup sweep's input. A corrupt file is
@@ -358,6 +465,155 @@ impl TerminalRunRecords {
     }
 }
 
+/// The **owed settlements**: one file per run whose ending the previous process
+/// could not tell its card (whole-branch review, finding 1).
+///
+/// It lives **beside** the per-chat current records (`<records>-owed/`), never
+/// inside one, for two reasons: the chat's next run replaces its current record,
+/// and an obligation stored there would be erased by that write — leaving the
+/// earlier card permanently live-looking; and the record directory being
+/// unusable must not also take away the only place an ending can be recorded.
+/// A file is removed only once its card PATCH landed, so the obligation is
+/// retried by every start until then.
+///
+/// The startup sweep reads this set **independently of the current records**: an
+/// unreadable or already-replaced record is no reason to abandon a card whose
+/// ending is still owed.
+pub(crate) struct TerminalOwedSettlements {
+    dir: PathBuf,
+}
+
+impl TerminalOwedSettlements {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// The directory the obligations live in. Its absence means "nothing owed";
+    /// an unreadable one is not knowing. A test uses it to plant a corrupt
+    /// entry; production only asks `load_all`.
+    #[cfg(test)]
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn path(&self, run_id: &str) -> PathBuf {
+        self.dir.join(owed_file_name(run_id))
+    }
+
+    /// Persist one obligation, **checked**: the card may only be told a run
+    /// ended once this landed, otherwise no restart could repeat the write.
+    pub(crate) fn add(&self, owed: &OwedSettlement) -> std::io::Result<()> {
+        let data = serde_json::to_vec(owed).map_err(std::io::Error::other)?;
+        sidecar::write_atomic(&self.path(&owed.record.run_id), &data)
+    }
+
+    /// Drop an obligation whose card has been told. Best effort: a failure only
+    /// means the next start repeats an idempotent PATCH.
+    pub(crate) fn remove(&self, run_id: &str) {
+        match std::fs::remove_file(self.path(run_id)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!("terminal owed: could not remove the obligation for {run_id}: {error}")
+            }
+        }
+    }
+
+    /// Every obligation on disk, and whether the set is **complete**.
+    ///
+    /// An incomplete set must not be read as "nothing owed": that is what would
+    /// let a `running` sweep relabel a settled card 「已失去跟踪」. A missing
+    /// directory is complete-and-empty (the sidecar convention); an unreadable
+    /// one, or a file that will not parse or is not named for its own run, is
+    /// not knowing.
+    pub(crate) fn load_all(&self) -> (Vec<OwedSettlement>, bool) {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), true),
+            Err(e) => {
+                tracing::warn!("terminal owed: could not read {}: {e}", self.dir.display());
+                return (Vec::new(), false);
+            }
+        };
+        let mut owed = Vec::new();
+        let mut complete = true;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        "terminal owed: could not list an entry in {}: {e}",
+                        self.dir.display()
+                    );
+                    complete = false;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(raw) = read_bounded(&path) else {
+                complete = false;
+                continue;
+            };
+            match serde_json::from_slice::<OwedSettlement>(&raw) {
+                // An obligation only means something at the path its OWN run id
+                // names: anything else is unreadable, whether misplaced or
+                // crafted.
+                Ok(settlement) if self.path(&settlement.record.run_id) == path => owed.push(settlement),
+                Ok(_) => complete = false,
+                Err(e) => {
+                    tracing::warn!("terminal owed: could not parse {}: {e}", path.display());
+                    complete = false;
+                }
+            }
+        }
+        (owed, complete)
+    }
+}
+
+/// The 「问 AI」 marker's whole decision, as one function: verify the record still
+/// names the run being marked, then change **only** that bit. `None` means the
+/// chat has moved on (or the bit is already set), and the newer record must not
+/// be replaced by this snapshot.
+fn merge_ask_ai_submitted(mut record: TerminalRunRecord, run_id: &str) -> Option<TerminalRunRecord> {
+    if record.run_id != run_id || record.ask_ai_submitted {
+        return None;
+    }
+    record.ask_ai_submitted = true;
+    Some(record)
+}
+
+/// Read one sidecar file's bytes, bounded. `None` means missing, unreadable or
+/// past [`TERMINAL_RECORD_MAX_BYTES`] — the record and the owed entry share the
+/// bound because both can carry the Host's command.
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("terminal record: could not read {}: {e}", path.display());
+            return None;
+        }
+    };
+    let mut raw = Vec::new();
+    if let Err(e) = file.take(TERMINAL_RECORD_MAX_BYTES + 1).read_to_end(&mut raw) {
+        tracing::warn!("terminal record: could not read {}: {e}", path.display());
+        return None;
+    }
+    if raw.len() as u64 > TERMINAL_RECORD_MAX_BYTES {
+        tracing::warn!(
+            "terminal record: {} is larger than the {TERMINAL_RECORD_MAX_BYTES}-byte bound; ignoring it",
+            path.display()
+        );
+        return None;
+    }
+    Some(raw)
+}
+
 /// One record's file name: a readable slug of the Chat/Topic plus a stable hash
 /// of the whole key. The slug keeps a `ls` of the directory meaningful; the hash
 /// keeps two keys that sanitise to the same slug (a `:` and a `-`, say) apart,
@@ -384,19 +640,44 @@ fn file_name(key: &ThreadKey) -> String {
 /// FNV-1a over the key's two halves, separated so `("ab", "c")` and
 /// `("a", "bc")` cannot collide.
 fn fnv1a(key: &ThreadKey) -> u64 {
+    fnv1a_bytes(
+        key.chat_id
+            .bytes()
+            .chain(std::iter::once(0))
+            .chain(key.thread_id.bytes()),
+    )
+}
+
+/// FNV-1a over a byte stream, in one place so every sidecar name agrees on the
+/// hash and it stays fixed across toolchains.
+fn fnv1a_bytes(bytes: impl Iterator<Item = u8>) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
-    for byte in key
-        .chat_id
-        .bytes()
-        .chain(std::iter::once(0))
-        .chain(key.thread_id.bytes())
-    {
+    for byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(PRIME);
     }
     hash
+}
+
+/// One obligation's file name: the run id sanitised for `ls`, plus its stable
+/// hash. Run ids are normally `[0-9-]`, but the name is derived defensively so a
+/// crafted id can never escape the directory, and the hash keeps two ids that
+/// sanitise alike apart.
+fn owed_file_name(run_id: &str) -> String {
+    let slug: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    format!("{slug}-{:016x}.json", fnv1a_bytes(run_id.bytes()))
 }
 
 #[cfg(test)]
@@ -405,6 +686,15 @@ mod tests {
 
     fn key(chat: &str, thread: &str) -> ThreadKey {
         ThreadKey::new(chat.to_string(), thread.to_string())
+    }
+
+    /// A record store whose directories live INSIDE the tempdir: the owed
+    /// sidecar is a sibling of the records directory, so a store rooted at the
+    /// tempdir itself would leave one behind.
+    fn store(dir: &tempfile::TempDir) -> TerminalRunRecords {
+        let path = dir.path().join("terminal-runs");
+        std::fs::create_dir_all(&path).unwrap();
+        TerminalRunRecords::new(path)
     }
 
     fn record(key: &ThreadKey, run_id: &str) -> TerminalRunRecord {
@@ -420,8 +710,6 @@ mod tests {
             pids: vec![1234],
             is_group: true,
             state: TerminalRunState::Running,
-            outcome: None,
-            card_settled: false,
             ask_ai_submitted: false,
         }
     }
@@ -432,7 +720,7 @@ mod tests {
     #[test]
     fn a_record_round_trips_with_its_state_spelled_as_the_adr_does() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let key = key("oc_chat", "omt_topic");
         let written = record(&key, "run-1");
         records.write(&written).unwrap();
@@ -448,7 +736,7 @@ mod tests {
     #[test]
     fn one_file_per_chat_and_a_write_never_touches_another_chat() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let a = key("oc_a", "oc_a");
         let b = key("oc_a", "omt_topic_b");
         records.write(&record(&a, "run-a1")).unwrap();
@@ -488,7 +776,7 @@ mod tests {
     #[test]
     fn only_the_current_record_names_a_current_run() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let key = key("oc_chat", "oc_chat");
         assert!(
             !records.is_current(&key, "run-1"),
@@ -513,7 +801,7 @@ mod tests {
     #[test]
     fn a_record_written_under_another_chats_file_reads_as_none() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let owner = key("oc_owner", "oc_owner");
         let other = key("oc_other", "oc_other");
         let owner_record = record(&owner, "run-owner");
@@ -541,7 +829,7 @@ mod tests {
     #[test]
     fn an_oversized_record_reads_as_none() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let key = key("oc_chat", "oc_chat");
         // A valid record padded past the bound: parsable JSON that is simply too
         // large to belong in a click's callback.
@@ -561,7 +849,7 @@ mod tests {
     #[test]
     fn a_corrupt_or_missing_record_fails_open() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let key = key("oc_chat", "oc_chat");
         assert_eq!(records.read(&key), None, "no record is not an error");
 
@@ -576,7 +864,7 @@ mod tests {
     #[test]
     fn mark_ask_ai_submitted_only_marks_the_current_run() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let key = key("oc_chat", "oc_chat");
         records.write(&record(&key, "run-1")).unwrap();
         assert!(!records.read(&key).unwrap().ask_ai_submitted);
@@ -595,41 +883,157 @@ mod tests {
     }
 
     /// Whole-branch review (finding 1): the ending a restart needs to finish the
-    /// card's last write is in the record itself — including that the card has
-    /// not been told yet.
+    /// card's last write lives in the **owed sidecar**, not in the per-chat
+    /// record — the chat's next run replaces that file, and the obligation must
+    /// outlive it.
     #[test]
-    fn a_settled_record_round_trips_its_ending_and_the_owed_card_write() {
+    fn an_owed_settle_round_trips_beside_the_record() {
         let dir = tempfile::tempdir().unwrap();
-        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let records = store(&dir);
         let key = key("oc_chat", "oc_chat");
         let mut settled = record(&key, "run-1");
         settled.state = TerminalRunState::Settled;
-        settled.outcome = Some(TerminalRunOutcome {
-            exit_code: Some(3),
-            spawn_error: None,
-            elapsed_ms: 1_500,
-            stopped: false,
-            survivors: true,
-            output_over_limit: false,
+        let owed = OwedSettlement {
+            record: settled.clone(),
+            outcome: TerminalRunOutcome {
+                exit_code: Some(3),
+                spawn_error: None,
+                elapsed_ms: 1_500,
+                stopped: false,
+                survivors: true,
+                output_over_limit: false,
+            },
+        };
+        records.owed().add(&owed).unwrap();
+        assert_eq!(records.owed().load_all(), (vec![owed.clone()], true));
+
+        // Replacing the chat's current record — what the next run does — leaves
+        // the obligation untouched.
+        records.write(&record(&key, "run-2")).unwrap();
+        assert_eq!(
+            records.owed().load_all(),
+            (vec![owed.clone()], true),
+            "the obligation is not the per-chat record"
+        );
+
+        records.owed().remove("run-1");
+        assert_eq!(records.owed().load_all(), (Vec::new(), true));
+    }
+
+    /// An unreadable obligation is "not knowing", never "nothing owed": a sweep
+    /// that read it as empty could relabel a settled card lost.
+    #[test]
+    fn an_unreadable_owed_entry_makes_the_set_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = store(&dir);
+        std::fs::create_dir_all(records.owed().dir()).unwrap();
+        std::fs::write(records.owed().dir().join("broken.json"), b"{ not json").unwrap();
+
+        let (owed, complete) = records.owed().load_all();
+        assert!(owed.is_empty());
+        assert!(!complete, "an unparseable obligation is not an empty set");
+
+        std::fs::remove_file(records.owed().dir().join("broken.json")).unwrap();
+        assert_eq!(
+            records.owed().load_all(),
+            (Vec::new(), true),
+            "and with it gone the set is complete again"
+        );
+    }
+
+    /// Whole-branch review (finding 3): the marker only ever changes its own
+    /// bit, and only while the record still names that run. Everything else in
+    /// the newer run's record — command, cwd, state, timeout, card — survives.
+    #[test]
+    fn the_ask_ai_marker_never_rewrites_a_successor_runs_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = store(&dir);
+        let key = key("oc_chat", "oc_chat");
+        let mut successor = record(&key, "run-b");
+        successor.command = "cargo test".into();
+        successor.cwd = "/successor".into();
+        successor.timeout_ms = 90_000;
+        successor.card_id = "om_b".into();
+        successor.state = TerminalRunState::Settled;
+        records.write(&successor).unwrap();
+
+        // The marker for a run the chat has moved on from writes nothing.
+        assert_eq!(
+            merge_ask_ai_submitted(successor.clone(), "run-a"),
+            None,
+            "a stale snapshot is not a permission to rewrite the new record"
+        );
+        assert_eq!(
+            merge_ask_ai_submitted(successor.clone(), "run-b").map(|merged| merged.ask_ai_submitted),
+            Some(true)
+        );
+
+        records.mark_ask_ai_submitted(&key, "run-a");
+        assert_eq!(
+            records.read(&key),
+            Some(successor),
+            "the successor's record survives intact"
+        );
+    }
+
+    /// Whole-branch review (finding 3): the merge is a locked read-modify-write.
+    /// A merge already in flight (parked after its re-read) must block the
+    /// chat's next run's write; the successor's record is what lands last.
+    #[test]
+    fn an_in_flight_marker_cannot_clobber_the_next_runs_record() {
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let records = Arc::new(store(&dir));
+        let key = key("oc_chat", "oc_chat");
+        records.write(&record(&key, "run-a")).unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        records.pause_merge_once(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
         });
-        settled.card_settled = false;
-        records.write(&settled).unwrap();
 
-        assert_eq!(records.read(&key), Some(settled.clone()));
-        let raw = std::fs::read_to_string(records.path(&key)).unwrap();
-        assert!(raw.contains("\"card_settled\":false"), "{raw}");
-        assert!(raw.contains("\"elapsed_ms\":1500"), "{raw}");
+        let marker = {
+            let records = Arc::clone(&records);
+            let key = key.clone();
+            std::thread::spawn(move || records.mark_ask_ai_submitted(&key, "run-a"))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the merge reached its pause");
 
-        // A record from before these fields existed still reads, and its
-        // defaults say "no ending to rebuild".
-        let mut legacy = serde_json::to_value(record(&key, "run-2")).unwrap();
-        let object = legacy.as_object_mut().unwrap();
-        object.remove("outcome");
-        object.remove("card_settled");
-        object.remove("ask_ai_submitted");
-        let legacy: TerminalRunRecord = serde_json::from_value(legacy).unwrap();
-        assert_eq!(legacy.outcome, None);
-        assert!(!legacy.card_settled);
-        assert!(!legacy.ask_ai_submitted);
+        let mut successor = record(&key, "run-b");
+        successor.command = "sleep 1".into();
+        successor.cwd = "/successor".into();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let writer = {
+            let records = Arc::clone(&records);
+            let successor = successor.clone();
+            std::thread::spawn(move || {
+                let _ = started_tx.send(());
+                let result = records.write(&successor);
+                let _ = written_tx.send(());
+                result
+            })
+        };
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the successor's write reached the lock");
+        // Give the writer every chance to slip in while the merge is paused; the
+        // chat lock is what keeps it out.
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = release_tx.send(());
+        marker.join().unwrap();
+        assert!(written_rx.recv_timeout(Duration::from_secs(5)).is_ok());
+        writer.join().unwrap().unwrap();
+
+        assert_eq!(
+            records.read(&key),
+            Some(successor),
+            "the next run's record wins, with its own fields"
+        );
     }
 }
