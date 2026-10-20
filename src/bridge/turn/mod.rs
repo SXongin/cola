@@ -1026,10 +1026,13 @@ impl Turn {
             }
         }
         render::read_planned_outputs(&handles.backend, &mut plans).await;
+        let mut settled_chain = None;
         {
             let mut cards = handles.cards.cards.lock().await;
             if let Some(card) = cards.get_mut(&self.session_id) {
+                let chain = card.chain_id();
                 let acc = &mut card.acc;
+                settled_chain = Some(chain);
                 if let Some(transcript) = &final_transcript {
                     render::render_new_turn_parts_committing(
                         acc,
@@ -1096,13 +1099,28 @@ impl Turn {
         )
         .await
         .unwrap_or_default();
-        // Stamp under the anchor guard: the read is an await, so a successor
-        // that replaced the card meanwhile must not inherit this Turn's counts
-        // (the same rule the ownership-checked ending paths apply).
-        if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id)
-            && card.acc.turn_anchor() == settle_anchor.as_ref()
-        {
-            card.acc.set_turn_diff_stats(stats);
+        // Stamp under the chain + anchor guard: the read is an await, so a
+        // successor that replaced the card meanwhile must not inherit this
+        // Turn's counts. If ownership is gone, the rest of this finalization
+        // (footer refreshes, flush, notice) belongs to nobody: abort it and
+        // release the guard.
+        let still_owned = {
+            let mut live = handles.cards.cards.lock().await;
+            match live.get_mut(&self.session_id) {
+                Some(card) if settled_chain == Some(card.chain_id()) => {
+                    card.acc.set_turn_diff_stats(stats);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !still_owned {
+            tracing::info!(
+                "finalization: session {}'s card was replaced during the change-index read; skipping the ending flush",
+                self.session_id
+            );
+            self.release(handles).await;
+            return;
         }
         // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
         // may have created or switched branches, or committed, so re-read the
