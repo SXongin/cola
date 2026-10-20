@@ -4053,6 +4053,7 @@ pub(crate) async fn assert_failed_dir_keeps_surfaces(
             waiting: false,
             pending: vec![surfaces.claim],
             pending_elsewhere: None,
+            pending_overflow: 0,
             tail: vec![],
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,

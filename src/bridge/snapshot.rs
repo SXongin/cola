@@ -46,6 +46,12 @@ pub struct SnapshotData {
     /// `None` when there were none. The status chip points at that card
     /// instead of falling back to the server run state; see [`ElsewherePending`].
     pub pending_elsewhere: Option<ElsewherePending>,
+    /// How many of `pending` this snapshot does NOT embed because the claimed
+    /// blocks alone would exceed one Feishu card (#841). Such requests are left
+    /// UNCLAIMED — the normal pending flow renders them on their own cards — so
+    /// the card names the overflow instead of claiming what it cannot show.
+    /// `0` on every snapshot whose pendings fit, which is the common case.
+    pub pending_overflow: usize,
     /// The 最近对话 tail: the last conversation user/assistant messages,
     /// newest last, with the **Compaction**s that happened inside that window
     /// interleaved at their server positions — a marker that never consumes one
@@ -81,6 +87,14 @@ pub enum ElsewherePending {
 impl SnapshotData {
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// The pendings the snapshot card actually EMBEDS — and therefore the only
+    /// ones it may claim (#841). Empty when the whole set had to move to the
+    /// standalone pending flow.
+    pub fn embedded_pending(&self) -> &[crate::bridge::request::kind::PendingRequest] {
+        let embedded = self.pending.len().saturating_sub(self.pending_overflow);
+        &self.pending[..embedded]
     }
 
     /// ADR-0028 suppression predicate, reading this snapshot's gathered state.
@@ -223,6 +237,7 @@ pub(crate) async fn gather_snapshot(
         waiting,
         pending,
         pending_elsewhere: None,
+        pending_overflow: 0,
         tail,
         newest_user_anchor,
         newest_user_is_cola_authored,
@@ -267,15 +282,27 @@ pub(crate) async fn snapshot_card_from_data(
     data: SnapshotData,
     back: Option<&crate::feishu::card::session::BackToList>,
 ) -> (serde_json::Value, SnapshotData) {
-    let data = crate::bridge::snapshot_claims::claimable_pendings(
+    let mut data = crate::bridge::snapshot_claims::claimable_pendings(
         &handles.requests,
         &handles.cards,
         handles.pins_enabled,
         data,
     )
     .await;
-    let card = crate::feishu::snapshot_card::build_snapshot_card(verb, title, &data, back);
-    (card, data)
+    // The builder decides how many of the claimed pendings the one-shot card
+    // can actually carry; the rest stay UNCLAIMED (and unrendered) so the
+    // normal pending flow keeps them answerable (#841). The count travels with
+    // the data, so a claim-ack rebuild renders the same card.
+    let built = crate::feishu::snapshot_card::build_snapshot_card_fitted(
+        verb,
+        title,
+        &data,
+        &crate::feishu::snapshot_card::SnapshotQuestionState::new(),
+        &[],
+        back,
+    );
+    data.pending_overflow = built.pending_overflow;
+    (built.card, data)
 }
 
 /// What a re-activation's snapshot produced (ADR-0028).
