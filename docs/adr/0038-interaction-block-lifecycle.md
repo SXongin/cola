@@ -222,10 +222,12 @@ The snapshot's claimed pending blocks are the ONE non-evictable section: a
 claim whose block the card does not render leaves a request the user cannot
 answer there. The rule enforcing that invariant is PARTIAL rather than
 all-or-nothing (#842, refining #841): the card embeds the longest PREFIX of the
-session's own pendings that fits one card — capped at five blocks, because a
-card packed with dozens of them leaves no room for the conversation a reader
-adopted the session for — and leaves the rest UNCLAIMED, named on the card
-(`…另有 N 个待处理请求超出单卡容量，将稍后显示`). The copy promises neither a
+session's own pendings that fits one card — capped at five blocks, so the block
+share stays small enough for the 最近对话 section the reader adopted the session
+for — and leaves the rest UNCLAIMED, named on the card
+(`…另有 N 个待处理请求超出单卡容量，将稍后显示`). The cap bounds the blocks'
+share; it does not reserve the tail, so a tail that is over budget on its own is
+still trimmed by the ladder below. The copy promises neither a
 standalone card nor another card: an unclaimed request is surfaced INLINE on the
 session's live card when one exists, and only falls back to a card of its own
 otherwise.
