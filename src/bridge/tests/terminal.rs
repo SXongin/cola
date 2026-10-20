@@ -225,6 +225,65 @@ async fn the_default_session_directory_is_the_cwd_without_a_session() {
     assert!(text.contains(&resolved), "the card names the default cwd: {text}");
 }
 
+/// Spec #821 user story 10: the **Path Scope** base is canonicalised when it
+/// exists, the same way `/cat` resolves a path. A symlinked project directory is
+/// the exact shape of macOS's `/var` → `/private/var` — which is why this shape
+/// broke the card/record assertions there: the card and the record must name the
+/// target, not the spelling the session was seeded with.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_symlinked_project_directory_is_canonicalised_on_the_card_and_the_record() {
+    let _wd = test_work_dir();
+    let real = tempfile::tempdir().unwrap();
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("project-link");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, &link)).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'symlink-822\\n'",
+        key.clone(),
+        "msg_symlink",
+        ConversationKind::P2p,
+    )
+    .await;
+    let settled = settled_card(&platform).await;
+    let target = canonical(real.path());
+    let link_spelling = link.to_string_lossy().into_owned();
+    let text = card_text(&settled);
+    assert!(text.contains(&target), "the card names the target: {text}");
+    assert!(
+        !text.contains(&link_spelling),
+        "not the symlink's spelling: {text}"
+    );
+    let record = app.terminal_records.read(&key).expect("the run's record");
+    assert_eq!(record.cwd, target, "the record a rerun replays is canonical too");
+
+    // 重跑 replays the recorded cwd and must behave identically.
+    let rerun = button_value(&settled, "rerun").expect("重跑");
+    app.host_action_on_message(rerun, "msg_symlink")
+        .await
+        .expect("the click is acknowledged");
+    wait_for_card_update(&platform, "the rerun settles", CardUpdates::Any, |card| {
+        card_text(card).contains("退出码 0") && card_text(card).contains("symlink-822")
+    })
+    .await;
+    let text = card_text(&settled_card(&platform).await);
+    assert!(
+        text.contains(&target),
+        "the rerun's card names the target: {text}"
+    );
+    assert!(
+        !text.contains(&link_spelling),
+        "not the symlink's spelling: {text}"
+    );
+}
+
 /// stdin is closed: a command that reads it sees EOF at once instead of
 /// waiting on cola's terminal.
 #[cfg(target_os = "linux")]
