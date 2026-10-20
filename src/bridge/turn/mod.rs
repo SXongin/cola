@@ -231,6 +231,29 @@ enum SettledFinalRead {
     Live,
 }
 
+/// Whether the Backend accepted a Turn's prompt (ADR-0086 decision 9). A
+/// rejected submit stamps the **Unreceived** ending on the Turn's card, so a
+/// caller reporting the submission (the Terminal Card's 「问 AI」) must not call
+/// that submitted. Distinct from the Turn's own settlement: an accepted prompt
+/// that nobody answers is still accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptOutcome {
+    Accepted,
+    /// Nothing reached the Backend: the Turn could not start (busy), or the
+    /// submit was rejected.
+    NotAccepted,
+}
+
+impl PromptOutcome {
+    fn from_submit(resp: &crate::error::Result<()>) -> Self {
+        if resp.is_ok() {
+            Self::Accepted
+        } else {
+            Self::NotAccepted
+        }
+    }
+}
+
 /// Everything [`Turn::run`] needs for one turn. Built by `handle_prompt` for a
 /// fresh message and by the error-card "retry" action (which re-submits the
 /// original prompt under either the failed attempt's id or a fresh one, and
@@ -361,7 +384,10 @@ impl Turn {
     /// runs on its own task and is instrumented where it is spawned
     /// ([`RenderPoll`]). A 404 recreate changes the session under the turn, so
     /// `run_inner` re-scopes the rest of the trace to the fresh session.
-    pub(crate) async fn run(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<()> {
+    pub(crate) async fn run(
+        handles: &TurnHandles,
+        ctx: PromptContext,
+    ) -> crate::error::Result<PromptOutcome> {
         let span = span::turn(&ctx.session_id, &ctx.thread_key, tracing::Span::current().id());
         Self::run_inner(handles, ctx).instrument(span).await
     }
@@ -369,9 +395,10 @@ impl Turn {
     /// The lifecycle body, wrapped by [`Turn::run`]'s span. A separate fn so
     /// the instrumentation wraps every phase — `start` included — and the span
     /// stays alive across each await.
-    async fn run_inner(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<()> {
+    async fn run_inner(handles: &TurnHandles, ctx: PromptContext) -> crate::error::Result<PromptOutcome> {
         let Some(mut turn) = Self::start(handles, ctx).await? else {
-            return Ok(()); // busy: start already answered
+            // Busy: start already answered, and this message was not submitted.
+            return Ok(PromptOutcome::NotAccepted);
         };
         // The one INFO anchor per Turn (ADR-0048): session/chat/topic ride the
         // span prefix; the directory the turn works in and the prompt's size
@@ -398,10 +425,10 @@ impl Turn {
             let span = span::turn(&turn.session_id, &turn.thread_key, None);
             prompt_resp = turn.attempt(handles).instrument(span.clone()).await;
             turn.finish(handles, &prompt_resp).instrument(span).await;
-            return Ok(());
+            return Ok(PromptOutcome::from_submit(&prompt_resp));
         }
         turn.finish(handles, &prompt_resp).await;
-        Ok(())
+        Ok(PromptOutcome::from_submit(&prompt_resp))
     }
 
     /// The busy guard, the Loading card (a fresh reply below the user's
