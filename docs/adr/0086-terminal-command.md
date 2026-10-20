@@ -113,7 +113,8 @@ escape soup this section refuses.
    `#<id>` **Skill** tokens), so this is a deliberate parse change, bounded to that one shape:
    `!`, `! ` and any `!` mid-message stay prose, and `!ls #caveman` is now a shell command
    containing the literal `#caveman` rather than a skill load. `/run` alone answers usage;
-   `/help run` documents it; `/run` must be added to the **Command** parser's help tables or
+   `/help run` documents both entry points, the cap and `--timeout`, the absent terminal and the
+   Windows refusal; `/run` must be added to the **Command** parser's help tables or
    it silently becomes a `Forward` prompt.
 2. **One command, one child process, no carried state.** `sh -c`, cwd on the **Path Scope**'s
    base (the **Session**'s directory, the current **Project** while the Session is still
@@ -128,7 +129,9 @@ escape soup this section refuses.
    redirected straight into its **Terminal Log**, and cola tails that file's delta on its own
    render cadence. This is not only bookkeeping: on a pipe, cola's own death closes the read
    end and the child dies of `SIGPIPE` on its next write — which would make decision 10's
-   orphan impossible. Direct-to-file means a command outlives cola, the bytes 「📄 完整输出」
+   orphan impossible. Direct-to-file is what lets a command outlive cola **where the launch mode
+   permits it** — a supervised cola's cgroup takes the child on restart regardless (decision
+   10) — and it means the bytes 「📄 完整输出」
    needs are already there, and the live tail is "read what was appended since the last
    offset" rather than a ring buffer fed by a reader.
 4. **The result is a Terminal Card, and it is a command card.** A standalone member of the
@@ -166,7 +169,8 @@ escape soup this section refuses.
    sent and the child is up, marked settled when the run settles, and kept until the next run
    in that chat replaces it. The order is the guarantee: `record → spawn → card → record
    completed` means nothing a Terminal Command starts can run without a record naming it, so no
-   child outlives cola unnoticed. A record may be incomplete in either direction — written but
+   child outlives cola unnoticed — and where the launch mode takes the child instead, the record
+   still reports the run rather than leaving it frozen. A record may be incomplete in either direction — written but
    never spawned (no pid: the sweep reports and clears it) or spawned but no card yet (no
    message id: nothing to patch, the record is cleared and the orphan is nobody's lie). One
    window cannot be closed: the card id is assigned by the platform **on send**, so a crash
