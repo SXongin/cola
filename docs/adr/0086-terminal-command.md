@@ -224,7 +224,10 @@ escape soup this section refuses.
    not fail is retrieval: when a log exceeds the File Message lane's 30 MB cap, 「📄 完整输出」
    sends the first 30 MB from a bounded copy with a truncation line, so output is always
    retrievable to the platform's own ceiling. The 29 MB threshold exists so that ordinary runs
-   — the overwhelming majority — get their whole output without truncation.
+   — the overwhelming majority — get their whole output without truncation. That transfer never
+   runs inside the card callback: the click acknowledges, a bounded background step performs
+   the upload and the send with its own timeout, and the card reports the outcome — ADR-0083
+   §5's rule, unchanged, because a 30 MB upload cannot fit a callback's ack budget.
 8. **The environment is inherited, minus cola's own credentials — and this is not a
    sandbox.** `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and `OPENCODE_SERVER_USERNAME`
    are stripped (the same names `discovery.rs` already strips in the other direction, with
