@@ -5654,8 +5654,7 @@ impl App {
 #[cfg(test)]
 mod turn_diff_delivery_helpers {
     use super::{
-        TURN_DIFF_SCOPE_NOTE, TURN_DIFF_TITLE, TurnDiffClick, TurnDiffSendState, turn_diff_document,
-        turn_diff_file_name, turn_diff_state_toast,
+        TurnDiffClick, TurnDiffSendState, turn_diff_document, turn_diff_file_name, turn_diff_state_toast,
     };
     use crate::backend::{TurnDiff, TurnDiffFile};
 
@@ -5686,7 +5685,7 @@ mod turn_diff_delivery_helpers {
     fn the_document_header_carries_the_turn_time_and_identity() {
         let anchor_ms = crate::feishu::card::test_local_ms(2026, 10, 19, 14, 30);
         let document = turn_diff_document(&diff(), &click(), Some(anchor_ms));
-        assert_eq!(document.title, TURN_DIFF_TITLE);
+        assert_eq!(document.title, "本轮期间的工作区变化");
         assert_eq!(document.files.len(), 1);
         assert!(
             document.subtitle.contains("10-19 14:30"),
@@ -5697,7 +5696,7 @@ mod turn_diff_delivery_helpers {
         assert!(document.subtitle.contains("msg_user_1"));
         assert!(document.subtitle.contains("/repo/cola"));
         assert!(
-            document.subtitle.ends_with(TURN_DIFF_SCOPE_NOTE),
+            document.subtitle.ends_with("快照区间差，可能含同目录其他写入者"),
             "the scope note closes the subtitle: {}",
             document.subtitle
         );
