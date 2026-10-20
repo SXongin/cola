@@ -305,21 +305,27 @@ impl TerminalRunRecords {
     /// Mark `run_id`'s record settled, as a **targeted merge**: only when the
     /// chat's current record still names that run, and only its state changes.
     ///
-    /// The restart's owed-settle repair calls this after its card PATCH lands.
+    /// The restart's owed-settle repair calls this after its card PATCH lands,
+    /// and so does the live settle path — a landed PATCH alone must never drop
+    /// the obligation while the on-disk record can still say `running`, or the
+    /// next start's lost sweep would relabel the card it just repaired.
+    ///
     /// A blind replace would be wrong twice over: the chat may have moved on to
     /// a newer run (whose record must not be touched), and the current record
     /// may have learned something since the snapshot was taken — today the
     /// 「问 AI」 bit — which a stale snapshot would silently clear.
     ///
-    /// `true` means the obligation is discharged: the current record is absent,
-    /// names another run, is already settled, or was just written. `false` means
-    /// the write failed, so the caller must keep the obligation — otherwise the
-    /// next start's `running` sweep would relabel a settled card 「已失去跟踪」.
+    /// `true` means the obligation is discharged: the current record is
+    /// **provably** absent, names another run, is already settled, or was just
+    /// written. `false` means the record exists but cannot be read, or the write
+    /// failed — either way the caller must keep the obligation, because a
+    /// `running` record behind an unreadable file is exactly what the next
+    /// start's lost sweep would act on.
     pub(crate) fn mark_settled(&self, key: &ThreadKey, run_id: &str) -> bool {
         let lock = self.chat_lock(key);
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(mut record) = self.read(key) else {
-            return true;
+            return self.record_provably_absent(key);
         };
         if record.run_id != run_id || record.state != TerminalRunState::Running {
             return true;
@@ -333,6 +339,31 @@ impl TerminalRunRecords {
                 );
                 false
             }
+        }
+    }
+
+    /// Whether this chat's record file is **provably** absent.
+    ///
+    /// A missing file under a path that is not a directory (the record directory
+    /// replaced by a file, say), or an entry that exists but will not parse, is
+    /// not absence: something may still be on disk saying `running`, so an
+    /// obligation must not be dropped on the strength of "I could not read it".
+    /// A deleted store whose parent still exists is genuinely empty — nothing
+    /// there could be lost-swept.
+    fn record_provably_absent(&self, key: &ThreadKey) -> bool {
+        match std::fs::metadata(&self.dir) {
+            Ok(meta) if meta.is_dir() => match std::fs::metadata(self.path(key)) {
+                Ok(_) => false,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            },
+            // The store path exists but is not a directory: nothing provable.
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A deleted store cannot hold a record; an unreadable parent
+                // means this is not knowing rather than absence.
+                self.dir.parent().is_some_and(Path::is_dir)
+            }
+            Err(_) => false,
         }
     }
 
@@ -1034,6 +1065,49 @@ mod tests {
             records.read(&key),
             Some(successor),
             "the next run's record wins, with its own fields"
+        );
+    }
+
+    /// Whole-branch review (round 3): `mark_settled` discharges an obligation
+    /// only on **proof**. An absent record under a real directory is proof; a
+    /// record that exists but will not parse, or a record directory that is no
+    /// longer a directory, is not — it may still say `running`, which is exactly
+    /// what the next lost sweep would act on.
+    #[test]
+    fn mark_settled_distinguishes_absence_from_an_unreadable_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = store(&dir);
+        let key = key("oc_chat", "oc_chat");
+
+        assert!(
+            records.mark_settled(&key, "run-1"),
+            "no record at all is nothing to protect"
+        );
+
+        std::fs::write(records.path(&key), b"{ not json").unwrap();
+        assert!(
+            !records.mark_settled(&key, "run-1"),
+            "an unreadable record may still be running"
+        );
+
+        std::fs::remove_file(records.path(&key)).unwrap();
+        let records_dir = records.dir().to_path_buf();
+        let backup = records_dir.with_file_name("terminal-runs.bak");
+        std::fs::rename(&records_dir, &backup).unwrap();
+        std::fs::write(&records_dir, b"not a directory").unwrap();
+        assert!(
+            !records.mark_settled(&key, "run-1"),
+            "a store that is not a directory cannot prove absence"
+        );
+
+        std::fs::remove_file(&records_dir).unwrap();
+        std::fs::rename(&backup, &records_dir).unwrap();
+        records.write(&record(&key, "run-1")).unwrap();
+        assert!(records.mark_settled(&key, "run-1"), "a running record is merged");
+        assert_eq!(
+            records.read(&key).unwrap().state,
+            TerminalRunState::Settled,
+            "the merge is the targeted state change"
         );
     }
 }
