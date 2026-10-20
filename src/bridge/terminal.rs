@@ -14,13 +14,21 @@
 //!   route, so a terminal hangup does not reach it;
 //! - the log lives in a 0700 directory as a 0600 file under
 //!   `~/.cola/terminal/`;
-//! - the card is posted live and patched on the render cadence while the child
-//!   runs; the settling write is last and the loop stops on it (#823,
-//!   decision 4);
+//! - the card is posted in 「启动中」, then patched on the render cadence while
+//!   the run is live; the settling write is last and the loop stops on it
+//!   (#823, decision 4);
+//! - one run per **Chat**/**Topic** is claimed atomically, and the run is live
+//!   while its **process group** has members — not while `sh` is alive — so a
+//!   background child keeps the claim, the tail and 「⏹ 终止」 until the group
+//!   empties (decision 6);
+//! - `--timeout` caps the live tail, never the wait: 「继续」 extends it by the
+//!   same amount while the run is past the cap and live; 终止 and a failed size
+//!   probe terminate the whole group through #826's `terminate_process_group`;
+//! - a long run sends the existing chat-type Completion Notice once
+//!   (decision 12);
 //! - Unix only: Windows refuses with a stated reason and spawns nothing
-//!   (decision 13). The kill/timeout/run-record half is later slices
-//!   (#825/#826/#827); this tracer parses `--timeout` and carries it without
-//!   acting on it, exactly as the ADR's cap stops *tailing*, never the wait.
+//!   (decision 13). The durable **Terminal Run Record** and its restart sweep
+//!   remain #827's slice.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -301,10 +309,12 @@ pub(crate) async fn execute(
         platform.reply_text(request.message_id, TERMINAL_BUSY).await?;
         return Ok(());
     }
-    let claim = TerminalClaim {
+    let mut claim = TerminalClaim {
         runs: Arc::clone(&handles.terminal_runs),
         thread_key: thread_key.clone(),
         run_id: run.clone(),
+        pgid: None,
+        handed_off: false,
     };
     // The Path Scope (ADR-0083 §4, ADR-0086 §2): `current_project_directory` is
     // pending-first — the Pending Session's directory wins, else the active
@@ -358,10 +368,7 @@ pub(crate) async fn execute(
         output_over_limit: false,
         full_output: None,
         notice: None,
-        state: TerminalState::Live {
-            past_cap: false,
-            survivors: false,
-        },
+        state: TerminalState::Starting,
         run_id: &run,
         chat_id: &thread_key.chat_id,
         thread_id: &thread_key.thread_id,
@@ -414,10 +421,11 @@ pub(crate) async fn execute(
             },
         )
         .await;
-        drop(claim);
+        claim.finish();
         return Ok(());
     };
     let pgid = child.id();
+    claim.pgid = pgid;
     slot.live.store(true, Ordering::SeqCst);
 
     // #826's size probe runs on its own task; it owns the runaway kill and
@@ -437,6 +445,17 @@ pub(crate) async fn execute(
         Arc::clone(&over_limit),
         stop_rx,
     ));
+
+    // The card was posted in 「启动中」 with no controls; as soon as the child
+    // exists, patch it live so 「⏹ 终止」 is available without waiting a render
+    // tick. `slot.live` is already true, so a click on it is actionable.
+    spawn_live_patch(
+        Arc::clone(&patch_facts),
+        false,
+        false,
+        Arc::clone(&settled),
+        Arc::clone(&card_write),
+    );
 
     let cap = spec.timeout;
     let mut deadline = started + cap;
@@ -581,8 +600,8 @@ pub(crate) async fn execute(
     // Release before the notice: the command has ended, so a new one may start
     // while the notice is in flight. The notice is this run's own and captures
     // its request identity (ADR-0086 decision 12).
-    drop(claim);
-    announce_completion(handles, platform, request, elapsed, stop_by_user).await;
+    claim.finish();
+    announce_completion(handles, platform, request, elapsed, stop_by_user, survivors).await;
     Ok(())
 }
 
@@ -600,20 +619,110 @@ fn group_has_members(pgid: Option<u32>) -> bool {
     }
 }
 
-/// Releases the Chat/Topic slot when the run ends, however it ends.
+/// Owns the Chat/Topic slot for exactly as long as the process group can still
+/// act. Its rule is the module's invariant: **the slot is released only when the
+/// group has no members**. Every exit path — settle, probe kill, 终止, spawn
+/// failure, task abort, panic — either sees an empty group (release) or hands
+/// the claim to a reaper that keeps it until the group empties.
 struct TerminalClaim {
     runs: Arc<Mutex<TerminalRuns>>,
     thread_key: ThreadKey,
     run_id: String,
+    /// The group the claim protects, once the child has spawned.
+    pgid: Option<u32>,
+    /// Set when `finish`/`drop` handed the entry to a reaper: the entry must
+    /// stay claimed, so `Drop` must not remove it.
+    handed_off: bool,
+}
+
+impl TerminalClaim {
+    /// The run settled normally. Release now when the group is empty; if a
+    /// termination could not confirm that, keep the slot claimed and hand it to
+    /// a waiter that releases when the group finally empties — never before.
+    fn finish(mut self) {
+        if let Some(pgid) = self.pgid
+            && group_has_members(Some(pgid))
+        {
+            tracing::warn!(
+                "terminal: process group {pgid} still has members after settle; keeping the chat slot claimed"
+            );
+            self.handed_off = true;
+            spawn_group_reaper(
+                Arc::clone(&self.runs),
+                self.thread_key.clone(),
+                self.run_id.clone(),
+                pgid,
+                false,
+            );
+        }
+        // `Drop` releases when `handed_off` is false.
+    }
 }
 
 impl Drop for TerminalClaim {
     fn drop(&mut self) {
+        if self.handed_off {
+            return;
+        }
+        // An aborted or panicking run never reaches `finish`: the child would
+        // otherwise keep running while its slot is released. Signal it here and
+        // keep the slot claimed until the reaper confirms the group is gone.
+        if let Some(pgid) = self.pgid
+            && group_has_members(Some(pgid))
+        {
+            tracing::warn!("terminal: run ended without settling; terminating process group {pgid}");
+            self.handed_off = true;
+            spawn_group_reaper(
+                Arc::clone(&self.runs),
+                self.thread_key.clone(),
+                self.run_id.clone(),
+                pgid,
+                true,
+            );
+            return;
+        }
         self.runs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .release(&self.thread_key, &self.run_id);
     }
+}
+
+/// Keep the slot claimed until `pgid` has no members, then release it.
+/// `kill` is for an abort/panic path that never ran the normal termination;
+/// a settle that already tried to kill only waits. A group that never empties
+/// keeps the slot claimed — the stated invariant — rather than opening the chat
+/// to an overlapping command.
+fn spawn_group_reaper(
+    runs: Arc<Mutex<TerminalRuns>>,
+    thread_key: ThreadKey,
+    run_id: String,
+    pgid: u32,
+    kill: bool,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        // No runtime left to reap with: keep the entry rather than release a
+        // slot whose group may still be alive.
+        tracing::warn!("terminal: no runtime to reap process group {pgid}; keeping the chat slot claimed");
+        return;
+    };
+    handle.spawn(async move {
+        if kill {
+            terminate_process_group(Some(pgid)).await;
+        }
+        if group_has_members(Some(pgid)) {
+            tracing::warn!(
+                "terminal: process group {pgid} survived termination; keeping the chat slot claimed"
+            );
+        }
+        while group_has_members(Some(pgid)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        runs.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(&thread_key, &run_id);
+        tracing::info!("terminal: process group {pgid} emptied; released the chat slot");
+    });
 }
 
 /// What settles the card: the real exit code, a spawn failure, the elapsed
@@ -794,6 +903,21 @@ async fn settle_run(
     }
 }
 
+/// The Completion Notice's copy: an unconfirmed termination must not read as a
+/// successful one, the same rule the settled card follows.
+fn completion_notice_text(stopped: bool, survivors: bool, elapsed: Duration) -> String {
+    if stopped && survivors {
+        format!(
+            "⚠️ 终端命令已发送终止，但进程组可能仍在运行 · 耗时 {}",
+            elapsed_label(elapsed)
+        )
+    } else if stopped {
+        format!("🖥️ 终端命令已终止 · 耗时 {}", elapsed_label(elapsed))
+    } else {
+        format!("🖥️ 终端命令已完成 · 耗时 {}", elapsed_label(elapsed))
+    }
+}
+
 /// The Completion Notice a long Terminal Command owes (ADR-0086 decision 12):
 /// exactly one, only when the run passed the same long-task threshold a
 /// **Turn** uses, under the same chat-type opt-in. It has no **Turn** to reuse,
@@ -805,6 +929,7 @@ async fn announce_completion(
     request: TerminalRequest<'_>,
     elapsed: Duration,
     stopped: bool,
+    survivors: bool,
 ) {
     let threshold = Duration::from_millis(handles.config.notice_rules().long_task_notice_ms());
     if elapsed < threshold {
@@ -826,8 +951,7 @@ async fn announce_completion(
     } else {
         None
     };
-    let verb = if stopped { "已终止" } else { "已完成" };
-    let text = format!("🖥️ 终端命令{verb} · 耗时 {}", elapsed_label(elapsed));
+    let text = completion_notice_text(stopped, survivors, elapsed);
     if let Err(error) = platform
         .reply_completion_notice(request.message_id, requester, name.as_deref(), &text)
         .await
@@ -1261,6 +1385,70 @@ mod tests {
         assert_eq!(parse_bang("hello !ls"), None, "a mid-message `!` is prose");
         assert_eq!(parse_bang("ls!"), None, "a trailing `!` is prose");
         assert_eq!(parse_bang(""), None);
+    }
+
+    /// #825 blocking review: the slot is released only once the process group
+    /// has no members. A normal settle that cannot confirm termination hands
+    /// the claim to a reaper instead of opening the chat to an overlap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_claim_is_not_released_while_its_group_is_alive() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.4")
+            .process_group(0)
+            .spawn()
+            .expect("spawn a live group");
+        let pgid = child.id();
+        let key = ThreadKey::new("chat".into(), "chat".into());
+        let (control, _rx) = mpsc::unbounded_channel();
+        let run = Arc::new(TerminalRun {
+            run_id: "run-1".into(),
+            live: AtomicBool::new(true),
+            past_cap: AtomicBool::new(false),
+            control,
+        });
+        let runs = Arc::new(Mutex::new(TerminalRuns::default()));
+        runs.lock().unwrap().claim(&key, run).expect("the slot is free");
+        let claim = TerminalClaim {
+            runs: Arc::clone(&runs),
+            thread_key: key.clone(),
+            run_id: "run-1".into(),
+            pgid: Some(pgid),
+            handed_off: false,
+        };
+
+        claim.finish();
+        assert!(
+            runs.lock().unwrap().runs.contains_key(&key),
+            "a settle with a live group must keep the slot claimed"
+        );
+
+        // Reaping the child empties the group; the reaper may now release it.
+        child.wait().expect("reap the child");
+        for _ in 0..100 {
+            if !runs.lock().unwrap().runs.contains_key(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !runs.lock().unwrap().runs.contains_key(&key),
+            "the reaper releases the slot once the group is empty"
+        );
+    }
+
+    /// #825 review: the notice's copy follows the card's rule — an
+    /// unconfirmed termination is not announced as a clean one.
+    #[test]
+    fn an_unconfirmed_termination_notice_says_the_group_may_still_run() {
+        let elapsed = Duration::from_secs(601);
+        let text = completion_notice_text(true, true, elapsed);
+        assert!(text.contains("可能仍在运行"), "{text}");
+        let text = completion_notice_text(true, false, elapsed);
+        assert!(text.contains("已终止"), "{text}");
+        assert!(!text.contains("可能仍在运行"), "{text}");
     }
 
     /// #826: the delivery copy is bounded at the platform's cap and carries a
