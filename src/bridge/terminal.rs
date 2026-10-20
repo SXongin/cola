@@ -354,24 +354,93 @@ fn run_id() -> String {
 /// keeps a non-UTF-8 log readable (ADR-0086 §4). The window is returned
 /// **raw**: `\r` collapsing, line caps and ANSI stripping are the card's
 /// display concerns, so the per-line cap can still see a whole long line.
+///
+/// The read is **size-bounded**, not `read_to_end` on the file: a live command
+/// is still appending, so EOF keeps moving and a continuous producer such as
+/// `/run yes` would grow this allocation without limit. Seeking to the last
+/// `window` bytes and then taking at most that many is what makes one tick cost
+/// a fixed amount of memory no matter how fast the child writes.
 fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let window = (max_chars as u64).saturating_mul(4).saturating_add(4);
-    let start = len.saturating_sub(window);
-    if start > 0 {
-        file.seek(SeekFrom::Start(start))?;
+    let truncated = len > window;
+    if truncated {
+        // From the END, so the window is the newest bytes at the moment of the
+        // seek rather than a start computed from an already-stale length.
+        let offset = i64::try_from(window).unwrap_or(i64::MAX);
+        file.seek(SeekFrom::End(-offset))?;
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), start > 0))
+    let mut bytes = Vec::with_capacity(window.min(1_048_576) as usize);
+    (&mut file).take(window).read_to_end(&mut bytes)?;
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_bang;
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+
+    /// A command's log is written while cola reads it. The read must take a
+    /// fixed-size suffix, never follow EOF into however much the producer keeps
+    /// appending: `read_to_end` on a growing file allocates without bound and a
+    /// `/run yes` would exhaust cola's memory. This drives a real append loop
+    /// and asserts one read returns — promptly — with at most the window.
+    #[test]
+    fn a_continuously_growing_log_reads_a_bounded_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growth.log");
+        // Pre-fill past the window so the read definitely seeks and truncates,
+        // and the producer starts from a known state.
+        std::fs::write(&path, vec![b'y'; 64 * 1024]).unwrap();
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer = {
+            let path = path.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .expect("open the growing log");
+                let chunk = [b'y'; 64 * 1024];
+                // Bound the writer too, so even the unfixed read cannot run
+                // away with the disk while the test waits out its timeout.
+                for _ in 0..64 {
+                    if stop.load(Ordering::Relaxed) || file.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let max_chars = 2_500;
+        let window = (max_chars as u64).saturating_mul(4).saturating_add(4);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                sender.send(read_tail(&path, max_chars)).ok();
+            })
+        };
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("read_tail must return on a continuously growing log");
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        let (output, truncated) = result.expect("read the growing log");
+        assert!(truncated, "a log larger than the window is truncated");
+        assert!(
+            output.len() as u64 <= window,
+            "the read stays inside the {window}-byte window, got {}",
+            output.len()
+        );
+    }
 
     /// The `!` prefix (ADR-0086 §1): the entry point opens only at the FIRST
     /// character, and only when a command remains. `!` alone, `! ` and a

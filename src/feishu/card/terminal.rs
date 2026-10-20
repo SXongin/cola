@@ -81,25 +81,16 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     let (command_element, _) = fenced_element("**命令**", view.command, false, &mut markdown);
     let (tail, budget_cut) = display_tail(view.output);
     let truncated = budget_cut || view.output_truncated;
-    let live = matches!(view.state, TerminalState::Live);
-    let output = if !tail.is_empty() {
-        tail
-    } else if live {
-        "（等待输出…）".to_string()
-    } else {
-        "（无输出）".to_string()
-    };
-    let (output_element, fence_clipped) = fenced_element("**输出**", &output, true, &mut markdown);
-
-    let mut elements = vec![cwd_element, command_element, output_element];
-    if truncated || fence_clipped {
-        elements.push(json!({
-            "tag": "markdown",
-            "content": markdown.clean("_（输出过长，已截断显示；完整输出已写入终端日志）_"),
-        }));
-    }
-    let (header, template, line) = match view.state {
-        TerminalState::Live => ("🖥️ 终端命令 · 运行中", "blue", "⏳ 运行中…".to_string()),
+    // Every state-derived decision — header, colour, state line and the
+    // placeholder for an empty tail — is made in one match, so the live/settled
+    // split has a single owner.
+    let (header, template, line, empty_tail) = match view.state {
+        TerminalState::Live => (
+            "🖥️ 终端命令 · 运行中",
+            "blue",
+            "⏳ 运行中…".to_string(),
+            "（等待输出…）",
+        ),
         TerminalState::Settled {
             exit_code,
             spawn_error,
@@ -117,9 +108,23 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
                     "red",
                 ),
             };
-            ("🖥️ 终端命令", template, line)
+            ("🖥️ 终端命令", template, line, "（无输出）")
         }
     };
+    let output = if tail.is_empty() {
+        empty_tail.to_string()
+    } else {
+        tail
+    };
+    let (output_element, fence_clipped) = fenced_element("**输出**", &output, true, &mut markdown);
+
+    let mut elements = vec![cwd_element, command_element, output_element];
+    if truncated || fence_clipped {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean("_（输出过长，已截断显示；完整输出已写入终端日志）_"),
+        }));
+    }
     elements.push(json!({
         "tag": "markdown",
         "content": markdown.clean(&line),
@@ -208,9 +213,10 @@ fn strip_ansi_and_control(input: &str) -> String {
     while let Some(c) = chars.next() {
         match c {
             '\u{1b}' => skip_escape(&mut chars),
-            // The 8-bit CSI/OSC introducers some programs emit instead of ESC.
+            // The 8-bit C1 introducers some programs emit instead of ESC:
+            // CSI, OSC, DCS, SOS, PM and APC respectively.
             '\u{9b}' => skip_csi(&mut chars),
-            '\u{9d}' => skip_osc(&mut chars),
+            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
             '\t' => out.push('\t'),
             c if c.is_control() => {}
             c => out.push(c),
@@ -219,12 +225,16 @@ fn strip_ansi_and_control(input: &str) -> String {
     out
 }
 
-/// Skip one ESC-introduced sequence: CSI (`ESC [`), OSC (`ESC ] … BEL|ESC \`),
+/// Skip one ESC-introduced sequence: CSI (`ESC [`), the string controls —
+/// OSC (`ESC ]`), DCS (`ESC P`), SOS (`ESC X`), PM (`ESC ^`) and APC (`ESC _`) —
 /// the two-character character-set designators, or a bare ESC plus one char.
 fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     match chars.next() {
         Some('[') => skip_csi(chars),
-        Some(']') => skip_osc(chars),
+        // Every string control carries an opaque payload terminated by ST
+        // (`ESC \`); treating only OSC as a string left a DCS payload such as
+        // `ESC P1;2|payload ESC \` visible on the card.
+        Some(']' | 'P' | 'X' | '^' | '_') => skip_string(chars),
         Some('(' | ')' | '*' | '+' | '-' | '.' | '/' | '#' | '%') => {
             chars.next();
         }
@@ -241,10 +251,11 @@ fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Skip an OSC sequence up to BEL or the `ESC \` string terminator.
-fn skip_osc(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+/// Skip a string-control payload (OSC/DCS/SOS/PM/APC) up to ST — `ESC \` or
+/// the 8-bit `0x9C` — or the BEL some terminals accept as a terminator.
+fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     while let Some(c) = chars.next() {
-        if c == '\u{7}' {
+        if c == '\u{7}' || c == '\u{9c}' {
             break;
         }
         if c == '\u{1b}' && chars.peek() == Some(&'\\') {

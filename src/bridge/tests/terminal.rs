@@ -989,6 +989,110 @@ async fn ansi_is_stripped_from_the_card_and_kept_in_the_log() {
     assert!(raw.contains(&0x07), "the log keeps the control byte unchanged");
 }
 
+/// #823 / review: the other string controls — DCS (`ESC P … ST`) and APC
+/// (`ESC _ … ST`) — carry payloads just like OSC and must not leak into the
+/// display. Their bytes stay in the Terminal Log as evidence.
+#[cfg(unix)]
+#[tokio::test]
+async fn dcs_and_apc_payloads_are_stripped_from_the_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let dcs_payload = "dcs-payload-823";
+    let apc_payload = "apc-payload-823";
+    // `\033P…\033\\` is DCS, `\033_…\033\\` is APC; `printf` turns the octal
+    // and the doubled backslash into the real introducer and ST.
+    let command = format!(
+        "/run printf 'dcs-before-823-\\033P1;2|{dcs_payload}\\033\\\\dcs-after-823\\n\\033_{apc_payload}\\033\\\\apc-after-823\\n'; sleep 0.2"
+    );
+    send_command_in(&app, &command, key, "msg_string_control", ConversationKind::P2p).await;
+
+    let body = output_body(&settled_card(&platform).await);
+    assert!(
+        body.contains("dcs-before-823"),
+        "text before the DCS survives: {body}"
+    );
+    assert!(
+        body.contains("dcs-after-823"),
+        "text after the DCS survives: {body}"
+    );
+    assert!(
+        !body.contains(dcs_payload) && !body.contains("1;2|"),
+        "the DCS payload is not displayed: {body}"
+    );
+    assert!(
+        body.contains("apc-after-823"),
+        "text after the APC survives: {body}"
+    );
+    assert!(
+        !body.contains(apc_payload),
+        "the APC payload is not displayed: {body}"
+    );
+    assert!(!body.contains('\u{1b}'), "no ESC reaches the display: {body:?}");
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let raw = std::fs::read(find_log_containing(&dir, dcs_payload)).expect("read the Terminal Log");
+    assert!(
+        raw.windows(2).any(|w| w == b"\x1bP"),
+        "the log keeps the DCS introducer unchanged"
+    );
+    assert!(
+        raw.windows(2).any(|w| w == b"\x1b_"),
+        "the log keeps the APC introducer unchanged"
+    );
+}
+
+/// #823 / review: a fast producer keeps the log growing through the live
+/// reads. Every patch still shows a bounded tail, and the newest output wins.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fast_producer_still_yields_a_bounded_live_tail() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    send_command_in(
+        &app,
+        "/run i=0; while [ $i -lt 100000 ]; do echo \"burst-823-$i\"; i=$((i+1)); done",
+        key,
+        "msg_burst",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let updates = platform.updated_cards().await;
+    assert!(!updates.is_empty(), "the live loop patched the card");
+    for card in &updates {
+        let body = output_body(card);
+        assert!(
+            body.chars().count() <= TERMINAL_TAIL_CHARS,
+            "every live patch stays bounded ({} chars)",
+            body.chars().count()
+        );
+    }
+    let settled = card_text(&settled_card(&platform).await);
+    assert!(
+        settled.contains("burst-823-99999"),
+        "the newest line wins under a fast producer: {settled}"
+    );
+}
+
 /// #823: one very long line is capped, with a marker that says so.
 #[cfg(unix)]
 #[tokio::test]
