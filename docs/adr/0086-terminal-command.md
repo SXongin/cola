@@ -173,7 +173,9 @@ escape soup this section refuses.
    naming its card, and a run that outlives cola is always findable and markable — and where
    the launch mode takes the child instead, the record still reports the run rather than
    leaving it frozen. A record written but never spawned has a card id and no pid; the sweep
-   patches that card to 「已失去跟踪」 and clears the record. One window cannot be closed: a
+   patches that card to 「已失去跟踪」 and marks the record lost, **keeping** it — the card's
+   rerun must still find its run id current, and deleting the record would turn the buttons
+   into stale clicks. One window cannot be closed: a
    crash between the card send and the record write leaves a card in 「启动中」 with no record
    — and because the spawn comes *after* the record, **nothing is running**; that card is the
    only lie this design cannot fix, and it is settled by hand. Making the send and the record
@@ -265,13 +267,15 @@ escape soup this section refuses.
     frozen card (settled as lost on the next start), re-running cola is a lock-protected no-op,
     deleting `access.json` un-claims the bot, and the recovery path is `/restart` (or the
     Supervisor), never the button on a card whose process is gone.
-12. **The completion notice is the long-task one, captured by the command itself.** A Terminal
-    Command notifies only when it ran past the five-minute threshold, in any chat type — a
-    quick `/run ls` owes nobody a push, and a Terminal Command has no reply semantics to
-    justify a group-wide notice the way a **Turn** does. The rule is the same threshold
-    `[bridge] long_task_notice` already carries, but the capture cannot be a **Turn**'s: the
-    notice needs a requester, a reply target and a card id, and a Terminal Command has no
-    Turn, so it captures the three itself. No new switch.
+12. **The completion notice is the existing one, captured by the command itself.** A Terminal
+    Command notifies only when it ran past the five-minute threshold **and** the chat type's own
+    notice opt-in is on: `[bridge] long_task_notice` in p2p (off by default) and
+    `[bridge] group_completion_notice` in a group (on by default), exactly the switches a
+    **Turn** obeys (ADR-0043, ADR-0060). A quick `/run ls` owes nobody a push even where the
+    opt-in is on; a long command in a group notifies by default, and in p2p only when the Host
+    opted in. No new switch, and no policy the existing ones contradict. The capture cannot be
+    a **Turn**'s: the notice needs a requester, a reply target and a card id, and a Terminal
+    Command has no Turn, so it captures the three itself.
 13. **Unix first; Windows refuses and says why.** cola ships a Windows build, but the hard half
     is not the shell (`sh -c` vs `cmd /C`), it is terminating the whole tree: a process group
     and a negative pid on Unix versus a Job Object or `taskkill /T` on Windows. V1 answers
