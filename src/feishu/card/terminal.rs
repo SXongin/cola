@@ -30,7 +30,7 @@ use serde_json::json;
 
 use super::sanitize::CardMarkdown;
 use super::shell::{card_shell, fmt_elapsed};
-use super::tool_render::clip_fenced_body;
+use super::tool_render::{clip_fenced_body, clip_fenced_tail};
 use super::{MAX_ELEMENT_TEXT_CHARS, fenced_code};
 
 /// The newest characters of a **Terminal Log** a card shows: the live tail and
@@ -77,8 +77,8 @@ pub(crate) struct TerminalCard<'a> {
 /// the run's surface (ADR-0086 §4 defers 终止/重跑/完整输出).
 pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     let mut markdown = CardMarkdown::new();
-    let (cwd_element, _) = fenced_element("**目录**", view.cwd, &mut markdown);
-    let (command_element, _) = fenced_element("**命令**", view.command, &mut markdown);
+    let (cwd_element, _) = fenced_element("**目录**", view.cwd, false, &mut markdown);
+    let (command_element, _) = fenced_element("**命令**", view.command, false, &mut markdown);
     let (tail, budget_cut) = display_tail(view.output);
     let truncated = budget_cut || view.output_truncated;
     let live = matches!(view.state, TerminalState::Live);
@@ -89,7 +89,7 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     } else {
         "（无输出）".to_string()
     };
-    let (output_element, fence_clipped) = fenced_element("**输出**", &output, &mut markdown);
+    let (output_element, fence_clipped) = fenced_element("**输出**", &output, true, &mut markdown);
 
     let mut elements = vec![cwd_element, command_element, output_element];
     if truncated || fence_clipped {
@@ -127,15 +127,25 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     card_shell(header, template, elements)
 }
 
-/// One fenced element under the per-element budget. `clip_fenced_body` charges
-/// the body's JSON-escaped bytes PLUS the dynamic fence `fenced_code` will add,
-/// so the whole element (prefix, fence and body) stays inside
-/// [`MAX_ELEMENT_TEXT_CHARS`]; the returned flag says whether the body had to
-/// be cut. The prefix itself is charged at its byte length, which is never
-/// smaller than its character count (the conservative side).
-fn fenced_element(prefix: &str, body: &str, markdown: &mut CardMarkdown) -> (serde_json::Value, bool) {
+/// One fenced element under the per-element budget. The clip charges the body's
+/// JSON-escaped bytes PLUS the dynamic fence `fenced_code` will add, so the
+/// whole element (prefix, fence and body) stays inside
+/// [`MAX_ELEMENT_TEXT_CHARS`]; the returned flag says whether the body had to be
+/// cut. The prefix itself is charged at its byte length, which is never smaller
+/// than its character count (the conservative side). `keep_tail` clips from the
+/// end, so the output's newest line — its diagnostic — survives.
+fn fenced_element(
+    prefix: &str,
+    body: &str,
+    keep_tail: bool,
+    markdown: &mut CardMarkdown,
+) -> (serde_json::Value, bool) {
     let budget = MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1);
-    let clipped = clip_fenced_body(body, None, budget);
+    let clipped = if keep_tail {
+        clip_fenced_tail(body, None, budget)
+    } else {
+        clip_fenced_body(body, None, budget)
+    };
     let was_clipped = clipped != body;
     let block = fenced_code(&clipped, None);
     let element = json!({

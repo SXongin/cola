@@ -140,6 +140,16 @@ pub(crate) async fn execute(
             return Ok(());
         }
     };
+    // The test build can model environment entries cola's process would carry;
+    // production passes none and simply inherits (then scrubs) the real one.
+    #[cfg(test)]
+    let inherited_env = handles
+        .terminal_test_env
+        .lock()
+        .map(|env| env.clone())
+        .unwrap_or_default();
+    #[cfg(not(test))]
+    let inherited_env: Vec<(String, String)> = Vec::new();
 
     // The live card goes out before the child exists (ADR-0086 decision 5's
     // card → record → spawn order, with the record a later slice): the run
@@ -154,7 +164,7 @@ pub(crate) async fn execute(
     let card_id = platform.reply_card(message_id, &live).await?;
 
     let started = Instant::now();
-    let (mut child, spawn_error) = match spawn_in(&log, &cwd, &spec.command) {
+    let (mut child, spawn_error) = match spawn_in(&log, &cwd, &spec.command, &inherited_env) {
         Ok(child) => (Some(child), None),
         Err(error) => {
             // No child means no exit code; the card says why instead of
@@ -230,7 +240,12 @@ async fn patch_live(
 /// process could not start (missing cwd, no `sh`, …) — the card then settles
 /// with that reason.
 #[cfg(unix)]
-fn spawn_in(log: &TerminalLog, cwd: &str, command: &str) -> std::io::Result<tokio::process::Child> {
+fn spawn_in(
+    log: &TerminalLog,
+    cwd: &str,
+    command: &str,
+    inherited_env: &[(String, String)],
+) -> std::io::Result<tokio::process::Child> {
     let stdout = log.writer.try_clone()?;
     let stderr = log.writer.try_clone()?;
     let mut child = tokio::process::Command::new("sh");
@@ -251,7 +266,13 @@ fn spawn_in(log: &TerminalLog, cwd: &str, command: &str) -> std::io::Result<toki
         .process_group(0);
     // ADR-0086 §8: the environment is inherited MINUS cola's own credentials.
     // The child runs as the Host and may read anything the Host can, but the
-    // server password cola holds is not part of "the Host's shell".
+    // server password cola holds is not part of "the Host's shell". A test
+    // injects values here first, so the scrub is exercised against a child that
+    // would otherwise have inherited them — without mutating the test process's
+    // environment.
+    for (name, value) in inherited_env {
+        child.env(name, value);
+    }
     for name in SCRUBBED_ENV {
         child.env_remove(name);
     }
@@ -261,7 +282,12 @@ fn spawn_in(log: &TerminalLog, cwd: &str, command: &str) -> std::io::Result<toki
 /// Non-Unix hosts never reach here — [`unsupported_reason`] refuses first — but
 /// the module still has to compile there (ADR-0086 decision 13).
 #[cfg(not(unix))]
-fn spawn_in(_log: &TerminalLog, _cwd: &str, _command: &str) -> std::io::Result<tokio::process::Child> {
+fn spawn_in(
+    _log: &TerminalLog,
+    _cwd: &str,
+    _command: &str,
+    _inherited_env: &[(String, String)],
+) -> std::io::Result<tokio::process::Child> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         WINDOWS_REFUSAL,
@@ -273,6 +299,7 @@ fn spawn_in(_log: &TerminalLog, _cwd: &str, _command: &str) -> std::io::Result<t
 /// credentials leak, so the directory is cola's own and the file is private.
 struct TerminalLog {
     path: PathBuf,
+    #[cfg_attr(not(unix), allow(dead_code))]
     writer: std::fs::File,
 }
 

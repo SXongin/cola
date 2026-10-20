@@ -258,6 +258,13 @@ pub struct SharedCore {
     /// not a config knob, since the location is part of the ADR's at-rest
     /// surface.
     pub terminal_log_root: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// Test-only: variables the child would inherit BEFORE the credential scrub
+    /// (ADR-0086 §8). Lets a test model cola's own environment without mutating
+    /// the process environment, which is unsound under parallel `cargo test`.
+    /// The field itself exists only in a test build, so production cannot set
+    /// it.
+    #[cfg(test)]
+    pub terminal_test_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl SharedCore {
@@ -382,6 +389,8 @@ impl SharedCore {
             file_uploads: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             file_messages_sent: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             terminal_log_root: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(test)]
+            terminal_test_env: Arc::new(std::sync::Mutex::new(Vec::new())),
             // The File Viewer transfer's per-network-call bound (ADR-0083 §5).
             viewer_transfer_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::viewer::VIEWER_TRANSFER_TIMEOUT_MS,
@@ -459,6 +468,8 @@ impl SharedCore {
             preferred_port: self.preferred_port,
             diff_cooldown: Arc::clone(&self.diff_cooldown),
             terminal_log_root: Arc::clone(&self.terminal_log_root),
+            #[cfg(test)]
+            terminal_test_env: Arc::clone(&self.terminal_test_env),
         }
     }
 

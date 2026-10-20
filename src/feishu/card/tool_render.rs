@@ -1100,6 +1100,38 @@ pub(crate) fn clip_fenced_body(text: &str, lang: Option<&str>, max_escaped_bytes
     clipped
 }
 
+/// [`clip_fenced_body`] from the END: keep the NEWEST bytes of a body under the
+/// same budget, dropping the oldest ones. Output panes need this — a command's
+/// last line is its diagnostic, so a fence-sized clip must eat the prefix, not
+/// the tail. The walk is the same charge as [`clip_fenced_body`] (escaped
+/// bytes + the fence the accumulated suffix needs + `lang`), run backwards and
+/// then reversed; the fence only grows as the walk extends leftward, so the
+/// first over-budget character stops it. No truncation marker, for the same
+/// reason as [`clip_fenced_body`].
+pub(crate) fn clip_fenced_tail(text: &str, lang: Option<&str>, max_escaped_bytes: usize) -> String {
+    if fenced_body_fits(text, lang, max_escaped_bytes) {
+        return text.to_string();
+    }
+    let lang_bytes = fence_lang_bytes(lang);
+    let mut used = 0usize;
+    let mut run = 0usize;
+    let mut longest = 0usize;
+    let mut kept: Vec<char> = Vec::new();
+    for c in text.chars().rev() {
+        let cost = escaped_char_len(c);
+        let next_run = if c == '`' { run + 1 } else { 0 };
+        let next_longest = longest.max(next_run);
+        if used + cost + fenced_block_bytes(next_longest) + lang_bytes > max_escaped_bytes {
+            break;
+        }
+        used += cost;
+        run = next_run;
+        longest = next_longest;
+        kept.push(c);
+    }
+    kept.into_iter().rev().collect()
+}
+
 /// The `img` elements this panel renders (ADR-0076): one per embedded File
 /// Content, all pushed immediately AFTER the panel so the image is visible and
 /// its adjacency to the panel gives the correspondence. `alt` and `title` share
