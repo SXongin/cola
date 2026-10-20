@@ -261,52 +261,147 @@ pub fn build_snapshot_card_with_state(
         .filter(|req| req.session_id() == data.session_id)
         .collect();
 
-    // The tail is the one section whose size the caller cannot bound: a message
-    // has no length limit and a compaction marker carries a summary up to the
-    // live row's own cap, so the two together can exceed the one-shot card
-    // budget (issue #726). Build the full card first — a tail that fits stays
-    // byte-for-byte what it always was — and only when it does not fit rebuild
-    // with the OLDEST entries omitted, named by a visible line. Dropping from
-    // the old end keeps the newest conversation, which is what the reader came
-    // for, and never touches the transcript-side four-message selection.
-    let mut omitted = 0;
-    loop {
-        let card = snapshot_card_with_tail(
-            verb,
-            &title,
-            data,
-            &pending,
-            question_state,
-            receipts,
-            back,
-            &data.tail[omitted..],
-            omitted,
-        );
-        // Never a silently rejected card: if even the tail-less body is over
-        // budget there is no tail left to trade, and the last build is the best
-        // this one-shot card can do.
-        if card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS || omitted >= data.tail.len() {
-            return card;
-        }
-        omitted += 1;
+    // One-shot cards have no splitter, so the snapshot has to trade content
+    // away when its evictable sections outgrow the budget (issue #726):
+    //
+    // 1. the receipts first — residue for blocks another client already
+    //    resolved, not conversation;
+    // 2. then the 最近对话 tail, oldest entry first, so the newest conversation
+    //    survives;
+    // 3. never the claimed pending blocks. A claim whose block is dropped from
+    //    the card is a request the user can no longer answer there, so those
+    //    form the non-evictable floor and are reported rather than silently
+    //    lost if they alone outgrow the card.
+    //
+    // The full build is returned untouched whenever it fits: the budget can
+    // only ever remove the OLDEST evictable content, and a fitting snapshot
+    // keeps the exact bytes it always had.
+    let full = SnapshotPass {
+        receipts,
+        omitted_receipts: 0,
+        tail: &data.tail,
+        omitted_tail: 0,
+    };
+    let build =
+        |pass: &SnapshotPass| snapshot_card_pass(verb, &title, data, &pending, question_state, back, pass);
+    let card = build(&full);
+    if fits_card(&card) {
+        return card;
     }
+
+    // Drop the receipts before the conversation. Binary-searched so a long
+    // receipt list costs O(log n) builds rather than one per line — a
+    // monotonically shrinking predicate, since each omitted line removes bytes
+    // and only adds a digit to the overflow line.
+    let without_receipts = SnapshotPass {
+        receipts: &[],
+        omitted_receipts: receipts.len(),
+        ..full
+    };
+    let no_receipts = build(&without_receipts);
+    if fits_card(&no_receipts) {
+        return smallest_omission(
+            receipts.len(),
+            |omitted| {
+                build(&SnapshotPass {
+                    receipts: &receipts[omitted..],
+                    omitted_receipts: omitted,
+                    ..without_receipts
+                })
+            },
+            no_receipts,
+        );
+    }
+
+    // Still over: the tail goes too, oldest entry first.
+    let floor_pass = SnapshotPass {
+        tail: &[],
+        omitted_tail: data.tail.len(),
+        ..without_receipts
+    };
+    let floor = build(&floor_pass);
+    if fits_card(&floor) {
+        return smallest_omission(
+            data.tail.len(),
+            |omitted| {
+                build(&SnapshotPass {
+                    tail: &data.tail[omitted..],
+                    omitted_tail: omitted,
+                    ..floor_pass
+                })
+            },
+            floor,
+        );
+    }
+
+    // The non-evictable floor is over budget on its own (many claimed pendings,
+    // or a pathological run-state chip). Nothing in this card can be traded for
+    // space without making a pending unanswerable, so ship the floor and say so
+    // in the log; Feishu's rejection path is the caller's remaining signal.
+    tracing::warn!(
+        "snapshot card is {} chars with every evictable section dropped (budget {}): the claimed pending blocks alone exceed one card",
+        floor.to_string().len(),
+        crate::feishu::card::MAX_CARD_JSON_CHARS
+    );
+    floor
 }
 
-/// [`build_snapshot_card_with_state`]'s single build pass: the full card with
-/// `tail` as the 最近对话 entries and `omitted` older entries named in the
-/// overflow line. Split out so the budget loop can rebuild with a shorter tail
-/// while every other section stays identical.
-#[allow(clippy::too_many_arguments)]
-fn snapshot_card_with_tail(
+/// Whether an assembled card fits the one-shot budget Feishu accepts.
+fn fits_card(card: &serde_json::Value) -> bool {
+    card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS
+}
+
+/// The smallest prefix omission in `0..=len` whose card fits, given that the
+/// fully-evicted build (`len`) is already known to fit.
+///
+/// The predicate is monotone: one more omitted entry removes its bytes and adds
+/// at most a character to the overflow line, so more omission never costs more.
+fn smallest_omission(
+    len: usize,
+    mut build: impl FnMut(usize) -> serde_json::Value,
+    known_fit: serde_json::Value,
+) -> serde_json::Value {
+    let (mut lo, mut hi) = (0, len);
+    let mut best = None;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        let card = build(mid);
+        if fits_card(&card) {
+            best = Some(card);
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    best.unwrap_or(known_fit)
+}
+
+/// The evictable content of one build pass, and how many older items were
+/// omitted (each count rendered as a visible line).
+///
+/// Everything outside this struct — the status chip and the claimed pending
+/// blocks — is NOT evictable: dropping a claim's block would leave a request
+/// the user can no longer answer from this card.
+#[derive(Clone, Copy)]
+struct SnapshotPass<'a> {
+    receipts: &'a [String],
+    omitted_receipts: usize,
+    tail: &'a [TailEntry],
+    omitted_tail: usize,
+}
+
+/// [`build_snapshot_card_with_state`]'s single build pass, for one
+/// [`SnapshotPass`] selection. Split out so the budget search can rebuild with
+/// more of the evictable content omitted while every non-evictable section
+/// stays identical.
+fn snapshot_card_pass(
     verb: &str,
     title: &str,
     data: &SnapshotData,
     pending: &[&crate::bridge::request::kind::PendingRequest],
     question_state: &SnapshotQuestionState,
-    receipts: &[String],
     back: Option<&BackToList>,
-    tail: &[TailEntry],
-    omitted: usize,
+    pass: &SnapshotPass,
 ) -> serde_json::Value {
     // The card's markdown state (one table budget, one fenced fallback) for the
     // section that builds model-authored text — the 最近对话 tail's entry texts.
@@ -329,14 +424,24 @@ fn snapshot_card_with_tail(
         }
         elements.extend(req.snapshot_block_elements(&data.directory, question_state));
     }
-    for line in receipts {
+    if pass.omitted_receipts > 0 {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!(
+                "…更早的 {} 条处理回执已省略（超出单卡容量）",
+                pass.omitted_receipts
+            )
+        }));
+    }
+    for line in pass.receipts {
         elements.push(json!({ "tag": "markdown", "content": line }));
     }
-    let has_tail = omitted > 0 || !tail.is_empty();
-    if (!pending.is_empty() || !receipts.is_empty()) && has_tail {
+    let has_receipts = pass.omitted_receipts > 0 || !pass.receipts.is_empty();
+    let has_tail = pass.omitted_tail > 0 || !pass.tail.is_empty();
+    if (!pending.is_empty() || has_receipts) && has_tail {
         elements.push(json!({ "tag": "hr" }));
     }
-    elements.extend(tail_panels(tail, omitted, &mut md));
+    elements.extend(tail_panels(pass.tail, pass.omitted_tail, &mut md));
 
     // The `/switch`-list adoption's way back to the page it came from
     // (ADR-0052), at the card's end where the list footer used to be.
@@ -1100,6 +1205,85 @@ mod tests {
             "the dropped entry is named: {s}"
         );
         assert!(!s.contains("巨巨巨"), "an entry that cannot fit is not carried");
+    }
+
+    /// Receipts are residue, not conversation: when the card is over budget the
+    /// old ones go BEFORE any tail entry is touched, with their own visible
+    /// line. The tail — the part the reader came for — then stays whole.
+    #[test]
+    fn oversized_receipts_are_evicted_before_the_tail() {
+        let receipts: Vec<String> = (0..4)
+            .map(|i| format!("回执{i}：{}", "已由其他客户端处理。".repeat(200)))
+            .collect();
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            (0..2)
+                .map(|i| tail(MessageRole::User, i * 1000, &format!("第{i}条短消息")))
+                .collect(),
+        );
+        let card =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &receipts, None);
+        let s = card.to_string();
+
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the card must fit: {}",
+            s.len()
+        );
+        assert!(
+            s.contains("条处理回执已省略"),
+            "the evicted receipts are named: {s}"
+        );
+        assert!(!s.contains("回执0"), "the OLDEST receipt is the one dropped: {s}");
+        assert!(s.contains(&receipts[3]), "the newest receipt is kept whole");
+        assert!(
+            s.contains("第0条短消息") && s.contains("第1条短消息"),
+            "the tail is untouched while receipts can pay for the space: {s}"
+        );
+    }
+
+    /// A card that fits is the FULL build verbatim: the budget only ever runs
+    /// its eviction ladder when the unbudgeted card is over. This pins the
+    /// no-degradation path, so a future change cannot quietly start dropping
+    /// entries (or adding overflow lines) to cards that never needed it.
+    #[test]
+    fn a_fitting_card_is_the_full_build_verbatim() {
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            (0..4)
+                .map(|i| {
+                    let role = if i % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    };
+                    tail(role, i * 1000, &format!("第{i}条短消息"))
+                })
+                .collect(),
+        );
+        let built = build_snapshot_card("接管", "t", &d, None);
+        let unbudgeted = snapshot_card_pass(
+            "接管",
+            &display_title("t", &d.session_id),
+            &d,
+            &[],
+            &SnapshotQuestionState::new(),
+            None,
+            &SnapshotPass {
+                receipts: &[],
+                omitted_receipts: 0,
+                tail: &d.tail,
+                omitted_tail: 0,
+            },
+        );
+
+        assert_eq!(built, unbudgeted, "the budget must not touch a card that fits");
+        let s = built.to_string();
+        assert!(!s.contains("已省略"), "no overflow line on a fitting card: {s}");
+        // chip + heading + four entries, and nothing else.
+        assert_eq!(elements(&built).len(), 6, "elements: {s}");
     }
 
     /// A tail that fits is untouched by the budget: every entry whole, no
