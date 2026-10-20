@@ -57,6 +57,23 @@ fn anchor_transcript(created_ms: i64) -> SessionTranscript {
     }])
 }
 
+/// Does the card carry any part of the Turn's change index — the settled line
+/// (either spelling) or its complete-diff button? The negative cases assert
+/// the whole index is absent, so a regression to the retired `📝 本次改动`
+/// copy cannot slip through by matching only the current one.
+fn has_turn_diff_index(card: &serde_json::Value) -> bool {
+    let text = card_text(card);
+    let button = card["body"]["elements"]
+        .as_array()
+        .map(|elements| {
+            elements
+                .iter()
+                .any(|element| element["value"]["op"] == "turn_diff")
+        })
+        .unwrap_or(false);
+    text.contains("📝 本轮期间工作区变化") || text.contains("📝 本次改动") || button
+}
+
 /// Every File Message the platform posted (`msg_type: "file"`), in call order.
 async fn file_messages(platform: &RecordingPlatform) -> Vec<PlatformCall> {
     platform
@@ -620,9 +637,7 @@ async fn an_empty_settle_read_leaves_the_terminal_card_without_an_index() {
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.updated_cards().await);
     assert!(
-        cards
-            .iter()
-            .all(|card| !card_text(card).contains("📝 本轮期间工作区变化")),
+        cards.iter().all(|card| !has_turn_diff_index(card)),
         "an empty authoritative answer renders no index: {cards:?}"
     );
     assert_eq!(
@@ -715,9 +730,7 @@ async fn a_failed_settle_read_leaves_the_terminal_card_without_an_index() {
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.updated_cards().await);
     assert!(
-        cards
-            .iter()
-            .all(|card| !card_text(card).contains("📝 本轮期间工作区变化")),
+        cards.iter().all(|card| !has_turn_diff_index(card)),
         "a failed read renders no index: {cards:?}"
     );
     assert_eq!(
@@ -753,9 +766,7 @@ async fn a_v1_turn_terminates_without_an_index() {
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.updated_cards().await);
     assert!(
-        cards
-            .iter()
-            .all(|card| !card_text(card).contains("📝 本轮期间工作区变化")),
+        cards.iter().all(|card| !has_turn_diff_index(card)),
         "a V1 terminal card renders no index: {cards:?}"
     );
     assert_eq!(
