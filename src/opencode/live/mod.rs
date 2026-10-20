@@ -2041,8 +2041,20 @@ where
     let deadline = Instant::now() + timeout;
     let mut last_error = None;
     loop {
-        match read().await {
-            Ok(Some(value)) => {
+        // The read itself is bounded too: a request that hangs on an
+        // established connection would otherwise keep the wait alive past its
+        // deadline — the bound must not depend on the read returning (#784
+        // review).
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, read()).await {
+            Err(_elapsed) => {
+                panic!(
+                    "timed out after {}s waiting for {what} (the read did not return before the bound)\n{}",
+                    timeout.as_secs(),
+                    diagnostics()
+                );
+            }
+            Ok(Ok(Some(value))) => {
                 assert!(
                     Instant::now() < deadline,
                     "timed out after {}s waiting for {what} (the read only returned after the bound)\n{}",
@@ -2051,8 +2063,8 @@ where
                 );
                 return value;
             }
-            Ok(None) => {}
-            Err(error) => last_error = Some(error),
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => last_error = Some(error),
         }
         assert!(
             Instant::now() < deadline,
@@ -2200,8 +2212,7 @@ async fn assert_tool_call(
         POLL_TIMEOUT,
         || async {
             let transcript = backend.transcript(session_id).await?;
-            let settled =
-                find_tool_call(&transcript, shell).is_some_and(|tool| tool.status == ToolStatus::Completed);
+            let settled = tool_settled(&transcript, shell);
             last.borrow_mut().replace(transcript.clone());
             Ok(settled.then_some(transcript))
         },
@@ -2232,6 +2243,16 @@ async fn assert_tool_call(
             .any(|block| matches!(block, ContentBlock::Text(text) if text.contains("live-harness-tool"))),
         "the command output must be in the tool result: {tool:#?}"
     );
+}
+
+/// Whether the transcript's tool call for `shell` has SETTLED — the predicate
+/// the tool wait polls.
+///
+/// The turn's `complete` mark is deliberately not consulted: a closed turn that
+/// still carries a `Running` tool is exactly the race #784 fixed, and treating
+/// it as settled would let a genuinely stuck tool pass.
+fn tool_settled(transcript: &SessionTranscript, shell: provider::Tool) -> bool {
+    find_tool_call(transcript, shell).is_some_and(|tool| tool.status == ToolStatus::Completed)
 }
 
 /// The transcript's tool call for `shell`, by the tool's wire name.
@@ -2447,12 +2468,12 @@ mod poll_tests {
         assert_eq!(value, 2, "one failed read does not fail the wait");
     }
 
-    /// The bound is end to end: a read that only returns after it is a timeout,
-    /// even when it carries a settled value. Without this a slow read would
-    /// quietly widen every bound the suite declares (#784 review).
+    /// The bound is end to end: a read that outlives it is a timeout, even when
+    /// it would carry a settled value. Without this a slow read would quietly
+    /// widen every bound the suite declares (#784 review).
     #[tokio::test]
-    #[should_panic(expected = "the read only returned after the bound")]
-    async fn a_value_that_arrives_after_the_bound_is_a_timeout() {
+    #[should_panic(expected = "timed out after 0s waiting for a late value")]
+    async fn a_read_that_outlives_the_bound_is_a_timeout() {
         poll_until(
             "a late value",
             Duration::from_millis(20),
@@ -2463,6 +2484,60 @@ mod poll_tests {
             || "no diagnostics".to_string(),
         )
         .await;
+    }
+
+    /// A read that NEVER returns is bounded too: the wait owns its deadline,
+    /// so a request hanging on an established connection cannot keep it alive
+    /// past the bound (#784 review).
+    #[tokio::test]
+    #[should_panic(expected = "the read did not return before the bound")]
+    async fn a_read_that_never_returns_is_bounded() {
+        poll_until(
+            "a hanging read",
+            Duration::from_millis(20),
+            std::future::pending::<crate::error::Result<Option<()>>>,
+            || "the child's stderr".to_string(),
+        )
+        .await;
+    }
+
+    /// The tool predicate the wait polls: only a `Completed` tool satisfies it.
+    /// The assistant message here is already complete, so a `Running` tool on a
+    /// CLOSED turn must still fail — that is the race #784 fixed, and treating
+    /// the turn's close as proof would let a stuck tool pass.
+    #[test]
+    fn only_a_completed_tool_is_settled() {
+        let transcript = |status: ToolStatus| {
+            SessionTranscript::new(vec![crate::bridge::test_support::typed_message(
+                "msg_assistant",
+                MessageRole::Assistant,
+                Some(2),
+                vec![Part::Tool(crate::backend::ToolCall {
+                    identity: crate::backend::ToolIdentity {
+                        name: provider::Tool::Bash.name().to_string(),
+                        call_id: "call_1".to_string(),
+                    },
+                    status,
+                    started_at: Some(2),
+                    input: None,
+                    metadata: None,
+                    output: crate::backend::ToolOutput::default(),
+                })],
+            )])
+        };
+
+        assert!(
+            !tool_settled(&transcript(ToolStatus::Running), provider::Tool::Bash),
+            "a closed turn with a running tool is not settled"
+        );
+        assert!(
+            tool_settled(&transcript(ToolStatus::Completed), provider::Tool::Bash),
+            "the completed call settles the wait"
+        );
+        assert!(
+            !tool_settled(&transcript(ToolStatus::Completed), provider::Tool::Shell),
+            "another tool's call never settles this one"
+        );
     }
 
     /// Nothing settling fails AT the bound, with the diagnostics attached.
