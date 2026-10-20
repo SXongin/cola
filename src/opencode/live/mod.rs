@@ -166,7 +166,14 @@ async fn live_v1_scripted_capability_chain() {
     );
 
     assert_user_anchor(&transcript, &message_id);
-    assert_tool_call(&transcript, provider::Tool::Bash, provider::ToolCommand::Fast);
+    assert_tool_call(
+        &backend,
+        &session.id,
+        &server,
+        provider::Tool::Bash,
+        provider::ToolCommand::Fast,
+    )
+    .await;
     assert_streamed_reasoning(&transcript);
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
@@ -468,7 +475,14 @@ async fn live_v2_scripted_transcript_read() {
     );
 
     assert_user_anchor(&transcript, &message_id);
-    assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Slow);
+    assert_tool_call(
+        &backend,
+        &session.id,
+        &server,
+        provider::Tool::Shell,
+        provider::ToolCommand::Slow,
+    )
+    .await;
     assert_streamed_reasoning(&transcript);
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
@@ -631,7 +645,14 @@ async fn live_v2_scripted_write_chain() {
         crate::opencode::parsing::is_cola_message_id(supplement.id.as_str()),
         "V2 must persist the supplement's cola-chosen id: {supplement:#?}"
     );
-    assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Slow);
+    assert_tool_call(
+        &backend,
+        &session.id,
+        &server,
+        provider::Tool::Shell,
+        provider::ToolCommand::Slow,
+    )
+    .await;
     assert_streamed_reasoning(&transcript);
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
@@ -1136,7 +1157,14 @@ async fn live_v2_scripted_permission_chain() {
         turn_error(&transcript, &message_id)
     );
     assert_user_anchor(&transcript, &message_id);
-    assert_tool_call(&transcript, provider::Tool::Shell, provider::ToolCommand::Fast);
+    assert_tool_call(
+        &backend,
+        &session.id,
+        &server,
+        provider::Tool::Shell,
+        provider::ToolCommand::Fast,
+    )
+    .await;
     assert_streamed_reasoning(&transcript);
     assert_final_text(&transcript);
     assert_turn_complete(&transcript, &message_id);
@@ -2137,30 +2165,53 @@ fn assert_user_anchor(transcript: &crate::backend::SessionTranscript, message_id
 
 /// The generation's shell tool call ran to completion with the scripted
 /// command's output.
-fn assert_tool_call(
-    transcript: &crate::backend::SessionTranscript,
+///
+/// A turn's `complete` mark and its tool part's terminal status are separate
+/// writes: the snapshot that first reports the turn closed can still show the
+/// tool `Running` (#784). This therefore polls a FRESH read until the tool
+/// itself reports `Completed`, bounded by [`POLL_TIMEOUT`] — the turn's closed
+/// mark never stands in for the tool's terminal status, so a tool genuinely
+/// stuck on `Running` still fails the test, with the stuck call in the panic.
+async fn assert_tool_call(
+    backend: &OpenCodeBackend,
+    session_id: &str,
+    server: &LiveServer,
     shell: provider::Tool,
     command: provider::ToolCommand,
 ) {
-    let tool = transcript
-        .messages
-        .iter()
-        .flat_map(|message| message.parts.iter())
-        .find_map(|part| match part {
-            Part::Tool(tool) if tool.identity.name == shell.name() => Some(tool),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "the {} tool call must be in the transcript: {transcript:#?}",
-                shell.name()
-            )
-        });
-    assert_eq!(
-        tool.status,
-        ToolStatus::Completed,
-        "the answered tool call must have completed: {tool:#?}"
-    );
+    let deadline = Instant::now() + POLL_TIMEOUT;
+    let transcript = loop {
+        match backend.transcript(session_id).await {
+            Ok(transcript) => {
+                if find_tool_call(&transcript, shell).is_some_and(|tool| tool.status == ToolStatus::Completed)
+                {
+                    break transcript;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the {} tool call never completed within {}s: {transcript:#?}\n{}",
+                    shell.name(),
+                    POLL_TIMEOUT.as_secs(),
+                    server.stderr()
+                );
+            }
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the transcript could not be read while waiting for the {} tool call: {error:?}\n{}",
+                    shell.name(),
+                    server.stderr()
+                );
+            }
+        }
+        sleep(POLL_INTERVAL).await;
+    };
+    let tool = find_tool_call(&transcript, shell).unwrap_or_else(|| {
+        panic!(
+            "the {} tool call must be in the transcript: {transcript:#?}",
+            shell.name()
+        )
+    });
     assert_eq!(
         tool.input
             .as_ref()
@@ -2176,6 +2227,21 @@ fn assert_tool_call(
             .any(|block| matches!(block, ContentBlock::Text(text) if text.contains("live-harness-tool"))),
         "the command output must be in the tool result: {tool:#?}"
     );
+}
+
+/// The transcript's tool call for `shell`, by the tool's wire name.
+fn find_tool_call(
+    transcript: &SessionTranscript,
+    shell: provider::Tool,
+) -> Option<&crate::backend::ToolCall> {
+    transcript
+        .messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .find_map(|part| match part {
+            Part::Tool(tool) if tool.identity.name == shell.name() => Some(tool),
+            _ => None,
+        })
 }
 
 /// The question tool call ran to completion: the fragmented arguments
