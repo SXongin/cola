@@ -5,10 +5,12 @@
 //!
 //! It names the cwd the command actually ran in and the command itself, shows
 //! the merged output the **Terminal Log** holds, and settles with the exit code
-//! and elapsed time. Two states share one builder: [`TerminalState::Live`] is
-//! patched on the render cadence while the child runs, [`TerminalState::Settled`]
-//! is the one settling write the patch loop stops after (#823). The distinction
-//! is a state, not a flag, so the loop can end on it.
+//! and elapsed time. Three states share one builder: [`TerminalState::Starting`]
+//! is the card sent before the child exists (no controls), [`TerminalState::Live`]
+//! is patched on the render cadence while the process group runs, and
+//! [`TerminalState::Settled`] is the one settling write the patch loop stops
+//! after (#823). The distinction is a state, not a flag, so the loop can end on
+//! it.
 //!
 //! Every fenced element — cwd, command and output alike — is clipped through the
 //! shared [`clip_fenced_body`] walk, so a long backtick run can never make the
@@ -72,6 +74,9 @@ pub(crate) struct TerminalFullOutput<'a> {
 /// What the card is: the live state the patch loop refreshes, or the settled
 /// result it stops on.
 pub(crate) enum TerminalState<'a> {
+    /// The card is sent before the child exists (ADR-0086 decision 5): it
+    /// carries no controls, because there is no live run to stop yet.
+    Starting,
     /// The process group still has members; the tail may still grow and no exit
     /// code exists. `past_cap` is the one state in which 「继续」 is available;
     /// `survivors` means `sh` itself exited and background members remain.
@@ -132,6 +137,13 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     // placeholder for an empty tail, and whether run controls belong — is made
     // in one match, so the live/settled split has a single owner.
     let (header, template, line, empty_tail, controls) = match &view.state {
+        TerminalState::Starting => (
+            "🖥️ 终端命令 · 启动中",
+            "blue",
+            "⏳ 启动中…".to_string(),
+            "（等待输出…）",
+            false,
+        ),
         TerminalState::Live { past_cap, survivors } => {
             let line = if *survivors && *past_cap {
                 "⏳ 已达时限，命令进程已退出，后台进程仍在运行…"

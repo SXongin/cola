@@ -867,8 +867,8 @@ async fn the_card_is_live_while_the_command_runs_and_settles_last() {
     assert_eq!(replies.len(), 1, "one Terminal Card: {replies:?}");
     let live = card_text(&replies[0]);
     assert!(
-        live.contains("运行中"),
-        "the first reply is the live card: {live}"
+        live.contains("启动中"),
+        "the first reply is the starting card: {live}"
     );
     assert!(
         live.contains("等待输出"),
@@ -1907,6 +1907,25 @@ fn button_value(card: &serde_json::Value, op: &str) -> Option<serde_json::Value>
     }
 }
 
+/// The card that carries a live run: the startup card has no controls, so a
+/// test that means to click one waits for the first live PATCH.
+#[cfg(unix)]
+async fn live_card_with(platform: &RecordingPlatform, op: &str) -> serde_json::Value {
+    for _ in 0..500 {
+        if let Some(card) = platform
+            .updated_cards()
+            .await
+            .into_iter()
+            .rev()
+            .find(|card| button_value(card, op).is_some())
+        {
+            return card;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no live card ever carried the {op:?} control");
+}
+
 /// Wait until at least `count` Terminal Cards were posted.
 #[cfg(unix)]
 async fn wait_for_replied_cards(platform: &RecordingPlatform, count: usize) {
@@ -1978,7 +1997,7 @@ async fn a_second_command_is_refused_and_a_stale_run_id_is_rejected() {
         "the refused command posts no Terminal Card"
     );
 
-    let card = platform.replied_cards().await[0].clone();
+    let card = live_card_with(&platform, "kill").await;
     let mut stale = button_value(&card, "kill").expect("the live card carries 终止");
     stale["run_id"] = serde_json::json!("not-the-current-run");
     let result = app.host_action(stale).await.expect("a toast result");
@@ -2060,7 +2079,7 @@ async fn two_concurrent_commands_cannot_both_claim_one_chat() {
         platform.texts().await
     );
 
-    let card = platform.replied_cards().await[0].clone();
+    let card = live_card_with(&platform, "kill").await;
     let kill = button_value(&card, "kill").expect("the live card carries 终止");
     app.host_action(kill).await.expect("a toast result");
     for handle in [first, second] {
@@ -2230,6 +2249,89 @@ async fn a_background_writer_past_the_threshold_is_still_stopped() {
     );
 }
 
+/// #825 blocking review: aborting the task that owns a run must not release the
+/// Chat/Topic slot while its process group lives. The claim's `Drop` signals the
+/// group and keeps the slot until a reaper confirms it is empty; only then may a
+/// later command run.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn aborting_a_run_keeps_the_slot_until_its_group_is_killed() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run echo $$ > aborted.pid; trap '' TERM; while :; do sleep 1; done",
+                key,
+                "msg_aborted",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    wait_for_replied_cards(&platform, 1).await;
+    let pid = wait_for_file_line(&proj.path().join("aborted.pid")).await;
+    assert!(pid_alive(pid), "the run is live before the abort");
+
+    running.abort();
+    let _ = running.await;
+
+    // The group ignores SIGTERM, so it is still alive when the next command
+    // arrives: the slot must still be claimed.
+    send_command_in(
+        &app,
+        "/run echo after-abort",
+        key.clone(),
+        "msg_after_abort",
+        ConversationKind::P2p,
+    )
+    .await;
+    assert!(
+        platform
+            .texts()
+            .await
+            .last()
+            .is_some_and(|text| text.contains("「⏹ 终止」")),
+        "an aborted run's live group keeps the slot claimed"
+    );
+
+    // The reaper escalates to SIGKILL after the grace; only then does the slot
+    // become available again.
+    wait_for_pid_gone(pid).await;
+    let mut ran = false;
+    for attempt in 0..100 {
+        send_command_in(
+            &app,
+            "/run echo after-abort-gone",
+            key.clone(),
+            &format!("msg_after_gone_{attempt}"),
+            ConversationKind::P2p,
+        )
+        .await;
+        if platform.updated_cards().await.last().is_some_and(|card| {
+            let text = card_text(card);
+            text.contains("after-abort-gone") && text.contains("退出码 0")
+        }) {
+            ran = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ran, "the slot is released once the aborted group is gone");
+}
+
 /// #825 settle path: a live PATCH parked when the run ends must never land
 /// after the settling write. The settle waits for the card's write lock, marks
 /// the run settled first, and is the last write — so the card cannot be
@@ -2323,7 +2425,7 @@ async fn kill_ends_the_whole_process_group() {
     let pid = wait_for_file_line(&proj.path().join("child.pid")).await;
     assert!(pid_alive(pid), "the child is running before the click");
 
-    let card = platform.replied_cards().await[0].clone();
+    let card = live_card_with(&platform, "kill").await;
     let kill = button_value(&card, "kill").expect("the live card carries 终止");
     app.host_action(kill).await.expect("a toast result");
     tokio::time::timeout(Duration::from_secs(10), running)
