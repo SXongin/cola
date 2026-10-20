@@ -319,35 +319,48 @@ Decision 5 marks a record settled "when the run settles", and decision 10's swee
 reads only `running` records. That left a card permanently live-looking in two
 windows: a settling PATCH that failed, and a process that died after writing
 `settled` but before the PATCH. "The run is over" and "the card has been told" are
-now separate facts in the record:
+now separate facts, and the second one is **not** kept in the per-chat record:
 
-- `outcome` carries the ending the card renders — exit code, spawn error, elapsed
-  time, whether 终止 ended it, whether group members survived, whether the probe
-  stopped it — written **together with** `state = settled` and
-  `card_settled = false`, before the settling PATCH.
-- A landed PATCH sets `card_settled = true`. A failed or interrupted one leaves it
-  false, and the startup sweep rebuilds the **same** settled card from the record
-  and PATCHes it again; only a landed write marks it done, so a failure stays owed
-  and a success makes the next start do nothing. The re-PATCH is idempotent by
-  construction.
-- A `running` record still sweeps to `lost`, and that write *is* its ending write,
-  so `card_settled` is set with it. A record with no `outcome` (one written before
-  this amendment) is left alone: nothing can rebuild what it does not have.
-- A settled run keeps its buttons whatever ended it. A launch that never started
-  has no output, but it has a log path and a record, so 「↻ 重跑」 (gated on a
-  written record), 「📄 完整输出」 and 「问 AI」 stay usable instead of vanishing.
+- An **owed settlement** — one file per run id under `<records>-owed/`, beside the
+  per-chat records — carries the record snapshot and the ending the card renders
+  (exit code, spawn error, elapsed time, whether 终止 ended it, whether group
+  members survived, whether the probe stopped it). It is written **before** the
+  settling PATCH, and the card is not told until that write lands: a card must
+  never claim an ending no durable obligation backs. If the obligation cannot be
+  persisted, the card is left as it is and the failure is logged.
+- It is deliberately not part of the record: the chat's next run replaces that
+  file, so an obligation stored there would be erased by the very next command —
+  and the earlier card would stay live-looking forever. The obligation also
+  survives the record directory being unusable, which is why it is a sibling.
+- The startup sweep reads the owed set **first and independently of the current
+  records** (an unreadable or already-replaced record does not matter), rebuilds
+  the same settled card, and drops the entry once its PATCH lands **and** the
+  chat's own record no longer claims the run is still running — a failed state
+  write keeps the obligation, so a later start cannot mistake the repaired card
+  for a lost one. A `running` record whose card is owed is therefore *not*
+  reported lost, and an incomplete owed view never stands in for "nothing owed" —
+  that is what would relabel an accurate settled card 「已失去跟踪」.
+- A `running` record still sweeps to `lost`. A settled run keeps its buttons
+  whatever ended it: a launch that never started has no output, but it has a log
+  path and a record, so 「↻ 重跑」 (gated on a written record), 「📄 完整输出」 and
+  「问 AI」 stay usable instead of vanishing.
 
-The same record also carries `ask_ai_submitted`: decision 9's one submission per
-run was guarded in memory, which a restart clears, so the same current run's
-button submitted again. The guard now consults the record first and persists an
-accepted submission there; the in-memory flag stays as this process's fast path
-and as the fallback when the record cannot be written.
+The same record carries `ask_ai_submitted`: decision 9's one submission per run
+was guarded in memory, which a restart clears, so the same current run's button
+submitted again. Every write of one chat's record now takes that chat's lock, and
+the marker is a **targeted merge** under it: it re-reads the record, verifies it
+still names the run being marked, and changes only that bit — a stale snapshot
+never rewrites a successor run's record. The write stays best effort: a crash
+between the prompt's acceptance and this write can still duplicate a submission
+after a restart, and that window is accepted rather than bought with a blocking
+round trip on the click path.
 
 Finally, the size probe's "check the log, then signal the group" cycle shares a
-gate with the run's own ending. The run stands the probe down before the reap that
-frees the process-group id, and a cycle already in flight re-reads the flag under
-the gate. A run that has ended is therefore never signalled, and a pgid the run no
-longer owns is never reached.
+gate with the run's own ending. The run takes the gate **before** setting
+`stood_down`, around the reap that frees the process-group id; the probe holds it
+across its final check, the group-liveness check and the signal. A cycle that
+starts after a stand-down therefore sees the flag and signals nothing, and a pgid
+the run no longer owns is never reached.
 
 ## Why
 
