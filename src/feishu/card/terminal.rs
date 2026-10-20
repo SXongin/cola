@@ -381,10 +381,6 @@ fn elapsed_label(elapsed: Duration) -> String {
     }
 }
 
-/// The platform's File Message ceiling as the card names it: the same 30 MB
-/// `feishu::file::MAX_FILE_BYTES` enforces.
-const FULL_OUTPUT_CAP_LABEL: &str = "30 MB";
-
 /// What 「📄 完整输出」's delivery reports on the clicked card (ADR-0086
 /// decision 7): what landed, and — past the upload cap — that the file was NOT
 /// the whole log, with the path its remaining bytes live at.
@@ -419,10 +415,15 @@ pub(crate) fn full_output_notice(outcome: FullOutputOutcome<'_>) -> String {
             truncated: true,
             total_size,
             path,
-        } => format!(
-            "📄 完整输出共 {}，超过 {FULL_OUTPUT_CAP_LABEL} 上传上限：文件未完整发送，仅发送了前 {FULL_OUTPUT_CAP_LABEL}（超出部分未发送，末行为截断说明）。完整输出在 `{path}`。",
-            crate::backend::file_content::human_size(total_size)
-        ),
+        } => {
+            // Derived from the platform cap itself, so the copy cannot drift
+            // from `feishu::file::MAX_FILE_BYTES`.
+            let cap = crate::backend::file_content::human_size(crate::feishu::file::MAX_FILE_BYTES);
+            format!(
+                "📄 完整输出共 {}，超过 {cap} 上传上限：文件未完整发送，仅发送了前 {cap}（超出部分未发送，末行为截断说明）。完整输出在 `{path}`。",
+                crate::backend::file_content::human_size(total_size)
+            )
+        }
         FullOutputOutcome::NotSent { reason, path } => {
             format!("⚠️ 完整输出未发送（{reason}）。文件在 `{path}`。")
         }

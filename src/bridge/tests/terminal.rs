@@ -1314,6 +1314,24 @@ async fn wait_for_file_message(platform: &RecordingPlatform) -> PlatformCall {
     .expect("the Terminal Log is delivered as a File Message")
 }
 
+/// Poll until a plain text reply carrying `needle` is recorded.
+#[cfg(unix)]
+async fn wait_for_text_containing(platform: &RecordingPlatform, needle: &str) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(text) = platform.calls.lock().await.iter().find_map(|call| match call {
+                PlatformCall::ReplyText { text, .. } if text.contains(needle) => Some(text.clone()),
+                _ => None,
+            }) {
+                return text;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no text reply contains {needle:?}"))
+}
+
 /// Poll until an in-place PATCH of `message_id` whose card carries `needle`
 /// lands.
 #[cfg(unix)]
@@ -1618,14 +1636,21 @@ async fn full_output_reports_a_missing_log_instead_of_staying_silent() {
     let path = log.to_string_lossy().to_string();
     std::fs::remove_file(&log).expect("remove the Terminal Log");
 
+    // The card the reader already sees must survive a failed read: the outcome
+    // is a reply, not an empty rebuild that erases the tail.
+    let patches_before = platform.updated_cards().await.len();
     let payload = full_output_payload(&platform).await;
     app.host_action_on_message(payload, "msg_reply").await;
 
-    let patched = wait_for_patch_containing(&platform, "msg_reply", "无法读取终端日志").await;
+    let reply = wait_for_text_containing(&platform, "无法读取终端日志").await;
     assert!(
-        card_text(&patched).contains(&path),
-        "the outcome names the path it could not read: {}",
-        card_text(&patched)
+        reply.contains(&path),
+        "the outcome names the path it could not read: {reply}"
+    );
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        patches_before,
+        "a failed read leaves the settled card — and its tail — untouched"
     );
     assert!(
         !platform
@@ -1635,5 +1660,224 @@ async fn full_output_reports_a_missing_log_instead_of_staying_silent() {
             .iter()
             .any(|call| matches!(call, PlatformCall::UploadFile { .. })),
         "nothing is uploaded for a log that is gone"
+    );
+}
+
+/// The app's own Terminal Log root holds exactly one log (each test builds a
+/// fresh one), so a live run's log can be found before a marker is flushed.
+#[cfg(unix)]
+fn only_log(dir: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(dir)
+        .expect("read the Terminal Log directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("log"))
+        .expect("one Terminal Log")
+}
+
+/// #826 review (finding 1): a descendant that IGNORES `SIGTERM` must not
+/// outlive the run. The shell exits on the group's `SIGTERM`, but the group is
+/// not empty yet — the probe keeps waiting through its grace and escalates to
+/// `SIGKILL`, so nothing can keep writing after the card settles.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_descendant_that_ignores_sigterm_is_killed_with_the_group() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.core
+        .terminal_log_cap_bytes
+        .store(4 * 1024, std::sync::atomic::Ordering::Relaxed);
+    app.core
+        .terminal_size_probe_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // The subshell inherits the run's process group and swallows SIGTERM; the
+    // outer shell dies on the group signal, which is exactly the case that used
+    // to leave the writer behind.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        send_command_in(
+            &app,
+            "/run (trap '' TERM; i=0; while :; do printf 'stubborn-826-%01000d\\n' $i; i=$((i+1)); sleep 0.02; done) & wait",
+            key,
+            "msg_stubborn",
+            ConversationKind::P2p,
+        ),
+    )
+    .await
+    .expect("the probe settles the run even with a TERM-ignoring descendant");
+
+    let text = card_text(&settled_card(&platform).await);
+    assert!(text.contains("输出超限"), "the run was stopped: {text}");
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = only_log(&dir);
+    let before = std::fs::metadata(&log).expect("the log exists").len();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::metadata(&log).expect("the log exists").len(),
+        before,
+        "a SIGTERM-ignoring descendant writes nothing after the settle"
+    );
+}
+
+/// #826 review (finding 2): the probe must keep its own cadence even while a
+/// live card PATCH is stalled. `update_message` has no request timeout, so a
+/// probe sharing the render loop's task would be blind for as long as the PATCH
+/// hangs — exactly when a runaway producer keeps writing.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_size_probe_fires_while_a_live_patch_is_stalled() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let cap = 4 * 1024u64;
+    app.core
+        .terminal_log_cap_bytes
+        .store(cap, std::sync::atomic::Ordering::Relaxed);
+    app.core
+        .terminal_size_probe_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let (entered, release) = platform.pause("update", "msg_reply");
+    let runner = {
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        tokio::spawn(async move {
+            send_command_in(
+                &app,
+                "/run i=0; while :; do printf 'stalled-826-%01000d\\n' $i; i=$((i+1)); sleep 0.025; done",
+                key,
+                "msg_stalled",
+                ConversationKind::P2p,
+            )
+            .await;
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("a live card patch is parked");
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    // The writer crosses the threshold while the PATCH is still parked, and the
+    // probe kills it there.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let log = only_log(&dir);
+            if std::fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0) > cap {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the producer crosses the threshold");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let log = only_log(&dir);
+    let first = std::fs::metadata(&log).expect("the log exists").len();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::metadata(&log).expect("the log exists").len(),
+        first,
+        "the probe stopped the writer while the card patch was parked"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(15), runner)
+        .await
+        .expect("the run settles once the patch is released")
+        .expect("the run task completes");
+    let text = card_text(&settled_card(&platform).await);
+    assert!(
+        text.contains("输出超限"),
+        "the settle names the threshold: {text}"
+    );
+}
+
+/// #826 review (finding 4): the delivery is bounded by its OWN timeout. With the
+/// upload parked past a shortened bound, the click still reports `未发送` (and
+/// where the log lives) instead of hanging on a callback-budget-shaped wait.
+#[cfg(unix)]
+#[tokio::test]
+async fn full_output_delivery_is_bounded_by_its_own_timeout() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "timeout-826-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key,
+        "msg_timeout",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = find_log_containing(&dir, marker);
+    let payload = full_output_payload(&platform).await;
+
+    // Shorter than the parked upload: the bound, not the callback, decides.
+    app.core
+        .viewer_transfer_timeout_ms
+        .store(100, std::sync::atomic::Ordering::Relaxed);
+    let (entered, _release) = platform.pause("upload_file", "");
+
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("the click is acknowledged");
+    assert_eq!(result.toast.as_deref(), Some("正在发送完整输出…"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the upload starts on the spawned task");
+
+    // No release: the parked upload outlives the bound, and the outcome is
+    // still stated on the card with the log's path.
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "完整输出未发送").await;
+    assert!(
+        card_text(&patched).contains(&*log.to_string_lossy()),
+        "the failure names where the bytes live: {}",
+        card_text(&patched)
+    );
+    assert!(
+        !platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|call| matches!(call, PlatformCall::SendMessageReply { .. })),
+        "a timed-out upload sends no File Message"
     );
 }

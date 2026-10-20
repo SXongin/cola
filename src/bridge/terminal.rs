@@ -59,6 +59,22 @@ pub(crate) const TERMINAL_SIZE_PROBE_MS: u64 = 250;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_millis(500);
 
+/// How often the termination sequence asks whether the group is empty yet.
+#[cfg(unix)]
+const GROUP_POLL: Duration = Duration::from_millis(10);
+
+/// How long a `SIGKILL`ed group is given to disappear before the confirmation
+/// gives up (a member in uninterruptible sleep, or a zombie awaiting its
+/// reaper, cannot leave promptly). Reported, never silently ignored.
+#[cfg(unix)]
+const KILL_CONFIRM: Duration = Duration::from_secs(2);
+
+/// The bound on ONE live-card PATCH. `Feishu::update_message` has no request
+/// timeout of its own, so an unanswered write would otherwise pin the render
+/// loop forever (the probe is independent, but the settle must stay
+/// reachable).
+const TERMINAL_PATCH_TIMEOUT_MS: u64 = 10_000;
+
 /// The environment names cola's child must NOT inherit (ADR-0086 §8): the
 /// server credentials cola itself holds. The same three names `discovery`
 /// reads in the other direction; everything else is the Host's own shell.
@@ -202,24 +218,37 @@ pub(crate) async fn execute(
         }
     };
     let mut wait_outcome = None;
-    let mut output_over_limit = false;
+    // The size probe runs on its OWN task (ADR-0086 decision 7). A card PATCH
+    // can stall on the network, and a probe sharing the render loop's task
+    // would be blind for exactly as long as that PATCH hangs — precisely when a
+    // runaway producer keeps writing. Its own task reads the log on its own
+    // short interval no matter what the card is doing; when it fires, it kills
+    // the process group and the settle waits for that termination to complete.
+    let over_limit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut probe_task = None;
     if let Some(child) = child.as_mut() {
-        // Two intervals with two jobs (ADR-0086 decision 7): the render tick
-        // patches the card, and the size probe — on its own, short cadence —
-        // watches for a runaway log. They are separate on purpose: a probe
-        // that rode the render tick would see the size up to a tick late, and
-        // the render tick is not the cadence a disk-filling command should be
-        // bounded by.
         let render_ms = handles.config.render_poll_ms().max(1);
         let probe_ms = handles.terminal_size_probe_ms.load(Ordering::Relaxed).max(1);
         let cap = handles.terminal_log_cap_bytes.load(Ordering::Relaxed);
         let pgid = child.id();
+        let (stop_probe, stop_rx) = tokio::sync::oneshot::channel();
+        probe_task = Some((
+            stop_probe,
+            tokio::spawn(run_size_probe(
+                log.path.clone(),
+                cap,
+                pgid,
+                Duration::from_millis(probe_ms),
+                std::sync::Arc::clone(&finished),
+                std::sync::Arc::clone(&over_limit),
+                stop_rx,
+            )),
+        ));
         let mut render = tokio::time::interval(Duration::from_millis(render_ms));
-        let mut probe = tokio::time::interval(Duration::from_millis(probe_ms));
-        // `interval`'s first tick is immediate; the card was just sent and the
-        // child just started, so consume both instead of patching/probing now.
+        // `interval`'s first tick is immediate; the card was just sent, so
+        // consume it instead of patching now.
         render.tick().await;
-        probe.tick().await;
         loop {
             tokio::select! {
                 status = child.wait() => {
@@ -227,23 +256,33 @@ pub(crate) async fn execute(
                     break;
                 }
                 _ = render.tick() => {
-                    patch_live(platform, &card_id, &cwd, &spec.command, &log.path).await;
-                }
-                _ = probe.tick() => {
-                    // `>` is the ADR's "passes 29 MB". Whatever the single
-                    // write that crossed it did is already on disk: this is an
-                    // observed threshold, not a write limit.
-                    if observed_log_len(&log.path) > cap {
-                        output_over_limit = true;
-                        break;
+                    // Bounded: an unanswered PATCH must not freeze the live-card
+                    // loop forever. The probe is independent, but the settle
+                    // still has to be reachable once the run ends.
+                    if tokio::time::timeout(
+                        Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
+                        patch_live(platform, &card_id, &cwd, &spec.command, &log.path),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        tracing::warn!("terminal: live patch timed out");
                     }
                 }
             }
         }
-        if output_over_limit {
-            wait_outcome = Some(stop_group(child, pgid).await);
-        }
     }
+    // Nothing may observe the log as a runaway after the run itself ended; a
+    // command that finished on its own settles with its real exit code, even
+    // when its output passed the threshold.
+    finished.store(true, Ordering::SeqCst);
+    if let Some((stop_probe, probe)) = probe_task {
+        // If the probe fired, this JOIN is what makes the card wait for the
+        // whole process group to be gone — not merely for `sh` to exit.
+        let _ = stop_probe.send(());
+        let _ = probe.await;
+    }
+    let output_over_limit = over_limit.load(Ordering::SeqCst);
     let (exit_code, spawn_error) = match wait_outcome {
         Some(Ok(status)) => (status.code(), spawn_error),
         Some(Err(error)) => (None, Some(error.to_string())),
@@ -426,56 +465,112 @@ fn observed_log_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-/// Stop a run that crossed the observed size threshold (ADR-0086 decision 7):
-/// `SIGTERM` to the whole process group, then `SIGKILL` after
-/// [`KILL_GRACE`] — killing only the parent would leave the children a
-/// command spawned writing the tree (decision 6's reason for signalling the
-/// group). Returns the child's own exit status, so the settle path is the same
-/// one a natural end takes.
-#[cfg(unix)]
-async fn stop_group(
-    child: &mut tokio::process::Child,
+/// The size probe's own task (ADR-0086 decision 7): it watches the log on its
+/// own short interval and, once the file has passed the **observed** threshold,
+/// kills the whole process group and waits for that group to be gone. It does
+/// not share a task with the render loop, so a stalled card PATCH cannot blind
+/// it; `finished` is set the moment the run ends on its own, so a completed
+/// command is never relabelled as a runaway.
+async fn run_size_probe(
+    path: PathBuf,
+    cap: u64,
     pgid: Option<u32>,
-) -> std::io::Result<std::process::ExitStatus> {
-    signal_group(pgid, rustix::process::Signal::TERM);
-    match tokio::time::timeout(KILL_GRACE, child.wait()).await {
-        Ok(status) => status,
-        Err(_) => {
-            signal_group(pgid, rustix::process::Signal::KILL);
-            child.wait().await
+    interval: Duration,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    over_limit: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut tick = tokio::time::interval(interval);
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            // Checked first: once the run ended there is nothing to stop.
+            biased;
+            _ = &mut stop => return,
+            _ = tick.tick() => {
+                if finished.load(Ordering::SeqCst) {
+                    return;
+                }
+                if observed_log_len(&path) <= cap {
+                    continue;
+                }
+                // `>` is the ADR's "passes 29 MB". Whatever the single write
+                // that crossed it did is already on disk: this is an observed
+                // threshold, not a write limit.
+                over_limit.store(true, Ordering::SeqCst);
+                terminate_process_group(pgid).await;
+                return;
+            }
         }
     }
 }
 
-/// Non-Unix hosts refuse before spawning (ADR-0086 decision 13), so this is
-/// unreachable there and the module still has to compile.
-#[cfg(not(unix))]
-async fn stop_group(
-    child: &mut tokio::process::Child,
-    _pgid: Option<u32>,
-) -> std::io::Result<std::process::ExitStatus> {
-    let _ = child.kill().await;
-    child.wait().await
+/// Stop the run's whole process group and return only once no member remains
+/// (ADR-0086 decisions 6 and 7): `SIGTERM` first, then `SIGKILL` after
+/// [`KILL_GRACE`], and in both phases wait for the GROUP to empty — not merely
+/// for `sh` to exit. A descendant that ignores `SIGTERM` must not keep writing
+/// after the shell dies, or the observed threshold means nothing.
+#[cfg(unix)]
+async fn terminate_process_group(pgid: Option<u32>) {
+    let Some(group) = group_pid(pgid) else {
+        return;
+    };
+    signal_group(pgid, rustix::process::Signal::TERM);
+    let grace = Instant::now() + KILL_GRACE;
+    while group_alive(group) {
+        if Instant::now() >= grace {
+            signal_group(pgid, rustix::process::Signal::KILL);
+            let confirm = Instant::now() + KILL_CONFIRM;
+            while group_alive(group) && Instant::now() < confirm {
+                tokio::time::sleep(GROUP_POLL).await;
+            }
+            if group_alive(group) {
+                // SIGKILL cannot be ignored; a group still visible here is a
+                // member in uninterruptible sleep (or a zombie awaiting its
+                // reaper). Nothing can write after SIGKILL, so this is
+                // reported, never silently swallowed.
+                tracing::warn!("terminal: process group {pgid:?} still has members after SIGKILL");
+            }
+            return;
+        }
+        tokio::time::sleep(GROUP_POLL).await;
+    }
 }
 
-/// `kill(-pgid, signal)` through rustix's safe wrapper. `process_group(0)`
-/// makes the child its own group leader, so its pid IS the group id. A failed
-/// signal is logged, never fatal: the run still settles on the wait.
+/// Non-Unix hosts refuse before spawning (ADR-0086 decision 13), so the probe
+/// never runs there and the module still has to compile.
+#[cfg(not(unix))]
+async fn terminate_process_group(_pgid: Option<u32>) {}
+
+/// The `Pid` a process group is signalled through. `process_group(0)` makes the
+/// child its own group leader, so its pid IS the group id. Pid 0/1 would
+/// address cola's own group or init; `child.id()` is never either, but a guard
+/// here is cheaper than trusting that forever.
+#[cfg(unix)]
+fn group_pid(pgid: Option<u32>) -> Option<rustix::process::Pid> {
+    let pgid = pgid.filter(|pid| *pid > 1)?;
+    let pid = i32::try_from(pgid).ok()?;
+    rustix::process::Pid::from_raw(pid)
+}
+
+/// Whether any process still belongs to the group (`kill(-pgid, 0)`).
+#[cfg(unix)]
+fn group_alive(group: rustix::process::Pid) -> bool {
+    match rustix::process::test_kill_process_group(group) {
+        Ok(()) => true,
+        Err(error) => error != rustix::io::Errno::SRCH,
+    }
+}
+
+/// `kill(-pgid, signal)` through rustix's safe wrapper. A failed signal is
+/// logged, never fatal: the run still settles on the wait.
 #[cfg(unix)]
 fn signal_group(pgid: Option<u32>, signal: rustix::process::Signal) {
-    // Pid 0 would address cola's own group; `child.id()` is never 0, but a
-    // guard here is cheaper than trusting that forever.
-    let Some(pgid) = pgid.filter(|pid| *pid > 1) else {
+    let Some(group) = group_pid(pgid) else {
         return;
     };
-    let Ok(pid) = i32::try_from(pgid) else {
-        return;
-    };
-    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-        return;
-    };
-    if let Err(error) = rustix::process::kill_process_group(pid, signal) {
-        tracing::warn!("terminal: signalling process group {pgid} failed: {error}");
+    if let Err(error) = rustix::process::kill_process_group(group, signal) {
+        tracing::warn!("terminal: signalling process group {pgid:?} failed: {error}");
     }
 }
 

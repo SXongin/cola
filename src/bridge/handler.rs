@@ -5355,68 +5355,83 @@ impl App {
             },
         )
         .await;
-        let (tail, tail_truncated, notice) = match read {
-            Ok(Ok((copy, tail, tail_truncated))) => {
-                let crate::bridge::terminal::FullOutput {
-                    bytes,
-                    total_size,
-                    truncated,
-                } = copy;
-                // The File Message's name is the log's own: it already names
-                // the run (`<run-id>.log`), so the delivered artifact and the
-                // path the card names cannot drift.
-                let name = std::path::Path::new(&request.path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "terminal.log".to_string());
-                let content = crate::backend::FileContent::from_bytes("text/plain", &name, bytes);
-                let hash = crate::bridge::handles::content_identity_hash(
-                    &content.mime,
-                    &content.name,
-                    content.data.as_deref().unwrap_or_default(),
-                );
-                let delivery = crate::bridge::viewer::send_file_message(
-                    &self.feishu,
-                    &self.cards_handle(),
+        let read = match read {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => {
+                // A failed read has no outcome to PATCH onto the card: leaving
+                // the card untouched keeps the tail the reader already sees
+                // instead of rebuilding it as "无输出". The reply IS the
+                // click's result.
+                self.reply_terminal_outcome(
                     &request.message_id,
-                    &content,
-                    hash,
+                    &format!(
+                        "⚠️ 无法读取终端日志（{error}）。文件应在 `{}`（可能已被清理）。",
+                        request.path
+                    ),
                     timeout_ms,
                 )
                 .await;
-                use crate::feishu::card::tool_render::FileDelivery;
-                let notice = crate::feishu::card::terminal::full_output_notice(match delivery {
-                    FileDelivery::SentAsFile => crate::feishu::card::terminal::FullOutputOutcome::Sent {
-                        truncated,
-                        total_size,
-                        path: &request.path,
-                    },
-                    FileDelivery::FileSendOutcomeUnknown => {
-                        crate::feishu::card::terminal::FullOutputOutcome::Unknown { path: &request.path }
-                    }
-                    _ => crate::feishu::card::terminal::FullOutputOutcome::NotSent {
-                        reason: "上传或发送失败",
-                        path: &request.path,
-                    },
-                });
-                (tail, tail_truncated, notice)
+                return;
             }
-            Ok(Err(error)) => (
-                String::new(),
-                false,
-                format!(
-                    "⚠️ 无法读取终端日志（{error}）。文件应在 `{}`（可能已被清理）。",
-                    request.path
-                ),
-            ),
             Err(ViewerFsReadError::Busy(line) | ViewerFsReadError::Timeout(line)) => {
-                (String::new(), false, line)
+                self.reply_terminal_outcome(&request.message_id, &line, timeout_ms)
+                    .await;
+                return;
             }
-            Err(ViewerFsReadError::Worker(error)) => (
-                String::new(),
-                false,
-                format!("⚠️ 无法读取终端日志（{error}）。文件在 `{}`。", request.path),
-            ),
+            Err(ViewerFsReadError::Worker(error)) => {
+                self.reply_terminal_outcome(
+                    &request.message_id,
+                    &format!("⚠️ 无法读取终端日志（{error}）。文件在 `{}`。", request.path),
+                    timeout_ms,
+                )
+                .await;
+                return;
+            }
+        };
+        let (copy, tail, tail_truncated) = read;
+        let notice = {
+            let crate::bridge::terminal::FullOutput {
+                bytes,
+                total_size,
+                truncated,
+            } = copy;
+            // The File Message's name is the log's own: it already names
+            // the run (`<run-id>.log`), so the delivered artifact and the
+            // path the card names cannot drift.
+            let name = std::path::Path::new(&request.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "terminal.log".to_string());
+            let content = crate::backend::FileContent::from_bytes("text/plain", &name, bytes);
+            let hash = crate::bridge::handles::content_identity_hash(
+                &content.mime,
+                &content.name,
+                content.data.as_deref().unwrap_or_default(),
+            );
+            let delivery = crate::bridge::viewer::send_file_message(
+                &self.feishu,
+                &self.cards_handle(),
+                &request.message_id,
+                &content,
+                hash,
+                timeout_ms,
+            )
+            .await;
+            use crate::feishu::card::tool_render::FileDelivery;
+            crate::feishu::card::terminal::full_output_notice(match delivery {
+                FileDelivery::SentAsFile => crate::feishu::card::terminal::FullOutputOutcome::Sent {
+                    truncated,
+                    total_size,
+                    path: &request.path,
+                },
+                FileDelivery::FileSendOutcomeUnknown => {
+                    crate::feishu::card::terminal::FullOutputOutcome::Unknown { path: &request.path }
+                }
+                _ => crate::feishu::card::terminal::FullOutputOutcome::NotSent {
+                    reason: "上传或发送失败",
+                    path: &request.path,
+                },
+            })
         };
         // The card reports the outcome in place. Rebuilding it from the
         // payload's own render inputs is what lets the button stay
@@ -5457,6 +5472,24 @@ impl App {
                 "terminal: full-output outcome for {} did not land",
                 request.message_id
             );
+        }
+    }
+
+    /// Speak a 「📄 完整输出」 outcome under the clicked card when there is no
+    /// new card to write — a log that could not be read leaves the settled
+    /// card's tail untouched instead of rebuilding it empty. Bounded like every
+    /// other delivery step, so the click is never silently dropped.
+    async fn reply_terminal_outcome(&self, message_id: &str, line: &str, timeout_ms: u64) {
+        if !matches!(
+            crate::bridge::bounded_call(
+                "terminal full output reply",
+                timeout_ms,
+                self.feishu.reply_text(message_id, line),
+            )
+            .await,
+            Some(Ok(_))
+        ) {
+            tracing::warn!("terminal: full-output outcome reply for {message_id} did not land");
         }
     }
 
