@@ -169,6 +169,15 @@ pub struct SharedCore {
     /// released when the process group empties. Card actions reach the live run
     /// through the control channel this holds, so 终止 and 继续 cross tasks.
     pub terminal_runs: Arc<std::sync::Mutex<crate::bridge::terminal::TerminalRuns>>,
+    /// The **Terminal Run Record** store (ADR-0086 decision 5): one small
+    /// durable file per Chat/Topic, beside the session mapping. Written before
+    /// a child is spawned, kept until the chat's next run replaces it, and read
+    /// by the startup sweep and by 「↻ 重跑」's stale check.
+    pub terminal_records: Arc<crate::bridge::terminal_record::TerminalRunRecords>,
+    /// `[bridge] log_days`, the age bound the **Terminal Log** sweep shares with
+    /// the application log's retention (ADR-0086 decision 10): swept by age,
+    /// never wholesale, so a live orphan's file is not unlinked.
+    pub terminal_log_days: u32,
     /// New sessions cola creates start with Auto-Accept on (from
     /// `[bridge] default_auto_accept`, #513). Adoptions ignore it and keep
     /// the session's own state.
@@ -377,6 +386,12 @@ impl SharedCore {
             terminal_runs: Arc::new(std::sync::Mutex::new(
                 crate::bridge::terminal::TerminalRuns::default(),
             )),
+            terminal_records: Arc::new(
+                crate::bridge::terminal_record::TerminalRunRecords::beside_session_file(
+                    &cfg.bridge.session_file,
+                ),
+            ),
+            terminal_log_days: cfg.bridge.log_days,
             default_auto_accept: cfg.bridge.default_auto_accept,
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
@@ -492,6 +507,7 @@ impl SharedCore {
             preferred_port: self.preferred_port,
             diff_cooldown: Arc::clone(&self.diff_cooldown),
             terminal_runs: Arc::clone(&self.terminal_runs),
+            terminal_records: Arc::clone(&self.terminal_records),
             terminal_log_root: Arc::clone(&self.terminal_log_root),
             terminal_log_cap_bytes: Arc::clone(&self.terminal_log_cap_bytes),
             terminal_size_probe_ms: Arc::clone(&self.terminal_size_probe_ms),

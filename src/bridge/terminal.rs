@@ -26,9 +26,14 @@
 //!   probe terminate the whole group through #826's `terminate_process_group`;
 //! - a long run sends the existing chat-type Completion Notice once
 //!   (decision 12);
+//! - the run's **Terminal Run Record** is written **before** the child is
+//!   spawned and kept until the next run in that chat replaces it, so a
+//!   restart can report the run honestly and the card's 「↻ 重跑」 still knows
+//!   its command, cwd and timeout (#827, decision 5). The sweep at startup
+//!   never signals a recorded pid, and the Terminal Log directory is swept by
+//!   age (`[bridge] log_days`), never wholesale;
 //! - Unix only: Windows refuses with a stated reason and spawns nothing
-//!   (decision 13). The durable **Terminal Run Record** and its restart sweep
-//!   remain #827's slice.
+//!   (decision 13).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -43,6 +48,7 @@ use tokio::sync::mpsc;
 
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
+use crate::bridge::terminal_record::{TerminalRunRecord, TerminalRunRecords, TerminalRunState};
 use crate::config::ThreadKey;
 use crate::feishu::Platform;
 use crate::feishu::card::terminal::{
@@ -317,8 +323,23 @@ impl AskAiGuard {
     /// Take the run's one submission slot, or say why the click is refused.
     /// The state transition and the decision happen under one lock, so two
     /// concurrent clicks cannot both be accepted.
-    pub(crate) fn claim(runs: &Arc<Mutex<TerminalRuns>>, key: &ThreadKey, run_id: &str) -> AskAiClaim {
+    ///
+    /// `records` is the restart-surviving half of the rule (#827): `last` is
+    /// process-local, so in a fresh process it is empty and a card whose run the
+    /// chat has replaced would otherwise submit its old output. When a record
+    /// exists it decides "current"; when none does (a wiped state directory, a
+    /// run this process never recorded) the in-memory `last` still answers, and
+    /// a lost run's id — which the sweep keeps current — keeps its button.
+    pub(crate) fn claim(
+        runs: &Arc<Mutex<TerminalRuns>>,
+        records: &TerminalRunRecords,
+        key: &ThreadKey,
+        run_id: &str,
+    ) -> AskAiClaim {
         if run_id.is_empty() {
+            return AskAiClaim::Stale;
+        }
+        if records.read(key).is_some_and(|record| record.run_id != run_id) {
             return AskAiClaim::Stale;
         }
         {
@@ -328,10 +349,10 @@ impl AskAiGuard {
                 Some(last) if last.ask_ai_submitted => return AskAiClaim::AlreadySubmitted,
                 Some(last) if last.ask_ai_in_flight => return AskAiClaim::InFlight,
                 Some(last) => last.ask_ai_in_flight = true,
-                // No run in this process: a restart. The durable record (#827)
-                // is the restart-surviving authority, and a lost run's button
-                // must work, so the click is accepted and this run becomes the
-                // chat's last one.
+                // No run in this process: a restart. The record above already
+                // decided the click is current (or there is no record to
+                // contradict it), and a lost run's button must work, so the
+                // click is accepted and this run becomes the chat's last one.
                 None => {
                     state.last.insert(
                         key.clone(),
@@ -500,36 +521,84 @@ pub(crate) async fn execute(
     // One command per Chat/Topic (ADR-0086 decision 6): the claim is taken
     // here, not as a side effect of dispatch, because every inbound message is
     // its own task. A refusal names the running card's 「⏹ 终止」.
+    let Some(claimed) = claim_slot(handles, thread_key) else {
+        platform.reply_text(request.message_id, TERMINAL_BUSY).await?;
+        return Ok(());
+    };
+    run_claimed(handles, claimed, request, spec, None).await
+}
+
+/// Claim the Chat/Topic's slot for a fresh run id (ADR-0086 decision 6), or
+/// `None` when another run holds it. Nothing durable is written here — the card
+/// and the record come later, in [`run_claimed`].
+fn claim_slot(handles: &CommandHandles, thread_key: &ThreadKey) -> Option<ClaimedRun> {
     let run = run_id();
-    let (control, mut controls) = mpsc::unbounded_channel();
+    let (control, controls) = mpsc::unbounded_channel();
     let slot = Arc::new(TerminalRun {
         run_id: run.clone(),
         live: AtomicBool::new(false),
         past_cap: AtomicBool::new(false),
         control,
     });
-    let claimed = {
+    {
         let mut runs = handles
             .terminal_runs
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        runs.claim(thread_key, Arc::clone(&slot)).is_ok()
-    };
-    if !claimed {
-        platform.reply_text(request.message_id, TERMINAL_BUSY).await?;
-        return Ok(());
+        runs.claim(thread_key, Arc::clone(&slot)).ok()?;
     }
-    let mut claim = TerminalClaim {
-        runs: Arc::clone(&handles.terminal_runs),
-        thread_key: thread_key.clone(),
-        run_id: run.clone(),
-        pgid: None,
-        handed_off: false,
-    };
+    Some(ClaimedRun {
+        claim: TerminalClaim {
+            runs: Arc::clone(&handles.terminal_runs),
+            thread_key: thread_key.clone(),
+            run_id: run.clone(),
+            // The group the claim protects, once the child has spawned.
+            pgid: None,
+            handed_off: false,
+        },
+        slot,
+        controls,
+        run_id: run,
+    })
+}
+
+/// A claimed slot plus the run identity it was claimed for. The claim's `Drop`
+/// keeps #825's invariant — a slot is released only once the process group has
+/// no members — so every early return from [`run_claimed`] either has no group
+/// yet (release) or hands the claim to the reaper.
+struct ClaimedRun {
+    claim: TerminalClaim,
+    slot: Arc<TerminalRun>,
+    controls: mpsc::UnboundedReceiver<TerminalControl>,
+    run_id: String,
+}
+
+/// The run itself, on an already-claimed slot: card → record → spawn → record
+/// completed (ADR-0086 decision 5). `cwd` is the record's for a rerun — the
+/// same command must run in the same directory even if the conversation has
+/// moved since — and the Path Scope's base for a fresh command.
+async fn run_claimed(
+    handles: &CommandHandles,
+    claimed: ClaimedRun,
+    request: TerminalRequest<'_>,
+    spec: RunSpec,
+    cwd: Option<String>,
+) -> crate::error::Result<()> {
+    let platform = handles.flow.platform.as_ref();
+    let ClaimedRun {
+        mut claim,
+        slot,
+        mut controls,
+        run_id: run,
+    } = claimed;
+    let thread_key = &claim.thread_key;
     // The Path Scope (ADR-0083 §4, ADR-0086 §2): `current_project_directory` is
     // pending-first — the Pending Session's directory wins, else the active
     // session's, else the default — and the card names exactly this spelling.
-    let cwd = handles.current_project_directory(thread_key).await;
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => handles.current_project_directory(thread_key).await,
+    };
     // The log root is `~/.cola/terminal` (ADR-0086 §7). No home means nowhere
     // for the output to go: refuse BEFORE spawning, never fall back to a
     // relative directory that could put command output in an unrelated tree.
@@ -566,10 +635,11 @@ pub(crate) async fn execute(
     #[cfg(not(test))]
     let inherited_env: Vec<(String, String)> = Vec::new();
 
-    // The live card goes out before the child exists (ADR-0086 decision 5's
-    // card → record → spawn order, with the record a later slice): the run
-    // always has a surface, and 「运行中」 is the state the loop patches. Its
-    // buttons carry this run's id, so a click after a successor run is stale.
+    // The card goes out before the child exists (ADR-0086 decision 5's
+    // card → record → spawn order): the run always has a surface, and 「启动中」
+    // is the truthful label until the record names the card and the child is
+    // up. Its buttons carry this run's id, so a click after a successor run is
+    // stale.
     let live = build_terminal_card(TerminalCard {
         cwd: &cwd,
         command: &spec.command,
@@ -588,8 +658,55 @@ pub(crate) async fn execute(
     // point after which no live PATCH may be issued. A parked/late live write
     // can then never land after the settling write: the settle takes the same
     // lock, and a task that only starts afterwards sees the flag and returns.
+    // Its scope starts here so even the pre-spawn refusal paths can settle.
     let settled = Arc::new(AtomicBool::new(false));
     let card_write = Arc::new(tokio::sync::Mutex::new(()));
+    let started = Instant::now();
+    // Now that the card has an id, the record can name it. THIS write is the
+    // guarantee (ADR-0086 decision 5): it lands before the child exists, so no
+    // child ever runs without a record naming its card, and the one crash
+    // window left (between the send and this write) leaves nothing running. It
+    // is checked, not best-effort: a run whose identity cannot be persisted is
+    // refused rather than spawned unnameable.
+    let mut record = TerminalRunRecord {
+        run_id: run.clone(),
+        chat_id: thread_key.chat_id.clone(),
+        thread_id: thread_key.thread_id.clone(),
+        card_id: card_id.clone(),
+        log_path: log.path.to_string_lossy().to_string(),
+        command: spec.command.clone(),
+        cwd: cwd.clone(),
+        timeout_ms: u64::try_from(spec.timeout.as_millis()).unwrap_or(u64::MAX),
+        pids: Vec::new(),
+        is_group: request.is_group,
+        state: TerminalRunState::Running,
+    };
+    if let Err(error) = handles.terminal_records.write(&record) {
+        let reason = format!("无法写入终端运行记录（{error}）");
+        settle_run(
+            platform,
+            &card_id,
+            &cwd,
+            &spec.command,
+            &log.path,
+            thread_key,
+            request.is_group,
+            &run,
+            &settled,
+            &card_write,
+            TerminalOutcome {
+                exit_code: None,
+                spawn_error: Some(&reason),
+                elapsed: started.elapsed(),
+                stopped: false,
+                survivors: false,
+                output_over_limit: false,
+            },
+        )
+        .await;
+        claim.finish();
+        return Ok(());
+    }
     let patch_facts = Arc::new(LivePatchFacts {
         platform: Arc::clone(&handles.flow.platform),
         card_id: card_id.clone(),
@@ -601,7 +718,6 @@ pub(crate) async fn execute(
         thread_id: thread_key.thread_id.clone(),
     });
 
-    let started = Instant::now();
     let (child, spawn_error) = match spawn_in(&log, &cwd, &spec.command, &inherited_env) {
         Ok(child) => (Some(child), None),
         Err(error) => {
@@ -612,6 +728,10 @@ pub(crate) async fn execute(
         }
     };
     let Some(mut child) = child else {
+        // A spawn that never happened is settled in the record too: the sweep
+        // must not report it as possibly running on the next start.
+        record.state = TerminalRunState::Settled;
+        handles.terminal_records.update(&record);
         settle_run(
             platform,
             &card_id,
@@ -638,6 +758,10 @@ pub(crate) async fn execute(
     };
     let pgid = child.id();
     claim.pgid = pgid;
+    // The record completed (ADR-0086 decision 5): the child exists, so its id
+    // is recorded for the report. A persisted pid is never signalled.
+    record.pids = pgid.into_iter().collect();
+    handles.terminal_records.update(&record);
     slot.live.store(true, Ordering::SeqCst);
 
     // #826's size probe runs on its own task; it owns the runaway kill and
@@ -790,6 +914,11 @@ pub(crate) async fn execute(
         ),
     };
     let survivors = group_has_members(pgid);
+    // The record is marked settled BEFORE the card's last write: a restart
+    // between them then reports nothing to recover, which is the honest answer
+    // (the run is over) rather than a card patched "可能仍在运行".
+    record.state = TerminalRunState::Settled;
+    handles.terminal_records.update(&record);
     settle_run(
         platform,
         &card_id,
@@ -939,6 +1068,195 @@ fn spawn_group_reaper(
     });
 }
 
+/// What a 「↻ 重跑」 click found (ADR-0086 decisions 4 and 5).
+pub(crate) enum RerunClaim {
+    /// The click named the chat's current record and the slot was free: the
+    /// same command, cwd and timeout may start again.
+    Accepted(Box<ClaimedRerun>),
+    /// A run (or another click's rerun) still holds this Chat/Topic's slot.
+    Busy,
+    /// The click's run id is not the chat's current record id — a superseded
+    /// card, or a redelivered click whose first copy already replaced the
+    /// record.
+    Stale,
+}
+
+/// A rerun click that passed both guards, with the record it replays.
+pub(crate) struct ClaimedRerun {
+    claimed: ClaimedRun,
+    record: TerminalRunRecord,
+}
+
+/// Claim the slot AND check the clicked run id against the chat's current
+/// **Terminal Run Record** (ADR-0086 decision 4's stale rule, decision 5's
+/// retention).
+///
+/// The check runs twice, around the claim, and both are needed. The first read
+/// keeps a superseded card's click from being refused as merely "busy" — the
+/// honest answer is "stale". The second read, *under* the claim, is what makes
+/// a redelivered 「↻ 重跑」 single-shot: without it the second copy could read the
+/// old record, lose the race, find the slot free again after an instant first
+/// rerun, and run the command twice. A claim alone cannot see that the record
+/// moved on, and a record check alone cannot close the window between the two.
+pub(crate) fn claim_rerun(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    clicked_run_id: &str,
+) -> RerunClaim {
+    // The record this chat's buttons must name. Its absence (a removed state
+    // directory) is not a licence to run: nothing can prove the click current.
+    if !handles.terminal_records.is_current(thread_key, clicked_run_id) {
+        return RerunClaim::Stale;
+    }
+    let Some(claimed) = claim_slot(handles, thread_key) else {
+        return RerunClaim::Busy;
+    };
+    // Re-read under the claim: a click that replaced the record between the
+    // two reads has already started the command this one names.
+    let Some(record) = handles
+        .terminal_records
+        .read(thread_key)
+        .filter(|record| record.run_id == clicked_run_id)
+    else {
+        return RerunClaim::Stale;
+    };
+    RerunClaim::Accepted(Box::new(ClaimedRerun { claimed, record }))
+}
+
+/// Re-run the command a record names, with the record's own cwd and timeout
+/// (ADR-0086 decision 5) — the reason 「↻ 重跑」 still works after a restart.
+/// The command text and cwd come from the record, not from the button's payload:
+/// the record is the durable, single source, and a multi-kilobyte command does
+/// not belong in a card's JSON budget.
+pub(crate) async fn rerun(
+    handles: &CommandHandles,
+    claimed: Box<ClaimedRerun>,
+    request: TerminalRequest<'_>,
+) -> crate::error::Result<()> {
+    let ClaimedRerun { claimed, record } = *claimed;
+    let spec = RunSpec {
+        command: record.command.clone(),
+        timeout: record.timeout(),
+    };
+    // The chat type rides the record: a button payload carries none, and a
+    // rerun owes the same Completion Notice policy the original run had.
+    let request = TerminalRequest {
+        is_group: record.is_group,
+        ..request
+    };
+    run_claimed(handles, claimed, request, spec, Some(record.cwd)).await
+}
+
+/// The startup sweep (ADR-0086 decisions 5 and 10): every record a previous
+/// process left `running` is reported on its card and marked lost. It never
+/// signals a recorded pid — a pid read back after a restart may belong to
+/// something else, so a lost run is reported, never adopted or killed. A record
+/// whose card cannot be told stays `running` so the next start retries it
+/// instead of leaving the card frozen for good.
+///
+/// Returns how many runs were reported. Covers the record written before a
+/// spawn that never happened too: it has a card id and no pid, and the card it
+/// left reads 「已失去跟踪」 like any other — nothing was running, but cola
+/// cannot know that from the file.
+pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRunRecords) -> usize {
+    let mut reported = 0;
+    for mut record in records.load_all() {
+        if record.state != TerminalRunState::Running {
+            continue;
+        }
+        if !record.card_id.is_empty() {
+            let log = Path::new(&record.log_path);
+            let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
+            let card = build_terminal_card(TerminalCard {
+                cwd: &record.cwd,
+                command: &record.command,
+                output: &output,
+                output_truncated,
+                output_over_limit: false,
+                // 完整输出 stays usable on a lost run: the log is the evidence
+                // a restart did not destroy.
+                full_output: Some(TerminalFullOutput {
+                    log_path: &record.log_path,
+                    chat_id: &record.chat_id,
+                    thread_id: &record.thread_id,
+                    run_id: &record.run_id,
+                    lost: true,
+                    is_group: record.is_group,
+                    exit_code: None,
+                    elapsed: Duration::ZERO,
+                    output_over_limit: false,
+                }),
+                notice: None,
+                state: TerminalState::Lost,
+                run_id: &record.run_id,
+                chat_id: &record.chat_id,
+                thread_id: &record.thread_id,
+            });
+            let patched = tokio::time::timeout(
+                Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
+                platform.update_message(&record.card_id, &card),
+            )
+            .await;
+            match patched {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "terminal: could not mark card {} lost after a restart: {error}",
+                        record.card_id
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!("terminal: marking card {} lost timed out", record.card_id);
+                    continue;
+                }
+            }
+        }
+        record.state = TerminalRunState::Lost;
+        match records.write(&record) {
+            Ok(()) => reported += 1,
+            Err(error) => tracing::warn!("terminal: could not mark run {} lost: {error}", record.run_id),
+        }
+    }
+    reported
+}
+
+/// Sweep the **Terminal Log** directory by age (`[bridge] log_days`), never
+/// wholesale (ADR-0086 decision 10): the age is the file's last write, so a
+/// live orphan is still appending and its mtime keeps it — unlinking a file
+/// something is writing would lose the evidence a restart is supposed to keep.
+/// Returns how many files were removed.
+pub(crate) fn sweep_logs(root: &Path, log_days: u32) -> usize {
+    let retention = Duration::from_secs(u64::from(log_days.max(1)) * 24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        // A clock that jumped backwards makes a file look "from the future";
+        // `Err` from `duration_since` means exactly that, and it is left alone.
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age < retention {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(error) => tracing::warn!("terminal: could not sweep {}: {error}", path.display()),
+        }
+    }
+    removed
+}
+
 /// What settles the card: the real exit code, a spawn failure, the elapsed
 /// time, whether 终止 ended it, whether any group member outlived `sh`, and
 /// whether #826's size probe stopped it.
@@ -973,6 +1291,7 @@ async fn settle(
         run_id,
         chat_id: &thread_key.chat_id,
         thread_id: &thread_key.thread_id,
+        lost: false,
         is_group,
         exit_code: outcome.exit_code,
         elapsed: outcome.elapsed,
@@ -993,8 +1312,9 @@ async fn settle(
             stopped: outcome.stopped,
             survivors: outcome.survivors,
         },
-        // A settled card carries no run controls; only the full-output button.
-        run_id: "",
+        // A settled card carries no run controls; its buttons still name the
+        // run, because 重跑 and 完整输出 stay usable while it is current.
+        run_id,
         chat_id: &thread_key.chat_id,
         thread_id: &thread_key.thread_id,
     });
@@ -1277,7 +1597,7 @@ impl TerminalLog {
 /// when the Host has no home directory — [`execute`] then refuses rather than
 /// inventing a relative path, which could place command output in an unrelated
 /// working tree.
-fn default_terminal_root() -> Option<PathBuf> {
+pub(crate) fn default_terminal_root() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".cola").join("terminal"))
 }
 

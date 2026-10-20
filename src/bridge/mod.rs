@@ -26,6 +26,7 @@ pub mod span;
 pub mod surfaces;
 pub(crate) mod tasks;
 pub(crate) mod terminal;
+pub(crate) mod terminal_record;
 pub mod topic;
 pub mod turn;
 pub(crate) mod turn_diff;

@@ -247,6 +247,9 @@ struct TerminalCardRequest {
     path: String,
     cwd: String,
     command: String,
+    /// Whether the sweep had marked this run lost: the rebuilt card must stay a
+    /// lost card (a restart is not an exit code).
+    lost: bool,
     exit_code: Option<i32>,
     elapsed: std::time::Duration,
     output_over_limit: bool,
@@ -283,6 +286,10 @@ impl TerminalCardRequest {
             path,
             cwd: run.get("cwd")?.as_str()?.to_string(),
             command: run.get("command")?.as_str()?.to_string(),
+            lost: run
+                .get("lost")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             exit_code: run
                 .get("exit_code")
                 .and_then(serde_json::Value::as_i64)
@@ -1521,6 +1528,50 @@ impl App {
         }
     }
 
+    /// Startup recovery for **Terminal Commands** (ADR-0086 decisions 5 and 10).
+    ///
+    /// A restart loses the run: the child may be an orphan (a hand-launched
+    /// cola) or may have gone with the process (a supervised one), and cola
+    /// cannot know which. So every record a previous process left `running` is
+    /// reported — its card patched to 「已失去跟踪（可能仍在运行）」 and the
+    /// record marked lost — and **no recorded process id is ever signalled**: a
+    /// pid may have been reused since, so a lost run is reported, never adopted
+    /// or killed. The record is kept, because the card's buttons must still find
+    /// their run id current.
+    ///
+    /// The **Terminal Log** directory is swept by age in the same pass, never
+    /// wholesale: a live orphan is still appending, so its file's mtime is
+    /// fresh and it is left alone.
+    ///
+    /// Called once from [`Self::run`]. Tests call it directly on a fresh `App`
+    /// over the same state directory, after installing their temp log root, so
+    /// "restart" is one explicit step rather than a hidden constructor side
+    /// effect — a sweep in `App::new` would run before a test could redirect
+    /// the log root and would touch the real `~/.cola/terminal`.
+    pub(crate) async fn sweep_terminal(&self) {
+        let reported = crate::bridge::terminal::sweep_records(&*self.feishu, &self.terminal_records).await;
+        if reported > 0 {
+            tracing::warn!(
+                "terminal: marked {reported} run(s) lost after a restart (their process ids are never signalled)"
+            );
+        }
+        let Some(root) = self
+            .terminal_log_root
+            .get()
+            .cloned()
+            .or_else(crate::bridge::terminal::default_terminal_root)
+        else {
+            return;
+        };
+        let removed = crate::bridge::terminal::sweep_logs(&root, self.terminal_log_days);
+        if removed > 0 {
+            tracing::info!(
+                "terminal: swept {removed} log(s) older than {} day(s)",
+                self.terminal_log_days
+            );
+        }
+    }
+
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         // Let the EventSink trait impl recover a &Arc<App> from &self.
         let _ = self.self_weak.set(Arc::downgrade(&self));
@@ -1533,6 +1584,13 @@ impl App {
             let _ = std::fs::remove_file(&notify_path);
             self.announce_restart(&notify).await;
         }
+
+        // A restart loses the run, and the card says so (ADR-0086 decision 10):
+        // report every record a previous process left running and sweep the
+        // Terminal Log directory by age. Before the WS and poll loops, so the
+        // reports land before any new click can re-claim a chat; best-effort
+        // and bounded per card, so a dead network cannot wedge startup.
+        self.sweep_terminal().await;
 
         // Instant Reminder startup orphan sweep (#249): clear the reminders a
         // previous process left at Feishu — the client gives the user no way
@@ -2562,6 +2620,12 @@ impl App {
                     // runs off the ack, because it may ensure a server and wait
                     // on a whole Turn.
                     Some("ask_ai") => self.handle_terminal_ask_ai(&value).await,
+                    // 「↻ 重跑」 (ADR-0086 decisions 4 and 5): the click names a
+                    // run, the chat's record must still be that run, and the
+                    // command/cwd/timeout come from the record — which is why
+                    // the button works after a restart and why a redelivered
+                    // click is refused as stale instead of running twice.
+                    Some("rerun") => self.handle_terminal_rerun(&value).await,
                     // 「⏹ 终止」 / 「继续」 (ADR-0086 decision 6): the click
                     // only routes to the Chat/Topic's current run, whose id
                     // the button carries. A click for any other run id is
@@ -4499,6 +4563,72 @@ impl App {
         })
     }
 
+    /// Handle a 「↻ 重跑」 click (ADR-0086 decisions 4 and 5). The claim and the
+    /// stale check happen together, synchronously, inside the callback — cheap,
+    /// so the ack is never held — and the run itself is spawned off it. The
+    /// command, cwd and timeout come from the **Terminal Run Record**, which is
+    /// what makes the button work after a restart and what a multi-kilobyte
+    /// command is kept out of the card's JSON for.
+    async fn handle_terminal_rerun(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
+        let thread_key = thread_key_from_value(value);
+        if thread_key.chat_id.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("这张卡片缺少会话信息，无法操作。".to_string()),
+            });
+        }
+        let run_id = value.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+        // The clicked card is this run's new reply target: a rerun posts under
+        // the card it was clicked on, which is where its reader is looking.
+        let Some(message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("这条操作缺少消息位置，无法重跑。".to_string()),
+            });
+        };
+        let message_id = message_id.to_string();
+        let requester = value
+            .get("operator_open_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let claim = crate::bridge::terminal::claim_rerun(&self.command_handles(), &thread_key, run_id);
+        let toast = match claim {
+            crate::bridge::terminal::RerunClaim::Stale => "这张终端卡片的操作已过期。",
+            // The slot is held (the command this card names, or a successor,
+            // is still running): the record is untouched, so the card's own id
+            // stays current for a later click.
+            crate::bridge::terminal::RerunClaim::Busy => {
+                "这个会话已有终端命令在运行，请先点击运行卡片的「⏹ 终止」。"
+            }
+            crate::bridge::terminal::RerunClaim::Accepted(claimed) => {
+                let app = Arc::clone(self);
+                tokio::spawn(async move {
+                    if let Err(e) = crate::bridge::terminal::rerun(
+                        &app.command_handles(),
+                        claimed,
+                        crate::bridge::terminal::TerminalRequest {
+                            message_id: &message_id,
+                            requester_open_id: requester.as_deref(),
+                            // Replaced from the record inside `rerun`: a
+                            // button payload carries no chat type, and the
+                            // record does.
+                            is_group: false,
+                        },
+                    )
+                    .await
+                    {
+                        tracing::error!("Terminal rerun: {}", e);
+                    }
+                });
+                "↻ 正在重跑…"
+            }
+        };
+        Some(CardActionResult {
+            card: None,
+            toast: Some(toast.to_string()),
+        })
+    }
+
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
@@ -5629,6 +5759,33 @@ impl App {
         notice: &str,
         what: &'static str,
     ) {
+        // The rebuilt card keeps every settled button and its run id, and a run
+        // the sweep marked lost is rebuilt AS a lost card: the outcome PATCH
+        // must not invent an ending for it (ADR-0086 decisions 4, 5 and 10).
+        let full_output = Some(crate::feishu::card::terminal::TerminalFullOutput {
+            log_path: &request.path,
+            run_id: &request.run_id,
+            chat_id: &request.chat_id,
+            thread_id: &request.thread_id,
+            lost: request.lost,
+            is_group: request.is_group,
+            exit_code: request.exit_code,
+            elapsed: request.elapsed,
+            output_over_limit: request.output_over_limit,
+        });
+        let state = if request.lost {
+            crate::feishu::card::terminal::TerminalState::Lost
+        } else {
+            crate::feishu::card::terminal::TerminalState::Settled {
+                exit_code: request.exit_code,
+                spawn_error: None,
+                elapsed: request.elapsed,
+                // The outcome PATCH rebuilds a settled card, so the run
+                // controls stay dead.
+                stopped: false,
+                survivors: false,
+            }
+        };
         let card =
             crate::feishu::card::terminal::build_terminal_card(crate::feishu::card::terminal::TerminalCard {
                 cwd: &request.cwd,
@@ -5636,27 +5793,10 @@ impl App {
                 output,
                 output_truncated,
                 output_over_limit: request.output_over_limit,
-                full_output: Some(crate::feishu::card::terminal::TerminalFullOutput {
-                    log_path: &request.path,
-                    run_id: &request.run_id,
-                    chat_id: &request.chat_id,
-                    thread_id: &request.thread_id,
-                    is_group: request.is_group,
-                    exit_code: request.exit_code,
-                    elapsed: request.elapsed,
-                    output_over_limit: request.output_over_limit,
-                }),
+                full_output,
                 notice: Some(notice),
-                state: crate::feishu::card::terminal::TerminalState::Settled {
-                    exit_code: request.exit_code,
-                    spawn_error: None,
-                    elapsed: request.elapsed,
-                    // The outcome PATCH rebuilds a settled card, so the run
-                    // controls stay dead.
-                    stopped: false,
-                    survivors: false,
-                },
-                run_id: "",
+                state,
+                run_id: &request.run_id,
                 chat_id: &request.chat_id,
                 thread_id: &request.thread_id,
             });
@@ -5724,6 +5864,7 @@ impl App {
         let thread_key = thread_key_from_value(value);
         let (guard, toast) = match crate::bridge::terminal::AskAiGuard::claim(
             &self.terminal_runs,
+            &self.terminal_records,
             &thread_key,
             &request.card.run_id,
         ) {

@@ -1688,6 +1688,9 @@ pub(crate) struct CommandHandles {
     /// to reach the live run. Shared through the core with the card-action
     /// handler.
     pub(crate) terminal_runs: Arc<std::sync::Mutex<crate::bridge::terminal::TerminalRuns>>,
+    /// The **Terminal Run Record** store (ADR-0086 decision 5): the record a
+    /// run is found by after a restart, and the source 「↻ 重跑」 replays from.
+    pub(crate) terminal_records: Arc<crate::bridge::terminal_record::TerminalRunRecords>,
     /// The **Terminal Log** root override (ADR-0086 §7): unset in production,
     /// set once by a test so its runs never write under the real home.
     pub(crate) terminal_log_root: Arc<std::sync::OnceLock<std::path::PathBuf>>,
