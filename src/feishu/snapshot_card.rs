@@ -113,20 +113,35 @@ pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlock
 /// `md` is the card's markdown state: the entry texts share its one table budget
 /// and fenced fallback. A tail entry's attached skills are NOT rendered here
 /// (spec #652, ticket #655, acceptance reversal): the snapshot tail is text only.
+/// `omitted` counts the OLDEST entries the card's one-shot budget could not
+/// carry (issue #726) and renders as a visible line above them.
 fn tail_panels(
     tail: &[TailEntry],
+    omitted: usize,
     md: &mut crate::feishu::card::sanitize::CardMarkdown,
 ) -> Vec<serde_json::Value> {
     let mut panels = Vec::new();
-    if tail.is_empty() {
+    if tail.is_empty() && omitted == 0 {
         return panels;
     }
     panels.push(json!({ "tag": "markdown", "content": "**最近对话**" }));
+    // The budget's degradation is deliberate and visible (#726): an entry the
+    // card could not carry is COUNTED here rather than silently disappearing.
+    // The line is unfurled text, outside every entry's fold, so a reader who
+    // scrolls the snapshot knows the preview is a window, not the whole tail.
+    if omitted > 0 {
+        panels.push(json!({
+            "tag": "markdown",
+            "content": format!("…更早的 {omitted} 条记录已省略（超出单卡容量）")
+        }));
+    }
     for (i, entry) in tail.iter().enumerate() {
         // The snapshot is sent once, but SnapshotClaims rebuilds it in place on
         // a claim ack and on remote resolution — so its panels take stable ids
-        // too (the tail's order is fixed, so the entry index is stable).
-        let element_id = format!("snap_{i}");
+        // too (the tail's order is fixed, so the entry index is stable). The
+        // index is the entry's position in the FULL tail, so an evicted prefix
+        // cannot renumber the panels that remain.
+        let element_id = format!("snap_{}", omitted + i);
         let message = match entry {
             // One Compaction marker: the live card's own row builder, so the two
             // surfaces can never disagree on the copy or the fold.
@@ -236,12 +251,6 @@ pub fn build_snapshot_card_with_state(
     let verb = verb.strip_prefix("已").unwrap_or(verb);
     let title = display_title(title, &data.session_id);
 
-    // The card's markdown state (one table budget, one fenced fallback) for the
-    // section that builds model-authored text — the 最近对话 tail's entry texts.
-    // Hoisted here, not built inside `tail_panels`, so every entry's chunks draw
-    // from the ONE card-wide table budget rather than a fresh one per entry.
-    let mut md = crate::feishu::card::sanitize::CardMarkdown::new();
-
     // Only the adopted session's OWN pendings belong on the snapshot — never a
     // sibling session's block (defensive; the gather already filtered). The
     // same filtered set drives both the 等待你的确认 chip and the rendered
@@ -251,6 +260,59 @@ pub fn build_snapshot_card_with_state(
         .iter()
         .filter(|req| req.session_id() == data.session_id)
         .collect();
+
+    // The tail is the one section whose size the caller cannot bound: a message
+    // has no length limit and a compaction marker carries a summary up to the
+    // live row's own cap, so the two together can exceed the one-shot card
+    // budget (issue #726). Build the full card first — a tail that fits stays
+    // byte-for-byte what it always was — and only when it does not fit rebuild
+    // with the OLDEST entries omitted, named by a visible line. Dropping from
+    // the old end keeps the newest conversation, which is what the reader came
+    // for, and never touches the transcript-side four-message selection.
+    let mut omitted = 0;
+    loop {
+        let card = snapshot_card_with_tail(
+            verb,
+            &title,
+            data,
+            &pending,
+            question_state,
+            receipts,
+            back,
+            &data.tail[omitted..],
+            omitted,
+        );
+        // Never a silently rejected card: if even the tail-less body is over
+        // budget there is no tail left to trade, and the last build is the best
+        // this one-shot card can do.
+        if card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS || omitted >= data.tail.len() {
+            return card;
+        }
+        omitted += 1;
+    }
+}
+
+/// [`build_snapshot_card_with_state`]'s single build pass: the full card with
+/// `tail` as the 最近对话 entries and `omitted` older entries named in the
+/// overflow line. Split out so the budget loop can rebuild with a shorter tail
+/// while every other section stays identical.
+#[allow(clippy::too_many_arguments)]
+fn snapshot_card_with_tail(
+    verb: &str,
+    title: &str,
+    data: &SnapshotData,
+    pending: &[&crate::bridge::request::kind::PendingRequest],
+    question_state: &SnapshotQuestionState,
+    receipts: &[String],
+    back: Option<&BackToList>,
+    tail: &[TailEntry],
+    omitted: usize,
+) -> serde_json::Value {
+    // The card's markdown state (one table budget, one fenced fallback) for the
+    // section that builds model-authored text — the 最近对话 tail's entry texts.
+    // Hoisted here, not built inside `tail_panels`, so every entry's chunks draw
+    // from the ONE card-wide table budget rather than a fresh one per entry.
+    let mut md = crate::feishu::card::sanitize::CardMarkdown::new();
 
     let mut elements: Vec<serde_json::Value> = Vec::new();
     if let Some(chip) = status_chip_element(
@@ -270,10 +332,11 @@ pub fn build_snapshot_card_with_state(
     for line in receipts {
         elements.push(json!({ "tag": "markdown", "content": line }));
     }
-    if (!pending.is_empty() || !receipts.is_empty()) && !data.tail.is_empty() {
+    let has_tail = omitted > 0 || !tail.is_empty();
+    if (!pending.is_empty() || !receipts.is_empty()) && has_tail {
         elements.push(json!({ "tag": "hr" }));
     }
-    elements.extend(tail_panels(&data.tail, &mut md));
+    elements.extend(tail_panels(tail, omitted, &mut md));
 
     // The `/switch`-list adoption's way back to the page it came from
     // (ADR-0052), at the card's end where the list footer used to be.
@@ -919,9 +982,8 @@ mod tests {
         // Push the last entry past cola's single-element budget so the panel
         // chunks its full text rather than truncating it — long enough to
         // cross the budget, small enough that the whole card still fits
-        // Feishu's byte budget (a truly unbounded message has no one-card
-        // answer; the streaming path splits turns for that, a snapshot is
-        // one-shot).
+        // Feishu's byte budget (the #726 budget only evicts entries when the
+        // whole tail outgrows the card; it never clips a carried entry).
         long_tail.push(tail(
             MessageRole::Assistant,
             9000,
@@ -955,6 +1017,119 @@ mod tests {
             "snapshot card over estimated JSON budget: {}",
             s.len()
         );
+    }
+
+    /// The tail's one-shot budget (issue #726): four long messages and a
+    /// max-length compaction marker together are far past
+    /// `MAX_CARD_JSON_CHARS`, and the card must still be one Feishu accepts.
+    /// The degradation is deliberate: the OLDEST entries are dropped (the
+    /// newest conversation is what the reader came for), the dropped count is
+    /// named on the card, and every entry that IS carried is carried whole.
+    #[test]
+    fn an_oversized_tail_degrades_visibly_and_fits_the_card_budget() {
+        // Each message is ~3,600 CJK chars (~10.8 KB of JSON) with sentinels
+        // at both ends — a carried entry must show BOTH, so a partial entry can
+        // never pass as whole. The marker's summary is the live row's own
+        // 6,000-char cap (~18 KB).
+        let long = |label: &str| format!("{label}开头：{}：{label}结尾", "很长的内容。".repeat(600));
+        let marker_summary =
+            "压缩摘要。".repeat(crate::feishu::card::compaction::MAX_COMPACTION_SUMMARY_CHARS / 5);
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![
+                tail(MessageRole::User, 1000, &long("第一条")),
+                tail(MessageRole::Assistant, 2000, &long("第二条")),
+                TailEntry::Compaction(TailMarker {
+                    created_ms: 2500,
+                    compaction: compaction(crate::backend::CompactionStatus::Completed, &marker_summary),
+                }),
+                tail(MessageRole::User, 3000, &long("第三条")),
+                tail(MessageRole::Assistant, 4000, &long("第四条")),
+            ],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the one-shot snapshot must stay inside the card budget: {}",
+            s.len()
+        );
+        // Three oldest entries (two messages and the marker) had to go.
+        assert!(s.contains("…更早的 3 条记录已省略"), "the eviction is named: {s}");
+        assert!(
+            !s.contains("第一条") && !s.contains("第二条") && !s.contains("压缩摘要。"),
+            "the OLDEST entries are the ones dropped: {s}"
+        );
+        // The two newest messages are carried WHOLE — the budget never clips a
+        // surviving entry: both of each entry's sentinels are on the card.
+        for label in ["第三条", "第四条"] {
+            assert!(
+                s.contains(&format!("{label}开头")),
+                "{label} carries its start: {s}"
+            );
+            assert!(
+                s.contains(&format!("{label}结尾")),
+                "{label} carries its end: {s}"
+            );
+        }
+    }
+
+    /// The other end of the same budget: a single entry larger than the whole
+    /// card cannot be carried at all, so it is dropped too — and named. The
+    /// card still fits, which is the invariant that matters (#726: never a
+    /// silently rejected card).
+    #[test]
+    fn a_tail_entry_larger_than_the_card_is_dropped_and_named() {
+        let giant = "巨".repeat(crate::feishu::card::MAX_CARD_JSON_CHARS * 4);
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![tail(MessageRole::User, 1000, &giant)],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "the card must fit: {}",
+            s.len()
+        );
+        assert!(
+            s.contains("…更早的 1 条记录已省略"),
+            "the dropped entry is named: {s}"
+        );
+        assert!(!s.contains("巨巨巨"), "an entry that cannot fit is not carried");
+    }
+
+    /// A tail that fits is untouched by the budget: every entry whole, no
+    /// overflow line. The full build is returned as-is, so the common snapshot
+    /// keeps exactly the bytes it had before #726.
+    #[test]
+    fn a_tail_within_budget_is_not_degraded() {
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            (0..4)
+                .map(|i| {
+                    let role = if i % 2 == 0 {
+                        MessageRole::User
+                    } else {
+                        MessageRole::Assistant
+                    };
+                    tail(role, i * 1000, &format!("第{i}条短消息"))
+                })
+                .collect(),
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+        assert!(
+            !s.contains("已省略"),
+            "a fitting tail carries no overflow line: {s}"
+        );
+        for i in 0..4 {
+            assert!(s.contains(&format!("第{i}条短消息")), "entry {i} is whole: {s}");
+        }
     }
 
     /// ADR-0052: only an adoption from the `/switch` list carries the
