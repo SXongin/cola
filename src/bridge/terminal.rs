@@ -1903,7 +1903,18 @@ pub(crate) fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(Strin
     }
     let mut bytes = Vec::with_capacity(window.min(1_048_576) as usize);
     (&mut file).take(window).read_to_end(&mut bytes)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+    if truncated {
+        // #823c: the window starts mid-file, so its first line is a fragment —
+        // and it can be the middle of a long OSC/DCS payload whose introducer
+        // fell outside the window. Dropping that fragment is what keeps such a
+        // payload from rendering as text. A window with no newline at all is one
+        // capped line (a minified log): it is left alone, because dropping it
+        // would report a run that printed output as empty.
+        if let Some(newline) = bytes.iter().position(|&byte| byte == b'\n') {
+            bytes.drain(..=newline);
+        }
+    }
+    Ok((crate::feishu::card::terminal::decode_log_bytes(&bytes), truncated))
 }
 
 #[cfg(test)]
@@ -1967,6 +1978,38 @@ mod tests {
             output.len() as u64 <= window,
             "the read stays inside the {window}-byte window, got {}",
             output.len()
+        );
+    }
+
+    /// #823c: the bounded suffix read can begin inside a long OSC/DCS payload
+    /// whose introducer fell outside the window. The leading fragment is not a
+    /// whole line, so it is dropped instead of rendered as the payload's text —
+    /// while a window with no newline at all (one minified line) is kept, since
+    /// dropping it would report a run that printed output as empty.
+    #[test]
+    fn a_window_that_starts_inside_a_payload_does_not_render_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.log");
+        let mut bytes = b"start\n\x1bP".to_vec();
+        bytes.extend(std::iter::repeat_n(b'P', 300));
+        bytes.extend_from_slice(b"\x1b\\\ntail-line\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // A 260-byte window over a 320-byte file: it starts 60 bytes in, inside
+        // the payload that began at byte 8.
+        let (output, truncated) = read_tail(&path, 64).expect("read the log");
+        assert!(truncated);
+        assert_eq!(
+            output, "tail-line\n",
+            "the payload fragment is dropped, the whole line after it is kept"
+        );
+
+        std::fs::write(&path, vec![b'z'; 1_000]).unwrap();
+        let (output, truncated) = read_tail(&path, 64).expect("read the log");
+        assert!(truncated);
+        assert!(
+            output.starts_with("zzz"),
+            "a window with no newline is one capped line, not a fragment: {output}"
         );
     }
 
