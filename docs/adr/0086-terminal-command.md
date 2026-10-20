@@ -167,16 +167,17 @@ escape soup this section refuses.
    process ids and the run's state (`running` / `settled` / `lost`) — is written **before the
    child is spawned**, completed with the card's message id and the process ids once the card is
    sent and the child is up, marked settled when the run settles, and kept until the next run
-   in that chat replaces it. The order is the guarantee: `record → spawn → card → record
-   completed` means nothing a Terminal Command starts can run without a record naming it, so no
-   child outlives cola unnoticed — and where the launch mode takes the child instead, the record
-   still reports the run rather than leaving it frozen. A record may be incomplete in either direction — written but
-   never spawned (no pid: the sweep reports and clears it) or spawned but no card yet (no
-   message id: nothing to patch, the record is cleared and the orphan is nobody's lie). One
-   window cannot be closed: the card id is assigned by the platform **on send**, so a crash
-   between the send and the record's completion leaves a card claiming to run with no record.
-   Nothing is running in that case; the next run in that chat replaces the record, and that one
-   card is settled by hand. Making the send and the record one act is not available. This is
+   in that chat replaces it. The order is the guarantee: **card → record → spawn → record
+   completed**. The card is sent first, in 「启动中」; the record then carries its message id
+   and the run id; only then does the child spawn. So no child ever runs without a record
+   naming its card, and a run that outlives cola is always findable and markable — and where
+   the launch mode takes the child instead, the record still reports the run rather than
+   leaving it frozen. A record written but never spawned has a card id and no pid; the sweep
+   patches that card to 「已失去跟踪」 and clears the record. One window cannot be closed: a
+   crash between the card send and the record write leaves a card in 「启动中」 with no record
+   — and because the spawn comes *after* the record, **nothing is running**; that card is the
+   only lie this design cannot fix, and it is settled by hand. Making the send and the record
+   one act is not available. This is
    the one durable thing, and it exists because neither of the existing options can serve: the
    **Chain Record** is excluded by decision 4, and the card-handle cache drops any card with no
    interaction block, which is exactly this card. Two further properties fall out of the
@@ -207,7 +208,11 @@ escape soup this section refuses.
    `kill(-pgid, 0)` probe through a safe wrapper — the crate's `unsafe` ban is about its own
    code — and never a pid read back from a record. The consequence for the documented
    long-running escape hatch is stated: a `nohup … &` inside `/run` keeps the slot until it
-   ends, which is what "still using this tree" means.
+   ends, which is what "still using this tree" means. One boundary is stated rather than
+   guarded: a command that deliberately starts a new session (`setsid …`) leaves the group, so
+   it escapes the claim, the tail and 终止 — the same class as a command that kills cola
+   (decision 11). No portable safe mechanism stops a process from calling `setsid`, and
+   pretending otherwise would be the fake safety this ADR rejects elsewhere.
 7. **Output volume has an observed stop threshold, and delivery never depends on it.** Because
    the child writes to a file, a runaway command can fill the disk — and no portable safe
    primitive bounds one descriptor's size: `RLIMIT_FSIZE` is per process and would cap the
