@@ -97,8 +97,8 @@ enabling autostart.
 ## Feishu app setup
 
 cola talks to Feishu as a custom app (企业自建应用). Setup is one-time, in the
-[developer console](https://open.feishu.cn/app); the [README Quick
-start](../README.md#quick-start) has the condensed checklist — this section is the
+[developer console](https://open.feishu.cn/app); the
+[README](../README.md#try-it) has the condensed checklist — this section is the
 full map.
 
 ### 1. Enable the bot capability
