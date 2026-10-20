@@ -304,6 +304,7 @@ async fn aborted_turn_leaves_a_claimed_request() {
                 perm_request("per_claimed", "ses_test", "ls -la"),
             )],
             pending_elsewhere: None,
+            pending_overflow: 0,
             tail: Vec::new(),
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,

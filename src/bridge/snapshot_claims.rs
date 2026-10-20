@@ -122,7 +122,7 @@ impl SnapshotClaims {
                 receipts: Vec::new(),
                 back: back.cloned(),
             });
-        for req in &data.pending {
+        for req in data.embedded_pending() {
             let kind = req.claim_kind();
             self.claims
                 .insert(req.id().to_string(), (message_id.to_string(), kind));
@@ -353,7 +353,10 @@ pub(crate) async fn claim_snapshot_pendings(
         .lock()
         .await
         .claim(snapshot_message_id, verb, title, data, back);
-    for req in &data.pending {
+    // Only what the card actually renders is claimed: a pending the one-shot
+    // budget pushed off the snapshot (#841) stays unclaimed, so the normal
+    // pending flow still surfaces it on its own card.
+    for req in data.embedded_pending() {
         requests
             .flow_for(req.claim_kind())
             .remember_surfaced(req, &data.directory)
@@ -385,6 +388,7 @@ mod tests {
             waiting: false,
             pending: ids.iter().map(|id| perm(id)).collect(),
             pending_elsewhere: None,
+            pending_overflow: 0,
             tail: vec![],
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,
@@ -415,6 +419,25 @@ mod tests {
         assert_eq!(claims.claim_of("p1"), Some(("mid_1", ClaimKind::Permission)));
         assert!(claims.host_pending("mid_1").is_some());
         assert_eq!(claims.host_pending("mid_1").unwrap().len(), 2);
+    }
+
+    /// Only what the card EMBEDS is claimed (#841): a pending the budget
+    /// pushed off the snapshot must keep flowing on its standalone card, and a
+    /// claim with no rendered block would leave it unanswerable on both.
+    #[test]
+    fn claim_registers_only_the_embedded_pendings() {
+        let mut data = data_with(&["p1", "p2", "p3"]);
+        data.pending_overflow = 2;
+        let mut claims = SnapshotClaims::default();
+        claims.claim("mid_1", "接管", "title", &data, None);
+
+        assert_eq!(claims.claim_count(), 1, "only p1 is rendered and claimed");
+        assert!(claims.claim_of("p1").is_some());
+        assert!(claims.claim_of("p2").is_none());
+        assert!(claims.claim_of("p3").is_none());
+        // The host keeps the full adopt-time list: a rebuild filters it by the
+        // claims that survive.
+        assert_eq!(claims.host_pending("mid_1").unwrap().len(), 3);
     }
 
     #[test]

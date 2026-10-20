@@ -218,6 +218,8 @@ rule 4 exists to prevent cannot arise. Receipts are evicted before the
 conversation because they are residue for blocks another client already
 resolved, while the tail is what an adopting reader came for.
 
-The snapshot's claimed pending blocks are NOT evictable: a claim whose block
-the card does not render leaves a request the user can no longer answer there.
-If those alone outgrow one card it is reported, not silently traded (#841).
+The snapshot's claimed pending blocks are all-or-nothing rather than
+evictable: a claim whose block the card does not render leaves a request the
+user cannot answer there. When the whole set outgrows one card the snapshot
+embeds NONE of them, names the overflow on the card, and leaves them UNCLAIMED
+so the standalone pending flow still surfaces them (#841).
