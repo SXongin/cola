@@ -478,6 +478,10 @@ _Avoid_: Attachment message, media message, upload
 The Card footer line summarizing what a turn ran on: working directory (project basename), git branch and dirty state, the answering model, and context-window usage. The model line renders the full identity `provider/model@variant` (provider is part of model identity, not decoration). The directory/branch half is captured when the turn starts (so a wrong-branch run is visible from the first card) and refreshed when the turn ends (so the completed card shows where the turn landed); the model line and the context-window segment appear on every card — including a split "部分完成" one — as soon as their data exists. Context usage advances with the turn (each completed step), rendered as `used/window (percent)`, or as the used tokens alone when the window size is unknown. Only a streaming-card chain carries the Turn Footer; standalone Permission/Question cards and session snapshot cards never do (ADR-0019, ADR-0044).
 _Avoid_: Tail, footer bar, status line
 
+**Turn Diff**:
+A Turn's net file changes as the server's recorded snapshot for that Turn reports them — scoped to the Turn's user-message anchor. The card's index line and the complete-diff HTML artifact read the same Turn Diff; it is V2-only, and a Turn the server cannot answer has no index at all (ADR-0087).
+_Avoid_: tool diff, per-call diff, estimated diff, 本次改动统计 (when it means the estimate)
+
 **Dirty**:
 A git working tree that differs from HEAD — including untracked files — as measured by `git status --porcelain`. Shown as ⚠ on the Turn Footer. Captured at turn start (the state the AI operated on) and refreshed at turn end (whether the AI left uncommitted work behind).
 _Avoid_: Uncommitted, modified
