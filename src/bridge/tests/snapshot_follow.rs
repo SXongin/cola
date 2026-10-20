@@ -742,8 +742,12 @@ async fn a_busy_follow_repeats_the_pending_overflow_line() {
         })
         .expect("the follow re-renders the snapshot message");
     assert!(
-        follow_card.contains("另有 1 个待处理请求超出单卡容量"),
+        follow_card.contains("另有待处理请求超出单卡容量"),
         "the replacing card still names the leftover: {follow_card}"
+    );
+    assert!(
+        !follow_card.contains("1 个待处理请求"),
+        "a replacement drops the count a resolution may have made stale: {follow_card}"
     );
     assert!(
         follow_card.contains("已接管 唯一外部标题"),

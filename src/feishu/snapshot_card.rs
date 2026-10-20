@@ -578,24 +578,10 @@ impl SnapshotBuild<'_> {
             elements.extend(req.snapshot_block_elements(&data.directory, self.question_state));
         }
         // The overflow line names what the card leaves to the normal pending
-        // flow. It deliberately does not promise a standalone card: an
-        // unclaimed request is surfaced INLINE on the session's live card when
-        // one exists, and only falls back to its own card otherwise (#842).
-        match pending_overflow {
-            PendingOverflow::None => {}
-            PendingOverflow::Counted(n) => elements.push(json!({
-                "tag": "markdown",
-                "content": format!(
-                    "…另有 {n} 个待处理请求超出单卡容量，将稍后显示"
-                )
-            })),
-            // A rebuild cannot know how many of the unclaimed ones still
-            // exist (they are outside the claim registry), so it stops naming
-            // a number rather than showing a stale one.
-            PendingOverflow::Uncounted => elements.push(json!({
-                "tag": "markdown",
-                "content": "…另有待处理请求超出单卡容量，将稍后显示"
-            })),
+        // flow. Its copy is shared with the follow card that replaces this one,
+        // so the two surfaces cannot diverge.
+        if let Some(notice) = pending_overflow_notice(pending_overflow) {
+            elements.push(json!({ "tag": "markdown", "content": notice }));
         }
         if pass.omitted_receipts > 0 {
             elements.push(json!({
@@ -623,6 +609,21 @@ impl SnapshotBuild<'_> {
         }
 
         crate::feishu::card::shell::card_shell(&format!("已{} {}", self.verb, self.title), "blue", elements)
+    }
+}
+
+/// The overflow notice as ONE line (no leading newline), shared by the snapshot
+/// card and the follow card that replaces it so the two surfaces cannot
+/// disagree on the copy. `None` when nothing was left out.
+///
+/// The copy promises neither a standalone card nor another card: an unclaimed
+/// request is surfaced INLINE on the session's live card when one exists, and
+/// only falls back to a card of its own otherwise (#842).
+pub(crate) fn pending_overflow_notice(overflow: PendingOverflow) -> Option<String> {
+    match overflow {
+        PendingOverflow::None => None,
+        PendingOverflow::Counted(n) => Some(format!("…另有 {n} 个待处理请求超出单卡容量，将稍后显示")),
+        PendingOverflow::Uncounted => Some("…另有待处理请求超出单卡容量，将稍后显示".to_string()),
     }
 }
 
