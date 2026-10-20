@@ -44,6 +44,31 @@ pub(crate) const TERMINAL_LINE_CHARS: usize = 500;
 /// The visible end of a line the per-line cap cut.
 const LINE_CUT_MARKER: &str = " …（本行过长，已截断）";
 
+/// The settled card's retrieval button (ADR-0086 decision 7). The label is a
+/// constant so the handler and its tests name the same act.
+pub(crate) const TERMINAL_FULL_OUTPUT_LABEL: &str = "📄 完整输出";
+
+/// What 「📄 完整输出」 carries: the log path and the settled card's own render
+/// inputs, so the delivery's outcome can be PATCHed back onto the card it was
+/// clicked on — and the button is self-describing after a restart (ADR-0086
+/// decision 4). Only a settled run without a spawn failure gets one: a launch
+/// that never started has no output to retrieve. The cwd and command are NOT
+/// carried here: the builder puts the text its elements actually show into the
+/// payload, so a huge command cannot bloat the card's JSON budget.
+pub(crate) struct TerminalFullOutput<'a> {
+    /// The **Terminal Log** the button delivers.
+    pub(crate) log_path: &'a str,
+    /// The Chat/Topic the card lives in, for the click's route and in-flight
+    /// claim.
+    pub(crate) chat_id: &'a str,
+    pub(crate) thread_id: &'a str,
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) elapsed: Duration,
+    /// Whether the size probe stopped the run; the rebuilt card must still say
+    /// 「输出超限」.
+    pub(crate) output_over_limit: bool,
+}
+
 /// What the card is: the live state the patch loop refreshes, or the settled
 /// result it stops on.
 pub(crate) enum TerminalState<'a> {
@@ -70,6 +95,17 @@ pub(crate) struct TerminalCard<'a> {
     /// Whether the read itself omitted older bytes before the display tail was
     /// computed (the log is longer than the read window).
     pub(crate) output_truncated: bool,
+    /// Whether the size probe stopped the run at the log's **observed**
+    /// threshold (ADR-0086 decision 7). The settle line then reads 「输出超限」
+    /// instead of reporting a signal.
+    pub(crate) output_over_limit: bool,
+    /// The 「📄 完整输出」 button's payload, when the run settled and produced a
+    /// log worth retrieving.
+    pub(crate) full_output: Option<TerminalFullOutput<'a>>,
+    /// An outcome line the delivery PATCHes on (ADR-0086 decision 7): what was
+    /// sent, and — when the log was past the platform's cap — that the file was
+    /// not sent in full and where the bytes live.
+    pub(crate) notice: Option<&'a str>,
     pub(crate) state: TerminalState<'a>,
 }
 
@@ -97,6 +133,16 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
             elapsed,
         } => {
             let (line, template) = match (spawn_error, exit_code) {
+                // The observed threshold is the reason the run stopped
+                // (ADR-0086 decision 7): naming it beats a bare "killed by a
+                // signal", which would hide why.
+                _ if view.output_over_limit => (
+                    format!(
+                        "⚠️ 输出超限：终端日志已超过 29 MB 观测阈值，命令已停止 · 耗时 {}",
+                        elapsed_label(elapsed)
+                    ),
+                    "red",
+                ),
                 (Some(error), _) => (format!("⚠️ 无法启动：{error}"), "red"),
                 (None, Some(0)) => (format!("✅ 退出码 0 · 耗时 {}", elapsed_label(elapsed)), "green"),
                 (None, Some(code)) => (
@@ -129,7 +175,56 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         "tag": "markdown",
         "content": markdown.clean(&line),
     }));
+    if let Some(notice) = view.notice {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean(notice),
+        }));
+    }
+    if let Some(full_output) = view.full_output {
+        // The payload carries the text the elements SHOW, not the raw input: a
+        // multi-kilobyte command must not be duplicated into the card's JSON.
+        // Clipping twice is idempotent, so the rebuilt card renders the same.
+        let cwd = displayed_text("**目录**", view.cwd, false);
+        let command = displayed_text("**命令**", view.command, false);
+        elements.push(full_output_row(&full_output, &cwd, &command));
+    }
     card_shell(header, template, elements)
+}
+
+/// The 「📄 完整输出」 button row (ADR-0086 decisions 4 and 7). The payload is
+/// self-describing: the log path plus the settled card's render inputs, so the
+/// click can PATCH the same card with its outcome after a restart.
+fn full_output_row(view: &TerminalFullOutput<'_>, cwd: &str, command: &str) -> serde_json::Value {
+    json!({
+        "tag": "column_set",
+        "flex_mode": "flow",
+        "horizontal_spacing": "default",
+        "columns": [{
+            "tag": "column",
+            "width": "auto",
+            "vertical_align": "center",
+            "elements": [{
+                "tag": "button",
+                "type": "default",
+                "text": { "tag": "plain_text", "content": TERMINAL_FULL_OUTPUT_LABEL },
+                "value": {
+                    "action": "terminal",
+                    "op": "full_output",
+                    "chat_id": view.chat_id,
+                    "thread_id": view.thread_id,
+                    "path": view.log_path,
+                    "terminal_card": {
+                        "cwd": cwd,
+                        "command": command,
+                        "exit_code": view.exit_code,
+                        "elapsed_ms": view.elapsed.as_millis() as u64,
+                        "output_over_limit": view.output_over_limit,
+                    },
+                },
+            }],
+        }],
+    })
 }
 
 /// One fenced element under the per-element budget. The clip charges the body's
@@ -145,12 +240,7 @@ fn fenced_element(
     keep_tail: bool,
     markdown: &mut CardMarkdown,
 ) -> (serde_json::Value, bool) {
-    let budget = MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1);
-    let clipped = if keep_tail {
-        clip_fenced_tail(body, None, budget)
-    } else {
-        clip_fenced_body(body, None, budget)
-    };
+    let clipped = displayed_text(prefix, body, keep_tail);
     let was_clipped = clipped != body;
     let block = fenced_code(&clipped, None);
     let element = json!({
@@ -158,6 +248,19 @@ fn fenced_element(
         "content": markdown.clean(&format!("{prefix}\n{block}")),
     });
     (element, was_clipped)
+}
+
+/// The body a fenced element under `prefix` actually shows: clipped to the
+/// per-element budget, from the head or (the output's newest line) the tail.
+/// The button payload uses this too, so what it carries is exactly what the
+/// card renders — never the raw input.
+fn displayed_text(prefix: &str, body: &str, keep_tail: bool) -> String {
+    let budget = MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1);
+    if keep_tail {
+        clip_fenced_tail(body, None, budget)
+    } else {
+        clip_fenced_body(body, None, budget)
+    }
 }
 
 /// Render the newest output for display: split on `\n`, treat a `\r` inside a
@@ -275,5 +378,56 @@ fn elapsed_label(elapsed: Duration) -> String {
         format!("{:.2}s", elapsed.as_secs_f64())
     } else {
         fmt_elapsed(elapsed.as_secs())
+    }
+}
+
+/// The platform's File Message ceiling as the card names it: the same 30 MB
+/// `feishu::file::MAX_FILE_BYTES` enforces.
+const FULL_OUTPUT_CAP_LABEL: &str = "30 MB";
+
+/// What 「📄 完整输出」's delivery reports on the clicked card (ADR-0086
+/// decision 7): what landed, and — past the upload cap — that the file was NOT
+/// the whole log, with the path its remaining bytes live at.
+pub(crate) enum FullOutputOutcome<'a> {
+    /// One File Message went out; `truncated` means it carried only the bounded
+    /// first 30 MB of a longer log.
+    Sent {
+        truncated: bool,
+        total_size: u64,
+        path: &'a str,
+    },
+    /// Nothing was sent (a failed upload, a refused send, an unreadable log).
+    NotSent { reason: &'a str, path: &'a str },
+    /// The send may have landed; it is not retried (ADR-0076's ambiguity rule).
+    Unknown { path: &'a str },
+}
+
+/// The one line the delivery PATCHes onto the card. It always names where the
+/// log's bytes are, so a truncated or failed send still leaves the output
+/// reachable on the Host.
+pub(crate) fn full_output_notice(outcome: FullOutputOutcome<'_>) -> String {
+    match outcome {
+        FullOutputOutcome::Sent {
+            truncated: false,
+            total_size,
+            ..
+        } => format!(
+            "📄 完整输出已作为文件消息发送（{}）。",
+            crate::backend::file_content::human_size(total_size)
+        ),
+        FullOutputOutcome::Sent {
+            truncated: true,
+            total_size,
+            path,
+        } => format!(
+            "📄 完整输出共 {}，超过 {FULL_OUTPUT_CAP_LABEL} 上传上限：文件未完整发送，仅发送了前 {FULL_OUTPUT_CAP_LABEL}（超出部分未发送，末行为截断说明）。完整输出在 `{path}`。",
+            crate::backend::file_content::human_size(total_size)
+        ),
+        FullOutputOutcome::NotSent { reason, path } => {
+            format!("⚠️ 完整输出未发送（{reason}）。文件在 `{path}`。")
+        }
+        FullOutputOutcome::Unknown { path } => {
+            format!("⚠️ 完整输出发送结果未知，为避免重复未重试。文件在 `{path}`。")
+        }
     }
 }

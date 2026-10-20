@@ -1686,6 +1686,10 @@ pub(crate) struct CommandHandles {
     /// The **Terminal Log** root override (ADR-0086 §7): unset in production,
     /// set once by a test so its runs never write under the real home.
     pub(crate) terminal_log_root: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// The log's **observed** stop threshold and the probe's own interval
+    /// (ADR-0086 decision 7); see `SharedCore::terminal_log_cap_bytes`.
+    pub(crate) terminal_log_cap_bytes: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) terminal_size_probe_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only inherited-environment injection for the credential scrub
     /// (ADR-0086 §8); see `SharedCore::terminal_test_env`.
     #[cfg(test)]

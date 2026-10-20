@@ -32,7 +32,32 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
-use crate::feishu::card::terminal::{TERMINAL_TAIL_CHARS, TerminalCard, TerminalState, build_terminal_card};
+use crate::feishu::card::terminal::{
+    TERMINAL_TAIL_CHARS, TerminalCard, TerminalFullOutput, TerminalState, build_terminal_card,
+};
+
+/// The **Terminal Log**'s **observed** stop threshold (ADR-0086 decision 7):
+/// 29 MB. It is deliberately NOT a write limit — no portable safe primitive
+/// bounds one descriptor's size (`RLIMIT_FSIZE` is per process and would cap
+/// the command's own build artifacts, and truncating the live file does not
+/// move the child's offset back). So a dedicated probe reads the file's
+/// metadata and kills the process group once the file has passed this size;
+/// a fast producer can overshoot it before the probe looks, and that is
+/// stated rather than hidden. The threshold sits below the platform's 30 MB
+/// delivery cap so ordinary runs get their whole output.
+pub(crate) const TERMINAL_LOG_CAP_BYTES: u64 = 29 * 1024 * 1024;
+
+/// How often the size probe reads the log's metadata — its own short interval,
+/// never the slower render tick (ADR-0086 decision 7). A metadata read is
+/// cheap; this is the interval that decides how far a fast producer can
+/// overshoot.
+pub(crate) const TERMINAL_SIZE_PROBE_MS: u64 = 250;
+
+/// How long the probe's `SIGTERM` is given before the process group is
+/// `SIGKILL`ed: enough for a well-behaved child to die, short enough that a
+/// stopped runaway never lingers.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_millis(500);
 
 /// The environment names cola's child must NOT inherit (ADR-0086 §8): the
 /// server credentials cola itself holds. The same three names `discovery`
@@ -159,6 +184,9 @@ pub(crate) async fn execute(
         command: &spec.command,
         output: "",
         output_truncated: false,
+        output_over_limit: false,
+        full_output: None,
+        notice: None,
         state: TerminalState::Live,
     });
     let card_id = platform.reply_card(message_id, &live).await?;
@@ -174,19 +202,46 @@ pub(crate) async fn execute(
         }
     };
     let mut wait_outcome = None;
+    let mut output_over_limit = false;
     if let Some(child) = child.as_mut() {
+        // Two intervals with two jobs (ADR-0086 decision 7): the render tick
+        // patches the card, and the size probe — on its own, short cadence —
+        // watches for a runaway log. They are separate on purpose: a probe
+        // that rode the render tick would see the size up to a tick late, and
+        // the render tick is not the cadence a disk-filling command should be
+        // bounded by.
+        let render_ms = handles.config.render_poll_ms().max(1);
+        let probe_ms = handles.terminal_size_probe_ms.load(Ordering::Relaxed).max(1);
+        let cap = handles.terminal_log_cap_bytes.load(Ordering::Relaxed);
+        let pgid = child.id();
+        let mut render = tokio::time::interval(Duration::from_millis(render_ms));
+        let mut probe = tokio::time::interval(Duration::from_millis(probe_ms));
+        // `interval`'s first tick is immediate; the card was just sent and the
+        // child just started, so consume both instead of patching/probing now.
+        render.tick().await;
+        probe.tick().await;
         loop {
             tokio::select! {
                 status = child.wait() => {
                     wait_outcome = Some(status);
                     break;
                 }
-                () = tokio::time::sleep(Duration::from_millis(
-                    handles.config.render_poll_ms(),
-                )) => {
+                _ = render.tick() => {
                     patch_live(platform, &card_id, &cwd, &spec.command, &log.path).await;
                 }
+                _ = probe.tick() => {
+                    // `>` is the ADR's "passes 29 MB". Whatever the single
+                    // write that crossed it did is already on disk: this is an
+                    // observed threshold, not a write limit.
+                    if observed_log_len(&log.path) > cap {
+                        output_over_limit = true;
+                        break;
+                    }
+                }
             }
+        }
+        if output_over_limit {
+            wait_outcome = Some(stop_group(child, pgid).await);
         }
     }
     let (exit_code, spawn_error) = match wait_outcome {
@@ -197,11 +252,25 @@ pub(crate) async fn execute(
     };
     let elapsed = started.elapsed();
     let (output, output_truncated) = read_tail(&log.path, TERMINAL_TAIL_CHARS).unwrap_or_default();
+    let log_path = log.path.to_string_lossy().to_string();
+    // A settled run's log is what 「📄 完整输出」 delivers; a launch that never
+    // started has no output to retrieve, so it carries no button.
+    let full_output = spawn_error.is_none().then(|| TerminalFullOutput {
+        log_path: &log_path,
+        chat_id: &thread_key.chat_id,
+        thread_id: &thread_key.thread_id,
+        exit_code,
+        elapsed,
+        output_over_limit,
+    });
     let settled = build_terminal_card(TerminalCard {
         cwd: &cwd,
         command: &spec.command,
         output: &output,
         output_truncated,
+        output_over_limit,
+        full_output,
+        notice: None,
         state: TerminalState::Settled {
             exit_code,
             spawn_error: spawn_error.as_deref(),
@@ -229,6 +298,9 @@ async fn patch_live(
         command,
         output: &output,
         output_truncated,
+        output_over_limit: false,
+        full_output: None,
+        notice: None,
         state: TerminalState::Live,
     });
     if let Err(error) = platform.update_message(card_id, &card).await {
@@ -348,6 +420,136 @@ fn run_id() -> String {
     )
 }
 
+/// The log's current size, or 0 when it cannot be read: a probe that fails to
+/// stat has nothing to stop, and a run is never killed on a read error.
+fn observed_log_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+}
+
+/// Stop a run that crossed the observed size threshold (ADR-0086 decision 7):
+/// `SIGTERM` to the whole process group, then `SIGKILL` after
+/// [`KILL_GRACE`] — killing only the parent would leave the children a
+/// command spawned writing the tree (decision 6's reason for signalling the
+/// group). Returns the child's own exit status, so the settle path is the same
+/// one a natural end takes.
+#[cfg(unix)]
+async fn stop_group(
+    child: &mut tokio::process::Child,
+    pgid: Option<u32>,
+) -> std::io::Result<std::process::ExitStatus> {
+    signal_group(pgid, rustix::process::Signal::TERM);
+    match tokio::time::timeout(KILL_GRACE, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            signal_group(pgid, rustix::process::Signal::KILL);
+            child.wait().await
+        }
+    }
+}
+
+/// Non-Unix hosts refuse before spawning (ADR-0086 decision 13), so this is
+/// unreachable there and the module still has to compile.
+#[cfg(not(unix))]
+async fn stop_group(
+    child: &mut tokio::process::Child,
+    _pgid: Option<u32>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let _ = child.kill().await;
+    child.wait().await
+}
+
+/// `kill(-pgid, signal)` through rustix's safe wrapper. `process_group(0)`
+/// makes the child its own group leader, so its pid IS the group id. A failed
+/// signal is logged, never fatal: the run still settles on the wait.
+#[cfg(unix)]
+fn signal_group(pgid: Option<u32>, signal: rustix::process::Signal) {
+    // Pid 0 would address cola's own group; `child.id()` is never 0, but a
+    // guard here is cheaper than trusting that forever.
+    let Some(pgid) = pgid.filter(|pid| *pid > 1) else {
+        return;
+    };
+    let Ok(pid) = i32::try_from(pgid) else {
+        return;
+    };
+    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
+        return;
+    };
+    if let Err(error) = rustix::process::kill_process_group(pid, signal) {
+        tracing::warn!("terminal: signalling process group {pgid} failed: {error}");
+    }
+}
+
+/// The copy 「📄 完整输出」 sends. Never a truncation of the log itself: the
+/// child's descriptor offset does not move back (ADR-0086 decision 7), so a
+/// log past the platform's cap is sent as a bounded *copy* of its first bytes
+/// with a truncation line, and the file on disk is left exactly as the run
+/// left it.
+pub(crate) struct FullOutput {
+    /// The bytes a File Message carries (`<= MAX_FILE_BYTES`).
+    pub(crate) bytes: Vec<u8>,
+    /// The log's own size when the copy was taken.
+    pub(crate) total_size: u64,
+    /// Whether the copy omits bytes past the platform's upload cap.
+    pub(crate) truncated: bool,
+}
+
+/// Read the log for delivery, bounded by Feishu's File Message cap.
+pub(crate) fn read_full_output(path: &Path) -> std::io::Result<FullOutput> {
+    read_full_output_capped(path, crate::feishu::file::MAX_FILE_BYTES)
+}
+
+/// [`read_full_output`] with the cap spelled out: production always uses the
+/// platform's 30 MB, while a unit test proves the bounded-copy arithmetic
+/// without writing 30 MB.
+fn read_full_output_capped(path: &Path, cap: u64) -> std::io::Result<FullOutput> {
+    use std::io::Read;
+
+    // Whether the file is longer is decided by the bytes actually present, not
+    // by an earlier stat: an orphaned group member may still be writing the
+    // log, and a copy must never hand the platform more than its cap.
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    (&mut file).take(cap).read_to_end(&mut bytes)?;
+    let mut extra = [0u8; 1];
+    if file.read(&mut extra)? == 0 {
+        return Ok(FullOutput {
+            total_size: bytes.len() as u64,
+            bytes,
+            truncated: false,
+        });
+    }
+    // The log is longer than the cap. The truncation line is part of the
+    // delivered bytes, so it is charged against the same cap: room is made by
+    // trimming the head, never by overrunning the platform's ceiling. At the
+    // real 30 MB the line always fits; a degenerate cap smaller than the line
+    // (a unit test only) sends the head without it.
+    let total_size = std::fs::metadata(path)
+        .map(|meta| meta.len())
+        .unwrap_or_default()
+        .max(bytes.len() as u64);
+    let line = truncation_line(total_size, cap, path);
+    if (line.len() as u64) <= cap {
+        bytes.truncate((cap - line.len() as u64) as usize);
+        bytes.extend_from_slice(line.as_bytes());
+    }
+    Ok(FullOutput {
+        bytes,
+        total_size,
+        truncated: true,
+    })
+}
+
+/// The last line of a bounded delivery copy: it says the file is not the whole
+/// log, its true size, and where the rest lives.
+fn truncation_line(total_size: u64, cap: u64, path: &Path) -> String {
+    format!(
+        "\n…（已截断：日志共 {}，本文件仅含前 {}；完整输出在 {}）\n",
+        crate::backend::file_content::human_size(total_size),
+        crate::backend::file_content::human_size(cap),
+        path.display()
+    )
+}
+
 /// The newest window of `path`, and whether the log is longer than that window.
 /// UTF-8 is at most four bytes per character, so a window of `4 * max_chars`
 /// bytes always holds enough for the display tail's own budget; lossy decoding
@@ -360,7 +562,7 @@ fn run_id() -> String {
 /// `/run yes` would grow this allocation without limit. Seeking to the last
 /// `window` bytes and then taking at most that many is what makes one tick cost
 /// a fixed amount of memory no matter how fast the child writes.
-fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(String, bool)> {
+pub(crate) fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = std::fs::File::open(path)?;
@@ -475,5 +677,41 @@ mod tests {
         assert_eq!(parse_bang("hello !ls"), None, "a mid-message `!` is prose");
         assert_eq!(parse_bang("ls!"), None, "a trailing `!` is prose");
         assert_eq!(parse_bang(""), None);
+    }
+
+    /// #826: the delivery copy is bounded at the platform's cap and carries a
+    /// truncation line naming the real size and where the rest lives, while the
+    /// log itself is left untouched — truncating the log would not move the
+    /// child's descriptor offset back (ADR-0086 decision 7). The cap is spelled
+    /// out because production's 30 MB is too much to write in a unit test.
+    #[test]
+    fn the_delivery_copy_is_bounded_and_never_touches_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        std::fs::write(&path, vec![b'a'; 5_000]).unwrap();
+
+        let copy = read_full_output_capped(&path, 1_024).unwrap();
+        assert!(copy.truncated, "the copy admits it is not the whole log");
+        assert_eq!(copy.total_size, 5_000, "the log's real size is reported");
+        assert_eq!(copy.bytes.len(), 1_024, "the copy never exceeds the cap");
+        let text = String::from_utf8_lossy(&copy.bytes).into_owned();
+        assert!(text.starts_with("aaaa"), "the copy starts at the log's head");
+        assert!(
+            text.contains("已截断") && text.contains(&*path.display().to_string()),
+            "the truncation line says what was cut and where the rest lives: {text}"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            5_000,
+            "the Terminal Log is never truncated for delivery"
+        );
+
+        // Under the cap the whole log goes out, with no truncation line.
+        let small = dir.path().join("small.log");
+        std::fs::write(&small, b"short log\n").unwrap();
+        let copy = read_full_output_capped(&small, 1_024).unwrap();
+        assert!(!copy.truncated);
+        assert_eq!(copy.bytes, b"short log\n");
+        assert_eq!(copy.total_size, 10);
     }
 }
