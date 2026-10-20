@@ -1161,6 +1161,23 @@ pub(crate) async fn rerun(
     run_claimed(handles, claimed, request, spec, Some(record.cwd)).await
 }
 
+/// The tail a card shows for `log`, or the reason it could not be read (#822).
+///
+/// A failed read used to read as `unwrap_or_default()` — an empty body — so a
+/// command whose log became unreadable settled as if it had printed nothing,
+/// with only its exit code to go on. The line keeps the exit code and the state
+/// line intact and says what went wrong; the **Terminal Log** path stays on the
+/// card's buttons, so the evidence is still reachable.
+fn read_display_tail(log: &Path) -> (String, bool) {
+    match read_tail(log, TERMINAL_TAIL_CHARS) {
+        Ok(tail) => tail,
+        Err(error) => {
+            tracing::debug!("terminal: could not read {}: {error}", log.display());
+            (format!("（输出不可读取：{error}）"), false)
+        }
+    }
+}
+
 /// The startup sweep (ADR-0086 decisions 5 and 10): every record a previous
 /// process left `running` is reported on its card and marked lost. It never
 /// signals a recorded pid — a pid read back after a restart may belong to
@@ -1180,7 +1197,7 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
         }
         if !record.card_id.is_empty() {
             let log = Path::new(&record.log_path);
-            let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
+            let (output, output_truncated) = read_display_tail(log);
             let card = build_terminal_card(TerminalCard {
                 cwd: &record.cwd,
                 command: &record.command,
@@ -1336,7 +1353,13 @@ async fn settle(
     run_id: &str,
     outcome: TerminalOutcome<'_>,
 ) {
-    let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
+    // A launch that never happened has no log to read: 「无法启动」 already says
+    // why, and the read's own error would only repeat it.
+    let (output, output_truncated) = if outcome.spawn_error.is_some() {
+        (String::new(), false)
+    } else {
+        read_display_tail(log)
+    };
     let log_path = log.to_string_lossy().to_string();
     let full_output = outcome.spawn_error.is_none().then(|| TerminalFullOutput {
         log_path: &log_path,
@@ -1390,7 +1413,7 @@ async fn patch_live(
     past_cap: bool,
     survivors: bool,
 ) {
-    let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
+    let (output, output_truncated) = read_display_tail(log);
     let card = build_terminal_card(TerminalCard {
         cwd,
         command,
@@ -1944,6 +1967,22 @@ mod tests {
             output.len() as u64 <= window,
             "the read stays inside the {window}-byte window, got {}",
             output.len()
+        );
+    }
+
+    /// #822: a log that cannot be read is not an empty body. The settle keeps
+    /// its exit code, and the output element says why it is empty instead of
+    /// reporting a command that printed nothing.
+    #[test]
+    fn an_unreadable_log_reports_why_instead_of_an_empty_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.log");
+        let (output, truncated) = read_display_tail(&missing);
+        assert!(!truncated);
+        assert!(output.starts_with("（输出不可读取："), "{output}");
+        assert!(
+            output.contains("os error") || output.contains("No such file"),
+            "the reason is the read's own: {output}"
         );
     }
 
