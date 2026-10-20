@@ -349,11 +349,11 @@ pub trait Backend: Send + Sync {
     /// that turn's snapshot, so later edits cannot drift into it; `to` and
     /// `context` are the endpoint's other axes and are omitted from the query
     /// when `None`. `Ok(None)` is strictly "this generation has no session diff
-    /// endpoint" (V1), never an empty diff: the caller then aggregates the
-    /// Turn's tool metadata (#800), so no call site branches on a Generation.
+    /// endpoint" (V1), never an empty diff: V1 has no Turn Diff at all — no
+    /// card index and no artifact (ADR-0087).
     ///
-    /// The Turn card's 「查看完整改动」 callback (#801) reads this; V1's
-    /// aggregation (#800) is the fallback behind `Ok(None)`.
+    /// The Turn card's settle index and its 「查看完整改动」 callback (#801)
+    /// read this one source.
     async fn session_diff(
         &self,
         session_id: &str,

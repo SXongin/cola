@@ -1613,11 +1613,11 @@ pub(super) fn render_turn_parts(
     let Some(anchor) = acc.turn_anchor().cloned() else {
         return rendered_any;
     };
-    // The Turn's change index (#477) is refreshed from the same read, before
-    // the parts render: the #800 aggregation is local, and a newly settled edit
-    // becomes a rendered change that owes its flush. An anchorless card never
-    // reaches here, which is also why it can never offer the button.
-    rendered_any |= acc.refresh_turn_diff(transcript);
+    // The Turn's change index (#477) is NOT read here: it is resolved once at
+    // the Turn's settle from the artifact's own source (ADR-0087), and the
+    // card renders no estimate while the Turn runs (issue #830). An anchorless
+    // card never reaches here, which is also why it can never offer the button.
+    //
     // A merged Wake's completion entry (spec #593) is planned and committed by
     // the caller — [`plan_ledger_entries`] + [`read_planned_outputs`] +
     // [`commit_planned_entries`] — so its output read happens outside the cards
@@ -10043,8 +10043,8 @@ Index: /x/src/main.rs
 
     // --- The Turn's change index (spec #797, ticket #477) -------------------
 
-    /// One completed `edit` call carrying the recorded patch the #800
-    /// aggregation folds. Both generations' settled shapes end here, so the
+    /// One completed `edit` call carrying a recorded patch — the shape a Tool
+    /// Panel renders. Both generations' settled shapes end here, so the
     /// fixture speaks only the neutral one.
     fn edit_part(call_id: &str, at_ms: i64, path: &str, plus: &str) -> Part {
         let patch = format!(
@@ -10100,27 +10100,27 @@ Index: /x/src/main.rs
             .find(|element| element["tag"] == "button" && element["value"]["op"] == "turn_diff")
     }
 
-    /// Acceptance: a Turn that edited two files renders the index line and the
-    /// complete-diff button, with the footer still last. The button names the
-    /// Turn by its anchor (`from` = the user message id) and carries the exact
-    /// `op`/`session_id`/`directory` routing the click needs.
+    /// Acceptance: a terminal card renders the settled index — line and button
+    /// together — with the footer still last. The button names the Turn by its
+    /// anchor (`from`) and carries the exact `op`/`session_id`/`directory`
+    /// routing the click needs.
     #[test]
-    fn a_turn_that_edited_two_files_renders_the_index_line_and_button() {
-        let transcript = anchored_transcript(vec![
-            edit_part("call_edit_a", 1_100, "src/a.rs", "A"),
-            edit_part("call_edit_b", 1_200, "src/b.rs", "B"),
-        ]);
+    fn a_terminal_card_renders_the_settled_index_and_button() {
         let mut acc = anchored_accumulator();
         acc.set_card_state(CardState::Done);
+        acc.set_turn_diff_stats(crate::backend::TurnDiffStats {
+            files: 2,
+            additions: 4,
+            deletions: 2,
+        });
 
-        assert!(render_new_turn_parts(&mut acc, &transcript));
         let (card, full) = acc.build_card_with_split();
-        assert!(!full, "a two-file edit fits one card");
+        assert!(!full, "the index fits one card");
 
         let text = card_text(&card);
         assert!(
             text.contains("📝 本次改动 · 2 files · +4 −2"),
-            "the index line names both deduped files and their counts: {text}"
+            "the index line names the settled files and counts: {text}"
         );
 
         let button = turn_diff_button(&card).expect("the complete-diff button renders");
@@ -10151,110 +10151,65 @@ Index: /x/src/main.rs
             elements[footer_pos]
         );
         assert!(button_pos < footer_pos, "the index precedes the footer");
-
-        // A re-read of the same settled state adds no counts and owes no flush.
-        assert!(!render_new_turn_parts(&mut acc, &transcript));
     }
 
-    /// A Turn whose only file write is outside the working directory (a
-    /// `/tmp` scratch file) has no repository change: the card offers no index,
-    /// matching the V2 artifact, which cannot see that file.
+    /// Rendering a Turn NEVER writes the change index: even with recorded
+    /// edits, the running card and a terminal card no settle read has reached
+    /// carry nothing. The settle read is the only writer (ADR-0087, #830).
     #[test]
-    fn a_turn_that_only_writes_outside_the_work_directory_offers_no_entry() {
-        let transcript = anchored_transcript(vec![tool(
-            "write",
-            "call_write_tmp",
-            ToolStatus::Completed,
-            Some(1_100),
-            Some(serde_json::json!({
-                "filePath": "/tmp/opencode/comment.md",
-                "content": "temporary\n",
-            })),
-            Some("Wrote file successfully."),
-        )]);
-        let mut acc = anchored_accumulator();
-        acc.set_card_state(CardState::Done);
-
-        render_new_turn_parts(&mut acc, &transcript);
-        let card = acc.build_card_with_split().0;
-
-        assert!(!card_text(&card).contains("📝 本次改动"), "{card}");
-        assert!(turn_diff_button(&card).is_none(), "{card}");
-    }
-
-    /// Acceptance: a read/bash-only Turn recorded no file edit, so the card
-    /// offers neither the line nor the button — no dead entry.
-    #[test]
-    fn a_read_and_bash_only_turn_renders_no_index_and_no_button() {
+    fn rendering_a_turn_never_writes_a_change_index() {
         let transcript = anchored_transcript(vec![
-            tool(
-                "read",
-                "call_read",
-                ToolStatus::Completed,
-                Some(1_100),
-                Some(serde_json::json!({ "filePath": "src/a.rs" })),
-                Some("fn main() {}"),
-            ),
-            tool(
-                "bash",
-                "call_bash",
-                ToolStatus::Completed,
-                Some(1_200),
-                Some(serde_json::json!({ "command": "cargo test" })),
-                Some("ok"),
-            ),
+            edit_part("call_edit_a", 1_100, "src/a.rs", "A"),
+            edit_part("call_edit_b", 1_200, "src/b.rs", "B"),
         ]);
-        let mut acc = anchored_accumulator();
-        acc.set_card_state(CardState::Done);
-
-        assert!(render_new_turn_parts(&mut acc, &transcript));
-        let card = acc.build_card_with_split().0;
-        let text = card_text(&card);
-
-        assert!(!text.contains("📝 本次改动"), "no index line: {text}");
-        assert!(!text.contains("查看完整改动"), "no button copy: {text}");
-        let elements = card["body"]["elements"].as_array().unwrap();
-        assert!(
-            !elements
-                .iter()
-                .any(|element| element["value"]["op"] == "turn_diff"),
-            "no turn_diff payload: {card}"
-        );
-    }
-
-    /// A running Turn shows the live counts line but no entry: the one-shot
-    /// artifact must not freeze a mid-turn snapshot. The terminal card adds
-    /// the button.
-    #[test]
-    fn a_running_card_shows_the_index_line_without_the_button() {
-        let transcript = anchored_transcript(vec![edit_part("call_edit_a", 2_000, "src/a.rs", "A")]);
         let mut acc = anchored_accumulator();
         acc.set_card_state(CardState::Streaming);
         assert!(render_new_turn_parts(&mut acc, &transcript));
 
         let running = acc.build_card_with_split().0;
+        assert!(!card_text(&running).contains("📝 本次改动"), "{running}");
+        assert!(turn_diff_button(&running).is_none(), "{running}");
+
+        acc.set_card_state(CardState::Done);
+        let unsettled = acc.build_card_with_split().0;
         assert!(
-            card_text(&running).contains("📝 本次改动 · 1 files · +2 −1"),
-            "the live counts line renders: {running}"
+            !card_text(&unsettled).contains("📝 本次改动"),
+            "the render must not invent counts for a terminal card: {unsettled}"
         );
-        assert!(
-            turn_diff_button(&running).is_none(),
-            "no button until the Turn's card is terminal: {running}"
-        );
+        assert!(turn_diff_button(&unsettled).is_none(), "{unsettled}");
+    }
+
+    /// A running Turn carries no index even when settled counts are present:
+    /// the whole index is a terminal-card fact (ADR-0087). The terminal state
+    /// is what reveals it.
+    #[test]
+    fn a_running_card_carries_no_index_even_with_settled_counts() {
+        let mut acc = anchored_accumulator();
+        acc.set_card_state(CardState::Streaming);
+        acc.set_turn_diff_stats(crate::backend::TurnDiffStats {
+            files: 1,
+            additions: 2,
+            deletions: 1,
+        });
+
+        let running = acc.build_card_with_split().0;
+        assert!(!card_text(&running).contains("📝 本次改动"), "{running}");
+        assert!(turn_diff_button(&running).is_none(), "{running}");
 
         acc.set_card_state(CardState::Done);
         let settled = acc.build_card_with_split().0;
         assert!(
-            turn_diff_button(&settled).is_some(),
-            "the terminal card offers the one-shot entry: {settled}"
+            card_text(&settled).contains("📝 本次改动 · 1 files · +2 −1"),
+            "{settled}"
         );
+        assert!(turn_diff_button(&settled).is_some(), "{settled}");
     }
 
-    /// Acceptance: when the Turn splits, only the last (live) card carries the
-    /// index line and the button; a finalized prefix must not offer an entry.
+    /// Acceptance: when the Turn splits, only the last card carries the index
+    /// line and the button; a finalized prefix must not offer an entry.
     #[test]
     fn only_the_last_split_card_carries_the_index_and_button() {
-        let mut parts: Vec<Part> = (0..60)
+        let parts: Vec<Part> = (0..60)
             .map(|i| {
                 tool(
                     "read",
@@ -10266,11 +10221,14 @@ Index: /x/src/main.rs
                 )
             })
             .collect();
-        parts.push(edit_part("call_edit_a", 2_000, "src/a.rs", "A"));
-        parts.push(edit_part("call_edit_b", 2_100, "src/b.rs", "B"));
 
         let mut acc = anchored_accumulator();
         acc.set_card_state(CardState::Done);
+        acc.set_turn_diff_stats(crate::backend::TurnDiffStats {
+            files: 2,
+            additions: 4,
+            deletions: 2,
+        });
         assert!(render_new_turn_parts(&mut acc, &anchored_transcript(parts)));
 
         let mut cards = Vec::new();
@@ -10318,7 +10276,7 @@ Index: /x/src/main.rs
             project_name: Some("cola-demo".to_string()),
             git: Default::default(),
         });
-        acc.set_turn_diff_for_test(crate::backend::TurnDiffStats {
+        acc.set_turn_diff_stats(crate::backend::TurnDiffStats {
             files: 1,
             additions: 1,
             deletions: 1,

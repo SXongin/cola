@@ -162,7 +162,7 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
         thread_key: _,
         directory,
         started_at,
-        anchor: _,
+        anchor,
     } = facts;
     let flow = handles.flow();
     let disposition = settle::run(&flow, &session_id, &directory, timing, &ticket).await;
@@ -170,6 +170,11 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     let Some(disposition) = disposition else {
         return;
     };
+    // The terminal card's change index, resolved from the artifact's own source
+    // before the ownership-checked stamp (ADR-0087). The read is bounded and
+    // can never block the ending.
+    let index =
+        super::terminal_change_index(flow.backend.as_ref(), &session_id, &disposition, anchor.as_ref()).await;
     // The ownership re-check and the stamp share ONE cards lock (#539): the
     // guard is already released, so a new Turn may have replaced the card —
     // and its live card must never inherit this loop's ending. `None` means the
@@ -177,7 +182,7 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     // is the card the ending landed on, passed to the notice so it can never be
     // announced on a card a newer Turn swapped in afterwards (review finding 6).
     let Some(card_id) = ticket
-        .apply_ending_if_owned(&flow.cards, &session_id, &disposition)
+        .apply_ending_if_owned(&flow.cards, &session_id, &disposition, index)
         .await
     else {
         return;

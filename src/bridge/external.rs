@@ -1539,7 +1539,14 @@ async fn external_render_loop(
             tracing::info!("external render: session {} gained parts", session_id);
         }
         if stopped {
-            if Turn::finalize_stopped_if_anchor(&handles.cards, &session_id, &anchor).await {
+            if Turn::finalize_stopped_if_anchor(
+                handles.backend.as_ref(),
+                &handles.cards,
+                &session_id,
+                &anchor,
+            )
+            .await
+            {
                 tracing::info!("external reply render stopped: session {}", session_id);
             }
             break;
@@ -1561,7 +1568,14 @@ async fn external_render_loop(
                 // is rendered by the ordinary pass above.
                 TurnSettle::Running => {}
                 TurnSettle::Complete => {
-                    if Turn::finalize_done_if_anchor(&handles.cards, &session_id, &anchor).await {
+                    if Turn::finalize_done_if_anchor(
+                        handles.backend.as_ref(),
+                        &handles.cards,
+                        &session_id,
+                        &anchor,
+                    )
+                    .await
+                    {
                         tracing::info!("external reply rendered: session {} done", session_id);
                     }
                     break;
@@ -1571,8 +1585,14 @@ async fn external_render_loop(
                     // disposition table — the card state and failure line cannot
                     // disagree with the other ending paths (ADR-0059).
                     let disposition = Disposition::from(settle);
-                    if Turn::apply_disposition_if_anchor(&handles.cards, &session_id, &anchor, &disposition)
-                        .await
+                    if Turn::apply_disposition_if_anchor(
+                        handles.backend.as_ref(),
+                        &handles.cards,
+                        &session_id,
+                        &anchor,
+                        &disposition,
+                    )
+                    .await
                     {
                         tracing::info!(
                             "external reply rendered: session {} {}",
@@ -1665,7 +1685,7 @@ async fn stalled_poll(
 async fn idle_bound_reached(handles: &FlowHandles, session_id: &str, anchor: &TurnAnchor) {
     let has_content = Turn::has_rendered_content(&handles.cards, session_id).await;
     if has_content {
-        if Turn::finalize_done_if_anchor(&handles.cards, session_id, anchor).await {
+        if Turn::finalize_done_if_anchor(handles.backend.as_ref(), &handles.cards, session_id, anchor).await {
             tracing::info!(
                 "external reply render: idle bound reached; finalized session {}",
                 session_id

@@ -406,8 +406,8 @@ impl OpenCodeBackend {
     }
 
     /// One Turn's file diff where the generation serves a session diff
-    /// endpoint (V2's `GET /api/session/{id}/diff`); `None` on V1, whose caller
-    /// aggregates the Turn's tool metadata instead (#800).
+    /// endpoint (V2's `GET /api/session/{id}/diff`); `None` on V1, which has no
+    /// Turn Diff at all (ADR-0087).
     pub async fn session_diff(
         &self,
         session_id: &str,

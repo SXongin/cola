@@ -238,22 +238,11 @@ enum TurnDiffSendState {
     Empty,
 }
 
-/// Which source produced a Turn Diff: V2's session diff, or V1's aggregation
-/// over the Turn's tool metadata. The latter must name itself in the artifact
-/// (spec #797 decision 8), so the provenance is a value, not a bare bool.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TurnDiffSource {
-    SessionDiff,
-    ToolMetadata,
-}
-
-/// One click's read result: the diff, where it came from, and the Turn's
-/// server-time anchor (the artifact header's time). The anchor is `None` when
-/// the transcript read failed on V2 — the artifact stays usable and says
-/// 「时间未知」 rather than failing.
+/// One click's read result: the diff and the Turn's server-time anchor (the
+/// artifact header's time). The anchor is `None` when the transcript read failed
+/// — the artifact stays usable and says 「时间未知」 rather than failing.
 struct TurnDiffRead {
     diff: crate::backend::TurnDiff,
-    source: TurnDiffSource,
     anchor_ms: Option<i64>,
 }
 
@@ -290,20 +279,23 @@ impl Drop for TurnDiffClaim {
     }
 }
 
-/// What an empty Turn's click answers (spec #797 decision 7). No file is
-/// generated for a Turn that changed nothing.
-const TURN_DIFF_EMPTY_TEXT: &str = "本 turn 没有文件改动";
+/// What a click answers when the authoritative read is empty: the index existed
+/// at settle, so the Turn's net change has gone to zero since (usually an edit
+/// reverted later). ADR-0087.
+const TURN_DIFF_EMPTY_TEXT: &str = "这个 turn 没有留下净改动。";
 
-/// What a failed fetch, render or upload answers. The click is never silent,
-/// and a definite failure is not retried to the caller's timeout.
+/// What a failed Turn Diff READ answers (a transient error, a server restart or
+/// a snapshot the server cannot answer). The claim is dropped, so a later click
+/// retries. Distinct from a failed render/upload, which the artifact's own copy
+/// covers.
+const TURN_DIFF_READ_FAILURE_TEXT: &str = "暂时读不到终态改动，请稍后再试。";
+
+/// What a failed render or upload answers. The click is never silent, and a
+/// definite failure is not retried to the caller's timeout.
 const TURN_DIFF_FAILURE_TEXT: &str = "生成完整 diff 失败，请稍后重试。";
 
 /// The artifact's `title`: what the reader opens from the Turn card.
 const TURN_DIFF_TITLE: &str = "本次改动的完整 diff";
-
-/// The V1 provenance marker (spec #797 decision 8): the aggregated tool
-/// metadata says what the tools did, not what the working tree became.
-const TURN_DIFF_V1_SUBTITLE: &str = "按工具记录聚合";
 
 /// The artifact header's time when the transcript read failed: the diff is
 /// still usable, so the header states the gap instead of failing the click.
@@ -884,15 +876,12 @@ fn turn_diff_state_toast(state: TurnDiffSendState) -> &'static str {
     }
 }
 
-/// Build the artifact's document from the neutral Turn Diff. `source` names the
-/// provenance: the V1 aggregation (spec #797 decision 8) must say
-/// 「按工具记录聚合」, because it says what the tools recorded, not what the
-/// working tree became. `anchor_ms` is the Turn's server time (#798's header
-/// wants title, turn time, stats, in that order); `None` states it as unknown.
+/// Build the artifact's document from the neutral Turn Diff. `anchor_ms` is the
+/// Turn's server time (#798's header wants title, turn time, stats, in that
+/// order); `None` states it as unknown.
 fn turn_diff_document(
     diff: &crate::backend::TurnDiff,
     click: &TurnDiffClick,
-    source: TurnDiffSource,
     anchor_ms: Option<i64>,
 ) -> crate::backend::DiffDocument {
     let turn = if click.from.is_empty() {
@@ -909,10 +898,6 @@ fn turn_diff_document(
     if !click.directory.is_empty() {
         subtitle.push_str(" · ");
         subtitle.push_str(&click.directory);
-    }
-    if source == TurnDiffSource::ToolMetadata {
-        subtitle.push_str(" · ");
-        subtitle.push_str(TURN_DIFF_V1_SUBTITLE);
     }
     crate::backend::DiffDocument::from_turn_diff(diff.clone(), TURN_DIFF_TITLE, subtitle)
 }
@@ -4629,7 +4614,7 @@ impl App {
     }
 
     /// The off-callback Turn Diff delivery (#801): read the Turn's diff (V2's
-    /// `session.diff`, or V1's tool-metadata aggregation), render the
+    /// `session.diff`; V1 has none, ADR-0087), render the
     /// self-contained HTML artifact, upload it once and post exactly ONE File
     /// Message under the clicked Turn card. Every network step is bounded by
     /// the viewer transfer's bound; every failure is spoken, never dropped.
@@ -4641,7 +4626,7 @@ impl App {
         let turn = match self.read_turn_diff(&click, timeout_ms).await {
             Ok(turn) => turn,
             Err(()) => {
-                self.reply_turn_diff_line(&click.message_id, TURN_DIFF_FAILURE_TEXT, timeout_ms)
+                self.reply_turn_diff_line(&click.message_id, TURN_DIFF_READ_FAILURE_TEXT, timeout_ms)
                     .await;
                 return;
             }
@@ -4654,7 +4639,7 @@ impl App {
                 .await;
             return;
         }
-        let document = turn_diff_document(&turn.diff, &click, turn.source, turn.anchor_ms);
+        let document = turn_diff_document(&turn.diff, &click, turn.anchor_ms);
         let html = crate::backend::render_diff_html(&document);
         let name = turn_diff_file_name(&click.session_id, &click.from);
         let delivery = crate::bridge::viewer::send_html_file(
@@ -4689,12 +4674,11 @@ impl App {
     }
 
     /// Read one Turn Diff. V2's session diff (scoped to the Turn's snapshot by
-    /// `from`) is the source; `Ok(None)` sends us to #800's aggregation over
-    /// the Turn's tool metadata, carrying the provenance the artifact must
-    /// name. The transcript is read once for the Turn's server-time anchor
-    /// (the header's turn time); on V2 a failed transcript only makes the time
-    /// unknown, while on V1 the aggregation genuinely needs it. `Err` is a
-    /// failed read the caller speaks as a failure.
+    /// `from`) is the only source (ADR-0087): a generation without the endpoint
+    /// (`Ok(None)`) is a failed read, never a tool-metadata fallback. The
+    /// transcript is read once for the Turn's server-time anchor (the header's
+    /// turn time); a failed transcript only makes the time unknown, never fails
+    /// the artifact. `Err` is a failed read the caller speaks as a read failure.
     async fn read_turn_diff(
         self: &Arc<Self>,
         click: &TurnDiffClick,
@@ -4713,59 +4697,16 @@ impl App {
         )
         .await
         {
-            Some(Ok(Some(diff))) => Ok(TurnDiffRead {
-                diff,
-                source: TurnDiffSource::SessionDiff,
-                anchor_ms,
-            }),
-            // V1 has no session diff endpoint: aggregate the Turn's tool
-            // metadata instead. The payload carries the directory for the
-            // child-session routing the Turn card came from.
+            Some(Ok(Some(diff))) => Ok(TurnDiffRead { diff, anchor_ms }),
+            // V1 answers `Ok(None)` without a request: this card could only be
+            // a legacy button from the unreleased feature, and there is no
+            // artifact source to fall back to.
             Some(Ok(None)) => {
-                tracing::debug!(
-                    "turn diff: V1 aggregation for {} (directory {:?})",
-                    click.session_id,
-                    click.directory
+                tracing::warn!(
+                    "turn diff: {} has no session diff endpoint (V1)",
+                    click.session_id
                 );
-                let Some(transcript) = transcript.as_ref() else {
-                    tracing::warn!("turn diff: V1 aggregation without a readable transcript");
-                    return Err(());
-                };
-                // An empty `from` is the payload's "latest Turn" compatibility
-                // path (#801): `turn_diff_anchor` resolves the newest user
-                // message, the same rule the V2 read gets from an omitted
-                // `from`.
-                let Some(anchor) = turn_diff_anchor(transcript, &click.from) else {
-                    tracing::warn!(
-                        "turn diff: {} is not a user message in {}",
-                        click.from,
-                        click.session_id
-                    );
-                    return Err(());
-                };
-                // Scope the V1 aggregation like V2's `session.diff`: repo files
-                // only. The payload normally carries the directory; a stale or
-                // future caller without it falls back to the mapped session.
-                let root = if click.directory.is_empty() {
-                    self.sessions
-                        .lock()
-                        .await
-                        .directory_for_session(&click.session_id)
-                } else {
-                    Some(click.directory.clone())
-                };
-                let Some(root) = root.filter(|root| !root.is_empty()) else {
-                    tracing::warn!(
-                        "turn diff: no working directory for {}; cannot scope the V1 aggregation",
-                        click.session_id
-                    );
-                    return Err(());
-                };
-                Ok(TurnDiffRead {
-                    diff: crate::bridge::turn_diff::turn_diff_from_tools_in(transcript, &anchor, Some(&root)),
-                    source: TurnDiffSource::ToolMetadata,
-                    anchor_ms: Some(anchor.created_ms),
-                })
+                Err(())
             }
             Some(Err(error)) => {
                 tracing::warn!("turn diff: session diff read failed: {error}");
@@ -4775,9 +4716,9 @@ impl App {
         }
     }
 
-    /// The transcript read the click needs for the Turn's time (and, on V1, for
-    /// the aggregation). A failed read is logged and reported as `None`, never
-    /// propagated: on V2 the artifact is still produced with an unknown time.
+    /// The transcript read the click needs for the Turn's time. A failed read is
+    /// logged and reported as `None`, never propagated: the artifact is still
+    /// produced with an unknown time.
     async fn read_turn_diff_transcript(
         self: &Arc<Self>,
         click: &TurnDiffClick,
@@ -5705,8 +5646,8 @@ impl App {
 #[cfg(test)]
 mod turn_diff_delivery_helpers {
     use super::{
-        TURN_DIFF_TITLE, TURN_DIFF_V1_SUBTITLE, TurnDiffClick, TurnDiffSendState, TurnDiffSource,
-        turn_diff_document, turn_diff_file_name, turn_diff_state_toast,
+        TURN_DIFF_TITLE, TurnDiffClick, TurnDiffSendState, turn_diff_document, turn_diff_file_name,
+        turn_diff_state_toast,
     };
     use crate::backend::{TurnDiff, TurnDiffFile};
 
@@ -5729,32 +5670,23 @@ mod turn_diff_delivery_helpers {
         }])
     }
 
-    /// V1's aggregation says what the tools recorded, not what the working tree
-    /// became, so the artifact's subtitle must name it (spec #797 decision 8).
-    #[test]
-    fn the_v1_document_names_the_tool_metadata_source() {
-        let anchor_ms = crate::feishu::card::test_local_ms(2026, 10, 19, 14, 30);
-        let document = turn_diff_document(&diff(), &click(), TurnDiffSource::ToolMetadata, Some(anchor_ms));
-        assert_eq!(document.title, TURN_DIFF_TITLE);
-        assert!(
-            document.subtitle.contains(TURN_DIFF_V1_SUBTITLE),
-            "subtitle: {}",
-            document.subtitle
-        );
-        assert_eq!(document.files.len(), 1);
-    }
-
     /// #798's header wants the Turn's time between the title and the stats;
-    /// the subtitle carries it, in the card's own date + clock idiom.
+    /// the subtitle carries it, in the card's own date + clock idiom, plus the
+    /// Turn's identity (ADR-0087: one V2 source, so no provenance marker).
     #[test]
-    fn the_document_header_carries_the_turn_time() {
+    fn the_document_header_carries_the_turn_time_and_identity() {
         let anchor_ms = crate::feishu::card::test_local_ms(2026, 10, 19, 14, 30);
-        let document = turn_diff_document(&diff(), &click(), TurnDiffSource::SessionDiff, Some(anchor_ms));
+        let document = turn_diff_document(&diff(), &click(), Some(anchor_ms));
+        assert_eq!(document.title, TURN_DIFF_TITLE);
+        assert_eq!(document.files.len(), 1);
         assert!(
             document.subtitle.contains("10-19 14:30"),
             "subtitle: {}",
             document.subtitle
         );
+        assert!(document.subtitle.contains("ses_1"));
+        assert!(document.subtitle.contains("msg_user_1"));
+        assert!(document.subtitle.contains("/repo/cola"));
         let html = crate::backend::render_diff_html(&document);
         assert!(
             html.contains("10-19 14:30"),
@@ -5766,7 +5698,7 @@ mod turn_diff_delivery_helpers {
     /// the time as unknown instead.
     #[test]
     fn a_missing_turn_time_says_unknown_without_failing() {
-        let document = turn_diff_document(&diff(), &click(), TurnDiffSource::SessionDiff, None);
+        let document = turn_diff_document(&diff(), &click(), None);
         assert!(
             document.subtitle.contains(super::TURN_DIFF_UNKNOWN_TIME),
             "subtitle: {}",
@@ -5775,18 +5707,6 @@ mod turn_diff_delivery_helpers {
         let html = crate::backend::render_diff_html(&document);
         assert!(html.contains(super::TURN_DIFF_UNKNOWN_TIME));
         assert!(html.contains("src/main.rs"));
-    }
-
-    /// The V2 read is the working tree's own diff: it must not wear the V1
-    /// marker.
-    #[test]
-    fn the_v2_document_does_not_name_the_v1_source() {
-        let anchor_ms = crate::feishu::card::test_local_ms(2026, 10, 19, 14, 30);
-        let document = turn_diff_document(&diff(), &click(), TurnDiffSource::SessionDiff, Some(anchor_ms));
-        assert!(!document.subtitle.contains(TURN_DIFF_V1_SUBTITLE));
-        assert!(document.subtitle.contains("ses_1"));
-        assert!(document.subtitle.contains("msg_user_1"));
-        assert!(document.subtitle.contains("/repo/cola"));
     }
 
     /// The filename is reproducible from the Turn's identity, ASCII, short and

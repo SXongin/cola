@@ -942,6 +942,15 @@ async fn external_message_reply_renders_into_notification_card() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
     mock.external_message("OpenChamber 里发的消息");
+    // ADR-0087: the external follow's terminal card resolves the same
+    // `session.diff` index a normal Turn does.
+    mock.given_session_diff(crate::backend::TurnDiff(vec![crate::backend::TurnDiffFile {
+        path: "src/a.rs".into(),
+        patch: String::new(),
+        additions: 2,
+        deletions: 1,
+        status: "modified".into(),
+    }]));
     // OpenCode's reply to that message: reasoning → tool → text → stop.
     let reply_ready = mock.external_reply(vec![
         Part::StepStart(StepStart),
@@ -1051,6 +1060,12 @@ async fn external_message_reply_renders_into_notification_card() {
         text.contains("· feat/ext"),
         "final footer must show the end branch: {}",
         text
+    );
+    // ADR-0087: the out-of-turn (external follow) ending resolves the same
+    // terminal index as a normal Turn — the shared seam, not only `finish`.
+    assert!(
+        text.contains("📝 本次改动 · 1 files · +2 −1"),
+        "the followed run's terminal card carries the settle index: {text}"
     );
 
     // No SECOND card was sent — the reply lives entirely on the notification.
@@ -1934,8 +1949,15 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
 
     // The guard's contract directly: a stale anchor must not finalize the
     // card its successor owns.
+    let flow = app.flow_handles();
     assert!(
-        !Turn::finalize_done_if_anchor(&app.cards_handle(), "ses_ext", &anchor(2_000_000)).await,
+        !Turn::finalize_done_if_anchor(
+            flow.backend.as_ref(),
+            &app.cards_handle(),
+            "ses_ext",
+            &anchor(2_000_000)
+        )
+        .await,
         "a stale anchor must not finalize the replacement card"
     );
 

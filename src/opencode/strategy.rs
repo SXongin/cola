@@ -120,8 +120,7 @@ pub(crate) trait GenerationStrategy: Send + Sync {
     /// it does not drift with later edits); `to` and `context` are the
     /// endpoint's other axes and are omitted from the query when `None`.
     /// `Ok(None)` means the generation has no session diff endpoint (V1), not
-    /// an empty diff — the caller then aggregates the Turn's tool metadata
-    /// (#800).
+    /// an empty diff. V1 has no Turn Diff at all (ADR-0087).
     async fn session_diff(
         &self,
         http: &Transport,

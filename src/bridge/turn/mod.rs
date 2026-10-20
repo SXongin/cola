@@ -78,7 +78,9 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
-use crate::backend::{MessageId, MessageRole, PromptSkill, SessionTranscript, TurnAnchor, TurnSettle};
+use crate::backend::{
+    MessageId, MessageRole, PromptSkill, SessionTranscript, TurnAnchor, TurnDiffStats, TurnSettle,
+};
 use crate::bridge::chain::{ChainRecord, EndingKey, RenderedCursor};
 use crate::bridge::handles::{CardsHandle, NoticeRules, RequestsHandle, SessionsHandle, TurnHandles};
 use crate::bridge::span;
@@ -120,6 +122,34 @@ pub(crate) const LONG_TASK_NOTICE_MS: u64 = 300_000;
 /// not a config key; tests inject a tiny value through the turn config's
 /// `completion_notice_delay_ms` atomic.
 pub(crate) const COMPLETION_NOTICE_DELAY_MS: u64 = 3_000;
+
+/// How long a terminal card's ONE settle read of its change index may take
+/// (ADR-0087). The read runs after the run settled and before the terminal
+/// flush, so it delays the ending by at most this bound; an abandoned read
+/// simply leaves no index.
+const TURN_DIFF_INDEX_TIMEOUT_MS: u64 = 5_000;
+
+/// The change index a TERMINAL card carries (spec #797, ticket #477;
+/// ADR-0087): one bounded `session.diff` read scoped to the Turn's anchor,
+/// resolved from the same source the complete-diff click reads. `None` for a
+/// non-terminal ending (a Waiting yield), an anchorless card, an empty answer
+/// or a failed read — the card then renders neither the line nor the button.
+///
+/// Shared by the in-Turn finalization and the out-of-turn ending application,
+/// so a Wake continuation or a followed external run gets the same index as a
+/// normal Turn's card.
+pub(super) async fn terminal_change_index(
+    backend: &dyn crate::backend::Backend,
+    session_id: &str,
+    disposition: &Disposition,
+    anchor: Option<&TurnAnchor>,
+) -> Option<TurnDiffStats> {
+    if !disposition.card_state().is_some_and(|state| state.is_terminal()) {
+        return None;
+    }
+    crate::bridge::turn_diff::settle_turn_diff_stats(backend, session_id, anchor, TURN_DIFF_INDEX_TIMEOUT_MS)
+        .await
+}
 
 /// What one drain read saw (ADR-0043).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1048,6 +1078,26 @@ impl Turn {
                     acc.error().unwrap_or("none"),
                 );
             }
+        }
+        // The Turn's change index (#477) is resolved HERE, once, from the same
+        // source the complete-diff click reads (ADR-0087). A non-terminal
+        // ending (a Waiting yield) shows no index and spends no read; an empty
+        // or failed answer leaves zero stats, so the card renders no entry and
+        // no dead button (issue #830).
+        let settle_anchor = final_transcript
+            .as_ref()
+            .and_then(|transcript| transcript.anchor_of_user(&self.cola_message_id))
+            .or(captured_anchor);
+        let stats = terminal_change_index(
+            handles.backend.as_ref(),
+            &self.session_id,
+            &disposition,
+            settle_anchor.as_ref(),
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
+            card.acc.set_turn_diff_stats(stats);
         }
         // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI
         // may have created or switched branches, or committed, so re-read the
@@ -3447,15 +3497,21 @@ impl Turn {
     /// endpoints below, so the successor guard (`false`: a successor owns the
     /// card — nothing is touched) and the flush are shared by every ending.
     pub(crate) async fn apply_disposition_if_anchor(
+        backend: &dyn crate::backend::Backend,
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
         disposition: &Disposition,
     ) -> bool {
+        // The external render's terminal card resolves the same index as the
+        // in-Turn and out-of-turn endings (ADR-0087), before the ownership-
+        // checked stamp.
+        let index = terminal_change_index(backend, session_id, disposition, Some(anchor)).await;
         let stamped = {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) if card.acc.turn_anchor() == Some(anchor) => {
+                    card.acc.set_turn_diff_stats(index.unwrap_or_default());
                     card.acc.apply_ending(disposition);
                     true
                 }
@@ -3475,22 +3531,24 @@ impl Turn {
     /// guard. Returns whether it finalized (false: a successor owns the card
     /// now — nothing is touched).
     pub(crate) async fn finalize_done_if_anchor(
+        backend: &dyn crate::backend::Backend,
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
     ) -> bool {
-        Self::apply_disposition_if_anchor(cards, session_id, anchor, &Disposition::Done).await
+        Self::apply_disposition_if_anchor(backend, cards, session_id, anchor, &Disposition::Done).await
     }
 
     /// The stop terminal under the same anchor guard as
     /// [`Self::finalize_done_if_anchor`] (#457): a `/stop` seen by a stale
     /// renderer must not stamp its successor's card.
     pub(crate) async fn finalize_stopped_if_anchor(
+        backend: &dyn crate::backend::Backend,
         cards: &CardsHandle,
         session_id: &str,
         anchor: &TurnAnchor,
     ) -> bool {
-        Self::apply_disposition_if_anchor(cards, session_id, anchor, &Disposition::Stopped).await
+        Self::apply_disposition_if_anchor(backend, cards, session_id, anchor, &Disposition::Stopped).await
     }
 
     /// Collect `session_id`'s Waiting card (ADR-0059, spec #405): restamp it
@@ -4836,7 +4894,7 @@ mod tests {
         // The ending lands on om_old, atomically with the ownership re-check;
         // the returned id is the card it landed on.
         let stamped = ownership::Ticket::TurnAnchor(turn_anchor(1))
-            .apply_ending_if_owned(&cards, "ses_test", &Disposition::Done)
+            .apply_ending_if_owned(&cards, "ses_test", &Disposition::Done, None)
             .await;
         assert_eq!(
             stamped.as_deref(),
@@ -5198,5 +5256,72 @@ mod tests {
                 RetryDecision::Reuse(reused) if reused == "msg_cola_x"
             ));
         }
+    }
+
+    /// A Waiting yield is not a terminal card, so the shared settle helper
+    /// spends no `session.diff` read (ADR-0087): the index will be resolved on
+    /// the resumed run's own terminal ending.
+    #[tokio::test]
+    async fn a_waiting_ending_spends_no_change_index_read() {
+        let mut backend = MockBackend::new(Vec::new());
+        backend.given_session_diff(crate::backend::TurnDiff(vec![crate::backend::TurnDiffFile {
+            path: "src/a.rs".into(),
+            patch: String::new(),
+            additions: 1,
+            deletions: 0,
+            status: "modified".into(),
+        }]));
+        let anchor = TurnAnchor {
+            message_id: MessageId::new("msg_user"),
+            created_ms: 1_000,
+        };
+
+        let index = terminal_change_index(&backend, "ses_test", &Disposition::Waiting, Some(&anchor)).await;
+
+        assert_eq!(index, None, "a yield carries no terminal index");
+        assert!(
+            backend.session_diff_calls.lock().await.is_empty(),
+            "a non-terminal ending must not pay for the read"
+        );
+    }
+
+    /// The shared settle helper is what the out-of-turn endings use too: a
+    /// Done ending resolves the authoritative diff at `context = 0`.
+    #[tokio::test]
+    async fn a_terminal_ending_resolves_the_shared_change_index() {
+        let mut backend = MockBackend::new(Vec::new());
+        backend.given_session_diff(crate::backend::TurnDiff(vec![crate::backend::TurnDiffFile {
+            path: "src/a.rs".into(),
+            patch: String::new(),
+            additions: 2,
+            deletions: 1,
+            status: "modified".into(),
+        }]));
+        let anchor = TurnAnchor {
+            message_id: MessageId::new("msg_user"),
+            created_ms: 1_000,
+        };
+
+        let index = terminal_change_index(&backend, "ses_test", &Disposition::Done, Some(&anchor))
+            .await
+            .expect("a non-empty answer is the index");
+
+        assert_eq!(
+            index,
+            TurnDiffStats {
+                files: 1,
+                additions: 2,
+                deletions: 1,
+            }
+        );
+        assert_eq!(
+            backend.session_diff_calls.lock().await.as_slice(),
+            &[(
+                "ses_test".to_string(),
+                Some("msg_user".to_string()),
+                None,
+                Some(0)
+            )]
+        );
     }
 }
