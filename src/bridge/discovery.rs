@@ -874,11 +874,13 @@ enum ServiceStartFailure {
     /// once the probe classifies.
     Attach(String),
     /// The attempt never registered and could NOT be confirmed exited: it
-    /// ignored SIGTERM and survived SIGKILL. Deliberately NOT a fallback — a
-    /// possibly-live service on the store means raising an Owned Server beside
-    /// it would put two servers on one store (ADR-0013, ADR-0085), which is
-    /// the same hazard as [`Self::Attach`]. cola stays serverless and the
-    /// reconnect loop attaches once the service registers.
+    /// ignored SIGTERM and survived SIGKILL. Also raised when a contender lost
+    /// the rendezvous to a live incumbent but could not be stopped before that
+    /// incumbent was adopted. Deliberately NOT a fallback — a possibly-live
+    /// service on the store means raising an Owned Server beside it would put
+    /// two servers on one store (ADR-0013, ADR-0085), which is the same hazard
+    /// as [`Self::Attach`]. cola stays serverless and the reconnect loop
+    /// attaches once the service registers.
     NotReaped { child_pid: i32 },
 }
 
@@ -1197,13 +1199,17 @@ impl ServiceAttempt for RealServiceAttempt {
 /// The daemon writes `service.json` when it starts listening, so the wait is
 /// for a registration that names a LIVE `serve --service` — a stale file (dead
 /// or recycled pid) keeps the wait going rather than being attached to. A
-/// contender that exits because an incumbent already serves the machine is
-/// accepted: the incumbent's registration is live, which is all cola needs. An
-/// attempt that never registers is terminated (SIGTERM, a bounded wait, then
-/// SIGKILL) and reported as a failure: [`ServiceStartFailure::NoRegistration`]
-/// once it is confirmed exited — which is what sends the caller to the
-/// `serve --port` fallback — and [`ServiceStartFailure::NotReaped`] when it is
-/// not, so no fallback is raised beside a possibly-live service.
+/// contender that loses the rendezvous to an incumbent already serving the
+/// machine is accepted: the incumbent's registration is live, which is all cola
+/// needs. Losing does not mean EXITED, though — a contender can still be
+/// starting when the first poll sees the incumbent's file — so it is stopped
+/// (SIGTERM, a bounded wait, then SIGKILL) before the incumbent is adopted; two
+/// services must never write the one store (ADR-0013, ADR-0085). An attempt
+/// that never registers is stopped the same way and reported as a failure:
+/// [`ServiceStartFailure::NoRegistration`] once it is confirmed exited — which
+/// is what sends the caller to the `serve --port` fallback — and
+/// [`ServiceStartFailure::NotReaped`] when it is not, so no fallback is raised
+/// beside a possibly-live service.
 ///
 /// A CANCELLED wait (the reconnect task dropped at shutdown) is not a normal
 /// exit: the [`ServiceAttemptGuard`] then reaps the attempt on drop, so a
@@ -1224,11 +1230,30 @@ async fn start_shared_service(
     let mut exited_at: Option<tokio::time::Instant> = None;
     loop {
         if let Some(candidate) = live_service_registration(host, registration_path) {
-            // The attempt itself may be the exited contender that found an
-            // incumbent, so collect it before the handle is dropped — an
-            // unreaped child would outlive the start as a zombie.
-            attempt.reap_and_disarm();
-            return Ok(candidate);
+            // A registration naming OUR OWN attempt is the daemon that just
+            // came up: adopt it and leave it running.
+            if candidate.pid == child_pid {
+                attempt.reap_and_disarm();
+                return Ok(candidate);
+            }
+            // Anything else is an incumbent — another client's or a manual
+            // `serve --service` — whose live registration is all cola needs.
+            // Our contender must be GONE before cola attaches, though: it can
+            // still be starting when the first poll sees the incumbent's file,
+            // and a second service on the store is the two-server hazard
+            // (ADR-0013, ADR-0085). Stop it the way a failed attempt is
+            // stopped, and adopt only once it is confirmed exited.
+            let gone = reap_failed_service_attempt(host, attempt.attempt_mut()).await;
+            attempt.disarm();
+            return if gone {
+                Ok(candidate)
+            } else {
+                // The contender ignored SIGTERM and survived SIGKILL: the
+                // incumbent is usable, but adopting it beside a contender cola
+                // cannot stop would hide the hazard, and the `serve --port`
+                // fallback would raise a third server. Stay serverless.
+                Err(ServiceStartFailure::NotReaped { child_pid })
+            };
         }
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1266,11 +1291,12 @@ fn is_our_service_attempt(host: &dyn ServiceHost, pid: i32) -> bool {
     host.alive(pid) && host.cmd(pid).is_some_and(|args| is_opencode_service_cmd(&args))
 }
 
-/// Terminate a service attempt that never registered: SIGTERM, a bounded wait,
-/// then SIGKILL. Nothing is sent unless the pid is still a live
-/// `opencode ... serve --service` — an exited pid may have been recycled, and
-/// cola must never kill an unrelated process (the same guard the Owned Server
-/// path applies before it kills).
+/// Terminate a service attempt that must not outlive the start: it never
+/// registered, or it lost the rendezvous to a live incumbent that cola is about
+/// to adopt. SIGTERM, a bounded wait, then SIGKILL. Nothing is sent unless the
+/// pid is still a live `opencode ... serve --service` — an exited pid may have
+/// been recycled, and cola must never kill an unrelated process (the same guard
+/// the Owned Server path applies before it kills).
 ///
 /// Returns whether the attempt is CONFIRMED gone (exited and waited out, or no
 /// longer a live `serve --service`). `false` means cola cannot rule out a live
@@ -1369,8 +1395,9 @@ fn reap_failed_service_attempt_blocking(host: &dyn ServiceHost, attempt: &mut dy
 /// wait it out; without this guard a cancelled start (the reconnect task
 /// dropped at shutdown) would drop the handle and leave a service child that
 /// never registered alive (ticket #809). Every normal exit disarms the guard —
-/// the timeout path reaps through [`reap_failed_service_attempt`], the success
-/// path collects an exited contender — so only cancellation reaches `Drop`.
+/// the timeout and the lost-rendezvous paths reap through
+/// [`reap_failed_service_attempt`], the adopted-daemon path leaves the attempt
+/// it just adopted — so only cancellation reaches `Drop`.
 struct ServiceAttemptGuard<'h> {
     host: &'h dyn ServiceHost,
     attempt: Option<Box<dyn ServiceAttempt>>,
@@ -1395,7 +1422,8 @@ impl<'h> ServiceAttemptGuard<'h> {
     }
 
     /// Wait the attempt out and stop `Drop` from reaping it — the success path
-    /// (the attempt is the adopted daemon or an exited contender).
+    /// where the attempt IS the adopted daemon (the registration names it), so
+    /// the child must keep running while the handle no longer reaps it.
     fn reap_and_disarm(&mut self) -> bool {
         let reaped = self.attempt_mut().try_reap();
         self.armed = false;
@@ -3821,6 +3849,59 @@ mod tests {
         // The adopted attempt is waited out, not dropped: a child left
         // unreaped would linger as a zombie for as long as cola runs.
         assert_eq!(host.calls(), vec!["spawn", "reap 4242"]);
+    }
+
+    /// The incumbent can be visible on the FIRST poll, before the contender
+    /// has noticed it and exited. Accepting it then would leave the contender
+    /// running beside the incumbent — two services writing one store
+    /// (ADR-0013, ADR-0085). The contender is stopped first, and only then is
+    /// the incumbent adopted (#814).
+    #[tokio::test(start_paused = true)]
+    async fn an_incumbent_is_adopted_only_after_a_live_contender_is_stopped() {
+        let host = FakeServiceHost::new()
+            .registration(&service_registration_json(999, 49374, "incumbent-pw"))
+            // The contender is still alive and starting when the incumbent's
+            // registration is first read.
+            .live(4242, &["opencode", "serve", "--service"])
+            .dies_on_terminate()
+            .live(999, &["opencode", "serve", "--service"]);
+        let candidate = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect("the incumbent is adopted once the contender is gone");
+
+        assert_eq!(candidate.pid, 999);
+        assert_eq!(
+            host.calls(),
+            vec!["spawn", "terminate 4242", "reap 4242"],
+            "the live contender is stopped and waited out before adoption"
+        );
+    }
+
+    /// A contender cola cannot stop must not be silently left beside the
+    /// incumbent: adopting anyway would hide the two-server hazard, and
+    /// `serve --port` would add a third server. It reports `NotReaped`, which
+    /// is deliberately not fallback-eligible (#814).
+    #[tokio::test(start_paused = true)]
+    async fn an_unstoppable_contender_is_not_hidden_behind_the_incumbent() {
+        let host = FakeServiceHost::new()
+            .registration(&service_registration_json(999, 49374, "incumbent-pw"))
+            .live(4242, &["opencode", "serve", "--service"])
+            .survives_kill()
+            .live(999, &["opencode", "serve", "--service"]);
+        let failure = start_shared_service(
+            &host,
+            std::path::Path::new("/state/opencode/service.json"),
+            std::path::Path::new("/log/opencode-service.log"),
+        )
+        .await
+        .expect_err("a contender cola cannot stop is not hidden");
+
+        assert_eq!(failure, ServiceStartFailure::NotReaped { child_pid: 4242 });
+        assert_eq!(host.calls(), vec!["spawn", "terminate 4242", "kill 4242"]);
     }
 
     /// No registration in time: the attempt is terminated (SIGTERM) and the
