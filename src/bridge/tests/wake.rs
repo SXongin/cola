@@ -427,6 +427,20 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     let _wd = test_work_dir();
     let waiting = yielding_shell_transcript();
     let (dir, app, backend, platform) = scripted_app(vec![waiting], Some(SessionStatus::Idle)).await;
+    // ADR-0087: the in-place resume's terminal card reads the same
+    // `session.diff` index a normal Turn does — the shared out-of-turn seam.
+    backend.session_diff_available.store(true, Ordering::SeqCst);
+    *backend
+        .session_diff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(crate::backend::TurnDiff(vec![crate::backend::TurnDiffFile {
+            path: "src/a.rs".into(),
+            patch: String::new(),
+            additions: 2,
+            deletions: 1,
+            status: "modified".into(),
+        }]));
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下 CI"))
         .await
@@ -501,6 +515,12 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     assert!(
         card_text(&last).contains("📁"),
         "the resumed card keeps the Turn Footer: {last}"
+    );
+    // ADR-0087: the out-of-turn (Wake) ending resolves the same terminal index
+    // as a normal Turn — the shared seam, not only `finish`.
+    assert!(
+        card_text(&last).contains("📝 本次改动 · 1 files · +2 −1"),
+        "the resumed terminal card carries the settle index: {last}"
     );
 
     // The header cycled waiting → 🔄 resuming → ✅ on that one card: the

@@ -151,4 +151,31 @@ mod tests {
         );
         assert!(backend.session_diff_calls.lock().await.is_empty());
     }
+
+    /// A hung read is abandoned at the caller's bound and leaves no index; the
+    /// terminal card must not wait on an unhealthy server.
+    #[tokio::test]
+    async fn a_hung_read_times_out_to_no_index() {
+        let mut backend = MockBackend::new(Vec::new());
+        backend.given_session_diff(TurnDiff(vec![diff_file("src/a.rs", 1, 0)]));
+        backend
+            .hang_session_diff
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        assert!(
+            settle_turn_diff_stats(&backend, "ses_1", Some(&anchor()), 20)
+                .await
+                .is_none()
+        );
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(10),
+            "the read was actually awaited"
+        );
+        assert_eq!(
+            backend.session_diff_calls.lock().await.len(),
+            1,
+            "the attempt is recorded before the timeout"
+        );
+    }
 }

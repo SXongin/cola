@@ -1501,6 +1501,9 @@ pub struct MockBackend {
     /// for the transient/restart/unanswerable read (ADR-0087). The call is still
     /// recorded, so a test can prove the read happened.
     pub fail_session_diff: std::sync::atomic::AtomicBool,
+    /// When set, `session_diff` never resolves, standing in for a hung read
+    /// (ADR-0087's timeout arm). The call is recorded first.
+    pub hang_session_diff: std::sync::atomic::AtomicBool,
     /// Session ids whose `transcript` read fails with a 500 (spec #501): the
     /// child-read failure the ledger's activity carry-over pins — a failed
     /// gather leaves the row's last successful fragment in place, its age
@@ -1834,6 +1837,7 @@ impl MockBackend {
             session_diff: Arc::new(std::sync::Mutex::new(None)),
             session_diff_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_session_diff: std::sync::atomic::AtomicBool::new(false),
+            hang_session_diff: std::sync::atomic::AtomicBool::new(false),
             fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             hang_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             fail_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2914,6 +2918,9 @@ impl crate::backend::Backend for MockBackend {
             to.map(str::to_string),
             context,
         ));
+        if self.hang_session_diff.load(std::sync::atomic::Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
         if self.fail_session_diff.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(crate::error::BridgeError::OpenCode(
                 "session diff failed: 503".to_string(),

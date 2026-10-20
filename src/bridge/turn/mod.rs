@@ -1096,7 +1096,12 @@ impl Turn {
         )
         .await
         .unwrap_or_default();
-        if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id) {
+        // Stamp under the anchor guard: the read is an await, so a successor
+        // that replaced the card meanwhile must not inherit this Turn's counts
+        // (the same rule the ownership-checked ending paths apply).
+        if let Some(card) = handles.cards.cards.lock().await.get_mut(&self.session_id)
+            && card.acc.turn_anchor() == settle_anchor.as_ref()
+        {
             card.acc.set_turn_diff_stats(stats);
         }
         // Refresh the Turn Footer's work context at turn end (ADR-0019): the AI

@@ -567,9 +567,35 @@ async fn the_terminal_card_index_is_the_settle_session_diff_read() {
 #[tokio::test]
 async fn an_empty_settle_read_leaves_the_terminal_card_without_an_index() {
     let _wd = test_work_dir();
+    // The transcript records a settled edit, but the authority says empty:
+    // #830's "tools recorded something, the net is zero" shape. The card must
+    // follow the authority (no index), never the transcript.
+    let patch = "Index: src/a.rs\n===\n--- src/a.rs\n+++ src/a.rs\n@@ -1 +1 @@\n-old\n+new\n";
+    let mut edit = crate::bridge::test_support::tool_part(
+        "edit",
+        "call_edit",
+        crate::backend::ToolStatus::Completed,
+        serde_json::json!({ "filePath": "src/a.rs" }),
+        "ok",
+    );
+    if let crate::backend::Part::Tool(call) = &mut edit {
+        call.metadata = Some(serde_json::json!({ "diff": patch }));
+    }
+    let assistant = crate::bridge::test_support::typed_message(
+        "msg_assistant",
+        crate::backend::MessageRole::Assistant,
+        Some(2_000),
+        vec![
+            edit,
+            crate::bridge::test_support::text_part("完成。"),
+            crate::backend::Part::StepFinish(crate::backend::StepFinish {
+                reason: crate::backend::FinishReason::Stop,
+            }),
+        ],
+    );
     let timeline = vec![
         super::drain::user("msg_cola_anchor", 1_000, "第一条消息"),
-        super::drain::assistant(2_000, "完成。"),
+        assistant,
     ];
     let (_dir, app, backend, platform) = super::drain::scripted_app(
         vec![SessionTranscript::new(timeline)],
@@ -694,5 +720,41 @@ async fn a_failed_settle_read_leaves_the_terminal_card_without_an_index() {
         backend.session_diff_calls.lock().await.len(),
         1,
         "the settle read was attempted once"
+    );
+}
+
+/// V1 has no `session.diff` endpoint, so its terminal card renders no index
+/// and no button (ADR-0087). The settle read is still attempted once (the mock
+/// records it) and answers `Ok(None)`.
+#[tokio::test]
+async fn a_v1_turn_terminates_without_an_index() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        super::drain::user("msg_cola_anchor", 1_000, "第一条消息"),
+        super::drain::assistant(2_000, "完成。"),
+    ];
+    let (_dir, app, backend, platform) = super::drain::scripted_app(
+        vec![SessionTranscript::new(timeline)],
+        Some(crate::opencode::types::SessionStatus::Idle),
+    )
+    .await;
+
+    let turn = super::drain::spawn_turn(&app, super::drain::ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn ends")
+        .expect("the turn task does not panic")
+        .expect("the turn succeeded");
+
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.updated_cards().await);
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("📝 本次改动")),
+        "a V1 terminal card renders no index: {cards:?}"
+    );
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        1,
+        "the settle read was attempted; V1 answers Ok(None)"
     );
 }
