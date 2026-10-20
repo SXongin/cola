@@ -12,6 +12,7 @@
 
 use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
+use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
 
 fn thread() -> ThreadKey {
     ThreadKey::new("chat_1".into(), "chat_1".into())
@@ -72,15 +73,34 @@ fn canonical(path: &std::path::Path) -> String {
         .to_string()
 }
 
-/// The one card the command replied with.
-#[cfg(unix)]
-async fn first_card(platform: &RecordingPlatform) -> serde_json::Value {
+/// The card's settled state: the last in-place update. Since #823 the reply is
+/// the live 「运行中」 card and the settled exit code always arrives by PATCH;
+/// the reply is only a defensive fallback for a path that wrote no update.
+async fn settled_card(platform: &RecordingPlatform) -> serde_json::Value {
+    if let Some(card) = platform.updated_cards().await.last() {
+        return card.clone();
+    }
     platform
         .replied_cards()
         .await
         .into_iter()
-        .next()
+        .last()
         .expect("the command replies with a Terminal Card")
+}
+
+/// The body of the card's fenced output element (`**输出**` → the fence body),
+/// so a budget assertion measures the tail alone rather than the whole card.
+#[cfg(unix)]
+fn output_body(card: &serde_json::Value) -> String {
+    let content = card_texts(card)
+        .into_iter()
+        .find(|content| content.starts_with("**输出**"))
+        .expect("the card carries an output element");
+    let fenced = content
+        .strip_prefix("**输出**\n")
+        .expect("the output element starts with its label");
+    let body = fenced.split_once('\n').expect("the fence has a body line").1;
+    body.rsplit_once('\n').expect("the fence closes").0.to_string()
 }
 
 #[cfg(unix)]
@@ -100,7 +120,7 @@ async fn run_echo_replies_with_a_terminal_card_naming_cwd_command_output_exit_an
 
     let cards = platform.replied_cards().await;
     assert_eq!(cards.len(), 1, "exactly one Terminal Card: {cards:?}");
-    let text = card_text(&cards[0]);
+    let text = card_text(&settled_card(&platform).await);
     assert!(
         text.contains(&canonical(proj.path())),
         "the card names the resolved cwd: {text}"
@@ -137,7 +157,7 @@ async fn a_failing_command_settles_with_its_exit_code_and_stderr() {
     )
     .await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("退出码 7"), "the real exit code: {text}");
     assert!(text.contains("err-line"), "stderr is shown: {text}");
     assert!(text.contains("out-line"), "stdout is shown: {text}");
@@ -169,7 +189,7 @@ async fn a_pending_sessions_directory_is_the_cwd() {
     .await;
     send_command_in(&app, "/run pwd", key, "msg_pending_run", ConversationKind::P2p).await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     let resolved = canonical(proj.path());
     assert!(text.contains(&resolved), "the card names the pending cwd: {text}");
     assert!(
@@ -192,7 +212,7 @@ async fn the_default_session_directory_is_the_cwd_without_a_session() {
 
     send_command(&app, "/run pwd", "msg_default_run").await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     let resolved = canonical(fallback.path());
     assert!(text.contains(&resolved), "the card names the default cwd: {text}");
 }
@@ -218,7 +238,7 @@ async fn stdin_is_closed_so_a_reading_command_exits_immediately() {
         ConversationKind::P2p,
     )
     .await;
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(
         text.contains("/dev/null"),
         "the child's stdin is /dev/null: {text}"
@@ -233,8 +253,7 @@ async fn stdin_is_closed_so_a_reading_command_exits_immediately() {
     )
     .await
     .expect("a command reading stdin exits instead of hanging");
-    let cards = platform.replied_cards().await;
-    let text = card_text(cards.last().expect("cat's card"));
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("退出码 0"), "cat ends on EOF: {text}");
 }
 
@@ -262,7 +281,7 @@ async fn the_terminal_log_lives_in_a_0700_directory_as_a_0600_file() {
         ConversationKind::P2p,
     )
     .await;
-    first_card(&platform).await;
+    settled_card(&platform).await;
 
     let dir = app
         .core
@@ -312,7 +331,7 @@ async fn the_child_leads_its_own_process_group() {
     )
     .await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(
         text.contains("退出码 0"),
         "the child is its own process-group leader: {text}"
@@ -363,9 +382,14 @@ async fn the_child_environment_scrubs_cola_credentials() {
         .await;
     }
 
-    let cards = platform.replied_cards().await;
-    assert_eq!(cards.len(), CREDENTIAL_ENV.len(), "one card per probe");
-    for (card, name) in cards.iter().zip(CREDENTIAL_ENV) {
+    let settled: Vec<_> = platform
+        .updated_cards()
+        .await
+        .into_iter()
+        .filter(|card| card_text(card).contains("退出码"))
+        .collect();
+    assert_eq!(settled.len(), CREDENTIAL_ENV.len(), "one settled card per probe");
+    for (card, name) in settled.iter().zip(CREDENTIAL_ENV) {
         let text = card_text(card);
         assert!(
             text.contains("退出码 1"),
@@ -380,8 +404,9 @@ async fn the_child_environment_scrubs_cola_credentials() {
 
 /// The card family's 3,000-character per-element budget (ADR-0086 §4): a body
 /// of nothing but backticks grows the fence with it, so this is exactly where
-/// clipping the body before fencing would overrun the element. The output is
-/// cut and the card says so.
+/// clipping the body before fencing would overrun the element. #823's per-line
+/// cap now cuts the single long line first (with its visible marker), and every
+/// element still stays inside the budget.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_backtick_heavy_output_stays_within_the_element_budget() {
@@ -393,7 +418,8 @@ async fn a_backtick_heavy_output_stays_within_the_element_budget() {
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
-    // 3,000 backticks: past the tail budget, then fence-sized by `fenced_code`.
+    // 3,000 backticks on one line: past the tail and per-line budgets, and a
+    // fence-sized body if it reached `fenced_code` whole.
     send_command_in(
         &app,
         "/run printf '%3000s' | tr ' ' '\\140'",
@@ -403,7 +429,7 @@ async fn a_backtick_heavy_output_stays_within_the_element_budget() {
     )
     .await;
 
-    let card = first_card(&platform).await;
+    let card = settled_card(&platform).await;
     let texts = card_texts(&card);
     for text in &texts {
         assert!(
@@ -413,7 +439,7 @@ async fn a_backtick_heavy_output_stays_within_the_element_budget() {
         );
     }
     assert!(
-        texts.join("\n").contains("输出过长"),
+        texts.join("\n").contains("已截断"),
         "a cut display says so: {texts:?}"
     );
 }
@@ -511,7 +537,7 @@ async fn run_usage_and_flag_forms_are_answered_without_spawning() {
         ConversationKind::P2p,
     )
     .await;
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("capped"), "the capped form runs: {text}");
 
     send_command_in(
@@ -522,8 +548,7 @@ async fn run_usage_and_flag_forms_are_answered_without_spawning() {
         ConversationKind::P2p,
     )
     .await;
-    let cards = platform.replied_cards().await;
-    let text = card_text(cards.last().expect("the terminator form's card"));
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("terminator"), "the `--` form runs: {text}");
 }
 
@@ -553,7 +578,7 @@ async fn run_works_with_the_server_down_and_never_contacts_it() {
     )
     .await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("offline"), "the command ran with no server: {text}");
     assert!(text.contains("退出码 0"), "and settled normally: {text}");
     assert!(prompts.lock().await.is_empty(), "no prompt reached the Backend");
@@ -579,7 +604,7 @@ async fn a_bang_prefixed_message_runs_the_remainder_as_a_terminal_command() {
 
     let cards = platform.replied_cards().await;
     assert_eq!(cards.len(), 1, "exactly one Terminal Card: {cards:?}");
-    let text = card_text(&cards[0]);
+    let text = card_text(&settled_card(&platform).await);
     assert!(
         text.contains(&canonical(proj.path())),
         "the card names the resolved cwd: {text}"
@@ -681,7 +706,7 @@ async fn a_mention_stripped_or_indented_bang_still_qualifies() {
     ))
     .await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("mentioned"), "the stripped `!` command ran: {text}");
     assert!(text.contains("退出码 0"), "and settled normally: {text}");
 
@@ -693,8 +718,7 @@ async fn a_mention_stripped_or_indented_bang_still_qualifies() {
         ConversationKind::P2p,
     )
     .await;
-    let cards = platform.replied_cards().await;
-    let text = card_text(cards.last().expect("the indented form's card"));
+    let text = card_text(&settled_card(&platform).await);
     assert!(text.contains("indented"), "a leading-whitespace `!` runs: {text}");
     assert!(prompts.lock().await.is_empty(), "neither form became a prompt");
 }
@@ -731,7 +755,7 @@ async fn a_bang_command_with_a_hash_token_loads_no_skill() {
     )
     .await;
 
-    let text = card_text(&first_card(&platform).await);
+    let text = card_text(&settled_card(&platform).await);
     assert!(
         text.contains("#caveman"),
         "the literal `#caveman` is the command's argument: {text}"
@@ -813,4 +837,227 @@ async fn help_lists_run_and_documents_both_entry_points() {
             "`/help run` must document {expected:?}: {help}"
         );
     }
+}
+
+/// #823: the card is posted live and patched on the render cadence while the
+/// command runs; the settling write is last and nothing follows it.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_card_is_live_while_the_command_runs_and_settles_last() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+
+    send_command_in(
+        &app,
+        "/run printf 'early-token-823\\n'; sleep 1; printf 'late-token-823\\n'",
+        key,
+        "msg_live",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let replies = platform.replied_cards().await;
+    assert_eq!(replies.len(), 1, "one Terminal Card: {replies:?}");
+    let live = card_text(&replies[0]);
+    assert!(
+        live.contains("运行中"),
+        "the first reply is the live card: {live}"
+    );
+    assert!(
+        live.contains("等待输出"),
+        "the live card starts before the child has written: {live}"
+    );
+
+    let updates = platform.updated_cards().await;
+    assert!(
+        updates.iter().any(|card| {
+            let text = card_text(card);
+            text.contains("运行中") && text.contains("early-token-823")
+        }),
+        "a live patch shows output written before the run settled: {updates:?}"
+    );
+    let settled = card_text(updates.last().expect("a settling write"));
+    assert!(settled.contains("退出码 0"), "the last write settles: {settled}");
+    assert!(
+        settled.contains("late-token-823"),
+        "it holds the full output: {settled}"
+    );
+    assert!(
+        !settled.contains("运行中"),
+        "the last write is not live: {settled}"
+    );
+
+    // The loop stopped on settle: no write follows the settling write.
+    let count = platform.updated_cards().await.len();
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        count,
+        "no patch follows the settling write"
+    );
+}
+
+/// #823: `\r` is an overwrite, so a progress line collapses to its last frame
+/// instead of carrying every frame the command wrote.
+#[cfg(unix)]
+#[tokio::test]
+async fn carriage_return_frames_collapse_to_the_last_frame() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'frame-aaa-823\\rframe-bbb-823\\rfinal-frame-823\\nplain-line-823\\n'; sleep 0.2",
+        key,
+        "msg_cr",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let body = output_body(&settled_card(&platform).await);
+    assert!(
+        body.contains("final-frame-823"),
+        "the last frame survives: {body}"
+    );
+    assert!(body.contains("plain-line-823"), "the next line survives: {body}");
+    assert!(!body.contains("frame-aaa-823"), "earlier frames are gone: {body}");
+    assert!(
+        !body.contains("frame-bbb-823"),
+        "only the last frame remains: {body}"
+    );
+    assert_eq!(
+        body.matches("final-frame-823").count(),
+        1,
+        "the last frame appears once: {body}"
+    );
+}
+
+/// #823: ANSI and control sequences are stripped from the display and kept
+/// byte-for-byte in the Terminal Log.
+#[cfg(unix)]
+#[tokio::test]
+async fn ansi_is_stripped_from_the_card_and_kept_in_the_log() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "ansi-823-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '\\033[31m{marker}\\033[0m\\a\\n'; sleep 0.2"),
+        key,
+        "msg_ansi",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let body = output_body(&settled_card(&platform).await);
+    assert!(body.contains(marker), "the text itself renders: {body}");
+    assert!(!body.contains('\u{1b}'), "no ESC reaches the display: {body:?}");
+    assert!(
+        !body.contains("[31m"),
+        "no CSI body reaches the display: {body:?}"
+    );
+    assert!(!body.contains('\u{7}'), "no BEL reaches the display: {body:?}");
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = find_log_containing(&dir, marker);
+    let raw = std::fs::read(&log).expect("read the Terminal Log");
+    assert!(
+        raw.windows(5).any(|w| w == b"\x1b[31m"),
+        "the log keeps the escape sequence unchanged"
+    );
+    assert!(raw.contains(&0x07), "the log keeps the control byte unchanged");
+}
+
+/// #823: one very long line is capped, with a marker that says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_line_past_the_cap_is_truncated_with_a_visible_marker() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'begin-823-'; head -c 4000 /dev/zero | tr '\\0' x; printf '%s\\n' '-end-823'; sleep 0.2",
+        key,
+        "msg_long_line",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let card = settled_card(&platform).await;
+    let body = output_body(&card);
+    assert!(body.contains("begin-823-"), "the line's head is shown: {body}");
+    assert!(body.contains("本行过长"), "the marker is visible: {body}");
+    assert!(
+        !body.contains("-end-823"),
+        "the long line is actually cut: {body}"
+    );
+    assert!(
+        body.chars().count() <= TERMINAL_TAIL_CHARS,
+        "the capped line stays inside the tail budget: {} chars",
+        body.chars().count()
+    );
+}
+
+/// #823: when the tail budget cuts content the card says so, and it keeps the
+/// NEWEST output within the 2,500-character budget.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_tail_keeps_the_newest_output_and_says_when_it_cut_content() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run for i in $(seq -w 1 900); do echo \"line-$i-823\"; done; sleep 0.2",
+        key,
+        "msg_budget",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let card = settled_card(&platform).await;
+    let text = card_text(&card);
+    assert!(text.contains("line-900-823"), "the newest line survives: {text}");
+    assert!(!text.contains("line-001-823"), "the oldest line is cut: {text}");
+    assert!(text.contains("输出过长"), "the cut is stated explicitly: {text}");
+    let body = output_body(&card);
+    assert!(
+        body.chars().count() <= TERMINAL_TAIL_CHARS,
+        "the tail stays within its budget: {} chars",
+        body.chars().count()
+    );
 }
