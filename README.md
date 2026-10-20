@@ -1,57 +1,57 @@
 # cola
 
 [![CI](https://github.com/SXongin/cola/actions/workflows/ci.yml/badge.svg)](https://github.com/SXongin/cola/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/SXongin/cola.svg)](https://github.com/SXongin/cola/releases/latest)
+[![crates.io](https://img.shields.io/crates/v/colark.svg)](https://crates.io/crates/colark)
 [![Codecov](https://codecov.io/gh/SXongin/cola/graph/badge.svg?branch=main)](https://codecov.io/gh/SXongin/cola)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/SXongin/cola/badge)](https://securityscorecards.dev/viewer/?uri=github.com/SXongin/cola)
-[![crates.io](https://img.shields.io/crates/v/colark.svg)](https://crates.io/crates/colark)
-[![Downloads](https://img.shields.io/crates/d/colark.svg)](https://crates.io/crates/colark)
-[![Release](https://img.shields.io/github/v/release/SXongin/cola.svg)](https://github.com/SXongin/cola/releases/latest)
 [![Platforms](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey)](#1-install)
-[![Last commit](https://img.shields.io/github/last-commit/SXongin/cola)](https://github.com/SXongin/cola/commits/main)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A bridge bot that brings the [OpenCode](https://opencode.ai) AI coding experience
-into [Feishu](https://www.feishu.cn). You chat with the bot in Feishu; cola maps
-Feishu threads to OpenCode sessions, streams the AI's reasoning/tools/answers
-onto interactive cards, and surfaces permission and question requests as
-tap-to-answer cards.
+**Your coding agent, in Feishu.** Send the bot a message from your phone — the AI
+edits code on your machine, and you watch, steer and approve every step without
+opening a terminal.
+
+cola bridges [Feishu](https://www.feishu.cn) and [OpenCode](https://opencode.ai):
+each Feishu thread is an OpenCode session, each turn streams onto one live card,
+and every permission request becomes a button.
+
+<!--
+Hero media — drop the recorded GIF in and uncomment (see docs/images/README.md
+for the shot list and naming). Keep the width so the card is legible on desktop
+without dominating the page.
+<p align="center">
+  <img src="docs/images/turn-card.gif" width="340"
+       alt="A cola turn in Feishu: reasoning and tool calls stream into one card, then a permission card is approved with one tap">
+</p>
+-->
 
 **中文文档**: [用户使用手册（简体中文）](docs/user-guide.zh-CN.md)。
 
-<!-- TODO(screenshots): add Feishu screenshots here when ready. Suggested
-     set — a turn card mid-stream, a permission card, a question card, the
-     todo panel. Save them under docs/images/ and reference by relative path. -->
+## What it feels like
 
-## Why cola
+> **You** · 把 pollers 里那张卡的 chat 映射修一下
+>
+> **cola** · ⏳ 思考中 · `read pollers.rs` · `edit pollers.rs` · 14s
+> ⚠️ 要运行 `cargo test` 吗？　**［允许］［总是允许］［拒绝］**
+>
+> **You** · （点「允许」）
+>
+> **cola** · ✅ 改完了 · 2 个文件 · **+18 −6**　**［🔍 查看完整改动］**
 
-- **A coding agent in your chat app.** Drive OpenCode from Feishu — phone or
-  desktop — instead of a terminal; each Feishu thread maps to a session.
-- **One card per turn, updated live.** Reasoning, tool calls and the answer
-  stream onto a single interactive card with collapsible panels, a phase timer
-  and a live todo panel, so a slow turn never looks like a dead one.
-- **Decisions are two taps.** Permission requests render as
-  Allow / Deny / Always buttons right on the card, and questions become a
-  multi-select card that accepts custom answers.
-- **Send a screenshot.** Images in a message or a quoted reply are attached to
-  the prompt for vision-capable models.
-- **Your sessions are shared.** cola attaches to the same OpenCode server and
-  store as OpenChamber and the CLI, so sessions started anywhere can be adopted
-  (`/switch`, with a snapshot of what's pending) and messages sent from another
-  client are surfaced back into Feishu.
-- **OpenCode 1 and 2.** cola attaches to either generation — 1.18.x (V1) or
-  2.0.x (V2) — detects which protocol the server speaks at attach, and records
-  the evidence in the log; there is nothing to configure.
-- **A topic per task.** `/topic <dir>` opens a Feishu topic whose first message
-  creates the session in that project, with a cover card that keeps the title,
-  project, branch and model visible and up to date.
-- **Steer without restarting.** `/model`, `/agent`, `/think` and `/autoaccept`
-  are per-session overrides applied to the next message.
-- **Private by default.** A fresh cola refuses everyone until you claim it with
-  a one-time code; only the Host can drive it.
-- **Set it and forget it.** Autostart at boot, a singleton lock, restart and
-  self-update — on Linux, macOS and Windows.
+One card per turn, buttons for decisions, and `/cat` / `/diff` when you want to
+read the code or the diff yourself. That is the whole surface.
 
-## Quick start
+## Try it
+
+About **5 minutes**, and it costs nothing: you create a free Feishu **self-built
+app** (企业自建应用) for yourself. You need:
+
+- an `opencode` binary on `PATH` (see <https://opencode.ai>) — OpenCode
+  **1.18.x (V1) and 2.0.x (V2) both work**; cola starts and manages its own
+  server, and detects which protocol the attached server speaks (the log records
+  the choice)
+- a Feishu account where you can create an app
 
 ### 1. Install
 
@@ -73,51 +73,47 @@ own binary in place, which a root-owned path like `/usr/local/bin` would block:
   `PATH` (via the Environment Variables dialog), then reopen the terminal.
   `AppData\Local` is user-writable and not roamed, unlike `AppData\Roaming`.
 
-Or install from [crates.io](https://crates.io/crates/colark) with Rust tooling:
-`cargo binstall colark` fetches the prebuilt release asset for your platform
-(no compile), while `cargo install colark` (edition 2024) builds from source —
-source builds need a C compiler and linker (the TLS stack builds AWS-LC); on
-Windows, NASM as well (or set `AWS_LC_SYS_PREBUILT_NASM=1`). No system OpenSSL
-is required. The binary is named `cola` either way. Updates follow the install
-channel: a cargo-tracked install (`cargo install` or `cargo binstall`) is
-updated with cargo — `/update` reports the command — while an archive install
-uses cola's own updater (`/update`, `cola update`).
+Or install with Rust tooling: `cargo binstall colark` fetches the prebuilt
+release asset (no compile), while `cargo install colark` (edition 2024) builds
+from source — source builds need a C compiler and linker, plus NASM on Windows.
+Updates follow the install channel: a cargo-tracked install is updated with
+cargo (`/update` prints the command), an archive install uses cola's own
+updater. Building from source is `cargo build --release`. The [user
+guide](docs/user-guide.md#install) explains each choice in detail.
 
-Or build from source (same prerequisites as `cargo install`):
-`cargo build --release`. The [user guide](docs/user-guide.md#install) explains
-each choice in detail.
+### 2. Create the Feishu app
 
-You also need an `opencode` binary on `PATH` (see <https://opencode.ai>) —
-OpenCode **1.18.x (V1) and 2.0.x (V2) both work**; cola starts and manages its
-own server and detects which protocol the attached server speaks (the log
-records the choice).
-
-### 2. Create a Feishu app
-
-One-time setup at <https://open.feishu.cn/app> (create a custom app):
+One-time setup at <https://open.feishu.cn/app> (create a custom app). Do **not**
+publish it yet — the event subscription in step 4 needs cola running first.
 
 1. Enable the **bot capability** (应用能力 → 机器人) — required before the app can
    join chats or send anything.
-2. Grant these scopes (权限管理):
-   - `im:message`, `im:message:send_as_bot` — send, reply to and update cards,
-     read message content and download message images
+2. Grant these three scopes (权限管理) and you are done:
+   - `im:message` — send, reply to and update cards; read quotes and images
+   - `im:message:send_as_bot` — send as the bot
    - `im:message.p2p_msg:readonly` — receive DMs
-   - `im:message.group_at_msg:readonly` — receive group messages that @ the bot
-   - `im:chat:readonly` — read chat names
-   - `contact:contact.base:readonly`, `contact:user.base:readonly` — read user names
-   - `im:datasync.feed_card.time_sensitive:write` — *(optional)*
-     Feishu's Instant Reminder, used by `[bridge] instant_reminder` (off by
-     default); without it pinning is skipped and everything else keeps working
-3. Configure event subscription (事件与回调): use **long-connection mode** and
-   subscribe to the `im.message.receive_v1` event. Card-button callbacks
-   (`card.action.trigger`) arrive over the same connection automatically — no
-   webhook URL needed.
-4. **Publish** the version so the configuration takes effect and the bot is usable.
-5. Add the bot to a chat (or DM it) so it can receive messages.
+
+   Group chats, real names and the optional Instant Reminder each need one more
+   scope — see the full map below.
+
+<details>
+<summary>Full scope list (groups, names, Instant Reminder)</summary>
+
+| Scope | What cola uses it for | If missing |
+| --- | --- | --- |
+| `im:message` | send/reply to and update cards; read a message by id (quote context); download message images | cola cannot reply or update cards — unusable |
+| `im:message:send_as_bot` | send and reply to messages as the bot | card sending fails |
+| `im:message.p2p_msg:readonly` | receive DMs | DMs never reach cola |
+| `im:message.group_at_msg:readonly` | receive group messages that @ the bot | group messages never reach cola |
+| `im:chat:readonly` | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
+| `contact:contact.base:readonly` | authorizes the contact API call | user names unavailable |
+| `contact:user.base:readonly` | returns the user's `name` field | completion notices lose the @name |
+| `im:datasync.feed_card.time_sensitive:write` | *(optional)* Feishu Instant Reminder — pin a chat while a permission or question waits (`[bridge] instant_reminder`, off by default) | pinning is skipped, everything else works |
 
 Missing scopes degrade features instead of crashing cola. The [user
-guide](docs/user-guide.md#feishu-app-setup) maps every scope to what it unlocks
-and what breaks without it.
+guide](docs/user-guide.md#feishu-app-setup) maps every scope to what it unlocks.
+
+</details>
 
 ### 3. Configure
 
@@ -130,17 +126,29 @@ app_id = "cli_xxxxxxxxxxxx"
 app_secret = "your-app-secret"
 ```
 
-That's the minimum. Every other setting is optional — e.g. Feishu's Instant
-Reminder is an opt-in via `[bridge] instant_reminder = true`
-(off by default; needs the optional `im:datasync.feed_card.time_sensitive:write`
-scope above), which pins a chat while a permission or question waits; and
-`[bridge] long_task_notice = true` (off by default) announces a p2p turn that
-ran 5+ minutes with a reply message, because the card patch itself pushes no
-notification. See the [user guide](docs/user-guide.md#configuration).
+That is the minimum. Everything else is optional — for example
+`[bridge] instant_reminder = true` pins a chat while a permission waits, and
+`[bridge] long_task_notice = true` announces a p2p turn that ran 5+ minutes with
+a reply message (the card patch itself pushes no notification). See the [user
+guide](docs/user-guide.md#configuration).
 
-### 4. Run
+### 4. Start cola, then finish the app
 
-Register cola to start at boot/login — the recommended way:
+```bash
+cola
+```
+
+Leave it running (Ctrl-C stops it). Now, back in the developer console:
+
+1. **事件与回调**: choose **使用长连接接收事件** (long-connection mode) and
+   subscribe to `im.message.receive_v1`. This is why cola is running already —
+   Feishu only accepts long-connection mode while a client is connected. Card
+   buttons (`card.action.trigger`) arrive over the same connection; there is no
+   webhook URL to configure.
+2. **Publish** the version (版本管理与发布) so the scopes and events take effect.
+3. Add the bot to a chat, or just DM it.
+
+Once it works, register it to start at boot and forget about it:
 
 ```bash
 cola autostart enable
@@ -150,38 +158,73 @@ cola autostart status   # confirm it is registered
 - **Linux**: a systemd **user** unit. On a headless machine (no desktop login),
   also run `loginctl enable-linger $USER` (printed as a hint) so it starts at
   boot.
-- **macOS**: a LaunchAgent.
-- **Windows**: an `HKCU\...\Run` registry value.
+- **macOS**: a LaunchAgent. **Windows**: an `HKCU\...\Run` registry value.
 
-`cola autostart disable` stops the instance (even a supervised one still
-starting up) and removes the registration; `cola stop` stops it but keeps the
-registration. Enable it **after** installing both cola and `opencode` — the
-registration snapshots the binary path and your `PATH`, so re-run `enable` if
-you ever move either.
-
-To run in the foreground instead, just `cola` (Ctrl-C stops it). To detach it
-from the terminal: `nohup cola >/dev/null 2>&1 &` on Linux/macOS, or
-`start /b cola` on Windows.
-
-cola attaches to an already-running `opencode serve` on the shared store
-(so sessions stay shared with OpenChamber / the CLI), and lazily starts its own
-when none is running.
-
-Inspect and control it from the shell: `cola status` (a snapshot — run state,
-autostart, claim, server + generation; `--json` for scripts), `cola doctor` (the
-environment checks a support request needs), `cola logs [-f]` (tail the log),
-`cola restart`, `cola config path|show|validate`, and `cola completions <shell>`.
+`cola autostart disable` stops the instance and removes the registration;
+`cola stop` stops it but keeps it. Enable it **after** installing both cola and
+`opencode` — the registration snapshots the binary path and your `PATH`, so
+re-run `enable` if you move either. To detach from the terminal instead:
+`nohup cola >/dev/null 2>&1 &` on Linux/macOS, or `start /b cola` on Windows.
 
 ### 5. Claim the bot
 
 cola is **private by default**: a fresh (or upgraded) instance starts
-*unclaimed* and refuses everyone. On startup it prints a one-time **claim
-code** to the log (`~/.cola/cola.log`); DM the bot `/claim <code>` from your
-own Feishu account to become its Host. After that only you can use it.
+*unclaimed* and refuses everyone. On startup it prints a one-time **claim code**
+(also in `~/.cola/cola.log`); DM the bot `/claim <code>` from your own Feishu
+account to become its Host. After that only you can use it.
 
 The code rotates on every restart, is never written to disk, and the claim
 itself is one-time — restarts and upgrades never ask again. DM the bot `/help`
-to get started after claiming.
+to see every command.
+
+Inspect and control it from the shell: `cola status` (run state, autostart,
+claim, server + generation; `--json` for scripts), `cola doctor` (the
+environment checks a support request needs), `cola logs [-f]`, `cola restart`,
+`cola config path|show|validate`, and `cola completions <shell>`.
+
+## What you get
+
+- **One card per turn, updated live.** Reasoning, tool calls and the answer
+  stream onto a single card with collapsible panels, a phase timer and a live
+  todo panel, so a slow turn never looks like a dead one.
+- **Decisions are two taps.** Permission requests render as
+  Allow / Deny / Always buttons on the card, and questions become a
+  multi-select card that accepts custom answers.
+- **See what changed, and read the code.** A finished turn with edits carries
+  `N files · +A −D` and delivers the whole diff as one self-contained red/green
+  HTML file — open it anywhere, nothing to install. `/diff [--base <ref>]` does
+  it for a branch, and `/cat <path>` previews any file on the host: paged,
+  markdown/raw toggle, images and directory browsing, sendable as a file.
+- **As many sessions as you have tasks.** `/new`, `/dir <path>`, a Feishu
+  `/topic` per project, `/switch` to adopt a session started elsewhere (with a
+  snapshot of what is pending), `/sub` for the subagents a turn spawned.
+- **Your sessions are shared.** Same OpenCode server and store as OpenChamber
+  and the CLI — a session started anywhere can be picked up here, and messages
+  from another client come back into Feishu.
+- **Send a screenshot.** Images in a message or a quoted reply ride along for
+  vision-capable models.
+- **Set it and forget it.** Private by default, autostart at boot, a singleton
+  lock, restart and self-update — on Linux, macOS and Windows.
+
+## How it works
+
+```mermaid
+flowchart LR
+    you(["You · Feishu<br/>phone or desktop"])
+    cola["cola"]
+    server["opencode server"]
+    store[("shared store")]
+    other["opencode CLI<br/>OpenChamber"]
+
+    you <-->|"messages · cards · buttons"| cola
+    cola <-->|"HTTP + event stream"| server
+    server --- store
+    other <--> server
+```
+
+cola attaches to a running `opencode serve` on the shared store and lazily starts
+its own when none is running. Because the store is shared, the same session can
+be driven from Feishu, the CLI or OpenChamber — whichever you have at hand.
 
 ## Docs
 
@@ -193,8 +236,9 @@ to get started after claiming.
   `cargo xtask check-doc-drift` 守护）。
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md): commit conventions,
   the verification loop, PR rules.
-- **Code of conduct** — [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): the
-  Contributor Covenant 2.1, including where to report unacceptable behavior.
 - **Architecture** — [docs/adr/](docs/adr/), [GLOSSARY.md](GLOSSARY.md),
   [AGENTS.md](AGENTS.md) (includes the hard-won known pitfalls for the OpenCode
   server API and Feishu integration — read before contributing).
+- **Code of conduct** — [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+MIT licensed — see [LICENSE](LICENSE).
