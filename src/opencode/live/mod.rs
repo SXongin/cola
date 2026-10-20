@@ -2023,6 +2023,11 @@ async fn capture_fixture(name: &str, generation: &str, version: &str, command: &
 /// `diagnostics` is appended to the timeout panic — the child's stderr, so a
 /// hung poll is debuggable from the failure alone — and the last read error is
 /// always reported, so a persistent failure is never masked by a bare timeout.
+///
+/// The bound is end to end: a value that only arrives AFTER `timeout` is a
+/// timeout too, not a pass. A read that starts just inside the deadline and
+/// settles just outside it must fail the wait — otherwise a slow poll quietly
+/// widens every bound the suite declares (#784 review).
 async fn poll_until<T, F, Fut>(
     what: &str,
     timeout: Duration,
@@ -2037,7 +2042,15 @@ where
     let mut last_error = None;
     loop {
         match read().await {
-            Ok(Some(value)) => return value,
+            Ok(Some(value)) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out after {}s waiting for {what} (the read only returned after the bound)\n{}",
+                    timeout.as_secs(),
+                    diagnostics()
+                );
+                return value;
+            }
             Ok(None) => {}
             Err(error) => last_error = Some(error),
         }
@@ -2179,33 +2192,25 @@ async fn assert_tool_call(
     shell: provider::Tool,
     command: provider::ToolCommand,
 ) {
-    let deadline = Instant::now() + POLL_TIMEOUT;
-    let transcript = loop {
-        match backend.transcript(session_id).await {
-            Ok(transcript) => {
-                if find_tool_call(&transcript, shell).is_some_and(|tool| tool.status == ToolStatus::Completed)
-                {
-                    break transcript;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "the {} tool call never completed within {}s: {transcript:#?}\n{}",
-                    shell.name(),
-                    POLL_TIMEOUT.as_secs(),
-                    server.stderr()
-                );
-            }
-            Err(error) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the transcript could not be read while waiting for the {} tool call: {error:?}\n{}",
-                    shell.name(),
-                    server.stderr()
-                );
-            }
-        }
-        sleep(POLL_INTERVAL).await;
-    };
+    // The last read is kept for the timeout diagnostic: a tool stuck on
+    // `Running` must fail with the stuck call visible, not just "timed out".
+    let last: std::cell::RefCell<Option<SessionTranscript>> = std::cell::RefCell::new(None);
+    let transcript = poll_until(
+        &format!("the {} tool call to complete", shell.name()),
+        POLL_TIMEOUT,
+        || async {
+            let transcript = backend.transcript(session_id).await?;
+            let settled =
+                find_tool_call(&transcript, shell).is_some_and(|tool| tool.status == ToolStatus::Completed);
+            last.borrow_mut().replace(transcript.clone());
+            Ok(settled.then_some(transcript))
+        },
+        || match last.borrow().as_ref() {
+            Some(transcript) => format!("last transcript: {transcript:#?}\n{}", server.stderr()),
+            None => server.stderr(),
+        },
+    )
+    .await;
     let tool = find_tool_call(&transcript, shell).unwrap_or_else(|| {
         panic!(
             "the {} tool call must be in the transcript: {transcript:#?}",
@@ -2390,4 +2395,86 @@ fn assert_provider_requests(requests: &[crate::test_http::RecordedRequest]) {
         followup.to_string().contains("live-harness-tool"),
         "the command's output must ride the tool result: {followup:#?}"
     );
+}
+
+/// [`poll_until`]'s own contract, driven deterministically — no live server, no
+/// race window, so the wait that fixes #784 is covered by the hermetic suite
+/// rather than only by the ignored live chains.
+#[cfg(test)]
+mod poll_tests {
+    use super::*;
+    use crate::error::BridgeError;
+
+    /// The shape #784 hit: nothing settles, then it does. Retried, never failed.
+    #[tokio::test]
+    async fn a_value_after_two_empty_reads_is_returned() {
+        let reads = std::cell::Cell::new(0);
+        let value = poll_until(
+            "the third read",
+            POLL_TIMEOUT,
+            || async {
+                let n = reads.get() + 1;
+                reads.set(n);
+                Ok((n == 3).then_some(n))
+            },
+            || "no diagnostics".to_string(),
+        )
+        .await;
+
+        assert_eq!(value, 3, "the wait retries until a read settles");
+    }
+
+    /// A transient read error is a retry, not a failure: the wait only fails
+    /// when its bound runs out.
+    #[tokio::test]
+    async fn a_transient_read_error_is_retried() {
+        let reads = std::cell::Cell::new(0);
+        let value = poll_until(
+            "the second read",
+            POLL_TIMEOUT,
+            || async {
+                let n = reads.get() + 1;
+                reads.set(n);
+                if n == 1 {
+                    return Err(BridgeError::OpenCode("transient".into()));
+                }
+                Ok(Some(n))
+            },
+            || "no diagnostics".to_string(),
+        )
+        .await;
+
+        assert_eq!(value, 2, "one failed read does not fail the wait");
+    }
+
+    /// The bound is end to end: a read that only returns after it is a timeout,
+    /// even when it carries a settled value. Without this a slow read would
+    /// quietly widen every bound the suite declares (#784 review).
+    #[tokio::test]
+    #[should_panic(expected = "the read only returned after the bound")]
+    async fn a_value_that_arrives_after_the_bound_is_a_timeout() {
+        poll_until(
+            "a late value",
+            Duration::from_millis(20),
+            || async {
+                sleep(Duration::from_millis(80)).await;
+                Ok(Some(()))
+            },
+            || "no diagnostics".to_string(),
+        )
+        .await;
+    }
+
+    /// Nothing settling fails AT the bound, with the diagnostics attached.
+    #[tokio::test]
+    #[should_panic(expected = "timed out after 0s waiting for a value that never comes (last error: None)")]
+    async fn nothing_settling_fails_at_the_bound() {
+        poll_until(
+            "a value that never comes",
+            Duration::from_millis(20),
+            || async { Ok(None::<()>) },
+            || "the child's stderr".to_string(),
+        )
+        .await;
+    }
 }
