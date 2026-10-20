@@ -13,8 +13,11 @@ edits code on your machine, and you watch, steer and approve every step without
 opening a terminal.
 
 cola bridges [Feishu](https://www.feishu.cn) and [OpenCode](https://opencode.ai):
-each Feishu thread is an OpenCode session, each turn streams onto one live card,
-and every permission request becomes a button.
+each DM is an OpenCode session, each turn streams onto one live card, and every
+permission request becomes a button.
+
+It is a bot for one person: you create the app, you claim it, and only you can
+drive it.
 
 *The name: **Co**de with **La**rk — Lark's China brand is Feishu.*
 
@@ -96,18 +99,17 @@ publish it yet — the event subscription in step 4 needs cola running first.
    - `im:message:send_as_bot` — send as the bot
    - `im:message.p2p_msg:readonly` — receive DMs
 
-   Group chats, real names and the optional Instant Reminder each need one more
-   scope — see the full map below.
+   Real names and the optional Instant Reminder each need one more scope — see
+   below.
 
 <details>
-<summary>Full scope list (groups, names, Instant Reminder)</summary>
+<summary>Optional extras: names and Instant Reminder</summary>
 
 | Scope | What cola uses it for | If missing |
 | --- | --- | --- |
 | `im:message` | send/reply to and update cards; read a message by id (quote context); download message images | cola cannot reply or update cards — unusable |
 | `im:message:send_as_bot` | send and reply to messages as the bot | card sending fails |
 | `im:message.p2p_msg:readonly` | receive DMs | DMs never reach cola |
-| `im:message.group_at_msg:readonly` | receive group messages that @ the bot | group messages never reach cola |
 | `im:chat:readonly` | chat display names (`/attach` rejection card, `/switch` cards) | raw chat ids instead of names |
 | `contact:contact.base:readonly` | authorizes the contact API call | user names unavailable |
 | `contact:user.base:readonly` | returns the user's `name` field | completion notices lose the @name |
@@ -149,7 +151,7 @@ Leave it running (Ctrl-C stops it). Now, back in the developer console:
    buttons (`card.action.trigger`) arrive over the same connection; there is no
    webhook URL to configure.
 2. **Publish** the version (版本管理与发布) so the scopes and events take effect.
-3. Add the bot to a chat, or just DM it.
+3. DM the bot — that is the whole setup.
 
 ### 5. Claim the bot
 
@@ -204,12 +206,11 @@ re-run `enable` if you move either. To detach from the terminal instead:
   session diff). `/diff [--base <ref>]` does it for a branch, and `/cat <path>`
   previews any file on the host: paged, markdown/raw toggle, images and
   directory browsing, sendable as a file.
-- **As many sessions as you have tasks.** `/new`, `/dir <path>`, a Feishu
-  `/topic` per project, `/switch` to adopt a session started elsewhere (with a
-  snapshot of what is pending), `/sub` for the subagents a turn spawned. The
-  store is shared with the CLI and OpenChamber, so a session begun anywhere
-  continues here — and messages sent from another client come back into
-  Feishu.
+- **As many sessions as you have tasks.** `/new`, `/dir <path>`, `/switch` to
+  adopt a session started elsewhere (with a snapshot of what is pending), `/sub`
+  for the subagents a turn spawned. The store is shared with the CLI and
+  OpenChamber, so a session begun anywhere continues here — and messages sent
+  from another client come back into Feishu.
 - **Set it and forget it.** Private by default, autostart at boot, a singleton
   lock, restart and self-update — on Linux, macOS and Windows.
 
