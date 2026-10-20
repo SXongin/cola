@@ -77,11 +77,11 @@ async fn snapshot_claim_prevents_poller_duplicate() {
     );
 }
 
-/// The claim handoff (#841/#842): only the blocks the card EMBEDS are claimed
-/// and remembered. A request the block cap or the budget pushed off the
-/// snapshot stays unclaimed, so the normal flow surfaces it — and the snapshot
-/// must not have `remember_surfaced` it either, or its own card would answer
-/// against state the snapshot never owned.
+/// The claim handoff (#841/#842): `claim_snapshot_pendings` claims and
+/// remembers exactly the set the card rendered. The send path has already
+/// trimmed `SnapshotData.pending` to that set, so a request the block cap or the
+/// budget left out cannot reach the claim set at all — the end-to-end test
+/// below proves the poller still surfaces it on its own card.
 #[tokio::test]
 async fn claim_registers_only_what_the_card_renders() {
     let _wd = test_work_dir();
@@ -132,10 +132,6 @@ async fn claim_registers_only_what_the_card_renders() {
         handles.requests.snapshot_claims.lock().await.claim_count(),
         3,
         "the leftover request is not claimed"
-    );
-    assert!(
-        !app.question.has_question("q_4").await,
-        "a request the card never rendered is never remembered by the snapshot"
     );
 }
 

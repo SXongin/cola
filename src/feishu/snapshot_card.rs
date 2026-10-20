@@ -285,10 +285,11 @@ pub struct BuiltSnapshot {
 }
 
 /// The most pending blocks one snapshot card embeds, independent of the byte
-/// budget (#842). A card packed with dozens of permission blocks leaves no room
-/// for the 最近对话 the adopting reader came for, and is unusable to scroll, so
-/// the block share has its own ceiling — the budget can lower this further, it
-/// never raises it.
+/// budget (#842). Dozens of permission blocks make a card unusable to scroll and
+/// crowd out the 最近对话 a reader adopted the session for, so the block share
+/// has its own ceiling. This bounds the blocks; it does not reserve the tail —
+/// the budget can lower the count further, and a tail that is over budget on its
+/// own is still trimmed by the ladder.
 pub const MAX_SNAPSHOT_PENDING_BLOCKS: usize = 5;
 
 /// [`build_snapshot_card_with_state`] plus the embedded/overflow decision. The

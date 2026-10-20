@@ -355,7 +355,12 @@ pub(crate) async fn snapshot_card_from_data(
         &[],
         back,
     );
+    // The builder counted `built.embedded` over the SAME own-session predicate,
+    // so this retain and the truncate below are a PAIR: truncating to that count
+    // against a differently filtered list would keep a foreign-session request
+    // and drop a real one — and both would then be claimed and rendered.
     data.pending.retain(|req| req.session_id() == data.session_id);
+    debug_assert!(built.embedded <= data.pending.len());
     data.pending.truncate(built.embedded);
     data.pending_overflow = PendingOverflow::from_send(built.overflow);
     (built.card, data)
