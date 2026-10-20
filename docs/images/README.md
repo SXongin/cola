@@ -16,7 +16,7 @@ paragraph.
 | `permission-card.png` | A permission request card with 「允许 / 总是允许 / 拒绝」 visible. | phone, 2× scale |
 | `question-card.png` | A question card with multi-select and a custom answer filled in. | phone, 2× scale |
 | `file-viewer.png` | `/cat src/bridge/pollers.rs` — the file card with its pager and view toggle. | phone, 2× scale |
-| `turn-diff.png` | The 「查看完整改动」 HTML diff, opened in a browser. | desktop, cropped to the diff |
+| `turn-diff.png` | The 「查看完整变化」 HTML diff, opened in a browser. | desktop, cropped to the diff |
 | `sessions.png` | The `/switch` card listing several sessions, or a `/topic` cover card. | phone, 2× scale |
 
 Keep the set to the hero GIF plus three or four stills; a wall of screenshots

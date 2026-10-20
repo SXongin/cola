@@ -10119,12 +10119,12 @@ Index: /x/src/main.rs
 
         let text = card_text(&card);
         assert!(
-            text.contains("📝 本次改动 · 2 files · +4 −2"),
+            text.contains("📝 本轮期间工作区变化 · 2 files · +4 −2"),
             "the index line names the settled files and counts: {text}"
         );
 
         let button = turn_diff_button(&card).expect("the complete-diff button renders");
-        assert_eq!(button["text"]["content"], "🔍 查看完整改动");
+        assert_eq!(button["text"]["content"], "🔍 查看完整变化");
         assert_eq!(
             button["value"],
             serde_json::json!({
@@ -10167,13 +10167,16 @@ Index: /x/src/main.rs
         assert!(render_new_turn_parts(&mut acc, &transcript));
 
         let running = acc.build_card_with_split().0;
-        assert!(!card_text(&running).contains("📝 本次改动"), "{running}");
+        assert!(
+            !card_text(&running).contains("📝 本轮期间工作区变化"),
+            "{running}"
+        );
         assert!(turn_diff_button(&running).is_none(), "{running}");
 
         acc.set_card_state(CardState::Done);
         let unsettled = acc.build_card_with_split().0;
         assert!(
-            !card_text(&unsettled).contains("📝 本次改动"),
+            !card_text(&unsettled).contains("📝 本轮期间工作区变化"),
             "the render must not invent counts for a terminal card: {unsettled}"
         );
         assert!(turn_diff_button(&unsettled).is_none(), "{unsettled}");
@@ -10193,13 +10196,16 @@ Index: /x/src/main.rs
         });
 
         let running = acc.build_card_with_split().0;
-        assert!(!card_text(&running).contains("📝 本次改动"), "{running}");
+        assert!(
+            !card_text(&running).contains("📝 本轮期间工作区变化"),
+            "{running}"
+        );
         assert!(turn_diff_button(&running).is_none(), "{running}");
 
         acc.set_card_state(CardState::Done);
         let settled = acc.build_card_with_split().0;
         assert!(
-            card_text(&settled).contains("📝 本次改动 · 1 files · +2 −1"),
+            card_text(&settled).contains("📝 本轮期间工作区变化 · 1 files · +2 −1"),
             "{settled}"
         );
         assert!(turn_diff_button(&settled).is_some(), "{settled}");
@@ -10248,14 +10254,14 @@ Index: /x/src/main.rs
                 "finalized card {i} must not offer the button: {card}"
             );
             assert!(
-                !card_text(card).contains("📝 本次改动"),
+                !card_text(card).contains("📝 本轮期间工作区变化"),
                 "finalized card {i} must not offer the index line: {card}"
             );
         }
 
         let last = cards.last().unwrap();
         assert!(
-            card_text(last).contains("📝 本次改动 · 2 files · +4 −2"),
+            card_text(last).contains("📝 本轮期间工作区变化 · 2 files · +4 −2"),
             "the live chunk carries the index line: {last}"
         );
         let button = turn_diff_button(last).expect("the live chunk carries the button");
@@ -10284,7 +10290,7 @@ Index: /x/src/main.rs
         acc.set_card_state(CardState::Done);
 
         let card = acc.build_card_with_split().0;
-        assert!(!card_text(&card).contains("📝 本次改动"));
+        assert!(!card_text(&card).contains("📝 本轮期间工作区变化"));
         assert!(turn_diff_button(&card).is_none());
 
         // The same counts WITH the anchor do render: the guard is the anchor,
@@ -10294,7 +10300,7 @@ Index: /x/src/main.rs
             created_ms: 1_000,
         });
         let anchored = acc.build_card();
-        assert!(card_text(&anchored).contains("📝 本次改动 · 1 files · +1 −1"));
+        assert!(card_text(&anchored).contains("📝 本轮期间工作区变化 · 1 files · +1 −1"));
         assert!(turn_diff_button(&anchored).is_some());
     }
 }

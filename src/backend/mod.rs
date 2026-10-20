@@ -352,7 +352,7 @@ pub trait Backend: Send + Sync {
     /// endpoint" (V1), never an empty diff: V1 has no Turn Diff at all — no
     /// card index and no artifact (ADR-0087).
     ///
-    /// The Turn card's settle index and its 「查看完整改动」 callback (#801)
+    /// The Turn card's settle index and its 「查看完整变化」 callback (#801)
     /// read this one source.
     async fn session_diff(
         &self,
