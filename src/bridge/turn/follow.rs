@@ -172,9 +172,20 @@ async fn run(handles: TurnHandles, facts: FollowFacts, timing: SettleTiming) {
     };
     // The terminal card's change index, resolved from the artifact's own source
     // before the ownership-checked stamp (ADR-0087). The read is bounded and
-    // can never block the ending.
-    let index =
-        super::terminal_change_index(flow.backend.as_ref(), &session_id, &disposition, anchor.as_ref()).await;
+    // can never block the ending. An initially unlanded follow captures its
+    // anchor during the settle loop, so fall back to the live card's anchor:
+    // the Turn that just ended is still the one to scope.
+    let index_anchor = match anchor {
+        Some(anchor) => Some(anchor),
+        None => super::Turn::armed_turn_anchor(&flow.cards, &session_id).await,
+    };
+    let index = super::terminal_change_index(
+        flow.backend.as_ref(),
+        &session_id,
+        &disposition,
+        index_anchor.as_ref(),
+    )
+    .await;
     // The ownership re-check and the stamp share ONE cards lock (#539): the
     // guard is already released, so a new Turn may have replaced the card —
     // and its live card must never inherit this loop's ending. `None` means the
