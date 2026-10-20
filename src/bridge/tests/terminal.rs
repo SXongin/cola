@@ -10,6 +10,7 @@
 //! the child's own process group, the flag grammar, and that no OpenCode
 //! server is contacted.
 
+#[cfg(unix)]
 use crate::bridge::terminal_record::{TerminalRunRecord, TerminalRunState};
 use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
@@ -470,6 +471,51 @@ async fn windows_refuses_the_command_with_a_reason_and_spawns_nothing() {
             .iter()
             .any(|text| text.contains("Windows") && text.contains("不支持")),
         "the refusal states why: {texts:?}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "a refused command posts no Terminal Card"
+    );
+    assert!(prompts.lock().await.is_empty(), "and becomes no prompt");
+}
+
+/// #824: the `!` entry point is the `/run` execution path, so a non-Unix Host
+/// must refuse it with the SAME stated reason and spawn nothing. A regression
+/// that forwarded a bang message to the model — or tried to run it half-way —
+/// cannot pass here.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn windows_refuses_a_bang_command_with_the_same_reason_and_spawns_nothing() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run echo hi",
+        key.clone(),
+        "msg_windows_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    send_command_in(&app, "!echo hi", key, "msg_windows_bang", ConversationKind::P2p).await;
+
+    let texts = platform.texts().await;
+    assert_eq!(texts.len(), 2, "one refusal per entry point: {texts:?}");
+    assert_eq!(
+        texts[0], texts[1],
+        "`!` is refused with `/run`'s own stated reason"
+    );
+    assert_eq!(
+        texts[0],
+        crate::bridge::terminal::WINDOWS_REFUSAL,
+        "the reason is the documented one: {texts:?}"
     );
     assert!(
         platform.replied_cards().await.is_empty(),
