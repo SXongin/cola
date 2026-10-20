@@ -63,23 +63,27 @@ pub(crate) const TERMINAL_ASK_AI_LABEL: &str = "问 AI";
 /// What the settled card's buttons carry: the log path, the Chat/Topic the card
 /// lives in, and the settled card's own render inputs, so a click's outcome can
 /// be PATCHed back onto the card it was clicked on — and every button is
-/// self-describing after a restart (ADR-0086 decision 4). Only a settled run
-/// without a spawn failure gets them: a launch that never started has no output
-/// to retrieve and nothing to hand over. The cwd and command are NOT carried
-/// here: the builder puts the text its elements actually show into the payload,
-/// so a huge command cannot bloat the card's JSON budget.
+/// self-describing after a restart (ADR-0086 decision 4). A settled run gets
+/// them whatever ended it — a spawn failure included, because 重跑 replays the
+/// record and 完整输出 still names the log (whole-branch review, finding 3); each
+/// action is gated on what it needs, not on the run having produced output. The
+/// cwd and command are NOT carried here: the builder puts the text its elements
+/// actually show into the payload, so a huge command cannot bloat the card's
+/// JSON budget.
 pub(crate) struct TerminalFullOutput<'a> {
-    /// The **Terminal Log** the 「📄 完整输出」 button delivers.
+    /// The **Terminal Log** the 「📄 完整输出」 button delivers. A run that never
+    /// spawned still has one: it is created before the child.
     pub(crate) log_path: &'a str,
     /// The run every settled button names (ADR-0086 decision 4): a click for
     /// any other id is a stale click once the run record can check it.
     pub(crate) run_id: &'a str,
     /// The run 「↻ 重跑」 may replay, when the card itself named one. `None` on a
-    /// legacy payload that carried no run id (#828): the rebuild's fallback —
-    /// the Chat/Topic's current record — may name a different command, and a
+    /// legacy payload that carried no run id (#828) — the rebuild's fallback,
+    /// the Chat/Topic's current record, may name a different command, and a
     /// rerun replays the record, so offering it there would replay the wrong
-    /// one. 「问 AI」 still uses [`Self::run_id`], because it quotes the output
-    /// the payload carries.
+    /// one — and on a run whose record could not be written, where no click
+    /// could prove itself current. 「问 AI」 still uses [`Self::run_id`], because
+    /// it quotes the output the payload carries.
     pub(crate) rerun_run_id: Option<&'a str>,
     /// The Chat/Topic the card lives in, for the click's route and in-flight
     /// claim.

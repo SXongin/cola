@@ -313,6 +313,42 @@ because the click is checked against the record anyway. So:
   send its later writes to an inode nothing can retrieve. Age decides only among
   logs no record references.
 
+## Amendment (2026-10-21): the ending is recorded before the card is told, and the probe stands down
+
+Decision 5 marks a record settled "when the run settles", and decision 10's sweep
+reads only `running` records. That left a card permanently live-looking in two
+windows: a settling PATCH that failed, and a process that died after writing
+`settled` but before the PATCH. "The run is over" and "the card has been told" are
+now separate facts in the record:
+
+- `outcome` carries the ending the card renders — exit code, spawn error, elapsed
+  time, whether 终止 ended it, whether group members survived, whether the probe
+  stopped it — written **together with** `state = settled` and
+  `card_settled = false`, before the settling PATCH.
+- A landed PATCH sets `card_settled = true`. A failed or interrupted one leaves it
+  false, and the startup sweep rebuilds the **same** settled card from the record
+  and PATCHes it again; only a landed write marks it done, so a failure stays owed
+  and a success makes the next start do nothing. The re-PATCH is idempotent by
+  construction.
+- A `running` record still sweeps to `lost`, and that write *is* its ending write,
+  so `card_settled` is set with it. A record with no `outcome` (one written before
+  this amendment) is left alone: nothing can rebuild what it does not have.
+- A settled run keeps its buttons whatever ended it. A launch that never started
+  has no output, but it has a log path and a record, so 「↻ 重跑」 (gated on a
+  written record), 「📄 完整输出」 and 「问 AI」 stay usable instead of vanishing.
+
+The same record also carries `ask_ai_submitted`: decision 9's one submission per
+run was guarded in memory, which a restart clears, so the same current run's
+button submitted again. The guard now consults the record first and persists an
+accepted submission there; the in-memory flag stays as this process's fast path
+and as the fallback when the record cannot be written.
+
+Finally, the size probe's "check the log, then signal the group" cycle shares a
+gate with the run's own ending. The run stands the probe down before the reap that
+frees the process-group id, and a cycle already in flight re-reads the flag under
+the gate. A run that has ended is therefore never signalled, and a pgid the run no
+longer owns is never reached.
+
 ## Why
 
 - **It is the third step of one capability ladder**, not a new subsystem: browse (ADR-0078) →

@@ -279,6 +279,11 @@ pub struct SharedCore {
     /// it.
     #[cfg(test)]
     pub terminal_test_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Test-only seam for one size-probe cycle (whole-branch review, finding 2):
+    /// it lets a test park a cycle across the run's ending and prove no signal
+    /// is sent after it. The field itself exists only in a test build.
+    #[cfg(test)]
+    pub terminal_probe_hook: Arc<std::sync::Mutex<Option<Arc<crate::bridge::terminal::TerminalProbeHook>>>>,
     /// The **Terminal Log**'s **observed** stop threshold (ADR-0086 decision 7):
     /// the size probe kills the process group once the file has passed it. It
     /// is not a write limit, so a fast producer overshoots. Scaled down by a
@@ -424,6 +429,8 @@ impl SharedCore {
             terminal_log_root: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             terminal_test_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(test)]
+            terminal_probe_hook: Arc::new(std::sync::Mutex::new(None)),
             terminal_log_cap_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::terminal::TERMINAL_LOG_CAP_BYTES,
             )),
@@ -513,6 +520,8 @@ impl SharedCore {
             terminal_size_probe_ms: Arc::clone(&self.terminal_size_probe_ms),
             #[cfg(test)]
             terminal_test_env: Arc::clone(&self.terminal_test_env),
+            #[cfg(test)]
+            terminal_probe_hook: Arc::clone(&self.terminal_probe_hook),
         }
     }
 

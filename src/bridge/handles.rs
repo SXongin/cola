@@ -1702,6 +1702,12 @@ pub(crate) struct CommandHandles {
     /// (ADR-0086 §8); see `SharedCore::terminal_test_env`.
     #[cfg(test)]
     pub(crate) terminal_test_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// Test-only seam for one size-probe cycle (whole-branch review, finding 2):
+    /// a test parks a cycle across the run's ending and proves it signals
+    /// nothing. Exists only in a test build, so production cannot park a probe.
+    #[cfg(test)]
+    pub(crate) terminal_probe_hook:
+        Arc<std::sync::Mutex<Option<Arc<crate::bridge::terminal::TerminalProbeHook>>>>,
 }
 
 impl CommandHandles {
