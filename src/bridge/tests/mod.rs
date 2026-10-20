@@ -34,6 +34,7 @@ pub(crate) mod subtask;
 pub(crate) mod supplement;
 pub(crate) mod surfaces;
 pub(crate) mod switch;
+pub(crate) mod terminal;
 pub(crate) mod topic;
 pub(crate) mod turn_diff_delivery;
 pub(crate) mod undeliverable;

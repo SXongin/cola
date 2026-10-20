@@ -94,7 +94,28 @@ pub enum Command {
     /// Any other `/diff` argument — an unknown flag, extra words, or a bare
     /// `--base` with no value. Answered with one usage line and no git call.
     DiffUsage,
+    /// `/run [--timeout <n>[smh]] [--] <cmd>` — one **Terminal Command**
+    /// (ADR-0086): the command text and its cap. `None` is the bare `/run` or a
+    /// refused flag form, both answered with usage and nothing spawned.
+    Run(Option<RunSpec>),
 }
+
+/// One parsed `/run` invocation (ADR-0086 §2, §6): the command text after flag
+/// parsing (everything after the flags, or after `--`) and that run's cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSpec {
+    /// The exact command text handed to `sh -c`; flags were parsed only before
+    /// it, so a command may carry `--timeout`-looking words of its own.
+    pub command: String,
+    /// The run's cap; the default when `--timeout` names none.
+    pub timeout: std::time::Duration,
+}
+
+/// The default cap for a `/run` (`--timeout` names its own): ten minutes.
+pub const RUN_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The hard maximum for `--timeout`: twenty-four hours.
+pub const RUN_MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// One skill-invocation request (spec #662): the ids a message named, and which
 /// form named them.
@@ -336,6 +357,11 @@ pub fn parse_command(text: &str) -> Option<Command> {
                 _ => Some(Command::DiffUsage),
             }
         }
+        // `/run [--timeout <n>[smh]] [--] <cmd>` — one Terminal Command
+        // (ADR-0086 §2, §6). Flags are parsed only before the command, and `--`
+        // ends flag parsing so a command may start with `-`; a bare `/run` or a
+        // refused flag form answers usage and runs nothing.
+        "/run" => Some(Command::Run(parse_run_arg(arg))),
         "/topic" => match arg {
             Some(a) => {
                 // `/topic --adopt <keyword> [--force]` — adopt an existing
@@ -430,6 +456,66 @@ pub fn parse_command(text: &str) -> Option<Command> {
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
     }
+}
+
+/// Parse `/run`'s argument (ADR-0086 §6): `--timeout <n>[smh]` flags, then the
+/// command — or, after `--`, the rest as the command verbatim, so a command may
+/// begin with `-`. `None` means usage: a bare `/run`, a bare or malformed
+/// `--timeout`, a value past [`RUN_MAX_TIMEOUT`], or an unknown leading flag.
+fn parse_run_arg(arg: Option<&str>) -> Option<RunSpec> {
+    let mut rest = arg?;
+    let mut timeout = RUN_DEFAULT_TIMEOUT;
+    loop {
+        if rest.is_empty() {
+            return None;
+        }
+        let Some(after) = rest.strip_prefix("--") else {
+            // A leading `-` before the command is an unknown flag; only `--`
+            // makes a dash-led command reachable.
+            if rest.starts_with('-') {
+                return None;
+            }
+            return Some(RunSpec {
+                command: rest.to_string(),
+                timeout,
+            });
+        };
+        let after_trimmed = after.trim_start();
+        // `--` followed by whitespace (or nothing) IS the terminator: the rest
+        // is the command, never a flag — `-- --version` runs `--version`.
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            return (!after_trimmed.is_empty()).then(|| RunSpec {
+                command: after_trimmed.to_string(),
+                timeout,
+            });
+        }
+        let value_and_rest = after.strip_prefix("timeout")?;
+        if !value_and_rest.is_empty() && !value_and_rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let value_and_rest = value_and_rest.trim_start();
+        let mut parts = value_and_rest.splitn(2, char::is_whitespace);
+        let value = parts.next().filter(|v| !v.is_empty())?;
+        timeout = parse_run_timeout(value)?;
+        rest = parts.next().unwrap_or("").trim_start();
+    }
+}
+
+/// Parse a `--timeout` value: digits plus an optional `s`/`m`/`h` unit (no
+/// unit means seconds), refused when it is not a number, not a whole number of
+/// seconds, or past [`RUN_MAX_TIMEOUT`].
+fn parse_run_timeout(value: &str) -> Option<std::time::Duration> {
+    let (digits, unit) = match value.as_bytes().last() {
+        Some(b's') => (&value[..value.len() - 1], 1u64),
+        Some(b'm') => (&value[..value.len() - 1], 60),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        _ => (value, 1),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = digits.parse::<u64>().ok()?.checked_mul(unit)?;
+    (seconds <= RUN_MAX_TIMEOUT.as_secs()).then(|| std::time::Duration::from_secs(seconds))
 }
 
 /// Collect the ids of every `/skill <id>` token in `text`, in order (spec #652,
@@ -822,6 +908,9 @@ pub(crate) async fn handle_command(
                 .platform
                 .reply_text(message_id, crate::bridge::repo_diff::DIFF_USAGE)
                 .await?;
+        }
+        Command::Run(spec) => {
+            crate::bridge::terminal::execute(handles, &thread_key, message_id, spec).await?;
         }
         Command::Switch(action) => {
             handle_switch_action(handles, &thread_key, action, message_id, kind).await?;
@@ -2823,6 +2912,108 @@ mod tests {
         assert_eq!(
             parse_command("/diffs x"),
             Some(Command::Forward("/diffs x".into()))
+        );
+    }
+
+    /// `/run` grammar (ADR-0086 §6): flags only before the command, `--` ends
+    /// flag parsing, and every refused form parses to `Run(None)` — the usage
+    /// answer, never a Forward prompt and never a spawn.
+    #[test]
+    fn parse_run() {
+        let run = |command: &str, timeout: std::time::Duration| {
+            Some(Command::Run(Some(RunSpec {
+                command: command.into(),
+                timeout,
+            })))
+        };
+        assert_eq!(parse_command("/run echo hi"), run("echo hi", RUN_DEFAULT_TIMEOUT));
+        assert_eq!(parse_command("/RUN echo hi"), run("echo hi", RUN_DEFAULT_TIMEOUT));
+        assert_eq!(
+            parse_command("/run   echo   hi  "),
+            run("echo   hi", RUN_DEFAULT_TIMEOUT),
+            "the command keeps its inner spacing, trailing space is trimmed"
+        );
+        assert_eq!(parse_command("/run"), Some(Command::Run(None)));
+        assert_eq!(parse_command("/run   "), Some(Command::Run(None)));
+
+        assert_eq!(
+            parse_command("/run --timeout 30s echo hi"),
+            run("echo hi", std::time::Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 10m echo hi"),
+            run("echo hi", std::time::Duration::from_secs(600))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 2h echo hi"),
+            run("echo hi", std::time::Duration::from_secs(7_200))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 90 echo hi"),
+            run("echo hi", std::time::Duration::from_secs(90)),
+            "no unit means seconds"
+        );
+        assert_eq!(
+            parse_command("/run --timeout 86400s echo hi"),
+            run("echo hi", RUN_MAX_TIMEOUT),
+            "exactly 24h is allowed"
+        );
+        // Refused forms: bare, malformed, past the cap, unknown flag.
+        assert_eq!(parse_command("/run --timeout"), Some(Command::Run(None)));
+        assert_eq!(parse_command("/run --timeout   "), Some(Command::Run(None)));
+        assert_eq!(
+            parse_command("/run --timeout abc echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 5x echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 5s5 echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run --timeout -5s echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 25h echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run --timeout 86401s echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run --base main echo hi"),
+            Some(Command::Run(None))
+        );
+        assert_eq!(
+            parse_command("/run -ls"),
+            Some(Command::Run(None)),
+            "a dash-led token before `--` is a flag"
+        );
+
+        // `--` terminates flags: the rest is the command verbatim.
+        assert_eq!(parse_command("/run -- -ls"), run("-ls", RUN_DEFAULT_TIMEOUT));
+        assert_eq!(
+            parse_command("/run -- --version"),
+            run("--version", RUN_DEFAULT_TIMEOUT)
+        );
+        assert_eq!(
+            parse_command("/run --timeout 5s -- --help me"),
+            run("--help me", std::time::Duration::from_secs(5))
+        );
+        // Flags after the command are command text, never flags.
+        assert_eq!(
+            parse_command("/run echo --timeout 5s"),
+            run("echo --timeout 5s", RUN_DEFAULT_TIMEOUT)
+        );
+        // Only the exact token is `/run`.
+        assert_eq!(
+            parse_command("/runner x"),
+            Some(Command::Forward("/runner x".into()))
         );
     }
 
