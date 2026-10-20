@@ -16,6 +16,8 @@ cola bridges [Feishu](https://www.feishu.cn) and [OpenCode](https://opencode.ai)
 each Feishu thread is an OpenCode session, each turn streams onto one live card,
 and every permission request becomes a button.
 
+*The name: **Co**de with **La**rk — Lark's China brand is Feishu.*
+
 <!--
 Hero media — drop the recorded GIF in and uncomment (see docs/images/README.md
 for the shot list and naming). Keep the width so the card is legible on desktop
