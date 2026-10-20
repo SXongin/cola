@@ -4167,6 +4167,93 @@ async fn an_old_log_a_record_still_names_is_kept_and_its_silent_orphan_keeps_wri
     );
 }
 
+/// #827 re-review (finding 1): the age sweep deletes files, so it must not run
+/// against a PARTIAL view of the records — a record it could not read may name
+/// the very log it is about to unlink. A corrupt record file next to an old,
+/// still-open orphan log leaves everything alone for this start.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_corrupt_record_skips_the_age_sweep_and_leaves_an_old_open_log_alone() {
+    use std::io::Write;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 14;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, _platform) = restart_app(cfg, root.clone()).await;
+    let log = root.join("orphan-of-a-lost-record.log");
+    std::fs::write(&log, b"before\n").unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"held open\n")
+        .unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    // The record that would name this log is unreadable, so the sweep cannot
+    // know whether the file is referenced.
+    std::fs::create_dir_all(app.terminal_records.dir()).unwrap();
+    std::fs::write(app.terminal_records.dir().join("broken.json"), b"{ not json").unwrap();
+
+    app.sweep_terminal().await;
+
+    assert!(log.exists(), "an incomplete record set must not delete any log");
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().len(),
+        b"before\nheld open\n".len() as u64
+    );
+}
+
+/// #827 re-review (finding 1): a records directory that cannot be listed is the
+/// same "we do not know" — nothing is swept, so a live orphan's aged log stays.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_record_directory_skips_the_age_sweep() {
+    use std::io::Write;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 14;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, _platform) = restart_app(cfg, root.clone()).await;
+    let log = root.join("orphan-without-a-reference-set.log");
+    std::fs::write(&log, b"before\n").unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&log)
+        .unwrap()
+        .write_all(b"held open\n")
+        .unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+    // A plain file where the records directory belongs: `read_dir` fails, and
+    // no reference can be enumerated (deterministic even as root, where a
+    // permission bit would not stop the read).
+    std::fs::write(app.terminal_records.dir(), b"not a directory").unwrap();
+
+    app.sweep_terminal().await;
+
+    assert!(
+        log.exists(),
+        "an unlistable record directory must not delete any log"
+    );
+}
+
 /// #827 acceptance: the record is written BEFORE the child is spawned — a live
 /// run is already `running` on disk, with its card id and the child's pid.
 #[cfg(unix)]

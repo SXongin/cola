@@ -142,8 +142,27 @@ impl TerminalRunRecords {
     /// caller that cannot tell "no record" from "the run is replaced" must fail
     /// closed (see [`AskAiGuard`](crate::bridge::terminal::AskAiGuard) and
     /// [`is_current`](Self::is_current)).
+    ///
+    /// The file must also be *this* chat's: the record's own chat/topic is
+    /// checked against `key`, and a mismatch reads as unreadable. Names are a
+    /// slug plus a hash, not a proof — a misplaced or crafted file written under
+    /// another chat's name would otherwise supply a matching `run_id` and let a
+    /// stale card pass after a restart.
     pub(crate) fn read(&self, key: &ThreadKey) -> Option<TerminalRunRecord> {
-        Self::load_file(&self.path(key))
+        let path = self.path(key);
+        let record = Self::load_file(&path)?;
+        if record.chat_id != key.chat_id || record.thread_id != key.thread_id {
+            tracing::warn!(
+                "terminal record: {} names chat {}/{} instead of the file's {}/{}; ignoring it",
+                path.display(),
+                record.chat_id,
+                record.thread_id,
+                key.chat_id,
+                key.thread_id
+            );
+            return None;
+        }
+        Some(record)
     }
 
     /// Read and parse one record file — the one implementation both
@@ -214,24 +233,66 @@ impl TerminalRunRecords {
         }
     }
 
-    /// Every record on disk — the startup sweep's input, and the referenced
-    /// **Terminal Log** set the age sweep must never unlink. A corrupt file is
-    /// skipped with a warning, never an error.
+    /// Every record on disk — the startup sweep's input. A corrupt file is
+    /// skipped with a warning, never an error; callers that must know whether
+    /// they saw everything use [`scan`](Self::scan).
     pub(crate) fn load_all(&self) -> Vec<TerminalRunRecord> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Vec::new();
+        self.scan().0
+    }
+
+    /// Every record on disk, and whether the set is **complete** — the
+    /// directory was readable, every entry could be listed, and every `.json`
+    /// file in it parsed.
+    ///
+    /// The flag exists for the **Terminal Log** age sweep, which deletes files:
+    /// a record it could not read may name the very log it is about to unlink,
+    /// so an incomplete view must not sweep at all (see
+    /// [`sweep_logs`](crate::bridge::terminal::sweep_logs)). A missing directory
+    /// is complete-and-empty — the sidecar convention, and the first start of a
+    /// cola that has never run a command — while an unreadable one is not
+    /// knowing, and says so. A file whose record names a different chat/topic
+    /// than its own name encodes counts as unreadable too: [`read`](Self::read)
+    /// refuses it as this chat's record, so no sweep may treat the set as
+    /// complete while it is there.
+    pub(crate) fn scan(&self) -> (Vec<TerminalRunRecord>, bool) {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), true),
+            Err(e) => {
+                tracing::warn!(
+                    "terminal record: could not read the record directory {}: {e}",
+                    self.dir.display()
+                );
+                return (Vec::new(), false);
+            }
         };
         let mut records = Vec::new();
-        for entry in entries.flatten() {
+        let mut complete = true;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!(
+                        "terminal record: could not list an entry in {}: {e}",
+                        self.dir.display()
+                    );
+                    complete = false;
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(record) = Self::load_file(&path) {
-                records.push(record);
+            match Self::load_file(&path) {
+                // A record only means something at the path its OWN key names:
+                // a file under another chat's name is unreadable, whether it was
+                // misplaced or crafted, so the set is not complete.
+                Some(record) if self.path(&record.key()) == path => records.push(record),
+                Some(_) | None => complete = false,
             }
         }
-        records
+        (records, complete)
     }
 }
 
@@ -378,6 +439,36 @@ mod tests {
         records.write(&lost).unwrap();
         assert!(!records.is_current(&key, "run-1"), "the replaced run is stale");
         assert!(records.is_current(&key, "run-2"), "a lost run is still current");
+    }
+
+    /// #827 re-review (finding 2): a parseable file under a chat's name is not
+    /// that chat's record. The record's own chat/topic must match the file's
+    /// key, or a misplaced or crafted record could pass the restart staleness
+    /// checks merely by carrying a matching run id.
+    #[test]
+    fn a_record_written_under_another_chats_file_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let owner = key("oc_owner", "oc_owner");
+        let other = key("oc_other", "oc_other");
+        let owner_record = record(&owner, "run-owner");
+        let raw = serde_json::to_vec(&owner_record).unwrap();
+        // A perfectly valid record, installed under another chat's file name.
+        std::fs::write(records.path(&other), &raw).unwrap();
+
+        assert_eq!(
+            records.read(&other),
+            None,
+            "another chat's record is unreadable at this key"
+        );
+        assert!(
+            !records.is_current(&other, "run-owner"),
+            "and it proves nothing about this chat's current run"
+        );
+
+        // The same bytes at the owner's own path are the owner's record.
+        std::fs::write(records.path(&owner), &raw).unwrap();
+        assert_eq!(records.read(&owner), Some(owner_record));
     }
 
     /// The read is bounded (a card callback reads it synchronously): a file
