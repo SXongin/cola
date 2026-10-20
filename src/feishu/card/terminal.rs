@@ -74,6 +74,13 @@ pub(crate) struct TerminalFullOutput<'a> {
     /// The run every settled button names (ADR-0086 decision 4): a click for
     /// any other id is a stale click once the run record can check it.
     pub(crate) run_id: &'a str,
+    /// The run 「↻ 重跑」 may replay, when the card itself named one. `None` on a
+    /// legacy payload that carried no run id (#828): the rebuild's fallback —
+    /// the Chat/Topic's current record — may name a different command, and a
+    /// rerun replays the record, so offering it there would replay the wrong
+    /// one. 「问 AI」 still uses [`Self::run_id`], because it quotes the output
+    /// the payload carries.
+    pub(crate) rerun_run_id: Option<&'a str>,
     /// The Chat/Topic the card lives in, for the click's route and in-flight
     /// claim.
     pub(crate) chat_id: &'a str,
@@ -370,11 +377,10 @@ fn settled_buttons_row(
     output_truncated: bool,
 ) -> serde_json::Value {
     let chat_type = if view.is_group { "group" } else { "p2p" };
-    let facts = |op: &str| {
-        json!({
+    let facts = |op: &str, run_id: &str| {
+        let mut value = json!({
             "action": "terminal",
             "op": op,
-            "run_id": view.run_id,
             "chat_id": view.chat_id,
             "thread_id": view.thread_id,
             "chat_type": chat_type,
@@ -382,19 +388,23 @@ fn settled_buttons_row(
             "terminal_card": {
                 "cwd": cwd,
                 "command": command,
-                "run_id": view.run_id,
                 "lost": view.lost,
                 "exit_code": view.exit_code,
                 "elapsed_ms": view.elapsed.as_millis() as u64,
                 "output_over_limit": view.output_over_limit,
             },
-        })
+        });
+        // An empty id is never written (#828): a click that reads one can only
+        // be refused, so the field is omitted and the payload says nothing it
+        // cannot back.
+        if !run_id.is_empty() {
+            value["run_id"] = json!(run_id);
+            value["terminal_card"]["run_id"] = json!(run_id);
+        }
+        value
     };
-    let mut ask_ai = facts("ask_ai");
-    ask_ai["output"] = json!(output);
-    ask_ai["output_truncated"] = json!(output_truncated);
     let mut columns = Vec::new();
-    if !view.run_id.is_empty() {
+    if let Some(rerun_run_id) = view.rerun_run_id {
         // 「↻ 重跑」 names the run and its route, and nothing else: the record
         // holds the command, cwd and timeout it replays (ADR-0086 decision 4 as
         // amended for #827). Carrying them here would duplicate a
@@ -406,7 +416,7 @@ fn settled_buttons_row(
             json!({
                 "action": "terminal",
                 "op": "rerun",
-                "run_id": view.run_id,
+                "run_id": rerun_run_id,
                 "chat_id": view.chat_id,
                 "thread_id": view.thread_id,
             }),
@@ -415,9 +425,17 @@ fn settled_buttons_row(
     columns.push(button_column(
         TERMINAL_FULL_OUTPUT_LABEL,
         "default",
-        facts("full_output"),
+        facts("full_output", view.run_id),
     ));
-    columns.push(button_column(TERMINAL_ASK_AI_LABEL, "primary", ask_ai));
+    // A click has to name its run (ADR-0086 decision 4), and a rebuild with no
+    // id to name could only write a button that toasts 「无效操作」 (#828): the
+    // button is omitted instead, never written with an empty id.
+    if !view.run_id.is_empty() {
+        let mut ask_ai = facts("ask_ai", view.run_id);
+        ask_ai["output"] = json!(output);
+        ask_ai["output_truncated"] = json!(output_truncated);
+        columns.push(button_column(TERMINAL_ASK_AI_LABEL, "primary", ask_ai));
+    }
     json!({
         "tag": "column_set",
         "flex_mode": "flow",
@@ -804,6 +822,7 @@ mod tests {
                 chat_id: "chat_1",
                 thread_id: "chat_1",
                 run_id: "run-827",
+                rerun_run_id: Some("run-827"),
                 lost: true,
                 is_group: false,
                 exit_code: None,
@@ -877,6 +896,7 @@ mod tests {
                 chat_id: "chat_1",
                 thread_id: "chat_1",
                 run_id: "run-827",
+                rerun_run_id: Some("run-827"),
                 lost: false,
                 is_group: false,
                 exit_code: Some(0),
@@ -1000,6 +1020,60 @@ mod tests {
         }
         // The raw byte form follows the same rule.
         assert_eq!(decode_log_bytes(b"a\x90payload\x07still\x9cb"), "ab");
+    }
+
+    /// #828: a rebuild with no run id to name omits 「问 AI」 — a button whose
+    /// click could only toast 「无效操作」 — and never writes an empty id.
+    /// 「📄 完整输出」 needs no run id and stays.
+    #[test]
+    fn a_card_with_no_run_id_writes_no_ask_ai_button() {
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "make",
+            output: "done\n",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: Some(TerminalFullOutput {
+                log_path: "/logs/run.log",
+                run_id: "",
+                rerun_run_id: None,
+                chat_id: "chat_1",
+                thread_id: "chat_1",
+                lost: false,
+                is_group: false,
+                exit_code: Some(0),
+                elapsed: Duration::from_secs(1),
+                output_over_limit: false,
+            }),
+            notice: None,
+            state: TerminalState::Settled {
+                exit_code: Some(0),
+                spawn_error: None,
+                elapsed: Duration::from_secs(1),
+                stopped: false,
+                survivors: false,
+            },
+            run_id: "",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let value = card.to_string();
+        assert!(
+            !value.contains("\"op\":\"ask_ai\""),
+            "no dead 「问 AI」 button: {value}"
+        );
+        assert!(
+            !value.contains("\"op\":\"rerun\""),
+            "重跑 needs a run this card named: {value}"
+        );
+        assert!(
+            value.contains("\"op\":\"full_output\""),
+            "完整输出 needs no run id: {value}"
+        );
+        assert!(
+            !value.contains("\"run_id\":\"\""),
+            "an empty run id is never written: {value}"
+        );
     }
 
     /// #822: the cwd and the command are clipped to the per-element budget, and

@@ -5760,12 +5760,34 @@ impl App {
         notice: &str,
         what: &'static str,
     ) {
+        // #828: a payload minted before the settled buttons named their run
+        // carries no run id, and rebuilding from it wrote a 「问 AI」 button with
+        // an empty id — a button that could only toast 「无效操作」. The chat's
+        // **Terminal Run Record** is the durable source of "current" (ADR-0086
+        // decision 4), so a legacy payload takes its run id from there; when the
+        // record has none either, the button is omitted rather than written with
+        // an empty id.
+        let run_id = if request.run_id.is_empty() {
+            self.terminal_records
+                .read(&ThreadKey::new(
+                    request.chat_id.clone(),
+                    request.thread_id.clone(),
+                ))
+                .map(|record| record.run_id)
+                .unwrap_or_default()
+        } else {
+            request.run_id.clone()
+        };
         // The rebuilt card keeps every settled button and its run id, and a run
         // the sweep marked lost is rebuilt AS a lost card: the outcome PATCH
         // must not invent an ending for it (ADR-0086 decisions 4, 5 and 10).
         let full_output = Some(crate::feishu::card::terminal::TerminalFullOutput {
             log_path: &request.path,
-            run_id: &request.run_id,
+            run_id: &run_id,
+            // 重跑 replays the record, so it may only name a run the card
+            // itself named: the fallback above can be a newer, different
+            // command.
+            rerun_run_id: (!request.run_id.is_empty()).then_some(request.run_id.as_str()),
             chat_id: &request.chat_id,
             thread_id: &request.thread_id,
             lost: request.lost,
@@ -5797,7 +5819,7 @@ impl App {
                 full_output,
                 notice: Some(notice),
                 state,
-                run_id: &request.run_id,
+                run_id: &run_id,
                 chat_id: &request.chat_id,
                 thread_id: &request.thread_id,
             });
