@@ -766,18 +766,17 @@ impl ExternalFlow {
         }
         // This card REPLACES the one-shot snapshot that named the requests its
         // block cap left out (#842), so the fact is repeated here — otherwise
-        // the only place naming them is a card that no longer exists. The count
-        // is the send-time one and still exact at arm time. The inline blocks
-        // follow this text, so the line reads immediately above the ones it is
-        // NOT about.
-        match data.pending_overflow {
-            crate::bridge::snapshot::PendingOverflow::None => {}
-            crate::bridge::snapshot::PendingOverflow::Counted(n) => {
-                static_text.push_str(&format!("\n…另有 {n} 个待处理请求超出单卡容量，将稍后显示"));
-            }
-            crate::bridge::snapshot::PendingOverflow::Uncounted => {
-                static_text.push_str("\n…另有待处理请求超出单卡容量，将稍后显示");
-            }
+        // the only place naming them is a card that no longer exists. It uses
+        // the UNCOUNTED form: arming happens a moment after the snapshot was
+        // sent, and a resolution can land in between, so the send-time count is
+        // no longer trustworthy (the same rule a claim-ack rebuild follows).
+        // The inline blocks follow this text, so the line reads immediately
+        // above the ones it is NOT about.
+        if let Some(notice) =
+            crate::feishu::snapshot_card::pending_overflow_notice(data.pending_overflow.uncounted())
+        {
+            static_text.push('\n');
+            static_text.push_str(&notice);
         }
         // A NEW external run (the adoption follows it): a `/stop` from before
         // it is not this run's ending, same as the reply renderer's arm. A
