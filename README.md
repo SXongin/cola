@@ -148,24 +148,6 @@ Leave it running (Ctrl-C stops it). Now, back in the developer console:
 2. **Publish** the version (版本管理与发布) so the scopes and events take effect.
 3. Add the bot to a chat, or just DM it.
 
-Once it works, register it to start at boot and forget about it:
-
-```bash
-cola autostart enable
-cola autostart status   # confirm it is registered
-```
-
-- **Linux**: a systemd **user** unit. On a headless machine (no desktop login),
-  also run `loginctl enable-linger $USER` (printed as a hint) so it starts at
-  boot.
-- **macOS**: a LaunchAgent. **Windows**: an `HKCU\...\Run` registry value.
-
-`cola autostart disable` stops the instance and removes the registration;
-`cola stop` stops it but keeps it. Enable it **after** installing both cola and
-`opencode` — the registration snapshots the binary path and your `PATH`, so
-re-run `enable` if you move either. To detach from the terminal instead:
-`nohup cola >/dev/null 2>&1 &` on Linux/macOS, or `start /b cola` on Windows.
-
 ### 5. Claim the bot
 
 cola is **private by default**: a fresh (or upgraded) instance starts
@@ -181,6 +163,28 @@ Inspect and control it from the shell: `cola status` (run state, autostart,
 claim, server + generation; `--json` for scripts), `cola doctor` (the
 environment checks a support request needs), `cola logs [-f]`, `cola restart`,
 `cola config path|show|validate`, and `cola completions <shell>`.
+
+### 6. Keep it running
+
+Stop the foreground instance (Ctrl-C) and register cola to start at boot:
+
+```bash
+cola autostart enable
+cola autostart status   # confirm it is registered
+```
+
+Two instances cannot share the bot — cola takes a singleton lock — so stop this
+one first. macOS starts the supervised instance immediately; on Linux the unit
+is only enabled, so `systemctl --user start cola` hands over now (otherwise it
+comes up at your next login), and a headless machine also needs
+`loginctl enable-linger $USER`. **Windows** uses an `HKCU\...\Run` value, which
+takes effect at the next sign-in.
+
+`cola autostart disable` stops the instance and removes the registration;
+`cola stop` stops it but keeps it. Enable it **after** installing both cola and
+`opencode` — the registration snapshots the binary path and your `PATH`, so
+re-run `enable` if you move either. To detach from the terminal instead:
+`nohup cola >/dev/null 2>&1 &` on Linux/macOS, or `start /b cola` on Windows.
 
 ## What you get
 
