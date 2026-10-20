@@ -558,3 +558,259 @@ async fn run_works_with_the_server_down_and_never_contacts_it() {
     assert!(text.contains("退出码 0"), "and settled normally: {text}");
     assert!(prompts.lock().await.is_empty(), "no prompt reached the Backend");
 }
+
+/// The second entry point (spec #821, ticket #824; ADR-0086 §1): a message
+/// whose first character is `!` runs the remainder as the command and answers
+/// the same Terminal Card — the `/run` execution path, not a copy of it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bang_prefixed_message_runs_the_remainder_as_a_terminal_command() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(&app, "!echo bang hi", key, "msg_bang", ConversationKind::P2p).await;
+
+    let cards = platform.replied_cards().await;
+    assert_eq!(cards.len(), 1, "exactly one Terminal Card: {cards:?}");
+    let text = card_text(&cards[0]);
+    assert!(
+        text.contains(&canonical(proj.path())),
+        "the card names the resolved cwd: {text}"
+    );
+    assert!(
+        text.contains("echo bang hi"),
+        "the card names the command: {text}"
+    );
+    assert!(text.contains("bang hi"), "the card carries the output: {text}");
+    assert!(text.contains("退出码 0"), "the exit code is 0: {text}");
+    assert!(text.contains("耗时"), "the elapsed time is named: {text}");
+    assert!(
+        prompts.lock().await.is_empty(),
+        "a `!` message never becomes a prompt"
+    );
+}
+
+/// Only the FIRST character opens the entry point: `!` alone, `! ` (spaces
+/// only) and a `!` anywhere else stay prose and reach the model as before.
+#[tokio::test]
+async fn bang_alone_bang_space_and_a_mid_message_bang_stay_prose() {
+    let _wd = test_work_dir();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+
+    for (message_id, text) in [
+        ("msg_bare_bang", "!"),
+        ("msg_bang_space", "!   "),
+        ("msg_mid_bang", "hello !ls"),
+        ("msg_inner_bang", "ls ! la"),
+    ] {
+        send_command(&app, text, message_id).await;
+    }
+
+    let terminal_cards = platform
+        .replied_cards()
+        .await
+        .iter()
+        .filter(|card| card.to_string().contains("🖥️ 终端命令"))
+        .count();
+    assert_eq!(
+        terminal_cards, 0,
+        "no prose message spawns a command or posts a Terminal Card"
+    );
+    assert_eq!(
+        *prompts.lock().await,
+        vec![
+            "!".to_string(),
+            "!   ".to_string(),
+            "hello !ls".to_string(),
+            "ls ! la".to_string(),
+        ],
+        "every non-qualifying message reaches the model verbatim"
+    );
+}
+
+/// The text the bridge parses is already mention-stripped and trimmed, so
+/// `@cola !ls` (the bot's mention dropped upstream) and `  !ls` qualify —
+/// while the stripped result is still prose when its first character is not
+/// `!`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mention_stripped_or_indented_bang_still_qualifies() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // The production WS path strips the bot's own mention and trims; the test
+    // composes that same step instead of pretending the raw token arrives.
+    let mention = crate::feishu::event::Mention {
+        key: Some("@_user_1".into()),
+        id: Some(crate::feishu::event::MentionId {
+            open_id: Some("ou_bot".into()),
+        }),
+        name: Some("cola".into()),
+    };
+    let stripped = crate::feishu::message::strip_mentions("@_user_1 !echo mentioned", &[mention], "ou_bot");
+    assert_eq!(
+        stripped, "!echo mentioned",
+        "the mention strip leaves the prefix first"
+    );
+
+    app.handle_message(incoming(
+        "msg_mentioned_bang".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        stripped,
+        None,
+    ))
+    .await;
+
+    let text = card_text(&first_card(&platform).await);
+    assert!(text.contains("mentioned"), "the stripped `!` command ran: {text}");
+    assert!(text.contains("退出码 0"), "and settled normally: {text}");
+
+    send_command_in(
+        &app,
+        "  !echo indented",
+        key,
+        "msg_indented_bang",
+        ConversationKind::P2p,
+    )
+    .await;
+    let cards = platform.replied_cards().await;
+    let text = card_text(cards.last().expect("the indented form's card"));
+    assert!(text.contains("indented"), "a leading-whitespace `!` runs: {text}");
+    assert!(prompts.lock().await.is_empty(), "neither form became a prompt");
+}
+
+/// A `!` message never scans for `#<id>` Skill tokens: `!ls #caveman` runs the
+/// literal command (the `#caveman` is part of it) and loads no Skill, so no
+/// skill list is read and no prompt is submitted.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bang_command_with_a_hash_token_loads_no_skill() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_skills(vec![crate::backend::SkillInfo {
+        id: "caveman".into(),
+        name: "Caveman".into(),
+        description: Some("Talk like caveman.".into()),
+        content: Some("# Caveman".into()),
+    }]);
+    let prompts = backend.prompt_calls.clone();
+    let skill_reads = backend.list_skills_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "!echo '#caveman'",
+        key,
+        "msg_bang_hash",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let text = card_text(&first_card(&platform).await);
+    assert!(
+        text.contains("#caveman"),
+        "the literal `#caveman` is the command's argument: {text}"
+    );
+    assert!(text.contains("退出码 0"), "the literal command ran: {text}");
+    assert!(
+        prompts.lock().await.is_empty(),
+        "the message never became a prompt"
+    );
+    assert_eq!(
+        skill_reads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no Skill list was read"
+    );
+}
+
+/// An unrelated `/foo` still forwards to the model exactly as before: the `!`
+/// interception is a first-character check, not a change to the command parser.
+#[tokio::test]
+async fn an_unrelated_slash_command_still_forwards_to_the_model() {
+    let _wd = test_work_dir();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+
+    send_command(&app, "/please-read", "msg_forward").await;
+
+    assert_eq!(
+        *prompts.lock().await,
+        vec!["/please-read".to_string()],
+        "an unknown `/` command is forwarded verbatim"
+    );
+    assert!(
+        platform
+            .replied_cards()
+            .await
+            .iter()
+            .all(|card| !card.to_string().contains("🖥️ 终端命令")),
+        "the forward posts no Terminal Card"
+    );
+}
+
+/// `/run` is in the command help list, and `/help run` documents both entry
+/// points, the cap and `--timeout`, the absent terminal and the Windows
+/// refusal.
+#[tokio::test]
+async fn help_lists_run_and_documents_both_entry_points() {
+    let _wd = test_work_dir();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command(&app, "/help", "msg_help").await;
+    let cards = platform.replied_cards().await;
+    assert_eq!(cards.len(), 1, "`/help` replies with the command card");
+    let listed = card_text(&cards[0]);
+    assert!(listed.contains("/run"), "the help card lists `/run`: {listed}");
+    assert!(
+        listed.contains("!命令") || listed.contains("!<命令>"),
+        "the help card names the `!` entry point: {listed}"
+    );
+
+    send_command(&app, "/help run", "msg_help_run").await;
+    let texts = platform.texts().await;
+    let help = texts.last().expect("`/help run` replies with text");
+    for expected in [
+        "/run",
+        "!<cmd>",
+        "10 minutes",
+        "24 hours",
+        "--timeout",
+        "terminal",
+        "Windows",
+    ] {
+        assert!(
+            help.contains(expected),
+            "`/help run` must document {expected:?}: {help}"
+        );
+    }
+}

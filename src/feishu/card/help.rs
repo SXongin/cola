@@ -42,6 +42,10 @@ pub fn build_help_card() -> serde_json::Value {
                     "/diff [--base <ref>]",
                     "发送仓库 review：当前分支相对 base 的改动（单个 HTML 文件）",
                 ),
+                (
+                    "/run [--timeout <n>[smh]] [--] <命令>",
+                    "在宿主机上执行一条命令并回复终端卡片（也可用 `!命令` 开头直接发）",
+                ),
                 ("/agent <名字>", "切换 agent（下条消息生效）"),
                 ("/model <提供方/模型>", "切换模型（下条消息生效）"),
                 ("/think [等级]", "设置/清除思考等级（下条消息生效）"),
@@ -107,6 +111,7 @@ mod tests {
             "/dir",
             "/cat",
             "/diff",
+            "/run",
             "/switch",
             "/sub",
             "/topic",

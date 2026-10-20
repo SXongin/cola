@@ -591,6 +591,7 @@ pub fn help_text() -> String {
 `/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
 `/cat <path>` · View a host file in a card (a directory opens the Directory Browser there)
 `/diff [--base <ref>]` · Send this branch's repository changes against a base ref as one HTML file
+`/run [--timeout <n>[smh]] [--] <cmd>` · Run one shell command on the host and reply with a Terminal Card (also a message starting with `!<cmd>`)
 `/switch` · Session card: browse / search / adopt / new
 `/switch <kw>` · Switch to a session by name/dir/id (adopts foreign ones)
 `/switch <id> [--force]` · Take over a session by id/title
@@ -629,6 +630,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "diff" => {
             "/diff [--base <ref>]\nRender this branch's repository review as one self-contained HTML File Message: committed changes since the fork point, uncommitted tracked changes, and untracked files. It compares the working tree against `git merge-base <base> HEAD` (never fetches, never touches the index), so the result is stable and re-checkable across turns and restarts.\n- `/diff` — use `--base`, else `[review] base`, else `origin/main`, else `main`\n- `/diff --base <ref>` — override the base for this call\nAny other argument answers this usage line and runs no git. The command runs in this conversation's project directory (the same rule as `/cat`), and the file is replied to the command message so it stays in its chat/topic. Only one `/diff` per chat per 10 seconds; earlier repeats answer 稍后再试. An empty review answers one line and sends no file; each failure (not a git repository, base not found, git missing) answers its own readable text.\nExample: `/diff --base main`"
+        }
+        "run" => {
+            "/run [--timeout <n>[smh]] [--] <cmd>\nRun one shell command on the HOST machine and reply with a Terminal Card: the resolved cwd, the command, its merged stdout/stderr, the exit code and the elapsed time. No model is in the loop — this is a terminal, not a prompt — so nothing enters the session transcript.\n- `/run <cmd>` — one command, one `sh -c`; there is no persistent shell, so `cd`/`export` do not carry between runs. Path Scope: the session's directory, the current project while the session is still pending, else the default session directory; the card names the cwd it actually used.\n- `--timeout <n>[smh]` — this run's cap (default 10 minutes, maximum 24 hours). Flags are parsed only before the command, and `--` ends flag parsing so a command may begin with `-`.\n- `!<cmd>` — the same act from a message prefix: a message whose FIRST character is `!` runs the rest as the command, e.g. `!ls -la`. The `!` form accepts no flags — everything after `!` is the command, so `!ls #caveman` literally runs `ls #caveman` and loads no Skill. `!` alone, `! `, and a `!` anywhere but the first character stay prose for the model.\nThere is no pseudo-terminal: `/run` is line-oriented, so a full-screen or interactive program either fails fast (`top` → `failed tty get`, `git commit` → `unable to start editor`) or waits on input that never comes. Use its non-interactive flag (`top -b`, `git commit -m …`), or run it under `tmux` and capture the pane.\nWindows refuses: cola cannot safely terminate the whole process tree there (ADR-0086), so `/run` and `!` answer a refusal and execute nothing.\nThe output is command output, not a sandbox: it can read files, expose environment variables and change the working tree, and every member of the chat can read the card.\nExamples: `/run echo hi`, `/run --timeout 30s cargo test`, `/run -- --version`, `!ls #caveman`"
         }
         "dir" => {
             "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths. Its 📁 浏览目录 button opens a filesystem browser: drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, and filter the child names.\nExample: `/dir /root/proj/lib`"
@@ -3027,6 +3031,31 @@ mod tests {
         assert_eq!(
             parse_command("/help Model"),
             Some(Command::Help(Some("model".into())))
+        );
+    }
+
+    /// `/run` is a documented command, not a `Forward` prompt (ADR-0086 §1):
+    /// the index lists it, and `/help run` carries both entry points, the cap
+    /// and `--timeout`, the absent terminal and the Windows refusal.
+    #[test]
+    fn help_lists_run_and_its_topic_documents_the_terminal_contract() {
+        let text = help_text();
+        assert!(text.contains("`/run"), "the command index lists `/run`: {text}");
+        let run = command_help("run").expect("run has a help topic");
+        assert!(run.contains("/run"), "{run}");
+        assert!(run.contains("!<cmd>"), "the message prefix is documented: {run}");
+        assert!(run.contains("--timeout"), "the flag is documented: {run}");
+        assert!(
+            run.contains("10 minutes") && run.contains("24 hours"),
+            "the default cap and hard maximum are documented: {run}"
+        );
+        assert!(
+            run.contains("no pseudo-terminal") || run.contains("no terminal"),
+            "the absent terminal is documented: {run}"
+        );
+        assert!(
+            run.contains("Windows"),
+            "the Windows refusal is documented: {run}"
         );
     }
 
