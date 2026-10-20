@@ -149,22 +149,39 @@ escape soup this section refuses.
    never a heuristic over the command text. The card carries 「⏹ 终止」 while the run is live,
    and 「↻ 重跑」, 「📄 完整输出」 and 「问 AI」 once it settles; every button is dead while the
    run is live except 终止, and 终止 is dead once the run has settled or the sweep has marked
-   it lost.
+   it lost. **Every button carries the run id it was rendered for** — 「↻ 重跑」 also the
+   command, cwd and timeout, 「📄 完整输出」 the log path and 「问 AI」 the output window — so a
+   card is self-describing after a restart. A button whose run id is not the chat's current
+   record id is refused as stale, and that is what makes a redelivered rerun click single-shot:
+   the claim in decision 6 prevents overlap, but card actions carry no dedupe of their own, so
+   a duplicate arriving after a fast command has settled would otherwise claim a released slot.
 5. **The card's identity is durable; the run itself is not.** A **Terminal Run Record** — one
-   small file under cola's state directory carrying the thread key, the card's message id and
-   chat, the **Terminal Log** path, the command, the cwd, the timeout and the process ids — is
-   written once at spawn and deleted when the run settles. This is the one durable thing, and
-   it exists because neither of the existing options can serve: the **Chain Record** is
-   excluded by decision 4, and the card-handle cache drops any card with no interaction
-   block, which is exactly this card. On startup the sweep reads each record, PATCHes its card
-   to 「已失去跟踪」, and deletes the record; a persisted process id is **never signalled**,
-   because a pid may have been reused since — a lost run is reported, not adopted. This is not
-   the deferred background-task ledger: it has one write and one delete, no liveness model and
-   no takeover.
+   small file per **Chat**/**Topic** under cola's state directory, carrying the run id, the
+   card's message id and chat, the **Terminal Log** path, the command, the cwd, the timeout, the
+   process ids and the run's state (`running` / `settled` / `lost`) — is written **before the
+   child is spawned**, completed with the card's message id and the process ids once the card is
+   sent and the child is up, marked settled when the run settles, and kept until the next run
+   in that chat replaces it. The order is the guarantee: `record → spawn → card → record
+   completed` means nothing a Terminal Command starts can run without a record naming it, so no
+   child outlives cola unnoticed. A record may be incomplete in either direction — written but
+   never spawned (no pid: the sweep reports and clears it) or spawned but no card yet (no
+   message id: nothing to patch, the record is cleared and the orphan is nobody's lie). This is
+   the one durable thing, and it exists because neither of the existing options can serve: the
+   **Chain Record** is excluded by decision 4, and the card-handle cache drops any card with no
+   interaction block, which is exactly this card. Two further properties fall out of the
+   retention: a click whose run id is not the current record's is refused as stale even after
+   the run settled, and 「↻ 重跑」/「📄 完整输出」 still know their data after a restart. On
+   startup the sweep reads each record whose state is `running`, PATCHes its card to
+   「已失去跟踪」 when it has a message id, and marks it `lost`; a persisted process id is
+   **never signalled**, because a pid may have been reused since — a lost run is reported, not
+   adopted. This is not the deferred background-task ledger: it has one record per chat, no
+   liveness model and no takeover.
 6. **Serial, bounded, and killable.** One Terminal Command per **Chat**/**Topic** at a time,
    enforced by an atomic claim (the `/diff` cooldown's precedent) — a second command is
-   refused with the running card's 「⏹ 终止」 named, and the same claim makes a double-clicked
-   「↻ 重跑」 harmless. The cap is `--timeout <n>[smh]`, default ten minutes, hard maximum
+   refused with the running card's 「⏹ 终止」 named. The claim prevents *overlap*, not
+   *duplication*: idempotence is decision 4's run id, and the two together are what make a
+   double-clicked 「↻ 重跑」 single-shot even when the first rerun finished instantly. The cap
+   is `--timeout <n>[smh]`, default ten minutes, hard maximum
    twenty-four hours; flags are parsed only before the command, and `--` ends flag parsing, so
    a command may begin with `-`. The `!` form accepts no flags at all — everything after `!`
    is the command. Reaching the cap stops **tailing**, never the `wait()`: a command that exits
@@ -173,11 +190,13 @@ escape soup this section refuses.
    killed, so an extended run blocks later commands — stated, not hidden. 终止 signals the
    **process group** (`SIGTERM`, then `SIGKILL` after a grace), because killing only the
    parent leaves the compilers it spawned running.
-7. **Output volume is bounded too.** Because the child writes to a file, a runaway command can
-   fill the disk, and truncating that file does not help — the child's descriptor offset does
-   not move back, so the next write lands past a hole and the file grows again. When the
-   **Terminal Log** passes 32 MB, cola stops the run and settles the card as 「输出超限」; what
-   was written stays available for 「📄 完整输出」 under the File Message lane's own 30 MB cap.
+7. **Output volume is bounded too, below the delivery cap on purpose.** Because the child writes
+   to a file, a runaway command can fill the disk, and truncating that file does not help — the
+   child's descriptor offset does not move back, so the next write lands past a hole and the
+   file grows again. The run stops at **29 MB**, and the number is chosen so the File Message
+   lane's 30 MB cap always has headroom: any log a settled run still has is deliverable, with
+   no 31 MB hole where the output is too large to keep and too small to send. A run stopped by
+   the cap settles as 「输出超限」 with whatever was written.
 8. **The environment is inherited, minus cola's own credentials — and this is not a
    sandbox.** `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and `OPENCODE_SERVER_USERNAME`
    are stripped (the same names `discovery.rs` already strips in the other direction, with
@@ -274,8 +293,8 @@ escape soup this section refuses.
 
 - **A new card family member, a new module, and one small durable record.** The Terminal Card
   joins the command card family; execution, tail and kill live in one Host-capability module
-  shaped like `viewer` (backend-neutral, generation-neutral); the Terminal Run Record is a
-  write-once, delete-on-settle file, not a ledger.
+  shaped like `viewer` (backend-neutral, generation-neutral); the Terminal Run Record is one
+  overwritten file per Chat/Topic, not a ledger.
 - **`!` is a breaking parse change.** Messages that begin with `!` stop reaching the model.
   Bounded deliberately to the first character, and documented in `/help run`.
 - **The blast radius is the Host's own shell.** A Terminal Command can kill cola, kill the
@@ -285,7 +304,7 @@ escape soup this section refuses.
   one; the sweep settles it on the next start, the log keeps the evidence, and `/restart` is
   the way back.
 - **The Terminal Log is a new at-rest secret surface.** Temporary by design, 0700/0600,
-  capped at 32 MB per run, swept by age, and named so it can never be confused with the
+  capped at 29 MB per run, swept by age, and named so it can never be confused with the
   application log.
 - **Two launch modes behave differently, visibly.** A supervised cola has no controlling
   terminal (prompts fail fast) and takes its children with it on restart; a hand-launched one
