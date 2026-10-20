@@ -146,10 +146,13 @@ escape soup this section refuses.
    no-tty signature — `failed tty get`, `not a terminal`, `unable to start editor`, `the input
    device is not a TTY`, `No such device or address` — gains one line pointing at `tmux` or at
    the command's non-interactive flag (`top -b`, `git commit -m`); that is a fixed mapping,
-   never a heuristic over the command text. The card carries 「⏹ 终止」 while the run is live,
-   and 「↻ 重跑」, 「📄 完整输出」 and 「问 AI」 once it settles; every button is dead while the
-   run is live except 终止, and 终止 is dead once the run has settled or the sweep has marked
-   it lost. **Every button carries the run id it was rendered for** — 「↻ 重跑」 also the
+   never a heuristic over the command text. The card carries 「⏹ 终止」 for as long as the run
+   is **live**, and 「继续」 joins it once the cap is reached; 「↻ 重跑」, 「📄 完整输出」 and
+   「问 AI」 enable once the run **settles**, and stay usable on a run the sweep marked lost —
+   that is what keeps a restart from being collateral damage to the buttons. 终止, 继续 and the
+   rest are dead once the run settles; they are refused by state, not hidden, so a stale click
+   is a no-op rather than an error. **Every button carries the run id it was rendered for** —
+   「↻ 重跑」 also the
    command, cwd and timeout, 「📄 完整输出」 the log path and 「问 AI」 the output window — so a
    card is self-describing after a restart. A button whose run id is not the chat's current
    record id is refused as stale, and that is what makes a redelivered rerun click single-shot:
@@ -165,7 +168,11 @@ escape soup this section refuses.
    completed` means nothing a Terminal Command starts can run without a record naming it, so no
    child outlives cola unnoticed. A record may be incomplete in either direction — written but
    never spawned (no pid: the sweep reports and clears it) or spawned but no card yet (no
-   message id: nothing to patch, the record is cleared and the orphan is nobody's lie). This is
+   message id: nothing to patch, the record is cleared and the orphan is nobody's lie). One
+   window cannot be closed: the card id is assigned by the platform **on send**, so a crash
+   between the send and the record's completion leaves a card claiming to run with no record.
+   Nothing is running in that case; the next run in that chat replaces the record, and that one
+   card is settled by hand. Making the send and the record one act is not available. This is
    the one durable thing, and it exists because neither of the existing options can serve: the
    **Chain Record** is excluded by decision 4, and the card-handle cache drops any card with no
    interaction block, which is exactly this card. Two further properties fall out of the
@@ -186,17 +193,29 @@ escape soup this section refuses.
    a command may begin with `-`. The `!` form accepts no flags at all — everything after `!`
    is the command. Reaching the cap stops **tailing**, never the `wait()`: a command that exits
    at 10:01 still settles with its exit code, and the card offers 「继续」 (extend by the same
-   amount) and 「⏹ 终止」. The chat's slot stays claimed until the process actually exits or is
+   amount) and 「⏹ 终止」. The chat's slot stays claimed until the process group empties or is
    killed, so an extended run blocks later commands — stated, not hidden. 终止 signals the
    **process group** (`SIGTERM`, then `SIGKILL` after a grace), because killing only the
-   parent leaves the compilers it spawned running.
-7. **Output volume is bounded too, below the delivery cap on purpose.** Because the child writes
-   to a file, a runaway command can fill the disk, and truncating that file does not help — the
-   child's descriptor offset does not move back, so the next write lands past a hole and the
-   file grows again. The run stops at **29 MB**, and the number is chosen so the File Message
-   lane's 30 MB cap always has headroom: any log a settled run still has is deliverable, with
-   no 31 MB hole where the output is too large to keep and too small to send. A run stopped by
-   the cap settles as 「输出超限」 with whatever was written.
+   parent leaves the compilers it spawned running. **The run is live while its process group
+   has members, not while `sh` is alive**: `sh -c 'cargo build &'` exits at once while cargo
+   keeps writing the tree, so a run that leaves background children stays claimed, keeps its
+   「⏹ 终止」, and names the survivors on the card until the group empties. Liveness is a
+   `kill(-pgid, 0)` probe through a safe wrapper — the crate's `unsafe` ban is about its own
+   code — and never a pid read back from a record. The consequence for the documented
+   long-running escape hatch is stated: a `nohup … &` inside `/run` keeps the slot until it
+   ends, which is what "still using this tree" means.
+7. **Output volume has an observed stop threshold, and delivery never depends on it.** Because
+   the child writes to a file, a runaway command can fill the disk — and no portable safe
+   primitive bounds one descriptor's size: `RLIMIT_FSIZE` is per process and would cap the
+   command's own build artifacts too, while truncating the live file does not help because the
+   child's offset does not move back. So the cap is a **stop threshold, not a write limit**: a
+   dedicated size probe — a metadata read on a short interval of its own, not the slower render
+   tick — kills the group and settles 「输出超限」 when the log passes 29 MB. A fast producer
+   can overshoot the threshold before the probe sees it; that is stated, not hidden. What must
+   not fail is retrieval: when a log exceeds the File Message lane's 30 MB cap, 「📄 完整输出」
+   sends the first 30 MB from a bounded copy with a truncation line, so output is always
+   retrievable to the platform's own ceiling. The 29 MB threshold exists so that ordinary runs
+   — the overwhelming majority — get their whole output without truncation.
 8. **The environment is inherited, minus cola's own credentials — and this is not a
    sandbox.** `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and `OPENCODE_SERVER_USERNAME`
    are stripped (the same names `discovery.rs` already strips in the other direction, with
@@ -304,8 +323,8 @@ escape soup this section refuses.
   one; the sweep settles it on the next start, the log keeps the evidence, and `/restart` is
   the way back.
 - **The Terminal Log is a new at-rest secret surface.** Temporary by design, 0700/0600,
-  capped at 29 MB per run, swept by age, and named so it can never be confused with the
-  application log.
+  stopped at a 29 MB observed threshold, swept by age, and named so it can never be confused
+  with the application log.
 - **Two launch modes behave differently, visibly.** A supervised cola has no controlling
   terminal (prompts fail fast) and takes its children with it on restart; a hand-launched one
   can have a stopped `sudo` on the desktop and leaves orphans behind. Both are reported, never
