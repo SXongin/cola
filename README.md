@@ -44,13 +44,14 @@ read the code or the diff yourself. That is the whole surface.
 
 ## Try it
 
-About **5 minutes**, and it costs nothing: you create a free Feishu **self-built
-app** (企业自建应用) for yourself. You need:
+About **5 minutes**, and the Feishu side is free: you create a **self-built app**
+(企业自建应用) for yourself (model usage bills to whatever provider your OpenCode
+is configured with). You need:
 
 - an `opencode` binary on `PATH` (see <https://opencode.ai>) — OpenCode
-  **1.18.x (V1) and 2.0.x (V2) both work**; cola starts and manages its own
-  server, and detects which protocol the attached server speaks (the log records
-  the choice)
+  **1.18.x (V1) and 2.0.x (V2) both work**; cola attaches to the shared server,
+  starting one when none is running, and detects which protocol it speaks (the
+  log records the choice)
 - a Feishu account where you can create an app
 
 ### 1. Install
@@ -190,23 +191,23 @@ re-run `enable` if you move either. To detach from the terminal instead:
 
 - **One card per turn, updated live.** Reasoning, tool calls and the answer
   stream onto a single card with collapsible panels, a phase timer and a live
-  todo panel, so a slow turn never looks like a dead one.
+  todo panel, so a slow turn never looks like a dead one; images in a message or
+  a quoted reply ride along for vision-capable models.
 - **Decisions are two taps.** Permission requests render as
   Allow / Deny / Always buttons on the card, and questions become a
   multi-select card that accepts custom answers.
 - **See what changed, and read the code.** A finished turn with edits carries
   `N files · +A −D` and delivers the whole diff as one self-contained red/green
-  HTML file — open it anywhere, nothing to install. `/diff [--base <ref>]` does
-  it for a branch, and `/cat <path>` previews any file on the host: paged,
-  markdown/raw toggle, images and directory browsing, sendable as a file.
+  HTML file — open it anywhere, nothing to install (OpenCode 2; V1 has no
+  session diff). `/diff [--base <ref>]` does it for a branch, and `/cat <path>`
+  previews any file on the host: paged, markdown/raw toggle, images and
+  directory browsing, sendable as a file.
 - **As many sessions as you have tasks.** `/new`, `/dir <path>`, a Feishu
   `/topic` per project, `/switch` to adopt a session started elsewhere (with a
-  snapshot of what is pending), `/sub` for the subagents a turn spawned.
-- **Your sessions are shared.** Same OpenCode server and store as OpenChamber
-  and the CLI — a session started anywhere can be picked up here, and messages
-  from another client come back into Feishu.
-- **Send a screenshot.** Images in a message or a quoted reply ride along for
-  vision-capable models.
+  snapshot of what is pending), `/sub` for the subagents a turn spawned. The
+  store is shared with the CLI and OpenChamber, so a session begun anywhere
+  continues here — and messages sent from another client come back into
+  Feishu.
 - **Set it and forget it.** Private by default, autostart at boot, a singleton
   lock, restart and self-update — on Linux, macOS and Windows.
 
@@ -226,9 +227,9 @@ flowchart LR
     other <--> server
 ```
 
-cola attaches to a running `opencode serve` on the shared store and lazily starts
-its own when none is running. Because the store is shared, the same session can
-be driven from Feishu, the CLI or OpenChamber — whichever you have at hand.
+cola attaches to a running `opencode serve` on the shared store and starts one
+when none is running. Because the store is shared, the same session can be
+driven from Feishu, the CLI or OpenChamber — whichever you have at hand.
 
 ## Docs
 
