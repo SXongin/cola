@@ -147,7 +147,7 @@ pub(crate) async fn scripted_app_with(
 pub(crate) fn spawn_turn(
     app: &Arc<App>,
     context: PromptContext,
-) -> tokio::task::JoinHandle<crate::error::Result<()>> {
+) -> tokio::task::JoinHandle<crate::error::Result<crate::bridge::turn::PromptOutcome>> {
     let app = Arc::clone(app);
     tokio::spawn(async move { Turn::run(&app.turn_handles(), context).await })
 }

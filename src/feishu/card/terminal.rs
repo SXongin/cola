@@ -66,6 +66,9 @@ pub(crate) const TERMINAL_ASK_AI_LABEL: &str = "问 AI";
 pub(crate) struct TerminalFullOutput<'a> {
     /// The **Terminal Log** the 「📄 完整输出」 button delivers.
     pub(crate) log_path: &'a str,
+    /// The run every settled button names (ADR-0086 decision 4): a click for
+    /// any other id is a stale click once the run record can check it.
+    pub(crate) run_id: &'a str,
     /// The Chat/Topic the card lives in, for the click's route and in-flight
     /// claim.
     pub(crate) chat_id: &'a str,
@@ -121,7 +124,7 @@ pub(crate) struct TerminalCard<'a> {
     /// threshold (ADR-0086 decision 7). The settle line then reads 「输出超限」
     /// instead of reporting a signal.
     pub(crate) output_over_limit: bool,
-    /// The 「📄 完整输出」 button's payload, when the run settled and produced a
+    /// The settled card's button payload, when the run settled and produced a
     /// log worth retrieving.
     pub(crate) full_output: Option<TerminalFullOutput<'a>>,
     /// An outcome line the delivery PATCHes on (ADR-0086 decision 7): what was
@@ -130,14 +133,15 @@ pub(crate) struct TerminalCard<'a> {
     pub(crate) notice: Option<&'a str>,
     pub(crate) state: TerminalState<'a>,
     /// The id a click must name to be current; empty on a settled card, whose
-    /// only control is the full-output button.
+    /// buttons carry their run id through [`TerminalFullOutput`].
     pub(crate) run_id: &'a str,
     pub(crate) chat_id: &'a str,
     pub(crate) thread_id: &'a str,
 }
 
-/// Build a Terminal Card in either state. No buttons in this slice: the card is
-/// the run's surface (ADR-0086 §4 defers 终止/重跑/完整输出).
+/// Build a Terminal Card in any state: the live card carries the run controls
+/// (`⏹ 终止`, `继续` past the cap), the settled card its `📄 完整输出` and
+/// `问 AI` buttons (ADR-0086 §4).
 pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     let mut markdown = CardMarkdown::new();
     let (cwd_element, _) = fenced_element("**目录**", view.cwd, false, &mut markdown);
@@ -325,6 +329,7 @@ fn settled_buttons_row(
         json!({
             "action": "terminal",
             "op": op,
+            "run_id": view.run_id,
             "chat_id": view.chat_id,
             "thread_id": view.thread_id,
             "chat_type": chat_type,
