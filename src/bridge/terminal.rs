@@ -1,10 +1,10 @@
 //! **Terminal Commands** (ADR-0086): the Host-capability module that runs one
-//! shell command for `/run`. Backend- and generation-neutral, like the **File
-//! Viewer**'s `bridge::viewer`: this module owns execution (spawn, wait, read
-//! the **Terminal Log**), while `feishu::card::terminal` renders the **Terminal
-//! Card**. It never contacts the OpenCode server — no `ensure_server`, no
-//! prompt, no session read — so it works with `start_server = "never"` and
-//! while the server is down.
+//! shell command for `/run` and for a `!`-prefixed message. Backend- and
+//! generation-neutral, like the **File Viewer**'s `bridge::viewer`: this module
+//! owns execution (spawn, wait, read the **Terminal Log**), while
+//! `feishu::card::terminal` renders the **Terminal Card**. It never contacts the
+//! OpenCode server — no `ensure_server`, no prompt, no session read — so it works
+//! with `start_server = "never"` and while the server is down.
 //!
 //! Shape (ADR-0086 §2, §3, §13):
 //! - one `sh -c` child, cwd on the **Path Scope**'s base, stdin closed, merged
@@ -73,8 +73,21 @@ fn unsupported_reason() -> Option<&'static str> {
     Some(WINDOWS_REFUSAL)
 }
 
-/// Run one `/run` (ADR-0086 §2). `None` is the bare or refused form: answer
-/// usage and spawn nothing.
+/// The `!` entry point (ADR-0086 §1): a message whose first character is `!`
+/// and whose remainder is non-empty runs that remainder as the command. The
+/// text is already mention-stripped, and it is trimmed here, so `@cola !ls`
+/// and `  !ls` qualify. `!` is a message prefix, not a **Command**: `!` alone,
+/// `! ` and a `!` anywhere but the first character stay prose. The form takes
+/// no flags — everything after `!` is the command — so `!ls #caveman` runs the
+/// literal command and loads no **Skill**. `None` means prose.
+pub(crate) fn parse_bang(text: &str) -> Option<String> {
+    let command = text.trim().strip_prefix('!')?.trim();
+    (!command.is_empty()).then(|| command.to_string())
+}
+
+/// Run one Terminal Command (ADR-0086 §2) — the `/run` and `!` entry points
+/// alike. `None` is the bare or refused `/run` form: answer usage and spawn
+/// nothing.
 pub(crate) async fn execute(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -289,4 +302,44 @@ fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(String, bool)> {
         decoded
     };
     Ok((output, truncated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bang;
+
+    /// The `!` prefix (ADR-0086 §1): the entry point opens only at the FIRST
+    /// character, and only when a command remains. `!` alone, `! ` and a
+    /// mid-message `!` stay prose; the `!` form takes no flags, so everything
+    /// after it — a `#<id>` Skill token included — is the literal command.
+    #[test]
+    fn bang_opens_only_at_the_first_character_and_needs_a_remainder() {
+        assert_eq!(parse_bang("!ls"), Some("ls".to_string()));
+        assert_eq!(
+            parse_bang("!ls -la /tmp"),
+            Some("ls -la /tmp".to_string()),
+            "the whole remainder is the command"
+        );
+        assert_eq!(
+            parse_bang("  !ls  "),
+            Some("ls".to_string()),
+            "leading whitespace is trimmed before the check"
+        );
+        assert_eq!(
+            parse_bang("!ls #caveman"),
+            Some("ls #caveman".to_string()),
+            "the `!` form accepts no flags and no Skill scan: the token is literal"
+        );
+        assert_eq!(
+            parse_bang("!--timeout 5s echo hi"),
+            Some("--timeout 5s echo hi".to_string()),
+            "everything after `!` is the command, flags-looking words included"
+        );
+        assert_eq!(parse_bang("!"), None, "`!` alone is prose");
+        assert_eq!(parse_bang("! "), None, "`! ` with only spaces is empty");
+        assert_eq!(parse_bang("!   \t "), None, "only spaces means empty");
+        assert_eq!(parse_bang("hello !ls"), None, "a mid-message `!` is prose");
+        assert_eq!(parse_bang("ls!"), None, "a trailing `!` is prose");
+        assert_eq!(parse_bang(""), None);
+    }
 }

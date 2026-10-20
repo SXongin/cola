@@ -1507,6 +1507,30 @@ impl App {
         }
         let kind = ConversationKind::classify(&msg.chat_type, msg.thread_id.as_deref());
         let thread_key = kind.thread_key(&msg.chat_id, msg.thread_id.as_deref());
+        // A message whose first character is `!` is a **Terminal Command**, not
+        // prose and not a **Command** (ADR-0086 §1). This runs BEFORE
+        // `parse_command`: that parser scans a plain message for `#<id>` Skill
+        // tokens, so `!ls #caveman` must run the literal command rather than
+        // load a Skill. The `!` form takes no flags and no timeout, so the run
+        // uses the default cap. Every other shape (`!`, `! `, a mid-message
+        // `!`) falls through to the unchanged prompt path.
+        if let Some(command) = crate::bridge::terminal::parse_bang(&msg.text) {
+            let spec = command::RunSpec {
+                command,
+                timeout: command::RUN_DEFAULT_TIMEOUT,
+            };
+            if let Err(e) = crate::bridge::terminal::execute(
+                &self.command_handles(),
+                &thread_key,
+                &msg.message_id,
+                Some(spec),
+            )
+            .await
+            {
+                tracing::error!("Terminal: {}", e);
+            }
+            return;
+        }
         if let Some(cmd) = command::parse_command(&msg.text) {
             // Unrecognized `/command`s are forwarded as prompts. Command
             // dispatch lives on the shared core, but the prompt pipeline is the
