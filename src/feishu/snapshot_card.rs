@@ -265,7 +265,9 @@ pub fn build_snapshot_card_with_state(
     // away when its evictable sections outgrow the budget (issue #726):
     //
     // 1. the receipts first — residue for blocks another client already
-    //    resolved, not conversation;
+    //    resolved, not conversation. ADR-0038's 2026-10-20 update reconciles
+    //    this with rule 4: a receipt the snapshot does not render is absent
+    //    from this surface, never mis-targeted, and keeps its transcript home;
     // 2. then the 最近对话 tail, oldest entry first, so the newest conversation
     //    survives;
     // 3. never the claimed pending blocks. A claim whose block is dropped from
@@ -346,9 +348,36 @@ pub fn build_snapshot_card_with_state(
     floor
 }
 
-/// Whether an assembled card fits the one-shot budget Feishu accepts.
+/// Whether an assembled card fits the one-shot budgets Feishu accepts: the
+/// serialized size AND the component ceiling. Both bind independently — a tail
+/// of many title-only compaction rows is small in bytes but crosses
+/// [`crate::feishu::card::MAX_CARD_COMPONENTS`] (issue #726's review).
 fn fits_card(card: &serde_json::Value) -> bool {
     card.to_string().len() <= crate::feishu::card::MAX_CARD_JSON_CHARS
+        && card_components(card) <= crate::feishu::card::MAX_CARD_COMPONENTS
+}
+
+/// The card's component count as Feishu charges it: every body element, and
+/// every element nested inside a panel (a folded panel is a component AND its
+/// markdown chunks are components).
+fn card_components(card: &serde_json::Value) -> usize {
+    card["body"]["elements"]
+        .as_array()
+        .map(|elements| {
+            elements
+                .iter()
+                .map(|element| 1 + nested_components(element))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The components one element carries beyond itself.
+fn nested_components(element: &serde_json::Value) -> usize {
+    element["elements"]
+        .as_array()
+        .map(|children| children.iter().map(|child| 1 + nested_components(child)).sum())
+        .unwrap_or(0)
 }
 
 /// The smallest prefix omission in `0..=len` whose card fits, given that the
@@ -549,6 +578,12 @@ mod tests {
             text: text.into(),
             files: Vec::new(),
         })
+    }
+
+    /// A tail MESSAGE entry (the `tail` helper above is the same shape; this
+    /// one keeps the entry type explicit where a vector mixes entries).
+    fn tail_message(role: MessageRole, created_ms: i64, text: &str) -> TailEntry {
+        tail(role, created_ms, text)
     }
 
     fn file(name: &str) -> crate::backend::FileContent {
@@ -1241,6 +1276,69 @@ mod tests {
             s.contains("第0条短消息") && s.contains("第1条短消息"),
             "the tail is untouched while receipts can pay for the space: {s}"
         );
+    }
+
+    /// The component ceiling binds too (#726's review): 160 title-only
+    /// compaction rows are small in bytes but would cross Feishu's component
+    /// limit, so the ladder must keep evicting by COUNT. The newest entry — the
+    /// message after all the markers — is the one that survives.
+    #[test]
+    fn a_tail_of_many_component_rows_is_evicted_by_component_count() {
+        let mut tail: Vec<TailEntry> = (0..160)
+            .map(|i| {
+                TailEntry::Compaction(TailMarker {
+                    created_ms: i,
+                    compaction: compaction(crate::backend::CompactionStatus::Completed, ""),
+                })
+            })
+            .collect();
+        tail.push(tail_message(MessageRole::User, 9000, "最后一条消息"));
+        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], tail);
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let s = card.to_string();
+
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "byte budget: {}",
+            s.len()
+        );
+        assert!(
+            card_components(&card) <= crate::feishu::card::MAX_CARD_COMPONENTS,
+            "component budget: {} > {}",
+            card_components(&card),
+            crate::feishu::card::MAX_CARD_COMPONENTS
+        );
+        assert!(s.contains("条记录已省略"), "the eviction is named: {s}");
+        assert!(s.contains("最后一条消息"), "the newest entry survives: {s}");
+    }
+
+    /// An evicted prefix must not renumber the panels that remain: the ids are
+    /// positions in the FULL tail, so a claim-ack rebuild keeps the fold state
+    /// of every entry still on the card.
+    #[test]
+    fn evicted_entries_do_not_renumber_the_kept_panels() {
+        let huge = "巨".repeat(12_000);
+        let d = data(
+            Some(opencode::types::SessionStatus::Idle),
+            vec![],
+            vec![
+                tail_message(MessageRole::User, 1000, &huge),
+                tail_message(MessageRole::Assistant, 2000, &huge),
+                tail_message(MessageRole::User, 3000, "最后一条"),
+            ],
+        );
+        let card = build_snapshot_card("接管", "t", &d, None);
+        let ids: Vec<&str> = elements(&card)
+            .iter()
+            .filter_map(|element| element["element_id"].as_str())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["snap_2"],
+            "the surviving entry keeps its full-tail index"
+        );
+        assert!(card.to_string().contains("条记录已省略"), "{card}");
     }
 
     /// A card that fits is the FULL build verbatim: the budget only ever runs
