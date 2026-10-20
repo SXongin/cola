@@ -14,6 +14,9 @@
 //!   route, so a terminal hangup does not reach it;
 //! - the log lives in a 0700 directory as a 0600 file under
 //!   `~/.cola/terminal/`;
+//! - the card is posted live and patched on the render cadence while the child
+//!   runs; the settling write is last and the loop stops on it (#823,
+//!   decision 4);
 //! - Unix only: Windows refuses with a stated reason and spawns nothing
 //!   (decision 13). The kill/timeout/run-record half is later slices
 //!   (#825/#826/#827); this tracer parses `--timeout` and carries it without
@@ -22,18 +25,14 @@
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
-#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-#[cfg(unix)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
-#[cfg(unix)]
-use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
-use crate::feishu::card::terminal::{TerminalCard, build_terminal_card};
+use crate::feishu::card::terminal::{TERMINAL_TAIL_CHARS, TerminalCard, TerminalState, build_terminal_card};
 
 /// The environment names cola's child must NOT inherit (ADR-0086 §8): the
 /// server credentials cola itself holds. The same three names `discovery`
@@ -94,7 +93,7 @@ pub(crate) async fn execute(
     message_id: &str,
     spec: Option<RunSpec>,
 ) -> crate::error::Result<()> {
-    let platform = &handles.flow.platform;
+    let platform = handles.flow.platform.as_ref();
     let Some(spec) = spec else {
         platform.reply_text(message_id, RUN_USAGE).await?;
         return Ok(());
@@ -130,8 +129,8 @@ pub(crate) async fn execute(
         cwd,
         spec.timeout
     );
-    let run = match run_in(&cwd, &spec.command, &log_root).await {
-        Ok(run) => run,
+    let log = match TerminalLog::create(&log_root) {
+        Ok(log) => log,
         Err(error) => {
             // A log that cannot be created is the one failure that must not
             // spawn: there would be nowhere for the output to go.
@@ -141,38 +140,99 @@ pub(crate) async fn execute(
             return Ok(());
         }
     };
-    let card = build_terminal_card(TerminalCard {
+
+    // The live card goes out before the child exists (ADR-0086 decision 5's
+    // card → record → spawn order, with the record a later slice): the run
+    // always has a surface, and 「运行中」 is the state the loop patches.
+    let live = build_terminal_card(TerminalCard {
         cwd: &cwd,
         command: &spec.command,
-        output: &run.output,
-        output_truncated: run.output_truncated,
-        exit_code: run.exit_code,
-        spawn_error: run.spawn_error.as_deref(),
-        elapsed: run.elapsed,
+        output: "",
+        output_truncated: false,
+        state: TerminalState::Live,
     });
-    platform.reply_card(message_id, &card).await?;
+    let card_id = platform.reply_card(message_id, &live).await?;
+
+    let started = Instant::now();
+    let (mut child, spawn_error) = match spawn_in(&log, &cwd, &spec.command) {
+        Ok(child) => (Some(child), None),
+        Err(error) => {
+            // No child means no exit code; the card says why instead of
+            // freezing on 「运行中」.
+            tracing::debug!("terminal: spawn failed: {error}");
+            (None, Some(error.to_string()))
+        }
+    };
+    let mut wait_outcome = None;
+    if let Some(child) = child.as_mut() {
+        loop {
+            tokio::select! {
+                status = child.wait() => {
+                    wait_outcome = Some(status);
+                    break;
+                }
+                () = tokio::time::sleep(Duration::from_millis(
+                    handles.config.render_poll_ms(),
+                )) => {
+                    patch_live(platform, &card_id, &cwd, &spec.command, &log.path).await;
+                }
+            }
+        }
+    }
+    let (exit_code, spawn_error) = match wait_outcome {
+        Some(Ok(status)) => (status.code(), spawn_error),
+        Some(Err(error)) => (None, Some(error.to_string())),
+        // The spawn itself failed; `child` was `None` above.
+        None => (None, spawn_error),
+    };
+    let elapsed = started.elapsed();
+    let (output, output_truncated) = read_tail(&log.path, TERMINAL_TAIL_CHARS).unwrap_or_default();
+    let settled = build_terminal_card(TerminalCard {
+        cwd: &cwd,
+        command: &spec.command,
+        output: &output,
+        output_truncated,
+        state: TerminalState::Settled {
+            exit_code,
+            spawn_error: spawn_error.as_deref(),
+            elapsed,
+        },
+    });
+    // The one settling write: the loop has already stopped, and nothing is
+    // written after this.
+    platform.update_message(&card_id, &settled).await?;
     Ok(())
 }
 
-/// One run's result: how the child ended, how long it took, and the bounded
-/// tail of its Terminal Log.
-struct TerminalRun {
-    exit_code: Option<i32>,
-    spawn_error: Option<String>,
-    elapsed: Duration,
-    output: String,
-    output_truncated: bool,
+/// Patch the live card from the log's newest bytes. A failed live write is not
+/// fatal: the run continues and the settling write still lands.
+async fn patch_live(
+    platform: &dyn crate::feishu::Platform,
+    card_id: &str,
+    cwd: &str,
+    command: &str,
+    log: &Path,
+) {
+    let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
+    let card = build_terminal_card(TerminalCard {
+        cwd,
+        command,
+        output: &output,
+        output_truncated,
+        state: TerminalState::Live,
+    });
+    if let Err(error) = platform.update_message(card_id, &card).await {
+        tracing::warn!("terminal: live patch failed: {error}");
+    }
 }
 
-/// Create the run's Terminal Log, spawn the child into it, wait, and read the
-/// tail. `Err` means the log could not be created — the only failure that
-/// happens **before** a child exists.
+/// Create the run's Terminal Log, spawn the child into it. `Err` means the
+/// process could not start (missing cwd, no `sh`, …) — the card then settles
+/// with that reason.
 #[cfg(unix)]
-async fn run_in(cwd: &str, command: &str, log_root: &Path) -> std::io::Result<TerminalRun> {
-    let log = TerminalLog::create(log_root)?;
+fn spawn_in(log: &TerminalLog, cwd: &str, command: &str) -> std::io::Result<tokio::process::Child> {
     let stdout = log.writer.try_clone()?;
     let stderr = log.writer.try_clone()?;
-    let started = Instant::now();
     let mut child = tokio::process::Command::new("sh");
     child
         .arg("-c")
@@ -195,45 +255,31 @@ async fn run_in(cwd: &str, command: &str, log_root: &Path) -> std::io::Result<Te
     for name in SCRUBBED_ENV {
         child.env_remove(name);
     }
-    let status = child.status().await;
-    let elapsed = started.elapsed();
-    let (exit_code, spawn_error) = match status {
-        Ok(status) => (status.code(), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
-    let (output, output_truncated) = read_tail(&log.path, TERMINAL_TAIL_CHARS).unwrap_or_default();
-    Ok(TerminalRun {
-        exit_code,
-        spawn_error,
-        elapsed,
-        output,
-        output_truncated,
-    })
+    child.spawn()
 }
 
 /// Non-Unix hosts never reach here — [`unsupported_reason`] refuses first — but
-/// the module still has to compile there.
+/// the module still has to compile there (ADR-0086 decision 13).
 #[cfg(not(unix))]
-async fn run_in(_cwd: &str, _command: &str, _log_root: &Path) -> std::io::Result<TerminalRun> {
+fn spawn_in(_log: &TerminalLog, _cwd: &str, _command: &str) -> std::io::Result<tokio::process::Child> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         WINDOWS_REFUSAL,
     ))
 }
 
-/// The one **Terminal Log** a run writes: `~/.cola/terminal/<run-id>.log`, in a
-/// 0700 directory, created 0600 (ADR-0086 §7, §12). It is command output, where
+/// The one **Terminal Log** a run writes: `<root>/<run-id>.log`, in a 0700
+/// directory, created 0600 (ADR-0086 §7, §12). It is command output, where
 /// credentials leak, so the directory is cola's own and the file is private.
-#[cfg(unix)]
 struct TerminalLog {
     path: PathBuf,
     writer: std::fs::File,
 }
 
-#[cfg(unix)]
 impl TerminalLog {
     fn create(root: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(root)?;
+        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             // Set explicitly: `create_dir_all` under the usual umask makes a
@@ -243,6 +289,7 @@ impl TerminalLog {
         let path = root.join(format!("{}.log", run_id()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
+        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
@@ -263,7 +310,6 @@ fn default_terminal_root() -> Option<PathBuf> {
 /// A process-unique run id for the log's name: the wall clock plus a counter,
 /// so two commands in the same nanosecond cannot collide. The durable **Terminal
 /// Run Record** (#827) will carry the same id.
-#[cfg(unix)]
 fn run_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -275,11 +321,12 @@ fn run_id() -> String {
     )
 }
 
-/// The newest `max_chars` characters of `path`, and whether anything was cut.
+/// The newest window of `path`, and whether the log is longer than that window.
 /// UTF-8 is at most four bytes per character, so a window of `4 * max_chars`
-/// bytes always holds enough; lossy decoding keeps a non-UTF-8 log readable
-/// (ADR-0086 §4). The live tail's line and `\r` handling arrives with #823.
-#[cfg(unix)]
+/// bytes always holds enough for the display tail's own budget; lossy decoding
+/// keeps a non-UTF-8 log readable (ADR-0086 §4). The window is returned
+/// **raw**: `\r` collapsing, line caps and ANSI stripping are the card's
+/// display concerns, so the per-line cap can still see a whole long line.
 fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -292,16 +339,7 @@ fn read_tail(path: &Path, max_chars: usize) -> std::io::Result<(String, bool)> {
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let decoded = String::from_utf8_lossy(&bytes).into_owned();
-    let truncated = start > 0 || decoded.chars().count() > max_chars;
-    let output = if truncated {
-        let mut tail: Vec<char> = decoded.chars().rev().take(max_chars).collect();
-        tail.reverse();
-        tail.into_iter().collect()
-    } else {
-        decoded
-    };
-    Ok((output, truncated))
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), start > 0))
 }
 
 #[cfg(test)]
