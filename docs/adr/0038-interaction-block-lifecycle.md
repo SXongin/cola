@@ -201,3 +201,23 @@ owning session id, so a restarted process can classify it too. An empty owner
 (a record written before the id was persisted) is UNKNOWN and keeps the
 neutral copy. Snapshot claims (ADR-0028) and a late click's 404 card keep
 their existing line.
+
+## Update (2026-10-20)
+
+Rule 4's receipts yield to the Session Snapshot's one-shot card budget (#726).
+A snapshot has no splitter, so when its 最近对话 tail plus its receipts cannot
+fit one Feishu card, the OLDEST receipts are omitted first — their count named
+on the card (`…更早的 N 条处理回执已省略（超出单卡容量）`) — and then the oldest
+tail entries, the same way.
+
+The rule's requirement is about a receipt's CONTENT, not its permanence on a
+one-shot surface: every receipt the snapshot renders still names its target in
+one markdown line, the omitted ones keep their home in the session transcript,
+and an unrendered receipt is absent rather than mis-targeted — the ambiguity
+rule 4 exists to prevent cannot arise. Receipts are evicted before the
+conversation because they are residue for blocks another client already
+resolved, while the tail is what an adopting reader came for.
+
+The snapshot's claimed pending blocks are NOT evictable: a claim whose block
+the card does not render leaves a request the user can no longer answer there.
+If those alone outgrow one card it is reported, not silently traded (#841).
