@@ -523,17 +523,21 @@ fn display_line(line: &str) -> String {
 
 /// Remove ANSI escape sequences and other control characters from display
 /// text, keeping tabs (a code block's indentation). The Terminal Log keeps the
-/// original bytes.
+/// original bytes. This is the char-level pass: the raw 8-bit C1 controls are
+/// not valid UTF-8 and are stripped on the bytes by [`decode_log_bytes`], which
+/// is where a log window is turned into text.
 fn strip_ansi_and_control(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\u{1b}' => skip_escape(&mut chars),
-            // The 8-bit C1 introducers some programs emit instead of ESC:
-            // CSI, OSC, DCS, SOS, PM and APC respectively.
+            // The 8-bit C1 introducers, in their UTF-8 two-byte form (a raw
+            // `0x9b` never reaches this pass — see `strip_raw_c1`): CSI, OSC,
+            // DCS, SOS, PM and APC respectively.
             '\u{9b}' => skip_csi(&mut chars),
-            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
+            '\u{9d}' => skip_string(&mut chars, true),
+            '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars, false),
             '\t' => out.push('\t'),
             c if c.is_control() => {}
             c => out.push(c),
@@ -548,10 +552,13 @@ fn strip_ansi_and_control(input: &str) -> String {
 fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     match chars.next() {
         Some('[') => skip_csi(chars),
-        // Every string control carries an opaque payload terminated by ST
-        // (`ESC \`); treating only OSC as a string left a DCS payload such as
-        // `ESC P1;2|payload ESC \` visible on the card.
-        Some(']' | 'P' | 'X' | '^' | '_') => skip_string(chars),
+        // OSC is the one string control some programs end with BEL, and it is
+        // the only one that accepts it (#823b).
+        Some(']') => skip_string(chars, true),
+        // DCS, SOS, PM and APC carry an opaque payload terminated by ST
+        // (`ESC \`) only. Treating them as OSC — or as nothing — left the
+        // payload such as `ESC P1;2|payload ESC \` visible on the card.
+        Some('P' | 'X' | '^' | '_') => skip_string(chars, false),
         Some('(' | ')' | '*' | '+' | '-' | '.' | '/' | '#' | '%') => {
             chars.next();
         }
@@ -568,11 +575,13 @@ fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Skip a string-control payload (OSC/DCS/SOS/PM/APC) up to ST — `ESC \` or
-/// the 8-bit `0x9C` — or the BEL some terminals accept as a terminator.
-fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+/// Skip a string-control payload up to ST — `ESC \` or the 8-bit `0x9c`.
+/// `bel_ends` is the OSC exception (#823b): some programs terminate an OSC with
+/// BEL, and only OSC accepts it — a DCS/SOS/PM/APC payload may legitimately
+/// contain one, so BEL there must not end the skip.
+fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, bel_ends: bool) {
     while let Some(c) = chars.next() {
-        if c == '\u{7}' || c == '\u{9c}' {
+        if c == '\u{9c}' || (bel_ends && c == '\u{7}') {
             break;
         }
         if c == '\u{1b}' && chars.peek() == Some(&'\\') {
@@ -580,6 +589,98 @@ fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
             break;
         }
     }
+}
+
+/// Decode one window of **Terminal Log** bytes into display text (#823a).
+///
+/// The raw 8-bit C1 introducers (`0x90`, `0x9b`, `0x9d`, …) are not valid
+/// UTF-8, so `String::from_utf8_lossy` folds each into U+FFFD before
+/// [`strip_ansi_and_control`] can see it — and the sequence's payload then
+/// renders as ordinary text. Their introducer bytes are recognised here, on the
+/// bytes, and their payload is skipped; the rest is decoded lossily exactly as
+/// before.
+pub(crate) fn decode_log_bytes(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(&strip_raw_c1(bytes)).into_owned()
+}
+
+/// Strip the raw 8-bit C1 controls from one window of log bytes (#823a).
+///
+/// C1 introducers are continuation-range bytes, so they can never start a
+/// character: the decision is made per byte only where no valid UTF-8 character
+/// starts. A log that carries the controls in their UTF-8 two-byte form
+/// (`0xC2 0x9B`) stays whole here and is handled by the char-level pass, which
+/// is also where every other control is removed.
+fn strip_raw_c1(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(len) = utf8_char_len(bytes, i) {
+            out.extend_from_slice(&bytes[i..i + len]);
+            i += len;
+            continue;
+        }
+        match byte {
+            // CSI: its parameters, up to and including the final byte.
+            0x9b => i = skip_csi_bytes(bytes, i + 1),
+            // OSC, DCS, SOS, PM and APC: the opaque payload up to ST. BEL ends
+            // OSC only, the same rule as the char-level pass (#823b).
+            0x90 | 0x98 | 0x9d | 0x9e | 0x9f => i = skip_string_bytes(bytes, i + 1, byte == 0x9d),
+            // A stray C1 control — a terminator whose introducer was already
+            // consumed, PAD, NEL, …: a control character, never content, so it
+            // is dropped exactly as the char-level pass drops a control.
+            0x80..=0x9f => i += 1,
+            // Any other byte that starts no character: keep the replacement
+            // character the lossy decode would have produced, so nothing
+            // textual silently changes size or meaning.
+            _ => {
+                out.extend_from_slice("\u{fffd}".as_bytes());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The length of the valid UTF-8 character starting at `i`, or `None` when the
+/// byte there starts no complete character (an invalid or truncated sequence).
+fn utf8_char_len(bytes: &[u8], i: usize) -> Option<usize> {
+    let len = match bytes[i] {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return None,
+    };
+    let slice = bytes.get(i..i.checked_add(len)?)?;
+    std::str::from_utf8(slice).is_ok().then_some(len)
+}
+
+/// Skip a raw C1 CSI sequence (`0x9b`): its parameters up to and including the
+/// final byte (`0x40`–`0x7e`), the same rule as [`skip_csi`].
+fn skip_csi_bytes(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() {
+        let byte = bytes[i];
+        i += 1;
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    i
+}
+
+/// Skip a raw C1 string-control payload up to ST — `0x9c` or `ESC \` — with the
+/// OSC-only BEL terminator, the same rule as [`skip_string`].
+fn skip_string_bytes(bytes: &[u8], mut i: usize, bel_ends: bool) -> usize {
+    while i < bytes.len() {
+        match bytes[i] {
+            0x9c => return i + 1,
+            0x07 if bel_ends => return i + 1,
+            0x1b if bytes.get(i + 1) == Some(&b'\\') => return i + 2,
+            _ => i += 1,
+        }
+    }
+    i
 }
 
 /// The settle line's elapsed label: milliseconds under a second (a quick
@@ -860,6 +961,45 @@ mod tests {
             chat_id: "",
             thread_id: "",
         })
+    }
+
+    /// #823a: a raw C1 introducer is not valid UTF-8, so the lossy decode used
+    /// to fold it into U+FFFD before the char pass — and everything the
+    /// introducer carried rendered as text. The byte pass strips each raw
+    /// string control with its payload; the char pass keeps handling the UTF-8
+    /// form, which is valid bytes and must survive the byte pass untouched.
+    #[test]
+    fn a_raw_c1_string_control_is_stripped_with_its_payload() {
+        let raw: &[u8] = b"before\x90dcs-payload\x9cafter\x9b31mcolour\x9dosc-title\x9cextra";
+        assert_eq!(decode_log_bytes(raw), "beforeaftercolourextra");
+
+        assert_eq!(decode_log_bytes("héllo 世界".as_bytes()), "héllo 世界");
+        assert_eq!(
+            decode_log_bytes("a\u{90}b\u{9c}c".as_bytes()),
+            "a\u{90}b\u{9c}c",
+            "the UTF-8 two-byte form is the char pass's job"
+        );
+        assert_eq!(strip_ansi_and_control("\u{90}hidden\u{9c}shown"), "shown");
+        assert_eq!(strip_ansi_and_control("\u{9d}title\u{9c}shown"), "shown");
+        // A stray C1 byte is a control, not content: dropped, never U+FFFD.
+        assert_eq!(decode_log_bytes(b"a\x9cb\x85c"), "abc");
+    }
+
+    /// #823b: BEL ends an OSC only. A DCS/SOS/PM/APC payload may contain one,
+    /// and treating it as a terminator left the rest of that payload visible.
+    #[test]
+    fn bel_ends_only_an_osc_string_control() {
+        assert_eq!(strip_ansi_and_control("\u{1b}]0;title\u{7}visible"), "visible");
+        assert_eq!(
+            strip_ansi_and_control("\u{1b}P1;2|payload\u{7}more\u{1b}\\visible"),
+            "visible"
+        );
+        for introducer in ['X', '^', '_'] {
+            let input = format!("\u{1b}{introducer}payload\u{7}more\u{1b}\\visible");
+            assert_eq!(strip_ansi_and_control(&input), "visible", "{introducer}");
+        }
+        // The raw byte form follows the same rule.
+        assert_eq!(decode_log_bytes(b"a\x90payload\x07still\x9cb"), "ab");
     }
 
     /// #822: the cwd and the command are clipped to the per-element budget, and
