@@ -24,8 +24,8 @@ Release smoke test (run it in a real Feishu chat; CONTRIBUTING.md has the how-to
   2. With /autoaccept off, trigger a tool permission: the permission card's
      允许一次 / 始终允许 / 拒绝 buttons round-trip and the answer reaches the tool.
   3. Trigger the question tool: the question card's buttons round-trip.
-  4. In a group, @cola /topic: the topic is created and shows up in the
-     group's topic list.
+  4. /cat <a few-hundred-line file>: the viewer card renders, the pager and
+     重新读取 / 发送为文件 round-trip.
   5. /model: the model picker card appears.
   6. /dir <non-git directory>: the session starts without error.";
 

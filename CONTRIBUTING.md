@@ -393,8 +393,8 @@ needed:
    tool.
 3. **Question tool** — ask the agent to use the `question` tool. The question
    card's buttons round-trip and the turn continues with the chosen answer.
-4. **`/topic` in a group** — @ the bot with `/topic`. The topic is created, it
-   shows up in the group's topic list, and its cover card is the topic root.
+4. **`/cat`** — send `/cat <a file of a few hundred lines>`. The viewer card
+   renders with its pager, and 「重新读取」 / 「发送为文件」 round-trip.
 5. **`/model`** — the model picker card appears, and a picked model shows in
    the next message's footer.
 6. **`/dir <non-git directory>`** — the session starts there without error.
