@@ -49,7 +49,7 @@ honour.
   feature is V2-only.
 - **The click re-reads the same source.** It requests `context = 3` for the
   artifact's hunks. A successful empty answer says
-  「这个 turn 没有留下净改动。」; a failed read says
+  「本轮期间工作区没有留下净变化。」; a failed read says
   「暂时读不到终态改动，请稍后再试。」 and stays retryable. A legacy V1
   button — from the unreleased feature's cards — lands on the same
   read-failure answer rather than a special case.
@@ -85,3 +85,28 @@ honour.
   ending is never blocked on the read.
 - `#797` decisions 6 and 8 and `#477`'s live-index rule are amended by this
   ADR.
+
+## Amendment — 2026-10-21 (#844): the copy names the measurement
+
+`session.diff` diffs two **worktree** snapshots taken at the Turn's step
+boundaries (the working copy when the Session is still active), so its answer
+is "the worktree changed between T0 and T1". It is not an authorship claim:
+another session in the same directory (a sibling chat, a `task` child, a
+background shell), an editor, or a `git merge` inside the window lands in the
+same diff, and neither the API nor the bridge records write provenance. The
+overlap is undetectable in general — the writers can both be idle by settle
+time — so no active-session heuristic can restore attribution.
+
+The index and the artifact therefore keep the same single source (the decision
+above is unchanged) but stop claiming the Turn wrote the files:
+
+- the card line is `📝 本轮期间工作区变化 · N files · +A −D`;
+- the button is `🔍 查看完整变化`;
+- the artifact title is 「本轮期间的工作区变化」 and its subtitle ends with
+  「快照区间差，可能含同目录其他写入者」;
+- an empty answer says 「本轮期间工作区没有留下净变化。」
+
+The counts, the terminal-card gate, the 5 s bound and the "authority or
+nothing" rule are untouched. A future source with per-write provenance (an
+upstream turn-attribution API) is what would let the copy claim authorship
+again.

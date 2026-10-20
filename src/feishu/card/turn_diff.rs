@@ -1,20 +1,25 @@
 //! The Turn card's change index (spec #797, ticket #477; ADR-0087).
 //!
-//! A Turn that changed files gets one markdown line — `📝 本次改动 · N files ·
-//! +A −D` — and one button — `🔍 查看完整改动` — in its terminal card's tail,
-//! after the tool panels and before the footer. The line is only an index: the
-//! complete red/green diff is the HTML artifact (spec decision 1), so no patch
-//! body ever rides the card.
+//! A Turn whose window saw the worktree change gets one markdown line — `📝
+//! 本轮期间工作区变化 · N files · +A −D` — and one button — `🔍 查看完整变化` —
+//! in its terminal card's tail, after the tool panels and before the footer.
+//! The line is only an index: the complete red/green diff is the HTML artifact
+//! (spec decision 1), so no patch body ever rides the card.
 //!
-//! **The index is not an estimate.** The counts come from the SAME read the
-//! click's artifact comes from, resolved ONCE at the Turn's settle
+//! **The index is not an estimate, and it does not claim authorship.** The
+//! counts come from the SAME read the click's artifact comes from, resolved
+//! ONCE at the Turn's settle
 //! ([`settle_turn_diff_stats`](crate::bridge::turn_diff::settle_turn_diff_stats)):
-//! V2's `session.diff` scoped to the Turn. A Turn whose read answers empty or
-//! fails renders neither element. #477's card used to fold the tool aggregation
-//! on both generations while the click read `session.diff`, so the line could
-//! claim a change the artifact then denied (issue #830); the aggregation is
-//! gone. The price is liveness: there is no turn-level count while the Turn
-//! runs.
+//! V2's `session.diff` scoped to the Turn. That read diffs two **worktree**
+//! snapshots, so a concurrent writer in the same directory (another session, an
+//! editor, a git operation) lands in it too; the API carries no write
+//! provenance. The copy therefore names the measurement — the worktree's change
+//! during the Turn — never "what this Turn changed" (issue #844). A Turn whose
+//! read answers empty or fails renders neither element. #477's card used to
+//! fold the tool aggregation on both generations while the click read
+//! `session.diff`, so the line could claim a change the artifact then denied
+//! (issue #830); the aggregation is gone. The price is liveness: there is no
+//! turn-level count while the Turn runs.
 //!
 //! The button's payload names the Turn by its
 //! [`TurnAnchor`](crate::backend::TurnAnchor) user message (`from`), which is
@@ -37,7 +42,7 @@ use crate::backend::TurnDiffStats;
 
 /// The button's copy. Named once so the tests and the estimate cannot read a
 /// different string from the render.
-pub(crate) const TURN_DIFF_BUTTON_TEXT: &str = "🔍 查看完整改动";
+pub(crate) const TURN_DIFF_BUTTON_TEXT: &str = "🔍 查看完整变化";
 
 /// The callback op that names this button's click (`op: "turn_diff"`).
 pub(crate) const TURN_DIFF_OP: &str = "turn_diff";
@@ -53,7 +58,7 @@ pub(crate) fn index_components() -> usize {
 /// is captured at the Turn's settle, never estimated while the Turn runs.
 pub(crate) fn index_line(stats: TurnDiffStats) -> String {
     format!(
-        "📝 本次改动 · {} files · +{} −{}",
+        "📝 本轮期间工作区变化 · {} files · +{} −{}",
         stats.files, stats.additions, stats.deletions
     )
 }
@@ -115,10 +120,10 @@ mod tests {
     /// reads like the artifact's counts.
     #[test]
     fn the_index_line_names_the_files_and_line_counts() {
-        assert_eq!(index_line(stats()), "📝 本次改动 · 2 files · +3 −1");
+        assert_eq!(index_line(stats()), "📝 本轮期间工作区变化 · 2 files · +3 −1");
         assert_eq!(
             index_line(TurnDiffStats::default()),
-            "📝 本次改动 · 0 files · +0 −0"
+            "📝 本轮期间工作区变化 · 0 files · +0 −0"
         );
     }
 

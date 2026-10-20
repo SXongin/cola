@@ -1064,7 +1064,7 @@ async fn external_message_reply_renders_into_notification_card() {
     // ADR-0087: the out-of-turn (external follow) ending resolves the same
     // terminal index as a normal Turn — the shared seam, not only `finish`.
     assert!(
-        text.contains("📝 本次改动 · 1 files · +2 −1"),
+        text.contains("📝 本轮期间工作区变化 · 1 files · +2 −1"),
         "the followed run's terminal card carries the settle index: {text}"
     );
 

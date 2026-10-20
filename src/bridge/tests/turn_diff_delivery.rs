@@ -1,4 +1,4 @@
-//! The Turn card's 「查看完整改动」 callback (spec #797, ticket #801).
+//! The Turn card's 「查看完整变化」 callback (spec #797, ticket #801).
 //!
 //! A click is acknowledged immediately and the diff is fetched, rendered and
 //! delivered off the callback path as exactly ONE File Message. These tests
@@ -283,7 +283,7 @@ async fn an_empty_turn_replies_text_once_and_sends_no_file() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "这个 turn 没有留下净改动。").await;
+    wait_for_reply_containing(&platform, "本轮期间工作区没有留下净变化。").await;
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
@@ -292,7 +292,7 @@ async fn an_empty_turn_replies_text_once_and_sends_no_file() {
         .host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("a repeated click is acknowledged");
-    assert_eq!(repeated.toast.as_deref(), Some("这个 turn 没有留下净改动。"));
+    assert_eq!(repeated.toast.as_deref(), Some("本轮期间工作区没有留下净变化。"));
     assert_eq!(
         backend.session_diff_calls.lock().await.len(),
         1,
@@ -535,10 +535,10 @@ async fn the_terminal_card_index_is_the_settle_session_diff_read() {
     let card = cards
         .iter()
         .rev()
-        .find(|card| card_text(card).contains("📝 本次改动"))
+        .find(|card| card_text(card).contains("📝 本轮期间工作区变化"))
         .unwrap_or_else(|| panic!("the terminal card carries the settled index: {cards:?}"));
     assert!(
-        card_text(card).contains("📝 本次改动 · 1 files · +2 −1"),
+        card_text(card).contains("📝 本轮期间工作区变化 · 1 files · +2 −1"),
         "the index is the server's counts: {card}"
     );
     let button = card["body"]["elements"]
@@ -620,7 +620,9 @@ async fn an_empty_settle_read_leaves_the_terminal_card_without_an_index() {
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.updated_cards().await);
     assert!(
-        cards.iter().all(|card| !card_text(card).contains("📝 本次改动")),
+        cards
+            .iter()
+            .all(|card| !card_text(card).contains("📝 本轮期间工作区变化")),
         "an empty authoritative answer renders no index: {cards:?}"
     );
     assert_eq!(
@@ -713,7 +715,9 @@ async fn a_failed_settle_read_leaves_the_terminal_card_without_an_index() {
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.updated_cards().await);
     assert!(
-        cards.iter().all(|card| !card_text(card).contains("📝 本次改动")),
+        cards
+            .iter()
+            .all(|card| !card_text(card).contains("📝 本轮期间工作区变化")),
         "a failed read renders no index: {cards:?}"
     );
     assert_eq!(
@@ -749,7 +753,9 @@ async fn a_v1_turn_terminates_without_an_index() {
     let mut cards = platform.sent_cards().await;
     cards.extend(platform.updated_cards().await);
     assert!(
-        cards.iter().all(|card| !card_text(card).contains("📝 本次改动")),
+        cards
+            .iter()
+            .all(|card| !card_text(card).contains("📝 本轮期间工作区变化")),
         "a V1 terminal card renders no index: {cards:?}"
     );
     assert_eq!(

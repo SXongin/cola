@@ -519,7 +519,7 @@ async fn a_completion_wake_resumes_the_yielded_card_in_place() {
     // ADR-0087: the out-of-turn (Wake) ending resolves the same terminal index
     // as a normal Turn — the shared seam, not only `finish`.
     assert!(
-        card_text(&last).contains("📝 本次改动 · 1 files · +2 −1"),
+        card_text(&last).contains("📝 本轮期间工作区变化 · 1 files · +2 −1"),
         "the resumed terminal card carries the settle index: {last}"
     );
 

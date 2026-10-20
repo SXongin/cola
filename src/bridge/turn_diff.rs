@@ -1,13 +1,19 @@
 //! The Turn Diff index: one read, at the Turn's settle (spec #797, ticket
 //! #477; ADR-0087).
 //!
-//! The card's `📝 本次改动 · N files · +A −D` line and its complete-diff button
-//! read the SAME source as the click's HTML artifact: V2's
-//! `session.diff` scoped by the Turn's user-message anchor. [`settle_turn_diff_stats`]
-//! is that one read. It runs at a terminal ending, outside every card lock,
-//! bounded by the caller; a non-empty answer is the index and an empty answer,
-//! a failure or a timeout is no index at all. The card therefore never claims a
-//! change the artifact cannot show (issue #830).
+//! The card's `📝 本轮期间工作区变化 · N files · +A −D` line and its
+//! complete-diff button read the SAME source as the click's HTML artifact: V2's
+//! `session.diff` scoped by the Turn's user-message anchor.
+//! [`settle_turn_diff_stats`] is that one read. It runs at a terminal ending,
+//! outside every card lock, bounded by the caller; a non-empty answer is the
+//! index and an empty answer, a failure or a timeout is no index at all. The
+//! card therefore never claims a change the artifact cannot show (issue #830).
+//!
+//! The read diffs two **worktree** snapshots, so the numbers are the worktree's
+//! change during the Turn's window, not an authorship claim: a concurrent
+//! session, an editor or a git operation in the same directory lands in the
+//! same diff, and the API has no write provenance to tell them apart (#844).
+//! The copy names that measurement, and the artifact's subtitle repeats it.
 //!
 //! **V2-only.** V1 has no `session.diff` endpoint, so it has no Turn Diff at
 //! all: no index, no button, no artifact fallback. #800's tool-metadata

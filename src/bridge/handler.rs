@@ -282,7 +282,7 @@ impl Drop for TurnDiffClaim {
 /// What a click answers when the authoritative read is empty: the index existed
 /// at settle, so the Turn's net change has gone to zero since (usually an edit
 /// reverted later). ADR-0087.
-const TURN_DIFF_EMPTY_TEXT: &str = "这个 turn 没有留下净改动。";
+const TURN_DIFF_EMPTY_TEXT: &str = "本轮期间工作区没有留下净变化。";
 
 /// What a failed Turn Diff READ answers (a transient error, a server restart or
 /// a snapshot the server cannot answer). The claim is dropped, so a later click
@@ -294,8 +294,14 @@ const TURN_DIFF_READ_FAILURE_TEXT: &str = "暂时读不到终态改动，请稍�
 /// definite failure is not retried to the caller's timeout.
 const TURN_DIFF_FAILURE_TEXT: &str = "生成完整 diff 失败，请稍后重试。";
 
-/// The artifact's `title`: what the reader opens from the Turn card.
-const TURN_DIFF_TITLE: &str = "本次改动的完整 diff";
+/// The artifact's `title`: what the reader opens from the Turn card. It names
+/// the measurement — the worktree's change during the Turn — because the diff
+/// cannot say who wrote it (#844).
+const TURN_DIFF_TITLE: &str = "本轮期间的工作区变化";
+
+/// The artifact subtitle's closing note: the diff compares two worktree
+/// snapshots, so concurrent writers in the same directory are included.
+const TURN_DIFF_SCOPE_NOTE: &str = "快照区间差，可能含同目录其他写入者";
 
 /// The artifact header's time when the transcript read failed: the diff is
 /// still usable, so the header states the gap instead of failing the click.
@@ -899,6 +905,8 @@ fn turn_diff_document(
         subtitle.push_str(" · ");
         subtitle.push_str(&click.directory);
     }
+    subtitle.push_str(" · ");
+    subtitle.push_str(TURN_DIFF_SCOPE_NOTE);
     crate::backend::DiffDocument::from_turn_diff(diff.clone(), TURN_DIFF_TITLE, subtitle)
 }
 
@@ -2311,7 +2319,7 @@ impl App {
         let (session_id, thread_key) = self.card_action_span_context(&value).await;
         let action_span = span::action(session_id.as_deref(), thread_key.as_ref());
         let dispatch = async {
-            // The Turn card's 「🔍 查看完整改动」 carries `op` and NO `action`
+            // The Turn card's 「🔍 查看完整变化」 carries `op` and NO `action`
             // (#477/spec #797): route it before the action match, without
             // widening the button's exact four-key payload.
             if op == crate::feishu::card::turn_diff::TURN_DIFF_OP {
@@ -4502,7 +4510,7 @@ impl App {
         })
     }
 
-    /// Handle the Turn card's 「🔍 查看完整改动」 click (spec #797, ticket #801).
+    /// Handle the Turn card's 「🔍 查看完整变化」 click (spec #797, ticket #801).
     ///
     /// Feishu's card callback has a 3 s, no-retry budget (ADR-0078) and a diff
     /// fetch + HTML upload cannot fit it, so the click claims the Turn, spawns
@@ -5646,8 +5654,8 @@ impl App {
 #[cfg(test)]
 mod turn_diff_delivery_helpers {
     use super::{
-        TURN_DIFF_TITLE, TurnDiffClick, TurnDiffSendState, turn_diff_document, turn_diff_file_name,
-        turn_diff_state_toast,
+        TURN_DIFF_SCOPE_NOTE, TURN_DIFF_TITLE, TurnDiffClick, TurnDiffSendState, turn_diff_document,
+        turn_diff_file_name, turn_diff_state_toast,
     };
     use crate::backend::{TurnDiff, TurnDiffFile};
 
@@ -5672,7 +5680,8 @@ mod turn_diff_delivery_helpers {
 
     /// #798's header wants the Turn's time between the title and the stats;
     /// the subtitle carries it, in the card's own date + clock idiom, plus the
-    /// Turn's identity (ADR-0087: one V2 source, so no provenance marker).
+    /// Turn's identity and the scope note: `session.diff` is a worktree range,
+    /// not an authorship claim (#844).
     #[test]
     fn the_document_header_carries_the_turn_time_and_identity() {
         let anchor_ms = crate::feishu::card::test_local_ms(2026, 10, 19, 14, 30);
@@ -5687,6 +5696,11 @@ mod turn_diff_delivery_helpers {
         assert!(document.subtitle.contains("ses_1"));
         assert!(document.subtitle.contains("msg_user_1"));
         assert!(document.subtitle.contains("/repo/cola"));
+        assert!(
+            document.subtitle.ends_with(TURN_DIFF_SCOPE_NOTE),
+            "the scope note closes the subtitle: {}",
+            document.subtitle
+        );
         let html = crate::backend::render_diff_html(&document);
         assert!(
             html.contains("10-19 14:30"),
