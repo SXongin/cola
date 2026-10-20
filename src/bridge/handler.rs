@@ -1563,7 +1563,8 @@ impl App {
         else {
             return;
         };
-        let removed = crate::bridge::terminal::sweep_logs(&root, self.terminal_log_days);
+        let removed =
+            crate::bridge::terminal::sweep_logs(&root, self.terminal_log_days, &self.terminal_records);
         if removed > 0 {
             tracing::info!(
                 "terminal: swept {removed} log(s) older than {} day(s)",
@@ -5885,6 +5886,19 @@ impl App {
                 return Some(CardActionResult {
                     card: None,
                     toast: Some("这张终端卡片的操作已过期。".to_string()),
+                });
+            }
+            // The durable authority is unreadable and this process never ran
+            // the command: nothing can prove the card current, so refuse rather
+            // than hand old output to the model (#827 review, finding 1). The
+            // toast says which failure it is, so the reader knows to re-run.
+            crate::bridge::terminal::AskAiClaim::Unverifiable => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(
+                        "⚠️ 找不到这次运行的记录，无法确认它是否仍是最新的，因此没有提交（避免把旧输出交给 AI）。"
+                            .to_string(),
+                    ),
                 });
             }
         };

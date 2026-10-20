@@ -36,6 +36,15 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::sidecar;
 use crate::config::ThreadKey;
 
+/// The most a record file may contain and still be parsed. A record is a few
+/// hundred bytes of metadata, but its command is whatever the Host typed (a
+/// Feishu message's own bound is far below this), and the file is read inside a
+/// card callback, so the read is bounded rather than trusting the filesystem
+/// (CODING_STANDARDS: bound filesystem work in callbacks). Past this size the
+/// record is treated as unreadable — the guards then refuse, and the sweep
+/// leaves it alone.
+const TERMINAL_RECORD_MAX_BYTES: u64 = 128 * 1024;
+
 /// What a run's record says about the run itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -129,18 +138,45 @@ impl TerminalRunRecords {
 
     /// The chat's current record. Missing, unreadable or corrupt all read as
     /// "none": a record only feeds a restart's recovery and a stale-click
-    /// check, so a broken one must never wedge the click or the startup.
+    /// check, so a broken one must never wedge the click or the startup. A
+    /// caller that cannot tell "no record" from "the run is replaced" must fail
+    /// closed (see [`AskAiGuard`](crate::bridge::terminal::AskAiGuard) and
+    /// [`is_current`](Self::is_current)).
     pub(crate) fn read(&self, key: &ThreadKey) -> Option<TerminalRunRecord> {
-        let path = self.path(key);
-        let raw = match std::fs::read_to_string(&path) {
-            Ok(raw) => raw,
+        Self::load_file(&self.path(key))
+    }
+
+    /// Read and parse one record file — the one implementation both
+    /// [`read`](Self::read) and [`load_all`](Self::load_all) use, so the bound,
+    /// the fail-open rule and the warnings cannot drift apart.
+    ///
+    /// The read is **bounded** to [`TERMINAL_RECORD_MAX_BYTES`]: this runs
+    /// synchronously in a card callback for the stale-click guards, so it must
+    /// not grow with whatever sits at the path.
+    fn load_file(path: &Path) -> Option<TerminalRunRecord> {
+        use std::io::Read;
+
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
             Err(e) => {
                 tracing::warn!("terminal record: could not read {}: {e}", path.display());
                 return None;
             }
         };
-        match serde_json::from_str(&raw) {
+        let mut raw = Vec::new();
+        if let Err(e) = file.take(TERMINAL_RECORD_MAX_BYTES + 1).read_to_end(&mut raw) {
+            tracing::warn!("terminal record: could not read {}: {e}", path.display());
+            return None;
+        }
+        if raw.len() as u64 > TERMINAL_RECORD_MAX_BYTES {
+            tracing::warn!(
+                "terminal record: {} is larger than the {TERMINAL_RECORD_MAX_BYTES}-byte bound; ignoring it",
+                path.display()
+            );
+            return None;
+        }
+        match serde_json::from_slice(&raw) {
             Ok(record) => Some(record),
             Err(e) => {
                 tracing::warn!("terminal record: could not parse {}: {e}", path.display());
@@ -178,7 +214,8 @@ impl TerminalRunRecords {
         }
     }
 
-    /// Every record on disk — the startup sweep's input. A corrupt file is
+    /// Every record on disk — the startup sweep's input, and the referenced
+    /// **Terminal Log** set the age sweep must never unlink. A corrupt file is
     /// skipped with a warning, never an error.
     pub(crate) fn load_all(&self) -> Vec<TerminalRunRecord> {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
@@ -190,15 +227,8 @@ impl TerminalRunRecords {
             if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(raw) = std::fs::read_to_string(&path) else {
-                tracing::warn!("terminal record: could not read {}", path.display());
-                continue;
-            };
-            match serde_json::from_str::<TerminalRunRecord>(&raw) {
-                Ok(record) => records.push(record),
-                Err(e) => {
-                    tracing::warn!("terminal record: could not parse {}: {e}", path.display())
-                }
+            if let Some(record) = Self::load_file(&path) {
+                records.push(record);
             }
         }
         records
@@ -348,6 +378,26 @@ mod tests {
         records.write(&lost).unwrap();
         assert!(!records.is_current(&key, "run-1"), "the replaced run is stale");
         assert!(records.is_current(&key, "run-2"), "a lost run is still current");
+    }
+
+    /// The read is bounded (a card callback reads it synchronously): a file
+    /// past the bound is treated as unreadable, never loaded whole.
+    #[test]
+    fn an_oversized_record_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = TerminalRunRecords::new(dir.path().to_path_buf());
+        let key = key("oc_chat", "oc_chat");
+        // A valid record padded past the bound: parsable JSON that is simply too
+        // large to belong in a click's callback.
+        let mut record = record(&key, "run-1");
+        record.command = "x".repeat(TERMINAL_RECORD_MAX_BYTES as usize);
+        let raw = serde_json::to_vec(&record).unwrap();
+        assert!(raw.len() as u64 > TERMINAL_RECORD_MAX_BYTES);
+        std::fs::write(records.path(&key), &raw).unwrap();
+
+        assert_eq!(records.read(&key), None, "past the bound is unreadable");
+        assert!(!records.is_current(&key, "run-1"), "and it proves nothing");
+        assert!(records.load_all().is_empty(), "the sweep skips it too");
     }
 
     /// A corrupt or missing record reads as "none" rather than an error: the

@@ -305,6 +305,12 @@ pub(crate) enum AskAiClaim {
     AlreadySubmitted,
     /// A newer Terminal Command replaced the run this card was rendered for.
     Stale,
+    /// Nothing can prove the click current: the **Terminal Run Record** is
+    /// missing, unreadable, corrupt or past its read bound, and this process
+    /// never started the run (a restart). Refused rather than accepted, because
+    /// an unverifiable card is exactly the old output the stale rule exists to
+    /// keep out of the model.
+    Unverifiable,
 }
 
 /// The in-flight claim one 「问 AI」 click takes, released on drop unless the
@@ -326,10 +332,11 @@ impl AskAiGuard {
     ///
     /// `records` is the restart-surviving half of the rule (#827): `last` is
     /// process-local, so in a fresh process it is empty and a card whose run the
-    /// chat has replaced would otherwise submit its old output. When a record
-    /// exists it decides "current"; when none does (a wiped state directory, a
-    /// run this process never recorded) the in-memory `last` still answers, and
-    /// a lost run's id — which the sweep keeps current — keeps its button.
+    /// chat has replaced would otherwise submit its old output. With a record
+    /// present it decides "current"; with none, only a run THIS process started
+    /// can vouch for the click — after a restart it cannot, so the click is
+    /// refused as [`AskAiClaim::Unverifiable`] rather than accepted. A lost
+    /// run's id stays current in the record, so its button keeps working.
     pub(crate) fn claim(
         runs: &Arc<Mutex<TerminalRuns>>,
         records: &TerminalRunRecords,
@@ -339,7 +346,11 @@ impl AskAiGuard {
         if run_id.is_empty() {
             return AskAiClaim::Stale;
         }
-        if records.read(key).is_some_and(|record| record.run_id != run_id) {
+        // `None` covers missing, unreadable, corrupt and oversized alike: the
+        // fail-open read has no way to say "this is the current run", and a
+        // guard must not read that silence as permission.
+        let record = records.read(key);
+        if record.as_ref().is_some_and(|record| record.run_id != run_id) {
             return AskAiClaim::Stale;
         }
         {
@@ -349,11 +360,14 @@ impl AskAiGuard {
                 Some(last) if last.ask_ai_submitted => return AskAiClaim::AlreadySubmitted,
                 Some(last) if last.ask_ai_in_flight => return AskAiClaim::InFlight,
                 Some(last) => last.ask_ai_in_flight = true,
-                // No run in this process: a restart. The record above already
-                // decided the click is current (or there is no record to
-                // contradict it), and a lost run's button must work, so the
-                // click is accepted and this run becomes the chat's last one.
+                // No run in this process: a restart. Only the record can make
+                // the click current now, and it must also name a run — a lost
+                // one does. Without it nothing can tell an old card from the
+                // current one, so the click is refused.
                 None => {
+                    if record.is_none() {
+                        return AskAiClaim::Unverifiable;
+                    }
                     state.last.insert(
                         key.clone(),
                         LastRun {
@@ -1222,20 +1236,36 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
 }
 
 /// Sweep the **Terminal Log** directory by age (`[bridge] log_days`), never
-/// wholesale (ADR-0086 decision 10): the age is the file's last write, so a
-/// live orphan is still appending and its mtime keeps it — unlinking a file
-/// something is writing would lose the evidence a restart is supposed to keep.
+/// wholesale (ADR-0086 decision 10), and never a log a **Terminal Run Record**
+/// still names.
+///
+/// The age alone is not enough. A live orphan that keeps its descriptor open but
+/// has produced no output for longer than the retention has an old mtime, and
+/// unlinking its file would route every later write into an inode nothing can
+/// reach — 「📄 完整输出」 would find no file. A referenced log is the evidence of
+/// the run its record describes (a lost run's included), and it only becomes
+/// unreferenced when the chat's next run replaces the record. So the record set
+/// is the protection, and age decides among the rest.
+///
 /// Returns how many files were removed.
-pub(crate) fn sweep_logs(root: &Path, log_days: u32) -> usize {
+pub(crate) fn sweep_logs(root: &Path, log_days: u32, records: &TerminalRunRecords) -> usize {
     let retention = Duration::from_secs(u64::from(log_days.max(1)) * 24 * 60 * 60);
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
+    let referenced: std::collections::HashSet<PathBuf> = records
+        .load_all()
+        .into_iter()
+        .map(|record| PathBuf::from(record.log_path))
+        .collect();
     let now = SystemTime::now();
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
+            continue;
+        }
+        if referenced.contains(&path) {
             continue;
         }
         let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {

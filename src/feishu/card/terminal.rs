@@ -378,10 +378,22 @@ fn settled_buttons_row(
     ask_ai["output_truncated"] = json!(output_truncated);
     let mut columns = Vec::new();
     if !view.run_id.is_empty() {
-        // 「↻ 重跑」 replays the record, so its payload needs only the run id;
-        // the command, cwd and timeout stay in the record rather than in the
-        // card's JSON budget (ADR-0086 decision 5).
-        columns.push(button_column(TERMINAL_RERUN_LABEL, "primary", facts("rerun")));
+        // 「↻ 重跑」 names the run and its route, and nothing else: the record
+        // holds the command, cwd and timeout it replays (ADR-0086 decision 4 as
+        // amended for #827). Carrying them here would duplicate a
+        // multi-kilobyte command and the resolved cwd into the card's JSON
+        // budget for no reader.
+        columns.push(button_column(
+            TERMINAL_RERUN_LABEL,
+            "primary",
+            json!({
+                "action": "terminal",
+                "op": "rerun",
+                "run_id": view.run_id,
+                "chat_id": view.chat_id,
+                "thread_id": view.thread_id,
+            }),
+        ));
     }
     columns.push(button_column(
         TERMINAL_FULL_OUTPUT_LABEL,
@@ -710,6 +722,78 @@ mod tests {
             value.contains("\"lost\":true"),
             "the outcome keeps it lost: {value}"
         );
+    }
+
+    /// #827 review (finding 3): 「↻ 重跑」 names only the run and its route. The
+    /// command, cwd and timeout live in the **Terminal Run Record**, so a
+    /// multi-kilobyte command is never duplicated into the card's JSON budget.
+    #[test]
+    fn the_rerun_button_carries_only_the_run_and_its_route() {
+        fn find_button(card: &serde_json::Value, op: &str) -> Option<serde_json::Value> {
+            match card {
+                serde_json::Value::Object(map) => {
+                    if map.get("tag").and_then(|tag| tag.as_str()) == Some("button")
+                        && map
+                            .get("value")
+                            .and_then(|value| value.get("op"))
+                            .and_then(|op| op.as_str())
+                            == Some(op)
+                    {
+                        return map.get("value").cloned();
+                    }
+                    map.values().find_map(|value| find_button(value, op))
+                }
+                serde_json::Value::Array(items) => items.iter().find_map(|value| find_button(value, op)),
+                _ => None,
+            }
+        }
+
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: &"x".repeat(5_000),
+            output: "",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: Some(TerminalFullOutput {
+                log_path: "/logs/run.log",
+                chat_id: "chat_1",
+                thread_id: "chat_1",
+                run_id: "run-827",
+                lost: false,
+                is_group: false,
+                exit_code: Some(0),
+                elapsed: Duration::from_secs(1),
+                output_over_limit: false,
+            }),
+            notice: None,
+            state: TerminalState::Settled {
+                exit_code: Some(0),
+                spawn_error: None,
+                elapsed: Duration::from_secs(1),
+                stopped: false,
+                survivors: false,
+            },
+            run_id: "run-827",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let rerun = find_button(&card, "rerun").expect("the settled card carries 重跑");
+        let mut keys: Vec<&str> = rerun
+            .as_object()
+            .expect("a button value is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["action", "chat_id", "op", "run_id", "thread_id"],
+            "the rerun payload is the run and its route: {rerun}"
+        );
+        assert_eq!(rerun["run_id"], "run-827");
+        // The same card's 完整输出 keeps its own payload (path + render inputs).
+        let full = find_button(&card, "full_output").expect("完整输出");
+        assert!(full.get("terminal_card").is_some(), "{full}");
     }
 
     /// #827: the card the send happens on says 「启动中」 and offers no control —
