@@ -5,12 +5,13 @@
 //!
 //! It names the cwd the command actually ran in and the command itself, shows
 //! the merged output the **Terminal Log** holds, and settles with the exit code
-//! and elapsed time. Three states share one builder: [`TerminalState::Starting`]
+//! and elapsed time. Four states share one builder: [`TerminalState::Starting`]
 //! is the card sent before the child exists (no controls), [`TerminalState::Live`]
-//! is patched on the render cadence while the process group runs, and
+//! is patched on the render cadence while the process group runs,
 //! [`TerminalState::Settled`] is the one settling write the patch loop stops
-//! after (#823). The distinction is a state, not a flag, so the loop can end on
-//! it.
+//! after (#823), and [`TerminalState::Lost`] is what a restart's sweep settles a
+//! run it can no longer track into (#827). The distinction is a state, not a
+//! flag, so the loop can end on it and the buttons can follow it.
 //!
 //! Every fenced element — cwd, command and output alike — is clipped through the
 //! shared [`clip_fenced_body`] walk, so a long backtick run can never make the
@@ -50,6 +51,10 @@ const LINE_CUT_MARKER: &str = " …（本行过长，已截断）";
 /// constant so the handler and its tests name the same act.
 pub(crate) const TERMINAL_FULL_OUTPUT_LABEL: &str = "📄 完整输出";
 
+/// The command's own re-run (ADR-0086 decisions 4 and 5): a settled card and a
+/// lost one keep it, and its payload names the run the record check compares.
+pub(crate) const TERMINAL_RERUN_LABEL: &str = "↻ 重跑";
+
 /// The settled card's explicit door to the model (ADR-0086 decision 9): the
 /// only path by which a Terminal Command's output reaches the Session
 /// Transcript. Constant for the same reason as the retrieval label.
@@ -73,6 +78,10 @@ pub(crate) struct TerminalFullOutput<'a> {
     /// claim.
     pub(crate) chat_id: &'a str,
     pub(crate) thread_id: &'a str,
+    /// Whether the sweep marked this run lost (ADR-0086 decision 10): the
+    /// outcome PATCH must rebuild a lost card, never quietly relabel it as a
+    /// settled one — a restart is not an exit code.
+    pub(crate) lost: bool,
     /// Whether the card lives in a group chat. A click carries no chat type of
     /// its own, and the 「问 AI」 submission needs it to rebuild the
     /// Chat/Topic route (the group-lobby guidance and the chat type's notice
@@ -109,6 +118,12 @@ pub(crate) enum TerminalState<'a> {
         /// A group member outlived `sh`; the run was still live until it exited.
         survivors: bool,
     },
+    /// A restart found the record still `running` and swept it (ADR-0086
+    /// decisions 5 and 10): cola no longer tracks the run, and says so instead
+    /// of guessing whether the child survived. 重跑, 完整输出 and 问 AI stay
+    /// usable here — that is what keeps a restart from being collateral damage
+    /// to the buttons.
+    Lost,
 }
 
 /// Everything a Terminal Card renders: the resolved cwd, the command, the
@@ -132,8 +147,10 @@ pub(crate) struct TerminalCard<'a> {
     /// not sent in full and where the bytes live.
     pub(crate) notice: Option<&'a str>,
     pub(crate) state: TerminalState<'a>,
-    /// The id a click must name to be current; empty on a settled card, whose
-    /// buttons carry their run id through [`TerminalFullOutput`].
+    /// The id a click must name to be current. A live card's controls carry it,
+    /// and so do a settled or lost card's buttons — either here (「↻ 重跑」) or
+    /// through [`TerminalFullOutput`] — so every click can be checked against
+    /// the chat's current **Terminal Run Record**.
     pub(crate) run_id: &'a str,
     pub(crate) chat_id: &'a str,
     pub(crate) thread_id: &'a str,
@@ -152,6 +169,16 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     // placeholder for an empty tail, and whether run controls belong — is made
     // in one match, so the live/settled split has a single owner.
     let (header, template, line, empty_tail, controls) = match &view.state {
+        TerminalState::Lost => (
+            "🖥️ 终端命令 · 已失去跟踪",
+            "orange",
+            // The wording is load-bearing (ADR-0086 decision 10): a supervised
+            // cola's restart takes the child with it, a hand-launched one's
+            // does not, so 「可能」 is the only honest verb.
+            "⚠️ 已失去跟踪（可能仍在运行）—— cola 重启后不再跟踪这条命令，日志保留在终端日志里。".to_string(),
+            "（无输出）",
+            false,
+        ),
         TerminalState::Starting => (
             "🖥️ 终端命令 · 启动中",
             "blue",
@@ -310,13 +337,14 @@ fn terminal_button(view: &TerminalCard<'_>, label: &str, op: &str, kind: &str) -
     })
 }
 
-/// The settled card's buttons (ADR-0086 decisions 4, 7 and 9) — 「📄 完整输出」
-/// and 「问 AI」 — in one row. Every payload is self-describing: the log path,
-/// the Chat/Topic route, and the settled card's render inputs, so a click can
-/// PATCH the same card with its outcome after a restart without a card-view
-/// read. The 「问 AI」 payload additionally carries the output window it was
-/// rendered with, so the submission needs neither a live process nor the log on
-/// disk: a run the sweep marked lost still hands its result over.
+/// The finished card's buttons (ADR-0086 decisions 4, 5, 7 and 9) —
+/// 「↻ 重跑」, 「📄 完整输出」 and 「问 AI」 — in one row, on a settled card and
+/// on a run the sweep marked lost alike. Every payload is self-describing: the
+/// run id, the log path, the Chat/Topic route, and the card's render inputs, so
+/// a click can PATCH the same card with its outcome after a restart without a
+/// card-view read. The 「问 AI」 payload additionally carries the output window
+/// it was rendered with, so the submission needs neither a live process nor the
+/// log on disk: a run the sweep marked lost still hands its result over.
 fn settled_buttons_row(
     view: &TerminalFullOutput<'_>,
     cwd: &str,
@@ -337,6 +365,8 @@ fn settled_buttons_row(
             "terminal_card": {
                 "cwd": cwd,
                 "command": command,
+                "run_id": view.run_id,
+                "lost": view.lost,
                 "exit_code": view.exit_code,
                 "elapsed_ms": view.elapsed.as_millis() as u64,
                 "output_over_limit": view.output_over_limit,
@@ -346,14 +376,24 @@ fn settled_buttons_row(
     let mut ask_ai = facts("ask_ai");
     ask_ai["output"] = json!(output);
     ask_ai["output_truncated"] = json!(output_truncated);
+    let mut columns = Vec::new();
+    if !view.run_id.is_empty() {
+        // 「↻ 重跑」 replays the record, so its payload needs only the run id;
+        // the command, cwd and timeout stay in the record rather than in the
+        // card's JSON budget (ADR-0086 decision 5).
+        columns.push(button_column(TERMINAL_RERUN_LABEL, "primary", facts("rerun")));
+    }
+    columns.push(button_column(
+        TERMINAL_FULL_OUTPUT_LABEL,
+        "default",
+        facts("full_output"),
+    ));
+    columns.push(button_column(TERMINAL_ASK_AI_LABEL, "primary", ask_ai));
     json!({
         "tag": "column_set",
         "flex_mode": "flow",
         "horizontal_spacing": "default",
-        "columns": [
-            button_column(TERMINAL_FULL_OUTPUT_LABEL, "default", facts("full_output")),
-            button_column(TERMINAL_ASK_AI_LABEL, "primary", ask_ai),
-        ],
+        "columns": columns,
     })
 }
 
@@ -615,5 +655,86 @@ mod tests {
         let text = crate::bridge::test_support::card_text(&settled(true, false));
         assert!(text.contains("⏹ 已终止"), "{text}");
         assert!(!text.contains("可能仍在运行"), "{text}");
+    }
+
+    /// #827: the losing half of a restart is the card, and 「已失去跟踪」 must
+    /// never read as 「仍在运行」 — or as an exit code the sweep never saw. The
+    /// card it rebuilds keeps the buttons a restart must not break: 重跑, 完整输出
+    /// and 问 AI.
+    #[test]
+    fn a_lost_card_reports_uncertainty_and_keeps_its_buttons() {
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "make",
+            output: "building\n",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: Some(TerminalFullOutput {
+                log_path: "/logs/run.log",
+                chat_id: "chat_1",
+                thread_id: "chat_1",
+                run_id: "run-827",
+                lost: true,
+                is_group: false,
+                exit_code: None,
+                elapsed: Duration::ZERO,
+                output_over_limit: false,
+            }),
+            notice: None,
+            state: TerminalState::Lost,
+            run_id: "run-827",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("已失去跟踪（可能仍在运行）"), "{text}");
+        assert!(!text.contains("退出码"), "a lost run has no exit code: {text}");
+        assert!(text.contains("building"), "the log's tail survives: {text}");
+        assert!(
+            text.contains(TERMINAL_FULL_OUTPUT_LABEL),
+            "完整输出 stays: {text}"
+        );
+        assert!(text.contains(TERMINAL_ASK_AI_LABEL), "问 AI stays: {text}");
+        assert!(text.contains(TERMINAL_RERUN_LABEL), "重跑 stays: {text}");
+        assert!(
+            !text.contains("⏹ 终止"),
+            "there is nothing left to signal: {text}"
+        );
+        let value = card.to_string();
+        assert!(value.contains("\"op\":\"rerun\""), "the rerun payload: {value}");
+        assert!(
+            value.contains("\"run_id\":\"run-827\""),
+            "it names the run: {value}"
+        );
+        assert!(
+            value.contains("\"lost\":true"),
+            "the outcome keeps it lost: {value}"
+        );
+    }
+
+    /// #827: the card the send happens on says 「启动中」 and offers no control —
+    /// the record and the child do not exist yet (ADR-0086 decision 5).
+    #[test]
+    fn a_starting_card_offers_nothing_to_click() {
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "make",
+            output: "",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: None,
+            notice: None,
+            state: TerminalState::Starting,
+            run_id: "run-827",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("启动中"), "{text}");
+        assert!(
+            !text.contains("⏹ 终止") && !text.contains(TERMINAL_RERUN_LABEL),
+            "{text}"
+        );
+        assert_eq!(card.to_string().matches("\"tag\":\"button\"").count(), 0);
     }
 }

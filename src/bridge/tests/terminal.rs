@@ -10,6 +10,7 @@
 //! the child's own process group, the flag grammar, and that no OpenCode
 //! server is contacted.
 
+use crate::bridge::terminal_record::{TerminalRunRecord, TerminalRunState};
 use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 #[cfg(unix)]
@@ -3287,5 +3288,799 @@ async fn a_double_clicked_ask_ai_submits_the_output_once() {
         1,
         "the run's output is submitted exactly once: {:?}",
         prompts.lock().await
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #827: the Terminal Run Record, the restart sweep, rerun and the log sweep.
+// ---------------------------------------------------------------------------
+
+/// A fresh `App` over an existing state directory and an existing **Terminal
+/// Log** root — the ticket's simulated restart: nothing in memory carries over,
+/// only the files on disk. The Backend's prompt recorder rides along, so a test
+/// can see exactly what a click submitted after the restart.
+#[cfg(unix)]
+async fn restart_app_recording(
+    cfg: crate::config::Config,
+    log_root: std::path::PathBuf,
+) -> (
+    std::sync::Arc<crate::bridge::App>,
+    std::sync::Arc<RecordingPlatform>,
+    std::sync::Arc<tokio::sync::Mutex<Vec<String>>>,
+) {
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .terminal_log_root
+        .set(log_root)
+        .expect("the restarted app installs its Terminal Log root once");
+    (app, platform, prompts)
+}
+
+/// [`restart_app_recording`] without the prompt recorder, for the tests that do
+/// not submit anything.
+#[cfg(unix)]
+async fn restart_app(
+    cfg: crate::config::Config,
+    log_root: std::path::PathBuf,
+) -> (
+    std::sync::Arc<crate::bridge::App>,
+    std::sync::Arc<RecordingPlatform>,
+) {
+    let (app, platform, _prompts) = restart_app_recording(cfg, log_root).await;
+    (app, platform)
+}
+
+/// The **Terminal Log** root the app under test writes under.
+#[cfg(unix)]
+fn log_root(app: &std::sync::Arc<crate::bridge::App>) -> std::path::PathBuf {
+    app.core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone()
+}
+
+/// A spinner that runs until the sweep has had its chance, so a test can prove
+/// a persisted pid is never signalled: it is alive before and after.
+#[cfg(unix)]
+fn orphan_process() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a stand-in orphan")
+}
+
+/// #827 acceptance: a run's record carries the card, command, cwd, timeout and
+/// log, and is marked settled when the run settles — kept, not deleted, until
+/// the chat's next run replaces it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_records_its_card_command_cwd_and_timeout_until_the_next_run_replaces_it() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run --timeout 30m printf 'record-827\\n'",
+        key.clone(),
+        "msg_record",
+        ConversationKind::P2p,
+    )
+    .await;
+    let settled = settled_card(&platform).await;
+    let record = app
+        .terminal_records
+        .read(&key)
+        .expect("the run left a Terminal Run Record");
+    assert_eq!(record.state, TerminalRunState::Settled);
+    assert_eq!(record.command, "printf 'record-827\\n'");
+    assert_eq!(
+        record.cwd,
+        canonical(proj.path()),
+        "the record names the cwd it ran in"
+    );
+    assert_eq!(record.timeout_ms, 30 * 60 * 1000, "the run's own cap");
+    assert!(!record.card_id.is_empty(), "the record names the card");
+    assert!(!record.pids.is_empty(), "the child's id is recorded");
+    assert!(
+        std::fs::read_to_string(&record.log_path)
+            .expect("the recorded log exists")
+            .contains("record-827"),
+        "the record points at the log the run wrote"
+    );
+    // The card's buttons carry the record's run id: that is the click the
+    // record check compares against.
+    let rerun = button_value(&settled, "rerun").expect("a settled card carries 重跑");
+    assert_eq!(rerun["run_id"].as_str(), Some(record.run_id.as_str()));
+
+    send_command_in(
+        &app,
+        "/run printf 'second-827\\n'",
+        key.clone(),
+        "msg_record_two",
+        ConversationKind::P2p,
+    )
+    .await;
+    let next = app.terminal_records.read(&key).expect("still one record");
+    assert_ne!(next.run_id, record.run_id, "the next run replaced it");
+    assert_eq!(next.command, "printf 'second-827\\n'");
+    assert_eq!(
+        next.timeout_ms,
+        crate::bridge::command::RUN_DEFAULT_TIMEOUT.as_millis() as u64,
+        "the default cap, since this run declared none"
+    );
+    assert_eq!(next.state, TerminalRunState::Settled);
+}
+
+/// #827's ordering guarantee (`card → record → spawn`): a run whose record
+/// cannot be written never spawns. Without the record no restart could report
+/// the card or replay the command, so the child must not exist.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_whose_record_cannot_be_written_never_spawns() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    // The record directory is unusable: a plain file where it should be.
+    std::fs::write(app.terminal_records.dir(), b"not a directory").unwrap();
+
+    let marker = proj.path().join("spawned-827.txt");
+    send_command_in(
+        &app,
+        &format!("/run touch '{}'", marker.display()),
+        key,
+        "msg_no_record",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    assert!(!marker.exists(), "no child runs without a record naming its card");
+    let text = card_text(&settled_card(&platform).await);
+    assert!(
+        text.contains("无法写入终端运行记录"),
+        "the card says why it never started: {text}"
+    );
+}
+
+/// #827 acceptance: after a restart the sweep patches a `running` record's card
+/// to 「已失去跟踪（可能仍在运行）」, marks the record lost and KEEPS it (its run
+/// id is still the chat's current one, so the card's buttons stay usable) — and
+/// it never signals the recorded pid.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_restart_marks_a_running_run_lost_without_signalling_it() {
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let key = thread();
+    let (app, _platform) = restart_app(cfg.clone(), root.clone()).await;
+    let log = root.join("run-827.log");
+    std::fs::write(&log, b"orphan-marker-827\n").unwrap();
+    let mut orphan = orphan_process();
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-827".into(),
+            chat_id: key.chat_id.clone(),
+            thread_id: key.thread_id.clone(),
+            card_id: "msg_orphan_card".into(),
+            log_path: log.to_string_lossy().into_owned(),
+            command: "sleep 30".into(),
+            cwd: canonical(proj.path()),
+            timeout_ms: 60_000,
+            pids: vec![orphan.id()],
+            is_group: false,
+            state: TerminalRunState::Running,
+        })
+        .unwrap();
+
+    // The restart: a fresh App over the same state directory and log root.
+    let (app2, platform2) = restart_app(cfg.clone(), root.clone()).await;
+    app2.sweep_terminal().await;
+
+    let patched = wait_for_patch_containing(&platform2, "msg_orphan_card", "已失去跟踪").await;
+    let text = card_text(&patched);
+    assert!(
+        text.contains("可能仍在运行"),
+        "the wording is the honest one: {text}"
+    );
+    assert!(
+        text.contains("orphan-marker-827"),
+        "the log's tail survives the restart: {text}"
+    );
+    assert!(
+        orphan.try_wait().unwrap().is_none(),
+        "the sweep never signals a recorded pid"
+    );
+    assert!(
+        platform2.texts().await.is_empty(),
+        "the report goes on the card, not into the chat: {:?}",
+        platform2.texts().await
+    );
+    let after = app2
+        .terminal_records
+        .read(&key)
+        .expect("the record is kept, not deleted");
+    assert_eq!(after.state, TerminalRunState::Lost);
+    assert_eq!(
+        after.run_id, "run-827",
+        "its run id stays current, so the card's buttons still name it"
+    );
+
+    // "Cleared": the record is no longer `running`, so the next start reports
+    // nothing rather than patching the same card again.
+    let (app3, platform3) = restart_app(cfg, root).await;
+    app3.sweep_terminal().await;
+    assert!(
+        platform3.updated_cards().await.is_empty(),
+        "a lost record is not reported twice"
+    );
+
+    let _ = orphan.kill();
+    let _ = orphan.wait();
+}
+
+/// #827 acceptance: a record written before a spawn that never happened (a
+/// crash between the record write and the spawn) is reported on the next start
+/// and cleared from `running` — the card it left reads 已失去跟踪 like any
+/// other, because cola cannot tell from the file that nothing ran.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_record_written_before_a_spawn_that_never_happened_is_reported_and_cleared() {
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let logs = tempfile::tempdir().unwrap();
+    let key = thread();
+    let (app, _platform) = restart_app(cfg.clone(), logs.path().to_path_buf()).await;
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-never-spawned".into(),
+            chat_id: key.chat_id.clone(),
+            thread_id: key.thread_id.clone(),
+            card_id: "msg_never_spawned".into(),
+            log_path: logs.path().join("never.log").to_string_lossy().into_owned(),
+            command: "echo hi".into(),
+            cwd: "/tmp".into(),
+            timeout_ms: 600_000,
+            pids: Vec::new(),
+            is_group: false,
+            state: TerminalRunState::Running,
+        })
+        .unwrap();
+
+    let (app2, platform2) = restart_app(cfg, logs.path().to_path_buf()).await;
+    app2.sweep_terminal().await;
+
+    let patched = wait_for_patch_containing(&platform2, "msg_never_spawned", "已失去跟踪").await;
+    assert!(
+        card_text(&patched).contains("可能仍在运行"),
+        "{}",
+        card_text(&patched)
+    );
+    let after = app2.terminal_records.read(&key).unwrap();
+    assert_eq!(after.state, TerminalRunState::Lost, "cleared from `running`");
+    assert!(
+        app2.terminal_records
+            .load_all()
+            .iter()
+            .all(|record| record.state != TerminalRunState::Running),
+        "no record is left running, so the next start has nothing to report"
+    );
+}
+
+/// #827 acceptance: 「↻ 重跑」 re-runs the same command with the same cwd and
+/// timeout, including after a restart — the record is what it replays from, and
+/// the card it was clicked on is its reply target.
+#[cfg(unix)]
+#[tokio::test]
+async fn rerun_replays_the_recorded_command_cwd_and_timeout_after_a_restart() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run --timeout 42m printf 'rerun-827\\n'",
+        key.clone(),
+        "msg_first_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let record = app.terminal_records.read(&key).expect("the run's record");
+    let payload = button_value(&settled_card(&platform).await, "rerun").expect("重跑 on a settled card");
+    let root = log_root(&app);
+
+    let (app2, platform2) = restart_app(cfg, root).await;
+    app2.sweep_terminal().await;
+    let result = app2
+        .host_action_on_message(payload, "msg_clicked_card")
+        .await
+        .expect("the click is acknowledged");
+    assert_eq!(result.toast.as_deref(), Some("↻ 正在重跑…"));
+
+    wait_for_card_update(&platform2, "the rerun's settle", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        text.contains("退出码 0") && text.contains("rerun-827")
+    })
+    .await;
+    assert!(
+        platform2
+            .replied_cards_with_targets()
+            .await
+            .iter()
+            .any(|(target, card)| target == "msg_clicked_card" && card_text(card).contains("rerun-827")),
+        "the rerun posts its card under the card it was clicked on"
+    );
+    let next = app2.terminal_records.read(&key).expect("the rerun's own record");
+    assert_ne!(next.run_id, record.run_id, "the rerun is a new run");
+    assert_eq!(next.command, record.command, "the same command");
+    assert_eq!(
+        next.cwd, record.cwd,
+        "the same cwd, even if the chat has moved since"
+    );
+    assert_eq!(next.timeout_ms, 42 * 60 * 1000, "the same cap");
+}
+
+/// #827 acceptance: a click whose run id is not the chat's current record id is
+/// refused as stale, so a superseded card can never run a command the chat has
+/// moved on from.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rerun_click_naming_a_superseded_run_is_refused_as_stale() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'first-827\\n'",
+        key.clone(),
+        "msg_one",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let old = button_value(&settled_card(&platform).await, "rerun").expect("重跑");
+    send_command_in(
+        &app,
+        "/run printf 'second-827\\n'",
+        key.clone(),
+        "msg_two",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let cards_before = platform.replied_cards().await.len();
+
+    let result = app
+        .host_action_on_message(old, "msg_one_card")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        result.toast.unwrap_or_default().contains("过期"),
+        "the superseded card is refused as stale"
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        cards_before,
+        "a stale rerun starts nothing"
+    );
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().command,
+        "printf 'second-827\\n'",
+        "the current run's record is untouched"
+    );
+}
+
+/// #827 × #828: 「问 AI」's stale-click guard is restart-durable through the
+/// **Terminal Run Record**. After a restart there is no in-memory run to ask —
+/// a fresh process's run table is empty — so the record must refuse a replaced
+/// run's card (nothing reaches the model) while the chat's current run keeps its
+/// button working.
+#[cfg(unix)]
+#[tokio::test]
+async fn ask_ai_after_a_restart_refuses_a_replaced_run_and_accepts_the_current_one() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'ask-old-827\n'",
+        key.clone(),
+        "msg_old",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    send_command_in(
+        &app,
+        "/run printf 'ask-new-827\n'",
+        key.clone(),
+        "msg_new",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let ask_ai: Vec<serde_json::Value> = platform
+        .button_values()
+        .await
+        .into_iter()
+        .filter(|value| value["op"] == "ask_ai")
+        .collect();
+    assert_eq!(ask_ai.len(), 2, "both settled cards carry 问 AI");
+    let (old, current) = (ask_ai[0].clone(), ask_ai[1].clone());
+    let root = log_root(&app);
+
+    let (app2, _platform2, prompts) = restart_app_recording(cfg, root).await;
+    app2.sweep_terminal().await;
+
+    // The replaced run's card: a stale click, and nothing reaches the model.
+    let result = app2
+        .host_action_on_message(old, "msg_old_card")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        result.toast.unwrap_or_default().contains("过期"),
+        "a replaced run's 问 AI is refused as stale"
+    );
+    // The current run's card: submitted, with its own command and output.
+    let result = app2
+        .host_action_on_message(current, "msg_new_card")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        result.toast.unwrap_or_default().contains("AI"),
+        "the current run's 问 AI is accepted"
+    );
+    let prompt = wait_for_prompt_containing(&prompts, "ask-new-827").await;
+    assert!(
+        !prompt.contains("ask-old-827"),
+        "the stale card's output never reached the model: {prompt}"
+    );
+    assert_eq!(
+        prompts.lock().await.len(),
+        1,
+        "exactly one submission, from the current card: {:?}",
+        prompts.lock().await
+    );
+}
+
+/// #827 acceptance: a double-clicked 「↻ 重跑」 runs one command even when the
+/// first rerun finished instantly — the record check and the claim sit together,
+/// so the second copy finds a record that no longer names it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_double_clicked_rerun_runs_one_command_even_when_the_first_finished_instantly() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    let counter = proj.path().join("rerun-count-827.txt");
+    let command = format!("/run echo ran >> '{}'", counter.display());
+
+    send_command_in(&app, &command, key.clone(), "msg_first", ConversationKind::P2p).await;
+    settled_card(&platform).await;
+    let payload = button_value(&settled_card(&platform).await, "rerun").expect("重跑");
+
+    let first = app
+        .host_action_on_message(payload.clone(), "msg_double")
+        .await
+        .expect("the click is acknowledged");
+    assert_eq!(first.toast.as_deref(), Some("↻ 正在重跑…"));
+
+    // The first rerun finishes (instantly, by design), and the redelivered copy
+    // of the same click arrives afterwards.
+    let lines = async {
+        loop {
+            let count = std::fs::read_to_string(&counter)
+                .map(|raw| raw.lines().count())
+                .unwrap_or(0);
+            if count >= 2 {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), lines)
+        .await
+        .expect("the first rerun ran");
+    let second = app
+        .host_action_on_message(payload, "msg_double")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        second.toast.unwrap_or_default().contains("过期"),
+        "the redelivered click is refused as stale"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        2,
+        "the command ran once for the original and once for the rerun — not twice for one click"
+    );
+}
+
+/// #827 acceptance: 终止 and 继续 do nothing once the run settled — refused by
+/// state, not an error, and no record is touched.
+#[cfg(unix)]
+#[tokio::test]
+async fn terminate_and_continue_do_nothing_once_the_run_settled() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run echo settled-827",
+        key.clone(),
+        "msg_settled",
+        ConversationKind::P2p,
+    )
+    .await;
+    let settled = settled_card(&platform).await;
+    assert!(
+        button_value(&settled, "kill").is_none() && button_value(&settled, "continue").is_none(),
+        "a settled card carries no run controls: {}",
+        card_text(&settled)
+    );
+    let record = app.terminal_records.read(&key).unwrap();
+    let before = record.clone();
+    for op in ["kill", "continue"] {
+        let value = serde_json::json!({
+            "action": "terminal",
+            "op": op,
+            "run_id": record.run_id,
+            "chat_id": key.chat_id,
+            "thread_id": key.thread_id,
+        });
+        let result = app
+            .host_action_on_message(value, "msg_settled")
+            .await
+            .expect("the click is acknowledged");
+        assert!(
+            result.toast.unwrap_or_default().contains("过期"),
+            "a {op} after settle does nothing"
+        );
+    }
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap(),
+        before,
+        "a refused control changes nothing"
+    );
+}
+
+/// #827 acceptance: 重跑 and 完整输出 stay usable on a run the sweep marked
+/// lost, while 终止 does nothing there — a restart is not collateral damage to
+/// the buttons. The full-output outcome must also leave the card LOST rather
+/// than relabelling it with an exit code it never had.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let key = thread();
+    let log = root.join("lost-827.log");
+    std::fs::write(&log, b"lost-marker-827\n").unwrap();
+    let (app, _platform) = restart_app(cfg.clone(), root.clone()).await;
+    seed_entry(&app, entry(&key, proj.path())).await;
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-lost-827".into(),
+            chat_id: key.chat_id.clone(),
+            thread_id: key.thread_id.clone(),
+            card_id: "msg_lost_card".into(),
+            log_path: log.to_string_lossy().into_owned(),
+            command: "printf 'lost-827\\n'".into(),
+            cwd: canonical(proj.path()),
+            timeout_ms: 60_000,
+            pids: vec![4242],
+            is_group: false,
+            state: TerminalRunState::Running,
+        })
+        .unwrap();
+    let (app2, platform2, prompts) = restart_app_recording(cfg, root).await;
+    app2.sweep_terminal().await;
+    let lost = wait_for_patch_containing(&platform2, "msg_lost_card", "已失去跟踪").await;
+
+    let rerun = button_value(&lost, "rerun").expect("重跑 stays usable on a lost run");
+    assert_eq!(rerun["run_id"].as_str(), Some("run-lost-827"));
+    let full = button_value(&lost, "full_output").expect("完整输出 stays usable on a lost run");
+    assert!(
+        button_value(&lost, "kill").is_none() && button_value(&lost, "continue").is_none(),
+        "a lost run has nothing left to signal: {}",
+        card_text(&lost)
+    );
+
+    // 终止 on the lost run: refused by state, like a settled one.
+    let kill = serde_json::json!({
+        "action": "terminal",
+        "op": "kill",
+        "run_id": "run-lost-827",
+        "chat_id": key.chat_id,
+        "thread_id": key.thread_id,
+    });
+    let result = app2
+        .host_action_on_message(kill, "msg_lost_card")
+        .await
+        .expect("the click is acknowledged");
+    assert!(result.toast.unwrap_or_default().contains("过期"));
+
+    // 问 AI still submits on the lost run: its run id is the record's current
+    // one, and the button's payload carries the output window it rendered.
+    let ask = button_value(&lost, "ask_ai").expect("问 AI stays usable on a lost run");
+    let result = app2
+        .host_action_on_message(ask, "msg_lost_card")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.unwrap_or_default();
+    assert!(toast.contains("AI"), "the lost run's 问 AI is accepted: {toast}");
+    let prompt = wait_for_prompt_containing(&prompts, "lost-marker-827").await;
+    assert!(
+        prompt.contains("lost-827"),
+        "the submission quotes the lost run's command and output: {prompt}"
+    );
+
+    // 重跑 runs the recorded command from the recorded cwd.
+    app2.host_action_on_message(rerun, "msg_lost_card").await;
+    wait_for_card_update(&platform2, "the lost run's rerun", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        text.contains("退出码 0") && text.contains("lost-827")
+    })
+    .await;
+
+    // 完整输出 still delivers the log, and the outcome leaves the card lost.
+    app2.host_action_on_message(full, "msg_lost_card").await;
+    wait_for_file_message(&platform2).await;
+    let rebuilt = wait_for_patch_containing(&platform2, "msg_lost_card", "完整输出已作为文件消息发送").await;
+    let text = card_text(&rebuilt);
+    assert!(
+        text.contains("已失去跟踪"),
+        "the outcome does not relabel a lost run as settled: {text}"
+    );
+    assert!(!text.contains("退出码"), "and invents no exit code: {text}");
+    assert!(
+        button_value(&rebuilt, "rerun").is_some(),
+        "the rebuilt card keeps 重跑: {text}"
+    );
+}
+
+/// #827 acceptance: the **Terminal Log** directory is swept by age
+/// (`[bridge] log_days`), never wholesale — a file something is still writing
+/// (a live orphan) has a fresh mtime and is left alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 14;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let stale = root.join("stale.log");
+    let live = root.join("live.log");
+    let other = root.join("notes.txt");
+    std::fs::write(&stale, b"old output\n").unwrap();
+    std::fs::write(&live, b"old output\n").unwrap();
+    std::fs::write(&other, b"not a log\n").unwrap();
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+    for path in [&stale, &live, &other] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+    }
+    // The orphan is still appending: its mtime is now, whatever its age was.
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap()
+            .write_all(b"still writing\n")
+            .unwrap();
+    }
+
+    let (app, _platform) = restart_app(cfg, root).await;
+    app.sweep_terminal().await;
+
+    assert!(!stale.exists(), "a log past `[bridge] log_days` is swept");
+    assert!(live.exists(), "a file still being written is not unlinked");
+    assert!(other.exists(), "the sweep only owns .log files");
+}
+
+/// #827 acceptance: the record is written BEFORE the child is spawned — a live
+/// run is already `running` on disk, with its card id and the child's pid.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_run_is_recorded_as_running_with_its_card_and_pid() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run sleep 10",
+                key,
+                "msg_live_record",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    live_card_with(&platform, "kill").await;
+
+    let record = app.terminal_records.read(&key).expect("the live run's record");
+    assert_eq!(record.state, TerminalRunState::Running);
+    assert!(!record.card_id.is_empty(), "the record names the card it writes");
+    assert_eq!(record.command, "sleep 10");
+    assert_eq!(record.pids.len(), 1, "the child's id was recorded: {record:?}");
+    let child = rustix::process::Pid::from_raw(record.pids[0] as i32);
+    assert!(
+        child.is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok()),
+        "the recorded pid is the child that is running"
+    );
+
+    let card = live_card_with(&platform, "kill").await;
+    let kill = button_value(&card, "kill").expect("the live card carries 终止");
+    app.host_action(kill).await.expect("a toast result");
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().state,
+        TerminalRunState::Settled,
+        "the record is marked settled when the run settles"
     );
 }
