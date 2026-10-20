@@ -252,6 +252,12 @@ pub struct SharedCore {
     /// The File Viewer's bounded blocking-read budget, shared by `/cat` and
     /// every card action on this bridge instance.
     pub viewer_fs_read_slots: Arc<tokio::sync::Semaphore>,
+    /// The **Terminal Log** root (ADR-0086 §7): unset in production, where a
+    /// run writes under the per-user `~/.cola/terminal`; set once by a test so
+    /// its runs never leave files in the real home. Internal only — deliberately
+    /// not a config knob, since the location is part of the ADR's at-rest
+    /// surface.
+    pub terminal_log_root: Arc<std::sync::OnceLock<std::path::PathBuf>>,
 }
 
 impl SharedCore {
@@ -375,6 +381,7 @@ impl SharedCore {
             file_images: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             file_uploads: Arc::new(Mutex::new(indexmap::IndexMap::new())),
             file_messages_sent: Arc::new(Mutex::new(indexmap::IndexMap::new())),
+            terminal_log_root: Arc::new(std::sync::OnceLock::new()),
             // The File Viewer transfer's per-network-call bound (ADR-0083 §5).
             viewer_transfer_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::viewer::VIEWER_TRANSFER_TIMEOUT_MS,
@@ -451,6 +458,7 @@ impl SharedCore {
             external: Arc::clone(&self.external),
             preferred_port: self.preferred_port,
             diff_cooldown: Arc::clone(&self.diff_cooldown),
+            terminal_log_root: Arc::clone(&self.terminal_log_root),
         }
     }
 
