@@ -52,7 +52,7 @@ pub struct DiffFile {
 
 /// The one document both diff surfaces map into: a turn's changes or a
 /// repository review's. `title`/`subtitle` name the source (turn time, base
-/// branch, "按工具记录聚合", …) and `truncated` carries a caller-supplied
+/// branch, and `truncated` carries a caller-supplied
 /// omission note; the renderer appends its own note when the size cap drops
 /// files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -469,7 +469,7 @@ struct Hunk<'a> {
 /// The old/new line counters come from the `@@` header and end the hunk when
 /// both counts are spent: after that a `+++` is a header again, never a
 /// `+`-prefixed addition. Before the first hunk those four prefixes are always
-/// headers, which is what a V1 `recorded_diff` starts with. A blank line is
+/// headers, which is what a recorded patch starts with. A blank line is
 /// not a file header and is preserved rather than silently dropped.
 fn parse_hunks(patch: &str) -> Vec<Hunk<'_>> {
     let mut hunks: Vec<Hunk<'_>> = Vec::new();

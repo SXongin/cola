@@ -8,8 +8,7 @@
 //! rather than dropped.
 
 use crate::backend::{
-    MessageId, MessageRole, MessageTime, Part, SessionTranscript, ToolCall, ToolIdentity, ToolOutput,
-    ToolStatus, TranscriptMessage, TurnDiff, TurnDiffFile,
+    MessageId, MessageRole, MessageTime, SessionTranscript, TranscriptMessage, TurnDiff, TurnDiffFile,
 };
 use crate::bridge::test_support::*;
 use std::time::Duration;
@@ -120,51 +119,6 @@ async fn wait_for_reply_containing(platform: &RecordingPlatform, needle: &str) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     panic!("timed out waiting for a reply containing {needle:?}");
-}
-
-/// An anchored Turn whose assistant message carries one settled `edit` call —
-/// the V1 tool-metadata shape #800 aggregates when `session_diff` answers
-/// `None`.
-fn anchored_edit_transcript(path: &str) -> SessionTranscript {
-    let patch = format!(
-        "Index: {path}\n===================================================================\n--- {path}\n+++ {path}\n@@ -1 +1,2 @@\n-old {path}\n+new {path}\n"
-    );
-    SessionTranscript::new(vec![
-        TranscriptMessage {
-            id: MessageId::new(TURN_FROM),
-            role: MessageRole::User,
-            time: Some(MessageTime {
-                created: 1_000,
-                completed: Some(1_000),
-            }),
-            model: None,
-            tokens: None,
-            error: None,
-            parts: Vec::new(),
-        },
-        TranscriptMessage {
-            id: MessageId::new("msg_assistant"),
-            role: MessageRole::Assistant,
-            time: Some(MessageTime {
-                created: 1_100,
-                completed: Some(1_200),
-            }),
-            model: None,
-            tokens: None,
-            error: None,
-            parts: vec![Part::Tool(ToolCall {
-                identity: ToolIdentity {
-                    name: "edit".to_string(),
-                    call_id: "call_edit".to_string(),
-                },
-                status: ToolStatus::Completed,
-                started_at: Some(1_100),
-                input: None,
-                metadata: Some(serde_json::json!({ "diff": patch })),
-                output: ToolOutput::default(),
-            })],
-        },
-    ])
 }
 
 fn app_config() -> (tempfile::TempDir, crate::config::Config) {
@@ -282,85 +236,6 @@ fn assert_turn_diff_file_name(name: &str) {
     );
 }
 
-/// V1 has no session diff endpoint: the click aggregates the Turn's tool
-/// metadata (#800) and still delivers one artifact.
-#[tokio::test]
-async fn v1_click_falls_back_to_the_tool_metadata_aggregation() {
-    let (_dir, cfg) = app_config();
-    let mut backend = MockBackend::new(Vec::new());
-    backend.given_transcript("ses_test", vec![anchored_edit_transcript("src/v1.rs")]);
-    let (app, platform) = build_app(cfg, backend).await;
-
-    app.host_action_on_message(click(), CARD_MESSAGE)
-        .await
-        .expect("the click is acknowledged");
-
-    let message = wait_for_file_message(&platform).await;
-    assert!(
-        matches!(
-            message,
-            PlatformCall::SendMessageReply {
-                msg_type: ref ty,
-                ..
-            } if ty == "file"
-        ),
-        "the V1 fallback still sends a File Message: {message:?}"
-    );
-    assert_eq!(file_uploads(&platform).await.len(), 1);
-}
-
-/// The payload's empty `from` compatibility path (#801) works on V1 too: the
-/// backend read omits `from`, and the aggregation resolves the newest user
-/// message instead of failing on the empty string.
-#[tokio::test]
-async fn v1_click_with_an_empty_from_uses_the_newest_user_message() {
-    let (_dir, cfg) = app_config();
-    let mut backend = MockBackend::new(Vec::new());
-    backend.given_transcript("ses_test", vec![anchored_edit_transcript("src/v1.rs")]);
-    let (app, platform) = build_app(cfg, backend).await;
-
-    let mut payload = click();
-    payload["from"] = serde_json::json!("");
-    app.host_action_on_message(payload, CARD_MESSAGE)
-        .await
-        .expect("the click is acknowledged");
-
-    let message = wait_for_file_message(&platform).await;
-    assert!(
-        matches!(
-            message,
-            PlatformCall::SendMessageReply {
-                msg_type: ref ty,
-                ..
-            } if ty == "file"
-        ),
-        "an empty from still resolves the Turn and sends a File Message: {message:?}"
-    );
-    assert_eq!(file_uploads(&platform).await.len(), 1);
-}
-
-/// The V1 fallback must fail loudly when it has no working directory to scope
-/// the aggregation: without a root it cannot prove a recorded path belongs to
-/// the repository, and an unscoped diff would offer the dead entry this fix
-/// removes.
-#[tokio::test]
-async fn v1_click_without_a_working_directory_fails_loudly() {
-    let (_dir, cfg) = app_config();
-    let mut backend = MockBackend::new(Vec::new());
-    backend.given_transcript("ses_test", vec![anchored_edit_transcript("src/v1.rs")]);
-    let (app, platform) = build_app(cfg, backend).await;
-
-    let mut payload = click();
-    payload["directory"] = serde_json::json!("");
-    app.host_action_on_message(payload, CARD_MESSAGE)
-        .await
-        .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "生成完整 diff 失败").await;
-
-    assert!(file_uploads(&platform).await.is_empty(), "no upload");
-    assert!(file_messages(&platform).await.is_empty(), "no File Message");
-}
-
 /// Repeated clicks are a no-op after the artifact was sent: the in-process
 /// `(session, from)` guard answers 「已发送」 and posts nothing again.
 #[tokio::test]
@@ -408,7 +283,7 @@ async fn an_empty_turn_replies_text_once_and_sends_no_file() {
     app.host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("the click is acknowledged");
-    wait_for_reply_containing(&platform, "本 turn 没有文件改动").await;
+    wait_for_reply_containing(&platform, "这个 turn 没有留下净改动。").await;
 
     assert!(file_uploads(&platform).await.is_empty(), "no upload");
     assert!(file_messages(&platform).await.is_empty(), "no File Message");
@@ -417,7 +292,7 @@ async fn an_empty_turn_replies_text_once_and_sends_no_file() {
         .host_action_on_message(click(), CARD_MESSAGE)
         .await
         .expect("a repeated click is acknowledged");
-    assert_eq!(repeated.toast.as_deref(), Some("本 turn 没有文件改动"));
+    assert_eq!(repeated.toast.as_deref(), Some("这个 turn 没有留下净改动。"));
     assert_eq!(
         backend.session_diff_calls.lock().await.len(),
         1,
@@ -621,4 +496,203 @@ async fn the_click_acks_before_the_delivery_runs() {
     wait_for_file_message(&platform).await;
     assert_eq!(file_uploads(&platform).await.len(), 1, "one upload");
     assert_eq!(file_messages(&platform).await.len(), 1, "one File Message");
+}
+
+/// ADR-0087's settle seam: a normal Turn's terminal card reads
+/// `session.diff(from=<anchor>, context=0)` once — the SAME source the click
+/// reads — and renders its counts and button. Nothing is estimated from the
+/// transcript while the Turn runs.
+#[tokio::test]
+async fn the_terminal_card_index_is_the_settle_session_diff_read() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        super::drain::user("msg_cola_anchor", 1_000, "第一条消息"),
+        super::drain::assistant(2_000, "完成。"),
+    ];
+    let (_dir, app, backend, platform) = super::drain::scripted_app(
+        vec![SessionTranscript::new(timeline)],
+        Some(crate::opencode::types::SessionStatus::Idle),
+    )
+    .await;
+    backend
+        .session_diff_available
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *backend
+        .session_diff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(TurnDiff(vec![diff_file("src/a.rs", 2, 1)]));
+
+    let turn = super::drain::spawn_turn(&app, super::drain::ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn ends")
+        .expect("the turn task does not panic")
+        .expect("the turn succeeded");
+
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.updated_cards().await);
+    let card = cards
+        .iter()
+        .rev()
+        .find(|card| card_text(card).contains("📝 本次改动"))
+        .unwrap_or_else(|| panic!("the terminal card carries the settled index: {cards:?}"));
+    assert!(
+        card_text(card).contains("📝 本次改动 · 1 files · +2 −1"),
+        "the index is the server's counts: {card}"
+    );
+    let button = card["body"]["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|element| element["value"]["op"] == "turn_diff")
+        .unwrap_or_else(|| panic!("the terminal card carries the button: {card}"));
+    assert_eq!(button["value"]["from"], "msg_cola_anchor");
+
+    assert_eq!(
+        backend.session_diff_calls.lock().await.as_slice(),
+        &[(
+            "ses_test".to_string(),
+            Some("msg_cola_anchor".to_string()),
+            None,
+            Some(0)
+        )],
+        "one settle read, scoped to the Turn, at zero context"
+    );
+}
+
+/// Issue #830's shape, inverted: an EMPTY authoritative answer means no entry.
+/// The transcript may record edits, but the card must not claim a change the
+/// artifact cannot show — and it still spends the one settle read.
+#[tokio::test]
+async fn an_empty_settle_read_leaves_the_terminal_card_without_an_index() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        super::drain::user("msg_cola_anchor", 1_000, "第一条消息"),
+        super::drain::assistant(2_000, "完成。"),
+    ];
+    let (_dir, app, backend, platform) = super::drain::scripted_app(
+        vec![SessionTranscript::new(timeline)],
+        Some(crate::opencode::types::SessionStatus::Idle),
+    )
+    .await;
+    backend
+        .session_diff_available
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *backend
+        .session_diff
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TurnDiff::default());
+
+    let turn = super::drain::spawn_turn(&app, super::drain::ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn ends")
+        .expect("the turn task does not panic")
+        .expect("the turn succeeded");
+
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.updated_cards().await);
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("📝 本次改动")),
+        "an empty authoritative answer renders no index: {cards:?}"
+    );
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        1,
+        "the empty answer is still the one settle read"
+    );
+}
+
+/// A failed click read speaks the dedicated copy and stays retryable: the
+/// claim is released on the failure, and a later successful read sends the
+/// artifact. Distinct from the render/upload failure copy (ADR-0087).
+#[tokio::test]
+async fn a_failed_read_speaks_the_read_failure_and_stays_retryable() {
+    let (_dir, cfg) = app_config();
+    let mut backend = MockBackend::new(Vec::new());
+    backend.given_session_diff(TurnDiff(vec![diff_file("src/a.rs", 1, 0)]));
+    backend
+        .fail_session_diff
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform, backend) = app_with_backend(cfg, backend);
+
+    app.host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    wait_for_reply_containing(&platform, "暂时读不到终态改动，请稍后再试。").await;
+    assert!(file_messages(&platform).await.is_empty(), "nothing was sent");
+
+    backend
+        .fail_session_diff
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..200 {
+        app.host_action_on_message(click(), CARD_MESSAGE)
+            .await
+            .expect("the retry is acknowledged");
+        if backend.session_diff_calls.lock().await.len() > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    wait_for_file_message(&platform).await;
+    assert_eq!(file_uploads(&platform).await.len(), 1, "one retried upload");
+}
+
+/// V1 has no `session.diff`: the unreleased feature's legacy button lands on
+/// the same read-failure copy, never on a tool-metadata fallback (ADR-0087).
+#[tokio::test]
+async fn a_generation_without_the_endpoint_answers_the_read_failure() {
+    let (_dir, cfg) = app_config();
+    let backend = MockBackend::new(Vec::new());
+    let (app, platform) = build_app(cfg, backend).await;
+
+    app.host_action_on_message(click(), CARD_MESSAGE)
+        .await
+        .expect("the click is acknowledged");
+    wait_for_reply_containing(&platform, "暂时读不到终态改动，请稍后再试。").await;
+
+    assert!(file_uploads(&platform).await.is_empty(), "no upload");
+    assert!(file_messages(&platform).await.is_empty(), "no File Message");
+}
+
+/// A failed SETTLE read is not an error card: the Turn still ends, it simply
+/// carries no index (ADR-0087). The read happened and was abandoned.
+#[tokio::test]
+async fn a_failed_settle_read_leaves_the_terminal_card_without_an_index() {
+    let _wd = test_work_dir();
+    let timeline = vec![
+        super::drain::user("msg_cola_anchor", 1_000, "第一条消息"),
+        super::drain::assistant(2_000, "完成。"),
+    ];
+    let (_dir, app, backend, platform) = super::drain::scripted_app(
+        vec![SessionTranscript::new(timeline)],
+        Some(crate::opencode::types::SessionStatus::Idle),
+    )
+    .await;
+    backend
+        .session_diff_available
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    backend
+        .fail_session_diff
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let turn = super::drain::spawn_turn(&app, super::drain::ctx("ses_test", "第一条消息"));
+    tokio::time::timeout(Duration::from_secs(5), turn)
+        .await
+        .expect("the turn ends despite the failed index read")
+        .expect("the turn task does not panic")
+        .expect("the turn succeeded");
+
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.updated_cards().await);
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains("📝 本次改动")),
+        "a failed read renders no index: {cards:?}"
+    );
+    assert_eq!(
+        backend.session_diff_calls.lock().await.len(),
+        1,
+        "the settle read was attempted once"
+    );
 }

@@ -435,8 +435,8 @@ impl GenerationStrategy for V1Strategy {
     }
 
     /// V1 has no session diff endpoint: the read answers `Ok(None)` without a
-    /// request, and the caller aggregates the Turn's tool metadata instead
-    /// (#800).
+    /// request. V1 therefore has no Turn Diff — no card index and no artifact
+    /// (ADR-0087).
     async fn session_diff(
         &self,
         _http: &Transport,

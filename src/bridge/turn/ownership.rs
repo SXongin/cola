@@ -65,7 +65,7 @@
 
 use tokio::sync::{MappedMutexGuard, MutexGuard};
 
-use crate::backend::TurnAnchor;
+use crate::backend::{TurnAnchor, TurnDiffStats};
 use crate::bridge::handles::{CardsHandle, WaitsHandle};
 use crate::feishu::card::CardState;
 
@@ -371,11 +371,18 @@ impl Ticket {
     /// the caller must not announce an ending). The caller passes this id to
     /// [`crate::bridge::turn::announce_completion`] so the notice is bound to
     /// the very card the ending landed on (spec #602, review finding 6).
+    ///
+    /// `index` is the terminal change index the caller resolved outside this
+    /// lock (ADR-0087). It is stamped with the ending under the same ownership
+    /// check, so a successor's card can never inherit this card's counts; `None`
+    /// (or a zero fold) means no index. The responsibility for skipping a
+    /// non-terminal ending belongs to the caller.
     pub(super) async fn apply_ending_if_owned(
         &self,
         cards: &CardsHandle,
         session_id: &str,
         disposition: &Disposition,
+        index: Option<TurnDiffStats>,
     ) -> Option<String> {
         // The chain identity the ending lands on, captured with the stamp under
         // ONE lock: a replacement takes the session over with a FRESH chain, so
@@ -385,6 +392,7 @@ impl Ticket {
             let mut live = cards.cards.lock().await;
             match live.get_mut(session_id) {
                 Some(card) if self.matches(card.acc.turn_anchor(), Some(card.chain_id())) => {
+                    card.acc.set_turn_diff_stats(index.unwrap_or_default());
                     card.acc.apply_ending(disposition);
                     card.chain_id()
                 }
@@ -1046,7 +1054,7 @@ mod tests {
         Turn::seed_card(cards, SID, Some("om_live")).await;
         Turn::set_turn_anchor(cards, SID, &live).await;
         assert_eq!(
-            owns.apply_ending_if_owned(cards, SID, &Disposition::Failed("loop failure".into()))
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Failed("loop failure".into()), None)
                 .await
                 .as_deref(),
             Some("om_live"),
@@ -1063,7 +1071,7 @@ mod tests {
         Turn::set_card_state(cards, SID, CardState::Streaming).await;
         set_card_error(cards, SID, "successor failure").await;
         assert!(
-            owns.apply_ending_if_owned(cards, SID, &Disposition::Stopped)
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Stopped, None)
                 .await
                 .is_none(),
             "a stale anchor applies nothing"
@@ -1097,7 +1105,7 @@ mod tests {
             anchor: turn_anchor(3),
         };
         assert_eq!(
-            owns.apply_ending_if_owned(cards, SID, &Disposition::Done)
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Done, None)
                 .await
                 .as_deref(),
             Some("om_live"),
@@ -1110,7 +1118,7 @@ mod tests {
         Turn::seed_card(cards, SID, Some("om_successor")).await;
         Turn::set_card_state(cards, SID, CardState::Streaming).await;
         assert!(
-            owns.apply_ending_if_owned(cards, SID, &Disposition::Stopped)
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Stopped, None)
                 .await
                 .is_none(),
             "a stale chain applies nothing"
@@ -1124,7 +1132,7 @@ mod tests {
         // The card vanishing is ownership lost as well.
         Turn::drop_card(cards, SID).await;
         assert!(
-            owns.apply_ending_if_owned(cards, SID, &Disposition::Done)
+            owns.apply_ending_if_owned(cards, SID, &Disposition::Done, None)
                 .await
                 .is_none(),
             "a vanished card applies nothing"

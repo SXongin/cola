@@ -1485,9 +1485,9 @@ pub struct MockBackend {
     /// Records every `transcript` call's session id — the neutral read the
     /// render poll, the drain and the follow poll on.
     pub transcript_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
-    /// Whether `session_diff` serves a V2-shaped answer (`true`) or the V1
-    /// `Ok(None)` that sends the caller to the tool-metadata aggregation
-    /// (#799, #801). Default `false`.
+    /// Whether `session_diff` serves a V2-shaped answer (`true`) or V1's
+    /// `Ok(None)`, which means no Turn Diff at all (ADR-0087). Default
+    /// `false`.
     pub session_diff_available: std::sync::atomic::AtomicBool,
     /// The Turn Diff `session_diff` serves when
     /// [`Self::session_diff_available`] is set; `None` reads as an empty diff
@@ -1497,6 +1497,10 @@ pub struct MockBackend {
     /// context)`, in call order (#801). Lets a test pin the exact Turn range
     /// the callback asks for instead of only its effect.
     pub session_diff_calls: Arc<tokio::sync::Mutex<Vec<SessionDiffCall>>>,
+    /// When set, `session_diff` fails with a transport-level error, standing in
+    /// for the transient/restart/unanswerable read (ADR-0087). The call is still
+    /// recorded, so a test can prove the read happened.
+    pub fail_session_diff: std::sync::atomic::AtomicBool,
     /// Session ids whose `transcript` read fails with a 500 (spec #501): the
     /// child-read failure the ledger's activity carry-over pins — a failed
     /// gather leaves the row's last successful fragment in place, its age
@@ -1829,6 +1833,7 @@ impl MockBackend {
             session_diff_available: std::sync::atomic::AtomicBool::new(false),
             session_diff: Arc::new(std::sync::Mutex::new(None)),
             session_diff_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_session_diff: std::sync::atomic::AtomicBool::new(false),
             fail_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             hang_transcripts: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             fail_transcript_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2115,9 +2120,8 @@ impl MockBackend {
     }
 
     /// Scenario: the backend serves the V2 session diff endpoint, answering
-    /// `diff` for every read (#799, #801). Without this the mock keeps the V1
-    /// `Ok(None)`, so the click's tool-metadata aggregation is the path under
-    /// test.
+    /// `diff` for every read (#799, #801). Without this the mock keeps V1's
+    /// `Ok(None)` — no Turn Diff on either surface (ADR-0087).
     pub(crate) fn given_session_diff(&mut self, diff: crate::backend::TurnDiff) -> &mut Self {
         *self
             .session_diff
@@ -2892,8 +2896,8 @@ impl crate::backend::Backend for MockBackend {
         Ok(transcript)
     }
 
-    /// No scripted session diff yet: the mock answers the V1 arm, leaving the
-    /// tool-metadata aggregation (#800) as the caller's path.
+    /// No scripted session diff yet: the mock answers V1's `Ok(None)` arm,
+    /// which is a no-entry Turn Diff (ADR-0087).
     ///
     /// [`Self::given_session_diff`] switches the mock to the V2 arm and names
     /// the diff the read serves.
@@ -2910,6 +2914,11 @@ impl crate::backend::Backend for MockBackend {
             to.map(str::to_string),
             context,
         ));
+        if self.fail_session_diff.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::error::BridgeError::OpenCode(
+                "session diff failed: 503".to_string(),
+            ));
+        }
         if !self
             .session_diff_available
             .load(std::sync::atomic::Ordering::SeqCst)

@@ -1544,14 +1544,15 @@ pub(super) struct StreamAccumulator {
     /// the rendering fixtures. Read through [`Self::turn_anchor`] /
     /// [`Self::has_turn_anchor`].
     turn_anchor: Option<TurnAnchor>,
-    /// The Turn's change-index counts (spec #797, ticket #477): the
-    /// [`TurnDiffStats`] fold over the #800 tool-metadata aggregation, deduped
-    /// by path, refreshed from each transcript read. The card's live tail
-    /// renders `N files · +A −D` and the complete-diff button from this stored
-    /// fact — the render itself never hits the network. Default (zero files)
-    /// means the Turn recorded no file edit, so neither element renders.
-    /// Private to this module: written by [`Self::refresh_turn_diff`]; read by
-    /// the card build and its split estimate through [`Self::turn_diff_index`].
+    /// The Turn's change-index counts (spec #797, ticket #477; ADR-0087): the
+    /// [`TurnDiffStats`] resolved ONCE at the Turn's settle by
+    /// [`crate::bridge::turn_diff::settle_turn_diff_stats`] from V2's
+    /// `session.diff` scoped to this Turn. Default (zero files) means no index
+    /// was captured, so the card renders neither the line nor the button.
+    /// Nothing writes this while the Turn runs: the card shows no estimate
+    /// (issue #830). Private to this module: written by
+    /// [`Self::set_turn_diff_stats`]; read by the card build and its split
+    /// estimate through [`Self::turn_diff_index`].
     turn_diff_stats: TurnDiffStats,
     /// Whether this card has already shown the neutral waiting line
     /// 「⏳ 等待当前运行接收…」 (ADR-0062): the unreceived watch pushes it
@@ -1894,6 +1895,9 @@ impl StreamAccumulator {
     /// was frozen in Error while the run continued (the elapsed time it held
     /// measured nothing of this activity).
     pub(super) fn restore_live_state(&mut self) {
+        // A re-armed card works on again: the previous attempt's settled index
+        // is stale until this run's own settle read (ADR-0087).
+        self.turn_diff_stats = TurnDiffStats::default();
         self.card_state = if !self.text.is_empty() || self.has_running_tool() {
             CardState::Streaming
         } else if !self.reasoning.is_empty() {
@@ -1918,6 +1922,9 @@ impl StreamAccumulator {
     /// The content the Turn already produced, its prompt and its reply target
     /// all stay: this is still the request's own card.
     pub(super) fn set_resuming(&mut self) {
+        // The yield's index is stale the moment the card works again; the
+        // resumed run's settle read writes the next one (ADR-0087).
+        self.turn_diff_stats = TurnDiffStats::default();
         self.card_state = CardState::Resuming;
         self.refresh_phase();
     }
@@ -2003,11 +2010,11 @@ impl StreamAccumulator {
         self.card_state = state;
     }
 
-    /// Stamp the Turn's change-index counts directly: a test seam for the
-    /// anchorless/empty render cases, standing in for the read that
-    /// [`Self::refresh_turn_diff`] would perform.
-    #[cfg(test)]
-    pub(super) fn set_turn_diff_for_test(&mut self, stats: TurnDiffStats) {
+    /// Stamp the Turn's settled change-index counts: the one production writer,
+    /// called by a terminal ending's settle read (ADR-0087). Also the render
+    /// fixtures' seam. The counts are a terminal-card fact; the card renders
+    /// them from [`Self::turn_diff_index`].
+    pub(super) fn set_turn_diff_stats(&mut self, stats: TurnDiffStats) {
         self.turn_diff_stats = stats;
     }
 
@@ -2166,44 +2173,17 @@ impl StreamAccumulator {
         self.turn_anchor = Some(anchor.clone());
     }
 
-    /// Refresh the Turn's change-index counts from a transcript read (spec
-    /// #797, ticket #477): the #800 aggregation folds the Turn's settled
-    /// file-editing calls into one [`TurnDiff`](crate::backend::TurnDiff),
-    /// deduped by path with the last recorded patch per path winning. This is
-    /// an ESTIMATE, not the artifact's source: the card renders it without a
-    /// network read (#477's rule), while V2's opened artifact is the
-    /// authoritative `session.diff` for the Turn and can report larger counts
-    /// when a file was edited more than once or changed outside a
-    /// file-editing tool. The walk is local — no backend request — so a card
-    /// render can always read the stored counts. Returns whether the rendered
-    /// counts changed: a newly settled edit is rendered content and owes its
-    /// flush. An empty diff stores zeroes, and the card then renders neither
-    /// the line nor the button (a read/bash-only Turn offers no dead entry).
-    pub(super) fn refresh_turn_diff(&mut self, transcript: &SessionTranscript) -> bool {
-        let Some(anchor) = self.turn_anchor.clone() else {
-            return false;
-        };
-        let diff =
-            crate::bridge::turn_diff::turn_diff_from_tools_in(transcript, &anchor, self.directory.as_deref());
-        let stats = if diff.is_empty() {
-            TurnDiffStats::default()
-        } else {
-            diff.stats()
-        };
-        if stats == self.turn_diff_stats {
-            return false;
-        }
-        self.turn_diff_stats = stats;
-        true
-    }
-
-    /// The change-index facts the live card tail renders (#477), or `None` when
-    /// it must render nothing: the Turn recorded no file edit (zero files), the
-    /// card has no [`TurnAnchor`] to name the Turn by (`from`), or no session
-    /// id to route the click — an entry it could not make work is exactly the
-    /// dead button the ticket forbids. The counts line renders while the Turn
-    /// runs; the button is added only by a terminal card.
+    /// The change-index facts the card tail renders (#477), or `None` when it
+    /// must render nothing: no count was captured at the Turn's settle (zero
+    /// files), the card is not terminal yet, it has no [`TurnAnchor`] to name
+    /// the Turn by (`from`), or no session id to route the click — an entry it
+    /// could not make work is exactly the dead button the ticket forbids. The
+    /// whole index is a terminal-card fact: the counts only exist once the
+    /// settle read has run, and the artifact is one-shot (ADR-0087).
     fn turn_diff_index(&self) -> Option<(TurnDiffStats, &TurnAnchor)> {
+        if !self.card_state.is_terminal() {
+            return None;
+        }
         let anchor = self.turn_anchor.as_ref()?;
         if self.session_id.as_deref().is_none_or(str::is_empty) {
             return None;
@@ -4302,22 +4282,19 @@ impl StreamAccumulator {
                     size += panel_estimate(panel, session);
                 }
             }
-            // The Turn's change index (#477) rides this same tail: the markdown
-            // line always, the complete-diff button only once the card is
-            // terminal (the artifact is one-shot, so a mid-turn click would
-            // freeze a partial snapshot). Charged from exactly the elements the
-            // build renders, so a near-budget card splits instead of being
-            // rejected by Feishu. Absent when the build renders neither element
+            // The Turn's change index (#477) rides this same tail: the settled
+            // line and its complete-diff button, which only a terminal card
+            // carries (ADR-0087). Charged from exactly the elements the build
+            // renders, so a near-budget card splits instead of being rejected
+            // by Feishu. Absent when the build renders neither element
             // ([`Self::turn_diff_index`]).
             if let Some((stats, anchor)) = self.turn_diff_index() {
-                let show_button = self.card_state.is_terminal();
-                comps += crate::feishu::card::turn_diff::index_components(show_button);
+                comps += crate::feishu::card::turn_diff::index_components();
                 size += crate::feishu::card::turn_diff::index_estimate(
                     stats,
                     self.session_id.as_deref().unwrap_or_default(),
                     anchor.message_id.as_str(),
                     self.directory.as_deref().unwrap_or_default(),
-                    show_button,
                 );
             }
         }
@@ -4668,22 +4645,19 @@ impl StreamAccumulator {
                 }
             }
 
-            // The Turn's change index (spec #797, ticket #477): the counts line
-            // — live, from the transcript-side estimate — and the complete-diff
-            // entry only once the card is terminal, after every tool panel and
-            // before the footer (which `build` appends below, keeping the
-            // recovery buttons after it). A one-shot artifact sent mid-turn
-            // would freeze a partial snapshot that later edits cannot update,
-            // so the button waits for the end. A split's finalized prefix
-            // carries no tail; a read/bash-only or anchorless Turn renders
-            // neither element.
+            // The Turn's change index (spec #797, ticket #477; ADR-0087): the
+            // settle-read line and its complete-diff button, together, after
+            // every tool panel and before the footer (which `build` appends
+            // below, keeping the recovery buttons after it). Only a terminal
+            // card carries it ([`Self::turn_diff_index`]); a split's finalized
+            // prefix carries no tail, and an empty/unreadable anchorless Turn
+            // renders neither element.
             if let Some((stats, anchor)) = self.turn_diff_index() {
                 for element in crate::feishu::card::turn_diff::index_elements(
                     stats,
                     self.session_id.as_deref().unwrap_or_default(),
                     anchor.message_id.as_str(),
                     self.directory.as_deref().unwrap_or_default(),
-                    self.card_state.is_terminal(),
                 ) {
                     builder = builder.with_element(element);
                 }
@@ -7663,7 +7637,7 @@ mod tests {
         });
 
         let index =
-            crate::feishu::card::turn_diff::index_estimate(stats, "ses_test", "msg_user", "/repo/cola", true);
+            crate::feishu::card::turn_diff::index_estimate(stats, "ses_test", "msg_user", "/repo/cola");
         assert!(index > 0, "the index elements have a measurable size");
 
         // One receipt whose estimate leaves the index's bytes as the only
@@ -7672,27 +7646,28 @@ mod tests {
         let line_len = crate::feishu::card::MAX_CARD_JSON_CHARS - index + 10 - 40;
         acc.push_receipt(&"x".repeat(line_len));
 
-        acc.set_turn_diff_for_test(TurnDiffStats::default());
+        acc.set_turn_diff_stats(TurnDiffStats::default());
         assert_eq!(
             acc.estimate_split_index(0, true),
             1,
             "the near-budget card fits without the change index"
         );
 
-        acc.set_turn_diff_for_test(stats);
+        acc.set_turn_diff_stats(stats);
         assert_eq!(
             acc.estimate_split_index(0, true),
             0,
             "the index line and button must push the same card over the budget"
         );
 
-        // While the Turn is still running only the line is charged: the same
-        // near-budget card fits, because the button is not rendered yet.
+        // A running card carries no index at all (ADR-0087): even with settled
+        // stats, the same near-budget card fits because the terminal gate hides
+        // the pair.
         acc.set_card_state(CardState::Streaming);
         assert_eq!(
             acc.estimate_split_index(0, true),
             1,
-            "a running card charges the line, not the settled button"
+            "a running card charges no change index"
         );
     }
 
@@ -7710,7 +7685,7 @@ mod tests {
             message_id: MessageId::new("msg_user"),
             created_ms: 1_000,
         });
-        acc.set_turn_diff_for_test(TurnDiffStats {
+        acc.set_turn_diff_stats(TurnDiffStats {
             files: 2,
             additions: 3,
             deletions: 1,

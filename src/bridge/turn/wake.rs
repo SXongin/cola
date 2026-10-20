@@ -749,13 +749,17 @@ impl Turn {
             anchor: anchor.clone(),
         };
         let disposition = settle::run(flow, session_id, directory, timing, &ticket).await?;
+        // The terminal card's change index, from the artifact's own source
+        // (ADR-0087), before the ownership-checked stamp below.
+        let index =
+            super::terminal_change_index(flow.backend.as_ref(), session_id, &disposition, Some(anchor)).await;
         // The same post-run gap as the follow's: the loop's last probe may be
         // stale by now, so the ending is applied atomically with a fresh
         // ownership check. Ownership lost is a loop that ended nothing — the
         // same `None` `run` returns. The returned id is the card the ending
         // landed on, so the caller's notice is bound to it.
         let card_id = ticket
-            .apply_ending_if_owned(&flow.cards, session_id, &disposition)
+            .apply_ending_if_owned(&flow.cards, session_id, &disposition, index)
             .await?;
         Some((disposition, card_id))
     }
