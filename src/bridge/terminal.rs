@@ -1211,6 +1211,7 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
                     chat_id: &record.chat_id,
                     thread_id: &record.thread_id,
                     run_id: &record.run_id,
+                    rerun_run_id: Some(&record.run_id),
                     lost: true,
                     is_group: record.is_group,
                     exit_code: None,
@@ -1364,6 +1365,8 @@ async fn settle(
     let full_output = outcome.spawn_error.is_none().then(|| TerminalFullOutput {
         log_path: &log_path,
         run_id,
+        // A fresh run's own card always names its run, so 重跑 is offered.
+        rerun_run_id: Some(run_id),
         chat_id: &thread_key.chat_id,
         thread_id: &thread_key.thread_id,
         lost: false,

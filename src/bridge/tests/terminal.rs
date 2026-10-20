@@ -4138,6 +4138,73 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
     );
 }
 
+/// #828 review: a payload minted before the settled buttons named their run
+/// carries no `run_id`, and the shared outcome rebuild wrote a 「问 AI」 button
+/// with an empty id — a dead button that could only toast 「无效操作」. The
+/// rebuild now takes the Chat/Topic's current run from the record and omits
+/// 重跑, which would replay a run this card never named.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_legacy_payload_without_a_run_id_rebuilds_a_working_ask_ai_button() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'legacy-828\\n'",
+        key.clone(),
+        "msg_legacy",
+        ConversationKind::P2p,
+    )
+    .await;
+    let settled = settled_card(&platform).await;
+    let record = app.terminal_records.read(&key).expect("the run's record");
+    let mut full_output = button_value(&settled, "full_output").expect("完整输出");
+    // The payload a card built before the buttons carried run ids looks like.
+    full_output.as_object_mut().unwrap().remove("run_id");
+    full_output["terminal_card"]
+        .as_object_mut()
+        .unwrap()
+        .remove("run_id");
+
+    let result = app
+        .host_action_on_message(full_output, "msg_legacy")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        result.toast.unwrap_or_default().contains("完整输出"),
+        "the legacy payload is still routable"
+    );
+
+    let rebuilt = wait_for_patch_containing(&platform, "msg_legacy", "完整输出已作为文件消息发送").await;
+    let ask = button_value(&rebuilt, "ask_ai").expect("问 AI is rebuilt");
+    assert_eq!(
+        ask["run_id"].as_str(),
+        Some(record.run_id.as_str()),
+        "the rebuild names the chat's current run"
+    );
+    assert!(
+        button_value(&rebuilt, "rerun").is_none(),
+        "重跑 is not offered for a run the payload never named: {}",
+        card_text(&rebuilt)
+    );
+
+    let result = app
+        .host_action_on_message(ask, "msg_legacy")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.unwrap_or_default();
+    assert!(
+        toast.contains("AI"),
+        "the rebuilt 问 AI is not a dead 「无效操作」 button: {toast}"
+    );
+}
+
 /// #827 acceptance: the **Terminal Log** directory is swept by age
 /// (`[bridge] log_days`), never wholesale — a file something is still writing
 /// (a live orphan) has a fresh mtime and is left alone.
