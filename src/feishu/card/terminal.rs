@@ -161,8 +161,8 @@ pub(crate) struct TerminalCard<'a> {
 /// `问 AI` buttons (ADR-0086 §4).
 pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     let mut markdown = CardMarkdown::new();
-    let (cwd_element, _) = fenced_element("**目录**", view.cwd, false, &mut markdown);
-    let (command_element, _) = fenced_element("**命令**", view.command, false, &mut markdown);
+    let (cwd_element, cwd_clipped) = fenced_element("**目录**", view.cwd, false, &mut markdown);
+    let (command_element, command_clipped) = fenced_element("**命令**", view.command, false, &mut markdown);
     let (tail, budget_cut) = display_tail(view.output);
     let truncated = budget_cut || view.output_truncated;
     // Every state-derived decision — header, colour, state line, the
@@ -260,7 +260,24 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     };
     let (output_element, fence_clipped) = fenced_element("**输出**", &output, true, &mut markdown);
 
-    let mut elements = vec![cwd_element, command_element, output_element];
+    let mut elements = vec![cwd_element, command_element];
+    if cwd_clipped || command_clipped {
+        // #822: a clip has to be visible. Without this the fenced body just
+        // stops, and a reader takes a cut path or command for the real one —
+        // exactly what the output's own cut has said for its element. The label
+        // names only what was cut, so a clipped command never makes a whole cwd
+        // look cut too.
+        let what = match (cwd_clipped, command_clipped) {
+            (true, true) => "目录和命令",
+            (true, false) => "目录",
+            _ => "命令",
+        };
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean(&format!("_（{what}过长，已截断显示）_")),
+        }));
+    }
+    elements.push(output_element);
     if truncated || fence_clipped {
         elements.push(json!({
             "tag": "markdown",
@@ -820,5 +837,65 @@ mod tests {
             "{text}"
         );
         assert_eq!(card.to_string().matches("\"tag\":\"button\"").count(), 0);
+    }
+
+    /// A card whose cwd and command are exactly `cwd`/`command`, settled.
+    fn card_with<'a>(cwd: &'a str, command: &'a str) -> serde_json::Value {
+        build_terminal_card(TerminalCard {
+            cwd,
+            command,
+            output: "done\n",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: None,
+            notice: None,
+            state: TerminalState::Settled {
+                exit_code: Some(0),
+                spawn_error: None,
+                elapsed: Duration::from_secs(1),
+                stopped: false,
+                survivors: false,
+            },
+            run_id: "",
+            chat_id: "",
+            thread_id: "",
+        })
+    }
+
+    /// #822: the cwd and the command are clipped to the per-element budget, and
+    /// the clip used to be silent — the fenced body just stopped, so a reader
+    /// took an incomplete path or command for the real one. Each cut now says
+    /// so, and names only what was cut.
+    #[test]
+    fn a_clipped_cwd_or_command_says_so() {
+        let long = "x".repeat(MAX_ELEMENT_TEXT_CHARS + 1);
+
+        let text = crate::bridge::test_support::card_text(&card_with(&long, "make"));
+        assert!(text.contains("（目录过长，已截断显示）"), "{text}");
+        assert!(
+            !text.contains("命令过长"),
+            "only the cut element is named: {text}"
+        );
+
+        let text = crate::bridge::test_support::card_text(&card_with("/work", &long));
+        assert!(text.contains("（命令过长，已截断显示）"), "{text}");
+        assert!(
+            !text.contains("目录过长"),
+            "only the cut element is named: {text}"
+        );
+
+        let card = card_with(&long, &long);
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("（目录和命令过长，已截断显示）"), "{text}");
+        for element in crate::bridge::test_support::card_texts(&card) {
+            assert!(
+                element.chars().count() <= MAX_ELEMENT_TEXT_CHARS,
+                "the note stays inside the per-element budget ({} chars): {element}",
+                element.chars().count()
+            );
+        }
+
+        let text = crate::bridge::test_support::card_text(&card_with("/work", "make"));
+        assert!(!text.contains("过长"), "no cut, no notice: {text}");
     }
 }
