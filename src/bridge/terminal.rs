@@ -1255,25 +1255,34 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
 ///
 /// Returns how many files were removed.
 pub(crate) fn sweep_logs(root: &Path, log_days: u32, records: &TerminalRunRecords) -> usize {
+    // The log directory first: with nothing to protect, the sweep is trivially
+    // empty, and a genuine first start (no records, no logs) costs one read.
+    let entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(root) {
+        Ok(entries) => entries.flatten().collect(),
+        Err(_) => return 0,
+    };
+    if entries.is_empty() {
+        return 0;
+    }
+    // The reference set must be COMPLETE: a record that would not parse may name
+    // the very log this would unlink, and logs with nobody to reference them are
+    // not "unreferenced" — they are unwitnessed.
     let (records_on_disk, complete) = records.scan();
-    if !complete {
+    if !complete || !records.dir().exists() {
         tracing::warn!(
-            "terminal: skipping the Terminal Log age sweep — every run record must be readable \
-             before a log can be proven unreferenced"
+            "terminal: skipping the Terminal Log age sweep — the run records must be present and \
+             all readable before a log can be proven unreferenced"
         );
         return 0;
     }
     let retention = Duration::from_secs(u64::from(log_days.max(1)) * 24 * 60 * 60);
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return 0;
-    };
     let referenced: std::collections::HashSet<PathBuf> = records_on_disk
         .into_iter()
         .map(|record| PathBuf::from(record.log_path))
         .collect();
     let now = SystemTime::now();
     let mut removed = 0;
-    for entry in entries.flatten() {
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("log") {
             continue;

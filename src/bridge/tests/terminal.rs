@@ -4087,12 +4087,81 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
             .unwrap();
     }
 
-    let (app, _platform) = restart_app(cfg, root).await;
+    let (app, _platform) = restart_app(cfg, root.clone()).await;
+    // The records directory must exist for the set to be trusted at all (a
+    // missing one beside existing logs is unwitnessed, not empty): one real
+    // record names `live.log`, leaving `stale.log` genuinely unreferenced.
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-live".into(),
+            chat_id: "oc_other_chat".into(),
+            thread_id: "oc_other_chat".into(),
+            card_id: "om_card".into(),
+            log_path: live.to_string_lossy().into_owned(),
+            command: "sleep 1".into(),
+            cwd: "/tmp".into(),
+            timeout_ms: 600_000,
+            pids: vec![1],
+            is_group: false,
+            state: TerminalRunState::Settled,
+        })
+        .unwrap();
     app.sweep_terminal().await;
 
     assert!(!stale.exists(), "a log past `[bridge] log_days` is swept");
     assert!(live.exists(), "a file still being written is not unlinked");
     assert!(other.exists(), "the sweep only owns .log files");
+}
+
+/// #827 last guard: a MISSING records directory is not permission to delete.
+/// Records that were deleted or moved leave nothing to name an orphan's aged
+/// log, so the reference set is incomplete and the sweep leaves every file —
+/// only a start with nothing to protect (no logs) is trivially empty.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_missing_record_directory_never_licenses_the_age_sweep() {
+    use std::io::Write;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 14;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, _platform) = restart_app(cfg.clone(), root.clone()).await;
+    assert!(
+        !app.terminal_records.dir().exists(),
+        "the fixture: no run has written a record yet"
+    );
+    // An aged orphan log whose writer still holds it open.
+    let log = root.join("orphan-without-records.log");
+    std::fs::write(&log, b"before\n").unwrap();
+    let mut orphan = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&log)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60))
+        .unwrap();
+
+    app.sweep_terminal().await;
+
+    assert!(
+        log.exists(),
+        "records that are gone cannot prove a log unreferenced, so nothing is unlinked"
+    );
+    orphan.write_all(b"after\n").unwrap();
+    assert!(std::fs::read(&log).unwrap().ends_with(b"after\n"));
+
+    // The genuine first start — no records and no logs — has nothing to protect
+    // and sweeps trivially, creating nothing.
+    let empty_root = logs.path().join("fresh-terminal");
+    let (fresh, _platform) = restart_app(cfg, empty_root.clone()).await;
+    fresh.sweep_terminal().await;
+    assert!(
+        !empty_root.exists() || std::fs::read_dir(&empty_root).unwrap().next().is_none(),
+        "a first start with no logs sweeps nothing"
+    );
 }
 
 /// #827 review (finding 2): age alone must not unlink a log a record still

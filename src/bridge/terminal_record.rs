@@ -124,9 +124,9 @@ impl TerminalRunRecords {
         Self { dir }
     }
 
-    /// The directory the records live in. A test asserts a sweep's effect on the
-    /// files; production never needs the path itself.
-    #[cfg(test)]
+    /// The directory the records live in. The log sweep asks whether it exists
+    /// at all (a test also asserts a sweep's effect on the files): a MISSING
+    /// record directory beside existing logs cannot vouch for any of them.
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
@@ -248,9 +248,11 @@ impl TerminalRunRecords {
     /// a record it could not read may name the very log it is about to unlink,
     /// so an incomplete view must not sweep at all (see
     /// [`sweep_logs`](crate::bridge::terminal::sweep_logs)). A missing directory
-    /// is complete-and-empty — the sidecar convention, and the first start of a
-    /// cola that has never run a command — while an unreadable one is not
-    /// knowing, and says so. A file whose record names a different chat/topic
+    /// reads as complete-and-empty here — the sidecar convention, and what the
+    /// startup report needs — while an unreadable one is not knowing, and says
+    /// so. A caller that DELETES on the strength of the set must also check
+    /// [`dir`](Self::dir): missing records beside existing files are not proof
+    /// that nothing is referenced. A file whose record names a different chat/topic
     /// than its own name encodes counts as unreadable too: [`read`](Self::read)
     /// refuses it as this chat's record, so no sweep may treat the set as
     /// complete while it is there.
