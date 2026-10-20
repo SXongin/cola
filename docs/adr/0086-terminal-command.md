@@ -21,15 +21,22 @@ with no model in the loop, no approval card, and no entry into the Session Trans
   same for local reads.
 - **Cards are the only surface with buttons and a live tail.** A `post`/`text` message is
   editable at most 20 times and carries no controls; a card is patched at the production
-  poll cadence (1.5 s, ADR-0011/ADR-0045) and can carry the buttons a running command needs.
-  The platform budget is unchanged: 30 KB, 200 elements (ADR-0083).
+  poll cadence and can carry the buttons a running command needs. The platform budget is
+  unchanged: 30 KB, 200 elements (ADR-0083), and cola's own text budget is
+  `MAX_ELEMENT_TEXT_CHARS` (3,000 chars per element).
 - **A card is readable by the whole chat.** The **Access List** gates who may act, never who
   may read (ADR-0035, ADR-0083). Terminal output therefore joins the same exposure directory
   names and file contents already have.
-- **Feishu delivers at least once.** `im.message.receive_v1` is deduped on `header.event_id`
-  in the WebSocket layer, before dispatch (`src/feishu/ws.rs`). A Terminal Command is
-  destructive by nature, so that dedupe is a correctness requirement of this feature, not an
-  incidental upstream nicety: a redelivered message must never run a command twice.
+- **Feishu delivers at least once, but the dedupe is best-effort.** `im.message.receive_v1`
+  is deduped on `header.event_id` in the WebSocket layer, before dispatch
+  (`src/feishu/ws.rs`) — a bounded in-memory set, and the key and the 5-minute age bound are
+  both optional. **Card actions never enter that set at all** (`card.action.trigger` has no
+  dedupe path), so a redelivered 「↻ 重跑」 click is unguarded. Any destructive path needs its
+  own idempotence; this design gets it from a real per-chat claim, not from the WS layer.
+- **A message is handled on its own task.** Every inbound frame is dispatched onto a spawned
+  task (`src/feishu/ws.rs`), so "one command per chat" is not a property anything already
+  provides: it must be an atomic claim, like `/diff`'s cooldown
+  (`src/bridge/repo_diff.rs`).
 - **Two reference implementations agree on the shape, and both inject output into context.**
   aider ships `/run` with **alias `!`** — "run a shell command and optionally add the output
   to the chat" — runs it in the project root, asks before adding the output, warns that it
@@ -50,7 +57,8 @@ with no model in the loop, no approval card, and no entry into the Session Trans
 
 There is no pseudo-terminal, and that is a shape constraint, not an implementation detail:
 `/run` is **line-oriented, not screen-oriented**. Measured on a Host with stdin `/dev/null`,
-stdout to a file, and `setsid` (the configuration decision 2 describes):
+stdout to a file, and `setsid` — the closest stand-in for "no terminal", taken before the
+implementation's own limit below was known:
 
 | Command | Result |
 |---|---|
@@ -61,12 +69,23 @@ stdout to a file, and `setsid` (the configuration decision 2 describes):
 | `ssh -t` | exit 255: `Pseudo-terminal will not be allocated because stdin is not a terminal` |
 | reading `/dev/tty` | `No such device or address` |
 
-The last row is the load-bearing one: with no controlling terminal, `sudo`, `ssh-add` and
-`gpg` fail **fast** instead of prompting. Without `setsid` they would inherit cola's
-controlling terminal — and when cola was started by hand from a desktop terminal, the prompt
-would appear *there*, invisible from Feishu, with the command apparently hung until its cap.
-So `setsid` is not only decision 5's process-group handle; it is what makes a password prompt
-an error instead of a ghost.
+**The last row is conditional, because the implementation cannot call `setsid`.** The crate is
+`#![cfg_attr(not(test), forbid(unsafe_code))]`, and `pre_exec` is the only `std` route to it —
+the wall ADR-0085 already hit, answered there with `CommandExt::process_group(0)`
+(`src/bridge/discovery.rs`). A process group is not a session: the child keeps cola's session
+and, when cola has a controlling terminal, its tty. So:
+
+- **cola under a Supervisor** (no controlling terminal): `/dev/tty` is `ENXIO`, a password
+  prompt fails fast, and the table stands.
+- **cola launched by hand from a terminal**: the child is a background process group in
+  cola's session, so a read from `/dev/tty` is stopped by `SIGTTIN` — `sudo`/`ssh-add` hang
+  until the cap (or 终止) instead of failing.
+
+That is accepted and documented rather than bought with a lint exception: a terminal is not
+where passwords should be typed, the hang is bounded by the same cap as any other run, and
+the property that matters — no terminal hangup reaches the child, and its output does not die
+with cola — holds in both modes precisely because stdin is null and stdout/stderr are files
+(the same argument ADR-0085 records for the Shared Service).
 
 Two practical consequences the implementation must carry:
 
@@ -87,88 +106,127 @@ escape soup this section refuses.
 ## Decision
 
 1. **Two entry points, one act.** `/run <cmd>`; or a message whose **first character** is `!`
-   and whose remainder is non-empty. `!` is a message prefix, not a **Command** — a message
-   starting with `!` used to be prose that reached the model, and this is a deliberate parse
-   change, bounded to that one shape so `!`, `! ` and any `!` mid-message stay prose. `/run`
-   alone answers usage; `/help run` documents it. `--timeout <dur>` is the only flag; there is
-   deliberately no `--dir`, because the **Path Scope** is the only cwd and `cd sub && …`
-   already covers the rest.
+   and whose remainder is non-empty — the text the bridge sees is already mention-stripped and
+   trimmed, so `@cola !ls` and `  !ls` qualify, and in a group the bot must still be mentioned
+   for the message to arrive at all. `!` is a message prefix, not a **Command**. A
+   `!`-prefixed message currently reaches the model as prose (and is still scanned for
+   `#<id>` **Skill** tokens), so this is a deliberate parse change, bounded to that one shape:
+   `!`, `! ` and any `!` mid-message stay prose, and `!ls #caveman` is now a shell command
+   containing the literal `#caveman` rather than a skill load. `/run` alone answers usage;
+   `/help run` documents it; `/run` must be added to the **Command** parser's help tables or
+   it silently becomes a `Forward` prompt.
 2. **One command, one child process, no carried state.** `sh -c`, cwd on the **Path Scope**'s
    base (the **Session**'s directory, the current **Project** while the Session is still
-   **Pending**), stdin closed (`Stdio::null`) so a password prompt, a pager or an editor
-   fails fast instead of hanging forever, stdout and stderr merged. The child is placed in its
-   own session (`setsid`), which serves two purposes at once: it is decision 5's process-group
-   handle, and it removes the controlling terminal — the difference between `sudo` failing
-   with an error and `sudo` prompting on a desktop terminal nobody is looking at. There is no
-   persistent shell and no `cd`/`export` carry between commands — a second truth about "where
-   am I" is worse than typing `cd x && …`. The card names the cwd it actually used.
+   **Pending**, and the default session directory when the conversation has neither), stdin
+   closed (`Stdio::null`), stdout and stderr merged. The child leaves cola's process group via
+   `CommandExt::process_group(0)` — the safe route ADR-0085 established — which is what
+   decision 6's kill targets and what keeps a terminal hangup from reaching the child. There
+   is no persistent shell and no `cd`/`export` carry between commands. A Terminal Command never
+   touches the Backend: it does not ensure a server, and it works with `start_server = "never"`
+   and while the server is down. The card names the cwd it actually used.
 3. **The output goes to a file, not through cola.** The child's stdout and stderr are
-   redirected straight into its **Terminal Log**, and cola tails that file's delta on the
+   redirected straight into its **Terminal Log**, and cola tails that file's delta on its own
    render cadence. This is not only bookkeeping: on a pipe, cola's own death closes the read
-   end and the child dies of `SIGPIPE` on its next write — which would make decision 8's
-   orphan impossible. Direct-to-file means a command outlives cola, the file we need for
-   「📄 完整输出」 is already there, and the live tail is "read the bytes appended since the
-   last offset" rather than a ring buffer fed by a reader.
+   end and the child dies of `SIGPIPE` on its next write — which would make decision 10's
+   orphan impossible. Direct-to-file means a command outlives cola, the bytes 「📄 完整输出」
+   needs are already there, and the live tail is "read what was appended since the last
+   offset" rather than a ring buffer fed by a reader.
 4. **The result is a Terminal Card, and it is a command card.** A standalone member of the
-   `/dir`-`/switch`-`/help`-`File Viewer` family (ADR-0083 §3): it joins no **Card Chain**,
-   is never written to the **Chain Record**, and is never reaped. It shows the resolved cwd,
-   the command, a live tail and, once settled, the exit code and elapsed time; the full output
-   beyond the card rides ADR-0076/ADR-0083's **File Message** ladder under a bounded cap. The
-   tail keeps the newest ~40 lines, splits on `\n` with `\r` treated as an overwrite (a
-   progress bar is one line, never a megabyte of frames), strips ANSI and control sequences
-   for display, and reads non-UTF-8 lossily. A failure whose stderr matches a known no-tty
-   signature — `failed tty get`, `not a terminal`, `unable to start editor`, `the input device
-   is not a TTY`, `No such device or address` — gains one line pointing at `tmux` or at the
-   command's non-interactive flag (`top -b`, `git commit -m`); that is a fixed mapping, not a
-   heuristic over the command text. The card carries 「⏹ 终止」, 「↻ 重跑」, 「📄 完整输出」 and
-   「问 AI」. 「重跑」 carries the command string inside its own payload, so the button still
-   works after a cola restart — no durable history is needed for it, and none is kept: the
-   in-memory cache only feeds the button.
-5. **Serial, bounded, and killable.** One Terminal Command per **Chat**/**Topic** at a time; a
-   second is refused with the running card's 「⏹ 终止」 named in the reply — a hidden queue
-   would land a forgotten command in the working tree minutes later. The default hard cap is
-   10 minutes, `--timeout` extends it per command; at the cap cola stops tailing and offers
-   「继续」/「⏹ 终止」 rather than killing silently, because the default guards against
-   forgetting, not against a deliberate long run. 终止 signals the **process group**
-   (`SIGTERM`, then `SIGKILL` after a grace), because killing only the parent leaves the
-   compilers it spawned running.
-6. **The environment is inherited, minus cola's own credentials — and this is not a
+   `/dir`-`/switch`-`/help`-`File Viewer` family (ADR-0083 §3): it joins no **Card Chain**, is
+   never written to the **Chain Record**, and is never *deleted* by the reaper — the startup
+   sweep may patch it (decision 5), which is a different act. It is posted as a reply to the
+   command message (ADR-0076's no-`reply_in_thread` rule) and captures the requester, reply
+   target and its own message id at send. It owns a per-command patch loop at the render
+   cadence, cancelled when the run settles; the Turn poller is not involved because a
+   Terminal Command is not a Turn. It shows the resolved cwd, the command, a live tail and,
+   once settled, the exit code and elapsed time. The tail keeps the newest lines **within a
+   2,500-character budget** — a per-line cap as well, since one minified line can be megabytes
+   — splits on `\n` with `\r` treated as an overwrite, strips ANSI, and reads non-UTF-8
+   lossily; when the budget cuts content it says so. A failure whose stderr matches a known
+   no-tty signature — `failed tty get`, `not a terminal`, `unable to start editor`, `the input
+   device is not a TTY`, `No such device or address` — gains one line pointing at `tmux` or at
+   the command's non-interactive flag (`top -b`, `git commit -m`); that is a fixed mapping,
+   never a heuristic over the command text. The card carries 「⏹ 终止」 while the run is live,
+   and 「↻ 重跑」, 「📄 完整输出」 and 「问 AI」 once it settles; every button is dead while the
+   run is live except 终止, and 终止 is dead once the run has settled or the sweep has marked
+   it lost.
+5. **The card's identity is durable; the run itself is not.** A **Terminal Run Record** — one
+   small file under cola's state directory carrying the thread key, the card's message id and
+   chat, the **Terminal Log** path, the command, the cwd, the timeout and the process ids — is
+   written once at spawn and deleted when the run settles. This is the one durable thing, and
+   it exists because neither of the existing options can serve: the **Chain Record** is
+   excluded by decision 4, and the card-handle cache drops any card with no interaction
+   block, which is exactly this card. On startup the sweep reads each record, PATCHes its card
+   to 「已失去跟踪」, and deletes the record; a persisted process id is **never signalled**,
+   because a pid may have been reused since — a lost run is reported, not adopted. This is not
+   the deferred background-task ledger: it has one write and one delete, no liveness model and
+   no takeover.
+6. **Serial, bounded, and killable.** One Terminal Command per **Chat**/**Topic** at a time,
+   enforced by an atomic claim (the `/diff` cooldown's precedent) — a second command is
+   refused with the running card's 「⏹ 终止」 named, and the same claim makes a double-clicked
+   「↻ 重跑」 harmless. The cap is `--timeout <n>[smh]`, default ten minutes, hard maximum
+   twenty-four hours; flags are parsed only before the command, and `--` ends flag parsing, so
+   a command may begin with `-`. The `!` form accepts no flags at all — everything after `!`
+   is the command. Reaching the cap stops **tailing**, never the `wait()`: a command that exits
+   at 10:01 still settles with its exit code, and the card offers 「继续」 (extend by the same
+   amount) and 「⏹ 终止」. The chat's slot stays claimed until the process actually exits or is
+   killed, so an extended run blocks later commands — stated, not hidden. 终止 signals the
+   **process group** (`SIGTERM`, then `SIGKILL` after a grace), because killing only the
+   parent leaves the compilers it spawned running.
+7. **Output volume is bounded too.** Because the child writes to a file, a runaway command can
+   fill the disk, and truncating that file does not help — the child's descriptor offset does
+   not move back, so the next write lands past a hole and the file grows again. When the
+   **Terminal Log** passes 32 MB, cola stops the run and settles the card as 「输出超限」; what
+   was written stays available for 「📄 完整输出」 under the File Message lane's own 30 MB cap.
+8. **The environment is inherited, minus cola's own credentials — and this is not a
    sandbox.** `OPENCODE_SERVER_PASSWORD`, `OPENCODE_PASSWORD` and `OPENCODE_SERVER_USERNAME`
    are stripped (the same names `discovery.rs` already strips in the other direction, with
-   its removals-last rule); everything else is the Host's shell. The limits are stated, not
-   implied: `cat ~/.config/opencode/auth.json` still works, `env` still shows whatever the
-   Host exported, and every card is readable by every member of the chat. The Access List
-   keeps the *act* private; it cannot keep the *result* private.
-7. **The model is not in the loop, and the transcript does not learn.** A Terminal Command
+   its removals-last rule); everything else is the Host's shell. **PATH is the Supervisor's,
+   not the login shell's**: `cola autostart enable` writes `Environment=PATH=<the PATH at
+   enable time>` into the unit, so a toolchain installed afterwards is invisible until the
+   enable is re-run — documented, and surfaced by `cola status`/`cola doctor` rather than
+   papered over with a login shell or a new config knob. The limits are stated, not implied:
+   `cat ~/.config/opencode/auth.json` still works, `env` still shows whatever the Host
+   exported, and every card is readable by every member of the chat. The Access List keeps the
+   *act* private; it cannot keep the *result* private.
+9. **The model is not in the loop, and the transcript does not learn.** A Terminal Command
    enters no **Turn**, no **Session Transcript**, and no context. Both reference
    implementations inject output into the conversation; the `!`/`/run` surface here is a
-   terminal in a chat, and silently turning every `ls` into a prompt is a context-cost and a
-   surprise. 「问 AI」 is the explicit door: it submits the command and its output as a prompt
-   through the normal pipeline, so it opens a real **Turn** and costs what a prompt costs.
-8. **A restart loses the run, and the card says so.** The child's fate depends on how cola was
-   launched, and cola cannot know which: hand-launched, the child survives as an orphan
-   (direct-to-file, decision 3); supervised by systemd, the restart's cgroup termination
-   (`KillMode=control-group`) takes it too, `setsid` notwithstanding; launchd has no cgroup.
-   The card therefore reads 「已失去跟踪（**可能**仍在运行）」, never 「仍在运行」, and the startup
-   sweep settles it as lost — never as done. Its Terminal Log survives, which is why the sweep
-   is by **age** (the `[bridge] log_days` precedent) and never a wholesale boot-time delete: a
-   blanket delete would unlink a file a live orphan is still writing.
-9. **No guard against a command that operates on cola itself.** `!kill <cola pid>`,
-   `!cola restart`, `!rm -rf ~/.cola` and `!pkill -f opencode` all run. The terminal is the
-   emergency exit when cola itself is wedged, and pattern-matching a "self-affecting" list is
-   the same fake safety as a command whitelist — `kill $(cat ~/.cola/cola.lock)` defeats any
-   list. The consequences are accepted and documented: a command that kills cola leaves a
-   frozen card with no exit code, re-running cola is a lock-protected no-op, deleting
-   `access.json` un-claims the bot, and the recovery path is `/restart` (or the Supervisor),
-   never the button on a card whose process is gone.
-10. **The completion notice is the existing one.** A Terminal Command that ran past five
-    minutes owes the same notice a long **Turn** does — `[bridge] long_task_notice` in p2p,
-    `[bridge] group_completion_notice` in groups — because a card patch pushes no
-    notification (ADR-0074). No new switch.
-11. **Unix first; Windows refuses and says why.** cola ships a Windows build, but the hard half
-    is not the shell (`sh -c` vs `cmd /C`), it is terminating the whole tree: `setsid` and a
-    negative pid on Unix versus a Job Object or `taskkill /T` on Windows. V1 answers Windows
-    with a stated refusal rather than a half-implemented lane; the loop is its own ticket.
+   terminal in a chat, and silently turning every `ls` into a prompt is a context cost and a
+   surprise. 「问 AI」 is the explicit door, and it is framed as data: the submission quotes
+   the command and its output the way a **Supplement** quotes context, bounded to the tail
+   rather than an unbounded log, and it goes through the normal prompt pipeline — so with a
+   live Turn it becomes that Turn's **Supplement** (ADR-0062), not a new Turn. The content is
+   attacker-controlled whenever the command read untrusted text, and it is presented as
+   output to reason about, never as instructions.
+10. **A restart loses the run, and the card says so.** The child's fate depends on how cola was
+    launched, and cola cannot know which: hand-launched, the child survives as an orphan
+    (direct-to-file, decision 3); supervised by systemd, the restart's cgroup termination
+    (`KillMode=control-group`) takes it too, `process_group` notwithstanding; launchd has no
+    cgroup. The card therefore reads 「已失去跟踪（**可能**仍在运行）」, never 「仍在运行」, and
+    the startup sweep settles it through decision 5's record. Its **Terminal Log** survives,
+    which is why the sweep is by **age** and never a wholesale boot-time delete: a blanket
+    delete would unlink a file a live orphan is still writing.
+11. **No guard against a command that operates on cola itself.** `!kill <cola pid>`,
+    `!cola restart`, `!rm -rf ~/.cola` and `!pkill -f opencode` all run. The terminal is the
+    emergency exit when cola itself is wedged, and pattern-matching a "self-affecting" list is
+    the same fake safety as a command whitelist — `kill $(cat ~/.cola/cola.lock)` defeats any
+    list. The consequences are accepted and documented: a command that kills cola leaves a
+    frozen card (settled as lost on the next start), re-running cola is a lock-protected no-op,
+    deleting `access.json` un-claims the bot, and the recovery path is `/restart` (or the
+    Supervisor), never the button on a card whose process is gone.
+12. **The completion notice is the long-task one, captured by the command itself.** A Terminal
+    Command notifies only when it ran past the five-minute threshold, in any chat type — a
+    quick `/run ls` owes nobody a push, and a Terminal Command has no reply semantics to
+    justify a group-wide notice the way a **Turn** does. The rule is the same threshold
+    `[bridge] long_task_notice` already carries, but the capture cannot be a **Turn**'s: the
+    notice needs a requester, a reply target and a card id, and a Terminal Command has no
+    Turn, so it captures the three itself. No new switch.
+13. **Unix first; Windows refuses and says why.** cola ships a Windows build, but the hard half
+    is not the shell (`sh -c` vs `cmd /C`), it is terminating the whole tree: a process group
+    and a negative pid on Unix versus a Job Object or `taskkill /T` on Windows. V1 answers
+    Windows with a stated refusal rather than a half-implemented lane; the loop is its own
+    ticket.
 
 ## Why
 
@@ -208,20 +266,28 @@ escape soup this section refuses.
   so borrowing it would mean teaching it a third, cola-owned kind.
 - **Wrapping tmux.** It solves persistence and interactivity by delegating to a program the
   Host may not run, and it moves the truth about "what is running" outside cola entirely.
+- **Relaxing `forbid(unsafe_code)` for `setsid`.** One corner case (a password prompt under a
+  hand-launched cola) is not worth weakening a crate-wide guard the repo already decided
+  against once, in ADR-0085.
 
 ## Consequences
 
-- **A new card family member and a new module.** The Terminal Card joins the command card
-  family; the execution, tail and kill logic lives in one Host-capability module shaped like
-  `viewer` (backend-neutral, generation-neutral), so no generation strategy and no fixture is
-  involved.
+- **A new card family member, a new module, and one small durable record.** The Terminal Card
+  joins the command card family; execution, tail and kill live in one Host-capability module
+  shaped like `viewer` (backend-neutral, generation-neutral); the Terminal Run Record is a
+  write-once, delete-on-settle file, not a ledger.
 - **`!` is a breaking parse change.** Messages that begin with `!` stop reaching the model.
   Bounded deliberately to the first character, and documented in `/help run`.
 - **The blast radius is the Host's own shell.** A Terminal Command can kill cola, kill the
   OpenCode server, or destroy the working tree. That is the feature, and it is why the three
   boundary sentences above are part of the decision rather than an appendix.
 - **A frozen card is a normal outcome, not a bug.** Any command that kills its parent leaves
-  one; the startup sweep settles it, the log keeps the evidence, and `/restart` is the way
-  back.
-- **The Terminal Log is a new at-rest secret surface.** Temporary by design, capped, swept by
-  age, and named so it can never be confused with the application log.
+  one; the sweep settles it on the next start, the log keeps the evidence, and `/restart` is
+  the way back.
+- **The Terminal Log is a new at-rest secret surface.** Temporary by design, 0700/0600,
+  capped at 32 MB per run, swept by age, and named so it can never be confused with the
+  application log.
+- **Two launch modes behave differently, visibly.** A supervised cola has no controlling
+  terminal (prompts fail fast) and takes its children with it on restart; a hand-launched one
+  can have a stopped `sudo` on the desktop and leaves orphans behind. Both are reported, never
+  guessed.
