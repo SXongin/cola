@@ -7,8 +7,12 @@
 //! the merged output the **Terminal Log** holds, and settles with the exit code
 //! and elapsed time. Output is rendered from a bounded tail
 //! ([`TERMINAL_TAIL_CHARS`]) because a card is a fixed budget and a command can
-//! write indefinitely; the log keeps every byte. The live tail, the tail's
-//! `\r`/ANSI handling and the controls are later slices (#823/#825).
+//! write indefinitely; the log keeps every byte. Every fenced element — cwd,
+//! command and output alike — is clipped through the shared
+//! [`clip_fenced_body`] walk, so a long backtick run can never make the fence
+//! (which grows with the run) push the element past
+//! [`MAX_ELEMENT_TEXT_CHARS`]. The live tail, the tail's `\r`/ANSI handling and
+//! the controls are later slices (#823/#825).
 
 use std::time::Duration;
 
@@ -16,7 +20,8 @@ use serde_json::json;
 
 use super::sanitize::CardMarkdown;
 use super::shell::{card_shell, fmt_elapsed};
-use super::{MAX_ELEMENT_TEXT_CHARS, clip_md, fenced_code};
+use super::tool_render::clip_fenced_body;
+use super::{MAX_ELEMENT_TEXT_CHARS, fenced_code};
 
 /// The newest characters of a **Terminal Log** a settled card shows: the same
 /// budget the live tail will use (#823, ADR-0086 §4).
@@ -43,36 +48,20 @@ pub(crate) struct TerminalCard<'a> {
 /// tracer bullet's whole surface (ADR-0086 §4 defers 终止/重跑/完整输出).
 pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     let mut markdown = CardMarkdown::new();
-    let cwd_block = fenced_code(view.cwd, None);
-    let command = clip_md(view.command, MAX_ELEMENT_TEXT_CHARS.saturating_sub(128));
-    let command_block = fenced_code(&command, None);
+    let (cwd_element, _) = fenced_element("**目录**", view.cwd, &mut markdown);
+    let (command_element, _) = fenced_element("**命令**", view.command, &mut markdown);
     let output = if view.output.is_empty() {
-        "（无输出）".to_string()
+        "（无输出）"
     } else {
-        view.output.to_string()
+        view.output
     };
-    let output_block = fenced_code(&output, None);
+    let (output_element, fence_clipped) = fenced_element("**输出**", output, &mut markdown);
 
-    let mut elements = vec![
-        json!({
-            "tag": "markdown",
-            "content": markdown.clean(&format!("**目录**\n{cwd_block}")),
-        }),
-        json!({
-            "tag": "markdown",
-            "content": markdown.clean(&format!("**命令**\n{command_block}")),
-        }),
-        json!({
-            "tag": "markdown",
-            "content": markdown.clean(&format!("**输出**\n{output_block}")),
-        }),
-    ];
-    if view.output_truncated {
+    let mut elements = vec![cwd_element, command_element, output_element];
+    if view.output_truncated || fence_clipped {
         elements.push(json!({
             "tag": "markdown",
-            "content": markdown.clean(&format!(
-                "_（输出过长，仅显示最后 {TERMINAL_TAIL_CHARS} 字符；完整输出已写入终端日志）_"
-            )),
+            "content": markdown.clean("_（输出过长，已截断显示；完整输出已写入终端日志）_"),
         }));
     }
     let (line, template) = match (view.spawn_error, view.exit_code) {
@@ -95,6 +84,24 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         "content": markdown.clean(&line),
     }));
     card_shell("🖥️ 终端命令", template, elements)
+}
+
+/// One fenced element under the per-element budget. `clip_fenced_body` charges
+/// the body's JSON-escaped bytes PLUS the dynamic fence `fenced_code` will add,
+/// so the whole element (prefix, fence and body) stays inside
+/// [`MAX_ELEMENT_TEXT_CHARS`]; the returned flag says whether the body had to
+/// be cut. The prefix itself is charged at its byte length, which is never
+/// smaller than its character count (the conservative side).
+fn fenced_element(prefix: &str, body: &str, markdown: &mut CardMarkdown) -> (serde_json::Value, bool) {
+    let budget = MAX_ELEMENT_TEXT_CHARS.saturating_sub(prefix.len() + 1);
+    let clipped = clip_fenced_body(body, None, budget);
+    let was_clipped = clipped != body;
+    let block = fenced_code(&clipped, None);
+    let element = json!({
+        "tag": "markdown",
+        "content": markdown.clean(&format!("{prefix}\n{block}")),
+    });
+    (element, was_clipped)
 }
 
 /// The settle line's elapsed label: milliseconds under a second (a quick

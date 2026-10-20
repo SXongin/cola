@@ -19,10 +19,7 @@
 //!   (#825/#826/#827); this tracer parses `--timeout` and carries it without
 //!   acting on it, exactly as the ADR's cap stops *tailing*, never the wait.
 
-#[cfg(unix)]
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
 #[cfg(unix)]
@@ -37,6 +34,16 @@ use crate::config::ThreadKey;
 #[cfg(unix)]
 use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
 use crate::feishu::card::terminal::{TerminalCard, build_terminal_card};
+
+/// The environment names cola's child must NOT inherit (ADR-0086 §8): the
+/// server credentials cola itself holds. The same three names `discovery`
+/// reads in the other direction; everything else is the Host's own shell.
+#[cfg(unix)]
+const SCRUBBED_ENV: [&str; 3] = [
+    "OPENCODE_SERVER_PASSWORD",
+    "OPENCODE_PASSWORD",
+    "OPENCODE_SERVER_USERNAME",
+];
 
 /// The bare `/run` / refused-flag answer. It names the grammar, the Path Scope
 /// base and the two practical limits the command's user meets first; `/help
@@ -87,8 +94,30 @@ pub(crate) async fn execute(
     // pending-first — the Pending Session's directory wins, else the active
     // session's, else the default — and the card names exactly this spelling.
     let cwd = handles.current_project_directory(thread_key).await;
-    tracing::debug!("terminal: running in {} with the {:?} cap", cwd, spec.timeout);
-    let run = match run_in(&cwd, &spec.command).await {
+    // The log root is `~/.cola/terminal` (ADR-0086 §7). No home means nowhere
+    // for the output to go: refuse BEFORE spawning, never fall back to a
+    // relative directory that could put command output in an unrelated tree.
+    let Some(log_root) = handles
+        .terminal_log_root
+        .get()
+        .cloned()
+        .or_else(default_terminal_root)
+    else {
+        platform
+            .reply_text(message_id, "⚠️ 无法创建终端日志：找不到 home 目录。")
+            .await?;
+        return Ok(());
+    };
+    // `--timeout` is carried in `RunSpec` for #825, which owns the cap: it
+    // stops the live tail, never the ADR's `wait()`. This slice does not apply
+    // or claim it — naming the owner here keeps the value from reading as an
+    // enforced limit.
+    tracing::debug!(
+        "terminal: running in {} (timeout {:?} is carried for #825 to enforce, not applied here)",
+        cwd,
+        spec.timeout
+    );
+    let run = match run_in(&cwd, &spec.command, &log_root).await {
         Ok(run) => run,
         Err(error) => {
             // A log that cannot be created is the one failure that must not
@@ -126,8 +155,8 @@ struct TerminalRun {
 /// tail. `Err` means the log could not be created — the only failure that
 /// happens **before** a child exists.
 #[cfg(unix)]
-async fn run_in(cwd: &str, command: &str) -> std::io::Result<TerminalRun> {
-    let log = TerminalLog::create()?;
+async fn run_in(cwd: &str, command: &str, log_root: &Path) -> std::io::Result<TerminalRun> {
+    let log = TerminalLog::create(log_root)?;
     let stdout = log.writer.try_clone()?;
     let stderr = log.writer.try_clone()?;
     let started = Instant::now();
@@ -147,6 +176,12 @@ async fn run_in(cwd: &str, command: &str) -> std::io::Result<TerminalRun> {
         // `pre_exec`: the child leads its own process group, so a terminal
         // hangup does not reach it and 终止 will be able to signal the tree.
         .process_group(0);
+    // ADR-0086 §8: the environment is inherited MINUS cola's own credentials.
+    // The child runs as the Host and may read anything the Host can, but the
+    // server password cola holds is not part of "the Host's shell".
+    for name in SCRUBBED_ENV {
+        child.env_remove(name);
+    }
     let status = child.status().await;
     let elapsed = started.elapsed();
     let (exit_code, spawn_error) = match status {
@@ -166,7 +201,7 @@ async fn run_in(cwd: &str, command: &str) -> std::io::Result<TerminalRun> {
 /// Non-Unix hosts never reach here — [`unsupported_reason`] refuses first — but
 /// the module still has to compile there.
 #[cfg(not(unix))]
-async fn run_in(_cwd: &str, _command: &str) -> std::io::Result<TerminalRun> {
+async fn run_in(_cwd: &str, _command: &str, _log_root: &Path) -> std::io::Result<TerminalRun> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         WINDOWS_REFUSAL,
@@ -184,20 +219,17 @@ struct TerminalLog {
 
 #[cfg(unix)]
 impl TerminalLog {
-    fn create() -> std::io::Result<Self> {
-        let dir = terminal_root();
-        std::fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
+    fn create(root: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(root)?;
         {
             use std::os::unix::fs::PermissionsExt;
             // Set explicitly: `create_dir_all` under the usual umask makes a
             // 0755 directory, and this one holds command output.
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
         }
-        let path = dir.join(format!("{}.log", run_id()));
+        let path = root.join(format!("{}.log", run_id()));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
@@ -207,13 +239,12 @@ impl TerminalLog {
     }
 }
 
-/// The directory every Terminal Log lives in: `~/.cola/terminal`.
-#[cfg(unix)]
-pub(crate) fn terminal_root() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cola")
-        .join("terminal")
+/// The production **Terminal Log** root: `~/.cola/terminal` (glossary). `None`
+/// when the Host has no home directory — [`execute`] then refuses rather than
+/// inventing a relative path, which could place command output in an unrelated
+/// working tree.
+fn default_terminal_root() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".cola").join("terminal"))
 }
 
 /// A process-unique run id for the log's name: the wall clock plus a counter,

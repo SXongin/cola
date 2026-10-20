@@ -17,6 +17,36 @@ fn thread() -> ThreadKey {
     ThreadKey::new("chat_1".into(), "chat_1".into())
 }
 
+/// The environment names a Terminal Command's child must not inherit
+/// (ADR-0086 §8).
+#[cfg(unix)]
+static CREDENTIAL_ENV: [&str; 3] = [
+    "OPENCODE_SERVER_PASSWORD",
+    "OPENCODE_PASSWORD",
+    "OPENCODE_SERVER_USERNAME",
+];
+
+/// Build an app whose **Terminal Log** root lives in a temp directory, so a
+/// test never leaves command output under the real home. The returned
+/// `TempDir` must stay alive for the test's duration.
+#[cfg(unix)]
+async fn build_terminal_app(
+    cfg: crate::config::Config,
+    backend: MockBackend,
+) -> (
+    std::sync::Arc<crate::bridge::App>,
+    std::sync::Arc<RecordingPlatform>,
+    tempfile::TempDir,
+) {
+    let logs = tempfile::tempdir().unwrap();
+    let (app, platform) = build_app(cfg, backend).await;
+    app.core
+        .terminal_log_root
+        .set(logs.path().join("terminal"))
+        .expect("the Terminal Log root is set once per app");
+    (app, platform, logs)
+}
+
 /// A seeded active session rooted at `directory`.
 fn entry(key: &ThreadKey, directory: &std::path::Path) -> SessionEntry {
     SessionEntry {
@@ -34,6 +64,7 @@ fn entry(key: &ThreadKey, directory: &std::path::Path) -> SessionEntry {
 
 /// The canonical spelling of `path` — what the card must name, since the cwd it
 /// ran in is the resolved one.
+#[cfg(unix)]
 fn canonical(path: &std::path::Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -42,6 +73,7 @@ fn canonical(path: &std::path::Path) -> String {
 }
 
 /// The one card the command replied with.
+#[cfg(unix)]
 async fn first_card(platform: &RecordingPlatform) -> serde_json::Value {
     platform
         .replied_cards()
@@ -51,6 +83,7 @@ async fn first_card(platform: &RecordingPlatform) -> serde_json::Value {
         .expect("the command replies with a Terminal Card")
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn run_echo_replies_with_a_terminal_card_naming_cwd_command_output_exit_and_elapsed() {
     let _wd = test_work_dir();
@@ -59,7 +92,7 @@ async fn run_echo_replies_with_a_terminal_card_naming_cwd_command_output_exit_an
     let cfg = test_config(&state.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
     let prompts = backend.prompt_calls.clone();
-    let (app, platform) = build_app(cfg, backend).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -84,13 +117,14 @@ async fn run_echo_replies_with_a_terminal_card_naming_cwd_command_output_exit_an
 
 /// A failing command settles with its REAL non-zero exit code and its stderr
 /// (merged into the log), never an empty card.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failing_command_settles_with_its_exit_code_and_stderr() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -115,13 +149,14 @@ async fn a_failing_command_settles_with_its_exit_code_and_stderr() {
 
 /// The command runs in the **Path Scope**'s base: a Pending Session's declared
 /// directory wins, exactly as it does for `/cat` and `/diff`.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_pending_sessions_directory_is_the_cwd() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
 
     send_command_in(
@@ -145,6 +180,7 @@ async fn a_pending_sessions_directory_is_the_cwd() {
 
 /// With neither a Pending Session nor an active one, the run happens in the
 /// default session directory and the card names it.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_default_session_directory_is_the_cwd_without_a_session() {
     let _wd = test_work_dir();
@@ -152,7 +188,7 @@ async fn the_default_session_directory_is_the_cwd_without_a_session() {
     let state = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&state.path().join("sessions.json"));
     cfg.bridge.work_dir = Some(fallback.path().to_path_buf());
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
 
     send_command(&app, "/run pwd", "msg_default_run").await;
 
@@ -170,7 +206,7 @@ async fn stdin_is_closed_so_a_reading_command_exits_immediately() {
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -213,7 +249,7 @@ async fn the_terminal_log_lives_in_a_0700_directory_as_a_0600_file() {
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -228,7 +264,12 @@ async fn the_terminal_log_lives_in_a_0700_directory_as_a_0600_file() {
     .await;
     first_card(&platform).await;
 
-    let dir = crate::bridge::terminal::terminal_root();
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
     let mode = std::fs::metadata(&dir)
         .expect("the Terminal Log directory exists")
         .permissions()
@@ -256,7 +297,7 @@ async fn the_child_leads_its_own_process_group() {
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
-    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -276,6 +317,136 @@ async fn the_child_leads_its_own_process_group() {
         text.contains("退出码 0"),
         "the child is its own process-group leader: {text}"
     );
+}
+
+/// ADR-0086 §8: the environment is inherited MINUS cola's own credentials.
+/// The three names are set for the duration of this test (nothing else reads
+/// them); `printenv` proves the child cannot see any of them, and a clean
+/// `PATH` read proves the rest of the environment still is inherited.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_child_environment_scrubs_cola_credentials() {
+    struct RestoreEnv(&'static [&'static str]);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for name in self.0 {
+                // The test runs no other env mutation, and no production code
+                // reads these names in-process.
+                unsafe { std::env::remove_var(name) };
+            }
+        }
+    }
+
+    for name in CREDENTIAL_ENV {
+        // Rust 2024 marks env mutation unsafe (it is process-global); tests
+        // are the crate's one place unsafe is allowed.
+        unsafe { std::env::set_var(name, "cola-secret-822") };
+    }
+    let _restore = RestoreEnv(&CREDENTIAL_ENV);
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    for (index, name) in CREDENTIAL_ENV.iter().enumerate() {
+        send_command_in(
+            &app,
+            &format!("/run printenv {name}"),
+            key.clone(),
+            &format!("msg_env_{index}"),
+            ConversationKind::P2p,
+        )
+        .await;
+    }
+
+    let cards = platform.replied_cards().await;
+    assert_eq!(cards.len(), CREDENTIAL_ENV.len(), "one card per probe");
+    for (card, name) in cards.iter().zip(CREDENTIAL_ENV) {
+        let text = card_text(card);
+        assert!(
+            text.contains("退出码 1"),
+            "`{name}` is unset in the child: {text}"
+        );
+        assert!(
+            !text.contains("cola-secret-822"),
+            "the credential value never reaches the child: {text}"
+        );
+    }
+}
+
+/// The card family's 3,000-character per-element budget (ADR-0086 §4): a body
+/// of nothing but backticks grows the fence with it, so this is exactly where
+/// clipping the body before fencing would overrun the element. The output is
+/// cut and the card says so.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_backtick_heavy_output_stays_within_the_element_budget() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // 3,000 backticks: past the tail budget, then fence-sized by `fenced_code`.
+    send_command_in(
+        &app,
+        "/run printf '%3000s' | tr ' ' '\\140'",
+        key,
+        "msg_run_backticks",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let card = first_card(&platform).await;
+    let texts = card_texts(&card);
+    for text in &texts {
+        assert!(
+            text.chars().count() <= crate::feishu::card::MAX_ELEMENT_TEXT_CHARS,
+            "every element stays inside the per-element budget ({} chars): {text}",
+            text.chars().count()
+        );
+    }
+    assert!(
+        texts.join("\n").contains("输出过长"),
+        "a cut display says so: {texts:?}"
+    );
+}
+
+/// On Windows the command is refused with a stated reason and nothing is
+/// spawned: no card, no prompt, no log.
+#[cfg(not(unix))]
+#[tokio::test]
+async fn windows_refuses_the_command_with_a_reason_and_spawns_nothing() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(&app, "/run echo hi", key, "msg_windows", ConversationKind::P2p).await;
+
+    let texts = platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("Windows") && text.contains("不支持")),
+        "the refusal states why: {texts:?}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "a refused command posts no Terminal Card"
+    );
+    assert!(prompts.lock().await.is_empty(), "and becomes no prompt");
 }
 
 /// Find the Terminal Log whose bytes carry `marker` (parallel tests share the
@@ -299,6 +470,7 @@ fn find_log_containing(dir: &std::path::Path, marker: &str) -> std::path::PathBu
 
 /// The bare `/run` and every refused flag form answer usage and spawn nothing;
 /// `--timeout` and `--` parse as ADR-0086 §6 says.
+#[cfg(unix)]
 #[tokio::test]
 async fn run_usage_and_flag_forms_are_answered_without_spawning() {
     let _wd = test_work_dir();
@@ -307,7 +479,7 @@ async fn run_usage_and_flag_forms_are_answered_without_spawning() {
     let cfg = test_config(&state.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
     let prompts = backend.prompt_calls.clone();
-    let (app, platform) = build_app(cfg, backend).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -357,6 +529,7 @@ async fn run_usage_and_flag_forms_are_answered_without_spawning() {
 
 /// No OpenCode server is contacted: `/run` works with `start_server = "never"`
 /// and an unreachable server.
+#[cfg(unix)]
 #[tokio::test]
 async fn run_works_with_the_server_down_and_never_contacts_it() {
     let _wd = test_work_dir();
@@ -367,7 +540,7 @@ async fn run_works_with_the_server_down_and_never_contacts_it() {
     cfg.opencode.url = Some("http://127.0.0.1:9".into());
     let backend = MockBackend::new(realistic_parts());
     let prompts = backend.prompt_calls.clone();
-    let (app, platform) = build_app(cfg, backend).await;
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
