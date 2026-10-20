@@ -639,11 +639,22 @@ async fn run_claimed(
     let thread_key = &claim.thread_key;
     // The Path Scope (ADR-0083 §4, ADR-0086 §2): `current_project_directory` is
     // pending-first — the Pending Session's directory wins, else the active
-    // session's, else the default — and the card names exactly this spelling.
+    // session's, else the default. The base is then **canonicalised when it
+    // exists**, the same resolution `/cat` applies to a path (spec #821 user
+    // story 10), so the card, the record, the rerun and the child all name one
+    // spelling — macOS's `/var` → `/private/var` is exactly the shape a raw
+    // spelling gets wrong. A base that does not exist is left exactly as
+    // requested: the spawn failure then names the directory the Host asked for,
+    // not one `canonicalize` invented. This applies to a rerun's recorded cwd
+    // too (idempotent for an existing directory), so both runs behave alike.
     let cwd = match cwd {
         Some(cwd) => cwd,
         None => handles.current_project_directory(thread_key).await,
     };
+    let cwd = std::fs::canonicalize(&cwd)
+        .ok()
+        .and_then(|resolved| resolved.to_str().map(str::to_string))
+        .unwrap_or(cwd);
     // The log root is `~/.cola/terminal` (ADR-0086 §7). No home means nowhere
     // for the output to go: refuse BEFORE spawning, never fall back to a
     // relative directory that could put command output in an unrelated tree.
