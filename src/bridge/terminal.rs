@@ -1608,7 +1608,8 @@ async fn settle(
 }
 
 /// End a run: persist the **owed settlement** first, tell the card, then drop
-/// the obligation once its PATCH landed (whole-branch review, finding 1).
+/// the obligation once its PATCH landed **and** the chat's record no longer says
+/// the run is running (whole-branch review, finding 1).
 ///
 /// The obligation — not the per-chat record — is the durable promise: the record
 /// is replaced by the chat's next run, so an ending kept only there could be
@@ -1616,6 +1617,14 @@ async fn settle(
 /// may the card be told; if it cannot be persisted, the card is left exactly as
 /// it is and the failure is logged, because a card that says 「已完成」 with no
 /// durable obligation is a claim no restart could repair.
+///
+/// Dropping the obligation is the same two-part condition the recovery path
+/// uses: a landed card PATCH alone is not enough, because the record's own state
+/// write may have failed (a read-only record directory, say). The on-disk record
+/// would then still say `running`, and without the obligation the next start's
+/// lost sweep would relabel the card it just repaired 「已失去跟踪」. So the
+/// targeted merge must land too; until it does, the obligation keeps protecting
+/// the record.
 ///
 /// `durable` says whether the pre-spawn record write landed: with it, the chat's
 /// record is also marked settled (best effort — the obligation is the authority).
@@ -1655,7 +1664,13 @@ async fn finish_run(
         outcome,
     )
     .await;
-    if patched {
+    // Both halves of the ending must be durable before the obligation can go: the
+    // card's PATCH and the record's state. A failed `update` above leaves the
+    // on-disk record `running`, and `mark_settled` is the targeted merge that
+    // fixes it without discarding what the record learned since. With no record
+    // at all (`durable == false`) there is nothing to protect, so the PATCH is
+    // the whole condition.
+    if patched && (!durable || records.mark_settled(&record.key(), run_id)) {
         records.owed().remove(run_id);
     }
     patched

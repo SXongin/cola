@@ -4779,10 +4779,104 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
     assert_eq!(after.card_id, "msg_card_new");
 }
 
+/// Whole-branch review (round 3): a landed card PATCH is not enough to drop the
+/// obligation. If the record's own state cannot be written (a read-only record
+/// directory), the on-disk record still says `running`; without the obligation
+/// the next start's lost sweep would relabel the repaired card 「已失去跟踪」.
+/// The live path must therefore hold the obligation until the targeted
+/// `mark_settled` lands too — exactly what the recovery path does.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_obligation_survives_a_record_write_failure_so_the_lost_sweep_cannot_relabel_the_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let run = tokio::spawn({
+        let app = Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run printf 'write-gap-827\\n'; sleep 0.5",
+                key,
+                "msg_write_gap",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    // The child exists and its record is `running`: now the record directory
+    // becomes unusable, so every later record write fails while the card PATCH
+    // and the sibling owed store stay healthy.
+    let running = wait_for_record(&app, &key, |record| {
+        record.state == TerminalRunState::Running && !record.pids.is_empty()
+    })
+    .await;
+    let records_dir = app.terminal_records.dir().to_path_buf();
+    let backup = records_dir.with_file_name("terminal-runs.bak");
+    std::fs::rename(&records_dir, &backup).unwrap();
+    std::fs::write(&records_dir, b"not a directory").unwrap();
+
+    // The card still settles: the PATCH never touches the record directory.
+    let patched = wait_for_patch_containing(&platform, &running.card_id, "退出码 0").await;
+    assert!(
+        !card_text(&patched).contains("已失去跟踪"),
+        "the run's own card settles: {}",
+        card_text(&patched)
+    );
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the run ends")
+        .unwrap();
+
+    // The obligation is retained, and the record on disk still says `running`.
+    let (owing, _) = app.terminal_records.owed().load_all();
+    assert!(
+        owing.iter().any(|entry| entry.record.run_id == running.run_id),
+        "a failed state write keeps the obligation: {owing:?}"
+    );
+    std::fs::remove_file(&records_dir).unwrap();
+    std::fs::rename(&backup, &records_dir).unwrap();
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().state,
+        TerminalRunState::Running,
+        "the record's own settle write never landed"
+    );
+    let root = log_root(&app);
+
+    // The restart repairs the card from the obligation and merges the record's
+    // state; the lost sweep never gets to relabel it.
+    let (app2, platform2) = restart_app(cfg, root).await;
+    app2.sweep_terminal().await;
+    let repaired = wait_for_patch_containing(&platform2, &running.card_id, "退出码 0").await;
+    let text = card_text(&repaired);
+    assert!(text.contains("write-gap-827"), "the log's tail: {text}");
+    assert!(
+        !text.contains("已失去跟踪"),
+        "the obligation protected the record from the lost sweep: {text}"
+    );
+    assert!(
+        app2.terminal_records.owed().load_all().0.is_empty(),
+        "the obligation is discharged once the merge lands"
+    );
+    assert_eq!(
+        app2.terminal_records.read(&key).unwrap().state,
+        TerminalRunState::Settled,
+        "and the record now says settled"
+    );
+}
+
 /// Whole-branch review (round 2, finding 1): the owed repair needs nothing from
 /// the chat's current record. A corrupt record — the state `load_all` skips —
-/// still leaves the obligation readable, so the card is repaired and the dead
-/// record never stands in for "nothing owed".
+/// still leaves the obligation readable, so the card is repaired. The record
+/// merge cannot prove anything through the corruption, so the obligation is
+/// **retained** (round 3): dropping it while a `running` record may be hiding
+/// behind an unreadable file is exactly the guess the lost sweep must not make.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_owed_settle_is_repaired_even_when_the_current_record_is_unreadable() {
@@ -4818,8 +4912,13 @@ async fn an_owed_settle_is_repaired_even_when_the_current_record_is_unreadable()
     assert!(text.contains("corrupt-record-827"), "{text}");
     assert!(!text.contains("已失去跟踪"), "the ending was known: {text}");
     assert!(
-        app2.terminal_records.owed().load_all().0.is_empty(),
-        "the obligation is dropped once its card landed"
+        app2.terminal_records
+            .owed()
+            .load_all()
+            .0
+            .iter()
+            .any(|entry| entry.record.run_id == pending.run_id),
+        "an unreadable record keeps the obligation: its `running` state cannot be disproved"
     );
 }
 

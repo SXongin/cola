@@ -340,6 +340,12 @@ now separate facts, and the second one is **not** kept in the per-chat record:
   for a lost one. A `running` record whose card is owed is therefore *not*
   reported lost, and an incomplete owed view never stands in for "nothing owed" —
   that is what would relabel an accurate settled card 「已失去跟踪」.
+- The **live settle path uses the same two-part condition**: the obligation is
+  dropped only after the card PATCH *and* the targeted record merge both land. A
+  landed PATCH alone is not enough — the record's own state write can fail while
+  Feishu works (a read-only record directory), and then the on-disk record still
+  says `running`; dropping the obligation there would let the next start's lost
+  sweep relabel the card the previous process just settled.
 - A `running` record still sweeps to `lost`. A settled run keeps its buttons
   whatever ended it: a launch that never started has no output, but it has a log
   path and a record, so 「↻ 重跑」 (gated on a written record), 「📄 完整输出」 and
