@@ -1,5 +1,5 @@
 use crate::backend::{MessageRole, TailEntry, TailMessage};
-use crate::bridge::snapshot::{ElsewherePending, SnapshotData};
+use crate::bridge::snapshot::{ElsewherePending, PendingOverflow, SnapshotData};
 use crate::feishu::card::session::{BackToList, back_to_list_button};
 use crate::opencode;
 use serde_json::json;
@@ -241,6 +241,10 @@ pub fn build_snapshot_card(
 /// `receipts` are Interaction Receipt lines for claimed blocks resolved by
 /// another client (#175, ADR-0038 rule 4): one markdown line each, rendered
 /// under the live blocks so a resolved block leaves a visible residue.
+///
+/// This is the RENDER path: `data.pending` is the split the send path decided
+/// (already trimmed), so every pending it still carries is rendered and no
+/// claimed block can be traded away for space (#842).
 pub fn build_snapshot_card_with_state(
     verb: &str,
     title: &str,
@@ -249,20 +253,54 @@ pub fn build_snapshot_card_with_state(
     receipts: &[String],
     back: Option<&BackToList>,
 ) -> serde_json::Value {
-    build_snapshot_card_fitted(verb, title, data, question_state, receipts, back).card
+    let verb = verb.strip_prefix("已").unwrap_or(verb);
+    let title = display_title(title, &data.session_id);
+    let pending: Vec<_> = data
+        .pending
+        .iter()
+        .filter(|req| req.session_id() == data.session_id)
+        .collect();
+    let build = SnapshotBuild {
+        verb,
+        title: &title,
+        data,
+        question_state,
+        back,
+    };
+    render_fitted(&build, &pending, data.pending_overflow, receipts)
 }
 
-/// A built snapshot together with the fact its caller must keep claims honest.
+/// A built snapshot together with the decision its caller must persist.
 pub struct BuiltSnapshot {
     pub card: serde_json::Value,
-    /// How many of `data.pending` this card does NOT embed (#841). The caller
-    /// must not claim them: they stay unclaimed, and the normal pending flow
-    /// renders them on their own cards.
-    pub pending_overflow: usize,
+    /// How many of `data.pending` the card EMBEDS, in order. The caller keeps
+    /// exactly this prefix (and claims exactly it); a rebuild renders that
+    /// stored set and never re-decides.
+    pub embedded: usize,
+    /// How many pendings the card left out (#841/#842). They stay UNCLAIMED, so
+    /// the normal pending flow surfaces them (inline on the session's live card
+    /// when one exists, otherwise its own card); the card names them instead of
+    /// claiming what it cannot show.
+    pub overflow: usize,
 }
 
-/// [`build_snapshot_card_with_state`] plus the embedded-pending count. The
-/// adoption path uses this one: it claims exactly what the card rendered.
+/// The most pending blocks one snapshot card embeds, independent of the byte
+/// budget (#842). A card packed with dozens of permission blocks leaves no room
+/// for the 最近对话 the adopting reader came for, and is unusable to scroll, so
+/// the block share has its own ceiling — the budget can lower this further, it
+/// never raises it.
+pub const MAX_SNAPSHOT_PENDING_BLOCKS: usize = 5;
+
+/// [`build_snapshot_card_with_state`] plus the embedded/overflow decision. The
+/// adoption path uses this one: it persists the returned split and claims
+/// exactly what the card rendered.
+///
+/// The decision is made HERE, ONCE: the longest prefix of the pendings whose
+/// blocks fit one card with every evictable section gone, capped at
+/// [`MAX_SNAPSHOT_PENDING_BLOCKS`]. A claim whose block the card does not render
+/// is a request the user cannot answer there, so the card either renders a
+/// pending or leaves it out entirely — and a rebuild only re-renders the stored
+/// split, so claims and rendered blocks cannot drift (#841, #842).
 pub fn build_snapshot_card_fitted(
     verb: &str,
     title: &str,
@@ -291,56 +329,68 @@ pub fn build_snapshot_card_fitted(
         back,
     };
 
-    // One-shot cards have no splitter, so the snapshot trades content away
-    // when it outgrows the budget (issue #726):
-    //
-    // 1. the claimed pending blocks leave FIRST, all of them — a claim whose
-    //    block the card does not render is a request the user cannot answer
-    //    there, so the snapshot embeds either the whole set or none, and the
-    //    ones it drops stay unclaimed for the standalone pending flow (#841);
-    // 2. then the receipts — residue for blocks another client already
-    //    resolved, not conversation. ADR-0038's 2026-10-20 update reconciles
-    //    this with rule 4: a receipt the snapshot does not render is absent
-    //    from this surface, never mis-targeted, and keeps its transcript home;
-    // 3. then the 最近对话 tail, oldest entry first, so the newest conversation
-    //    survives.
-    //
-    // The full build is returned untouched whenever it fits: the budget only
-    // ever runs its ladder when the unbudgeted card is over.
-    let mut pending_overflow = data.pending_overflow.min(pending.len());
-    let mut embedded = &pending[..pending.len() - pending_overflow];
-    if !embedded.is_empty() {
-        // Does the claimed set fit on its own, with every evictable section
-        // gone? If not, no amount of tail/receipt trading can save the card,
-        // and the pendings leave before the conversation costs anything.
-        let floor = build.card(
-            embedded,
-            pending_overflow,
-            &SnapshotPass {
-                receipts: &[],
-                omitted_receipts: receipts.len(),
-                tail: &[],
-                omitted_tail: data.tail.len(),
-            },
-        );
-        if !fits_card(&floor) {
-            pending_overflow = pending.len();
-            embedded = &[];
-        }
-    }
+    // The floor of a candidate split: chip + the K blocks + the overflow notice
+    // + the back button, with receipts and the tail gone. If this fits, the
+    // ladder below can always fit the final card by trading those away.
+    let floor_pass = SnapshotPass {
+        receipts: &[],
+        omitted_receipts: receipts.len(),
+        tail: &[],
+        omitted_tail: data.tail.len(),
+    };
+    let ceiling = pending.len().min(MAX_SNAPSHOT_PENDING_BLOCKS);
+    let embedded = largest_fitting(ceiling, |k| {
+        build.card(
+            &pending[..k],
+            PendingOverflow::from_send(pending.len() - k),
+            &floor_pass,
+        )
+    });
+    let overflow = pending.len() - embedded;
 
+    let card = render_fitted(
+        &build,
+        &pending[..embedded],
+        PendingOverflow::from_send(overflow),
+        receipts,
+    );
+    BuiltSnapshot {
+        card,
+        embedded,
+        overflow,
+    }
+}
+
+/// The render half shared by the send path and every rebuild: the embedded
+/// pendings are FIXED, and only the evictable content trades away. One-shot
+/// cards have no splitter, so when the card outgrows the budget (issue #726):
+///
+/// 1. the receipts leave first — residue for blocks another client already
+///    resolved, not conversation. ADR-0038's 2026-10-20 update reconciles this
+///    with rule 4: a receipt the snapshot does not render is absent from this
+///    surface, never mis-targeted, and keeps its transcript home;
+/// 2. then the 最近对话 tail, oldest entry first, so the newest conversation
+///    survives.
+///
+/// The claimed blocks are NOT in this ladder any more (#842): their inclusion
+/// was decided at send. A rebuild that dropped a still-claimed block would
+/// leave a request with no surface to answer it from — the invariant the whole
+/// split exists to protect.
+fn render_fitted(
+    build: &SnapshotBuild<'_>,
+    pendings: &[&crate::bridge::request::kind::PendingRequest],
+    overflow: PendingOverflow,
+    receipts: &[String],
+) -> serde_json::Value {
     let full = SnapshotPass {
         receipts,
         omitted_receipts: 0,
-        tail: &data.tail,
+        tail: &build.data.tail,
         omitted_tail: 0,
     };
-    let card = build.card(embedded, pending_overflow, &full);
+    let card = build.card(pendings, overflow, &full);
     if fits_card(&card) {
-        return BuiltSnapshot {
-            card,
-            pending_overflow,
-        };
+        return card;
     }
 
     // Drop the receipts before the conversation. Binary-searched so a long
@@ -352,54 +402,48 @@ pub fn build_snapshot_card_fitted(
         omitted_receipts: receipts.len(),
         ..full
     };
-    let no_receipts = build.card(embedded, pending_overflow, &without_receipts);
+    let no_receipts = build.card(pendings, overflow, &without_receipts);
     if fits_card(&no_receipts) {
-        return BuiltSnapshot {
-            card: smallest_omission(
-                receipts.len(),
-                |omitted| {
-                    build.card(
-                        embedded,
-                        pending_overflow,
-                        &SnapshotPass {
-                            receipts: &receipts[omitted..],
-                            omitted_receipts: omitted,
-                            ..without_receipts
-                        },
-                    )
-                },
-                no_receipts,
-            ),
-            pending_overflow,
-        };
+        return smallest_omission(
+            receipts.len(),
+            |omitted| {
+                build.card(
+                    pendings,
+                    overflow,
+                    &SnapshotPass {
+                        receipts: &receipts[omitted..],
+                        omitted_receipts: omitted,
+                        ..without_receipts
+                    },
+                )
+            },
+            no_receipts,
+        );
     }
 
     // Still over: the tail goes too, oldest entry first.
     let floor_pass = SnapshotPass {
         tail: &[],
-        omitted_tail: data.tail.len(),
+        omitted_tail: build.data.tail.len(),
         ..without_receipts
     };
-    let floor = build.card(embedded, pending_overflow, &floor_pass);
+    let floor = build.card(pendings, overflow, &floor_pass);
     if fits_card(&floor) {
-        return BuiltSnapshot {
-            card: smallest_omission(
-                data.tail.len(),
-                |omitted| {
-                    build.card(
-                        embedded,
-                        pending_overflow,
-                        &SnapshotPass {
-                            tail: &data.tail[omitted..],
-                            omitted_tail: omitted,
-                            ..floor_pass
-                        },
-                    )
-                },
-                floor,
-            ),
-            pending_overflow,
-        };
+        return smallest_omission(
+            build.data.tail.len(),
+            |omitted| {
+                build.card(
+                    pendings,
+                    overflow,
+                    &SnapshotPass {
+                        tail: &build.data.tail[omitted..],
+                        omitted_tail: omitted,
+                        ..floor_pass
+                    },
+                )
+            },
+            floor,
+        );
     }
 
     // Even the floor (status chip, overflow notice, back button) is over
@@ -411,10 +455,27 @@ pub fn build_snapshot_card_fitted(
         floor.to_string().len(),
         crate::feishu::card::MAX_CARD_JSON_CHARS
     );
-    BuiltSnapshot {
-        card: floor,
-        pending_overflow,
+    floor
+}
+
+/// The largest `k` in `0..=ceiling` whose candidate build fits, or 0 when even
+/// the empty split does not. One more pending block only adds an `hr` and its
+/// elements, so the predicate is monotone and a binary search suffices: `lo` is
+/// known to fit (or nothing does), `hi` is the untested ceiling.
+fn largest_fitting(ceiling: usize, mut build: impl FnMut(usize) -> serde_json::Value) -> usize {
+    if ceiling == 0 || !fits_card(&build(0)) {
+        return 0;
     }
+    let (mut lo, mut hi) = (0, ceiling);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if fits_card(&build(mid)) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// Whether an assembled card fits the one-shot budgets Feishu accepts: the
@@ -486,11 +547,11 @@ struct SnapshotBuild<'a> {
 
 impl SnapshotBuild<'_> {
     /// One build pass: the embedded pending blocks (already chosen), the
-    /// overflow count they leave behind, and the evictable content in `pass`.
+    /// overflow fact they leave behind, and the evictable content in `pass`.
     fn card(
         &self,
         pendings: &[&crate::bridge::request::kind::PendingRequest],
-        pending_overflow: usize,
+        pending_overflow: PendingOverflow,
         pass: &SnapshotPass,
     ) -> serde_json::Value {
         let data = self.data;
@@ -503,7 +564,7 @@ impl SnapshotBuild<'_> {
 
         let mut elements: Vec<serde_json::Value> = Vec::new();
         if let Some(chip) = status_chip_element(
-            !pendings.is_empty() || pending_overflow > 0,
+            !pendings.is_empty() || pending_overflow.any(),
             data.pending_elsewhere,
             data.waiting,
             data.status,
@@ -516,13 +577,25 @@ impl SnapshotBuild<'_> {
             }
             elements.extend(req.snapshot_block_elements(&data.directory, self.question_state));
         }
-        if pending_overflow > 0 {
-            elements.push(json!({
+        // The overflow line names what the card leaves to the normal pending
+        // flow. It deliberately does not promise a standalone card: an
+        // unclaimed request is surfaced INLINE on the session's live card when
+        // one exists, and only falls back to its own card otherwise (#842).
+        match pending_overflow {
+            PendingOverflow::None => {}
+            PendingOverflow::Counted(n) => elements.push(json!({
                 "tag": "markdown",
                 "content": format!(
-                    "…另有 {pending_overflow} 个待处理请求超出单卡容量，将在单独卡片中显示"
+                    "…另有 {n} 个待处理请求超出单卡容量，将稍后显示"
                 )
-            }));
+            })),
+            // A rebuild cannot know how many of the unclaimed ones still
+            // exist (they are outside the claim registry), so it stops naming
+            // a number rather than showing a stale one.
+            PendingOverflow::Uncounted => elements.push(json!({
+                "tag": "markdown",
+                "content": "…另有待处理请求超出单卡容量，将稍后显示"
+            })),
         }
         if pass.omitted_receipts > 0 {
             elements.push(json!({
@@ -538,7 +611,7 @@ impl SnapshotBuild<'_> {
         }
         let has_receipts = pass.omitted_receipts > 0 || !pass.receipts.is_empty();
         let has_tail = pass.omitted_tail > 0 || !pass.tail.is_empty();
-        if (!pendings.is_empty() || pending_overflow > 0 || has_receipts) && has_tail {
+        if (!pendings.is_empty() || pending_overflow.any() || has_receipts) && has_tail {
             elements.push(json!({ "tag": "hr" }));
         }
         elements.extend(tail_panels(pass.tail, pass.omitted_tail, &mut md));
@@ -556,10 +629,9 @@ impl SnapshotBuild<'_> {
 /// The evictable content of one build pass, and how many older items were
 /// omitted (each count rendered as a visible line).
 ///
-/// The claimed pending blocks are outside this struct on purpose: they are
-/// all-or-nothing (a claim whose block is dropped would leave a request the
-/// user cannot answer here), handled by [`build_snapshot_card_fitted`] BEFORE
-/// this ladder runs.
+/// The embedded pending blocks are outside this struct on purpose: the send
+/// path decided them once and a rebuild must render every one it still has
+/// (#842), so they never join this ladder.
 #[derive(Clone, Copy)]
 struct SnapshotPass<'a> {
     receipts: &'a [String],
@@ -652,7 +724,7 @@ mod tests {
             waiting: false,
             pending,
             pending_elsewhere: None,
-            pending_overflow: 0,
+            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
             tail,
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,
@@ -1366,12 +1438,12 @@ mod tests {
         );
     }
 
-    /// The claimed pending blocks are all-or-nothing (#841): their blocks are
-    /// what makes a claim answerable, so when they alone outgrow one card the
-    /// snapshot embeds NONE, names the overflow, and keeps the conversation
-    /// instead. The requests stay unclaimed for their standalone cards.
+    /// A long pending set is embedded up to the block cap (#842): the card
+    /// carries the first five blocks, names the rest, and keeps the
+    /// conversation it has room for. The rest stay unclaimed for the normal
+    /// pending flow.
     #[test]
-    fn an_oversized_pending_floor_leaves_the_requests_to_their_own_cards() {
+    fn a_long_pending_set_embeds_the_cap_and_names_the_rest() {
         let pending: Vec<PendingRequest> = (0..60)
             .map(|i| PendingRequest::Permission(permission(&format!("req_{i}"), "ses_adopted", "bash")))
             .collect();
@@ -1380,14 +1452,11 @@ mod tests {
             pending,
             vec![tail_message(MessageRole::User, 1000, "保留的对话")],
         );
-        let total = d.pending.len();
         let built = build_snapshot_card_fitted("接管", "t", &d, &SnapshotQuestionState::new(), &[], None);
         let s = built.card.to_string();
 
-        assert_eq!(
-            built.pending_overflow, total,
-            "the whole set moves to the standalone flow"
-        );
+        assert_eq!(built.embedded, MAX_SNAPSHOT_PENDING_BLOCKS, "the cap binds");
+        assert_eq!(built.overflow, 60 - MAX_SNAPSHOT_PENDING_BLOCKS);
         assert!(
             s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
             "byte budget: {}",
@@ -1398,16 +1467,54 @@ mod tests {
             "component budget: {}",
             card_components(&built.card)
         );
+        assert_eq!(
+            s.matches("✅ 允许一次").count(),
+            MAX_SNAPSHOT_PENDING_BLOCKS,
+            "exactly the capped prefix is embedded: {s}"
+        );
         assert!(
-            s.contains("个待处理请求超出单卡容量"),
+            s.contains("55 个待处理请求超出单卡容量"),
             "the overflow is named: {s}"
         );
         assert!(
-            !s.contains("✅ 允许一次"),
-            "no claimed block is embedded when the set cannot fit: {s}"
+            s.contains("将稍后显示"),
+            "the copy promises no particular card: {s}"
         );
-        assert!(s.contains("保留的对话"), "the conversation is kept instead: {s}");
+        assert!(s.contains("保留的对话"), "the conversation is kept: {s}");
         assert!(s.contains("等待你的确认"), "the chip still reports the wait: {s}");
+    }
+
+    /// The card budget can bind below the cap: five oversized question blocks
+    /// do not fit, so the snapshot embeds only the prefix that does — never
+    /// zero just because the whole set is too big (#842).
+    #[test]
+    fn the_card_budget_can_embed_fewer_than_the_cap() {
+        let pending: Vec<PendingRequest> = (0..5)
+            .map(|i| {
+                let mut q = question(&format!("req_{i}"), "ses_adopted");
+                q.questions[0].question = "问".repeat(5000);
+                PendingRequest::Question(q)
+            })
+            .collect();
+        let d = data(
+            Some(opencode::types::SessionStatus::Busy),
+            pending,
+            vec![tail_message(MessageRole::User, 1000, "对话")],
+        );
+        let built = build_snapshot_card_fitted("接管", "t", &d, &SnapshotQuestionState::new(), &[], None);
+        let s = built.card.to_string();
+
+        assert_eq!(built.embedded, 1, "one oversized block fits, the next does not");
+        assert_eq!(built.overflow, 4);
+        assert!(
+            s.len() <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "byte budget: {}",
+            s.len()
+        );
+        assert!(
+            s.contains("4 个待处理请求超出单卡容量"),
+            "the overflow is named: {s}"
+        );
     }
 
     /// A claimed set that fits is embedded and claimed in full: the overflow
@@ -1425,8 +1532,45 @@ mod tests {
         );
         let built = build_snapshot_card_fitted("接管", "t", &d, &SnapshotQuestionState::new(), &[], None);
 
-        assert_eq!(built.pending_overflow, 0);
+        assert_eq!(built.embedded, 1);
+        assert_eq!(built.overflow, 0);
         assert!(built.card.to_string().contains("✅ 允许一次"));
+        assert!(!built.card.to_string().contains("超出单卡容量"));
+    }
+
+    /// A rebuild renders the stored split and names the leftover requests
+    /// WITHOUT a number (#842): the unclaimed ones are outside the claim
+    /// registry, so cola cannot know how many remain, and a stale count would
+    /// be worse than none.
+    #[test]
+    fn a_rebuilt_card_names_the_overflow_without_a_count() {
+        let mut d = data(
+            Some(opencode::types::SessionStatus::Busy),
+            vec![PendingRequest::Permission(permission(
+                "req_1",
+                "ses_adopted",
+                "bash",
+            ))],
+            vec![tail_message(MessageRole::User, 1000, "对话")],
+        );
+        d.pending_overflow = PendingOverflow::Counted(3);
+        let counted =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &[], None)
+                .to_string();
+        assert!(counted.contains("3 个待处理请求超出单卡容量"), "{counted}");
+
+        d.pending_overflow = d.pending_overflow.uncounted();
+        let rebuilt =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &[], None)
+                .to_string();
+        assert!(
+            rebuilt.contains("另有待处理请求超出单卡容量"),
+            "the rebuild still names the leftover set: {rebuilt}"
+        );
+        assert!(
+            !rebuilt.contains("3 个待处理请求"),
+            "no stale count on a rebuild: {rebuilt}"
+        );
     }
 
     /// The component ceiling binds too (#726's review): 160 title-only
@@ -1522,7 +1666,7 @@ mod tests {
         }
         .card(
             &[],
-            0,
+            PendingOverflow::None,
             &SnapshotPass {
                 receipts: &[],
                 omitted_receipts: 0,

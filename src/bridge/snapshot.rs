@@ -36,9 +36,13 @@ pub struct SnapshotData {
     /// but idle (never guessed — the same rule the suppression predicate's
     /// idle check uses).
     pub waiting: bool,
-    /// Pending permission/question requests whose `sessionID` is the adopted
-    /// session (never another session's in the same directory, and never a
-    /// sub-task child's — ADR-0028 keeps those on today's standalone flow).
+    /// Pending permission/question requests this snapshot card EMBEDS — and
+    /// therefore the only ones it may claim (#841). The send path trims this to
+    /// the prefix the card can carry ([`PendingOverflow`]); a rebuild never
+    /// re-decides, it only re-renders what is left of this set. The gather fills
+    /// it with every request whose `sessionID` is the adopted session (never
+    /// another session's in the same directory, and never a sub-task child's —
+    /// ADR-0028 keeps those on today's standalone flow).
     pub pending: Vec<crate::bridge::request::kind::PendingRequest>,
     /// The session's pendings that `claimable_pendings` kept OFF this snapshot
     /// because they are already surfaced elsewhere (a live inline block, a
@@ -46,12 +50,12 @@ pub struct SnapshotData {
     /// `None` when there were none. The status chip points at that card
     /// instead of falling back to the server run state; see [`ElsewherePending`].
     pub pending_elsewhere: Option<ElsewherePending>,
-    /// How many of `pending` this snapshot does NOT embed because the claimed
-    /// blocks alone would exceed one Feishu card (#841). Such requests are left
-    /// UNCLAIMED — the normal pending flow renders them on their own cards — so
-    /// the card names the overflow instead of claiming what it cannot show.
-    /// `0` on every snapshot whose pendings fit, which is the common case.
-    pub pending_overflow: usize,
+    /// The requests this snapshot does NOT embed (#841): they stay UNCLAIMED,
+    /// the normal pending flow renders them (inline on a live card, otherwise a
+    /// standalone card), and the card names them instead of claiming what it
+    /// cannot show. Decided ONCE at send; a rebuild renders the stored fact and
+    /// never recomputes it — see [`PendingOverflow`].
+    pub pending_overflow: PendingOverflow,
     /// The 最近对话 tail: the last conversation user/assistant messages,
     /// newest last, with the **Compaction**s that happened inside that window
     /// interleaved at their server positions — a marker that never consumes one
@@ -84,17 +88,65 @@ pub enum ElsewherePending {
     Unpinned,
 }
 
-impl SnapshotData {
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
+/// What happened to the adopt-time pendings this snapshot did NOT embed (#841).
+///
+/// Decided ONCE, when the card is sent; a rebuild only re-renders the stored
+/// fact. The unclaimed requests are outside this snapshot's claim registry, so
+/// cola cannot observe whether they are still pending — which is exactly why
+/// the count is a send-time fact rather than something a rebuild re-derives.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PendingOverflow {
+    /// Every claimable pending fits: the common case, nothing to report.
+    None,
+    /// The sent card names the overflow count.
+    Counted(usize),
+    /// A rebuild of that card: the requests left over are still named, but the
+    /// count is gone — the snapshot cannot know how many survive.
+    Uncounted,
+}
+
+impl PendingOverflow {
+    /// The overflow fact for a send-time decision: `None` when nothing was left
+    /// out.
+    pub fn from_send(overflow: usize) -> PendingOverflow {
+        if overflow == 0 {
+            PendingOverflow::None
+        } else {
+            PendingOverflow::Counted(overflow)
+        }
     }
 
-    /// The pendings the snapshot card actually EMBEDS — and therefore the only
-    /// ones it may claim (#841). Empty when the whole set had to move to the
-    /// standalone pending flow.
+    /// Whether the session has pendings beyond what this card shows — true even
+    /// when the card embeds NONE of them, so the suppression predicate still
+    /// reports a waiting session.
+    pub fn any(self) -> bool {
+        !matches!(self, PendingOverflow::None)
+    }
+
+    /// This same fact as a rebuild renders it: the count cannot be kept
+    /// accurate, so the notice stops naming it.
+    pub fn uncounted(self) -> PendingOverflow {
+        match self {
+            PendingOverflow::None => PendingOverflow::None,
+            _ => PendingOverflow::Uncounted,
+        }
+    }
+}
+
+impl SnapshotData {
+    /// Whether the adopted session is waiting on the operator, whether or not
+    /// this card can show the block: an overflow-only set still counts, so the
+    /// snapshot is emitted and the chip reports the wait (#841).
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty() || self.pending_overflow.any()
+    }
+
+    /// The pendings the snapshot card EMBEDS — and therefore the only ones it
+    /// may claim (#841). The send path trims [`Self::pending`] to the prefix the
+    /// card carries, so this is the stored claim set itself; a rebuild's
+    /// retain-to-live-claims filter is the same statement one step later.
     pub fn embedded_pending(&self) -> &[crate::bridge::request::kind::PendingRequest] {
-        let embedded = self.pending.len().saturating_sub(self.pending_overflow);
-        &self.pending[..embedded]
+        &self.pending
     }
 
     /// ADR-0028 suppression predicate, reading this snapshot's gathered state.
@@ -237,7 +289,7 @@ pub(crate) async fn gather_snapshot(
         waiting,
         pending,
         pending_elsewhere: None,
-        pending_overflow: 0,
+        pending_overflow: PendingOverflow::None,
         tail,
         newest_user_anchor,
         newest_user_is_cola_authored,
@@ -289,10 +341,12 @@ pub(crate) async fn snapshot_card_from_data(
         data,
     )
     .await;
-    // The builder decides how many of the claimed pendings the one-shot card
-    // can actually carry; the rest stay UNCLAIMED (and unrendered) so the
-    // normal pending flow keeps them answerable (#841). The count travels with
-    // the data, so a claim-ack rebuild renders the same card.
+    // The builder decides which prefix of the pendings the one-shot card can
+    // carry; the rest stay UNCLAIMED (and unrendered) so the normal pending
+    // flow keeps them answerable (#841). The decision is nailed down here — the
+    // data's pending list becomes exactly what the card renders — so a claim-ack
+    // rebuild re-renders the same set instead of re-fitting a list it cannot see
+    // in full.
     let built = crate::feishu::snapshot_card::build_snapshot_card_fitted(
         verb,
         title,
@@ -301,7 +355,9 @@ pub(crate) async fn snapshot_card_from_data(
         &[],
         back,
     );
-    data.pending_overflow = built.pending_overflow;
+    data.pending.retain(|req| req.session_id() == data.session_id);
+    data.pending.truncate(built.embedded);
+    data.pending_overflow = PendingOverflow::from_send(built.overflow);
     (built.card, data)
 }
 
@@ -419,6 +475,45 @@ mod tests {
     async fn gather_from_typed_backend(mock: MockBackend) -> SnapshotData {
         let backend: Arc<dyn crate::backend::Backend> = Arc::new(mock);
         gather_snapshot(&backend, "ses_adopted", "/work/proj").await
+    }
+
+    /// The overflow fact is what keeps a cardless-but-waiting session honest
+    /// (#842): `None` is the only "nothing left over" state, and it is the only
+    /// one a rebuild must not invent.
+    #[test]
+    fn the_overflow_fact_survives_a_rebuild_without_a_count() {
+        assert!(!PendingOverflow::None.any());
+        assert!(PendingOverflow::Counted(2).any());
+        assert!(PendingOverflow::Uncounted.any());
+
+        assert_eq!(PendingOverflow::from_send(0), PendingOverflow::None);
+        assert_eq!(PendingOverflow::from_send(3), PendingOverflow::Counted(3));
+        assert_eq!(
+            PendingOverflow::Counted(3).uncounted(),
+            PendingOverflow::Uncounted
+        );
+        assert_eq!(PendingOverflow::Uncounted.uncounted(), PendingOverflow::Uncounted);
+        assert_eq!(PendingOverflow::None.uncounted(), PendingOverflow::None);
+    }
+
+    /// A session whose pendings ALL overflowed is still a waiting session: the
+    /// snapshot must be emitted (suppression reads `has_pending`), even though
+    /// the card carries no block to click (#842).
+    #[tokio::test]
+    async fn an_overflow_only_session_still_counts_as_pending() {
+        let mut data = gather_from_typed_backend(typed_backend(vec![
+            user("msg_u1", 1_000, &["帮我改一下"]),
+            assistant("msg_a1", 2_000, &["好的"]),
+        ]))
+        .await;
+        assert!(!data.has_pending(), "the fixture carries no request");
+
+        data.pending_overflow = PendingOverflow::Counted(6);
+        assert!(
+            data.has_pending(),
+            "the session is waiting even though the card shows no block"
+        );
+        assert!(data.embedded_pending().is_empty());
     }
 
     #[test]

@@ -101,6 +101,10 @@ impl SnapshotClaims {
     /// `/switch`-list state the card was built from, when it came from the
     /// list card (ADR-0052), kept so a rebuild preserves its 返回列表 button.
     ///
+    /// A card that embeds NOTHING (#842: the whole set overflowed) registers no
+    /// host at all: it claims no request, so no resolution can ever rebuild it,
+    /// and an entry here would keep a full `SnapshotData` alive forever.
+    ///
     /// Precondition: every pending is still claimable — `claimable_pendings`
     /// filtered the ones surfaced elsewhere — so an id is never claimed twice
     /// by construction. A re-claim would overwrite the existing entry,
@@ -113,6 +117,9 @@ impl SnapshotClaims {
         data: &SnapshotData,
         back: Option<&crate::feishu::card::session::BackToList>,
     ) {
+        if data.embedded_pending().is_empty() {
+            return;
+        }
         self.hosts
             .entry(message_id.to_string())
             .or_insert_with(|| ClaimedSnapshot {
@@ -139,6 +146,12 @@ impl SnapshotClaims {
     /// Re-render a host card in place: its blocks filtered to the claims that
     /// are still live, with the given live question state for them. `None`
     /// when the host entry is gone.
+    ///
+    /// This never re-decides the embed/overflow split (#842): the host stores
+    /// the split the send path made, and only `pending_overflow` is demoted to
+    /// [`crate::bridge::snapshot::PendingOverflow::Uncounted`], because the
+    /// unclaimed requests are outside the registry and their count can no
+    /// longer be trusted.
     pub fn rebuild(
         &self,
         message_id: &str,
@@ -148,6 +161,7 @@ impl SnapshotClaims {
         let mut data = host.data.clone();
         data.pending
             .retain(|r| self.claim_of(r.id()).is_some_and(|(mid, _)| mid == message_id));
+        data.pending_overflow = data.pending_overflow.uncounted();
         Some(crate::feishu::snapshot_card::build_snapshot_card_with_state(
             &host.verb,
             &host.title,
@@ -353,9 +367,9 @@ pub(crate) async fn claim_snapshot_pendings(
         .lock()
         .await
         .claim(snapshot_message_id, verb, title, data, back);
-    // Only what the card actually renders is claimed: a pending the one-shot
-    // budget pushed off the snapshot (#841) stays unclaimed, so the normal
-    // pending flow still surfaces it on its own card.
+    // Only what the card actually renders is claimed: a pending the block cap
+    // or the one-shot budget pushed off the snapshot (#841/#842) stays
+    // unclaimed, so the normal pending flow still surfaces it.
     for req in data.embedded_pending() {
         requests
             .flow_for(req.claim_kind())
@@ -388,7 +402,7 @@ mod tests {
             waiting: false,
             pending: ids.iter().map(|id| perm(id)).collect(),
             pending_elsewhere: None,
-            pending_overflow: 0,
+            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
             tail: vec![],
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,
@@ -421,23 +435,71 @@ mod tests {
         assert_eq!(claims.host_pending("mid_1").unwrap().len(), 2);
     }
 
-    /// Only what the card EMBEDS is claimed (#841): a pending the budget
-    /// pushed off the snapshot must keep flowing on its standalone card, and a
-    /// claim with no rendered block would leave it unanswerable on both.
+    /// Only what the card EMBEDS is claimed (#841): the send path trims
+    /// `pending` to the rendered prefix, so a request the budget pushed off the
+    /// snapshot keeps flowing on the normal pending path, and a claim with no
+    /// rendered block can never leave it unanswerable here.
     #[test]
     fn claim_registers_only_the_embedded_pendings() {
-        let mut data = data_with(&["p1", "p2", "p3"]);
-        data.pending_overflow = 2;
+        let mut data = data_with(&["p1"]);
+        data.pending_overflow = crate::bridge::snapshot::PendingOverflow::Counted(2);
         let mut claims = SnapshotClaims::default();
         claims.claim("mid_1", "接管", "title", &data, None);
 
         assert_eq!(claims.claim_count(), 1, "only p1 is rendered and claimed");
         assert!(claims.claim_of("p1").is_some());
-        assert!(claims.claim_of("p2").is_none());
-        assert!(claims.claim_of("p3").is_none());
-        // The host keeps the full adopt-time list: a rebuild filters it by the
-        // claims that survive.
-        assert_eq!(claims.host_pending("mid_1").unwrap().len(), 3);
+        // The host keeps exactly the rendered set: a rebuild renders that, and
+        // the leftover count never enters the claim set.
+        assert_eq!(claims.host_pending("mid_1").unwrap().len(), 1);
+    }
+
+    /// A card that embeds NOTHING (#842: the whole set overflowed) claims
+    /// nothing, so it registers no host. Before the refinement it stored one
+    /// anyway, and since `prune` is only reachable from a claim, that
+    /// `SnapshotData` (tail included) was never freed.
+    #[test]
+    fn an_overflow_only_card_registers_no_host() {
+        let mut data = data_with(&[]);
+        data.pending_overflow = crate::bridge::snapshot::PendingOverflow::Counted(3);
+        let mut claims = SnapshotClaims::default();
+        claims.claim("mid_1", "接管", "title", &data, None);
+
+        assert_eq!(claims.claim_count(), 0);
+        assert!(
+            claims.host_pending("mid_1").is_none(),
+            "no claim can ever rebuild it, so nothing is kept"
+        );
+    }
+
+    /// A rebuild on a partially-overflowed card keeps every LIVE claim on the
+    /// card (#842). The send decision (3 embedded, 2 left out) is stored, not
+    /// re-derived: deriving it from the post-resolution list would subtract the
+    /// leftover count again and silently drop a block the registry still
+    /// claims — a request with no surface left to answer it from.
+    #[test]
+    fn a_rebuild_keeps_every_live_claim_after_a_resolution() {
+        let mut data = data_with_patterns(&[("p1", "cmd_one"), ("p2", "cmd_two"), ("p3", "cmd_three")]);
+        data.pending_overflow = crate::bridge::snapshot::PendingOverflow::Counted(2);
+        let mut claims = SnapshotClaims::default();
+        claims.claim("mid_1", "接管", "title", &data, None);
+
+        let card = claims
+            .resolve("p1", "mid_1", &empty_state())
+            .expect("the host is rebuilt");
+        let s = card.to_string();
+        assert!(
+            s.contains("cmd_two") && s.contains("cmd_three"),
+            "every live claim stays rendered: {s}"
+        );
+        assert!(!s.contains("cmd_one"), "the resolved block is gone: {s}");
+        assert!(
+            s.contains("另有待处理请求超出单卡容量"),
+            "the leftover set is still named: {s}"
+        );
+        assert!(
+            !s.contains("2 个待处理请求"),
+            "a rebuild stops naming a count it cannot verify: {s}"
+        );
     }
 
     #[test]
