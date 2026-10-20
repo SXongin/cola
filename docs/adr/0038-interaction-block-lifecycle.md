@@ -218,8 +218,21 @@ rule 4 exists to prevent cannot arise. Receipts are evicted before the
 conversation because they are residue for blocks another client already
 resolved, while the tail is what an adopting reader came for.
 
-The snapshot's claimed pending blocks are all-or-nothing rather than
-evictable: a claim whose block the card does not render leaves a request the
-user cannot answer there. When the whole set outgrows one card the snapshot
-embeds NONE of them, names the overflow on the card, and leaves them UNCLAIMED
-so the standalone pending flow still surfaces them (#841).
+The snapshot's claimed pending blocks are the ONE non-evictable section: a
+claim whose block the card does not render leaves a request the user cannot
+answer there. The rule enforcing that invariant is PARTIAL rather than
+all-or-nothing (#842, refining #841): the card embeds the longest PREFIX of the
+session's own pendings that fits one card — capped at five blocks, because a
+card packed with dozens of them leaves no room for the conversation a reader
+adopted the session for — and leaves the rest UNCLAIMED, named on the card
+(`…另有 N 个待处理请求超出单卡容量，将稍后显示`). The copy promises neither a
+standalone card nor another card: an unclaimed request is surfaced INLINE on the
+session's live card when one exists, and only falls back to a card of its own
+otherwise.
+
+The split is decided ONCE, at send. `SnapshotData.pending` is trimmed to the
+embedded prefix, so a rebuild re-renders the stored decision and never re-derives
+it from the post-resolution claim set — otherwise the ladder would subtract the
+leftover count a second time and drop a still-claimed block. Rebuilds also stop
+naming the COUNT (`…另有待处理请求…`): the unclaimed requests are outside the
+claim registry, so how many survive cannot be observed from the snapshot.
