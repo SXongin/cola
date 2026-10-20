@@ -265,6 +265,16 @@ pub struct SharedCore {
     /// it.
     #[cfg(test)]
     pub terminal_test_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// The **Terminal Log**'s **observed** stop threshold (ADR-0086 decision 7):
+    /// the size probe kills the process group once the file has passed it. It
+    /// is not a write limit, so a fast producer overshoots. Scaled down by a
+    /// test, which cannot afford to write 29 MB; production uses
+    /// [`crate::bridge::terminal::TERMINAL_LOG_CAP_BYTES`].
+    pub terminal_log_cap_bytes: Arc<std::sync::atomic::AtomicU64>,
+    /// How often that probe reads the log's metadata (ms) — its own short
+    /// interval, never the slower render tick (ADR-0086 decision 7). A test
+    /// shrinks it.
+    pub terminal_size_probe_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedCore {
@@ -391,6 +401,12 @@ impl SharedCore {
             terminal_log_root: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             terminal_test_env: Arc::new(std::sync::Mutex::new(Vec::new())),
+            terminal_log_cap_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::bridge::terminal::TERMINAL_LOG_CAP_BYTES,
+            )),
+            terminal_size_probe_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                crate::bridge::terminal::TERMINAL_SIZE_PROBE_MS,
+            )),
             // The File Viewer transfer's per-network-call bound (ADR-0083 §5).
             viewer_transfer_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::viewer::VIEWER_TRANSFER_TIMEOUT_MS,
@@ -468,6 +484,8 @@ impl SharedCore {
             preferred_port: self.preferred_port,
             diff_cooldown: Arc::clone(&self.diff_cooldown),
             terminal_log_root: Arc::clone(&self.terminal_log_root),
+            terminal_log_cap_bytes: Arc::clone(&self.terminal_log_cap_bytes),
+            terminal_size_probe_ms: Arc::clone(&self.terminal_size_probe_ms),
             #[cfg(test)]
             terminal_test_env: Arc::clone(&self.terminal_test_env),
         }

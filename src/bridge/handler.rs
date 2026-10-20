@@ -209,12 +209,69 @@ enum ViewerFileOp {
     Preview,
 }
 
+/// Everything a Terminal Card's 「📄 完整输出」 payload carries (ADR-0086
+/// decisions 4 and 7): the clicked card and the **Terminal Log** path, plus the
+/// settled card's own render inputs so the delivery can PATCH the outcome back
+/// onto the same card without a card-view read or a second state store.
+struct TerminalFullOutputRequest {
+    message_id: String,
+    chat_id: String,
+    thread_id: String,
+    path: String,
+    cwd: String,
+    command: String,
+    exit_code: Option<i32>,
+    elapsed: std::time::Duration,
+    output_over_limit: bool,
+}
+
+impl TerminalFullOutputRequest {
+    /// Parse the button value; `None` when the click cannot be routed (no card
+    /// id, no log path) or the payload is not one of ours.
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let message_id = value.get("open_message_id")?.as_str()?.to_string();
+        let path = value.get("path")?.as_str()?.to_string();
+        if message_id.is_empty() || path.is_empty() {
+            return None;
+        }
+        let run = value.get("terminal_card")?;
+        Some(Self {
+            message_id,
+            chat_id: value
+                .get("chat_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            thread_id: value
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            path,
+            cwd: run.get("cwd")?.as_str()?.to_string(),
+            command: run.get("command")?.as_str()?.to_string(),
+            exit_code: run
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .map(|code| code as i32),
+            elapsed: std::time::Duration::from_millis(
+                run.get("elapsed_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            ),
+            output_over_limit: run
+                .get("output_over_limit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+}
+
 /// The transfer key of one viewer File Message attempt: the Chat, the clicked
 /// message, the **path** (a Tool Panel's Turn card can carry several file
 /// panels, so the clicked message alone does not name one file), and the content
 /// identity (a re-read rotates it, so changed bytes may be sent again).
 type ViewerFileTransferKey = (String, String, String, u64);
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerFileTransferStatus {
     Sent,
@@ -2374,6 +2431,15 @@ impl App {
                 // but must NOT PATCH — the clicked message is the agent's Turn
                 // card (#778) — and a browse card's file row, which carries no op
                 // and opens the file in place. The op tells the three apart.
+                // The Terminal Card's 「📄 完整输出」 (ADR-0086 decision 7): the
+                // click acknowledges and a spawned, bounded transfer uploads the
+                // Terminal Log as ONE File Message, then PATCHes the card with
+                // the outcome. A 30 MB upload never runs inside the callback's
+                // ack budget.
+                "terminal" => match value.get("op").and_then(|v| v.as_str()) {
+                    Some("full_output") => self.handle_terminal_full_output(&value).await,
+                    _ => None,
+                },
                 "file" => match value.get("op").and_then(|v| v.as_str()) {
                     Some("send") => self.handle_viewer_file_action(&value, ViewerFileOp::Send).await,
                     Some("preview") => {
@@ -5217,6 +5283,180 @@ impl App {
             Some(Ok(_))
         ) {
             tracing::warn!("viewer preview: failure reply for {message_id} did not land");
+        }
+    }
+
+    /// The Terminal Card's 「📄 完整输出」 click (ADR-0086 decision 7) — the
+    /// Terminal Command's counterpart of the viewer's 「发为文件」. The card
+    /// callback must ack inside Feishu's budget, and a 30 MB upload cannot fit
+    /// it, so the click claims the card, spawns the transfer and answers a
+    /// toast immediately. The spawned step reads a bounded copy of the
+    /// **Terminal Log**, sends it as exactly ONE File Message under the clicked
+    /// card, and PATCHes that card with the outcome — so a large upload neither
+    /// dies with the callback nor leaves the clicker without a result.
+    ///
+    /// It reuses the viewer's path on purpose: the same [`send_file_message`]
+    /// lane (content-hash upload cache, one bounded send), the same
+    /// [`SharedCore::viewer_transfer_timeout_ms`] per-call bound and the same
+    /// per-card in-flight claim. A second upload implementation is exactly what
+    /// this must not grow.
+    async fn handle_terminal_full_output(
+        self: &Arc<Self>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let Some(request) = TerminalFullOutputRequest::from_value(value) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        };
+        let thread_key = thread_key_from_value(value);
+        let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, &request.message_id) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("正在发送完整输出…".to_string()),
+            });
+        };
+        let app = Arc::clone(self);
+        tokio::spawn(async move {
+            let _in_flight_guard = in_flight_guard;
+            app.run_terminal_full_output(request).await;
+        });
+        Some(CardActionResult {
+            card: None,
+            toast: Some("正在发送完整输出…".to_string()),
+        })
+    }
+
+    /// The 「📄 完整输出」 transfer itself, off the card callback. One bounded
+    /// local read (the delivery copy and the display tail), one File Message
+    /// through the viewer's lane, then one PATCH onto the clicked card carrying
+    /// the outcome (ADR-0086 decision 7). Past the platform's 30 MB cap the copy
+    /// is the log's first 30 MB plus a truncation line — the log on disk is
+    /// never truncated, because the child's descriptor offset does not move
+    /// back.
+    async fn run_terminal_full_output(self: &Arc<Self>, request: TerminalFullOutputRequest) {
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let read_path = std::path::PathBuf::from(&request.path);
+        let read = bounded_viewer_fs_read(
+            self.cards_handle().viewer_fs_read_slots.clone(),
+            timeout_ms,
+            "⚠️ 终端日志读取繁忙，请稍后再试。",
+            "⚠️ 读取终端日志超时。",
+            move || -> std::io::Result<(crate::bridge::terminal::FullOutput, String, bool)> {
+                let copy = crate::bridge::terminal::read_full_output(&read_path)?;
+                let (tail, truncated) = crate::bridge::terminal::read_tail(
+                    &read_path,
+                    crate::feishu::card::terminal::TERMINAL_TAIL_CHARS,
+                )?;
+                Ok((copy, tail, truncated))
+            },
+        )
+        .await;
+        let (tail, tail_truncated, notice) = match read {
+            Ok(Ok((copy, tail, tail_truncated))) => {
+                let crate::bridge::terminal::FullOutput {
+                    bytes,
+                    total_size,
+                    truncated,
+                } = copy;
+                // The File Message's name is the log's own: it already names
+                // the run (`<run-id>.log`), so the delivered artifact and the
+                // path the card names cannot drift.
+                let name = std::path::Path::new(&request.path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "terminal.log".to_string());
+                let content = crate::backend::FileContent::from_bytes("text/plain", &name, bytes);
+                let hash = crate::bridge::handles::content_identity_hash(
+                    &content.mime,
+                    &content.name,
+                    content.data.as_deref().unwrap_or_default(),
+                );
+                let delivery = crate::bridge::viewer::send_file_message(
+                    &self.feishu,
+                    &self.cards_handle(),
+                    &request.message_id,
+                    &content,
+                    hash,
+                    timeout_ms,
+                )
+                .await;
+                use crate::feishu::card::tool_render::FileDelivery;
+                let notice = crate::feishu::card::terminal::full_output_notice(match delivery {
+                    FileDelivery::SentAsFile => crate::feishu::card::terminal::FullOutputOutcome::Sent {
+                        truncated,
+                        total_size,
+                        path: &request.path,
+                    },
+                    FileDelivery::FileSendOutcomeUnknown => {
+                        crate::feishu::card::terminal::FullOutputOutcome::Unknown { path: &request.path }
+                    }
+                    _ => crate::feishu::card::terminal::FullOutputOutcome::NotSent {
+                        reason: "上传或发送失败",
+                        path: &request.path,
+                    },
+                });
+                (tail, tail_truncated, notice)
+            }
+            Ok(Err(error)) => (
+                String::new(),
+                false,
+                format!(
+                    "⚠️ 无法读取终端日志（{error}）。文件应在 `{}`（可能已被清理）。",
+                    request.path
+                ),
+            ),
+            Err(ViewerFsReadError::Busy(line) | ViewerFsReadError::Timeout(line)) => {
+                (String::new(), false, line)
+            }
+            Err(ViewerFsReadError::Worker(error)) => (
+                String::new(),
+                false,
+                format!("⚠️ 无法读取终端日志（{error}）。文件在 `{}`。", request.path),
+            ),
+        };
+        // The card reports the outcome in place. Rebuilding it from the
+        // payload's own render inputs is what lets the button stay
+        // self-describing after a restart (ADR-0086 decision 4) without a
+        // card-view read.
+        let card =
+            crate::feishu::card::terminal::build_terminal_card(crate::feishu::card::terminal::TerminalCard {
+                cwd: &request.cwd,
+                command: &request.command,
+                output: &tail,
+                output_truncated: tail_truncated,
+                output_over_limit: request.output_over_limit,
+                full_output: Some(crate::feishu::card::terminal::TerminalFullOutput {
+                    log_path: &request.path,
+                    chat_id: &request.chat_id,
+                    thread_id: &request.thread_id,
+                    exit_code: request.exit_code,
+                    elapsed: request.elapsed,
+                    output_over_limit: request.output_over_limit,
+                }),
+                notice: Some(&notice),
+                state: crate::feishu::card::terminal::TerminalState::Settled {
+                    exit_code: request.exit_code,
+                    spawn_error: None,
+                    elapsed: request.elapsed,
+                },
+            });
+        if !matches!(
+            crate::bridge::bounded_call(
+                "terminal full output card",
+                timeout_ms,
+                self.feishu.update_message(&request.message_id, &card),
+            )
+            .await,
+            Some(Ok(()))
+        ) {
+            tracing::warn!(
+                "terminal: full-output outcome for {} did not land",
+                request.message_id
+            );
         }
     }
 

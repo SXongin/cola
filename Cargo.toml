@@ -76,7 +76,7 @@ tokio = { version = "1", features = ["test-util"] }
 # (`review::open_beneath`). Already in the tree via tempfile; declared directly
 # because the crate forbids `unsafe_code` and `libc::openat` is unsafe.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "alloc"] }
+rustix = { version = "1", features = ["fs", "alloc", "process"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 flate2 = "1"

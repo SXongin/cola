@@ -1163,3 +1163,477 @@ async fn the_tail_keeps_the_newest_output_and_says_when_it_cut_content() {
         body.chars().count()
     );
 }
+
+/// #826: the dedicated size probe — its own short interval, not the render
+/// tick — kills the process group once the **Terminal Log** has passed its
+/// threshold, and the card reads 「输出超限」. The threshold is scaled down here
+/// so a cheap producer crosses it while the run is live; production's is
+/// 29 MB. That the producer is *stopped* is pinned by the log no longer
+/// growing after the card settles.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_past_the_observed_threshold_is_stopped_and_reads_output_over_limit() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.core
+        .terminal_log_cap_bytes
+        .store(4 * 1024, std::sync::atomic::Ordering::Relaxed);
+    app.core
+        .terminal_size_probe_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "probe-826-marker";
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        send_command_in(
+            &app,
+            &format!("/run i=0; while :; do printf '{marker}-%01000d\\n' $i; i=$((i+1)); sleep 0.02; done"),
+            key,
+            "msg_probe",
+            ConversationKind::P2p,
+        ),
+    )
+    .await
+    .expect("the size probe stops the run instead of letting it write forever");
+
+    let card = settled_card(&platform).await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("输出超限"),
+        "the card states why the run stopped: {text}"
+    );
+    assert!(
+        !text.contains("进程被信号中止"),
+        "the stop is named as the observed threshold, not a bare signal: {text}"
+    );
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = find_log_containing(&dir, marker);
+    let before = std::fs::metadata(&log).expect("the log exists").len();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let after = std::fs::metadata(&log).expect("the log exists").len();
+    assert_eq!(before, after, "the killed producer writes nothing more");
+}
+
+/// #826: the threshold is **observed**, never a write limit (ADR-0086
+/// decision 7). One burst writes far past it before the probe can look, and
+/// the log really holds more than the threshold afterwards — what the probe
+/// bounds is the run, not the descriptor.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_threshold_is_observed_not_a_write_limit() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let cap = 4 * 1024u64;
+    app.core
+        .terminal_log_cap_bytes
+        .store(cap, std::sync::atomic::Ordering::Relaxed);
+    app.core
+        .terminal_size_probe_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // One 64 KiB burst, then enough of a pause that the probe definitely sees
+    // the size. A write limit would have cut it at the threshold; an observed
+    // threshold can only stop the run afterwards.
+    send_command_in(
+        &app,
+        "/run head -c 65536 /dev/zero | tr '\\0' x; sleep 0.2",
+        key,
+        "msg_burst",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let text = card_text(&settled_card(&platform).await);
+    assert!(text.contains("输出超限"), "the run is stopped: {text}");
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = std::fs::read_dir(&dir)
+        .expect("read the Terminal Log directory")
+        .next()
+        .expect("one log")
+        .expect("directory entry")
+        .path();
+    let written = std::fs::metadata(&log).expect("the log exists").len();
+    assert!(
+        written > cap,
+        "the write was never limited at the threshold: {written} bytes > cap {cap}"
+    );
+}
+
+/// The 「📄 完整输出」 button's payload, from the settled card the run PATCHed
+/// and replied. The live card carries none: the button enables once the run
+/// settles (ADR-0086 decision 4).
+#[cfg(unix)]
+async fn full_output_payload(platform: &RecordingPlatform) -> serde_json::Value {
+    platform
+        .button_values()
+        .await
+        .into_iter()
+        .find(|value| value["op"] == "full_output")
+        .unwrap_or_else(|| panic!("the settled card carries {FULL_OUTPUT_LABEL}"))
+}
+
+#[cfg(unix)]
+const FULL_OUTPUT_LABEL: &str = "📄 完整输出";
+
+/// Poll until a File Message (`msg_type:"file"`) is recorded, or fail.
+#[cfg(unix)]
+async fn wait_for_file_message(platform: &RecordingPlatform) -> PlatformCall {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(call) = platform.calls.lock().await.iter().find(
+                |call| matches!(call, PlatformCall::SendMessageReply { msg_type, .. } if msg_type == "file"),
+            ) {
+                return call.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Terminal Log is delivered as a File Message")
+}
+
+/// Poll until an in-place PATCH of `message_id` whose card carries `needle`
+/// lands.
+#[cfg(unix)]
+async fn wait_for_patch_containing(
+    platform: &RecordingPlatform,
+    message_id: &str,
+    needle: &str,
+) -> serde_json::Value {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let found = platform.calls.lock().await.iter().find_map(|call| match call {
+                PlatformCall::UpdateMessage {
+                    message_id: target,
+                    card,
+                } if target == message_id && card_text(card).contains(needle) => Some(card.clone()),
+                _ => None,
+            });
+            if let Some(card) = found {
+                return card;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no PATCH of {message_id} contains {needle:?}"))
+}
+
+/// #826: 「📄 完整输出」 posts the **Terminal Log** as a File Message when it
+/// fits the platform's 30 MB upload cap — the whole log, byte for byte, through
+/// the viewer's File Message lane rather than a second upload path — and the
+/// click is acknowledged with a toast before that upload finishes.
+#[cfg(unix)]
+#[tokio::test]
+async fn full_output_posts_the_terminal_log_as_a_file_message() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "full-output-826-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key,
+        "msg_full",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let live = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .next()
+        .expect("the live card");
+    assert!(
+        !live.to_string().contains(FULL_OUTPUT_LABEL),
+        "the live card carries no retrieval button: {}",
+        card_text(&live)
+    );
+
+    let payload = full_output_payload(&platform).await;
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = find_log_containing(&dir, marker);
+    let bytes = std::fs::read(&log).expect("read the Terminal Log");
+    assert_eq!(
+        payload["path"].as_str(),
+        Some(log.to_string_lossy().as_ref()),
+        "the button names the log it delivers"
+    );
+    assert_eq!(payload["chat_id"], "chat_1");
+
+    let result = app
+        .host_action_on_message(payload, "msg_reply")
+        .await
+        .expect("the click is acknowledged");
+    assert!(result.card.is_none(), "the upload never runs inside the callback");
+    assert_eq!(result.toast.as_deref(), Some("正在发送完整输出…"));
+
+    let sent = wait_for_file_message(&platform).await;
+    match sent {
+        PlatformCall::SendMessageReply {
+            message_id, msg_type, ..
+        } => {
+            assert_eq!(msg_type, "file");
+            assert_eq!(message_id, "msg_reply", "under the clicked Terminal Card");
+        }
+        other => panic!("expected a File Message, got {other:?}"),
+    }
+
+    let uploads: Vec<_> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| matches!(call, PlatformCall::UploadFile { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(uploads.len(), 1, "exactly one upload: {uploads:?}");
+    match &uploads[0] {
+        PlatformCall::UploadFile {
+            name,
+            mime,
+            size,
+            content,
+        } => {
+            assert_eq!(*size, bytes.len() as u64, "the whole log's size");
+            assert_eq!(content, &bytes, "the whole log's bytes, unchanged");
+            assert_eq!(mime, "text/plain");
+            assert_eq!(
+                name,
+                &log.file_name().unwrap().to_string_lossy().into_owned(),
+                "the log's own name, so path and artifact cannot drift"
+            );
+        }
+        other => panic!("expected an upload, got {other:?}"),
+    }
+
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "完整输出已作为文件消息发送").await;
+    assert!(
+        card_text(&patched).contains(marker),
+        "the card keeps its output tail: {}",
+        card_text(&patched)
+    );
+}
+
+/// #826: past the 30 MB upload cap the click still retrieves something — the
+/// first 30 MB from a bounded copy with a truncation line — the card states the
+/// file was NOT sent in full, names where the bytes live, and the log on disk
+/// is never truncated (the child's descriptor offset does not move back).
+#[cfg(unix)]
+#[tokio::test]
+async fn full_output_past_the_upload_cap_sends_a_truncated_bounded_copy_and_says_so() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "cap-826-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'; sleep 0.1"),
+        key,
+        "msg_cap_full",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = find_log_containing(&dir, marker);
+    // A log past the platform's cap. In production the size probe would have
+    // stopped the run below the delivery cap; a log this large is exactly what
+    // delivery must still handle (a restart's leftover, a lossy clock).
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        let pad = vec![b'z'; (crate::feishu::file::MAX_FILE_BYTES + 4096) as usize];
+        file.write_all(&pad).unwrap();
+    }
+    let before = std::fs::metadata(&log).unwrap().len();
+    assert!(before > crate::feishu::file::MAX_FILE_BYTES);
+
+    let payload = full_output_payload(&platform).await;
+    app.host_action_on_message(payload, "msg_reply").await;
+    wait_for_file_message(&platform).await;
+
+    let uploads: Vec<_> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter(|call| matches!(call, PlatformCall::UploadFile { .. }))
+        .cloned()
+        .collect();
+    assert_eq!(uploads.len(), 1, "exactly one bounded copy: {uploads:?}");
+    match &uploads[0] {
+        PlatformCall::UploadFile { size, content, .. } => {
+            assert_eq!(*size, crate::feishu::file::MAX_FILE_BYTES);
+            assert_eq!(content.len() as u64, crate::feishu::file::MAX_FILE_BYTES);
+            let tail = String::from_utf8_lossy(&content[content.len() - 512..]);
+            assert!(tail.contains("已截断"), "the truncation line is visible: {tail}");
+            assert!(
+                tail.contains(&*log.to_string_lossy()),
+                "the truncation line names where the rest lives: {tail}"
+            );
+        }
+        other => panic!("expected an upload, got {other:?}"),
+    }
+
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "文件未完整发送").await;
+    let text = card_text(&patched);
+    assert!(
+        text.contains(&*log.to_string_lossy()),
+        "the card says where the bytes live: {text}"
+    );
+    assert!(
+        text.contains("未发送"),
+        "the card states the rest was not sent: {text}"
+    );
+
+    // Delivery copied; it never truncated the log the child wrote.
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().len(),
+        before,
+        "the Terminal Log is left exactly as the run left it"
+    );
+}
+
+/// #826: the delivery runs off the card callback and is bounded by its own
+/// timeout — a parked upload neither holds the ack nor leaves the clicker
+/// without a result. The callback returns while the upload is still in flight,
+/// and the outcome lands afterwards as a card PATCH.
+#[cfg(unix)]
+#[tokio::test]
+async fn full_output_delivery_runs_off_the_card_callback() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run echo off-callback-826",
+        key,
+        "msg_off",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let payload = full_output_payload(&platform).await;
+
+    let (entered, release) = platform.pause("upload_file", "");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        app.host_action_on_message(payload, "msg_reply"),
+    )
+    .await
+    .expect("the callback acks while the upload is parked")
+    .expect("the click is acknowledged");
+    assert_eq!(result.toast.as_deref(), Some("正在发送完整输出…"));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the upload starts on the spawned task");
+    release.notify_one();
+
+    wait_for_file_message(&platform).await;
+    wait_for_patch_containing(&platform, "msg_reply", "完整输出已作为文件消息发送").await;
+}
+
+/// #826: a log that vanished (swept, or a run record from another process) is
+/// reported on the card with its path instead of a silent click — 「📄 完整输出」
+/// always answers.
+#[cfg(unix)]
+#[tokio::test]
+async fn full_output_reports_a_missing_log_instead_of_staying_silent() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let marker = "missing-826-marker";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key,
+        "msg_missing",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let dir = app
+        .core
+        .terminal_log_root
+        .get()
+        .expect("the test installed a temp Terminal Log root")
+        .clone();
+    let log = find_log_containing(&dir, marker);
+    let path = log.to_string_lossy().to_string();
+    std::fs::remove_file(&log).expect("remove the Terminal Log");
+
+    let payload = full_output_payload(&platform).await;
+    app.host_action_on_message(payload, "msg_reply").await;
+
+    let patched = wait_for_patch_containing(&platform, "msg_reply", "无法读取终端日志").await;
+    assert!(
+        card_text(&patched).contains(&path),
+        "the outcome names the path it could not read: {}",
+        card_text(&patched)
+    );
+    assert!(
+        !platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|call| matches!(call, PlatformCall::UploadFile { .. })),
+        "nothing is uploaded for a log that is gone"
+    );
+}
