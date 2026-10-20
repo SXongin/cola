@@ -1579,7 +1579,11 @@ impl App {
             if let Err(e) = crate::bridge::terminal::execute(
                 &self.command_handles(),
                 &thread_key,
-                &msg.message_id,
+                crate::bridge::terminal::TerminalRequest {
+                    message_id: &msg.message_id,
+                    requester_open_id: msg.requester_open_id.as_deref(),
+                    is_group: msg.chat_type != "p2p",
+                },
                 Some(spec),
             )
             .await
@@ -1623,8 +1627,16 @@ impl App {
                 self.handle_skill_command(thread_key, msg, invocation).await;
                 return;
             }
-            if let Err(e) =
-                command::handle_command(&self.command_handles(), cmd, thread_key, &msg.message_id, kind).await
+            if let Err(e) = command::handle_command(
+                &self.command_handles(),
+                cmd,
+                thread_key,
+                &msg.message_id,
+                kind,
+                msg.requester_open_id.as_deref(),
+                msg.chat_type != "p2p",
+            )
+            .await
             {
                 tracing::error!("Cmd: {}", e);
             }
@@ -2438,7 +2450,11 @@ impl App {
                 // ack budget.
                 "terminal" => match value.get("op").and_then(|v| v.as_str()) {
                     Some("full_output") => self.handle_terminal_full_output(&value).await,
-                    _ => None,
+                    // 「⏹ 终止」 / 「继续」 (ADR-0086 decision 6): the click
+                    // only routes to the Chat/Topic's current run, whose id
+                    // the button carries. A click for any other run id is
+                    // refused as stale, and the run loop owns the group.
+                    _ => self.handle_terminal_action(&value).await,
                 },
                 "file" => match value.get("op").and_then(|v| v.as_str()) {
                     Some("send") => self.handle_viewer_file_action(&value, ViewerFileOp::Send).await,
@@ -4327,6 +4343,50 @@ impl App {
     /// replies under the ORIGINAL user message, spec #655), and the
     /// agent/autoaccept toasts already established that a picker does not
     /// replace itself on a pick.
+    /// Route a Terminal Card control (ADR-0086 decision 6). The handler never
+    /// touches the process group: it looks the run up by the button's run id,
+    /// refuses a stale id, and enqueues the signal for the run loop. A control
+    /// is refused by state, not hidden, so a redelivered click is a no-op.
+    async fn handle_terminal_action(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
+        let thread_key = thread_key_from_value(value);
+        if thread_key.chat_id.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("这张卡片缺少会话信息，无法操作。".to_string()),
+            });
+        }
+        let run_id = value.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+        let op = value
+            .get("op")
+            .and_then(|v| v.as_str())
+            .and_then(crate::bridge::terminal::TerminalOp::parse);
+        let Some(op) = op else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("未知的终端操作。".to_string()),
+            });
+        };
+        let outcome = {
+            let runs = self
+                .terminal_runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            runs.control(&thread_key, run_id, op)
+        };
+        let toast = match outcome {
+            crate::bridge::terminal::TerminalControlOutcome::Accepted => match op {
+                crate::bridge::terminal::TerminalOp::Kill => "⏹ 正在终止…",
+                crate::bridge::terminal::TerminalOp::Continue => "⏱ 已延长时限，继续跟踪输出…",
+            },
+            crate::bridge::terminal::TerminalControlOutcome::Stale => "这张终端卡片的操作已过期。",
+            crate::bridge::terminal::TerminalControlOutcome::NotPastCap => "命令尚未到达时限。",
+        };
+        Some(CardActionResult {
+            card: None,
+            toast: Some(toast.to_string()),
+        })
+    }
+
     async fn handle_skill_card_action(
         self: &Arc<Self>,
         value: &serde_json::Value,
@@ -5457,7 +5517,14 @@ impl App {
                     exit_code: request.exit_code,
                     spawn_error: None,
                     elapsed: request.elapsed,
+                    // The outcome PATCH rebuilds a settled card, so the run
+                    // controls stay dead; #826's own payload identifies it.
+                    stopped: false,
+                    survivors: false,
                 },
+                run_id: "",
+                chat_id: &request.chat_id,
+                thread_id: &request.thread_id,
             });
         if !matches!(
             crate::bridge::bounded_call(

@@ -1063,6 +1063,8 @@ async fn topic_gate_rejects_the_unparseable_topic_shape() {
         topic_key,
         "msg_gate",
         crate::config::ConversationKind::Topic,
+        None,
+        false,
     )
     .await
     .unwrap();

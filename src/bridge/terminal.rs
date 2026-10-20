@@ -22,18 +22,23 @@
 //!   (#825/#826/#827); this tracer parses `--timeout` and carries it without
 //!   acting on it, exactly as the ADR's cap stops *tailing*, never the wait.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::mpsc;
 
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
+use crate::feishu::Platform;
 use crate::feishu::card::terminal::{
-    TERMINAL_TAIL_CHARS, TerminalCard, TerminalFullOutput, TerminalState, build_terminal_card,
+    TERMINAL_TAIL_CHARS, TerminalCard, TerminalFullOutput, TerminalState, build_terminal_card, elapsed_label,
 };
 
 /// The **Terminal Log**'s **observed** stop threshold (ADR-0086 decision 7):
@@ -113,6 +118,131 @@ fn unsupported_reason() -> Option<&'static str> {
     Some(WINDOWS_REFUSAL)
 }
 
+/// The command message's own facts (ADR-0086 decision 12): the reply target,
+/// the requester a Completion Notice must name, and whether the chat is a
+/// group. A Terminal Command has no **Turn**, so it captures these at send.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TerminalRequest<'a> {
+    pub(crate) message_id: &'a str,
+    pub(crate) requester_open_id: Option<&'a str>,
+    pub(crate) is_group: bool,
+}
+
+/// The refusal a second command gets while the Chat/Topic's slot is claimed
+/// (ADR-0086 decision 6): it names the running card's 「⏹ 终止」, the one act
+/// that releases the slot.
+pub(crate) const TERMINAL_BUSY: &str =
+    "⚠️ 这个会话已有终端命令在运行，请先点击运行卡片的「⏹ 终止」后再执行。";
+
+/// What a card button asks the live run to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalOp {
+    /// 「⏹ 终止」 — signal the whole process group and settle the card.
+    Kill,
+    /// 「继续」 — extend the cap by the same amount and resume the tail.
+    Continue,
+}
+
+impl TerminalOp {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "kill" => Some(Self::Kill),
+            "continue" => Some(Self::Continue),
+            _ => None,
+        }
+    }
+}
+
+/// One message to the run loop. A click only ever enqueues; the loop owns the
+/// process group and the card.
+#[derive(Debug)]
+enum TerminalControl {
+    Kill,
+    Continue,
+}
+
+/// What a card action found (ADR-0086 decision 4): the click is refused by
+/// state, not hidden, so a stale click is a no-op rather than an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalControlOutcome {
+    /// The signal reached the live run.
+    Accepted,
+    /// The run it named is no longer the Chat/Topic's current one (or is gone):
+    /// a stale click.
+    Stale,
+    /// The run is live but has not reached its cap: 继续 does not apply yet.
+    NotPastCap,
+}
+
+/// The live half of one Terminal Command, shared by the run loop and the
+/// card-action handler. The run id names the card's buttons; liveness and the
+/// cap are atomics so a click never waits on the loop.
+#[derive(Debug)]
+pub(crate) struct TerminalRun {
+    run_id: String,
+    /// True from claim until the process group empties (or the run is killed).
+    live: AtomicBool,
+    /// True exactly while the run is past its cap and still live — the one
+    /// state in which 「继续」 is available.
+    past_cap: AtomicBool,
+    control: mpsc::UnboundedSender<TerminalControl>,
+}
+
+/// One **Terminal Command** slot per **Chat**/**Topic** (ADR-0086 decision 6).
+/// The map is the atomic claim: it is inserted before anything is spawned, so
+/// two inbound tasks cannot both start a command in one conversation.
+#[derive(Default)]
+pub(crate) struct TerminalRuns {
+    runs: HashMap<ThreadKey, Arc<TerminalRun>>,
+}
+
+impl TerminalRuns {
+    /// Claim `key` for `run`, or report the current run so the refusal can name
+    /// its 「⏹ 终止」. The lock is held only for the map operation.
+    pub(crate) fn claim(&mut self, key: &ThreadKey, run: Arc<TerminalRun>) -> Result<(), Arc<TerminalRun>> {
+        if let Some(current) = self.runs.get(key) {
+            return Err(Arc::clone(current));
+        }
+        self.runs.insert(key.clone(), run);
+        Ok(())
+    }
+
+    /// Release `key` only if `run_id` is still its current run: a late settling
+    /// path can never delete a successor's claim.
+    pub(crate) fn release(&mut self, key: &ThreadKey, run_id: &str) {
+        if self.runs.get(key).is_some_and(|run| run.run_id == run_id) {
+            self.runs.remove(key);
+        }
+    }
+
+    /// Route a card action to the Chat/Topic's current run (ADR-0086 decision
+    /// 4's run-id check): a button for any other run id is stale.
+    pub(crate) fn control(&self, key: &ThreadKey, run_id: &str, op: TerminalOp) -> TerminalControlOutcome {
+        let Some(run) = self.runs.get(key) else {
+            return TerminalControlOutcome::Stale;
+        };
+        if run.run_id != run_id || !run.live.load(Ordering::SeqCst) {
+            return TerminalControlOutcome::Stale;
+        }
+        match op {
+            TerminalOp::Kill => {}
+            TerminalOp::Continue if !run.past_cap.load(Ordering::SeqCst) => {
+                return TerminalControlOutcome::NotPastCap;
+            }
+            TerminalOp::Continue => {}
+        }
+        let control = match op {
+            TerminalOp::Kill => TerminalControl::Kill,
+            TerminalOp::Continue => TerminalControl::Continue,
+        };
+        if run.control.send(control).is_ok() {
+            TerminalControlOutcome::Accepted
+        } else {
+            TerminalControlOutcome::Stale
+        }
+    }
+}
+
 /// The `!` entry point (ADR-0086 §1): a message whose first character is `!`
 /// and whose remainder is non-empty runs that remainder as the command. The
 /// text is already mention-stripped, and it is trimmed here, so `@cola !ls`
@@ -125,24 +255,57 @@ pub(crate) fn parse_bang(text: &str) -> Option<String> {
     (!command.is_empty()).then(|| command.to_string())
 }
 
-/// Run one Terminal Command (ADR-0086 §2) — the `/run` and `!` entry points
+/// Run one Terminal Command (ADR-0086 §2, §6) — the `/run` and `!` entry points
 /// alike. `None` is the bare or refused `/run` form: answer usage and spawn
 /// nothing.
+///
+/// The Chat/Topic's slot is claimed **before** the card is sent and the child is
+/// spawned, and released only after the process group empties (or 终止 killed
+/// it). The loop owns the process group: a card action only enqueues a control
+/// message, so a click never waits on the run and a run never waits on a click
+/// to notice its cap.
 pub(crate) async fn execute(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
-    message_id: &str,
+    request: TerminalRequest<'_>,
     spec: Option<RunSpec>,
 ) -> crate::error::Result<()> {
     let platform = handles.flow.platform.as_ref();
     let Some(spec) = spec else {
-        platform.reply_text(message_id, RUN_USAGE).await?;
+        platform.reply_text(request.message_id, RUN_USAGE).await?;
         return Ok(());
     };
     if let Some(reason) = unsupported_reason() {
-        platform.reply_text(message_id, reason).await?;
+        platform.reply_text(request.message_id, reason).await?;
         return Ok(());
     }
+    // One command per Chat/Topic (ADR-0086 decision 6): the claim is taken
+    // here, not as a side effect of dispatch, because every inbound message is
+    // its own task. A refusal names the running card's 「⏹ 终止」.
+    let run = run_id();
+    let (control, mut controls) = mpsc::unbounded_channel();
+    let slot = Arc::new(TerminalRun {
+        run_id: run.clone(),
+        live: AtomicBool::new(false),
+        past_cap: AtomicBool::new(false),
+        control,
+    });
+    let claimed = {
+        let mut runs = handles
+            .terminal_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        runs.claim(thread_key, Arc::clone(&slot)).is_ok()
+    };
+    if !claimed {
+        platform.reply_text(request.message_id, TERMINAL_BUSY).await?;
+        return Ok(());
+    }
+    let claim = TerminalClaim {
+        runs: Arc::clone(&handles.terminal_runs),
+        thread_key: thread_key.clone(),
+        run_id: run.clone(),
+    };
     // The Path Scope (ADR-0083 §4, ADR-0086 §2): `current_project_directory` is
     // pending-first — the Pending Session's directory wins, else the active
     // session's, else the default — and the card names exactly this spelling.
@@ -157,26 +320,17 @@ pub(crate) async fn execute(
         .or_else(default_terminal_root)
     else {
         platform
-            .reply_text(message_id, "⚠️ 无法创建终端日志：找不到 home 目录。")
+            .reply_text(request.message_id, "⚠️ 无法创建终端日志：找不到 home 目录。")
             .await?;
         return Ok(());
     };
-    // `--timeout` is carried in `RunSpec` for #825, which owns the cap: it
-    // stops the live tail, never the ADR's `wait()`. This slice does not apply
-    // or claim it — naming the owner here keeps the value from reading as an
-    // enforced limit.
-    tracing::debug!(
-        "terminal: running in {} (timeout {:?} is carried for #825 to enforce, not applied here)",
-        cwd,
-        spec.timeout
-    );
     let log = match TerminalLog::create(&log_root) {
         Ok(log) => log,
         Err(error) => {
             // A log that cannot be created is the one failure that must not
             // spawn: there would be nowhere for the output to go.
             platform
-                .reply_text(message_id, &format!("⚠️ 无法创建终端日志：{error}"))
+                .reply_text(request.message_id, &format!("⚠️ 无法创建终端日志：{error}"))
                 .await?;
             return Ok(());
         }
@@ -194,7 +348,8 @@ pub(crate) async fn execute(
 
     // The live card goes out before the child exists (ADR-0086 decision 5's
     // card → record → spawn order, with the record a later slice): the run
-    // always has a surface, and 「运行中」 is the state the loop patches.
+    // always has a surface, and 「运行中」 is the state the loop patches. Its
+    // buttons carry this run's id, so a click after a successor run is stale.
     let live = build_terminal_card(TerminalCard {
         cwd: &cwd,
         command: &spec.command,
@@ -203,12 +358,34 @@ pub(crate) async fn execute(
         output_over_limit: false,
         full_output: None,
         notice: None,
-        state: TerminalState::Live,
+        state: TerminalState::Live {
+            past_cap: false,
+            survivors: false,
+        },
+        run_id: &run,
+        chat_id: &thread_key.chat_id,
+        thread_id: &thread_key.thread_id,
     });
-    let card_id = platform.reply_card(message_id, &live).await?;
+    let card_id = platform.reply_card(request.message_id, &live).await?;
+    // Every live PATCH goes through one write lock, and `settled` marks the
+    // point after which no live PATCH may be issued. A parked/late live write
+    // can then never land after the settling write: the settle takes the same
+    // lock, and a task that only starts afterwards sees the flag and returns.
+    let settled = Arc::new(AtomicBool::new(false));
+    let card_write = Arc::new(tokio::sync::Mutex::new(()));
+    let patch_facts = Arc::new(LivePatchFacts {
+        platform: Arc::clone(&handles.flow.platform),
+        card_id: card_id.clone(),
+        cwd: cwd.clone(),
+        command: spec.command.clone(),
+        log: log.path.clone(),
+        run_id: run.clone(),
+        chat_id: thread_key.chat_id.clone(),
+        thread_id: thread_key.thread_id.clone(),
+    });
 
     let started = Instant::now();
-    let (mut child, spawn_error) = match spawn_in(&log, &cwd, &spec.command, &inherited_env) {
+    let (child, spawn_error) = match spawn_in(&log, &cwd, &spec.command, &inherited_env) {
         Ok(child) => (Some(child), None),
         Err(error) => {
             // No child means no exit code; the card says why instead of
@@ -217,119 +394,301 @@ pub(crate) async fn execute(
             (None, Some(error.to_string()))
         }
     };
-    let mut wait_outcome = None;
-    // The size probe runs on its OWN task (ADR-0086 decision 7). A card PATCH
-    // can stall on the network, and a probe sharing the render loop's task
-    // would be blind for exactly as long as that PATCH hangs — precisely when a
-    // runaway producer keeps writing. Its own task reads the log on its own
-    // short interval no matter what the card is doing; when it fires, it kills
-    // the process group and the settle waits for that termination to complete.
-    let over_limit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut probe_task = None;
-    if let Some(child) = child.as_mut() {
-        let render_ms = handles.config.render_poll_ms().max(1);
-        let probe_ms = handles.terminal_size_probe_ms.load(Ordering::Relaxed).max(1);
-        let cap = handles.terminal_log_cap_bytes.load(Ordering::Relaxed);
-        let pgid = child.id();
-        let (stop_probe, stop_rx) = tokio::sync::oneshot::channel();
-        probe_task = Some((
-            stop_probe,
-            tokio::spawn(run_size_probe(
-                log.path.clone(),
-                cap,
-                pgid,
-                Duration::from_millis(probe_ms),
-                std::sync::Arc::clone(&finished),
-                std::sync::Arc::clone(&over_limit),
-                stop_rx,
-            )),
-        ));
-        let mut render = tokio::time::interval(Duration::from_millis(render_ms));
-        // `interval`'s first tick is immediate; the card was just sent, so
-        // consume it instead of patching now.
-        render.tick().await;
-        loop {
-            tokio::select! {
-                status = child.wait() => {
-                    wait_outcome = Some(status);
-                    break;
+    let Some(mut child) = child else {
+        settle_run(
+            platform,
+            &card_id,
+            &cwd,
+            &spec.command,
+            &log.path,
+            thread_key,
+            &settled,
+            &card_write,
+            TerminalOutcome {
+                exit_code: None,
+                spawn_error: spawn_error.as_deref(),
+                elapsed: started.elapsed(),
+                stopped: false,
+                survivors: false,
+                output_over_limit: false,
+            },
+        )
+        .await;
+        drop(claim);
+        return Ok(());
+    };
+    let pgid = child.id();
+    slot.live.store(true, Ordering::SeqCst);
+
+    // #826's size probe runs on its own task; it owns the runaway kill and
+    // returns only once the whole group is gone. This loop owns the claim,
+    // liveness, the cap and 终止, and never reimplements that termination.
+    let over_limit = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let probe_ms = handles.terminal_size_probe_ms.load(Ordering::Relaxed).max(1);
+    let log_cap_bytes = handles.terminal_log_cap_bytes.load(Ordering::Relaxed);
+    let (stop_probe, stop_rx) = tokio::sync::oneshot::channel();
+    let probe = tokio::spawn(run_size_probe(
+        log.path.clone(),
+        log_cap_bytes,
+        pgid,
+        Duration::from_millis(probe_ms),
+        Arc::clone(&finished),
+        Arc::clone(&over_limit),
+        stop_rx,
+    ));
+
+    let cap = spec.timeout;
+    let mut deadline = started + cap;
+    let mut past_cap = false;
+    let mut stopping = false;
+    let mut stop_by_user = false;
+    let mut child_exit: Option<std::io::Result<std::process::ExitStatus>> = None;
+    let mut shown_survivors = false;
+    let render_ms = handles.config.render_poll_ms().max(1);
+    let mut render = tokio::time::interval(Duration::from_millis(render_ms));
+    // A second ticker for the post-cap state: the two render arms cannot share
+    // one `interval`, and past the cap only the survivor line is refreshed,
+    // never the tail.
+    let mut survivor_render = tokio::time::interval(Duration::from_millis(render_ms));
+    render.tick().await;
+    survivor_render.tick().await;
+
+    loop {
+        let alive = group_has_members(pgid);
+        // The run is live while its process group has members — not while `sh`
+        // is alive (ADR-0086 decision 6): a background child keeps the slot.
+        if child_exit.is_some() && !alive {
+            break;
+        }
+        if stopping {
+            // `terminate_process_group` is #826's helper, not a second killer:
+            // it SIGTERMs, escalates to SIGKILL and returns only once the group
+            // is empty. Calling it even when `sh` already exited is what kills
+            // a surviving background child.
+            terminate_process_group(pgid).await;
+            if child_exit.is_none() {
+                child_exit = Some(child.wait().await);
+            }
+            break;
+        }
+        let survivors = child_exit.is_some() && alive;
+        let cap_at = deadline;
+        tokio::select! {
+            control = controls.recv() => match control {
+                Some(TerminalControl::Kill) => {
+                    stopping = true;
+                    stop_by_user = true;
                 }
-                _ = render.tick() => {
-                    // Bounded: an unanswered PATCH must not freeze the live-card
-                    // loop forever. The probe is independent, but the settle
-                    // still has to be reachable once the run ends.
-                    if tokio::time::timeout(
-                        Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
-                        patch_live(platform, &card_id, &cwd, &spec.command, &log.path),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        tracing::warn!("terminal: live patch timed out");
+                Some(TerminalControl::Continue) => {
+                    // 「继续」 extends the cap by the same amount and resumes
+                    // the tail; the slot stays claimed until exit/kill.
+                    if past_cap {
+                        past_cap = false;
+                        slot.past_cap.store(false, Ordering::SeqCst);
+                        deadline = Instant::now() + cap;
                     }
                 }
+                None => break,
+            },
+            status = child.wait(), if child_exit.is_none() => {
+                child_exit = Some(status);
+            }
+            _ = render.tick(), if !past_cap => {
+                spawn_live_patch(
+                    Arc::clone(&patch_facts),
+                    false,
+                    survivors,
+                    Arc::clone(&settled),
+                    Arc::clone(&card_write),
+                );
+                shown_survivors = survivors;
+            }
+            _ = survivor_render.tick(), if past_cap => {
+                // The cap stopped the tail, but a process group that outlives
+                // `sh` still gets its survivor line: that is state, not output.
+                let survivors_now = child_exit.is_some() && group_has_members(pgid);
+                if survivors_now != shown_survivors {
+                    spawn_live_patch(
+                        Arc::clone(&patch_facts),
+                        true,
+                        survivors_now,
+                        Arc::clone(&settled),
+                        Arc::clone(&card_write),
+                    );
+                    shown_survivors = survivors_now;
+                }
+            }
+            () = tokio::time::sleep_until(cap_at.into()), if !past_cap => {
+                // The cap stops the live tail, never the wait (ADR-0086
+                // decision 6): the card offers 继续 and 终止 and the run keeps
+                // waiting for its real exit code.
+                past_cap = true;
+                slot.past_cap.store(true, Ordering::SeqCst);
+                spawn_live_patch(
+                    Arc::clone(&patch_facts),
+                    true,
+                    survivors,
+                    Arc::clone(&settled),
+                    Arc::clone(&card_write),
+                );
+                shown_survivors = survivors;
             }
         }
     }
-    // Nothing may observe the log as a runaway after the run itself ended; a
-    // command that finished on its own settles with its real exit code, even
-    // when its output passed the threshold.
+
+    // Nothing may observe the log as a runaway after the run itself ended; the
+    // probe's own contract is what makes a fired probe's settle wait for the
+    // whole group to be gone.
     finished.store(true, Ordering::SeqCst);
-    if let Some((stop_probe, probe)) = probe_task {
-        // If the probe fired, this JOIN is what makes the card wait for the
-        // whole process group to be gone — not merely for `sh` to exit.
-        let _ = stop_probe.send(());
-        let _ = probe.await;
-    }
+    let _ = stop_probe.send(());
+    let _ = probe.await;
     let output_over_limit = over_limit.load(Ordering::SeqCst);
-    let (exit_code, spawn_error) = match wait_outcome {
+
+    slot.live.store(false, Ordering::SeqCst);
+    slot.past_cap.store(false, Ordering::SeqCst);
+    let elapsed = started.elapsed();
+    let (exit_code, spawn_error) = match child_exit {
         Some(Ok(status)) => (status.code(), spawn_error),
         Some(Err(error)) => (None, Some(error.to_string())),
-        // The spawn itself failed; `child` was `None` above.
-        None => (None, spawn_error),
+        // The loop only breaks once the group is empty; a still-unwaited child
+        // is reaped here so the real exit code is never lost.
+        None => (
+            child.wait().await.ok().and_then(|status| status.code()),
+            spawn_error,
+        ),
     };
-    let elapsed = started.elapsed();
-    let (output, output_truncated) = read_tail(&log.path, TERMINAL_TAIL_CHARS).unwrap_or_default();
-    let log_path = log.path.to_string_lossy().to_string();
-    // A settled run's log is what 「📄 完整输出」 delivers; a launch that never
-    // started has no output to retrieve, so it carries no button.
-    let full_output = spawn_error.is_none().then(|| TerminalFullOutput {
-        log_path: &log_path,
-        chat_id: &thread_key.chat_id,
-        thread_id: &thread_key.thread_id,
-        exit_code,
-        elapsed,
-        output_over_limit,
-    });
-    let settled = build_terminal_card(TerminalCard {
-        cwd: &cwd,
-        command: &spec.command,
-        output: &output,
-        output_truncated,
-        output_over_limit,
-        full_output,
-        notice: None,
-        state: TerminalState::Settled {
+    let survivors = group_has_members(pgid);
+    settle_run(
+        platform,
+        &card_id,
+        &cwd,
+        &spec.command,
+        &log.path,
+        thread_key,
+        &settled,
+        &card_write,
+        TerminalOutcome {
             exit_code,
             spawn_error: spawn_error.as_deref(),
             elapsed,
+            stopped: stop_by_user && !output_over_limit,
+            survivors,
+            output_over_limit,
         },
-    });
-    // The one settling write: the loop has already stopped, and nothing is
-    // written after this.
-    platform.update_message(&card_id, &settled).await?;
+    )
+    .await;
+    // Release before the notice: the command has ended, so a new one may start
+    // while the notice is in flight. The notice is this run's own and captures
+    // its request identity (ADR-0086 decision 12).
+    drop(claim);
+    announce_completion(handles, platform, request, elapsed, stop_by_user).await;
     Ok(())
 }
 
-/// Patch the live card from the log's newest bytes. A failed live write is not
-/// fatal: the run continues and the settling write still lands.
-async fn patch_live(
-    platform: &dyn crate::feishu::Platform,
+/// Whether the child's process group still has members (ADR-0086 decision 6).
+/// The run stays live while this is true, even after `sh` itself exited.
+fn group_has_members(pgid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        group_pid(pgid).is_some_and(group_alive)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        false
+    }
+}
+
+/// Releases the Chat/Topic slot when the run ends, however it ends.
+struct TerminalClaim {
+    runs: Arc<Mutex<TerminalRuns>>,
+    thread_key: ThreadKey,
+    run_id: String,
+}
+
+impl Drop for TerminalClaim {
+    fn drop(&mut self) {
+        self.runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .release(&self.thread_key, &self.run_id);
+    }
+}
+
+/// What settles the card: the real exit code, a spawn failure, the elapsed
+/// time, whether 终止 ended it, whether any group member outlived `sh`, and
+/// whether #826's size probe stopped it.
+struct TerminalOutcome<'a> {
+    exit_code: Option<i32>,
+    spawn_error: Option<&'a str>,
+    elapsed: Duration,
+    stopped: bool,
+    survivors: bool,
+    output_over_limit: bool,
+}
+
+/// The one settling write: the loop has already stopped, and nothing is written
+/// after this. A settled run carries the 「📄 完整输出」 payload (ADR-0086
+/// decision 7) unless it never started.
+async fn settle(
+    platform: &dyn Platform,
     card_id: &str,
     cwd: &str,
     command: &str,
     log: &Path,
+    thread_key: &ThreadKey,
+    outcome: TerminalOutcome<'_>,
+) {
+    let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
+    let log_path = log.to_string_lossy().to_string();
+    let full_output = outcome.spawn_error.is_none().then(|| TerminalFullOutput {
+        log_path: &log_path,
+        chat_id: &thread_key.chat_id,
+        thread_id: &thread_key.thread_id,
+        exit_code: outcome.exit_code,
+        elapsed: outcome.elapsed,
+        output_over_limit: outcome.output_over_limit,
+    });
+    let settled = build_terminal_card(TerminalCard {
+        cwd,
+        command,
+        output: &output,
+        output_truncated,
+        output_over_limit: outcome.output_over_limit,
+        full_output,
+        notice: None,
+        state: TerminalState::Settled {
+            exit_code: outcome.exit_code,
+            spawn_error: outcome.spawn_error,
+            elapsed: outcome.elapsed,
+            stopped: outcome.stopped,
+            survivors: outcome.survivors,
+        },
+        // A settled card carries no run controls; only the full-output button.
+        run_id: "",
+        chat_id: &thread_key.chat_id,
+        thread_id: &thread_key.thread_id,
+    });
+    if let Err(error) = platform.update_message(card_id, &settled).await {
+        tracing::warn!("terminal: settling patch failed: {error}");
+    }
+}
+
+/// Patch the live card from the log's newest bytes. A failed live write is not
+/// fatal: the run continues and the settling write still lands.
+#[allow(clippy::too_many_arguments)] // the card's own facts plus its run identity
+async fn patch_live(
+    platform: &dyn Platform,
+    card_id: &str,
+    cwd: &str,
+    command: &str,
+    log: &Path,
+    run_id: &str,
+    chat_id: &str,
+    thread_id: &str,
+    past_cap: bool,
+    survivors: bool,
 ) {
     let (output, output_truncated) = read_tail(log, TERMINAL_TAIL_CHARS).unwrap_or_default();
     let card = build_terminal_card(TerminalCard {
@@ -340,10 +699,140 @@ async fn patch_live(
         output_over_limit: false,
         full_output: None,
         notice: None,
-        state: TerminalState::Live,
+        state: TerminalState::Live { past_cap, survivors },
+        run_id,
+        chat_id,
+        thread_id,
     });
     if let Err(error) = platform.update_message(card_id, &card).await {
         tracing::warn!("terminal: live patch failed: {error}");
+    }
+}
+
+/// The immutable facts one live PATCH needs, shared by every spawned patch.
+struct LivePatchFacts {
+    platform: Arc<dyn Platform>,
+    card_id: String,
+    cwd: String,
+    command: String,
+    log: PathBuf,
+    run_id: String,
+    chat_id: String,
+    thread_id: String,
+}
+
+/// Issue one live PATCH on its own task: a stalled card write must never block
+/// the loop that owns the cap, 终止 and the settle. The task checks `settled`
+/// before it starts and again under the card's write lock, so a PATCH queued
+/// behind a slow one cannot resurrect 「运行中」 after the settle.
+fn spawn_live_patch(
+    facts: Arc<LivePatchFacts>,
+    past_cap: bool,
+    survivors: bool,
+    settled: Arc<AtomicBool>,
+    card_write: Arc<tokio::sync::Mutex<()>>,
+) {
+    tokio::spawn(async move {
+        if settled.load(Ordering::SeqCst) {
+            return;
+        }
+        let _guard = card_write.lock().await;
+        if settled.load(Ordering::SeqCst) {
+            return;
+        }
+        if tokio::time::timeout(
+            Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
+            patch_live(
+                &*facts.platform,
+                &facts.card_id,
+                &facts.cwd,
+                &facts.command,
+                &facts.log,
+                &facts.run_id,
+                &facts.chat_id,
+                &facts.thread_id,
+                past_cap,
+                survivors,
+            ),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("terminal: live patch timed out");
+        }
+    });
+}
+
+/// The settling write, bounded like every live PATCH (a stalled Feishu request
+/// must not leave the card showing 「运行中」 forever). `settled` is set first,
+/// and the same write lock is taken, so the settle is the card's LAST write:
+/// no live patch can be issued after it, and an already-issued one finishes
+/// first. A timed-out settle still releases the claim — a dead card must not
+/// wedge the chat.
+#[allow(clippy::too_many_arguments)]
+async fn settle_run(
+    platform: &dyn Platform,
+    card_id: &str,
+    cwd: &str,
+    command: &str,
+    log: &Path,
+    thread_key: &ThreadKey,
+    settled: &AtomicBool,
+    card_write: &tokio::sync::Mutex<()>,
+    outcome: TerminalOutcome<'_>,
+) {
+    settled.store(true, Ordering::SeqCst);
+    let _guard = card_write.lock().await;
+    if tokio::time::timeout(
+        Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
+        settle(platform, card_id, cwd, command, log, thread_key, outcome),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!("terminal: settling patch timed out");
+    }
+}
+
+/// The Completion Notice a long Terminal Command owes (ADR-0086 decision 12):
+/// exactly one, only when the run passed the same long-task threshold a
+/// **Turn** uses, under the same chat-type opt-in. It has no **Turn** to reuse,
+/// so the requester, reply target and card identity were captured at send; the
+/// send calls the platform primitive directly.
+async fn announce_completion(
+    handles: &CommandHandles,
+    platform: &dyn Platform,
+    request: TerminalRequest<'_>,
+    elapsed: Duration,
+    stopped: bool,
+) {
+    let threshold = Duration::from_millis(handles.config.notice_rules().long_task_notice_ms());
+    if elapsed < threshold {
+        return;
+    }
+    let opted_in = if request.is_group {
+        handles.config.group_completion_notice
+    } else {
+        handles.config.long_task_notice
+    };
+    if !opted_in {
+        return;
+    }
+    let Some(requester) = request.requester_open_id else {
+        return;
+    };
+    let name = if request.is_group {
+        platform.user_name(requester).await.unwrap_or(None)
+    } else {
+        None
+    };
+    let verb = if stopped { "已终止" } else { "已完成" };
+    let text = format!("🖥️ 终端命令{verb} · 耗时 {}", elapsed_label(elapsed));
+    if let Err(error) = platform
+        .reply_completion_notice(request.message_id, requester, name.as_deref(), &text)
+        .await
+    {
+        tracing::warn!("terminal: completion notice failed: {error}");
     }
 }
 

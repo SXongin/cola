@@ -72,9 +72,11 @@ pub(crate) struct TerminalFullOutput<'a> {
 /// What the card is: the live state the patch loop refreshes, or the settled
 /// result it stops on.
 pub(crate) enum TerminalState<'a> {
-    /// The child is running; the tail may still grow and no exit code exists.
-    Live,
-    /// The child ended (or never started): the one settling write.
+    /// The process group still has members; the tail may still grow and no exit
+    /// code exists. `past_cap` is the one state in which 「继续」 is available;
+    /// `survivors` means `sh` itself exited and background members remain.
+    Live { past_cap: bool, survivors: bool },
+    /// The process group emptied (or never started): the one settling write.
     Settled {
         /// The child's real exit code; `None` when it was killed by a signal or
         /// never started at all.
@@ -83,6 +85,10 @@ pub(crate) enum TerminalState<'a> {
         /// broken launch is never an empty card.
         spawn_error: Option<&'a str>,
         elapsed: Duration,
+        /// 终止 ended the run (it may also have outlived `sh` itself).
+        stopped: bool,
+        /// A group member outlived `sh`; the run was still live until it exited.
+        survivors: bool,
     },
 }
 
@@ -107,6 +113,11 @@ pub(crate) struct TerminalCard<'a> {
     /// not sent in full and where the bytes live.
     pub(crate) notice: Option<&'a str>,
     pub(crate) state: TerminalState<'a>,
+    /// The id a click must name to be current; empty on a settled card, whose
+    /// only control is the full-output button.
+    pub(crate) run_id: &'a str,
+    pub(crate) chat_id: &'a str,
+    pub(crate) thread_id: &'a str,
 }
 
 /// Build a Terminal Card in either state. No buttons in this slice: the card is
@@ -117,44 +128,75 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
     let (command_element, _) = fenced_element("**命令**", view.command, false, &mut markdown);
     let (tail, budget_cut) = display_tail(view.output);
     let truncated = budget_cut || view.output_truncated;
-    // Every state-derived decision — header, colour, state line and the
-    // placeholder for an empty tail — is made in one match, so the live/settled
-    // split has a single owner.
-    let (header, template, line, empty_tail) = match view.state {
-        TerminalState::Live => (
-            "🖥️ 终端命令 · 运行中",
-            "blue",
-            "⏳ 运行中…".to_string(),
-            "（等待输出…）",
-        ),
+    // Every state-derived decision — header, colour, state line, the
+    // placeholder for an empty tail, and whether run controls belong — is made
+    // in one match, so the live/settled split has a single owner.
+    let (header, template, line, empty_tail, controls) = match &view.state {
+        TerminalState::Live { past_cap, survivors } => {
+            let line = if *survivors && *past_cap {
+                "⏳ 已达时限，命令进程已退出，后台进程仍在运行…"
+            } else if *survivors {
+                "⏳ 命令进程已退出，后台进程仍在运行…"
+            } else if *past_cap {
+                "⏳ 已达时限，仍在等待命令退出…"
+            } else {
+                "⏳ 运行中…"
+            };
+            let header = if *past_cap {
+                "🖥️ 终端命令 · 已达时限"
+            } else {
+                "🖥️ 终端命令 · 运行中"
+            };
+            (header, "blue", line.to_string(), "（等待输出…）", true)
+        }
         TerminalState::Settled {
             exit_code,
             spawn_error,
             elapsed,
+            stopped,
+            survivors,
         } => {
-            let (line, template) = match (spawn_error, exit_code) {
-                // The observed threshold is the reason the run stopped
-                // (ADR-0086 decision 7): naming it beats a bare "killed by a
-                // signal", which would hide why.
-                _ if view.output_over_limit => (
+            let (line, template) = if *stopped && *survivors {
+                // Termination could not be confirmed: never claim success.
+                (
                     format!(
-                        "⚠️ 输出超限：终端日志已超过 29 MB 观测阈值，命令已停止 · 耗时 {}",
-                        elapsed_label(elapsed)
+                        "⚠️ 已发送终止，但进程组可能仍在运行 · 耗时 {}",
+                        elapsed_label(*elapsed)
                     ),
                     "red",
-                ),
-                (Some(error), _) => (format!("⚠️ 无法启动：{error}"), "red"),
-                (None, Some(0)) => (format!("✅ 退出码 0 · 耗时 {}", elapsed_label(elapsed)), "green"),
-                (None, Some(code)) => (
-                    format!("❌ 退出码 {code} · 耗时 {}", elapsed_label(elapsed)),
-                    "red",
-                ),
-                (None, None) => (
-                    format!("⚠️ 进程被信号中止 · 耗时 {}", elapsed_label(elapsed)),
-                    "red",
-                ),
+                )
+            } else if *stopped {
+                (format!("⏹ 已终止 · 耗时 {}", elapsed_label(*elapsed)), "grey")
+            } else {
+                match (*spawn_error, *exit_code) {
+                    // The observed threshold is the reason the run stopped
+                    // (ADR-0086 decision 7): naming it beats a bare "killed by
+                    // a signal", which would hide why.
+                    _ if view.output_over_limit => (
+                        format!(
+                            "⚠️ 输出超限：终端日志已超过 29 MB 观测阈值，命令已停止 · 耗时 {}",
+                            elapsed_label(*elapsed)
+                        ),
+                        "red",
+                    ),
+                    (Some(error), _) => (format!("⚠️ 无法启动：{error}"), "red"),
+                    (None, Some(0)) => (format!("✅ 退出码 0 · 耗时 {}", elapsed_label(*elapsed)), "green"),
+                    (None, Some(code)) => (
+                        format!("❌ 退出码 {code} · 耗时 {}", elapsed_label(*elapsed)),
+                        "red",
+                    ),
+                    (None, None) => (
+                        format!("⚠️ 进程被信号中止 · 耗时 {}", elapsed_label(*elapsed)),
+                        "red",
+                    ),
+                }
             };
-            ("🖥️ 终端命令", template, line, "（无输出）")
+            let line = if *survivors && !*stopped {
+                format!("{line}\n⚠️ 仍有后台进程未退出。")
+            } else {
+                line
+            };
+            ("🖥️ 终端命令", template, line, "（无输出）", false)
         }
     };
     let output = if tail.is_empty() {
@@ -181,15 +223,55 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
             "content": markdown.clean(notice),
         }));
     }
-    if let Some(full_output) = view.full_output {
+    if let Some(full_output) = &view.full_output {
         // The payload carries the text the elements SHOW, not the raw input: a
         // multi-kilobyte command must not be duplicated into the card's JSON.
         // Clipping twice is idempotent, so the rebuilt card renders the same.
         let cwd = displayed_text("**目录**", view.cwd, false);
         let command = displayed_text("**命令**", view.command, false);
-        elements.push(full_output_row(&full_output, &cwd, &command));
+        elements.push(full_output_row(full_output, &cwd, &command));
+    }
+    if controls && !view.run_id.is_empty() {
+        elements.push(run_controls_row(&view));
     }
     card_shell(header, template, elements)
+}
+
+/// The live card's controls: 「⏹ 终止」 always, 「继续」 exactly past the cap.
+/// Both payloads carry the run id they were rendered for, so a click after a
+/// successor run is refused as stale (ADR-0086 decision 4).
+fn run_controls_row(view: &TerminalCard<'_>) -> serde_json::Value {
+    let mut columns = vec![terminal_button(view, "⏹ 终止", "kill", "danger")];
+    if matches!(view.state, TerminalState::Live { past_cap: true, .. }) {
+        columns.push(terminal_button(view, "继续", "continue", "primary"));
+    }
+    json!({
+        "tag": "column_set",
+        "flex_mode": "flow",
+        "horizontal_spacing": "default",
+        "columns": columns,
+    })
+}
+
+/// One run control, carrying the Chat/Topic route and the run id.
+fn terminal_button(view: &TerminalCard<'_>, label: &str, op: &str, kind: &str) -> serde_json::Value {
+    json!({
+        "tag": "column",
+        "width": "auto",
+        "vertical_align": "center",
+        "elements": [{
+            "tag": "button",
+            "type": kind,
+            "text": { "tag": "plain_text", "content": label },
+            "value": {
+                "action": "terminal",
+                "op": op,
+                "run_id": view.run_id,
+                "chat_id": view.chat_id,
+                "thread_id": view.thread_id,
+            },
+        }],
+    })
 }
 
 /// The 「📄 完整输出」 button row (ADR-0086 decisions 4 and 7). The payload is
@@ -371,7 +453,7 @@ fn skip_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 /// The settle line's elapsed label: milliseconds under a second (a quick
 /// `/run echo` must not read `0s`), hundredths up to a minute, then the shared
 /// minute/hour/day grammar.
-fn elapsed_label(elapsed: Duration) -> String {
+pub(crate) fn elapsed_label(elapsed: Duration) -> String {
     if elapsed < Duration::from_secs(1) {
         format!("{}ms", elapsed.as_millis())
     } else if elapsed < Duration::from_secs(60) {
@@ -430,5 +512,45 @@ pub(crate) fn full_output_notice(outcome: FullOutputOutcome<'_>) -> String {
         FullOutputOutcome::Unknown { path } => {
             format!("⚠️ 完整输出发送结果未知，为避免重复未重试。文件在 `{path}`。")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settled(stopped: bool, survivors: bool) -> serde_json::Value {
+        build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "sleep 5",
+            output: "",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: None,
+            notice: None,
+            state: TerminalState::Settled {
+                exit_code: None,
+                spawn_error: None,
+                elapsed: Duration::from_secs(1),
+                stopped,
+                survivors,
+            },
+            run_id: "",
+            chat_id: "",
+            thread_id: "",
+        })
+    }
+
+    /// A termination the run could not confirm is not reported as one
+    /// (#825/#826 review): the card says the group may still be alive.
+    #[test]
+    fn an_unconfirmed_termination_does_not_claim_success() {
+        let text = crate::bridge::test_support::card_text(&settled(true, true));
+        assert!(text.contains("可能仍在运行"), "{text}");
+        assert!(!text.contains("⏹ 已终止"), "{text}");
+
+        let text = crate::bridge::test_support::card_text(&settled(true, false));
+        assert!(text.contains("⏹ 已终止"), "{text}");
+        assert!(!text.contains("可能仍在运行"), "{text}");
     }
 }
