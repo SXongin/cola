@@ -764,6 +764,21 @@ impl ExternalFlow {
                 static_text.push_str(&format!("\n{role} {text}"));
             }
         }
+        // This card REPLACES the one-shot snapshot that named the requests its
+        // block cap left out (#842), so the fact is repeated here — otherwise
+        // the only place naming them is a card that no longer exists. The count
+        // is the send-time one and still exact at arm time. The inline blocks
+        // follow this text, so the line reads immediately above the ones it is
+        // NOT about.
+        match data.pending_overflow {
+            crate::bridge::snapshot::PendingOverflow::None => {}
+            crate::bridge::snapshot::PendingOverflow::Counted(n) => {
+                static_text.push_str(&format!("\n…另有 {n} 个待处理请求超出单卡容量，将稍后显示"));
+            }
+            crate::bridge::snapshot::PendingOverflow::Uncounted => {
+                static_text.push_str("\n…另有待处理请求超出单卡容量，将稍后显示");
+            }
+        }
         // A NEW external run (the adoption follows it): a `/stop` from before
         // it is not this run's ending, same as the reply renderer's arm. A
         // stop landing after this point ends the follow promptly as

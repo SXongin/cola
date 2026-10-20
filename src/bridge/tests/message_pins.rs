@@ -163,7 +163,7 @@ async fn a_snapshot_claimed_wait_pins_the_snapshot_card() {
                 permission("per_1", "ses_1"),
             )],
             pending_elsewhere: None,
-            pending_overflow: 0,
+            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
             tail: Vec::new(),
             newest_user_anchor: None,
             newest_user_is_cola_authored: false,

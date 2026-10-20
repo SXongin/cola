@@ -2,7 +2,30 @@ use super::drain::spawn_sync;
 use crate::backend::{
     FileContent, FinishReason, MessageRole, OtherPart, Part, SessionTranscript, StepFinish, TranscriptMessage,
 };
+use crate::bridge::snapshot::{PendingOverflow, SnapshotData};
 use crate::bridge::test_support::*;
+
+/// A minimal one-question request, owned by a chosen session (the claim tests
+/// only need an id and an owner; the block's shape is the card layer's).
+fn claim_question(request_id: &str, session_id: &str) -> opencode::types::QuestionRequest {
+    opencode::types::QuestionRequest {
+        id: request_id.into(),
+        session_id: session_id.into(),
+        questions: vec![opencode::types::QuestionInfo {
+            question: "选择目录".into(),
+            header: "目录".into(),
+            options: vec![opencode::types::QuestionOption {
+                label: "/a".into(),
+                description: String::new(),
+                ..Default::default()
+            }],
+            kind: crate::opencode::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
 
 /// A lobby adopt of a session that carries a pending permission ends in ONE
 /// card — the snapshot embeds the block — and the poll loop does NOT pop a
@@ -52,6 +75,149 @@ async fn snapshot_claim_prevents_poller_duplicate() {
         calls.iter().all(|c| !matches!(c, PlatformCall::SendCard { .. })),
         "no standalone permission card: {calls:?}"
     );
+}
+
+/// The claim handoff (#841/#842): only the blocks the card EMBEDS are claimed
+/// and remembered. A request the block cap or the budget pushed off the
+/// snapshot stays unclaimed, so the normal flow surfaces it — and the snapshot
+/// must not have `remember_surfaced` it either, or its own card would answer
+/// against state the snapshot never owned.
+#[tokio::test]
+async fn claim_registers_only_what_the_card_renders() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    // The send-time split: three blocks embedded, one request left over.
+    let data = SnapshotData {
+        session_id: "ses_1".into(),
+        directory: "/work".into(),
+        status: None,
+        waiting: false,
+        pending: vec![
+            crate::bridge::request::kind::PendingRequest::Question(claim_question("q_1", "ses_1")),
+            crate::bridge::request::kind::PendingRequest::Question(claim_question("q_2", "ses_1")),
+            crate::bridge::request::kind::PendingRequest::Question(claim_question("q_3", "ses_1")),
+        ],
+        pending_elsewhere: None,
+        pending_overflow: PendingOverflow::Counted(1),
+        tail: vec![],
+        newest_user_anchor: None,
+        newest_user_is_cola_authored: false,
+    };
+    let handles = app.flow_handles();
+    crate::bridge::snapshot_claims::claim_snapshot_pendings(
+        &handles.requests,
+        "msg_snap",
+        "接管",
+        "t",
+        &data,
+        None,
+    )
+    .await;
+
+    for id in ["q_1", "q_2", "q_3"] {
+        assert!(
+            handles.requests.snapshot_claims.lock().await.contains(id),
+            "{id} is rendered, so it is claimed"
+        );
+        assert!(
+            app.question.has_question(id).await,
+            "{id} is remembered so its block's buttons resolve"
+        );
+    }
+    assert_eq!(
+        handles.requests.snapshot_claims.lock().await.claim_count(),
+        3,
+        "the leftover request is not claimed"
+    );
+    assert!(
+        !app.question.has_question("q_4").await,
+        "a request the card never rendered is never remembered by the snapshot"
+    );
+}
+
+/// A pending set past the block cap (#842) is split instead of dropped: the
+/// snapshot embeds the first five, names the rest, and the poller surfaces the
+/// leftover request on its own card — exactly once.
+#[tokio::test]
+async fn a_pending_set_past_the_cap_splits_between_snapshot_and_poller() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    for i in 1..=6 {
+        backend.ask_permission(perm_request(
+            &format!("per_{i}"),
+            "ses_alpha01",
+            &format!("cmd_{i}"),
+        ));
+    }
+    let (app, platform) = build_app(cfg, backend).await;
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+
+    let snapshot = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } if card.to_string().contains("已接管") => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .expect("the adoption sends the snapshot");
+    assert_eq!(
+        snapshot.matches("✅ 允许一次").count(),
+        5,
+        "the cap bounds the embedded blocks: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("另有 1 个待处理请求超出单卡容量"),
+        "the leftover is named: {snapshot}"
+    );
+    assert!(
+        !snapshot.contains(r#""request_id":"per_6""#),
+        "the sixth block is not rendered: {snapshot}"
+    );
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let cards_with = |id: &str| {
+        calls
+            .iter()
+            .filter(|call| match call {
+                PlatformCall::ReplyCard { card, .. } | PlatformCall::SendCard { card, .. } => {
+                    card.to_string().contains(id)
+                }
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(
+        cards_with("per_6"),
+        1,
+        "the leftover gets its own card: {calls:?}"
+    );
+    for i in 1..=5 {
+        assert_eq!(
+            cards_with(&format!("per_{i}")),
+            1,
+            "a claimed block never surfaces twice: {calls:?}"
+        );
+    }
 }
 
 /// Answering a claimed block via the snapshot's own buttons resolves the
@@ -524,6 +690,64 @@ async fn busy_adopt_streams_turn_into_snapshot() {
     assert!(
         final_card.contains("✅ 完成"),
         "the follow finalizes Done: {final_card}"
+    );
+}
+
+/// The busy/waiting follow card REPLACES the one-shot snapshot, so it repeats
+/// the overflow line (#842): otherwise the requests the block cap left out are
+/// named only on a card the follow has already overwritten.
+#[tokio::test]
+async fn a_busy_follow_repeats_the_pending_overflow_line() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session(
+        "ses_alpha01",
+        "唯一外部标题",
+        "/work/ext",
+        100,
+    )]);
+    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.external_message_for("ses_alpha01", "帮我重构这个模块");
+    let reply_ready = backend.external_reply(realistic_parts());
+    for i in 1..=6 {
+        backend.ask_permission(perm_request(
+            &format!("per_{i}"),
+            "ses_alpha01",
+            &format!("cmd_{i}"),
+        ));
+    }
+    let backend = Arc::new(backend);
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    app.core
+        .external
+        .render_poll_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/switch 唯一外部标题", "msg_switch").await;
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let follow_card = calls
+        .iter()
+        .rev()
+        .find_map(|call| match call {
+            PlatformCall::UpdateMessage { message_id, card } if message_id == "msg_reply" => {
+                Some(card.to_string())
+            }
+            _ => None,
+        })
+        .expect("the follow re-renders the snapshot message");
+    assert!(
+        follow_card.contains("另有 1 个待处理请求超出单卡容量"),
+        "the replacing card still names the leftover: {follow_card}"
+    );
+    assert!(
+        follow_card.contains("已接管 唯一外部标题"),
+        "the follow card is the snapshot's successor: {follow_card}"
     );
 }
 
