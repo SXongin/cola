@@ -3581,6 +3581,49 @@ async fn a_record_written_before_a_spawn_that_never_happened_is_reported_and_cle
     );
 }
 
+/// #822: a run whose **Terminal Log** cannot be read is not rebuilt as an empty
+/// card. The sweep keeps the lost state and says why the output is missing, so
+/// the card is never read as 「命令什么都没输出」.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_lost_run_with_an_unreadable_log_says_why_the_output_is_missing() {
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let logs = tempfile::tempdir().unwrap();
+    let key = thread();
+    let (app, _platform) = restart_app(cfg.clone(), logs.path().to_path_buf()).await;
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-unreadable".into(),
+            chat_id: key.chat_id.clone(),
+            thread_id: key.thread_id.clone(),
+            card_id: "msg_unreadable".into(),
+            log_path: logs.path().join("swept-away.log").to_string_lossy().into_owned(),
+            command: "echo hi".into(),
+            cwd: "/tmp".into(),
+            timeout_ms: 600_000,
+            pids: Vec::new(),
+            is_group: false,
+            state: TerminalRunState::Running,
+        })
+        .unwrap();
+
+    let (app2, platform2) = restart_app(cfg, logs.path().to_path_buf()).await;
+    app2.sweep_terminal().await;
+
+    let patched = wait_for_patch_containing(&platform2, "msg_unreadable", "输出不可读取").await;
+    let text = card_text(&patched);
+    assert!(text.contains("已失去跟踪"), "the state line survives: {text}");
+    assert!(
+        !text.contains("（无输出）"),
+        "a read failure is not 「无输出」: {text}"
+    );
+    assert_eq!(
+        app2.terminal_records.read(&key).unwrap().state,
+        TerminalRunState::Lost
+    );
+}
+
 /// #827 acceptance: 「↻ 重跑」 re-runs the same command with the same cwd and
 /// timeout, including after a restart — the record is what it replays from, and
 /// the card it was clicked on is its reply target.
