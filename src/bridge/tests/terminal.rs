@@ -14,6 +14,8 @@ use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 #[cfg(unix)]
 use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
+#[cfg(unix)]
+use std::time::Duration;
 
 fn thread() -> ThreadKey {
     ThreadKey::new("chat_1".into(), "chat_1".into())
@@ -1880,4 +1882,797 @@ async fn full_output_delivery_is_bounded_by_its_own_timeout() {
             .any(|call| matches!(call, PlatformCall::SendMessageReply { .. })),
         "a timed-out upload sends no File Message"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #825: one command per Chat/Topic, kill, cap, liveness and the notice.
+// ---------------------------------------------------------------------------
+
+/// A button payload from a rendered card, by its `op` (buttons nest in column
+/// sets, so the walk is recursive).
+#[cfg(unix)]
+fn button_value(card: &serde_json::Value, op: &str) -> Option<serde_json::Value> {
+    match card {
+        serde_json::Value::Object(map) => {
+            if map.get("tag").and_then(|tag| tag.as_str()) == Some("button")
+                && let Some(value) = map.get("value")
+                && value.get("op").and_then(|v| v.as_str()) == Some(op)
+            {
+                return Some(value.clone());
+            }
+            map.values().find_map(|value| button_value(value, op))
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(|value| button_value(value, op)),
+        _ => None,
+    }
+}
+
+/// Wait until at least `count` Terminal Cards were posted.
+#[cfg(unix)]
+async fn wait_for_replied_cards(platform: &RecordingPlatform, count: usize) {
+    for _ in 0..500 {
+        if platform.replied_cards().await.len() >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "expected {count} replied cards, saw {}",
+        platform.replied_cards().await.len()
+    );
+}
+
+/// The highest `tick-N` the card's output carries.
+#[cfg(unix)]
+fn max_tick(card: &serde_json::Value) -> u32 {
+    card_text(card)
+        .split("tick-")
+        .skip(1)
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|n| n.parse::<u32>().ok())
+        .max()
+        .unwrap_or(0)
+}
+
+/// #825 acceptance: a second command in the same Chat/Topic is refused, and the
+/// refusal names the running card's 「⏹ 终止」. A click whose run id is not the
+/// current run is refused as stale — the run-id check that #827's record makes
+/// durable — and only the current run's own 终止 ends it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_command_is_refused_and_a_stale_run_id_is_rejected() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let first = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 30", key, "msg_first", ConversationKind::P2p).await;
+        }
+    });
+    wait_for_replied_cards(&platform, 1).await;
+
+    send_command_in(&app, "/run echo second", key, "msg_second", ConversationKind::P2p).await;
+    let texts = platform.texts().await;
+    let refusal = texts.last().expect("the second command was answered");
+    assert!(
+        refusal.contains("已有终端命令在运行"),
+        "the second command is refused: {refusal}"
+    );
+    assert!(
+        refusal.contains("「⏹ 终止」"),
+        "the refusal names the running card's kill button: {refusal}"
+    );
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "the refused command posts no Terminal Card"
+    );
+
+    let card = platform.replied_cards().await[0].clone();
+    let mut stale = button_value(&card, "kill").expect("the live card carries 终止");
+    stale["run_id"] = serde_json::json!("not-the-current-run");
+    let result = app.host_action(stale).await.expect("a toast result");
+    assert!(
+        result.toast.unwrap_or_default().contains("过期"),
+        "a click for another run id is refused as stale"
+    );
+    assert!(!first.is_finished(), "the stale click left the run alone");
+
+    let kill = button_value(&card, "kill").expect("the live card carries 终止");
+    let result = app.host_action(kill).await.expect("a toast result");
+    assert!(
+        result.toast.unwrap_or_default().contains("终止"),
+        "the current run's 终止 is accepted"
+    );
+    tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+    wait_for_card_update(&platform, "已终止", CardUpdates::Any, |card| {
+        card_text(card).contains("已终止")
+    })
+    .await;
+}
+
+/// #825 acceptance: the claim is atomic, not a property of dispatch. Two
+/// commands racing into one Chat/Topic — each on its own task, as every inbound
+/// message is — produce one run and one refusal.
+#[cfg(unix)]
+#[tokio::test]
+async fn two_concurrent_commands_cannot_both_claim_one_chat() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let first = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 2", key, "msg_race_a", ConversationKind::P2p).await;
+        }
+    });
+    let second = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 2", key, "msg_race_b", ConversationKind::P2p).await;
+        }
+    });
+
+    wait_for_replied_cards(&platform, 1).await;
+    // One of the two owns the claim for seconds; the other must have been
+    // refused by the time both dispatches have run.
+    for _ in 0..100 {
+        if !platform.texts().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        platform.replied_cards().await.len(),
+        1,
+        "exactly one command claimed the conversation"
+    );
+    assert!(
+        platform
+            .texts()
+            .await
+            .iter()
+            .all(|text| text.contains("「⏹ 终止」")),
+        "the loser was refused by name: {:?}",
+        platform.texts().await
+    );
+
+    let card = platform.replied_cards().await[0].clone();
+    let kill = button_value(&card, "kill").expect("the live card carries 终止");
+    app.host_action(kill).await.expect("a toast result");
+    for handle in [first, second] {
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("both dispatches return")
+            .unwrap();
+    }
+}
+
+/// #825 acceptance: the run is live while its process group has members, not
+/// while `sh` is alive. `sh -c 'sleep 5 &'` exits at once, yet the slot stays
+/// claimed, the card keeps 终止 and names the surviving background process, and
+/// only the group emptying (or 终止) releases it.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_background_child_keeps_the_run_live_and_the_slot_claimed() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 5 &", key, "msg_survivor", ConversationKind::P2p).await;
+        }
+    });
+
+    // `sh` has exited but `sleep 5` has not: the card must say so, stay live,
+    // and keep the kill control.
+    wait_for_card_update(&platform, "survivor line", CardUpdates::Any, |card| {
+        card_text(card).contains("后台进程仍在运行")
+    })
+    .await;
+    let survivor = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&survivor);
+    assert!(!text.contains("退出码"), "the run has not settled: {text}");
+    assert!(
+        button_value(&survivor, "kill").is_some(),
+        "the live card keeps 终止 while the group has members"
+    );
+
+    send_command_in(
+        &app,
+        "/run echo second",
+        key,
+        "msg_second_survivor",
+        ConversationKind::P2p,
+    )
+    .await;
+    let refusal = platform.texts().await.last().cloned().unwrap_or_default();
+    assert!(
+        refusal.contains("「⏹ 终止」"),
+        "the surviving group still claims the slot: {refusal}"
+    );
+    assert!(!running.is_finished(), "the background child is still running");
+
+    let kill = button_value(&survivor, "kill").expect("the survivor card carries 终止");
+    app.host_action(kill).await.expect("a toast result");
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed group ends")
+        .unwrap();
+}
+
+/// The #823 review's gap, owned by #825's liveness: a command that backgrounds
+/// a writer and returns must NOT settle on `sh`'s exit. The card keeps tailing
+/// the group, so the late bytes are on the run rather than lost behind a
+/// settled card.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_background_writer_is_tailed_after_sh_exits() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run (sleep 0.3; printf late-writer) & printf started",
+        key,
+        "msg_late_writer",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let settled = settled_card(&platform).await;
+    let text = card_text(&settled);
+    assert!(
+        text.contains("late-writer"),
+        "the run waited for the group before settling: {text}"
+    );
+    assert!(
+        text.contains("退出码 0"),
+        "`sh`'s real exit code still settles: {text}"
+    );
+}
+
+/// #825 + #826 cross-ticket: `sh` exiting does not end the run, so it must not
+/// stop the size probe either. A backgrounded writer that keeps appending past
+/// the observed threshold is killed as a runaway and the card says 「输出超限」.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_background_writer_past_the_threshold_is_still_stopped() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.core.terminal_log_cap_bytes.store(4 * 1024, Ordering::Relaxed);
+    app.core.terminal_size_probe_ms.store(5, Ordering::Relaxed);
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // The foreground `sh` exits at once; the subshell inherits its process
+    // group and keeps writing. A run that settled on `sh` alone would release
+    // the slot and the probe before this writer crossed the threshold.
+    tokio::time::timeout(
+        Duration::from_secs(15),
+        send_command_in(
+            &app,
+            "/run (i=0; while :; do printf 'late-runaway-%01000d\\n' $i; i=$((i+1)); done) &",
+            key.clone(),
+            "msg_late_runaway",
+            ConversationKind::P2p,
+        ),
+    )
+    .await
+    .expect("the probe still runs after sh exits");
+
+    let text = card_text(&settled_card(&platform).await);
+    assert!(
+        text.contains("输出超限"),
+        "the background writer was stopped by size: {text}"
+    );
+
+    // The probe's settle released the claim like any other settle.
+    send_command_in(
+        &app,
+        "/run echo after-runaway",
+        key,
+        "msg_after_runaway",
+        ConversationKind::P2p,
+    )
+    .await;
+    let text = card_text(&settled_card(&platform).await);
+    assert!(
+        text.contains("after-runaway") && text.contains("退出码 0"),
+        "the slot was released after the probe's settle: {text}"
+    );
+}
+
+/// #825 settle path: a live PATCH parked when the run ends must never land
+/// after the settling write. The settle waits for the card's write lock, marks
+/// the run settled first, and is the last write — so the card cannot be
+/// resurrected into 「运行中」.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_late_live_patch_cannot_resurrect_the_settled_card() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let (entered, release) = platform.pause("update", "msg_reply");
+    let runner = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run sleep 0.2; echo settled-token",
+                key,
+                "msg_late_patch",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("a live card patch is parked");
+
+    // The run ends while the PATCH is parked. Release it only now: it is a
+    // live-state write, and the settle must still be the card's last write.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .expect("the run settles once the parked patch is released")
+        .unwrap();
+
+    let last = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the card was patched");
+    let text = card_text(&last);
+    assert!(
+        text.contains("退出码 0") && !text.contains("运行中"),
+        "the settled card is the last write: {text}"
+    );
+}
+
+/// #825 acceptance: 终止 signals the whole group, so a background child of the
+/// command dies with it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn kill_ends_the_whole_process_group() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run sleep 30 & echo $! > child.pid; wait",
+                key,
+                "msg_tree",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    wait_for_replied_cards(&platform, 1).await;
+    let pid = wait_for_file_line(&proj.path().join("child.pid")).await;
+    assert!(pid_alive(pid), "the child is running before the click");
+
+    let card = platform.replied_cards().await[0].clone();
+    let kill = button_value(&card, "kill").expect("the live card carries 终止");
+    app.host_action(kill).await.expect("a toast result");
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+
+    wait_for_pid_gone(pid).await;
+}
+
+/// #825 acceptance: at the cap the tail stops but the wait continues — a
+/// command that exits after the cap still settles with its real exit code.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_cap_stops_the_tail_but_the_wait_continues() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(10, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 1s sh -c 'echo before-cap; sleep 2; echo after-cap; exit 3'",
+                key,
+                "msg_cap",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+
+    wait_for_card_update(&platform, "cap state", CardUpdates::Any, |card| {
+        card_text(card).contains("已达时限")
+    })
+    .await;
+    let capped = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&capped);
+    assert!(
+        button_value(&capped, "continue").is_some(),
+        "the cap state offers 继续: {text}"
+    );
+    let capped_output = output_body(&capped);
+    assert!(
+        capped_output.contains("before-cap") && !capped_output.contains("after-cap"),
+        "the tail stopped at the cap: {capped_output}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the post-cap exit still settles")
+        .unwrap();
+    let settled = platform.updated_cards().await.last().cloned().unwrap();
+    let text = card_text(&settled);
+    assert!(text.contains("退出码 3"), "the real exit code settles: {text}");
+    assert!(text.contains("after-cap"), "the post-cap output settles: {text}");
+}
+
+/// #825 acceptance: 「继续」 is available exactly while the run is past the cap
+/// and live; it extends the cap by the same amount (the tail resumes), the slot
+/// stays claimed until exit/kill, and after settle the click is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn continue_resumes_the_tail_while_the_cap_is_extended_and_is_refused_after_settle() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 1s sh -c 'for i in $(seq 1 30); do echo tick-$i; sleep 0.1; done'",
+                key,
+                "msg_continue",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+
+    wait_for_card_update(&platform, "cap state", CardUpdates::Any, |card| {
+        card_text(card).contains("已达时限")
+    })
+    .await;
+    let capped = platform.updated_cards().await.last().cloned().unwrap();
+    let capped_tick = max_tick(&capped);
+    let continue_value = button_value(&capped, "continue").expect("the cap state offers 继续");
+
+    // The claim survives the extension: a later command is still refused.
+    send_command_in(
+        &app,
+        "/run echo second",
+        key,
+        "msg_continue_second",
+        ConversationKind::P2p,
+    )
+    .await;
+    assert!(
+        platform
+            .texts()
+            .await
+            .last()
+            .is_some_and(|text| text.contains("「⏹ 终止」")),
+        "the extended run still claims the slot"
+    );
+
+    let result = app
+        .host_action(continue_value.clone())
+        .await
+        .expect("a toast result");
+    assert!(
+        result.toast.unwrap_or_default().contains("延长"),
+        "继续 is accepted past the cap"
+    );
+    // The tail resumes: a tick newer than the cap card's newest appears on a
+    // live (not 「已达时限」) card.
+    wait_for_card_update(&platform, "resumed live tail", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        !text.contains("已达时限") && max_tick(card) > capped_tick
+    })
+    .await;
+
+    let live = platform.updated_cards().await.last().cloned().unwrap();
+    let kill = button_value(&live, "kill").expect("the resumed card carries 终止");
+    app.host_action(kill).await.expect("a toast result");
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+
+    let result = app.host_action(continue_value).await.expect("a toast result");
+    assert!(
+        result.toast.unwrap_or_default().contains("过期"),
+        "继续 after settle is refused"
+    );
+}
+
+/// #825 acceptance: `--timeout` applies to that run only; the slot and cap are
+/// per Chat/Topic, so two conversations run side by side with their own caps.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_claim_and_cap_are_per_chat_not_process_wide() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    let a = ThreadKey::new("chat_a".into(), "chat_a".into());
+    let b = ThreadKey::new("chat_b".into(), "chat_b".into());
+
+    let run_a = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = a.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 1s sh -c 'echo owner-A; sleep 2'",
+                key,
+                "msg_chat_a",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let run_b = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = b.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 60s sh -c 'echo owner-B; sleep 2'",
+                key,
+                "msg_chat_b",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+
+    wait_for_replied_cards(&platform, 2).await;
+    wait_for_card_update(&platform, "A's cap", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        text.contains("owner-A") && text.contains("已达时限")
+    })
+    .await;
+    let cards = platform.updated_cards().await;
+    assert!(
+        cards.iter().all(|card| {
+            let text = card_text(card);
+            !(text.contains("owner-B") && text.contains("已达时限"))
+        }),
+        "B keeps its own 60s cap while A reaches its 1s one"
+    );
+
+    for (_key, message_id) in [(a, "msg_chat_a"), (b, "msg_chat_b")] {
+        let card = platform
+            .updated_cards()
+            .await
+            .into_iter()
+            .rev()
+            .find(|card| {
+                card_text(card).contains(if message_id == "msg_chat_a" {
+                    "owner-A"
+                } else {
+                    "owner-B"
+                })
+            })
+            .expect("the run has a live card");
+        if let Some(kill) = button_value(&card, "kill") {
+            app.host_action(kill).await.expect("a toast result");
+        }
+    }
+    for handle in [run_a, run_b] {
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("both runs end")
+            .unwrap();
+    }
+}
+
+/// #825 acceptance: a command past the long-task threshold sends exactly one
+/// completion notice, under the existing p2p opt-in; a quick command sends none.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_long_command_sends_exactly_one_notice_and_a_quick_one_none() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.long_task_notice = true;
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.long_task_notice_ms.store(1, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run sleep 0.05",
+        key.clone(),
+        "msg_notice",
+        ConversationKind::P2p,
+    )
+    .await;
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "exactly one notice: {notices:?}");
+    assert_eq!(notices[0].0, "msg_notice", "it replies to the command message");
+    assert_eq!(notices[0].1, TEST_HOST, "it names the requester");
+    assert!(
+        notices[0].3.contains("终端命令") && notices[0].3.contains("完成"),
+        "the notice says the command completed: {}",
+        notices[0].3
+    );
+
+    app.long_task_notice_ms.store(60_000, Ordering::Relaxed);
+    send_command_in(&app, "/run echo quick", key, "msg_quick", ConversationKind::P2p).await;
+    assert_eq!(
+        platform.completion_notices().await.len(),
+        1,
+        "a quick command sends no notice"
+    );
+}
+
+/// #825 acceptance: the group's own opt-in (`group_completion_notice`) is the
+/// switch a long Terminal Command obeys — no new configuration knob.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_long_group_command_obeys_the_group_notice_opt_in() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    assert!(
+        cfg.bridge.group_completion_notice,
+        "the group notice is the existing default-on switch"
+    );
+    assert!(
+        !cfg.bridge.long_task_notice,
+        "p2p's own opt-in stays off; the group uses its own"
+    );
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.long_task_notice_ms.store(1, Ordering::Relaxed);
+
+    send_command_in(
+        &app,
+        "/run sleep 0.05",
+        ThreadKey::new("chat_group".into(), "chat_group".into()),
+        "msg_group_notice",
+        ConversationKind::GroupLobby,
+    )
+    .await;
+    let notices = platform.completion_notices().await;
+    assert_eq!(notices.len(), 1, "the group opt-in sent one: {notices:?}");
+    assert_eq!(notices[0].0, "msg_group_notice");
+}
+
+/// Wait for a file to carry a decimal pid, then return it (a background child
+/// writes its own `$!`).
+#[cfg(target_os = "linux")]
+async fn wait_for_file_line(path: &std::path::Path) -> i32 {
+    for _ in 0..500 {
+        if let Ok(raw) = std::fs::read_to_string(path)
+            && let Ok(pid) = raw.trim().parse::<i32>()
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no pid was written to {path:?}");
+}
+
+/// Whether `pid` still accepts signal 0 (the test-side probe, through the same
+/// safe wrapper the run uses).
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: i32) -> bool {
+    rustix::process::Pid::from_raw(pid).is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+}
+
+/// Wait until the killed child is gone (reaped after its group died).
+#[cfg(target_os = "linux")]
+async fn wait_for_pid_gone(pid: i32) {
+    for _ in 0..300 {
+        if !pid_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("pid {pid} survived 终止");
 }

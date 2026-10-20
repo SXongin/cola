@@ -1683,6 +1683,11 @@ pub(crate) struct CommandHandles {
     /// process through the core, so two `/diff`s in one chat cannot both run
     /// inside the window.
     pub(crate) diff_cooldown: Arc<std::sync::Mutex<crate::bridge::repo_diff::DiffCooldown>>,
+    /// The **Terminal Command** slot registry (ADR-0086 decision 6): the
+    /// per-**Chat**/**Topic** claim, plus the control channel a card action uses
+    /// to reach the live run. Shared through the core with the card-action
+    /// handler.
+    pub(crate) terminal_runs: Arc<std::sync::Mutex<crate::bridge::terminal::TerminalRuns>>,
     /// The **Terminal Log** root override (ADR-0086 §7): unset in production,
     /// set once by a test so its runs never write under the real home.
     pub(crate) terminal_log_root: Arc<std::sync::OnceLock<std::path::PathBuf>>,

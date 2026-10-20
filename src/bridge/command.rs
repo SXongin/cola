@@ -840,12 +840,15 @@ pub(crate) fn is_reset_flag(name: &str) -> bool {
 /// `/command`s are intercepted by the message coordinator (which owns the
 /// prompt pipeline), so this never forwards — the `Command::Forward` arm below
 /// is unreachable and kept only for exhaustiveness.
+#[allow(clippy::too_many_arguments)] // the dispatcher carries the message's request facts
 pub(crate) async fn handle_command(
     handles: &CommandHandles,
     cmd: Command,
     thread_key: ThreadKey,
     message_id: &str,
     kind: ConversationKind,
+    requester_open_id: Option<&str>,
+    is_group: bool,
 ) -> crate::error::Result<()> {
     // Topic command gate (ADR-0007, ADR-0023): the rule lives in
     // `Command::topic_rejection`, so every command — including future ones —
@@ -914,7 +917,17 @@ pub(crate) async fn handle_command(
                 .await?;
         }
         Command::Run(spec) => {
-            crate::bridge::terminal::execute(handles, &thread_key, message_id, spec).await?;
+            crate::bridge::terminal::execute(
+                handles,
+                &thread_key,
+                crate::bridge::terminal::TerminalRequest {
+                    message_id,
+                    requester_open_id,
+                    is_group,
+                },
+                spec,
+            )
+            .await?;
         }
         Command::Switch(action) => {
             handle_switch_action(handles, &thread_key, action, message_id, kind).await?;

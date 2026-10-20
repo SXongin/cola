@@ -164,6 +164,11 @@ pub struct SharedCore {
     /// `/diff`'s process-internal cooldown (spec #803): keyed by chat id,
     /// claimed before any git/render/upload work.
     pub diff_cooldown: Arc<std::sync::Mutex<crate::bridge::repo_diff::DiffCooldown>>,
+    /// The **Terminal Command** slot registry (ADR-0086 decision 6): one run
+    /// per **Chat**/**Topic**, claimed atomically before anything is spawned and
+    /// released when the process group empties. Card actions reach the live run
+    /// through the control channel this holds, so 终止 and 继续 cross tasks.
+    pub terminal_runs: Arc<std::sync::Mutex<crate::bridge::terminal::TerminalRuns>>,
     /// New sessions cola creates start with Auto-Accept on (from
     /// `[bridge] default_auto_accept`, #513). Adoptions ignore it and keep
     /// the session's own state.
@@ -369,6 +374,9 @@ impl SharedCore {
             diff_cooldown: Arc::new(std::sync::Mutex::new(
                 crate::bridge::repo_diff::DiffCooldown::default(),
             )),
+            terminal_runs: Arc::new(std::sync::Mutex::new(
+                crate::bridge::terminal::TerminalRuns::default(),
+            )),
             default_auto_accept: cfg.bridge.default_auto_accept,
             group_completion_notice: cfg.bridge.group_completion_notice,
             long_task_notice: cfg.bridge.long_task_notice,
@@ -483,6 +491,7 @@ impl SharedCore {
             external: Arc::clone(&self.external),
             preferred_port: self.preferred_port,
             diff_cooldown: Arc::clone(&self.diff_cooldown),
+            terminal_runs: Arc::clone(&self.terminal_runs),
             terminal_log_root: Arc::clone(&self.terminal_log_root),
             terminal_log_cap_bytes: Arc::clone(&self.terminal_log_cap_bytes),
             terminal_size_probe_ms: Arc::clone(&self.terminal_size_probe_ms),
