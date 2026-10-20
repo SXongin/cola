@@ -1686,6 +1686,10 @@ pub(crate) struct CommandHandles {
     /// The **Terminal Log** root override (ADR-0086 §7): unset in production,
     /// set once by a test so its runs never write under the real home.
     pub(crate) terminal_log_root: Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    /// Test-only inherited-environment injection for the credential scrub
+    /// (ADR-0086 §8); see `SharedCore::terminal_test_env`.
+    #[cfg(test)]
+    pub(crate) terminal_test_env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 impl CommandHandles {

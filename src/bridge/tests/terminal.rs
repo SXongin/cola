@@ -12,6 +12,7 @@
 
 use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
+#[cfg(unix)]
 use crate::feishu::card::terminal::TERMINAL_TAIL_CHARS;
 
 fn thread() -> ThreadKey {
@@ -76,6 +77,7 @@ fn canonical(path: &std::path::Path) -> String {
 /// The card's settled state: the last in-place update. Since #823 the reply is
 /// the live 「运行中」 card and the settled exit code always arrives by PATCH;
 /// the reply is only a defensive fallback for a path that wrote no update.
+#[cfg(unix)]
 async fn settled_card(platform: &RecordingPlatform) -> serde_json::Value {
     if let Some(card) = platform.updated_cards().await.last() {
         return card.clone();
@@ -339,35 +341,24 @@ async fn the_child_leads_its_own_process_group() {
 }
 
 /// ADR-0086 §8: the environment is inherited MINUS cola's own credentials.
-/// The three names are set for the duration of this test (nothing else reads
-/// them); `printenv` proves the child cannot see any of them, and a clean
-/// `PATH` read proves the rest of the environment still is inherited.
+/// The values are injected through the spawn path's test-only inherited-env
+/// list, so they sit in the child's environment exactly where the real process
+/// environment would — without mutating the test process (unsound under
+/// parallel tests). `printenv` proves the scrub removed each one.
 #[cfg(unix)]
 #[tokio::test]
 async fn the_child_environment_scrubs_cola_credentials() {
-    struct RestoreEnv(&'static [&'static str]);
-    impl Drop for RestoreEnv {
-        fn drop(&mut self) {
-            for name in self.0 {
-                // The test runs no other env mutation, and no production code
-                // reads these names in-process.
-                unsafe { std::env::remove_var(name) };
-            }
-        }
-    }
-
-    for name in CREDENTIAL_ENV {
-        // Rust 2024 marks env mutation unsafe (it is process-global); tests
-        // are the crate's one place unsafe is allowed.
-        unsafe { std::env::set_var(name, "cola-secret-822") };
-    }
-    let _restore = RestoreEnv(&CREDENTIAL_ENV);
-
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
     let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    {
+        let mut inherited = app.core.terminal_test_env.lock().unwrap();
+        for name in CREDENTIAL_ENV {
+            inherited.push((name.to_string(), "cola-secret-822".to_string()));
+        }
+    }
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
@@ -402,14 +393,14 @@ async fn the_child_environment_scrubs_cola_credentials() {
     }
 }
 
-/// The card family's 3,000-character per-element budget (ADR-0086 §4): a body
-/// of nothing but backticks grows the fence with it, so this is exactly where
-/// clipping the body before fencing would overrun the element. #823's per-line
-/// cap now cuts the single long line first (with its visible marker), and every
-/// element still stays inside the budget.
+/// The card family's 3,000-character per-element budget (ADR-0086 §4): backtick
+/// lines grow the fence with their longest run, so this is where clipping the
+/// body before fencing would overrun the element or drop the newest line. A
+/// 3,000-backtick prefix is followed by `ERROR: boom`: the card must stay inside
+/// the budget and keep the diagnostic.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_backtick_heavy_output_stays_within_the_element_budget() {
+async fn a_backtick_heavy_output_keeps_the_newest_line_within_the_budget() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -418,11 +409,12 @@ async fn a_backtick_heavy_output_stays_within_the_element_budget() {
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
-    // 3,000 backticks on one line: past the tail and per-line budgets, and a
-    // fence-sized body if it reached `fenced_code` whole.
+    // Eight 375-backtick lines (3,000 total, each under the per-line cap) then
+    // the diagnostic. The fence is sized by the run, so the card must drop the
+    // old prefix rather than the last line.
     send_command_in(
         &app,
-        "/run printf '%3000s' | tr ' ' '\\140'",
+        "/run for i in 1 2 3 4 5 6 7 8; do printf '%375s\\n' | tr ' ' '\\140'; done; printf 'ERROR: boom\\n'",
         key,
         "msg_run_backticks",
         ConversationKind::P2p,
@@ -438,10 +430,16 @@ async fn a_backtick_heavy_output_stays_within_the_element_budget() {
             text.chars().count()
         );
     }
+    let joined = texts.join("\n");
+    let output = texts
+        .iter()
+        .find(|text| text.starts_with("**输出**"))
+        .expect("the card carries an output element");
     assert!(
-        texts.join("\n").contains("已截断"),
-        "a cut display says so: {texts:?}"
+        output.contains("ERROR: boom"),
+        "the newest diagnostic survives the clip: {output}"
     );
+    assert!(joined.contains("输出过长"), "a cut display says so: {texts:?}");
 }
 
 /// On Windows the command is refused with a stated reason and nothing is
