@@ -53,7 +53,7 @@
 
 ## 飞书应用配置
 
-cola 以企业自建应用的身份与飞书通信。配置是一次性的，在[开发者后台](https://open.feishu.cn/app)完成；[README 快速开始](../README.md#quick-start) 有一份精简清单——本节是完整说明。
+cola 以企业自建应用的身份与飞书通信。配置是一次性的，在[开发者后台](https://open.feishu.cn/app)完成；[README 快速开始](../README.md#try-it) 有一份精简清单——本节是完整说明。
 
 ### 1. 开启机器人能力
 
