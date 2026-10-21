@@ -470,3 +470,44 @@ the run no longer owns is never reached.
   terminal (prompts fail fast) and takes its children with it on restart; a hand-launched one
   can have a stopped `sudo` on the desktop and leaves orphans behind. Both are reported, never
   guessed.
+
+## Amendment (2026-10-21, #854): bare `/run` moves the Terminal Card to the newest position
+
+Decision 4 posts the card as its own message and never lets it move. A run may last up to
+24 hours, so every reply and every Turn message pushes the one surface that carries 「⏹ 终止」
+further up; reaching it again meant scrolling. `/card` (ADR-0043, 2026-09-22 amendment) is the
+same need solved for the live **Turn** card, and it cannot serve this one: a Terminal Card
+joins no **Card Chain**, so there is nothing for a split to continue.
+
+Bare `/run` — previously only the usage line — is now the Terminal Card's locator, the family's
+own name for the act (a new command would be one more thing to remember; `/run stop` is not an
+option, because everything after `/run` is the shell command):
+
+- **A live run** is served by its loop, the only writer the card has. The loop posts a fresh
+  live card as the reply to the command message, re-points the run at it, and freezes the
+  superseded card as 「🖥️ 终端命令 · 已下移」 — the tail it last showed, no controls — so the
+  chat never holds two cards that both look live for one run.
+- **A settled or lost run** is rebuilt from its **Terminal Run Record** (`settled_card`,
+  `lost_card`) and posted as a fresh card. Nothing durable changes: the record already names
+  the run, and the rebuilt buttons work exactly as the card's originals did.
+- **No run, no record** keeps the usage line. A run that is still 「启动中」, or one whose loop
+  ended before it could answer, answers 「终端命令状态正在更新，请稍后再发一次 `/run`」 — a
+  message that describes what is knowable instead of a card that would be a guess.
+
+The one-way-door part is decision 4's "its own message id at send": the card's identity is now
+**movable while the run is live**, and the order is the invariant that makes it safe, all of it
+under the run's existing card write lock:
+
+1. post the new card (bounded like every platform call);
+2. swap the run's target, then write the new id into the Terminal Run Record;
+3. only then freeze the old card.
+
+A stall or timeout in (3) therefore leaves the run writing the card the reader is looking at;
+it can only leave the superseded card still looking live, which the next pull or the settle
+makes visible instead of silently wrong. Because the swap happens in the run loop, a pull the
+loop can no longer serve (it just ended) is answered by the record rebuild or by the "updating"
+line — never by silence.
+
+Not taken: an automatic repost whenever a run passes a duration threshold (the chat gets noise
+with no one asking), and a pinned control card beside the live one (two 终止 buttons for one
+run, and the mirror's buttons outlive the run).
