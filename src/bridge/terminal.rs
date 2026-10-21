@@ -835,7 +835,15 @@ async fn run_claimed(
     // is recorded for the report. A persisted pid is never signalled.
     record.pids = pgid.into_iter().collect();
     record.touch();
-    handles.terminal_records.update(&record);
+    if let Err(error) = handles.terminal_records.write(&record) {
+        // The completed write carries the child's id. If it fails, the record
+        // stays `running` with **no pid** — the one state from which retention
+        // can never prove a group gone — so name the run and the consequence.
+        tracing::warn!(
+            "terminal: could not record the child pid for run {run} ({error}); the record keeps no \
+             group id, so its log can never be proven safe to expire"
+        );
+    }
     slot.live.store(true, Ordering::SeqCst);
 
     // #826's size probe runs on its own task; it owns the runaway kill and
@@ -1439,6 +1447,26 @@ pub(crate) struct TerminalExpiry {
     pub(crate) expired: usize,
     /// Old `lost` records kept because their process group may still be alive.
     pub(crate) kept_live: usize,
+    /// Old `lost` records kept because **no process id was recorded**: a live
+    /// orphan is unprovable, never dead.
+    pub(crate) kept_unprovable: usize,
+}
+
+/// Whether a recorded id can address a process group at all. Expiry needs this
+/// before it may call a group dead: `None` (the completed record write failed,
+/// or no child was ever spawned) and nonsense ids (0/1, out of range) prove
+/// nothing, and a log a live orphan may be writing must never be unlinked on a
+/// guess.
+fn recorded_group_is_probeable(pid: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        group_pid(pid).is_some()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
 }
 
 /// Retention (`[bridge] log_days`) for run records and their logs, not only for
@@ -1450,9 +1478,12 @@ pub(crate) struct TerminalExpiry {
 /// run replaces it, or `log_days`, whichever comes first", with one exception
 /// that is not negotiable: a **lost** run's process group may still be writing
 /// its log (a hand-launched cola's orphan), and its open descriptor keeps writing
-/// to the inode even after unlink. A lost record whose recorded group still has
-/// members therefore keeps both, and a later start tries again; the probe is
-/// `kill(-pgid, 0)`, never a signal.
+/// to the inode even after unlink. Expiry therefore needs **recorded proof**: a
+/// process-group id the signal-0 probe finds gone. A lost record whose recorded
+/// group still has members keeps both, and a later start tries again; a lost
+/// record with **no pid** — the state a failed post-spawn update leaves — is
+/// unprovable and is never expired at all. The probe is `kill(-pgid, 0)`, never a
+/// signal.
 ///
 /// Only an ending expires. A `running` record is unresolved — the lost sweep
 /// retries its card — and an owed settlement names the log its card still needs,
@@ -1512,6 +1543,20 @@ pub(crate) fn expire_records(root: &Path, log_days: u32, records: &TerminalRunRe
             // The run ended and its card is settled: nothing needs the evidence.
             TerminalRunState::Settled => {}
             TerminalRunState::Lost => {
+                // Proof first, liveness second. A lost record with NO recorded
+                // pid is the state a failed post-spawn update leaves: an orphan
+                // may still be writing its log and nothing can prove otherwise,
+                // so it is never expired (#827's "a file a live orphan is still
+                // writing is not unlinked").
+                if !recorded_group_is_probeable(record.pids.first().copied()) {
+                    expiry.kept_unprovable += 1;
+                    tracing::info!(
+                        "terminal: keeping lost run {} and its log — no process id was recorded, so \
+                         its group cannot be proven gone",
+                        record.run_id
+                    );
+                    continue;
+                }
                 if group_has_members(record.pids.first().copied()) {
                     expiry.kept_live += 1;
                     tracing::info!(

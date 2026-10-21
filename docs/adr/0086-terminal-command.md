@@ -361,9 +361,11 @@ now separate facts, and the second one is **not** kept in the per-chat record:
   - a record older than the window and `settled` is **expired**: the record and
     its **Terminal Log** are deleted together;
   - a `lost` record older than the window expires the same way **only once its
-    recorded process group is provably gone**. The probe is `kill(-pgid, 0)` and
-    never a signal; a group that still has members may be writing its log, so
-    both stay and a later start tries again;
+    recorded process group is provably gone**. *Recorded* is load-bearing: a
+    record with **no pid** — the state a failed post-spawn pid update leaves — is
+    unprovable and is **never** expired; its record and log both stay. The probe
+    is `kill(-pgid, 0)` and never a signal; a group that still has members may be
+    writing its log, so both stay and a later start tries again;
   - a `running` record is unresolved (its card is retried) and keeps its
     evidence, and an owed settlement names the log its card still needs, so it
     protects that record and log;
