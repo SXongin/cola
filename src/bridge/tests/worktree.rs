@@ -473,3 +473,51 @@ fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
+
+/// The issue's first acceptance bullet end to end: after `/worktree new`, the
+/// conversation's next message creates its session in the checkout.
+#[tokio::test]
+async fn the_next_message_creates_the_session_in_the_worktree() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    send_command_in(
+        &app,
+        "/worktree new next-msg",
+        key(),
+        "msg_worktree_next",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let expected = repo_canonical(&repo)
+        .join(".worktrees")
+        .join("next-msg")
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        created.lock().await.is_empty(),
+        "the command declares, it never creates"
+    );
+
+    app.handle_message(incoming(
+        "msg_worktree_after".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "开始吧".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        created.lock().await.last().and_then(|dir| dir.as_deref()),
+        Some(expected.as_str()),
+        "the next message materialises the session in the worktree"
+    );
+}
