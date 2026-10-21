@@ -60,6 +60,70 @@ pub(crate) const TERMINAL_RERUN_LABEL: &str = "↻ 重跑";
 /// Transcript. Constant for the same reason as the retrieval label.
 pub(crate) const TERMINAL_ASK_AI_LABEL: &str = "问 AI";
 
+/// ADR-0086 decision 4's **no-TTY signature table**, in one place: the fixed
+/// strings a missing terminal leaves in merged output, and the exactly-one hint
+/// line each adds. It is a table, never a heuristic over the command text — the
+/// same signature always yields the same line, and a signature may carry more
+/// than one spelling (all listed in its entry).
+///
+/// The ADR names five signatures; this table keeps five entries and lists the
+/// common aliases of each (`not a terminal`/`not a tty`; the `ENOTTY`/`ENXIO`
+/// family) so a real Host's message still lands in the right entry.
+pub(crate) struct NoTtySignature {
+    /// Lower-case fragments that identify the signature in merged output.
+    needles: &'static [&'static str],
+    /// The one hint line it adds: always names `tmux` or a non-interactive flag.
+    hint: &'static str,
+}
+
+/// The five documented signatures and their hints. See [`NoTtySignature`].
+///
+/// Order matters where signatures overlap: the specific spellings come before
+/// the generic `not a tty`, which `the input device is not a tty` would otherwise
+/// absorb.
+pub(crate) const NO_TTY_SIGNATURES: [NoTtySignature; 5] = [
+    // `top` (and other curses tools) under a null stdin.
+    NoTtySignature {
+        needles: &["failed tty get"],
+        hint: "🖥️ 这条命令需要一个终端：`top` 这类交互程序请加批处理参数（如 `top -b`），或用 `tmux` 运行。",
+    },
+    // An editor that cannot start without a screen (`git commit`, `vi`).
+    NoTtySignature {
+        needles: &["unable to start editor"],
+        hint: "🖥️ 编辑器需要终端：请用非交互参数（如 `git commit -m`），或用 `tmux` 运行。",
+    },
+    // A tool that demands the TTY device itself (`docker run -it`, `ssh -t`).
+    NoTtySignature {
+        needles: &["the input device is not a tty"],
+        hint: "🖥️ 命令在等待终端输入：请用它的非交互参数，或用 `tmux` 运行。",
+    },
+    // `ENOTTY` / `ENXIO`: the device is not a terminal, or there is none.
+    NoTtySignature {
+        needles: &[
+            "inappropriate ioctl for device",
+            "tcgetattr",
+            "no such device or address",
+        ],
+        hint: "🖥️ 无法访问终端设备：请改用非交互参数，或用 `tmux` 运行。",
+    },
+    // A generic "this is not a terminal" refusal, last because it is the widest.
+    NoTtySignature {
+        needles: &["not a terminal", "not a tty"],
+        hint: "🖥️ 这条命令需要一个终端：请改用它的非交互参数，或用 `tmux` 运行。",
+    },
+];
+
+/// The one no-TTY hint a settled failure's **displayed** output earns, or
+/// `None`. Case-insensitive over the card's tail (attacker-controlled text, so
+/// this only ever selects one of the fixed strings above).
+pub(crate) fn no_tty_hint(output: &str) -> Option<&'static str> {
+    let output = output.to_lowercase();
+    NO_TTY_SIGNATURES
+        .iter()
+        .find(|signature| signature.needles.iter().any(|needle| output.contains(needle)))
+        .map(|signature| signature.hint)
+}
+
 /// What the settled card's buttons carry: the log path, the Chat/Topic the card
 /// lives in, and the settled card's own render inputs, so a click's outcome can
 /// be PATCHed back onto the card it was clicked on — and every button is
@@ -299,6 +363,23 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
         "tag": "markdown",
         "content": markdown.clean(&line),
     }));
+    // Decision 4's fixed no-TTY hint: exactly one line, and only when the run
+    // actually failed. The table above is the whole rule; the command text is
+    // never inspected.
+    if let TerminalState::Settled {
+        exit_code,
+        spawn_error: None,
+        stopped: false,
+        ..
+    } = &view.state
+        && exit_code.is_some_and(|code| code != 0)
+        && let Some(hint) = no_tty_hint(&output)
+    {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": markdown.clean(hint),
+        }));
+    }
     if let Some(notice) = view.notice {
         elements.push(json!({
             "tag": "markdown",
@@ -807,6 +888,71 @@ mod tests {
         let text = crate::bridge::test_support::card_text(&settled(true, false));
         assert!(text.contains("⏹ 已终止"), "{text}");
         assert!(!text.contains("可能仍在运行"), "{text}");
+    }
+
+    /// #823 / ADR-0086 decision 4: the fixed five-entry table maps every
+    /// documented signature to its one hint, case-insensitively, and never
+    /// guesses from anything else.
+    #[test]
+    fn every_documented_no_tty_signature_names_its_hint() {
+        for signature in &NO_TTY_SIGNATURES {
+            for needle in signature.needles {
+                let output = format!("some output\nError: {} while starting", needle.to_uppercase());
+                assert_eq!(
+                    no_tty_hint(&output),
+                    Some(signature.hint),
+                    "signature {needle:?} must select its documented hint"
+                );
+                assert!(
+                    signature.hint.contains("tmux")
+                        || signature.hint.contains("`top -b`")
+                        || signature.hint.contains("`git commit -m`"),
+                    "the hint names a way out of the no-terminal dead end: {}",
+                    signature.hint
+                );
+            }
+        }
+        assert_eq!(no_tty_hint("error: disk full"), None, "no heuristic, no hint");
+        // Two signatures in one tail still add exactly one hint: the first
+        // documented entry wins.
+        assert_eq!(
+            no_tty_hint("failed tty get\nInappropriate ioctl for device"),
+            Some(NO_TTY_SIGNATURES[0].hint)
+        );
+    }
+
+    /// #823: the hint is rendered once on a **failed** settled card, and never on
+    /// a successful one (the same output can mention a tty for other reasons).
+    #[test]
+    fn a_no_tty_failure_renders_one_hint_on_the_settled_card() {
+        fn card(exit_code: i32, output: &str) -> serde_json::Value {
+            build_terminal_card(TerminalCard {
+                cwd: "/work",
+                command: "top",
+                output,
+                output_truncated: false,
+                output_over_limit: false,
+                full_output: None,
+                notice: None,
+                state: TerminalState::Settled {
+                    exit_code: Some(exit_code),
+                    spawn_error: None,
+                    elapsed: Duration::from_secs(1),
+                    stopped: false,
+                    survivors: false,
+                },
+                run_id: "run-823",
+                chat_id: "chat_1",
+                thread_id: "chat_1",
+            })
+        }
+
+        let text = crate::bridge::test_support::card_text(&card(1, "top: failed tty get\n"));
+        assert!(text.contains("需要一个终端"), "{text}");
+        assert_eq!(text.matches("tmux").count(), 1, "exactly one hint line: {text}");
+
+        let text = crate::bridge::test_support::card_text(&card(0, "top: failed tty get\n"));
+        assert!(!text.contains("tmux"), "a success earns no hint: {text}");
     }
 
     /// #827: the losing half of a restart is the card, and 「已失去跟踪」 must

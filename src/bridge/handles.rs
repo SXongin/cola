@@ -1708,6 +1708,10 @@ pub(crate) struct CommandHandles {
     #[cfg(test)]
     pub(crate) terminal_probe_hook:
         Arc<std::sync::Mutex<Option<Arc<crate::bridge::terminal::TerminalProbeHook>>>>,
+    /// Test-only: how many live-patch tasks the run spawned; see
+    /// `SharedCore::terminal_live_patch_starts`.
+    #[cfg(test)]
+    pub(crate) terminal_live_patch_starts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CommandHandles {

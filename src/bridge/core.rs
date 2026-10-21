@@ -284,6 +284,10 @@ pub struct SharedCore {
     /// is sent after it. The field itself exists only in a test build.
     #[cfg(test)]
     pub terminal_probe_hook: Arc<std::sync::Mutex<Option<Arc<crate::bridge::terminal::TerminalProbeHook>>>>,
+    /// Test-only: how many live-patch tasks a run's render loop spawned. A test
+    /// holds the card write across many ticks and proves the count stays bounded.
+    #[cfg(test)]
+    pub terminal_live_patch_starts: Arc<std::sync::atomic::AtomicUsize>,
     /// The **Terminal Log**'s **observed** stop threshold (ADR-0086 decision 7):
     /// the size probe kills the process group once the file has passed it. It
     /// is not a write limit, so a fast producer overshoots. Scaled down by a
@@ -431,6 +435,8 @@ impl SharedCore {
             terminal_test_env: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             terminal_probe_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            terminal_live_patch_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             terminal_log_cap_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::terminal::TERMINAL_LOG_CAP_BYTES,
             )),
@@ -522,6 +528,8 @@ impl SharedCore {
             terminal_test_env: Arc::clone(&self.terminal_test_env),
             #[cfg(test)]
             terminal_probe_hook: Arc::clone(&self.terminal_probe_hook),
+            #[cfg(test)]
+            terminal_live_patch_starts: Arc::clone(&self.terminal_live_patch_starts),
         }
     }
 
