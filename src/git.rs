@@ -151,6 +151,25 @@ impl std::fmt::Display for WorktreeError {
 
 impl std::error::Error for WorktreeError {}
 
+/// Strip Windows' verbatim (`\\?\`) prefix from a canonicalized path.
+/// `std::fs::canonicalize` returns one on Windows, and git rejects those paths
+/// for `worktree add` (`could not create leading directories … Invalid
+/// argument`); the card and the session store should also carry a path a user
+/// can recognise.
+pub(crate) fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}").into();
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return rest.into();
+        }
+    }
+    path
+}
+
 /// The parent directory of a project's worktrees, resolved against the
 /// repository's **primary checkout** (ADR-0088): the session's own directory
 /// may itself be a linked worktree, and nesting a worktree inside one is never
@@ -173,7 +192,7 @@ pub async fn worktree_root(
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from(dir));
-    Ok(primary.join(configured))
+    Ok(plain_path(primary).join(configured))
 }
 
 /// List every checkout of the repository containing `dir`, main checkout
@@ -682,7 +701,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.branch, "wt/feature-one");
-        assert!(created.path.ends_with(".worktrees/feature-one"));
+        assert!(std::path::Path::new(&created.path).ends_with(".worktrees/feature-one"));
         assert!(!created.root_ignored, "no .gitignore, so the root is not covered");
 
         let entries = list_worktrees(&s).await.unwrap();
@@ -691,7 +710,7 @@ mod tests {
         assert_eq!(entries[0].branch.as_deref(), Some("main"));
         assert!(!entries[1].main);
         assert_eq!(entries[1].branch.as_deref(), Some("wt/feature-one"));
-        assert!(entries[1].path.ends_with(".worktrees/feature-one"));
+        assert!(std::path::Path::new(&entries[1].path).ends_with(".worktrees/feature-one"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -749,7 +768,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             root,
-            std::fs::canonicalize(&dir).unwrap().join(".worktrees"),
+            plain_path(std::fs::canonicalize(&dir).unwrap()).join(".worktrees"),
             "the root must not nest inside the linked worktree"
         );
 
@@ -767,7 +786,11 @@ mod tests {
         let created = create_worktree(&s, Path::new(".worktrees"), "taken", None)
             .await
             .unwrap();
-        assert!(created.path.ends_with(".worktrees/taken-2"), "{}", created.path);
+        assert!(
+            std::path::Path::new(&created.path).ends_with(".worktrees/taken-2"),
+            "{}",
+            created.path
+        );
         assert_eq!(created.branch, "wt/taken-2");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -813,15 +836,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A deadline that has already passed reads every checkout as unknown
-    /// instead of claiming a clean tree — and returns without waiting.
+    /// An already-expired deadline returns one verdict per checkout without
+    /// waiting on git. (The read itself may still win the race on a loaded
+    /// machine — `timeout_at` polls the future first — so this pins the bound,
+    /// not the verdict.)
     #[tokio::test]
-    async fn worktree_dirty_past_deadline_reads_unknown() {
+    async fn worktree_dirty_past_deadline_returns_promptly() {
         let dir = init_repo("git-wt-past-deadline");
         let s = dir.to_string_lossy().to_string();
         let paths = vec![s];
+        let started = std::time::Instant::now();
         let results = worktree_dirty_until(&paths, tokio::time::Instant::now()).await;
-        assert_eq!(results, vec![None]);
+        assert_eq!(results.len(), 1);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a past deadline must not wait on git"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -859,5 +889,96 @@ mod tests {
         assert!(created.root_ignored);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `git rev-parse …` in a test repository, trimmed.
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(["-C"])
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// `--base` is the checkout's starting commit — not just a parsed word, so
+    /// ignoring the flag would fail here.
+    #[tokio::test]
+    async fn worktree_create_starts_at_the_given_base() {
+        let dir = init_repo("git-wt-startbase");
+        let first = git_out(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("b.txt"), "two").unwrap();
+        run(&dir, &["add", "b.txt"]);
+        run(&dir, &["commit", "-m", "second"]);
+        assert_ne!(first, git_out(&dir, &["rev-parse", "HEAD"]));
+
+        let s = dir.to_string_lossy().to_string();
+        let created = create_worktree(&s, Path::new(".worktrees"), "based", Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(git_out(Path::new(&created.path), &["rev-parse", "HEAD"]), first);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bare repository has no working tree to branch off.
+    #[tokio::test]
+    async fn worktree_create_refuses_a_bare_repository() {
+        let dir = temp_dir("git-wt-bare");
+        run(&dir, &["init", "--bare", "-b", "main"]);
+        let s = dir.to_string_lossy().to_string();
+
+        let error = create_worktree(&s, Path::new(".worktrees"), "x", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("bare"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Porcelain's detached/locked blocks: the branch line is absent, so the
+    /// row must render as detached rather than inventing a branch.
+    #[test]
+    fn parse_worktree_porcelain_reads_main_detached_and_locked() {
+        let text = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n\
+                    worktree /repo/.worktrees/wt\nHEAD def\ndetached\nlocked\n";
+        let entries = parse_worktree_porcelain(text);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].main);
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert!(!entries[1].main);
+        assert_eq!(entries[1].branch, None);
+        assert_eq!(entries[1].path, "/repo/.worktrees/wt");
+    }
+
+    #[test]
+    fn normalize_name_rejects_dotdot_and_punctuation_only() {
+        assert!(normalize_name("a..b").unwrap_err().to_string().contains(".."));
+        assert!(normalize_name("...").is_err());
+        assert!(normalize_name("-_-").is_err());
+    }
+
+    /// A root outside the repository cannot dirty the primary checkout, so the
+    /// reminder stays quiet even though `check-ignore` never sees the path.
+    #[tokio::test]
+    async fn worktree_create_outside_the_repository_is_quiet() {
+        let dir = init_repo("git-wt-outside");
+        let elsewhere = temp_dir("git-wt-elsewhere");
+        let s = dir.to_string_lossy().to_string();
+
+        let created = create_worktree(&s, &elsewhere, "out", None).await.unwrap();
+        assert!(created.root_ignored);
+        assert!(Path::new(&created.path).starts_with(&elsewhere));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 }

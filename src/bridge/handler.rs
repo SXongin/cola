@@ -3479,18 +3479,24 @@ impl App {
             .and_then(|v| v.as_str())
             .filter(|name| !name.is_empty())
             .map(str::to_string);
-        // The store write is not cancellable (a cancelled `set_pending` could
-        // leave the in-memory store and the file disagreeing), so a start past
-        // the deadline refuses instead of writing a pending the ack can no
-        // longer show. The write itself is a local JSON file, inside the
-        // margin the deadline leaves.
-        if tokio::time::Instant::now() >= deadline {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("⚠️ 处理超时，请重新点选（未做任何更改）".to_string()),
-            });
+        // The store lock is bounded by the same deadline (a held lock must not
+        // outlive the ack); the small local atomic write itself is the commit
+        // point and is not cancelled — a cancelled `set_pending` could leave
+        // the in-memory store and the file disagreeing.
+        match core
+            .sessions_handle()
+            .declare_pending_until(&thread_key, directory.clone(), title, deadline)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("⚠️ 处理超时，请重新点选（未做任何更改）".to_string()),
+                });
+            }
+            Err(error) => tracing::warn!("worktree pick: persist failed: {}", error),
         }
-        declare_pending_dir(core, &thread_key, &directory, title).await;
 
         // Refresh from the inventory already read — after the pending exists,
         // so the marker is the new current — under the SAME deadline as the

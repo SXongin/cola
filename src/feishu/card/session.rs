@@ -2533,6 +2533,50 @@ mod tests {
         assert_eq!(submit["value"]["thread_id"], "chat_1");
     }
 
+    /// ADR-0088: the worktree card names each checkout, its branch (or
+    /// detached), dirty state (or `?`), session count and current marker; an
+    /// empty project points at `/worktree new`.
+    #[test]
+    fn worktree_card_renders_detached_unknown_dirty_and_empty() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let rows = vec![
+            WorktreeRow {
+                path: "/r/.worktrees/a".into(),
+                name: "a".into(),
+                branch: None,
+                dirty: None,
+                main: false,
+                sessions: 0,
+                current: false,
+            },
+            WorktreeRow {
+                path: "/r".into(),
+                name: "r".into(),
+                branch: Some("main".into()),
+                dirty: Some(false),
+                main: true,
+                sessions: 3,
+                current: true,
+            },
+        ];
+        let text = build_worktree_card(&key, &rows, "/r").to_string();
+        assert!(text.contains("detached HEAD"), "{text}");
+        assert!(text.contains("? 状态未知"), "{text}");
+        assert!(text.contains("主检出"), "{text}");
+        assert!(text.contains("3 个会话"), "{text}");
+        assert!(!text.contains("0 个会话"), "{text}");
+        assert!(text.contains("✅ 当前"), "{text}");
+        assert!(text.contains("切换到这里"), "{text}");
+        assert!(text.contains("\"action\":\"worktree\""), "{text}");
+
+        let empty = build_worktree_card(&key, &[], "/r").to_string();
+        assert!(empty.contains("还没有 worktree"), "{empty}");
+        assert!(
+            !empty.contains("\"tag\":\"button\""),
+            "no rows, no buttons: {empty}"
+        );
+    }
+
     /// A keyword that matches nothing shows the no-match hint (not the
     /// first-run hint); a matching keyword names itself in the header.
     #[test]

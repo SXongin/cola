@@ -36,8 +36,10 @@ fn init_repo() -> tempfile::TempDir {
     repo
 }
 
+/// The repository path as cola stores it: canonical, without Windows' verbatim
+/// prefix (git rejects `\\?\` paths, so production strips it too).
 fn repo_canonical(repo: &tempfile::TempDir) -> std::path::PathBuf {
-    std::fs::canonicalize(repo.path()).unwrap()
+    crate::git::plain_path(std::fs::canonicalize(repo.path()).unwrap())
 }
 
 /// `/worktree new` creates the checkout, declares a Pending Session titled
@@ -120,7 +122,7 @@ async fn worktree_card_data_lists_main_and_linked_checkouts() {
             .await
             .expect("a git repository lists its checkouts");
     assert_eq!(
-        std::fs::canonicalize(&listed_repo).unwrap(),
+        crate::git::plain_path(std::fs::canonicalize(&listed_repo).unwrap()),
         repo_canonical(&repo),
         "the card names the project directory"
     );
@@ -200,7 +202,7 @@ async fn worktree_card_pick_declares_a_pending() {
         .expect("worktree pick should return a result");
     let toast = result.toast.clone().unwrap_or_default();
     assert!(toast.contains("下一条消息"), "{toast}");
-    assert!(toast.contains(".worktrees/feature"), "{toast}");
+    assert!(toast.contains("feature"), "{toast}");
 
     let pending = app
         .sessions
@@ -282,4 +284,192 @@ async fn worktree_card_pick_of_a_missing_checkout_toasts() {
         app.sessions.lock().await.pending_for(&key()).is_none(),
         "a missing directory never becomes a pending"
     );
+}
+
+/// A name the slug rule refuses answers the reason and declares nothing.
+#[tokio::test]
+async fn worktree_new_refuses_a_chinese_name() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command_in(
+        &app,
+        "/worktree new 用户指南",
+        key(),
+        "msg_worktree_cn",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("失败"), "{texts}");
+    assert!(texts.contains("只能包含英文"), "{texts}");
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "a refused name declares no pending"
+    );
+}
+
+/// `--base` reaches git and the reply names it, so the flag is not merely
+/// parsed (the git test pins the commit; this pins the surface).
+#[tokio::test]
+async fn worktree_new_passes_the_base_ref_through() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let first = git_out(repo.path(), &["rev-parse", "HEAD"]);
+    std::fs::write(repo.path().join("b.txt"), "two").unwrap();
+    git(repo.path(), &["add", "b.txt"]);
+    git(repo.path(), &["commit", "-m", "second"]);
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command_in(
+        &app,
+        &format!("/worktree new based --base {first}"),
+        key(),
+        "msg_worktree_base",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the command declares a pending");
+    assert!(std::path::Path::new(&pending.directory).is_dir());
+    assert_eq!(
+        git_out(std::path::Path::new(&pending.directory), &["rev-parse", "HEAD"]),
+        first
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains(&first), "the reply names the base: {texts}");
+}
+
+/// Picking the checkout the conversation already sits in is a no-op toast.
+#[tokio::test]
+async fn worktree_card_pick_of_the_current_checkout_toasts_only() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &["worktree", "add", "-b", "wt/feature", ".worktrees/feature"],
+    );
+    let feature = repo_canonical(&repo).join(".worktrees/feature");
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_pending(
+        &app,
+        crate::bridge::session::PendingEntry::new(key(), feature.to_string_lossy()),
+    )
+    .await;
+
+    let value = serde_json::json!({
+        "action": "worktree",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": feature.to_string_lossy(),
+        "name": "feature",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("worktree pick should return a result");
+    assert_eq!(result.toast.as_deref(), Some("已在当前目录"));
+    assert!(result.card.is_none(), "no change, no repaint");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .map(|p| p.directory.clone()),
+        Some(feature.to_string_lossy().to_string())
+    );
+}
+
+/// Unknown ops and empty payloads are answered without touching git or the
+/// store.
+#[tokio::test]
+async fn worktree_card_pick_rejects_an_unknown_op_and_an_empty_directory() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    for value in [
+        serde_json::json!({
+            "action": "worktree", "op": "bogus",
+            "chat_id": "chat_1", "thread_id": "chat_1", "directory": "/x",
+        }),
+        serde_json::json!({
+            "action": "worktree", "op": "pick",
+            "chat_id": "chat_1", "thread_id": "chat_1", "directory": "",
+        }),
+    ] {
+        let result = app
+            .host_action(value)
+            .await
+            .expect("worktree pick should return a result");
+        assert_eq!(result.toast.as_deref(), Some("无效操作"));
+        assert!(result.card.is_none());
+    }
+    assert!(app.sessions.lock().await.pending_for(&key()).is_none());
+}
+
+/// A pick in a project that is not a git repository answers the reason instead
+/// of declaring a pending.
+#[tokio::test]
+async fn worktree_card_pick_in_a_non_git_project_toasts_the_reason() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let plain = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(plain.path().to_path_buf());
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let value = serde_json::json!({
+        "action": "worktree",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": plain.path().to_string_lossy(),
+        "name": "plain",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("worktree pick should return a result");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(toast.contains("不是 git 仓库"), "{toast}");
+    assert!(app.sessions.lock().await.pending_for(&key()).is_none());
+}
+
+/// `git rev-parse …` in a test repository, trimmed.
+fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
