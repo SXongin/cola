@@ -1925,6 +1925,67 @@ async fn the_size_probe_fires_while_a_live_patch_is_stalled() {
     );
 }
 
+/// Whole-branch review: a stalled card write must not grow an unbounded backlog
+/// of live-patch tasks. The render tick skips while one is in flight, the
+/// timeout starts at spawn, and the newest output still lands once the write
+/// drains.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stalled_card_write_bounds_the_live_patch_backlog() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // The first live PATCH parks on its card write; every later tick must be
+    // skipped while it holds the lock.
+    let (entered, release) = platform.pause("update", "msg_reply");
+    let runner = tokio::spawn({
+        let app = Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run printf 'early-823\\n'; sleep 0.4; printf 'newest-823\\n'; sleep 30",
+                key,
+                "msg_backlog",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("a live card patch is parked");
+
+    // Many render ticks pass (5 ms cadence) while the lock is held: without the
+    // bound each one would add a task waiting behind the parked write.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let starts = app.core.terminal_live_patch_starts.load(Ordering::SeqCst);
+    assert!(
+        starts <= 2,
+        "at most one live patch in flight, saw {starts} starts"
+    );
+
+    // The producer wrote past the parked patch. Release it: the newest output
+    // lands, so the bound dropped nothing that mattered.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    release.notify_one();
+    wait_for_card_update(&platform, "the newest live output", CardUpdates::Any, |card| {
+        card_text(card).contains("newest-823")
+    })
+    .await;
+
+    runner.abort();
+    let _ = runner.await;
+}
+
 /// #826 review (finding 4): the delivery is bounded by its OWN timeout. With the
 /// upload parked past a shortened bound, the click still reports `未发送` (and
 /// where the log lives) instead of hanging on a callback-budget-shaped wait.
@@ -3849,6 +3910,74 @@ async fn a_rerun_click_naming_a_superseded_run_is_refused_as_stale() {
         "printf 'second-827\\n'",
         "the current run's record is untouched"
     );
+}
+
+/// Whole-branch review: a preflight failure must not reserve the in-memory
+/// current run. The durable record still names the previous run, so its
+/// 「问 AI」 must keep working — and the failed run must never be published as
+/// the chat's current identity.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_log_preflight_leaves_the_previous_runs_ask_ai_working() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    // The first run settles and leaves a current record + a working 问 AI.
+    let marker = "before-preflight-823";
+    send_command_in(
+        &app,
+        &format!("/run printf '{marker}\\n'"),
+        key.clone(),
+        "msg_one",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let ask = ask_ai_payload(&platform).await;
+    let first = app.terminal_records.read(&key).expect("the first run's record");
+
+    // Break the Terminal Log root: the next run's log cannot be created, so its
+    // preflight fails before any record names it.
+    let root = log_root(&app);
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, b"not a directory").unwrap();
+    send_command_in(
+        &app,
+        "/run printf 'never-823\\n'",
+        key.clone(),
+        "msg_two",
+        ConversationKind::P2p,
+    )
+    .await;
+    wait_for_text_containing(&platform, "无法创建终端日志").await;
+
+    // The durable current run is still the first one, and so is the published
+    // in-memory identity: the failed run never became current.
+    assert_eq!(app.terminal_records.read(&key).unwrap().run_id, first.run_id);
+    assert_eq!(
+        app.terminal_runs.lock().unwrap().last_run_id(&key),
+        Some(first.run_id.as_str()),
+        "a failed preflight must not publish its run"
+    );
+
+    // Its 问 AI still submits — the failed run must not make the card look stale.
+    let result = app
+        .host_action_on_message(ask, "msg_one_card")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(
+        toast.contains("AI"),
+        "the previous run's 问 AI is accepted: {toast}"
+    );
+    wait_for_prompt_containing(&prompts, marker).await;
 }
 
 /// #827 × #828: 「问 AI」's stale-click guard is restart-durable through the

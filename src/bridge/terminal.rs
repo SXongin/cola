@@ -245,22 +245,38 @@ struct LastRun {
 impl TerminalRuns {
     /// Claim `key` for `run`, or report the current run so the refusal can name
     /// its 「⏹ 终止」. The lock is held only for the map operation.
+    ///
+    /// The Chat/Topic's **current identity** is not published here: the durable
+    /// record has not been written yet, so a preflight failure (the log cannot be
+    /// created, say) must leave the previous run's card and 「问 AI」 working.
+    /// [`publish`](Self::publish) names the new run once its record names it.
     pub(crate) fn claim(&mut self, key: &ThreadKey, run: Arc<TerminalRun>) -> Result<(), Arc<TerminalRun>> {
         if let Some(current) = self.runs.get(key) {
             return Err(Arc::clone(current));
         }
-        // A new run is the Chat/Topic's current identity: every earlier run's
-        // settled buttons are stale from here on.
+        self.runs.insert(key.clone(), run);
+        Ok(())
+    }
+
+    /// Publish `run_id` as the Chat/Topic's current identity, **after** the
+    /// durable record names it. From here every earlier run's settled buttons are
+    /// stale, and the new run's own are checked against this id.
+    pub(crate) fn publish(&mut self, key: &ThreadKey, run_id: &str) {
         self.last.insert(
             key.clone(),
             LastRun {
-                run_id: run.run_id.clone(),
+                run_id: run_id.to_string(),
                 ask_ai_in_flight: false,
                 ask_ai_submitted: false,
             },
         );
-        self.runs.insert(key.clone(), run);
-        Ok(())
+    }
+
+    /// The Chat/Topic's published run id, if any — test-only, so a test can prove
+    /// a failed preflight never replaced the previous run.
+    #[cfg(test)]
+    pub(crate) fn last_run_id(&self, key: &ThreadKey) -> Option<&str> {
+        self.last.get(key).map(|last| last.run_id.as_str())
     }
 
     /// Release `key` only if `run_id` is still its current run: a late settling
@@ -776,6 +792,17 @@ async fn run_claimed(
         claim.finish();
         return Ok(());
     }
+    // The record now names this run, so it is the Chat/Topic's current identity
+    // (ADR-0086 decision 4): only from here do earlier cards' buttons become
+    // stale. Publishing before the write would let a preflight failure hide a
+    // previous run's working 「问 AI」 without a record to justify it.
+    {
+        let mut runs = handles
+            .terminal_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        runs.publish(thread_key, &run);
+    }
     let patch_facts = Arc::new(LivePatchFacts {
         platform: Arc::clone(&handles.flow.platform),
         card_id: card_id.clone(),
@@ -785,6 +812,10 @@ async fn run_claimed(
         run_id: run.clone(),
         chat_id: thread_key.chat_id.clone(),
         thread_id: thread_key.thread_id.clone(),
+        in_flight: Arc::new(AtomicBool::new(false)),
+        pending: std::sync::Mutex::new(None),
+        #[cfg(test)]
+        starts: Arc::clone(&handles.terminal_live_patch_starts),
     });
 
     let (child, spawn_error) = match spawn_in(&log, &cwd, &spec.command, &inherited_env) {
@@ -1907,12 +1938,41 @@ struct LivePatchFacts {
     run_id: String,
     chat_id: String,
     thread_id: String,
+    /// One live PATCH at a time. A render tick that finds one in flight records
+    /// its state in `pending` instead of spawning a waiter: when Feishu updates
+    /// stall, ticks would otherwise queue tasks that grow without bound for the
+    /// run's whole cap (up to 24 hours).
+    in_flight: Arc<AtomicBool>,
+    /// The newest live state a skipped tick asked for, coalesced into **one**
+    /// pending patch (newest wins). Keeping it (rather than dropping the tick)
+    /// is what lets a state transition — the cap line or the survivor line —
+    /// still reach the card once the stalled write drains.
+    pending: std::sync::Mutex<Option<(bool, bool)>>,
+    /// Test-only: how many live-patch tasks were actually spawned, so a test can
+    /// prove the backlog stayed bounded while the card write was held.
+    #[cfg(test)]
+    starts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Clears [`LivePatchFacts::in_flight`] when the patch task ends — by completion,
+/// timeout, or cancellation.
+struct LivePatchSlot(Arc<AtomicBool>);
+
+impl Drop for LivePatchSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Issue one live PATCH on its own task: a stalled card write must never block
-/// the loop that owns the cap, 终止 and the settle. The task checks `settled`
-/// before it starts and again under the card's write lock, so a PATCH queued
-/// behind a slow one cannot resurrect 「运行中」 after the settle.
+/// the loop that owns the cap, 终止 and the settle. **At most one patch is in
+/// flight**, so a card write that keeps timing out cannot grow a backlog of
+/// waiters; and the timeout starts now, not once the write lock is taken, so a
+/// patch queued behind a stall still gives up within one patch budget.
+///
+/// The task checks `settled` before it starts and again under the card's write
+/// lock, so a PATCH queued behind a slow one cannot resurrect 「运行中」 after the
+/// settle.
 fn spawn_live_patch(
     facts: Arc<LivePatchFacts>,
     past_cap: bool,
@@ -1920,33 +1980,76 @@ fn spawn_live_patch(
     settled: Arc<AtomicBool>,
     card_write: Arc<tokio::sync::Mutex<()>>,
 ) {
+    if settled.load(Ordering::SeqCst) {
+        return;
+    }
+    let state = (past_cap, survivors);
+    // Claim the one active patch, or coalesce this tick's state into the single
+    // pending slot. Claim and pend happen under `pending`'s lock so a tick can
+    // never set a pending state after the active task has decided to exit.
+    {
+        let mut pending = facts.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        if facts.in_flight.swap(true, Ordering::SeqCst) {
+            *pending = Some(state);
+            return;
+        }
+    }
     tokio::spawn(async move {
-        if settled.load(Ordering::SeqCst) {
-            return;
-        }
-        let _guard = card_write.lock().await;
-        if settled.load(Ordering::SeqCst) {
-            return;
-        }
-        if tokio::time::timeout(
-            Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
-            patch_live(
-                &*facts.platform,
-                &facts.card_id,
-                &facts.cwd,
-                &facts.command,
-                &facts.log,
-                &facts.run_id,
-                &facts.chat_id,
-                &facts.thread_id,
-                past_cap,
-                survivors,
-            ),
-        )
-        .await
-        .is_err()
-        {
-            tracing::warn!("terminal: live patch timed out");
+        #[cfg(test)]
+        facts.starts.fetch_add(1, Ordering::SeqCst);
+        let _slot = LivePatchSlot(Arc::clone(&facts.in_flight));
+        let mut state = state;
+        loop {
+            let (past_cap, survivors) = state;
+            // The bound starts at each patch, covering the wait for the lock:
+            // a patch that cannot get the card write within one budget is
+            // dropped, not queued forever.
+            let bounded = tokio::time::timeout(Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS), async {
+                if settled.load(Ordering::SeqCst) {
+                    return;
+                }
+                let _guard = card_write.lock().await;
+                if settled.load(Ordering::SeqCst) {
+                    return;
+                }
+                patch_live(
+                    &*facts.platform,
+                    &facts.card_id,
+                    &facts.cwd,
+                    &facts.command,
+                    &facts.log,
+                    &facts.run_id,
+                    &facts.chat_id,
+                    &facts.thread_id,
+                    past_cap,
+                    survivors,
+                )
+                .await;
+            })
+            .await;
+            if bounded.is_err() {
+                tracing::warn!("terminal: live patch timed out");
+            }
+            if settled.load(Ordering::SeqCst) {
+                break;
+            }
+            // Take the coalesced successor, or release the patch slot. Both
+            // happen under the same lock the claim takes, so no pending state
+            // can be stranded.
+            let next = {
+                let mut pending = facts.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                match pending.take() {
+                    Some(next) => Some(next),
+                    None => {
+                        facts.in_flight.store(false, Ordering::SeqCst);
+                        None
+                    }
+                }
+            };
+            match next {
+                Some(next) => state = next,
+                None => break,
+            }
         }
     });
 }
