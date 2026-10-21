@@ -6618,3 +6618,91 @@ async fn a_pull_whose_record_write_fails_keeps_the_run_on_the_old_card() {
         card_text(&settled)
     );
 }
+
+/// A freeze that fails on a run already past its cap must still leave the run's
+/// card usable: that state stands the ordinary render tick down, so the abort
+/// re-arms the cap announcement and the survivor ticker re-paints the card with
+/// its controls. Without that, a timed-out freeze (which may have landed) would
+/// leave the only stop surface frozen with no 终止.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_freeze_past_the_cap_still_restores_the_run_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform.given_reply_id("om_original");
+    platform.given_reply_id("om_pulled");
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 1s sleep 5",
+                key,
+                "msg_cap_pull_run",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    // The cap card: 已达时限, and 继续 is offered.
+    live_card_with(&platform, "continue").await;
+
+    platform.fail_updates_containing("已下移", 2);
+    send_command_in(
+        &app,
+        "/run",
+        key.clone(),
+        "msg_pull_failed",
+        ConversationKind::P2p,
+    )
+    .await;
+    let texts = platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("无法把终端卡片移到最新位置")),
+        "the failed pull is stated: {texts:?}"
+    );
+
+    // Past the cap only the survivor ticker runs; it must re-announce the cap
+    // and re-paint the run's card with its controls.
+    let restored = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let patches = patches_to(&platform, "om_original").await;
+            if let Some(last) = patches.last()
+                && card_text(last).contains("已达时限")
+            {
+                return last.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the abort re-paints the run's card past the cap");
+    assert!(
+        button_value(&restored, "kill").is_some() && button_value(&restored, "continue").is_some(),
+        "the run's card keeps 终止 and 继续: {}",
+        card_text(&restored)
+    );
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().card_id,
+        "om_original",
+        "the record never left the run's card"
+    );
+
+    let kill = button_value(&restored, "kill").expect("a control to end the run with");
+    app.host_action(kill).await.expect("a toast result");
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+}
