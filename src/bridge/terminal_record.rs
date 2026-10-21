@@ -201,6 +201,12 @@ pub(crate) struct TerminalRunRecords {
     /// that interleaved with the chat's next run could install a stale snapshot
     /// over the new run's record (whole-branch review, finding 3).
     locks: Mutex<HashMap<ThreadKey, Arc<Mutex<()>>>>,
+    /// Test-only: how many more record writes may land before every one fails
+    /// (`usize::MAX` = no limit). Models a temporarily unwritable record while
+    /// the directory stays readable — the state a failed post-spawn pid update
+    /// leaves behind, which retention must treat as unprovable.
+    #[cfg(test)]
+    writes_allowed: std::sync::atomic::AtomicUsize,
     /// Test-only: a one-shot pause inside the 「问 AI」 merge, between its
     /// re-read and its write. It lets a test hold that merge open while the
     /// chat's next run writes its own record — the interleave the chat lock
@@ -220,6 +226,8 @@ impl TerminalRunRecords {
         Self {
             dir,
             locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            writes_allowed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             #[cfg(test)]
             merge_pause: Mutex::new(None),
         }
@@ -315,8 +323,46 @@ impl TerminalRunRecords {
 
     /// [`write`](Self::write) for a caller already holding the chat's lock.
     fn write_locked(&self, record: &TerminalRunRecord) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.simulated_write_failure() {
+            return Err(std::io::Error::other(
+                "simulated record write failure (test seam)",
+            ));
+        }
         let data = serde_json::to_vec(record).map_err(std::io::Error::other)?;
         sidecar::write_atomic(&self.path(&record.key()), &data)
+    }
+
+    /// Test-only: allow `writes` more record writes, then fail every one. Used
+    /// to leave the on-disk record `running` with no pid while the directory
+    /// stays readable.
+    #[cfg(test)]
+    pub(crate) fn fail_writes_after(&self, writes: usize) {
+        self.writes_allowed
+            .store(writes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn simulated_write_failure(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let mut allowed = self.writes_allowed.load(Ordering::SeqCst);
+        loop {
+            if allowed == usize::MAX {
+                return false;
+            }
+            if allowed == 0 {
+                return true;
+            }
+            match self.writes_allowed.compare_exchange(
+                allowed,
+                allowed - 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return false,
+                Err(actual) => allowed = actual,
+            }
+        }
     }
 
     /// Rewrite a record whose card is already durable (the completed write, the

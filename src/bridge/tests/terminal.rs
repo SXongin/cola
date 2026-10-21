@@ -4527,10 +4527,12 @@ async fn an_old_lost_record_whose_group_still_lives_keeps_its_log() {
 }
 
 /// Spec #821: a `running` record is first resolved by the lost sweep (its card
-/// is told), and only then follows the retention rule — in the same startup.
+/// is told), but retention then needs **recorded proof** before it may expire the
+/// log. This record has no pid — the state a failed post-spawn update leaves —
+/// so a live orphan cannot be ruled out: the record and its log both stay.
 #[cfg(unix)]
 #[tokio::test]
-async fn an_old_running_record_is_resolved_then_expired() {
+async fn an_old_pidless_running_record_is_resolved_lost_and_kept() {
     let state = tempfile::tempdir().unwrap();
     let mut cfg = test_config(&state.path().join("sessions.json"));
     cfg.bridge.log_days = 7;
@@ -4563,8 +4565,98 @@ async fn an_old_running_record_is_resolved_then_expired() {
             .any(|card| card_text(card).contains("已失去跟踪")),
         "the lost sweep told the card first"
     );
-    assert!(!log.exists(), "then retention removed the log");
-    assert!(!app.terminal_records.path(&key).exists(), "and its record");
+    let record = app.terminal_records.read(&key).expect("the record is kept");
+    assert_eq!(record.state, TerminalRunState::Lost);
+    assert!(record.pids.is_empty(), "no pid was ever recorded");
+    assert!(
+        log.exists(),
+        "a pid-less lost record proves nothing, so its log a live orphan may still write is kept"
+    );
+    // Nothing to retry: a later start leaves it exactly as it is.
+    app.sweep_terminal().await;
+    assert!(app.terminal_records.path(&key).exists());
+    assert!(log.exists());
+}
+
+/// #827's acceptance criterion ("a file a live orphan is still writing is not
+/// unlinked") through the exact state the finding describes: the post-spawn pid
+/// write fails while the record directory stays readable, so the record is
+/// `running` with no pid; cola then goes away mid-run, and a later start marks
+/// the run lost. Retention must not read "no pid" as "no group" — the record and
+/// the log survive `log_days`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_run_whose_pid_write_failed_keeps_its_log_past_retention() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 7;
+    let (app, platform, _logs) = build_terminal_app(cfg.clone(), MockBackend::new(realistic_parts())).await;
+    // The pre-spawn write lands; the completed write (the pid) and every later
+    // one fail, while the directory itself stays readable.
+    app.terminal_records.fail_writes_after(1);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run printf 'pidless-827\\n'; sleep 30",
+                key,
+                "msg_pidless",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    // The live card proves the child spawned; from here the record can never gain
+    // a pid, because every write fails.
+    live_card_with(&platform, "kill").await;
+    let record = app.terminal_records.read(&key).expect("the record");
+    assert_eq!(record.state, TerminalRunState::Running);
+    assert!(
+        record.pids.is_empty(),
+        "the pid write failed, which is the modelled state: {record:?}"
+    );
+    let log = std::path::PathBuf::from(&record.log_path);
+    assert!(log.exists(), "the run wrote its log");
+
+    // Cola goes away mid-run: no settle write, no pid on disk.
+    running.abort();
+    let _ = running.await;
+
+    // `log_days` passes. Age the record through a store without the seam.
+    let resident =
+        crate::bridge::terminal_record::TerminalRunRecords::new(app.terminal_records.dir().to_path_buf());
+    let mut aged = resident.read(&key).expect("the running record");
+    aged.updated_at = crate::bridge::terminal_record::now_epoch_secs().saturating_sub(30 * 24 * 60 * 60);
+    resident.write(&aged).unwrap();
+    let root = log_root(&app);
+
+    // The restart resolves the run lost; retention cannot prove anything, so the
+    // evidence behind the possible live orphan stays.
+    let (app2, platform2) = restart_app(cfg, root).await;
+    app2.sweep_terminal().await;
+    assert!(
+        platform2
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("已失去跟踪")),
+        "the restart reports the run lost"
+    );
+    assert!(
+        app2.terminal_records.path(&key).exists(),
+        "a pid-less lost record is unprovable and is kept"
+    );
+    assert!(
+        log.exists(),
+        "and so is the log a live orphan may still be writing"
+    );
 }
 
 /// The restart sweeps must run at **startup**, not only when a test calls them

@@ -1590,6 +1590,14 @@ impl App {
                 self.terminal_log_days
             );
         }
+        if expiry.kept_unprovable > 0 {
+            tracing::info!(
+                "terminal: kept {} lost run(s) past {} day(s) — no process id was recorded, so their \
+                 groups cannot be proven gone",
+                expiry.kept_unprovable,
+                self.terminal_log_days
+            );
+        }
         let removed =
             crate::bridge::terminal::sweep_logs(&root, self.terminal_log_days, &self.terminal_records);
         if removed > 0 {
