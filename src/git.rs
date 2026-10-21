@@ -227,20 +227,19 @@ fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
     entries
 }
 
+/// The bound the ADR promises for the dirty fan-out on the command path.
+pub const DIRTY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Dirty state per checkout, bounded (ADR-0088): one `git status --porcelain`
 /// each, at most four at a time, all under ONE shared deadline. A read that
 /// misses it reads `None` — the card renders `?` instead of claiming a clean
 /// tree it never measured — while a read that finished keeps its answer.
-pub async fn worktree_dirty(paths: &[String]) -> Vec<Option<bool>> {
+pub async fn worktree_dirty_until(paths: &[String], deadline: tokio::time::Instant) -> Vec<Option<bool>> {
     use std::sync::Arc;
 
     const CONCURRENCY: usize = 4;
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     let limit = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
-    // One deadline for the whole fan-out, not one per wave: a queued read must
-    // not extend the card's wait beyond the bound the ADR promises.
-    let deadline = tokio::time::Instant::now() + BUDGET;
     let reads = paths.iter().map(|path| {
         let limit = Arc::clone(&limit);
         async move {
@@ -710,7 +709,7 @@ mod tests {
 
         let entries = list_worktrees(&s).await.unwrap();
         let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-        let dirty = worktree_dirty(&paths).await;
+        let dirty = worktree_dirty_until(&paths, tokio::time::Instant::now() + DIRTY_BUDGET).await;
         assert_eq!(
             dirty,
             vec![Some(true), Some(true)],
@@ -727,7 +726,7 @@ mod tests {
             .map(|e| e.path)
             .collect();
         assert_eq!(
-            worktree_dirty(&paths).await,
+            worktree_dirty_until(&paths, tokio::time::Instant::now() + DIRTY_BUDGET).await,
             vec![Some(false), Some(true)],
             "ignored root: only the worktree itself is dirty"
         );
@@ -810,6 +809,19 @@ mod tests {
             .to_string();
         assert!(error.contains("已在"), "{error}");
         assert!(error.contains("wt/held"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A deadline that has already passed reads every checkout as unknown
+    /// instead of claiming a clean tree — and returns without waiting.
+    #[tokio::test]
+    async fn worktree_dirty_past_deadline_reads_unknown() {
+        let dir = init_repo("git-wt-past-deadline");
+        let s = dir.to_string_lossy().to_string();
+        let paths = vec![s];
+        let results = worktree_dirty_until(&paths, tokio::time::Instant::now()).await;
+        assert_eq!(results, vec![None]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
