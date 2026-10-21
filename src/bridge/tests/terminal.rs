@@ -6514,11 +6514,15 @@ async fn a_pull_whose_freeze_fails_is_undone() {
         "the record is not re-pointed by an undone pull"
     );
     let bubble = patches_to(&platform, "om_pulled").await;
-    let undone = bubble.last().cloned().expect("the new card is written");
-    let undone_text = card_text(&undone);
     assert!(
-        undone_text.contains("正在移动") && button_value(&undone, "kill").is_none(),
-        "the unused card is back to a control-less placeholder: {undone_text}"
+        bubble.is_empty(),
+        "an aborted pull never renders the new message: {bubble:?}"
+    );
+    let reply = wait_for_reply_to(&platform, "msg_pull_failed").await;
+    let reply_text = card_text(&reply);
+    assert!(
+        reply_text.contains("正在移动") && button_value(&reply, "kill").is_none(),
+        "the posted card stays a control-less placeholder: {reply_text}"
     );
 
     tokio::time::timeout(Duration::from_secs(10), running)
@@ -6593,6 +6597,10 @@ async fn a_pull_whose_record_write_fails_keeps_the_run_on_the_old_card() {
         button_value(&restored, "kill").is_some(),
         "the old card keeps its controls: {}",
         card_text(&restored)
+    );
+    assert!(
+        patches_to(&platform, "om_pulled").await.is_empty(),
+        "an unrecorded pull never renders the new message"
     );
 
     tokio::time::timeout(Duration::from_secs(10), running)

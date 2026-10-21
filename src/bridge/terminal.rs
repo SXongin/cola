@@ -1206,6 +1206,7 @@ async fn run_claimed(
                         platform,
                         &target,
                         &card_write,
+                        &patch_facts,
                         &reply_to,
                         &cwd,
                         &spec.command,
@@ -2050,37 +2051,38 @@ async fn settle(
 /// Move one live run's card to the newest position (bare `/run`).
 ///
 /// One invariant decides every path: **a pull either moves the run onto a card
-/// that carries its controls — with the record naming it and the old card frozen
-/// — or it changes nothing and reports [`PullOutcome::Failed`]. At no point do
-/// two cards both look current, and no failure leaves the run writing a card
-/// that was frozen.**
+/// that carries its controls — the record naming it and the old card frozen — or
+/// it changes nothing and reports [`PullOutcome::Failed`]. Before the durable
+/// step, no card other than the run's own ever offers a control, so an abort can
+/// never leave two cards both looking current.**
 ///
 /// The order exists for that invariant, and every step runs under the card write
 /// lock, so an in-flight live PATCH either finished before the pull or waits for
 /// the swap and writes the new card:
 ///
-/// 1. post a **placeholder** with no controls (ADR-0067: a create has no
-///    idempotency key, so a create whose response is lost may have landed — a
-///    control-less orphan is then harmless, where a live orphan would be a
-///    second card offering 终止);
-/// 2. PATCH the placeholder into the live card — the run is still on the old
-///    card, so a failure here only leaves the placeholder;
-/// 3. freeze the old card as 「已下移」 (retried once) — if that cannot land,
-///    step 2 is undone and the pull aborts, because a frozen-to-be card that
-///    keeps its controls above a live one would be two current cards;
-/// 4. write the new id into the **Terminal Run Record** (retried once) — this is
-///    the only durable step, and its failure aborts by re-painting the old card
-///    live and the placeholder back to a placeholder;
-/// 5. swap the target: infallible, and the last thing that happens.
+/// 1. post a **placeholder** with no controls. A create has no idempotency key
+///    (ADR-0067), so a create whose response is lost may have landed — a
+///    control-less orphan is then harmless where a live one would be a second
+///    card offering 终止;
+/// 2. freeze the old card as 「已下移」 (retried once). Nothing else has a
+///    control yet, so a refusal aborts with the run exactly where it was;
+/// 3. write the new id into the **Terminal Run Record** (retried once). A
+///    failure un-paints the freeze and aborts: the record still names the card
+///    the run writes;
+/// 4. swap the target — infallible;
+/// 5. render the new card live. From here the run owns it, so a failure is not
+///    an abort: the next render tick rewrites it, and past the cap the cap
+///    announcement is re-armed so the survivor ticker does it instead.
 ///
-/// A crash between 4 and 5 leaves the record naming a card that is live and at
-/// the newest position, so the restart's sweep repairs the card the reader is
-/// looking at rather than the frozen one.
+/// A crash between 3 and 5 leaves the record naming a card that is at the newest
+/// position, so the restart's sweep repairs the card the reader is looking at
+/// rather than the frozen one.
 #[allow(clippy::too_many_arguments)]
 async fn repoint_card(
     platform: &dyn Platform,
     target: &Mutex<String>,
     card_write: &tokio::sync::Mutex<()>,
+    patch_facts: &LivePatchFacts,
     reply_to: &str,
     cwd: &str,
     command: &str,
@@ -2160,27 +2162,19 @@ async fn repoint_card(
         }
     };
 
-    // 2. Make it the live card. Until the swap it is only a second message, not
-    //    a second live card, so a failure here changes nothing for the run.
-    if !patch_card(platform, &new_id, &live, "render a pulled terminal card").await {
-        tracing::warn!("terminal: pull could not render the new card; leaving the run where it is");
-        return PullOutcome::Failed;
-    }
-
-    // 3. Freeze the card the run is leaving. Two attempts: a refused card write
+    // 2. Freeze the card the run is leaving. Two attempts: a refused card write
     //    is often transient, and the alternative to landing it is aborting.
     if !patch_card(platform, &old, &frozen, "freeze a superseded terminal card").await
         && !patch_card(platform, &old, &frozen, "freeze a superseded terminal card").await
     {
-        tracing::warn!("terminal: pull could not freeze the old card; undoing the repost");
-        patch_card(platform, &new_id, &placeholder, "undo a pulled terminal card").await;
+        tracing::warn!("terminal: pull could not freeze the old card; the run stays on it and nothing moved");
         return PullOutcome::Failed;
     }
 
-    // 4. The durable identity, before the swap: a restart patches the card the
+    // 3. The durable identity, before the swap: a restart patches the card the
     //    record names, so the record must name the card the run is about to
-    //    write. A failed write undoes the pull instead of leaving the two out of
-    //    step; the restore is the same two best-effort PATCHes as above.
+    //    write. A failed write un-paints the freeze instead of leaving the run
+    //    on a card that no longer looks live.
     record.card_id = new_id.clone();
     if records.write(record).is_err() && records.write(record).is_err() {
         tracing::warn!(
@@ -2188,14 +2182,28 @@ async fn repoint_card(
              keeping the run on the old card"
         );
         record.card_id = old.clone();
-        patch_card(platform, &old, &live, "undo a pull's freeze").await;
-        patch_card(platform, &new_id, &placeholder, "undo a pulled terminal card").await;
+        if !patch_card(platform, &old, &live, "undo a pull's freeze").await {
+            // The run still writes this card; the ticker below re-renders it.
+            // Re-arm the cap announcement so that also happens past the cap,
+            // where the ordinary render tick stands down.
+            patch_facts.cap_announced.store(false, Ordering::SeqCst);
+        }
         return PullOutcome::Failed;
     }
 
-    // 5. Infallible: the run writes the new card from here on, and the settling
+    // 4. Infallible: the run writes the new card from here on, and the settling
     //    write reads the same target.
-    *target.lock().unwrap_or_else(PoisonError::into_inner) = new_id;
+    *target.lock().unwrap_or_else(PoisonError::into_inner) = new_id.clone();
+
+    // 5. Render it live. Not an abort: the card is the run's now, and one failed
+    //    render is repaired by the next tick — or, past the cap, by the re-armed
+    //    cap announcement.
+    if !patch_card(platform, &new_id, &live, "render a pulled terminal card").await
+        && !patch_card(platform, &new_id, &live, "render a pulled terminal card").await
+    {
+        tracing::warn!("terminal: pull cannot render the new card yet; leaving it to the next tick");
+        patch_facts.cap_announced.store(false, Ordering::SeqCst);
+    }
     PullOutcome::Posted
 }
 

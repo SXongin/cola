@@ -497,24 +497,27 @@ option, because everything after `/run` is the shell command):
 The one-way-door part is decision 4's "its own message id at send": the card's identity is now
 **movable while the run is live**. One sentence decides every path: *a pull either moves the run
 onto a card that carries its controls — the record naming it and the old card frozen — or it
-changes nothing and says so; at no point do two cards both look current, and no failed pull
-leaves the run writing a card that was frozen.* The steps that make it true all run under the
-run's existing card write lock, in this order:
+changes nothing and says so. Before the durable step, no card other than the run's own ever
+offers a control, so an abort cannot leave two cards both looking current.* The steps all run
+under the run's existing card write lock, in this order:
 
 1. post a **placeholder** that carries no controls. A create has no idempotency key (ADR-0067),
    so a create whose response is lost may have landed; a control-less orphan is harmless where
    a live orphan would be a second card offering 终止;
-2. PATCH the placeholder into the live card;
-3. freeze the old card as 「已下移」, retried once;
-4. write the new id into the Terminal Run Record, retried once;
-5. swap the run's target — infallible, and last.
+2. freeze the old card as 「已下移」, retried once. Nothing else has a control yet, so a refusal
+   aborts with the run exactly where it was — the run still writes that card, and the ordinary
+   render tick re-paints it;
+3. write the new id into the Terminal Run Record, retried once. A failure un-paints the freeze
+   and aborts, so the record still names the card the run writes;
+4. swap the run's target — infallible;
+5. render the new card live. From here the run owns it, so a failure is not an abort: the next
+   render tick rewrites it, and past the cap the cap announcement is re-armed so the survivor
+   ticker does it instead.
 
-Every fallible step before the durable write aborts cleanly: the old card is re-painted live
-(step 3's undo), the new message is returned to the placeholder, and the command says the pull
-failed. Step 4 is the only durable one, and its failure aborts the same way rather than leaving
-memory and the record out of step. A crash between 4 and 5 leaves the record naming a card that
-is live and at the newest position, so a restart repairs the card the reader is looking at
-rather than the frozen one.
+Only the create and the durable write are one-way: everything after the swap is repaired by the
+loop that owns the card, and everything before it aborts. A crash between 3 and 5 leaves the
+record naming a card at the newest position, so a restart repairs the card the reader is looking
+at rather than the frozen one.
 
 Because the swap happens in the run loop, a pull the loop can no longer serve (it just ended)
 is answered by the record rebuild or by the "updating" line — never by silence.
