@@ -276,6 +276,21 @@ start_server = "auto"            # auto (default) | never | eager
   command names none. Unset resolves `origin/main`, then `main`, and errors if
   neither exists. `/diff --base <ref>` overrides it for that call.
 
+### `[worktree]` — all optional
+
+```toml
+[worktree]
+# root = ".worktrees"
+```
+
+- **`root`** — the parent directory `/worktree new` creates checkouts in. A
+  relative value resolves against the project's **primary checkout** (the main
+  worktree, not the session's own directory — that session may itself be in a
+  linked worktree); an absolute path is used as given. Defaults to `.worktrees`.
+  OpenCode's own `worktree.directory` in a project's `opencode.json` is a
+  separate setting read by the desktop/TUI; cola reads only this one, so set both
+  to the same value when the two clients should agree.
+
 ## Run
 
 ```bash
@@ -510,6 +525,8 @@ detailed help for any of these.
 | `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint (a markdown file keeps its source and offers a 「📖 渲染预览」 toggle), `.csv`/`.tsv` uses a markdown table, and images are embedded when Feishu's limits allow. Other binary files, images beyond those limits and text beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB upload cap; above it, nothing is sent and the card says 未发送. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths resolve as absolute paths, including outside the session directory |
 | `/diff [--base <ref>]` | Send this branch's **repository review** as one self-contained HTML File Message: committed changes since the fork point, uncommitted tracked changes, and untracked files. The base is `--base`, else `[review] base`, else `origin/main`, else `main`; cola never fetches, never stages entries (no `git add -N`) and never changes tracked content; git may refresh index stat data. Runs in the conversation's current project directory and replies to the command message (its chat or topic). An empty review answers `分支 <branch> 相对 <base> 没有改动`, while an empty repository with no commit answers `仓库还没有提交，没有可对比的改动。`; non-git directories and missing bases answer their own readable error. One `/diff` per chat per 10 seconds (`稍后再试`) |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
+| `/worktree` | Worktree card: this project's git checkouts — the main checkout included and labelled 「主检出」 — each with its branch, ⚠ dirty marker, session count and ✅ current marker. Picking a row declares a session there (created by the next message); it never adopts an existing session (use `/switch`). Dirty is read per checkout, so a row that misses the 5 s bound shows `?` |
+| `/worktree new <name> [--base <ref>]` | Create a worktree at `<root>/<name>` on branch `wt/<name>` from the current session's HEAD (or `<ref>`) and declare the session there — nothing is moved, so a running turn is untouched. `<name>` is normalised to a lowercase ASCII slug (`[a-z0-9.-]`, at most 40 characters); a name with Chinese is refused with an example. An existing directory gets a `-2` suffix, an existing branch that no checkout holds is attached, and cola never removes worktrees |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
 | `/switch <id> [--force]` | Take over a session by id/title |
@@ -592,14 +609,17 @@ Notes:
   outcome is unknown is not retried (a retry could duplicate the message). The
   10-second per-chat cooldown exists to stop a double click from uploading the
   same review twice, so a deliberate re-run after an edit needs a short wait.
-- `/new`, `/dir` and `/topic` only **declare** the session — the conversation's
-  next non-command message creates it in the chosen directory and maps it here,
-  so a mistaken `/new`, `/dir` or `/topic` can be corrected with another `/new`,
-  `/dir`, `/switch` or `/topic` before then without leaving a session in the
-  shared store. Inside a topic that is still waiting for its first message,
-  `/switch <id>` re-points the topic at an existing session instead. The `/dir`
-  card's pick and 建话题 follow the same timing (建话题's cover card shows
-  「下一条消息创建」 until then).
+- `/new`, `/dir`, `/topic` and `/worktree new` only **declare** the session —
+  the conversation's next non-command message creates it in the chosen directory
+  and maps it here, so a mistaken `/new`, `/dir`, `/worktree new` or `/topic` can
+  be corrected with another `/new`, `/dir`, `/switch` or `/topic` before then
+  without leaving a session in the shared store. Inside a topic that is still
+  waiting for its first message, `/switch <id>` re-points the topic at an
+  existing session instead. The `/dir` card's pick, the `/worktree` card's pick
+  and 建话题 follow the same timing (建话题's cover card shows 「下一条消息创建」
+  until then). This is why `/worktree new` is safe while a turn is running: it
+  writes a Pending Session and moves nothing, so the in-flight step is never
+  interrupted (the reason #428's mid-turn move was a dead end).
 - `/sub` is the read-only view of the current session's **child sessions** —
   the ones its `task` tool calls created. Each row carries the child's title,
   id, agent, last activity and live state (运行中 when Busy/Retry, 空闲 when
