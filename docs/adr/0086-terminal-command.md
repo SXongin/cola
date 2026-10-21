@@ -505,8 +505,8 @@ under the run's existing card write lock, in this order:
    so a create whose response is lost may have landed; a control-less orphan is harmless where
    a live orphan would be a second card offering 终止;
 2. freeze the old card as 「已下移」, retried once. Nothing else has a control yet, so a refusal
-   aborts with the run exactly where it was — the run still writes that card, and the ordinary
-   render tick re-paints it;
+   aborts with the run exactly where it was — the run still writes that card, and the render
+   tick (or, past the cap, the re-armed cap announcement) re-paints it;
 3. write the new id into the Terminal Run Record, retried once. A failure un-paints the freeze
    and aborts, so the record still names the card the run writes;
 4. swap the run's target — infallible;

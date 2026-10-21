@@ -2167,6 +2167,11 @@ async fn repoint_card(
     if !patch_card(platform, &old, &frozen, "freeze a superseded terminal card").await
         && !patch_card(platform, &old, &frozen, "freeze a superseded terminal card").await
     {
+        // A timed-out PATCH is ambiguous: it may have landed, so the run's own
+        // card may now be frozen with no controls. The ordinary render tick
+        // re-paints it, but that tick stands down past the cap — re-arm the cap
+        // announcement so the survivor ticker does it there too.
+        patch_facts.cap_announced.store(false, Ordering::SeqCst);
         tracing::warn!("terminal: pull could not freeze the old card; the run stays on it and nothing moved");
         return PullOutcome::Failed;
     }
