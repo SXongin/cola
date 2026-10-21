@@ -3246,6 +3246,15 @@ mod tests {
         let diff = command_help("diff").expect("diff has a help topic");
         assert!(diff.contains("/diff [--base <ref>]"), "{diff}");
         assert!(diff.contains("稍后再试"), "the cooldown is documented: {diff}");
+        let worktree = command_help("worktree").expect("worktree has a help topic");
+        assert!(worktree.contains("/worktree new <name>"), "{worktree}");
+        assert!(worktree.contains("--base"), "{worktree}");
+        assert!(worktree.contains("session"), "{worktree}");
+        assert!(
+            help_text().contains("/worktree new <name>"),
+            "/worktree is listed in the command index: {}",
+            help_text()
+        );
         assert_eq!(command_help("nonexistent"), None);
         // The retired text-list form has no help topic of its own.
         assert_eq!(command_help("list"), None);
