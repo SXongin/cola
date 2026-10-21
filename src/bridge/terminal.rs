@@ -814,8 +814,11 @@ async fn run_claimed(
         thread_id: thread_key.thread_id.clone(),
         in_flight: Arc::new(AtomicBool::new(false)),
         pending: std::sync::Mutex::new(None),
+        cap_announced: AtomicBool::new(false),
         #[cfg(test)]
         starts: Arc::clone(&handles.terminal_live_patch_starts),
+        #[cfg(test)]
+        fail_cap_patches: Arc::clone(&handles.terminal_fail_cap_patches),
     });
 
     let (child, spawn_error) = match spawn_in(&log, &cwd, &spec.command, &inherited_env) {
@@ -976,6 +979,8 @@ async fn run_claimed(
                         past_cap = false;
                         slot.past_cap.store(false, Ordering::SeqCst);
                         deadline = Instant::now() + cap;
+                        // The next cap transition must announce itself again.
+                        patch_facts.cap_announced.store(false, Ordering::SeqCst);
                     }
                 }
                 None => break,
@@ -999,7 +1004,13 @@ async fn run_claimed(
                 // The cap stopped the tail, but a process group that outlives
                 // `sh` still gets its survivor line: that is state, not output.
                 let survivors_now = child_exit.is_some() && group_has_members(pgid);
-                if survivors_now != shown_survivors {
+                // Re-announce the cap until a patch carrying it lands: the one
+                // PATCH that offers 「继续」 can be refused or time out, and the
+                // run must stay extendable while it is live (ADR-0086 §4). The
+                // single-flight machinery coalesces these attempts, so a stall
+                // still cannot grow a backlog.
+                let announce = !patch_facts.cap_announced.load(Ordering::SeqCst);
+                if announce || survivors_now != shown_survivors {
                     spawn_live_patch(
                         Arc::clone(&patch_facts),
                         true,
@@ -1894,8 +1905,9 @@ async fn finish_run(
     patched
 }
 
-/// Patch the live card from the log's newest bytes. A failed live write is not
-/// fatal: the run continues and the settling write still lands.
+/// Patch the live card from the log's newest bytes, and say whether the write
+/// landed. A failed live write is not fatal — the run continues and the settling
+/// write still lands — but the **cap** announcement is retried until it does.
 #[allow(clippy::too_many_arguments)] // the card's own facts plus its run identity
 async fn patch_live(
     platform: &dyn Platform,
@@ -1908,7 +1920,7 @@ async fn patch_live(
     thread_id: &str,
     past_cap: bool,
     survivors: bool,
-) {
+) -> bool {
     let (output, output_truncated) = read_display_tail(log);
     let card = build_terminal_card(TerminalCard {
         cwd,
@@ -1923,8 +1935,12 @@ async fn patch_live(
         chat_id,
         thread_id,
     });
-    if let Err(error) = platform.update_message(card_id, &card).await {
-        tracing::warn!("terminal: live patch failed: {error}");
+    match platform.update_message(card_id, &card).await {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!("terminal: live patch failed: {error}");
+            false
+        }
     }
 }
 
@@ -1948,6 +1964,15 @@ struct LivePatchFacts {
     /// is what lets a state transition — the cap line or the survivor line —
     /// still reach the card once the stalled write drains.
     pending: std::sync::Mutex<Option<(bool, bool)>>,
+    /// Whether a patch carrying the **cap** state has landed. While the run is
+    /// `past_cap` and this is false, every render tick retries the cap patch: a
+    /// rejected or timed-out announcement must not hide 「继续」 while the run is
+    /// still live (ADR-0086 §4, spec #821).
+    cap_announced: AtomicBool,
+    /// Test-only: how many cap-announcing patches to fail before letting one
+    /// through (0 = none). Lets a test prove the announcement is retried.
+    #[cfg(test)]
+    fail_cap_patches: Arc<std::sync::atomic::AtomicUsize>,
     /// Test-only: how many live-patch tasks were actually spawned, so a test can
     /// prove the backlog stayed bounded while the card write was held.
     #[cfg(test)]
@@ -2006,11 +2031,21 @@ fn spawn_live_patch(
             // dropped, not queued forever.
             let bounded = tokio::time::timeout(Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS), async {
                 if settled.load(Ordering::SeqCst) {
-                    return;
+                    return false;
+                }
+                #[cfg(test)]
+                if past_cap
+                    && facts
+                        .fail_cap_patches
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                {
+                    // A simulated Feishu rejection of the cap announcement.
+                    return false;
                 }
                 let _guard = card_write.lock().await;
                 if settled.load(Ordering::SeqCst) {
-                    return;
+                    return false;
                 }
                 patch_live(
                     &*facts.platform,
@@ -2024,11 +2059,22 @@ fn spawn_live_patch(
                     past_cap,
                     survivors,
                 )
-                .await;
+                .await
             })
             .await;
-            if bounded.is_err() {
-                tracing::warn!("terminal: live patch timed out");
+            let landed = match bounded {
+                Ok(landed) => landed,
+                Err(_) => {
+                    tracing::warn!("terminal: live patch timed out");
+                    false
+                }
+            };
+            if landed {
+                // A landed patch teaches the loop which state the card now
+                // shows: the cap is announced (stop retrying), or a post-继续
+                // live patch means the next cap transition will need announcing
+                // again.
+                facts.cap_announced.store(past_cap, Ordering::SeqCst);
             }
             if settled.load(Ordering::SeqCst) {
                 break;

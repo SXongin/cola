@@ -288,6 +288,10 @@ pub struct SharedCore {
     /// holds the card write across many ticks and proves the count stays bounded.
     #[cfg(test)]
     pub terminal_live_patch_starts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only: how many cap-announcing live patches to fail before letting one
+    /// through; proves the cap state is retried until it lands.
+    #[cfg(test)]
+    pub terminal_fail_cap_patches: Arc<std::sync::atomic::AtomicUsize>,
     /// The **Terminal Log**'s **observed** stop threshold (ADR-0086 decision 7):
     /// the size probe kills the process group once the file has passed it. It
     /// is not a write limit, so a fast producer overshoots. Scaled down by a
@@ -437,6 +441,8 @@ impl SharedCore {
             terminal_probe_hook: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             terminal_live_patch_starts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            terminal_fail_cap_patches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             terminal_log_cap_bytes: Arc::new(std::sync::atomic::AtomicU64::new(
                 crate::bridge::terminal::TERMINAL_LOG_CAP_BYTES,
             )),
@@ -530,6 +536,8 @@ impl SharedCore {
             terminal_probe_hook: Arc::clone(&self.terminal_probe_hook),
             #[cfg(test)]
             terminal_live_patch_starts: Arc::clone(&self.terminal_live_patch_starts),
+            #[cfg(test)]
+            terminal_fail_cap_patches: Arc::clone(&self.terminal_fail_cap_patches),
         }
     }
 

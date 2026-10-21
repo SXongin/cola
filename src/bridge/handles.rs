@@ -1712,6 +1712,10 @@ pub(crate) struct CommandHandles {
     /// `SharedCore::terminal_live_patch_starts`.
     #[cfg(test)]
     pub(crate) terminal_live_patch_starts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only: how many cap-announcing patches to fail first; see
+    /// `SharedCore::terminal_fail_cap_patches`.
+    #[cfg(test)]
+    pub(crate) terminal_fail_cap_patches: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl CommandHandles {

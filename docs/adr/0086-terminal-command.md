@@ -391,6 +391,15 @@ between the prompt's acceptance and this write can still duplicate a submission
 after a restart, and that window is accepted rather than bought with a blocking
 round trip on the click path.
 
+The **cap announcement is retried until a patch carrying it lands**. The one
+PATCH that offers 「继续」 can be refused or time out; a run with no background
+survivors would then never become extendable while it is still live, which
+decision 4 requires. Every render tick therefore attempts the cap state while
+`past_cap` and unannounced, through the same single-flight/coalescing machinery
+(so a stalled card write cannot grow a backlog), and stops as soon as a patch
+carrying the cap lands — or when the run settles. 「继续」 itself clears the
+announcement, so a later cap transition announces again.
+
 Finally, the size probe's "check the log, then signal the group" cycle shares a
 gate with the run's own ending. The run takes the gate **before** setting
 `stood_down`, around the reap that frees the process-group id; the probe holds it
