@@ -321,64 +321,79 @@ pub(crate) async fn worktree_card_data(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
 ) -> std::result::Result<(Vec<super::session::WorktreeRow>, String), String> {
-    const BUDGET: std::time::Duration = std::time::Duration::from_millis(2_500);
+    const LIST_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
-    let data = async {
-        let repo = handles.current_project_directory(thread_key).await;
-        let entries = crate::git::list_worktrees(&repo)
-            .await
-            .map_err(|error| error.to_string())?;
-        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
-        let dirty = crate::git::worktree_dirty(&paths).await;
-        // The conversation's current directory is pending-first, then the
-        // active session's; with neither, `/new` falls back to the default
-        // directory, and the card marks that same checkout (ADR-0088).
-        let current = match handles.flow.sessions.current_directory(thread_key).await {
-            Some(dir) => Some(dir),
-            None => Some(handles.current_project_directory(thread_key).await),
-        };
-        let sessions = handles
-            .flow
-            .sessions
-            .cached_session_list(&handles.flow.backend)
-            .await
-            .unwrap_or_default();
-        let rows = entries
-            .into_iter()
-            .zip(dirty)
-            .map(|(entry, dirty)| {
-                let name = std::path::Path::new(&entry.path)
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| entry.path.clone());
-                let count = sessions
-                    .iter()
-                    .filter(|session| {
-                        !session.is_child()
-                            && !session.is_archived()
-                            && crate::bridge::command::same_dir(&session.directory, &entry.path)
-                    })
-                    .count();
-                let current = current
-                    .as_deref()
-                    .is_some_and(|dir| crate::bridge::command::same_dir(dir, &entry.path));
-                super::session::WorktreeRow {
-                    path: entry.path,
-                    name,
-                    branch: entry.branch,
-                    dirty,
-                    main: entry.main,
-                    sessions: count,
-                    current,
-                }
-            })
-            .collect();
-        Ok::<_, String>((rows, repo))
+    let repo = handles.current_project_directory(thread_key).await;
+    let entries = match tokio::time::timeout(LIST_BUDGET, crate::git::list_worktrees(&repo)).await {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(error)) => return Err(error.to_string()),
+        Err(_) => return Err("读取 worktree 超时，请稍后再试".to_string()),
     };
-    match tokio::time::timeout(BUDGET, data).await {
-        Ok(result) => result,
-        Err(_) => Err("读取 worktree 超时，请稍后再试".to_string()),
-    }
+    let deadline = tokio::time::Instant::now() + crate::git::DIRTY_BUDGET;
+    let rows = worktree_rows(handles, thread_key, entries, deadline).await;
+    Ok((rows, repo))
+}
+
+/// Build the card rows for an already-read inventory (ADR-0088): dirty state
+/// under `deadline` (`?` past it), the session count from the cached list, and
+/// the current marker.
+///
+/// Separate from [`worktree_card_data`] so a card callback — which runs on a
+/// deadline — can reuse the inventory it just read for validation and give the
+/// remaining work a budget that fits the ack.
+pub(crate) async fn worktree_rows(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    entries: Vec<crate::git::WorktreeEntry>,
+    deadline: tokio::time::Instant,
+) -> Vec<super::session::WorktreeRow> {
+    let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+    let dirty = crate::git::worktree_dirty_until(&paths, deadline).await;
+    // The conversation's current directory is pending-first, then the active
+    // session's; with neither, `/new` falls back to the default directory, and
+    // the card marks that same checkout (ADR-0088).
+    let current = match handles.flow.sessions.current_directory(thread_key).await {
+        Some(dir) => Some(dir),
+        None => Some(handles.current_project_directory(thread_key).await),
+    };
+    let sessions = tokio::time::timeout_at(
+        deadline,
+        handles.flow.sessions.cached_session_list(&handles.flow.backend),
+    )
+    .await
+    .ok()
+    .and_then(std::result::Result::ok)
+    .unwrap_or_default();
+    entries
+        .into_iter()
+        .zip(dirty)
+        .map(|(entry, dirty)| {
+            let name = std::path::Path::new(&entry.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.path.clone());
+            let count = sessions
+                .iter()
+                .filter(|session| {
+                    !session.is_child()
+                        && !session.is_archived()
+                        && crate::bridge::command::same_dir(&session.directory, &entry.path)
+                })
+                .count();
+            let current = current
+                .as_deref()
+                .is_some_and(|dir| crate::bridge::command::same_dir(dir, &entry.path));
+            super::session::WorktreeRow {
+                path: entry.path,
+                name,
+                branch: entry.branch,
+                dirty,
+                main: entry.main,
+                sessions: count,
+                current,
+            }
+        })
+        .collect()
 }
 
 /// Send the `/worktree` card, or — for a directory that is not a git

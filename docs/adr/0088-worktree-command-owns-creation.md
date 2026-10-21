@@ -131,8 +131,11 @@ nothing is ever moved.
 - A worktree created here is unknown to the server's inventory until OpenCode's
   own discovery runs; cola does not care, because a Session is created **in** a
   directory, not **for** a worktree resource.
-- Listing costs one `git worktree list` plus N status reads, bounded at 5 s; a
-  hung filesystem shows `?` instead of blocking the card.
+- Listing costs one `git worktree list` plus N status reads, bounded at 5 s on
+  the command path; a hung filesystem shows `?` instead of blocking the card.
+  A pick is a card callback on a 2 s ack deadline, so it validates with one
+  short list read and gives the refresh only what is left — a read past that
+  bound leaves the row `?` rather than holding the ack hostage.
 - ADR-0041 gains a creation surface (`/worktree new`); nothing else in the
   session model changes — a worktree Session is an ordinary Session whose
   directory happens to be a linked checkout.

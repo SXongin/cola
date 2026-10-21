@@ -213,7 +213,10 @@ async fn worktree_card_pick_declares_a_pending() {
     assert_eq!(pending.title.as_deref(), Some("feature"));
 
     let card = result.card.expect("the pick refreshes the card").to_string();
-    assert!(card.contains("当前"), "{card}");
+    assert!(
+        card.contains("**feature** · ✅ 当前"),
+        "the picked checkout is the current row: {card}"
+    );
 }
 
 /// A payload directory that exists but is NOT a listed checkout is refused:

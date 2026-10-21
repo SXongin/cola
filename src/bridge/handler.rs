@@ -1279,26 +1279,6 @@ fn reconcile_viewer_page_lane(
 /// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
 /// Session Creation, ADR-0041). A persist failure is logged and the caller still
 /// toasts success, parity with the switch card's 新建.
-/// The `/worktree` card for a data read (ADR-0088). A failed read degrades to a
-/// one-line card carrying the reason, so an in-place refresh never dies on the
-/// project that stopped being a git repository.
-fn worktree_card_from(
-    thread_key: &ThreadKey,
-    data: std::result::Result<(Vec<crate::feishu::card::session::WorktreeRow>, String), String>,
-) -> serde_json::Value {
-    match data {
-        Ok((rows, repo)) => crate::feishu::card::session::build_worktree_card(thread_key, &rows, &repo),
-        Err(error) => crate::feishu::card::shell::card_shell(
-            "🌲 worktree",
-            "blue",
-            vec![serde_json::json!({
-                "tag": "markdown",
-                "content": crate::feishu::card::sanitize::sanitize_markdown(&format!("⚠️ {error}")),
-            })],
-        ),
-    }
-}
-
 async fn declare_pending_dir(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
@@ -3446,26 +3426,51 @@ impl App {
             });
         }
 
-        // One bounded read serves both the validation and the refreshed card
-        // (a card callback runs on a deadline — CODING_STANDARDS.md).
+        // The click re-reads git's own inventory before touching the store: the
+        // payload's directory is trusted only if it is still a listed checkout
+        // (and still on disk), so a stale card can never turn an ordinary
+        // directory — or a pruned worktree whose folder survived — into the
+        // conversation's project. One cheap list, bounded so the ack never
+        // waits on a stalled filesystem (CODING_STANDARDS.md: a card callback
+        // runs on a deadline).
         let handles = core.command_handles();
-        let data = crate::feishu::card::command::worktree_card_data(&handles, &thread_key).await;
-        let listed = data.as_ref().is_ok_and(|(rows, _)| {
-            rows.iter()
-                .any(|row| crate::bridge::command::same_dir(&row.path, &directory))
-        });
-        let card = worktree_card_from(&thread_key, data);
+        let repo = handles.current_project_directory(&thread_key).await;
+        let entries = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::git::list_worktrees(&repo),
+        )
+        .await
+        {
+            Ok(Ok(entries)) => entries,
+            Ok(Err(error)) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!("⚠️ {error}")),
+                });
+            }
+            Err(_) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("⚠️ 读取 worktree 超时，请稍后重试（未做任何更改）".to_string()),
+                });
+            }
+        };
+        let listed = entries
+            .iter()
+            .any(|entry| crate::bridge::command::same_dir(&entry.path, &directory));
         if !listed || !std::path::Path::new(&directory).is_dir() {
             return Some(CardActionResult {
-                card: Some(card),
-                toast: Some(format!("目录已不存在或已不是 worktree：`{directory}`")),
+                card: None,
+                toast: Some(format!(
+                    "目录已不存在或已不是 worktree：`{directory}`（未做任何更改）"
+                )),
             });
         }
 
         let current = core.sessions.lock().await.current_directory(&thread_key);
         if current.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
             return Some(CardActionResult {
-                card: Some(card),
+                card: None,
                 toast: Some("已在当前目录".to_string()),
             });
         }
@@ -3475,6 +3480,14 @@ impl App {
             .filter(|name| !name.is_empty())
             .map(str::to_string);
         declare_pending_dir(core, &thread_key, &directory, title).await;
+
+        // Refresh from the inventory already read — after the pending exists,
+        // so the marker is the new current — with the remaining dirty/session
+        // reads inside what is left of the ack budget.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        let rows =
+            crate::feishu::card::command::worktree_rows(&handles, &thread_key, entries, deadline).await;
+        let card = crate::feishu::card::session::build_worktree_card(&thread_key, &rows, &repo);
         Some(CardActionResult {
             card: Some(card),
             toast: Some(format!("下一条消息将在 `{directory}` 创建会话")),
