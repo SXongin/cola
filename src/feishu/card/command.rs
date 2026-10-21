@@ -307,6 +307,84 @@ pub(crate) async fn send_dir_card(
     Ok(())
 }
 
+/// The `/worktree` card's data (ADR-0088): the project's checkouts from
+/// `git worktree list`, each with its dirty state (bounded per checkout), the
+/// number of non-child, non-archived sessions rooted in it, and whether the
+/// conversation is already there. `Err` is the readable line for a non-git
+/// project — answered as text, never as an empty card.
+pub(crate) async fn worktree_card_data(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+) -> std::result::Result<(Vec<super::session::WorktreeRow>, String), String> {
+    let repo = handles.current_project_directory(thread_key).await;
+    let entries = crate::git::list_worktrees(&repo)
+        .await
+        .map_err(|error| error.to_string())?;
+    let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+    let dirty = crate::git::worktree_dirty(&paths).await;
+    let current = handles.flow.sessions.current_directory(thread_key).await;
+    let sessions = handles
+        .flow
+        .sessions
+        .cached_session_list(&handles.flow.backend)
+        .await
+        .unwrap_or_default();
+    let rows = entries
+        .into_iter()
+        .zip(dirty)
+        .map(|(entry, dirty)| {
+            let name = std::path::Path::new(&entry.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| entry.path.clone());
+            let count = sessions
+                .iter()
+                .filter(|session| {
+                    !session.is_child()
+                        && !session.is_archived()
+                        && crate::bridge::command::same_dir(&session.directory, &entry.path)
+                })
+                .count();
+            let current = current
+                .as_deref()
+                .is_some_and(|dir| crate::bridge::command::same_dir(dir, &entry.path));
+            super::session::WorktreeRow {
+                path: entry.path,
+                name,
+                branch: entry.branch,
+                dirty,
+                main: entry.main,
+                sessions: count,
+                current,
+            }
+        })
+        .collect();
+    Ok((rows, repo))
+}
+
+/// Send the `/worktree` card, or — for a directory that is not a git
+/// repository — the reason as text.
+pub(crate) async fn send_worktree_card(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> Result<()> {
+    match worktree_card_data(handles, thread_key).await {
+        Ok((rows, repo)) => {
+            let card = super::session::build_worktree_card(thread_key, &rows, &repo);
+            handles.flow.platform.reply_card(message_id, &card).await?;
+        }
+        Err(error) => {
+            handles
+                .flow
+                .platform
+                .reply_text(message_id, &format!("⚠️ /worktree：{error}"))
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// The bare `/cat` usage line: `/cat` with no path answers this instead of
 /// being forwarded as a prompt (ADR-0083 §2).
 pub(crate) const CAT_USAGE: &str = "\

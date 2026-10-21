@@ -40,3 +40,4 @@ pub(crate) mod turn_diff_delivery;
 pub(crate) mod undeliverable;
 pub(crate) mod viewer;
 pub(crate) mod wake;
+pub(crate) mod worktree;

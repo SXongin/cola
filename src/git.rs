@@ -119,6 +119,334 @@ async fn git(dir: &str, args: &[&str]) -> Option<String> {
     }
 }
 
+/// One checkout `git worktree list --porcelain` reports (ADR-0088).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    /// Absolute path to the checkout.
+    pub path: String,
+    /// The checked-out branch without `refs/heads/`; `None` for a detached
+    /// HEAD (a worktree OpenCode's own API creates is always detached).
+    pub branch: Option<String>,
+    /// The repository's main checkout — porcelain lists it first — rather
+    /// than a linked worktree.
+    pub main: bool,
+}
+
+/// What `/worktree new` created (ADR-0088).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedWorktree {
+    pub path: String,
+    pub branch: String,
+    /// Whether the configured root is covered by the primary checkout's
+    /// `.gitignore`. `false` means the main checkout starts reading dirty, and
+    /// the command's reply carries a reminder — cola never edits the
+    /// user's `.gitignore` (ADR-0088).
+    pub root_ignored: bool,
+}
+
+/// A worktree failure whose `Display` is the line the user reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeError(String);
+
+impl WorktreeError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl std::fmt::Display for WorktreeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WorktreeError {}
+
+/// The parent directory of a project's worktrees, resolved against the
+/// repository's **primary checkout** (ADR-0088): the session's own directory
+/// may itself be a linked worktree, and nesting a worktree inside one is never
+/// the intent.
+pub async fn worktree_root(
+    dir: &str,
+    configured: &std::path::Path,
+) -> Result<std::path::PathBuf, WorktreeError> {
+    if configured.is_absolute() {
+        return Ok(configured.to_path_buf());
+    }
+    let common = git_capture(dir, &["rev-parse", "--git-common-dir"])
+        .await
+        .map_err(|_| WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")))?;
+    if common.trim().is_empty() {
+        return Err(WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")));
+    }
+    let common = resolve_git_path(dir, common.trim());
+    let primary = common
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from(dir));
+    Ok(primary.join(configured))
+}
+
+/// List every checkout of the repository containing `dir`, main checkout
+/// included (ADR-0088). A non-git directory, or a git failure, is an error the
+/// command answers with text instead of an empty card.
+pub async fn list_worktrees(dir: &str) -> Result<Vec<WorktreeEntry>, WorktreeError> {
+    let inside = git_capture(dir, &["rev-parse", "--is-inside-work-tree"])
+        .await
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false);
+    if !inside {
+        return Err(WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")));
+    }
+    let text = git_capture(dir, &["worktree", "list", "--porcelain"])
+        .await
+        .map_err(|error| WorktreeError::new(format!("读取 worktree 失败：{error}")))?;
+    Ok(parse_worktree_porcelain(&text))
+}
+
+/// Parse `git worktree list --porcelain`: blank-line-separated blocks of
+/// `worktree <path>`, `HEAD <sha>`, `branch refs/heads/<name>`, `bare`,
+/// `detached`, `locked`/`prunable` lines. The first block is the main checkout.
+fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
+    let mut entries: Vec<WorktreeEntry> = Vec::new();
+    let mut current: Option<WorktreeEntry> = None;
+    for line in text.lines() {
+        if line.is_empty() {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(WorktreeEntry {
+                path: path.to_string(),
+                branch: None,
+                main: entries.is_empty(),
+            });
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+            && let Some(entry) = current.as_mut()
+        {
+            entry.branch = Some(branch.to_string());
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+/// Dirty state per checkout, bounded (ADR-0088): one `git status --porcelain`
+/// each, at most four at a time under one overall deadline. A checkout that
+/// misses the deadline reads `None` — the card renders `?` instead of claiming
+/// a clean tree it never measured.
+pub async fn worktree_dirty(paths: &[String]) -> Vec<Option<bool>> {
+    use std::sync::Arc;
+
+    const CONCURRENCY: usize = 4;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let limit = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+    let reads = paths.iter().map(|path| {
+        let limit = Arc::clone(&limit);
+        async move {
+            let _permit = limit.acquire().await.ok()?;
+            status_dirty(path).await
+        }
+    });
+    match tokio::time::timeout(BUDGET, futures_util::future::join_all(reads)).await {
+        Ok(results) => results,
+        Err(_) => vec![None; paths.len()],
+    }
+}
+
+/// The slug a worktree name becomes (ADR-0088): trim, lowercase,
+/// whitespace/underscore to `-`, collapse repeats, trim dashes and dots, then
+/// validate. Chinese and other non-ASCII input is refused rather than
+/// transliterated — a slug must stay typeable on another machine.
+pub fn normalize_name(input: &str) -> Result<String, WorktreeError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(WorktreeError::new("名字不能为空"));
+    }
+    let mut slug = String::with_capacity(trimmed.len());
+    let mut last_dash = false;
+    for ch in trimmed.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else if ch.is_whitespace() || ch == '_' || ch == '-' {
+            '-'
+        } else if ch == '.' {
+            '.'
+        } else {
+            return Err(WorktreeError::new(format!(
+                "名字 `{trimmed}` 只能包含英文、数字、`.`、`-`、`_`（例如 `user-guide`）"
+            )));
+        };
+        if mapped == '-' {
+            if last_dash {
+                continue;
+            }
+            last_dash = true;
+        } else {
+            last_dash = false;
+        }
+        slug.push(mapped);
+    }
+    let slug = slug.trim_matches(['-', '.']).to_string();
+    if slug.is_empty() || slug.contains("..") {
+        return Err(WorktreeError::new(format!(
+            "名字 `{trimmed}` 规范化后为空或包含 `..`；请用英文/数字命名，例如 `user-guide`"
+        )));
+    }
+    if slug.len() > 40 {
+        return Err(WorktreeError::new(format!(
+            "名字太长（{} 个字符，最多 40）；请缩短后再试",
+            slug.len()
+        )));
+    }
+    Ok(slug)
+}
+
+/// Create a worktree for `name` under `root` (a path relative to the primary
+/// checkout or absolute) from `base` (default `HEAD`) and return what was
+/// made (ADR-0088). An existing directory gets a `-2`… suffix, the branch
+/// following it; an existing branch no checkout holds is attached, while a
+/// checked-out one is refused with git's own reason.
+pub async fn create_worktree(
+    dir: &str,
+    root: &std::path::Path,
+    name: &str,
+    base: Option<&str>,
+) -> Result<CreatedWorktree, WorktreeError> {
+    let slug = normalize_name(name)?;
+    let bare = git_capture(dir, &["rev-parse", "--is-bare-repository"])
+        .await
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false);
+    if bare {
+        return Err(WorktreeError::new("这是 bare 仓库，不能创建 worktree"));
+    }
+    let root = worktree_root(dir, root).await?;
+    std::fs::create_dir_all(&root)
+        .map_err(|error| WorktreeError::new(format!("无法创建目录 `{}`：{error}", root.display())))?;
+
+    let mut candidate = slug.clone();
+    let mut suffix = 1;
+    let mut directory = root.join(&candidate);
+    while directory.exists() {
+        suffix += 1;
+        if suffix > 10 {
+            return Err(WorktreeError::new(format!(
+                "目录 `{}` 及随后的 9 个后缀都已存在",
+                root.join(slug).display()
+            )));
+        }
+        candidate = format!("{slug}-{suffix}");
+        directory = root.join(&candidate);
+    }
+    let branch = format!("wt/{candidate}");
+    let directory_text = directory.to_string_lossy().to_string();
+
+    let branch_exists = git_capture(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .await
+    .is_ok();
+    if branch_exists {
+        let held = list_worktrees(dir)
+            .await?
+            .into_iter()
+            .find(|entry| entry.branch.as_deref() == Some(branch.as_str()));
+        if let Some(held) = held {
+            return Err(WorktreeError::new(format!(
+                "分支 `{branch}` 已在 `{}` 中检出；请换一个名字，或先在那里处理",
+                held.path
+            )));
+        }
+        git_capture(dir, &["worktree", "add", &directory_text, &branch])
+            .await
+            .map_err(|error| WorktreeError::new(format!("git worktree add 失败：{error}")))?;
+    } else {
+        let start = base.unwrap_or("HEAD");
+        git_capture(dir, &["worktree", "add", "-b", &branch, &directory_text, start])
+            .await
+            .map_err(|error| WorktreeError::new(format!("git worktree add 失败：{error}")))?;
+    }
+
+    let root_ignored = root_is_ignored(dir, &root).await;
+    Ok(CreatedWorktree {
+        path: directory_text,
+        branch,
+        root_ignored,
+    })
+}
+
+/// Whether `root` is ignored by the repository at `dir`. A root outside the
+/// primary checkout cannot dirty it, so it counts as covered.
+async fn root_is_ignored(dir: &str, root: &std::path::Path) -> bool {
+    let Ok(common) = git_capture(dir, &["rev-parse", "--git-common-dir"]).await else {
+        return true;
+    };
+    let common = resolve_git_path(dir, common.trim());
+    let Some(primary) = common.parent() else {
+        return true;
+    };
+    let Ok(relative) = root
+        .canonicalize()
+        .unwrap_or_else(|_| root.to_path_buf())
+        .strip_prefix(primary.canonicalize().unwrap_or_else(|_| primary.to_path_buf()))
+        .map(std::path::Path::to_path_buf)
+    else {
+        return true;
+    };
+    if relative.as_os_str().is_empty() {
+        return true;
+    }
+    let output = tokio::process::Command::new("git")
+        .args(["-C"])
+        .arg(primary)
+        .args(["check-ignore", "-q", "--"])
+        .arg(&relative)
+        .output()
+        .await;
+    // Exit 0 = ignored; exit 1 = not ignored; anything else (a git error) is
+    // not evidence of a dirty main checkout, so it never warns.
+    matches!(output, Ok(out) if out.status.code() == Some(0))
+}
+
+/// Run a git command and return its trimmed stdout, or the trimmed stderr as
+/// the error text — the command layer needs git's own words for a refusal
+/// (`branch is already checked out`), which [`git`] discards by design.
+async fn git_capture(dir: &str, args: &[&str]) -> Result<String, String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", dir])
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| format!("git 无法执行：{error}"))?;
+    let text = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let stderr = if stderr.is_empty() {
+            format!("git 退出码 {}", out.status.code().unwrap_or(-1))
+        } else {
+            stderr
+        };
+        return Err(stderr);
+    };
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +644,213 @@ mod tests {
 
         let s = dir.to_string_lossy().to_string();
         assert_eq!(read_state(&s).await, GitState::default());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A committed repository with `user.name`/`user.email` configured — the
+    /// base every worktree test needs.
+    fn init_repo(label: &str) -> std::path::PathBuf {
+        let dir = temp_dir(label);
+        run(&dir, &["init", "-b", "main"]);
+        run(&dir, &["config", "user.email", "test@example.com"]);
+        run(&dir, &["config", "user.name", "test"]);
+        std::fs::write(dir.join("a.txt"), "hello").unwrap();
+        run(&dir, &["add", "a.txt"]);
+        run(&dir, &["commit", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn normalize_name_lowercases_collapses_and_trims() {
+        assert_eq!(normalize_name("  Fix  Login ").unwrap(), "fix-login");
+        assert_eq!(normalize_name("fix_login").unwrap(), "fix-login");
+        assert_eq!(normalize_name("a--b").unwrap(), "a-b");
+        assert_eq!(normalize_name(".hidden.").unwrap(), "hidden");
+        assert_eq!(normalize_name("v1.2").unwrap(), "v1.2");
+    }
+
+    #[test]
+    fn normalize_name_refuses_chinese_and_long_names() {
+        let chinese = normalize_name("用户指南").unwrap_err().to_string();
+        assert!(chinese.contains("只能包含英文"), "{chinese}");
+        let long = "a".repeat(41);
+        assert!(normalize_name(&long).unwrap_err().to_string().contains("太长"));
+        assert!(normalize_name("   ").is_err(), "an empty name is refused");
+    }
+
+    /// `worktree list` parses the main checkout first, then each linked one
+    /// with its branch — and marks the main checkout so the card can label it.
+    #[tokio::test]
+    async fn worktree_list_marks_main_and_carries_branches() {
+        let dir = init_repo("git-wt-list");
+        let s = dir.to_string_lossy().to_string();
+        let created = create_worktree(&s, Path::new(".worktrees"), "Feature One", None)
+            .await
+            .unwrap();
+        assert_eq!(created.branch, "wt/feature-one");
+        assert!(created.path.ends_with(".worktrees/feature-one"));
+        assert!(!created.root_ignored, "no .gitignore, so the root is not covered");
+
+        let entries = list_worktrees(&s).await.unwrap();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries[0].main, "the main checkout leads");
+        assert_eq!(entries[0].branch.as_deref(), Some("main"));
+        assert!(!entries[1].main);
+        assert_eq!(entries[1].branch.as_deref(), Some("wt/feature-one"));
+        assert!(entries[1].path.ends_with(".worktrees/feature-one"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Dirty state is per checkout: a file written in the worktree must not
+    /// dirty the main checkout, and the read reports each separately.
+    #[tokio::test]
+    async fn worktree_dirty_reads_each_checkout_separately() {
+        let dir = init_repo("git-wt-dirty");
+        let s = dir.to_string_lossy().to_string();
+        let created = create_worktree(&s, Path::new(".worktrees"), "dirty", None)
+            .await
+            .unwrap();
+        std::fs::write(Path::new(&created.path).join("new.txt"), "x").unwrap();
+
+        let entries = list_worktrees(&s).await.unwrap();
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        let dirty = worktree_dirty(&paths).await;
+        assert_eq!(
+            dirty,
+            vec![Some(true), Some(true)],
+            "the root is untracked in main too"
+        );
+
+        std::fs::write(dir.join(".gitignore"), ".worktrees/\n").unwrap();
+        run(&dir, &["add", ".gitignore"]);
+        run(&dir, &["commit", "-m", "ignore worktrees"]);
+        let paths: Vec<String> = list_worktrees(&s)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(
+            worktree_dirty(&paths).await,
+            vec![Some(false), Some(true)],
+            "ignored root: only the worktree itself is dirty"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The root resolves against the PRIMARY checkout even when the session is
+    /// already inside a linked worktree (ADR-0088): never worktree-in-worktree.
+    #[tokio::test]
+    async fn worktree_root_resolves_against_the_primary_checkout() {
+        let dir = init_repo("git-wt-root");
+        let s = dir.to_string_lossy().to_string();
+        let created = create_worktree(&s, Path::new(".worktrees"), "inside", None)
+            .await
+            .unwrap();
+
+        let root = worktree_root(&created.path, Path::new(".worktrees"))
+            .await
+            .unwrap();
+        assert_eq!(
+            root,
+            std::fs::canonicalize(&dir).unwrap().join(".worktrees"),
+            "the root must not nest inside the linked worktree"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing directory gets the next free `-2` suffix, and the branch
+    /// follows it, so the pair never disagrees.
+    #[tokio::test]
+    async fn worktree_create_suffixes_an_existing_directory() {
+        let dir = init_repo("git-wt-suffix");
+        let s = dir.to_string_lossy().to_string();
+        std::fs::create_dir_all(dir.join(".worktrees").join("taken")).unwrap();
+
+        let created = create_worktree(&s, Path::new(".worktrees"), "taken", None)
+            .await
+            .unwrap();
+        assert!(created.path.ends_with(".worktrees/taken-2"), "{}", created.path);
+        assert_eq!(created.branch, "wt/taken-2");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing branch that no checkout holds is attached: "open that
+    /// branch in a new directory" is the natural intent (ADR-0088).
+    #[tokio::test]
+    async fn worktree_create_attaches_an_unheld_branch() {
+        let dir = init_repo("git-wt-reuse");
+        run(&dir, &["branch", "wt/reuse"]);
+        let s = dir.to_string_lossy().to_string();
+
+        let created = create_worktree(&s, Path::new(".worktrees"), "reuse", None)
+            .await
+            .unwrap();
+        assert_eq!(created.branch, "wt/reuse");
+        let inside = std::process::Command::new("git")
+            .args(["-C", &created.path, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&inside.stdout).trim(), "wt/reuse");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A branch already checked out somewhere is refused with git's own
+    /// reason instead of a second checkout.
+    #[tokio::test]
+    async fn worktree_create_refuses_a_checked_out_branch() {
+        let dir = init_repo("git-wt-held");
+        run(&dir, &["branch", "wt/held"]);
+        run(&dir, &["worktree", "add", ".worktrees/other", "wt/held"]);
+        let s = dir.to_string_lossy().to_string();
+
+        let error = create_worktree(&s, Path::new(".worktrees"), "held", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("已在"), "{error}");
+        assert!(error.contains("wt/held"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A non-git directory is an error the card turns into text, never an
+    /// empty list.
+    #[tokio::test]
+    async fn worktree_list_refuses_a_non_git_directory() {
+        let dir = temp_dir("git-wt-nongit");
+        let s = dir.to_string_lossy().to_string();
+        let error = list_worktrees(&s).await.unwrap_err().to_string();
+        assert!(error.contains("不是 git 仓库"), "{error}");
+        assert!(
+            create_worktree(&s, Path::new(".worktrees"), "x", None)
+                .await
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root covered by `.gitignore` is reported as such, so the reply stays
+    /// quiet; cola never edits the file itself.
+    #[tokio::test]
+    async fn worktree_create_reports_an_ignored_root() {
+        let dir = init_repo("git-wt-ignored");
+        std::fs::write(dir.join(".gitignore"), ".worktrees/\n").unwrap();
+        run(&dir, &["add", ".gitignore"]);
+        run(&dir, &["commit", "-m", "ignore"]);
+        let s = dir.to_string_lossy().to_string();
+
+        let created = create_worktree(&s, Path::new(".worktrees"), "quiet", None)
+            .await
+            .unwrap();
+        assert!(created.root_ignored);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

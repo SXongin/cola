@@ -41,6 +41,8 @@ pub struct Config {
     pub bridge: BridgeConfig,
     #[serde(default)]
     pub review: ReviewConfig,
+    #[serde(default)]
+    pub worktree: WorktreeConfig,
 }
 
 /// Repository review settings (spec #803, ticket #804): what `/diff` compares
@@ -52,6 +54,30 @@ pub struct ReviewConfig {
     /// command always wins over this.
     #[serde(default)]
     pub base: Option<String>,
+}
+
+/// Worktree settings (ADR-0088): where `/worktree new` creates its checkouts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeConfig {
+    /// The parent directory for new worktrees. A relative value resolves
+    /// against the project's primary checkout (never the session's own
+    /// directory, which may itself be a linked worktree); an absolute path is
+    /// used as given. Defaults to `.worktrees`, the repository's own
+    /// convention.
+    #[serde(default = "default_worktree_root")]
+    pub root: PathBuf,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            root: default_worktree_root(),
+        }
+    }
+}
+
+fn default_worktree_root() -> PathBuf {
+    PathBuf::from(".worktrees")
 }
 
 /// When cola starts an `opencode serve` of its own (ADR-0013).
@@ -492,6 +518,7 @@ mod tests {
             },
             bridge: BridgeConfig::default(),
             review: ReviewConfig::default(),
+            worktree: WorktreeConfig::default(),
         };
         let dumped = masked_config_toml(&cfg).unwrap();
         assert!(dumped.contains("cli_abc"), "the app id is shown: {dumped}");
@@ -509,6 +536,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(configured.review.base.as_deref(), Some("upstream/dev"));
+    }
+
+    /// ADR-0088: the root is optional and defaults to the repository's own
+    /// `.worktrees`; an absolute path is kept verbatim.
+    #[test]
+    fn worktree_root_defaults_and_parses() {
+        let minimal: Config =
+            toml::from_str("[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n").unwrap();
+        assert_eq!(minimal.worktree.root, PathBuf::from(".worktrees"));
+
+        let configured: Config = toml::from_str(
+            "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n[worktree]\nroot = \"/tmp/wt\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured.worktree.root, PathBuf::from("/tmp/wt"));
     }
 
     #[test]

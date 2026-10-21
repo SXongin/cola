@@ -98,6 +98,16 @@ pub enum Command {
     /// (ADR-0086): the command text and its cap. `None` is the bare `/run` or a
     /// refused flag form, both answered with usage and nothing spawned.
     Run(Option<RunSpec>),
+    /// `/worktree` (no args, or `/worktree list`) — the project's git checkouts
+    /// as a picker card; picking one declares a **Pending Session** there
+    /// (ADR-0088).
+    WorktreeCard,
+    /// `/worktree new <name> [--base <ref>]` — create a checkout on branch
+    /// `wt/<name>` and declare the Pending Session that starts in it.
+    WorktreeNew { name: String, base: Option<String> },
+    /// A bare or malformed `/worktree new` — answered with usage and no git
+    /// call; `/worktree` with no argument opens the card instead.
+    WorktreeUsage,
 }
 
 /// One parsed `/run` invocation (ADR-0086 §2, §6): the command text after flag
@@ -150,6 +160,8 @@ impl Command {
             Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
             Command::Dir(_)
             | Command::DirCard
+            | Command::WorktreeCard
+            | Command::WorktreeNew { .. }
             | Command::Switch(_)
             | Command::Sub(SubAction::Attach { .. })
             | Command::New(_)
@@ -357,6 +369,14 @@ pub fn parse_command(text: &str) -> Option<Command> {
                 _ => Some(Command::DiffUsage),
             }
         }
+        // `/worktree` — the project's git checkouts (ADR-0088). No argument (or
+        // `list`) opens the picker card; `new <name> [--base <ref>]` creates a
+        // checkout and declares the Pending Session that starts in it. Every
+        // other form is answered with usage and runs no git.
+        "/worktree" => Some(match arg {
+            None => Command::WorktreeCard,
+            Some(a) => parse_worktree_arg(a),
+        }),
         // `/run [--timeout <n>[smh]] [--] <cmd>` — one Terminal Command
         // (ADR-0086 §2, §6). Flags are parsed only before the command, and `--`
         // ends flag parsing so a command may start with `-`; a bare `/run` or a
@@ -455,6 +475,49 @@ pub fn parse_command(text: &str) -> Option<Command> {
         })),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
+    }
+}
+
+/// Parse `/worktree`'s argument (ADR-0088). The grammar is `/worktree` (the
+/// card), `/worktree list` (the card), and `/worktree new <name> [--base
+/// <ref>]`. The name may span words (`Fix Login` normalises to `fix-login`),
+/// and `--base` may come before or after it; anything else — an unknown flag,
+/// a bare `--base`, a missing name — is usage, with no git call.
+fn parse_worktree_arg(arg: &str) -> Command {
+    let mut words = arg.split_whitespace();
+    match words.next() {
+        Some("list") => {
+            if words.next().is_none() {
+                Command::WorktreeCard
+            } else {
+                Command::WorktreeUsage
+            }
+        }
+        Some("new") => {
+            let mut name: Vec<&str> = Vec::new();
+            let mut base: Option<String> = None;
+            while let Some(word) = words.next() {
+                match word {
+                    "--base" => match words.next() {
+                        Some(value) if !value.starts_with('-') && base.is_none() => {
+                            base = Some(value.to_string());
+                        }
+                        _ => return Command::WorktreeUsage,
+                    },
+                    flag if flag.starts_with('-') => return Command::WorktreeUsage,
+                    word => name.push(word),
+                }
+            }
+            if name.is_empty() {
+                Command::WorktreeUsage
+            } else {
+                Command::WorktreeNew {
+                    name: name.join(" "),
+                    base,
+                }
+            }
+        }
+        _ => Command::WorktreeUsage,
     }
 }
 
@@ -589,6 +652,8 @@ pub fn help_text() -> String {
     "\
 **cola commands**
 `/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
+`/worktree` · Worktree card: this project's git checkouts (branch · dirty · session count); pick one to declare a session there
+`/worktree new <name> [--base <ref>]` · Create a worktree on branch `wt/<name>` and declare the session that starts there (nothing is moved)
 `/cat <path>` · View a host file in a card (a directory opens the Directory Browser there)
 `/diff [--base <ref>]` · Send this branch's repository changes against a base ref as one HTML file
 `/run [--timeout <n>[smh]] [--] <cmd>` · Run one shell command on the host and reply with a Terminal Card (also a message starting with `!<cmd>`)
@@ -637,6 +702,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "dir" => {
             "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths. Its 📁 浏览目录 button opens a filesystem browser: drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, and filter the child names.\nExample: `/dir /root/proj/lib`"
+        }
+        "worktree" => {
+            "/worktree\nList this project's git checkouts as a picker card: each row names the directory, its branch, dirty marker, session count and the current marker, and the main checkout is included and labelled. Picking a row declares a session there — created by the conversation's next message — exactly like `/dir`'s pick; it never adopts an existing session (use `/switch` for that).\n/worktree new <name> [--base <ref>]\nCreate a worktree at `[worktree] root` (default `.worktrees`, resolved against the main checkout) on branch `wt/<name>` from the current session's HEAD (or `<ref>`), then declare the session there. Nothing is moved, so a running turn is never interrupted.\nThe name is normalised to a lowercase ASCII slug (`[a-z0-9.-]`, at most 40 characters); a name with Chinese is refused with an example. An existing directory gets a `-2` suffix, an existing branch that no checkout holds is attached, and a branch already checked out is refused with git's own reason. cola never removes worktrees.\nExamples: `/worktree`, `/worktree new fix-login`, `/worktree new fix-login --base main`"
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
@@ -902,6 +970,19 @@ pub(crate) async fn handle_command(
         }
         Command::DirCard => {
             crate::feishu::card::command::send_dir_card(handles, &thread_key, message_id).await?;
+        }
+        Command::WorktreeCard => {
+            crate::feishu::card::command::send_worktree_card(handles, &thread_key, message_id).await?;
+        }
+        Command::WorktreeNew { name, base } => {
+            crate::bridge::worktree::create(handles, &thread_key, message_id, name, base).await?;
+        }
+        Command::WorktreeUsage => {
+            handles
+                .flow
+                .platform
+                .reply_text(message_id, crate::bridge::worktree::WORKTREE_USAGE)
+                .await?;
         }
         Command::Cat(path) => {
             crate::feishu::card::command::send_cat_card(handles, &thread_key, message_id, path.as_deref())
@@ -2930,6 +3011,62 @@ mod tests {
         assert_eq!(
             parse_command("/diffs x"),
             Some(Command::Forward("/diffs x".into()))
+        );
+
+        // ADR-0088: `/worktree` opens the card (also `/worktree list`);
+        // `new <name>` requires the name, accepts a multi-word name and
+        // `--base` on either side, and every other shape is usage.
+        assert_eq!(parse_command("/worktree"), Some(Command::WorktreeCard));
+        assert_eq!(parse_command("/worktree list"), Some(Command::WorktreeCard));
+        assert_eq!(
+            parse_command("/worktree new fix-login"),
+            Some(Command::WorktreeNew {
+                name: "fix-login".into(),
+                base: None,
+            })
+        );
+        assert_eq!(
+            parse_command("/worktree new Fix Login"),
+            Some(Command::WorktreeNew {
+                name: "Fix Login".into(),
+                base: None,
+            })
+        );
+        assert_eq!(
+            parse_command("/worktree new fix --base main"),
+            Some(Command::WorktreeNew {
+                name: "fix".into(),
+                base: Some("main".into()),
+            })
+        );
+        assert_eq!(
+            parse_command("/worktree new --base origin/main fix"),
+            Some(Command::WorktreeNew {
+                name: "fix".into(),
+                base: Some("origin/main".into()),
+            })
+        );
+        assert_eq!(parse_command("/worktree new"), Some(Command::WorktreeUsage));
+        assert_eq!(
+            parse_command("/worktree new fix --base"),
+            Some(Command::WorktreeUsage)
+        );
+        assert_eq!(
+            parse_command("/worktree new fix --base --other"),
+            Some(Command::WorktreeUsage)
+        );
+        assert_eq!(
+            parse_command("/worktree new fix --force"),
+            Some(Command::WorktreeUsage)
+        );
+        assert_eq!(parse_command("/worktree bogus"), Some(Command::WorktreeUsage));
+        assert_eq!(
+            parse_command("/worktree list extra"),
+            Some(Command::WorktreeUsage)
+        );
+        assert_eq!(
+            parse_command("/worktrees"),
+            Some(Command::Forward("/worktrees".into()))
         );
     }
 
