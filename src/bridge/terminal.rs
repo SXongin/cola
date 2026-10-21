@@ -2034,13 +2034,11 @@ fn spawn_live_patch(
                     return false;
                 }
                 #[cfg(test)]
-                if past_cap
-                    && facts
-                        .fail_cap_patches
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                        .is_ok()
-                {
-                    // A simulated Feishu rejection of the cap announcement.
+                if past_cap && facts.fail_cap_patches.load(Ordering::SeqCst) > 0 {
+                    // A simulated Feishu rejection of the cap announcement. The
+                    // test-only counter may race (two cap patches seeing one) and
+                    // that is benign: only one cap patch is ever in flight.
+                    facts.fail_cap_patches.fetch_sub(1, Ordering::SeqCst);
                     return false;
                 }
                 let _guard = card_write.lock().await;

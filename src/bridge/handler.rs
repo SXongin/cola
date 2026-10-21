@@ -5783,10 +5783,11 @@ impl App {
 
     /// Rebuild the clicked settled Terminal Card from its own payload and PATCH
     /// one outcome line onto it (ADR-0086 decision 4: the card carries its own
-    /// render inputs, so no card-view read is needed). Keeping both settled
-    /// buttons and their run ids means the card stays usable after the update.
-    /// A failed PATCH is logged, never retried: the outcome is information, not
-    /// an act.
+    /// render inputs, so no card-view read is needed). The rebuilt buttons keep
+    /// the run id the payload named — and a legacy payload that named none gets
+    /// no 「问 AI」 at all, because adopting the chat's current id would let an
+    /// old card submit after its record was replaced. A failed PATCH is logged,
+    /// never retried: the outcome is information, not an act.
     async fn update_terminal_card_outcome(
         self: &Arc<Self>,
         request: &TerminalCardRequest,
@@ -5799,35 +5800,35 @@ impl App {
             .viewer_transfer_timeout_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         // #828: a payload minted before the settled buttons named their run
-        // carries no run id, and rebuilding from it wrote a 「问 AI」 button with
-        // an empty id — a button that could only toast 「无效操作」. The chat's
-        // **Terminal Run Record** is the durable source of "current" (ADR-0086
-        // decision 4), so a legacy payload takes its run id from there; when the
-        // record has none either, the button is omitted rather than written with
-        // an empty id.
+        // carries no run id. The record is read for the card's ending, never to
+        // fill that id in — see below.
         let record = self.terminal_records.read(&ThreadKey::new(
             request.chat_id.clone(),
             request.thread_id.clone(),
         ));
-        let run_id = if request.run_id.is_empty() {
-            record
-                .as_ref()
-                .map(|record| record.run_id.clone())
-                .unwrap_or_default()
-        } else {
-            request.run_id.clone()
-        };
+        // The run id every rebuilt button names is the **payload's own**. A
+        // legacy payload has none, and the chat's current record may name a
+        // newer run: adopting that id here would let the old card's 「问 AI」
+        // pass the current-run check and submit the old command's output
+        // (spec #827: a click whose run id is not the current record id is
+        // stale). So it is never invented.
+        let run_id = request.run_id.clone();
+        // The ending must belong to the clicked card. A payload's run id names
+        // it; a legacy payload names no run, so only a record whose **own card
+        // id** is this card can speak for it — never a successor's card.
+        let record = record.filter(|record| {
+            if run_id.is_empty() {
+                record.card_id == request.message_id
+            } else {
+                record.run_id == run_id
+            }
+        });
         // The ending is the **record's**, not the payload's: a startup failure
         // and an unconfirmed termination live only there, and a rebuild that
         // invented a clean ending would misreport the run (spec #825). The
         // payload is not trusted to carry them; it is only a route.
         let outcome = (!request.lost)
-            .then(|| {
-                record
-                    .as_ref()
-                    .filter(|record| !run_id.is_empty() && record.run_id == run_id)
-                    .and_then(|record| record.outcome.as_ref())
-            })
+            .then(|| record.as_ref().and_then(|record| record.outcome.as_ref()))
             .flatten();
         if !request.lost && outcome.is_none() {
             // No durable ending for this run (the record expired, a successor

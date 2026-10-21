@@ -4421,21 +4421,39 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
 /// carries no `run_id`, and the shared outcome rebuild wrote a 「问 AI」 button
 /// with an empty id — a dead button that could only toast 「无效操作」. The
 /// rebuild now takes the Chat/Topic's current run from the record and omits
-/// 重跑, which would replay a run this card never named.
+/// A payload minted before the settled buttons named their run carries no
+/// `run_id`. The rebuild must **never invent one**: adopting the chat's current
+/// record id would let the old card's 「问 AI」 pass the current-run check and
+/// submit stale output (spec #827). The legacy card therefore keeps 完整输出 (it
+/// needs no run id) and gets no 问 AI at all; the run's own card still can.
+#[cfg(unix)]
+fn strip_run_id(value: &mut serde_json::Value) {
+    value.as_object_mut().unwrap().remove("run_id");
+    if let Some(card) = value
+        .get_mut("terminal_card")
+        .and_then(|value| value.as_object_mut())
+    {
+        card.remove("run_id");
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn a_legacy_payload_without_a_run_id_rebuilds_a_working_ask_ai_button() {
+async fn a_legacy_payload_never_rebuilds_a_submittable_ask_ai() {
     let _wd = test_work_dir();
     let proj = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     let cfg = test_config(&state.path().join("sessions.json"));
-    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
     let key = thread();
     seed_entry(&app, entry(&key, proj.path())).await;
 
+    let marker = "legacy-828";
     send_command_in(
         &app,
-        "/run printf 'legacy-828\\n'",
+        &format!("/run printf '{marker}\\n'"),
         key.clone(),
         "msg_legacy",
         ConversationKind::P2p,
@@ -4444,43 +4462,130 @@ async fn a_legacy_payload_without_a_run_id_rebuilds_a_working_ask_ai_button() {
     let settled = settled_card(&platform).await;
     let record = app.terminal_records.read(&key).expect("the run's record");
     let mut full_output = button_value(&settled, "full_output").expect("完整输出");
-    // The payload a card built before the buttons carried run ids looks like.
-    full_output.as_object_mut().unwrap().remove("run_id");
-    full_output["terminal_card"]
-        .as_object_mut()
-        .unwrap()
-        .remove("run_id");
+    strip_run_id(&mut full_output);
+    let ask = ask_ai_payload(&platform).await;
 
+    // The legacy card is still the chat's current record, so its ending is known.
     let result = app
-        .host_action_on_message(full_output, "msg_legacy")
+        .host_action_on_message(full_output, &record.card_id)
         .await
         .expect("the click is acknowledged");
     assert!(
         result.toast.unwrap_or_default().contains("完整输出"),
         "the legacy payload is still routable"
     );
-
-    let rebuilt = wait_for_patch_containing(&platform, "msg_legacy", "完整输出已作为文件消息发送").await;
-    let ask = button_value(&rebuilt, "ask_ai").expect("问 AI is rebuilt");
-    assert_eq!(
-        ask["run_id"].as_str(),
-        Some(record.run_id.as_str()),
-        "the rebuild names the chat's current run"
+    let rebuilt = wait_for_patch_containing(&platform, &record.card_id, "完整输出已作为文件消息发送").await;
+    let value = rebuilt.to_string();
+    assert!(
+        !value.contains("\"op\":\"ask_ai\""),
+        "no 问 AI may be rebuilt without a run id: {value}"
     );
     assert!(
-        button_value(&rebuilt, "rerun").is_none(),
-        "重跑 is not offered for a run the payload never named: {}",
-        card_text(&rebuilt)
+        button_value(&rebuilt, "full_output").is_some(),
+        "完整输出 needs no run id and stays: {value}"
+    );
+    assert!(
+        !value.contains("\"run_id\":\"\""),
+        "an empty run id is never written: {value}"
+    );
+    let text = card_text(&rebuilt);
+    assert!(
+        text.contains("退出码 0"),
+        "the record's ending still describes the card: {text}"
     );
 
+    // The run's own card keeps a working 问 AI: its payload named the run.
     let result = app
-        .host_action_on_message(ask, "msg_legacy")
+        .host_action_on_message(ask, &record.card_id)
         .await
         .expect("the click is acknowledged");
     let toast = result.toast.unwrap_or_default();
     assert!(
         toast.contains("AI"),
-        "the rebuilt 问 AI is not a dead 「无效操作」 button: {toast}"
+        "the current card's 问 AI still submits: {toast}"
+    );
+    wait_for_prompt_containing(&prompts, marker).await;
+}
+
+/// A legacy payload whose record a newer run has replaced can never submit its
+/// old output: the rebuild finds no record that names this card, so it leaves the
+/// card as it is (the outcome is spoken as text), and the legacy 问 AI payload —
+/// which names no run — is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_legacy_payload_cannot_submit_after_its_record_was_replaced() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform, _logs) = build_terminal_app(cfg, backend).await;
+    platform
+        .reply_ids
+        .lock()
+        .unwrap()
+        .extend(["msg_card_a".into(), "msg_card_b".into()]);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'old-legacy-828\\n'",
+        key.clone(),
+        "msg_old",
+        ConversationKind::P2p,
+    )
+    .await;
+    let settled = settled_card(&platform).await;
+    let old = app.terminal_records.read(&key).expect("the old record");
+    assert_eq!(old.card_id, "msg_card_a");
+    let mut legacy_full = button_value(&settled, "full_output").expect("完整输出");
+    strip_run_id(&mut legacy_full);
+    let mut legacy_ask = button_value(&settled, "ask_ai").expect("问 AI");
+    strip_run_id(&mut legacy_ask);
+
+    // A newer run replaces the chat's record before the old card is clicked.
+    send_command_in(
+        &app,
+        "/run printf 'new-legacy-828\\n'",
+        key.clone(),
+        "msg_new",
+        ConversationKind::P2p,
+    )
+    .await;
+    settled_card(&platform).await;
+    let current = app.terminal_records.read(&key).expect("the new record");
+    assert_eq!(current.card_id, "msg_card_b");
+
+    // 完整输出: no record names the old card, so nothing is rebuilt and the
+    // outcome is spoken as text (leaving the old card's state untouched).
+    let result = app
+        .host_action_on_message(legacy_full, "msg_card_a")
+        .await
+        .expect("the click is acknowledged");
+    assert!(
+        result.toast.unwrap_or_default().contains("完整输出"),
+        "the legacy payload is still routable"
+    );
+    wait_for_text_containing(&platform, "完整输出已作为文件消息发送").await;
+
+    // 问 AI: a payload with no run id cannot name a run, so it is refused — the
+    // old output never reaches the model.
+    let result = app
+        .host_action_on_message(legacy_ask, "msg_card_a")
+        .await
+        .expect("the click is acknowledged");
+    let toast = result.toast.unwrap_or_default();
+    assert!(
+        toast.contains("无效操作") || toast.contains("过期") || toast.contains("无法确认"),
+        "a legacy 问 AI is refused: {toast}"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        prompts.lock().await.is_empty(),
+        "the old card's output never reaches the model: {:?}",
+        prompts.lock().await
     );
 }
 
