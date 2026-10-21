@@ -70,8 +70,9 @@ nothing is ever moved.
 - **Collisions reuse, never silently destroy.** An existing directory gets a
   `-2`… suffix (the branch follows it). An existing branch that no worktree has
   checked out is attached to the new checkout — "start the new directory on that
-  branch" is the natural intent; a branch already checked out is refused with
-  git's own message.
+  branch" is the natural intent; a branch already checked out elsewhere is
+  refused, naming the checkout that holds it (the card's toast is the place for
+  a path the user can act on, not git's raw `already checked out` line).
 - **Creation declares, it never moves.** `new` writes a **Pending Session**
   (ADR-0041) titled with the worktree's name, so the next message creates the
   Session in the worktree. Nothing in the server moves, which is precisely why

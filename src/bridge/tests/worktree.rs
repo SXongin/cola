@@ -133,6 +133,11 @@ async fn worktree_card_data_lists_main_and_linked_checkouts() {
     assert_eq!(rows[1].sessions, 1);
     assert_eq!(rows[0].dirty, Some(true), "the untracked root dirties main");
     assert_eq!(rows[1].dirty, Some(false));
+    assert!(
+        rows[0].current,
+        "with no session or pending, the current marker falls back to work_dir (ADR-0088)"
+    );
+    assert!(!rows[1].current);
 
     let card = crate::feishu::card::session::build_worktree_card(&key(), &rows, &listed_repo).to_string();
     assert!(card.contains("主检出"), "{card}");
@@ -209,6 +214,39 @@ async fn worktree_card_pick_declares_a_pending() {
 
     let card = result.card.expect("the pick refreshes the card").to_string();
     assert!(card.contains("当前"), "{card}");
+}
+
+/// A payload directory that exists but is NOT a listed checkout is refused:
+/// a stale card must not turn an ordinary folder into the project directory.
+#[tokio::test]
+async fn worktree_card_pick_refuses_a_directory_that_is_not_a_worktree() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    std::fs::create_dir_all(repo.path().join(".worktrees/plain")).unwrap();
+    let plain = repo_canonical(&repo).join(".worktrees/plain");
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    let value = serde_json::json!({
+        "action": "worktree",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": plain.to_string_lossy(),
+        "name": "plain",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("worktree pick should return a result");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(toast.contains("已不是 worktree"), "{toast}");
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "a non-worktree directory never becomes a pending"
+    );
 }
 
 /// A checkout removed between render and click is a toast, never a pending on

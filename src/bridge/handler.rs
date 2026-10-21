@@ -1279,6 +1279,26 @@ fn reconcile_viewer_page_lane(
 /// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
 /// Session Creation, ADR-0041). A persist failure is logged and the caller still
 /// toasts success, parity with the switch card's 新建.
+/// The `/worktree` card for a data read (ADR-0088). A failed read degrades to a
+/// one-line card carrying the reason, so an in-place refresh never dies on the
+/// project that stopped being a git repository.
+fn worktree_card_from(
+    thread_key: &ThreadKey,
+    data: std::result::Result<(Vec<crate::feishu::card::session::WorktreeRow>, String), String>,
+) -> serde_json::Value {
+    match data {
+        Ok((rows, repo)) => crate::feishu::card::session::build_worktree_card(thread_key, &rows, &repo),
+        Err(error) => crate::feishu::card::shell::card_shell(
+            "🌲 worktree",
+            "blue",
+            vec![serde_json::json!({
+                "tag": "markdown",
+                "content": crate::feishu::card::sanitize::sanitize_markdown(&format!("⚠️ {error}")),
+            })],
+        ),
+    }
+}
+
 async fn declare_pending_dir(
     core: &Arc<SharedCore>,
     thread_key: &ThreadKey,
@@ -3395,9 +3415,12 @@ impl App {
 
     /// Handle a `/worktree` card button (ADR-0088): `op: "pick"` declares a
     /// **Pending Session** in the checkout — the same meaning as `/dir`'s pick,
-    /// so it never adopts an existing session (that is `/switch`'s job). A
-    /// checkout that vanished between render and click refreshes the card and
-    /// toasts instead of leaving a pending on a missing directory.
+    /// so it never adopts an existing session (that is `/switch`'s job).
+    ///
+    /// The click re-reads the inventory once: the payload's directory is
+    /// trusted only if it is still a listed checkout (and still on disk), so a
+    /// stale card can never turn an ordinary directory — or a pruned worktree
+    /// whose folder survived — into the conversation's project.
     async fn handle_worktree_card_action(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -3422,17 +3445,28 @@ impl App {
                 toast: Some("无效操作".to_string()),
             });
         }
+
+        // One bounded read serves both the validation and the refreshed card
+        // (a card callback runs on a deadline — CODING_STANDARDS.md).
+        let handles = core.command_handles();
+        let data = crate::feishu::card::command::worktree_card_data(&handles, &thread_key).await;
+        let listed = data.as_ref().is_ok_and(|(rows, _)| {
+            rows.iter()
+                .any(|row| crate::bridge::command::same_dir(&row.path, &directory))
+        });
+        let card = worktree_card_from(&thread_key, data);
+        if !listed || !std::path::Path::new(&directory).is_dir() {
+            return Some(CardActionResult {
+                card: Some(card),
+                toast: Some(format!("目录已不存在或已不是 worktree：`{directory}`")),
+            });
+        }
+
         let current = core.sessions.lock().await.current_directory(&thread_key);
         if current.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
             return Some(CardActionResult {
-                card: Some(self.build_worktree_card_for(core, &thread_key).await),
+                card: Some(card),
                 toast: Some("已在当前目录".to_string()),
-            });
-        }
-        if !std::path::Path::new(&directory).is_dir() {
-            return Some(CardActionResult {
-                card: Some(self.build_worktree_card_for(core, &thread_key).await),
-                toast: Some(format!("目录已不存在：`{directory}`")),
             });
         }
         let title = value
@@ -3442,30 +3476,9 @@ impl App {
             .map(str::to_string);
         declare_pending_dir(core, &thread_key, &directory, title).await;
         Some(CardActionResult {
-            card: Some(self.build_worktree_card_for(core, &thread_key).await),
+            card: Some(card),
             toast: Some(format!("下一条消息将在 `{directory}` 创建会话")),
         })
-    }
-
-    /// Rebuild the `/worktree` card in place (ADR-0088); a project that stopped
-    /// being a git repository degrades to a one-line card carrying the reason.
-    async fn build_worktree_card_for(
-        self: &Arc<Self>,
-        core: &Arc<SharedCore>,
-        thread_key: &ThreadKey,
-    ) -> serde_json::Value {
-        let handles = core.command_handles();
-        match crate::feishu::card::command::worktree_card_data(&handles, thread_key).await {
-            Ok((rows, repo)) => crate::feishu::card::session::build_worktree_card(thread_key, &rows, &repo),
-            Err(error) => crate::feishu::card::shell::card_shell(
-                "🌲 worktree",
-                "blue",
-                vec![serde_json::json!({
-                    "tag": "markdown",
-                    "content": crate::feishu::card::sanitize::sanitize_markdown(&format!("⚠️ {error}")),
-                })],
-            ),
-        }
     }
 
     /// Rebuild the `/dir` browse card (ADR-0078) for `view.dir`, clamping a

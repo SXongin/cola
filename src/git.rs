@@ -89,6 +89,9 @@ fn resolve_git_path(dir: &str, path: &str) -> std::path::PathBuf {
 async fn status_dirty(dir: &str) -> Option<bool> {
     let out = tokio::process::Command::new("git")
         .args(["-C", dir, "status", "--porcelain"])
+        // A dropped read (the dirty fan-out's deadline) must not leave a git
+        // child behind: `output()` only waits, it does not kill.
+        .kill_on_drop(true)
         .output()
         .await
         .ok()?;
@@ -101,22 +104,8 @@ async fn status_dirty(dir: &str) -> Option<bool> {
 /// Run a git command in `dir`; returns trimmed stdout, or None when git is
 /// unavailable, the command fails, or the output is empty (a clean status).
 async fn git(dir: &str, args: &[&str]) -> Option<String> {
-    let out = tokio::process::Command::new("git")
-        .args(["-C", dir])
-        .args(args)
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
-    }
+    let text = git_capture(dir, args).await.ok()?;
+    if text.is_empty() { None } else { Some(text) }
 }
 
 /// One checkout `git worktree list --porcelain` reports (ADR-0088).
@@ -239,9 +228,9 @@ fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
 }
 
 /// Dirty state per checkout, bounded (ADR-0088): one `git status --porcelain`
-/// each, at most four at a time under one overall deadline. A checkout that
-/// misses the deadline reads `None` — the card renders `?` instead of claiming
-/// a clean tree it never measured.
+/// each, at most four at a time, all under ONE shared deadline. A read that
+/// misses it reads `None` — the card renders `?` instead of claiming a clean
+/// tree it never measured — while a read that finished keeps its answer.
 pub async fn worktree_dirty(paths: &[String]) -> Vec<Option<bool>> {
     use std::sync::Arc;
 
@@ -249,17 +238,20 @@ pub async fn worktree_dirty(paths: &[String]) -> Vec<Option<bool>> {
     const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
     let limit = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+    // One deadline for the whole fan-out, not one per wave: a queued read must
+    // not extend the card's wait beyond the bound the ADR promises.
+    let deadline = tokio::time::Instant::now() + BUDGET;
     let reads = paths.iter().map(|path| {
         let limit = Arc::clone(&limit);
         async move {
-            let _permit = limit.acquire().await.ok()?;
-            status_dirty(path).await
+            let read = async move {
+                let _permit = limit.acquire().await.ok()?;
+                status_dirty(path).await
+            };
+            tokio::time::timeout_at(deadline, read).await.ok().flatten()
         }
     });
-    match tokio::time::timeout(BUDGET, futures_util::future::join_all(reads)).await {
-        Ok(results) => results,
-        Err(_) => vec![None; paths.len()],
-    }
+    futures_util::future::join_all(reads).await
 }
 
 /// The slug a worktree name becomes (ADR-0088): trim, lowercase,
@@ -430,6 +422,8 @@ async fn git_capture(dir: &str, args: &[&str]) -> Result<String, String> {
     let out = tokio::process::Command::new("git")
         .args(["-C", dir])
         .args(args)
+        // Same reason as `status_dirty`: a dropped future must not orphan git.
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|error| format!("git 无法执行：{error}"))?;
