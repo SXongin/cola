@@ -193,6 +193,10 @@ pub(crate) enum TerminalState<'a> {
         /// A group member outlived `sh`; the run was still live until it exited.
         survivors: bool,
     },
+    /// A bare `/run` moved the run's card to a newer message: this card keeps
+    /// the tail it froze with, offers no controls (the run is still live, and
+    /// one run must not show two current 终止 buttons), and says where to look.
+    Moved,
     /// A restart found the record still `running` and swept it (ADR-0086
     /// decisions 5 and 10): cola no longer tracks the run, and says so instead
     /// of guessing whether the child survived. 重跑, 完整输出 and 问 AI stay
@@ -259,6 +263,15 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
             "blue",
             "⏳ 启动中…".to_string(),
             "（等待输出…）",
+            false,
+        ),
+        TerminalState::Moved => (
+            "🖥️ 终端命令 · 已下移",
+            "grey",
+            // The run is NOT ended here: saying so would hide a live 终止. The
+            // line names the act and the place, nothing more.
+            "⇣ 已下移到最新卡片，本条不再更新。".to_string(),
+            "（无输出）",
             false,
         ),
         TerminalState::Live { past_cap, survivors } => {
@@ -1082,6 +1095,38 @@ mod tests {
         // The same card's 完整输出 keeps its own payload (path + render inputs).
         let full = find_button(&card, "full_output").expect("完整输出");
         assert!(full.get("terminal_card").is_some(), "{full}");
+    }
+
+    /// A card a bare `/run` superseded says where the run went and offers no
+    /// controls: the run is still live one message down, and a second 终止 here
+    /// would invite a click on a card that no longer updates.
+    #[test]
+    fn a_moved_card_names_the_newest_card_and_offers_nothing_to_click() {
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "make",
+            output: "still going\n",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: None,
+            notice: None,
+            state: TerminalState::Moved,
+            run_id: "run-827",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("已下移"), "{text}");
+        assert!(text.contains("本条不再更新"), "{text}");
+        assert!(
+            text.contains("still going"),
+            "it keeps the tail it froze with: {text}"
+        );
+        assert!(
+            !text.contains("⏹ 终止") && !text.contains("运行中"),
+            "a frozen card never claims the run or offers its control: {text}"
+        );
+        assert_eq!(card.to_string().matches("\"tag\":\"button\"").count(), 0);
     }
 
     /// #827: the card the send happens on says 「启动中」 and offers no control —

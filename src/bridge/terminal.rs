@@ -19,6 +19,9 @@
 //!   (#823, decision 4). The ending is **persisted before** that write, so a
 //!   failure — or cola dying between the two — is a write a restart finishes
 //!   rather than a card left looking live (whole-branch review, finding 1);
+//! - bare `/run` moves the card to the newest position: the loop reposts it,
+//!   re-points the run and freezes the superseded card, while a settled or lost
+//!   run is rebuilt from its record (ADR-0086's 2026-10-21 amendment);
 //! - one run per **Chat**/**Topic** is claimed atomically, and the run is live
 //!   while its **process group** has members — not while `sh` is alive — so a
 //!   background child keeps the claim, the tail and 「⏹ 终止」 until the group
@@ -53,7 +56,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
@@ -159,6 +162,22 @@ pub(crate) struct TerminalRequest<'a> {
 pub(crate) const TERMINAL_BUSY: &str =
     "⚠️ 这个会话已有终端命令在运行，请先点击运行卡片的「⏹ 终止」后再执行。";
 
+/// What a bare `/run` says when the repost itself was refused: the old card is
+/// untouched and still live, so the reader must not be left thinking a second
+/// card exists somewhere.
+const TERMINAL_PULL_FAILED: &str = "⚠️ 无法把终端卡片移到最新位置（飞书拒绝了这次发卡），原卡片仍在更新。";
+
+/// What a bare `/run` says when the record cannot rebuild a card yet: the run
+/// just ended (or the loop is gone) and the durable state is still being
+/// written. Saying "then try again" is honest; presenting a stale card is not.
+const TERMINAL_PULL_PENDING: &str = "⚠️ 终端命令状态正在更新，请稍后再发一次 `/run` 查看结果。";
+
+/// How long a bare `/run` waits for the loop's answer. One repost is a single
+/// card create under the card write lock, so the bound only has to outlast one
+/// stalled platform call plus the lock wait; past it, the command answers with
+/// [`TERMINAL_PULL_PENDING`] rather than hanging the message.
+const TERMINAL_PULL_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// What a card button asks the live run to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalOp {
@@ -184,6 +203,35 @@ impl TerminalOp {
 enum TerminalControl {
     Kill,
     Continue,
+    /// Bare `/run`: move the run's card to the newest position. The loop owns
+    /// this act because it owns the facts the new card renders (the cap state
+    /// and the survivor state) and the one card write lock. `ack` reports the
+    /// repost back to the command, so a pull the loop cannot serve is a stated
+    /// refusal rather than a silent no-op.
+    Pull {
+        reply_to: String,
+        ack: oneshot::Sender<PullOutcome>,
+    },
+}
+
+/// What a bare `/run` pull did, as the run loop reports it to the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PullOutcome {
+    /// A fresh live card is at the newest position, and the run patches it from
+    /// now on. The card itself is the reply — no text is owed.
+    Posted,
+    /// The repost did not land. The old card is untouched and still live, so the
+    /// command says so instead of leaving the reader without either.
+    Failed,
+}
+
+/// What the slot registry found for a bare `/run`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalPull {
+    /// The live run's loop was asked; [`PullOutcome`] carries its answer.
+    Requested,
+    /// No run this process can reach (none, not live yet, or the loop is gone).
+    NoLiveRun,
 }
 
 /// What a card action found (ADR-0086 decision 4): the click is refused by
@@ -315,6 +363,36 @@ impl TerminalRuns {
             TerminalControlOutcome::Accepted
         } else {
             TerminalControlOutcome::Stale
+        }
+    }
+
+    /// Ask the Chat/Topic's live run to move its card to the newest position
+    /// (bare `/run`). Unlike a card action there is no run id to check — the
+    /// command names no card — so only liveness gates it: a run that has not
+    /// spawned yet has no live tail to repost, and a settled one is rebuilt from
+    /// its record by the caller instead.
+    pub(crate) fn pull(
+        &self,
+        key: &ThreadKey,
+        reply_to: &str,
+        ack: oneshot::Sender<PullOutcome>,
+    ) -> TerminalPull {
+        let Some(run) = self.runs.get(key) else {
+            return TerminalPull::NoLiveRun;
+        };
+        // `live` false covers 「启动中」 (the card exists, the child does not) and
+        // the window after the group emptied.
+        if !run.live.load(Ordering::SeqCst) {
+            return TerminalPull::NoLiveRun;
+        }
+        let control = TerminalControl::Pull {
+            reply_to: reply_to.to_string(),
+            ack,
+        };
+        match run.control.send(control) {
+            Ok(()) => TerminalPull::Requested,
+            // The loop is gone; the record is the only surface left.
+            Err(_) => TerminalPull::NoLiveRun,
         }
     }
 }
@@ -573,8 +651,9 @@ pub(crate) async fn execute(
 ) -> crate::error::Result<()> {
     let platform = handles.flow.platform.as_ref();
     let Some(spec) = spec else {
-        platform.reply_text(request.message_id, RUN_USAGE).await?;
-        return Ok(());
+        // Bare `/run` is the Terminal Card's locator, the way `/card` is the
+        // live Turn card's: the family's own command name, no new command.
+        return show_card(handles, thread_key, request.message_id).await;
     };
     if let Some(reason) = unsupported_reason() {
         platform.reply_text(request.message_id, reason).await?;
@@ -588,6 +667,137 @@ pub(crate) async fn execute(
         return Ok(());
     };
     run_claimed(handles, claimed, request, spec, None).await
+}
+
+/// Bare `/run`: bring the **Chat/Topic**'s **Terminal Card** back to the newest
+/// position — the Terminal family's answer to `/card`, for the same reason
+/// (command replies and the Turn's own messages bury the live card above them).
+///
+/// Two shapes, decided by what can still be reached:
+///
+/// - **A live run** is served by its loop (ADR-0086 decision 4 keeps the card's
+///   identity durable and the loop the only writer). The loop reposts the card
+///   and re-points every later live patch and the settling write at it; the old
+///   card is frozen in place as 「已下移」, so the chat never holds two card
+///   copies that both look live. The new card is the reply, so a successful pull
+///   writes no text.
+/// - **A settled or lost run** is rebuilt from its **Terminal Run Record** and
+///   posted as a fresh, standalone card. Nothing durable changes: the record
+///   already names the run, and the rebuilt card's buttons work exactly as the
+///   settled one's do (the same `settled_card` / `lost_card` builders the settle
+///   and the startup sweep use).
+///
+/// A run that is starting, or one whose loop just ended before it could answer,
+/// reads as "updating" rather than as a card that would be a lie; with no record
+/// at all, the usage text stays the answer.
+pub(crate) async fn show_card(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    message_id: &str,
+) -> crate::error::Result<()> {
+    let platform = handles.flow.platform.as_ref();
+    let (ack, acked) = oneshot::channel();
+    let pull = {
+        let runs = handles
+            .terminal_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        runs.pull(thread_key, message_id, ack)
+    };
+    if pull == TerminalPull::Requested {
+        match tokio::time::timeout(TERMINAL_PULL_ACK_TIMEOUT, acked).await {
+            Ok(Ok(PullOutcome::Posted)) => return Ok(()),
+            Ok(Ok(PullOutcome::Failed)) => {
+                platform.reply_text(message_id, TERMINAL_PULL_FAILED).await?;
+                return Ok(());
+            }
+            // The loop ended (or could not answer in time) without reposting.
+            // Fall through to the record: when it already settled, the rebuild
+            // below still answers the request.
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    match record_card(handles.terminal_records.read(thread_key)) {
+        Some(card) => {
+            platform.reply_card(message_id, &card).await?;
+        }
+        None => {
+            let text = if has_record(handles, thread_key) {
+                TERMINAL_PULL_PENDING
+            } else {
+                RUN_USAGE
+            };
+            platform.reply_text(message_id, text).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether the Chat/Topic has any **Terminal Run Record**, settled or not. Only
+/// used to choose between "the state is still being written" and the bare usage
+/// line, so a failed read (which claims nothing) reads as no record.
+fn has_record(handles: &CommandHandles, thread_key: &ThreadKey) -> bool {
+    handles.terminal_records.read(thread_key).is_some()
+}
+
+/// The card a **Terminal Run Record** can rebuild at the newest position: its
+/// settled ending when it has one, its lost card when the restart gave up on it.
+/// `None` for a record that still claims `running` — that run's card belongs to
+/// its loop, and a second card built here could disagree with it.
+fn record_card(record: Option<TerminalRunRecord>) -> Option<serde_json::Value> {
+    let record = record?;
+    match record.state {
+        TerminalRunState::Settled => {
+            let outcome = record.outcome.as_ref()?;
+            Some(settled_card(
+                &record.cwd,
+                &record.command,
+                Path::new(&record.log_path),
+                &record.run_id,
+                &record.chat_id,
+                &record.thread_id,
+                record.is_group,
+                true,
+                outcome,
+            ))
+        }
+        TerminalRunState::Lost => Some(lost_card(&record)),
+        TerminalRunState::Running => None,
+    }
+}
+
+/// The card a run the startup sweep had to give up on shows (ADR-0086 decision
+/// 10): the tail the log still holds, `完整输出` kept as the evidence the
+/// restart did not destroy, `重跑` offered from the record, and no run controls.
+/// One builder for the sweep's repair and a bare `/run` repost, so the two can
+/// never tell different stories about the same run.
+fn lost_card(record: &TerminalRunRecord) -> serde_json::Value {
+    let log = Path::new(&record.log_path);
+    let (output, output_truncated) = read_display_tail(log);
+    build_terminal_card(TerminalCard {
+        cwd: &record.cwd,
+        command: &record.command,
+        output: &output,
+        output_truncated,
+        output_over_limit: false,
+        full_output: Some(TerminalFullOutput {
+            log_path: &record.log_path,
+            chat_id: &record.chat_id,
+            thread_id: &record.thread_id,
+            run_id: &record.run_id,
+            rerun_run_id: Some(&record.run_id),
+            lost: true,
+            is_group: record.is_group,
+            exit_code: None,
+            elapsed: Duration::ZERO,
+            output_over_limit: false,
+        }),
+        notice: None,
+        state: TerminalState::Lost,
+        run_id: &record.run_id,
+        chat_id: &record.chat_id,
+        thread_id: &record.thread_id,
+    })
 }
 
 /// Claim the Chat/Topic's slot for a fresh run id (ADR-0086 decision 6), or
@@ -727,6 +937,11 @@ async fn run_claimed(
         thread_id: &thread_key.thread_id,
     });
     let card_id = platform.reply_card(request.message_id, &live).await?;
+    // The card this run writes to. It is shared rather than captured because a
+    // bare `/run` pull moves the run onto a fresh message mid-flight (the loop
+    // swaps it under the same `card_write` lock every live PATCH takes), and
+    // both the patch loop and the settling write must follow the newest card.
+    let target = Arc::new(Mutex::new(card_id.clone()));
     // Every live PATCH goes through one write lock, and `settled` marks the
     // point after which no live PATCH may be issued. A parked/late live write
     // can then never land after the settling write: the settle takes the same
@@ -805,7 +1020,7 @@ async fn run_claimed(
     }
     let patch_facts = Arc::new(LivePatchFacts {
         platform: Arc::clone(&handles.flow.platform),
-        card_id: card_id.clone(),
+        card_id: Arc::clone(&target),
         cwd: cwd.clone(),
         command: spec.command.clone(),
         log: log.path.clone(),
@@ -983,6 +1198,29 @@ async fn run_claimed(
                         patch_facts.cap_announced.store(false, Ordering::SeqCst);
                     }
                 }
+                Some(TerminalControl::Pull { reply_to, ack }) => {
+                    // The loop owns the repost: it knows the render state the new
+                    // card must carry and holds the card write lock. A failed
+                    // repost is reported back so the command can say so.
+                    let outcome = repoint_card(
+                        platform,
+                        &target,
+                        &card_write,
+                        &reply_to,
+                        &cwd,
+                        &spec.command,
+                        &log.path,
+                        &run,
+                        &thread_key.chat_id,
+                        &thread_key.thread_id,
+                        past_cap,
+                        survivors,
+                        &handles.terminal_records,
+                        &mut record,
+                    )
+                    .await;
+                    let _ = ack.send(outcome);
+                }
                 None => break,
             },
             _ = exit_poll.tick(), if child_exit.is_none() => {
@@ -1073,12 +1311,15 @@ async fn run_claimed(
     // The ending becomes a durable obligation BEFORE the card's last write: a
     // failed (or interrupted) write is then a promise the next start keeps, from
     // a file the chat's next run cannot replace (whole-branch review, finding 1).
+    // The settling write goes to the card the run is on NOW: a pull may have
+    // moved it while the loop was running.
+    let settled_card_id = target.lock().unwrap_or_else(PoisonError::into_inner).clone();
     finish_run(
         &handles.terminal_records,
         &mut record,
         true,
         platform,
-        &card_id,
+        &settled_card_id,
         &cwd,
         &spec.command,
         &log.path,
@@ -1415,34 +1656,7 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
             continue;
         }
         if !record.card_id.is_empty() {
-            let log = Path::new(&record.log_path);
-            let (output, output_truncated) = read_display_tail(log);
-            let card = build_terminal_card(TerminalCard {
-                cwd: &record.cwd,
-                command: &record.command,
-                output: &output,
-                output_truncated,
-                output_over_limit: false,
-                // 完整输出 stays usable on a lost run: the log is the evidence
-                // a restart did not destroy.
-                full_output: Some(TerminalFullOutput {
-                    log_path: &record.log_path,
-                    chat_id: &record.chat_id,
-                    thread_id: &record.thread_id,
-                    run_id: &record.run_id,
-                    rerun_run_id: Some(&record.run_id),
-                    lost: true,
-                    is_group: record.is_group,
-                    exit_code: None,
-                    elapsed: Duration::ZERO,
-                    output_over_limit: false,
-                }),
-                notice: None,
-                state: TerminalState::Lost,
-                run_id: &record.run_id,
-                chat_id: &record.chat_id,
-                thread_id: &record.thread_id,
-            });
+            let card = lost_card(&record);
             match patch_card(
                 platform,
                 &record.card_id,
@@ -1833,6 +2047,100 @@ async fn settle(
     true
 }
 
+/// Move one live run's card to the newest position (bare `/run`).
+///
+/// Order is the whole safety argument:
+///
+/// 1. post the fresh live card (bounded like every other platform call);
+/// 2. re-point the run at it, then write that id into the **Terminal Run
+///    Record**;
+/// 3. only then freeze the old card as 「已下移」, with no controls.
+///
+/// A stall or a timeout in step 3 therefore leaves the run writing the card the
+/// reader is looking at — the old card merely keeps looking live, and it can
+/// never be the run's target again. Everything runs under the card write lock,
+/// so an in-flight live PATCH either finished before this or waits for the swap
+/// and writes the new card; a queued one cannot resurrect the old card.
+#[allow(clippy::too_many_arguments)]
+async fn repoint_card(
+    platform: &dyn Platform,
+    target: &Mutex<String>,
+    card_write: &tokio::sync::Mutex<()>,
+    reply_to: &str,
+    cwd: &str,
+    command: &str,
+    log: &Path,
+    run_id: &str,
+    chat_id: &str,
+    thread_id: &str,
+    past_cap: bool,
+    survivors: bool,
+    records: &TerminalRunRecords,
+    record: &mut TerminalRunRecord,
+) -> PullOutcome {
+    // One read of the log feeds both cards, so the frozen copy and the fresh one
+    // tell the same story about the same instant.
+    let (output, output_truncated) = read_display_tail(log);
+    let fresh = build_terminal_card(TerminalCard {
+        cwd,
+        command,
+        output: &output,
+        output_truncated,
+        output_over_limit: false,
+        full_output: None,
+        notice: None,
+        state: TerminalState::Live { past_cap, survivors },
+        run_id,
+        chat_id,
+        thread_id,
+    });
+    let _guard = card_write.lock().await;
+    let old = target.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let new_id = match tokio::time::timeout(
+        Duration::from_millis(TERMINAL_PATCH_TIMEOUT_MS),
+        platform.reply_card(reply_to, &fresh),
+    )
+    .await
+    {
+        Ok(Ok(id)) => id,
+        Ok(Err(error)) => {
+            tracing::warn!("terminal: pull could not post the new card: {error}");
+            return PullOutcome::Failed;
+        }
+        Err(_) => {
+            tracing::warn!("terminal: pull timed out posting the new card");
+            return PullOutcome::Failed;
+        }
+    };
+    *target.lock().unwrap_or_else(PoisonError::into_inner) = new_id.clone();
+    // The record is what a restart patches: without this write a restart would
+    // repair the frozen copy while the run's real card stayed looking live.
+    record.card_id = new_id;
+    if let Err(error) = records.write(record) {
+        tracing::warn!(
+            "terminal: pull reposted the card but could not record its id for run {run_id} \
+             ({error}); a restart would repair the superseded card instead"
+        );
+    }
+    // The superseded card keeps the tail it last showed and loses its controls:
+    // one run must never offer two 终止 buttons that both look current.
+    let frozen = build_terminal_card(TerminalCard {
+        cwd,
+        command,
+        output: &output,
+        output_truncated,
+        output_over_limit: false,
+        full_output: None,
+        notice: None,
+        state: TerminalState::Moved,
+        run_id,
+        chat_id,
+        thread_id,
+    });
+    patch_card(platform, &old, &frozen, "freeze a superseded terminal card").await;
+    PullOutcome::Posted
+}
+
 /// End a run: persist the **owed settlement** first, tell the card, then drop
 /// the obligation once its PATCH landed **and** the chat's record no longer says
 /// the run is running (whole-branch review, finding 1).
@@ -1947,7 +2255,11 @@ async fn patch_live(
 /// The immutable facts one live PATCH needs, shared by every spawned patch.
 struct LivePatchFacts {
     platform: Arc<dyn Platform>,
-    card_id: String,
+    /// The run's current card message. Shared because a bare `/run` pull moves
+    /// the run onto a fresh message; every read happens under the card write
+    /// lock, so a patch either writes the old card before the move or the new
+    /// one after it.
+    card_id: Arc<Mutex<String>>,
     cwd: String,
     command: String,
     log: PathBuf,
@@ -2045,9 +2357,17 @@ fn spawn_live_patch(
                 if settled.load(Ordering::SeqCst) {
                     return false;
                 }
+                // Read the target under the same lock the pull swaps it under,
+                // so this patch cannot be aimed at the card the pull just
+                // superseded.
+                let card_id = facts
+                    .card_id
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 patch_live(
                     &*facts.platform,
-                    &facts.card_id,
+                    &card_id,
                     &facts.cwd,
                     &facts.command,
                     &facts.log,
