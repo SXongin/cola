@@ -876,15 +876,11 @@ pub struct WorktreeRow {
     pub current: bool,
 }
 
-/// The `/worktree` picker card (ADR-0088): the project's git checkouts, the
-/// main one included and labelled, each with its branch, dirty marker, session
-/// count and current marker. Picking a row declares a Pending Session there —
-/// the same meaning as the `/dir` card's pick, so it never adopts.
-pub fn build_worktree_card(
-    thread_key: &crate::config::ThreadKey,
-    rows: &[WorktreeRow],
-    repo: &str,
-) -> serde_json::Value {
+/// The `/worktree` card (ADR-0088): the project's git checkouts, the main one
+/// included and labelled, each with its branch, dirty marker, session count and
+/// current marker. Read-only — re-rooting is `/dir`'s Pending Session and
+/// adoption is `/switch`'s job, so the card carries no callback and no button.
+pub fn build_worktree_card(rows: &[WorktreeRow], repo: &str) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = Vec::new();
     elements.push(json!({
         "tag": "markdown",
@@ -922,32 +918,14 @@ pub fn build_worktree_card(
             format!(" · {} 个会话", row.sessions)
         };
         elements.push(card_text_row(&format!("{title}\n{branch}{dirty}{sessions}")));
-        elements.push(json!({
-            "tag": "column_set",
-            "flex_mode": "none",
-            "columns": [{
-                "tag": "column",
-                "width": "auto",
-                "vertical_align": "center",
-                "elements": [{
-                    "tag": "button",
-                    "text": {
-                        "tag": "plain_text",
-                        "content": if row.current { "✅ 当前" } else { "切换到这里" },
-                    },
-                    "type": "default",
-                    "value": {
-                        "action": "worktree",
-                        "op": "pick",
-                        "chat_id": thread_key.chat_id,
-                        "thread_id": thread_key.thread_id,
-                        "directory": row.path,
-                        "name": row.name,
-                    },
-                }]
-            }]
-        }));
     }
+    // ADR-0088: the list is read-only. Re-rooting keeps the ONE meaning it has
+    // everywhere (`/dir`'s Pending Session) and adopting an existing Session
+    // stays `/switch`'s job, so this card needs no callback and no button.
+    elements.push(json!({
+        "tag": "markdown",
+        "content": "用 `/dir <路径>` 在该 worktree 重新落根；已有会话用 `/switch <名字>` 接管。",
+    }));
     card_shell("🌲 worktree", "blue", elements)
 }
 
@@ -2538,7 +2516,6 @@ mod tests {
     /// empty project points at `/worktree new`.
     #[test]
     fn worktree_card_renders_detached_unknown_dirty_and_empty() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let rows = vec![
             WorktreeRow {
                 path: "/r/.worktrees/a".into(),
@@ -2559,17 +2536,20 @@ mod tests {
                 current: true,
             },
         ];
-        let text = build_worktree_card(&key, &rows, "/r").to_string();
+        let text = build_worktree_card(&rows, "/r").to_string();
         assert!(text.contains("detached HEAD"), "{text}");
         assert!(text.contains("? 状态未知"), "{text}");
         assert!(text.contains("主检出"), "{text}");
         assert!(text.contains("3 个会话"), "{text}");
         assert!(!text.contains("0 个会话"), "{text}");
         assert!(text.contains("✅ 当前"), "{text}");
-        assert!(text.contains("切换到这里"), "{text}");
-        assert!(text.contains("\"action\":\"worktree\""), "{text}");
+        assert!(
+            !text.contains("\"tag\":\"button\""),
+            "the list is read-only: {text}"
+        );
+        assert!(text.contains("/dir <路径>"), "the re-root route is named: {text}");
 
-        let empty = build_worktree_card(&key, &[], "/r").to_string();
+        let empty = build_worktree_card(&[], "/r").to_string();
         assert!(empty.contains("还没有 worktree"), "{empty}");
         assert!(
             !empty.contains("\"tag\":\"button\""),

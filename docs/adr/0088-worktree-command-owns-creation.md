@@ -1,4 +1,4 @@
-# Worktree: cola creates the checkout with git and re-roots by Pending Session
+# Worktree: cola creates the checkout with git and starts by Pending Session
 
 Issue #433 taught cola to **follow** a Session that has already moved into a linked
 worktree: the directory mapping follows the server's location and the **Turn
@@ -27,8 +27,8 @@ nothing is ever moved.
 - **The server's list is an inventory, not a git view.** It returns
   `[{directory, strategy}]` — the main checkout included, directories that no
   longer exist kept until `POST /api/worktree/refresh` — and carries neither the
-  branch nor the dirty state. Both are exactly what a user picks a worktree to
-  see, and both are git reads either way.
+  branch nor the dirty state. Both are exactly what a user checks a worktree for,
+  and both are git reads either way.
 - **The root already has two conventions.** This repository sets
   `worktree.directory = ".worktrees"` in `opencode.json`; the server's default is
   outside the repository (`<server data dir>/worktree/<first six of the project
@@ -79,13 +79,16 @@ nothing is ever moved.
   #428's interruption cannot occur. A bound **Topic** is refused like `/dir`
   (`TOPIC_SELECTION_REJECTION`); a busy session is allowed; an existing Pending
   Session is replaced, as repeating `/dir` is.
-- **The card lists the project's checkouts, and pick means a new Session.** Rows
-  carry the directory's name, branch, dirty marker, session count and current
-  marker; the main checkout is a row labelled 「主检出」. Picking declares a
-  Pending Session — the same one meaning `/dir`'s card has — and never adopts:
-  `/switch` is the adoption surface, and one card with two meanings is the
-  harder thing to explain. The current directory falls back to `bridge.work_dir`
-  when the conversation has neither a session nor a pending, matching `/new`.
+- **The card is read-only.** Rows carry the directory's name, branch, dirty
+  marker, session count and current marker; the main checkout is a row labelled
+  「主检出」, and the card names the two routes out of it. It carries no
+  callback and no button: re-rooting keeps the one meaning it has everywhere
+  (`/dir` declares the Pending Session), and adopting an existing Session stays
+  `/switch`'s job. A pick button would have made this feature's only callback
+  write the session store — the one operation a callback cannot bound
+  (ADR-0089). The current
+  marker falls back to `bridge.work_dir` when the conversation has neither a
+  session nor a pending, matching `/new`.
 - **Dirty is measured, bounded.** One `git status --porcelain` per worktree,
   concurrency 4 under a 5 s overall bound; a row that misses the bound renders
   `?` rather than pretending to be clean. The list is not cached.
@@ -116,9 +119,11 @@ nothing is ever moved.
 - **Accept Chinese names, or transliterate them.** Rejected: a slug that cannot
   be typed on another machine, or a transliteration table that is always partly
   wrong, for a value the user can choose in English.
-- **Make pick adopt an existing Session when the directory has one.** Rejected:
-  the same click would mean "create" or "adopt" depending on invisible history;
-  the row's session count carries that information without changing the action.
+- **Make the card a picker.** Rejected on the second look: re-rooting is
+  `/dir`'s job and adopting is `/switch`'s, so a pick button would duplicate
+  both — and, unlike either, it would be a card callback writing the session
+  store, the one operation a callback cannot bound (ADR-0089). The card's rows
+  still say what a picker would show; the routes out are named under it.
 - **Removal in the same change.** Rejected: clean/dirty and force guards plus
   mappings that outlive a directory are a separate decision with their own
   failure modes.
@@ -131,13 +136,10 @@ nothing is ever moved.
 - A worktree created here is unknown to the server's inventory until OpenCode's
   own discovery runs; cola does not care, because a Session is created **in** a
   directory, not **for** a worktree resource.
-- Listing costs one `git worktree list` plus N status reads, bounded at 5 s on
-  the command path; a hung filesystem shows `?` instead of blocking the card.
-  A pick is a card callback on a 2 s ack deadline, so validation, the pending
-  write and the refresh share ONE 1.4 s deadline — a read past that bound
-  leaves the row `?` rather than holding the ack hostage, and a pick that
-  reaches the write already past it refuses instead of persisting a pending
-  the ack can no longer show.
+- Listing costs one `git worktree list` plus N status reads, bounded at 5 s; a
+  hung filesystem shows `?` instead of blocking the card. The card runs outside
+  any ack budget — a command reply, not a click — so it needs no shorter bound
+  and no deferred write.
 - ADR-0041 gains a creation surface (`/worktree new`); nothing else in the
   session model changes — a worktree Session is an ordinary Session whose
   directory happens to be a linked checkout.

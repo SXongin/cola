@@ -1,7 +1,6 @@
-//! `/worktree` (ADR-0088): the card, the create command, and the pick that
-//! declares a Pending Session in a checkout. Every worktree here is a real one
-//! in a throwaway git repository — the point of the command is git's own
-//! state, so a mock would test nothing.
+//! `/worktree` (ADR-0088): the read-only card and the create command. Every
+//! worktree here is a real one in a throwaway git repository — the point of the
+//! command is git's own state, so a mock would test nothing.
 
 use crate::bridge::test_support::*;
 
@@ -141,12 +140,16 @@ async fn worktree_card_data_lists_main_and_linked_checkouts() {
     );
     assert!(!rows[1].current);
 
-    let card = crate::feishu::card::session::build_worktree_card(&key(), &rows, &listed_repo).to_string();
+    let card = crate::feishu::card::session::build_worktree_card(&rows, &listed_repo).to_string();
     assert!(card.contains("主检出"), "{card}");
     assert!(card.contains("wt/feature"), "{card}");
     assert!(card.contains("有未提交改动"), "{card}");
     assert!(card.contains("1 个会话"), "{card}");
-    assert!(card.contains("\"action\":\"worktree\""), "{card}");
+    assert!(
+        !card.contains("\"tag\":\"button\""),
+        "the list is read-only: {card}"
+    );
+    assert!(card.contains("/dir <路径>"), "the re-root route is named: {card}");
 }
 
 /// A non-git project answers text, not an empty card.
@@ -174,118 +177,10 @@ async fn worktree_card_refuses_a_non_git_project() {
 
 /// Picking a checkout declares a Pending Session there, titled with the row's
 /// name, and refreshes the card with that row marked 当前 (ADR-0088).
-#[tokio::test]
-async fn worktree_card_pick_declares_a_pending() {
-    let _wd = test_work_dir();
-    let sessions = tempfile::tempdir().unwrap();
-    let repo = init_repo();
-    git(
-        repo.path(),
-        &["worktree", "add", "-b", "wt/feature", ".worktrees/feature"],
-    );
-    let mut cfg = test_config(&sessions.path().join("sessions.json"));
-    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    let worktree = repo_canonical(&repo).join(".worktrees/feature");
-
-    let value = serde_json::json!({
-        "action": "worktree",
-        "op": "pick",
-        "chat_id": "chat_1",
-        "thread_id": "chat_1",
-        "directory": worktree.to_string_lossy(),
-        "name": "feature",
-    });
-    let result = app
-        .host_action(value)
-        .await
-        .expect("worktree pick should return a result");
-    let toast = result.toast.clone().unwrap_or_default();
-    assert!(toast.contains("下一条消息"), "{toast}");
-    assert!(toast.contains("feature"), "{toast}");
-
-    let pending = app
-        .sessions
-        .lock()
-        .await
-        .pending_for(&key())
-        .cloned()
-        .expect("the pick declares a pending");
-    assert_eq!(pending.directory, worktree.to_string_lossy());
-    assert_eq!(pending.title.as_deref(), Some("feature"));
-
-    let card = result.card.expect("the pick refreshes the card").to_string();
-    assert!(
-        card.contains("**feature** · ✅ 当前"),
-        "the picked checkout is the current row: {card}"
-    );
-}
-
 /// A payload directory that exists but is NOT a listed checkout is refused:
 /// a stale card must not turn an ordinary folder into the project directory.
-#[tokio::test]
-async fn worktree_card_pick_refuses_a_directory_that_is_not_a_worktree() {
-    let _wd = test_work_dir();
-    let sessions = tempfile::tempdir().unwrap();
-    let repo = init_repo();
-    std::fs::create_dir_all(repo.path().join(".worktrees/plain")).unwrap();
-    let plain = repo_canonical(&repo).join(".worktrees/plain");
-    let mut cfg = test_config(&sessions.path().join("sessions.json"));
-    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    let value = serde_json::json!({
-        "action": "worktree",
-        "op": "pick",
-        "chat_id": "chat_1",
-        "thread_id": "chat_1",
-        "directory": plain.to_string_lossy(),
-        "name": "plain",
-    });
-    let result = app
-        .host_action(value)
-        .await
-        .expect("worktree pick should return a result");
-    let toast = result.toast.clone().unwrap_or_default();
-    assert!(toast.contains("已不是 worktree"), "{toast}");
-    assert!(
-        app.sessions.lock().await.pending_for(&key()).is_none(),
-        "a non-worktree directory never becomes a pending"
-    );
-}
-
 /// A checkout removed between render and click is a toast, never a pending on
 /// a missing directory (ADR-0088).
-#[tokio::test]
-async fn worktree_card_pick_of_a_missing_checkout_toasts() {
-    let _wd = test_work_dir();
-    let sessions = tempfile::tempdir().unwrap();
-    let repo = init_repo();
-    let missing = repo_canonical(&repo).join(".worktrees").join("gone");
-    let mut cfg = test_config(&sessions.path().join("sessions.json"));
-    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    let value = serde_json::json!({
-        "action": "worktree",
-        "op": "pick",
-        "chat_id": "chat_1",
-        "thread_id": "chat_1",
-        "directory": missing.to_string_lossy(),
-        "name": "gone",
-    });
-    let result = app
-        .host_action(value)
-        .await
-        .expect("worktree pick should return a result");
-    let toast = result.toast.clone().unwrap_or_default();
-    assert!(toast.contains("目录已不存在"), "{toast}");
-    assert!(
-        app.sessions.lock().await.pending_for(&key()).is_none(),
-        "a missing directory never becomes a pending"
-    );
-}
-
 /// A name the slug rule refuses answers the reason and declares nothing.
 #[tokio::test]
 async fn worktree_new_refuses_a_chinese_name() {
@@ -355,108 +250,10 @@ async fn worktree_new_passes_the_base_ref_through() {
 }
 
 /// Picking the checkout the conversation already sits in is a no-op toast.
-#[tokio::test]
-async fn worktree_card_pick_of_the_current_checkout_toasts_only() {
-    let _wd = test_work_dir();
-    let sessions = tempfile::tempdir().unwrap();
-    let repo = init_repo();
-    git(
-        repo.path(),
-        &["worktree", "add", "-b", "wt/feature", ".worktrees/feature"],
-    );
-    let feature = repo_canonical(&repo).join(".worktrees/feature");
-    let mut cfg = test_config(&sessions.path().join("sessions.json"));
-    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-    seed_pending(
-        &app,
-        crate::bridge::session::PendingEntry::new(key(), feature.to_string_lossy()),
-    )
-    .await;
-
-    let value = serde_json::json!({
-        "action": "worktree",
-        "op": "pick",
-        "chat_id": "chat_1",
-        "thread_id": "chat_1",
-        "directory": feature.to_string_lossy(),
-        "name": "feature",
-    });
-    let result = app
-        .host_action(value)
-        .await
-        .expect("worktree pick should return a result");
-    assert_eq!(result.toast.as_deref(), Some("已在当前目录"));
-    assert!(result.card.is_none(), "no change, no repaint");
-    assert_eq!(
-        app.sessions
-            .lock()
-            .await
-            .pending_for(&key())
-            .map(|p| p.directory.clone()),
-        Some(feature.to_string_lossy().to_string())
-    );
-}
-
 /// Unknown ops and empty payloads are answered without touching git or the
 /// store.
-#[tokio::test]
-async fn worktree_card_pick_rejects_an_unknown_op_and_an_empty_directory() {
-    let _wd = test_work_dir();
-    let sessions = tempfile::tempdir().unwrap();
-    let repo = init_repo();
-    let mut cfg = test_config(&sessions.path().join("sessions.json"));
-    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    for value in [
-        serde_json::json!({
-            "action": "worktree", "op": "bogus",
-            "chat_id": "chat_1", "thread_id": "chat_1", "directory": "/x",
-        }),
-        serde_json::json!({
-            "action": "worktree", "op": "pick",
-            "chat_id": "chat_1", "thread_id": "chat_1", "directory": "",
-        }),
-    ] {
-        let result = app
-            .host_action(value)
-            .await
-            .expect("worktree pick should return a result");
-        assert_eq!(result.toast.as_deref(), Some("无效操作"));
-        assert!(result.card.is_none());
-    }
-    assert!(app.sessions.lock().await.pending_for(&key()).is_none());
-}
-
-/// A pick in a project that is not a git repository answers the reason instead
-/// of declaring a pending.
-#[tokio::test]
-async fn worktree_card_pick_in_a_non_git_project_toasts_the_reason() {
-    let _wd = test_work_dir();
-    let sessions = tempfile::tempdir().unwrap();
-    let plain = tempfile::tempdir().unwrap();
-    let mut cfg = test_config(&sessions.path().join("sessions.json"));
-    cfg.bridge.work_dir = Some(plain.path().to_path_buf());
-    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
-
-    let value = serde_json::json!({
-        "action": "worktree",
-        "op": "pick",
-        "chat_id": "chat_1",
-        "thread_id": "chat_1",
-        "directory": plain.path().to_string_lossy(),
-        "name": "plain",
-    });
-    let result = app
-        .host_action(value)
-        .await
-        .expect("worktree pick should return a result");
-    let toast = result.toast.clone().unwrap_or_default();
-    assert!(toast.contains("不是 git 仓库"), "{toast}");
-    assert!(app.sessions.lock().await.pending_for(&key()).is_none());
-}
-
+/// The card in a project that is not a git repository answers the reason
+/// instead of rendering an empty list.
 /// `git rev-parse …` in a test repository, trimmed.
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
