@@ -6421,9 +6421,12 @@ async fn a_pull_that_cannot_post_the_new_card_changes_nothing() {
     });
     live_card_with(&platform, "kill").await;
 
-    // The "accepted remotely, response lost" shape: the create may have landed,
-    // but cola has no id to write to.
-    platform.given_reply_card_outcome(ReplyOutcome::Ambiguous);
+    // The "accepted remotely, response lost" shape: the create DID land, and cola
+    // has no id to write to. `ReplyOutcome::Ambiguous` cannot model this (the
+    // mock returns before recording the send); this seam records it.
+    platform
+        .fail_reply_card_after_send_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
     send_command_in(
         &app,
         "/run",
@@ -6439,6 +6442,20 @@ async fn a_pull_that_cannot_post_the_new_card_changes_nothing() {
             .iter()
             .any(|text| text.contains("无法把终端卡片移到最新位置")),
         "the failed pull is stated: {texts:?}"
+    );
+    // The orphan the lost response left behind is a card with nothing to click:
+    // that is what makes an ambiguous create harmless.
+    let orphan = platform
+        .replied_cards_with_targets()
+        .await
+        .into_iter()
+        .find(|(target, _)| target == "msg_pull_failed")
+        .map(|(_, card)| card)
+        .expect("the lost create is recorded by the mock");
+    let orphan_text = card_text(&orphan);
+    assert!(
+        orphan_text.contains("正在移动") && button_value(&orphan, "kill").is_none(),
+        "an orphaned pull card offers no controls: {orphan_text}"
     );
     assert_eq!(
         app.terminal_records.read(&key).unwrap().card_id,
