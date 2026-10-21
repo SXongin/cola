@@ -130,6 +130,9 @@ pub struct SessionStore {
     entries: Vec<SessionEntry>,
     /// At most one Pending Session per ThreadKey (ADR-0041).
     pending: Vec<PendingEntry>,
+    /// The one thread that writes `sessions.json` (ADR-0089); `None` only when
+    /// the thread could not be started, in which case writes stay synchronous.
+    writer: Option<crate::bridge::store_writer::StoreWriter>,
 }
 
 impl SessionStore {
@@ -152,10 +155,18 @@ impl SessionStore {
             }
             (Vec::new(), Vec::new())
         };
+        let writer = match crate::bridge::store_writer::StoreWriter::start(path.clone()) {
+            Ok(writer) => Some(writer),
+            Err(error) => {
+                tracing::warn!("could not start the session-store writer ({error}); writes stay synchronous");
+                None
+            }
+        };
         Ok(Self {
             path,
             entries,
             pending,
+            writer,
         })
     }
 
@@ -459,6 +470,21 @@ impl SessionStore {
     }
 
     fn write_to_disk(&self) -> crate::error::Result<()> {
+        let data = self.serialize()?;
+        // Atomic, and the failure is returned: this is the one sidecar whose
+        // loss is not recoverable, so its writer must not log-and-continue.
+        // The blocking form keeps that contract; a caller that must not wait
+        // (a card callback) uses `write_to_disk_deferred` (ADR-0089).
+        match &self.writer {
+            Some(writer) => writer.write_blocking(data)?,
+            None => sidecar::write_atomic(&self.path, &data)?,
+        }
+        Ok(())
+    }
+
+    /// The snapshot bytes: serialized under the store lock, right after the
+    /// mutation, so writer-thread order equals mutation order (ADR-0089).
+    fn serialize(&self) -> crate::error::Result<Vec<u8>> {
         #[derive(Serialize)]
         struct StoreFileRef<'a> {
             entries: &'a [SessionEntry],
@@ -468,10 +494,35 @@ impl SessionStore {
             entries: &self.entries,
             pending: &self.pending,
         })?;
-        // Atomic, and the failure is returned: this is the one sidecar whose
-        // loss is not recoverable, so its writer must not log-and-continue.
-        sidecar::write_atomic(&self.path, data.as_bytes())?;
-        Ok(())
+        Ok(data.into_bytes())
+    }
+
+    /// Persist this snapshot without waiting for the write: the caller bounds
+    /// its own wait on the returned receipt. The write itself still happens, in
+    /// order, on the store's single writer thread.
+    #[allow(dead_code)] // TODO(#449 follow-up): remove once the card callbacks defer.
+    pub(crate) fn write_to_disk_deferred(
+        &self,
+    ) -> crate::error::Result<crate::bridge::store_writer::DeferredWrite> {
+        let data = self.serialize()?;
+        match &self.writer {
+            Some(writer) => Ok(writer.write_deferred(data)?),
+            None => Ok(crate::bridge::store_writer::DeferredWrite::settled(
+                sidecar::write_atomic(&self.path, &data),
+            )),
+        }
+    }
+
+    /// [`Self::set_pending`] whose durability is reported later (ADR-0089):
+    /// the mutation is in memory now, the receipt settles when the file does.
+    #[allow(dead_code)] // TODO(#449 follow-up): remove once the card callbacks defer.
+    pub(crate) fn set_pending_deferred(
+        &mut self,
+        pending: PendingEntry,
+    ) -> crate::error::Result<crate::bridge::store_writer::DeferredWrite> {
+        self.pending.retain(|p| p.thread_key != pending.thread_key);
+        self.pending.push(pending);
+        self.write_to_disk_deferred()
     }
 
     /// Test-only durable write; production reaches it only through
@@ -1183,5 +1234,67 @@ mod tests {
         assert!(found.model.is_none());
         assert!(found.variant.is_none());
         assert!(found.agent.is_none());
+    }
+
+    /// ADR-0089: a deferred write applies the mutation to memory at once and
+    /// settles once the file lands.
+    #[tokio::test]
+    async fn deferred_pending_write_settles_and_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+
+        let receipt = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"))
+            .unwrap();
+        assert_eq!(
+            store.pending_for(&key).unwrap().directory,
+            "/tmp/wt",
+            "the mutation is visible before the write lands"
+        );
+        receipt.settle().await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("/tmp/wt"), "the file carries the pending: {text}");
+    }
+
+    /// Two deferred writes land in commit order on the one writer thread, so
+    /// the later snapshot is never overwritten by the earlier one.
+    #[tokio::test]
+    async fn deferred_writes_land_in_commit_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+
+        let first = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/first"))
+            .unwrap();
+        let second = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/second"))
+            .unwrap();
+        first.settle().await.unwrap();
+        second.settle().await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("/tmp/second"), "{text}");
+        assert!(!text.contains("/tmp/first"), "the stale snapshot lost: {text}");
+    }
+
+    /// A failed deferred write settles with the error instead of disappearing:
+    /// the store's loss is not recoverable, so the caller can say so.
+    #[tokio::test]
+    async fn a_failed_deferred_write_settles_with_the_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        // Make the target unwritable: a directory cannot be replaced by the
+        // atomic writer's rename.
+        std::fs::create_dir(&path).unwrap();
+
+        let receipt = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"))
+            .unwrap();
+        assert!(receipt.settle().await.is_err());
     }
 }
