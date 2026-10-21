@@ -11,7 +11,7 @@
 //! server is contacted.
 
 #[cfg(unix)]
-use crate::bridge::terminal_record::{OwedSettlement, TerminalRunRecord, TerminalRunState};
+use crate::bridge::terminal_record::{TerminalRunOutcome, TerminalRunRecord, TerminalRunState};
 use crate::bridge::test_support::*;
 use crate::config::{ConversationKind, SessionEntry, ThreadKey};
 #[cfg(unix)]
@@ -3590,6 +3590,7 @@ async fn a_restart_marks_a_running_run_lost_without_signalling_it() {
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         })
         .unwrap();
@@ -3666,6 +3667,7 @@ async fn a_record_written_before_a_spawn_that_never_happened_is_reported_and_cle
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         })
         .unwrap();
@@ -3715,6 +3717,7 @@ async fn a_lost_run_with_an_unreadable_log_says_why_the_output_is_missing() {
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         })
         .unwrap();
@@ -4136,6 +4139,7 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         })
         .unwrap();
@@ -4328,6 +4332,7 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
             is_group: false,
             state: TerminalRunState::Settled,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         })
         .unwrap();
@@ -4361,6 +4366,7 @@ fn expiry_record(
         is_group: false,
         state,
         ask_ai_submitted: false,
+        outcome: None,
         updated_at: crate::bridge::terminal_record::now_epoch_secs().saturating_sub(age_days * 24 * 60 * 60),
     }
 }
@@ -4774,6 +4780,7 @@ async fn an_old_log_a_record_still_names_is_kept_and_its_silent_orphan_keeps_wri
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         })
         .unwrap();
@@ -4977,15 +4984,12 @@ async fn wait_for_record(
 /// Poll the **owed settlements** until `run_id` has one, so a test can observe
 /// the durable obligation a failed settle leaves.
 #[cfg(unix)]
-async fn wait_for_owed(app: &std::sync::Arc<crate::bridge::App>, run_id: &str) -> OwedSettlement {
+async fn wait_for_owed(app: &std::sync::Arc<crate::bridge::App>, run_id: &str) -> TerminalRunRecord {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let (owed, _) = app.terminal_records.owed().load_all();
-            if let Some(settlement) = owed
-                .into_iter()
-                .find(|settlement| settlement.record.run_id == run_id)
-            {
-                return settlement;
+            if let Some(record) = owed.into_iter().find(|record| record.run_id == run_id) {
+                return record;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -5026,11 +5030,11 @@ async fn a_settling_patch_that_fails_is_finished_by_the_next_start() {
     let card_id = pending.card_id.clone();
     let owed = wait_for_owed(&app, &pending.run_id).await;
     assert_eq!(
-        owed.outcome.exit_code,
+        owed.outcome.as_ref().and_then(|outcome| outcome.exit_code),
         Some(0),
         "the ending the restart must repeat: {owed:?}"
     );
-    assert_eq!(owed.record.card_id, card_id, "the obligation names the card");
+    assert_eq!(owed.card_id, card_id, "the obligation names the card");
     let root = log_root(&app);
 
     // The restart: the run is over (so it is NOT reported as possibly running),
@@ -5123,7 +5127,11 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
     let old = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
     assert_eq!(old.card_id, "msg_card_old");
     let owed = wait_for_owed(&app, &old.run_id).await;
-    assert_eq!(owed.outcome.exit_code, Some(0), "the ending is owed");
+    assert_eq!(
+        owed.outcome.as_ref().and_then(|outcome| outcome.exit_code),
+        Some(0),
+        "the ending is owed"
+    );
 
     // The chat runs again before any restart: its pre-spawn write replaces the
     // per-chat record. That is precisely the write the obligation must survive.
@@ -5147,11 +5155,11 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
     let (owing, complete) = app.terminal_records.owed().load_all();
     assert!(complete);
     assert!(
-        owing.iter().all(|entry| entry.record.run_id != new.run_id),
+        owing.iter().all(|entry| entry.run_id != new.run_id),
         "the successful new run owes nothing"
     );
     assert!(
-        owing.iter().any(|entry| entry.record.run_id == old.run_id),
+        owing.iter().any(|entry| entry.run_id == old.run_id),
         "the replaced run's obligation is still there"
     );
     let root = log_root(&app);
@@ -5168,7 +5176,7 @@ async fn an_owed_settle_survives_the_next_run_replacing_the_record() {
         "the obligation is dropped once its card landed"
     );
     assert!(
-        std::path::Path::new(&owed.record.log_path).exists(),
+        std::path::Path::new(&owed.log_path).exists(),
         "the owed log survives the age sweep"
     );
     assert!(
@@ -5243,7 +5251,7 @@ async fn an_obligation_survives_a_record_write_failure_so_the_lost_sweep_cannot_
     // The obligation is retained, and the record on disk still says `running`.
     let (owing, _) = app.terminal_records.owed().load_all();
     assert!(
-        owing.iter().any(|entry| entry.record.run_id == running.run_id),
+        owing.iter().any(|entry| entry.run_id == running.run_id),
         "a failed state write keeps the obligation: {owing:?}"
     );
     std::fs::remove_file(&records_dir).unwrap();
@@ -5323,7 +5331,7 @@ async fn an_owed_settle_is_repaired_even_when_the_current_record_is_unreadable()
             .load_all()
             .0
             .iter()
-            .any(|entry| entry.record.run_id == pending.run_id),
+            .any(|entry| entry.run_id == pending.run_id),
         "an unreadable record keeps the obligation: its `running` state cannot be disproved"
     );
 }
@@ -5588,6 +5596,161 @@ async fn a_spawn_failure_keeps_the_settled_buttons() {
     .await;
     assert_eq!(next.command, first.command, "the record's command replays");
     assert_eq!(next.cwd, first.cwd, "in the record's cwd");
+}
+
+/// Spec #825 / #826: a settled card's buttons rebuild the card they were clicked
+/// on. A failed launch must still read 「无法启动」 after either click — the
+/// rebuild takes its ending from the record, never from a payload that could not
+/// carry it and never from an assumed clean exit.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_spawn_failure_survives_the_full_output_and_ask_ai_rebuilds() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    // A session directory that is not there: `sh` cannot start in it.
+    let missing = proj.path().join("gone-825");
+    seed_entry(&app, entry(&key, &missing)).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'never-825\\n'",
+        key.clone(),
+        "msg_spawn",
+        ConversationKind::P2p,
+    )
+    .await;
+    let card = settled_card(&platform).await;
+    assert!(card_text(&card).contains("无法启动"));
+    let full = button_value(&card, "full_output").expect("完整输出");
+    let ask = button_value(&card, "ask_ai").expect("问 AI");
+
+    // 「📄 完整输出」: the rebuilt card still names the failed launch.
+    app.host_action_on_message(full, "msg_spawn_card")
+        .await
+        .expect("the click is acknowledged");
+    let rebuilt = wait_for_patch_containing(&platform, "msg_spawn_card", "完整输出已作为文件消息发送").await;
+    let text = card_text(&rebuilt);
+    assert!(
+        text.contains("无法启动"),
+        "the startup failure survives the rebuild: {text}"
+    );
+    assert!(
+        !text.contains("退出码"),
+        "the rebuild invents no exit code: {text}"
+    );
+    assert!(
+        !text.contains("⏹ 终止") && !text.contains("继续"),
+        "a settled run keeps only the settled controls: {text}"
+    );
+    assert!(
+        button_value(&rebuilt, "rerun").is_some(),
+        "重跑 stays usable: {text}"
+    );
+
+    // 「问 AI」: its submission's outcome PATCH keeps it too.
+    app.host_action_on_message(ask, "msg_spawn_card")
+        .await
+        .expect("the click is acknowledged");
+    wait_for_card_update(&platform, "the 问 AI outcome", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        text.contains("无法启动") && (text.contains("已作为") || text.contains("提交给 AI 失败"))
+    })
+    .await;
+}
+
+/// Spec #825: 终止 signals the whole group; when it cannot confirm that, the card
+/// says the group may still be running. A button rebuild must keep that warning
+/// rather than upgrade an unconfirmed termination to a clean ending.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_survivor_warning_survives_the_full_output_rebuild() {
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, platform) = restart_app(cfg, root.clone()).await;
+    let key = thread();
+    let card_id = "msg_survivors_card";
+    let log = root.join("survivors.log");
+    std::fs::write(&log, b"still there\n").unwrap();
+    let log_path = log.to_string_lossy().into_owned();
+
+    // The settled card itself: 终止 could not confirm the group empty.
+    let card =
+        crate::feishu::card::terminal::build_terminal_card(crate::feishu::card::terminal::TerminalCard {
+            cwd: "/tmp",
+            command: "sleep 100",
+            output: "still there\n",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: Some(crate::feishu::card::terminal::TerminalFullOutput {
+                log_path: &log_path,
+                run_id: "run-survivors",
+                rerun_run_id: Some("run-survivors"),
+                chat_id: &key.chat_id,
+                thread_id: &key.thread_id,
+                lost: false,
+                is_group: false,
+                exit_code: None,
+                elapsed: Duration::from_secs(2),
+                output_over_limit: false,
+            }),
+            notice: None,
+            state: crate::feishu::card::terminal::TerminalState::Settled {
+                exit_code: None,
+                spawn_error: None,
+                elapsed: Duration::from_secs(2),
+                stopped: true,
+                survivors: true,
+            },
+            run_id: "run-survivors",
+            chat_id: &key.chat_id,
+            thread_id: &key.thread_id,
+        });
+    assert!(card_text(&card).contains("可能仍在运行"));
+    let payload = button_value(&card, "full_output").expect("完整输出");
+
+    // The record the rebuild reads: the same ending the card shows.
+    let mut record = expiry_record(
+        &key,
+        "run-survivors",
+        &log,
+        TerminalRunState::Settled,
+        Vec::new(),
+        0,
+    );
+    record.outcome = Some(TerminalRunOutcome {
+        exit_code: None,
+        spawn_error: None,
+        elapsed_ms: 2_000,
+        stopped: true,
+        survivors: true,
+        output_over_limit: false,
+    });
+    app.terminal_records.write(&record).unwrap();
+
+    app.host_action_on_message(payload, card_id)
+        .await
+        .expect("the click is acknowledged");
+    let rebuilt = wait_for_patch_containing(&platform, card_id, "完整输出已作为文件消息发送").await;
+    let text = card_text(&rebuilt);
+    assert!(
+        text.contains("已发送终止"),
+        "the termination is still stated as unconfirmed: {text}"
+    );
+    assert!(
+        text.contains("可能仍在运行"),
+        "the survivor warning survives the rebuild: {text}"
+    );
+    assert!(
+        !text.contains("退出码"),
+        "the rebuild invents no exit code: {text}"
+    );
 }
 
 /// Whole-branch review, finding 4: 「问 AI」's one-submission rule is durable.
