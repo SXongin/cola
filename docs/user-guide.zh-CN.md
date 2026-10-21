@@ -351,8 +351,12 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 ✅/⚠️/❌ 标记并给出汇总，任一检查失败时以非零码退出。
 
 `cola config path|show|validate` 分别打印解析到的配置路径、脱敏后的生效配置、
-或做一次解析校验。`cola version` 等价于 `--version`，`cola completions <shell>`
-打印补全脚本。
+或做一次解析校验。`cola version` 等价于 `--version`。`cola completions <shell>`
+打印补全脚本；加上 `--install` 则把脚本写入该 shell 的用户补全目录（遵循
+`XDG_DATA_HOME`/`XDG_CONFIG_HOME`，`--dry-run` 只预览，省略 shell 时从 `$SHELL`
+推断），且绝不覆盖不是 cola 生成的文件。自动安装仅支持 Unix；符号链接或硬链接的
+补全文件、以及符号链接的父目录组件，都会被拒绝而不是跟随。PowerShell 不支持自动
+安装——请重定向脚本并在 `$PROFILE` 中 source；zsh 会打印需加入 `fpath` 的目录。
 
 ## 单实例锁与重启
 

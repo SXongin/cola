@@ -443,7 +443,15 @@ summary, and exits non-zero when a check fails.
 
 `cola config path|show|validate` prints the resolved config path, the effective
 config with the app secret masked, or a parse check. `cola version` mirrors
-`--version`, and `cola completions <shell>` prints a completion script.
+`--version`. `cola completions <shell>` prints a completion script; with
+`--install` it writes that script into the shell's user completion directory
+(honoring `XDG_DATA_HOME`/`XDG_CONFIG_HOME`, `--dry-run` to preview, the shell
+inferred from `$SHELL` when omitted), never overwriting a file cola did not
+generate. Automatic install is Unix-only, and a symlinked completion, a
+hard-linked one, or a symlinked directory component is refused rather than
+followed. PowerShell has
+no automatic install — redirect the script and source it from `$PROFILE` — and
+zsh prints the directory to add to `fpath`.
 
 ## Singleton lock & restart
 

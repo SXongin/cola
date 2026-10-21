@@ -3,6 +3,7 @@
 mod autostart;
 mod backend;
 mod bridge;
+mod completions;
 mod config;
 mod error;
 mod feishu;
@@ -107,11 +108,20 @@ enum Subcommand {
         #[command(subcommand)]
         action: config::ConfigAction,
     },
-    /// Print a shell completion script to stdout.
+    /// Print a shell completion script to stdout, or install it into the
+    /// shell's completion directory with `--install`.
     Completions {
-        /// The shell to generate completions for.
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
+        /// The shell to generate completions for. Optional with `--install`,
+        /// which infers it from `$SHELL` when omitted.
+        #[arg(value_enum, required_unless_present = "install")]
+        shell: Option<clap_complete::Shell>,
+        /// Write the script into the shell's user completion directory instead
+        /// of printing it.
+        #[arg(long)]
+        install: bool,
+        /// With `--install`, report the target path and write nothing.
+        #[arg(long, requires = "install")]
+        dry_run: bool,
     },
     /// Print cola's version and build provenance (same as `--version`).
     Version,
@@ -862,14 +872,6 @@ async fn status_cli(
     Ok(())
 }
 
-/// `cola completions <shell>`: print the generated script to stdout.
-fn print_completions(shell: clap_complete::Shell) -> anyhow::Result<()> {
-    use clap::CommandFactory;
-    let mut command = Cli::command();
-    clap_complete::generate(shell, &mut command, "cola", &mut std::io::stdout());
-    Ok(())
-}
-
 impl Drop for SingletonLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -907,9 +909,15 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", version::display_version());
         return Ok(());
     }
-    // Shell completions are pure — no config, no lock, no I/O.
-    if let Some(Subcommand::Completions { shell }) = cli.subcommand {
-        return print_completions(shell);
+    // Shell completions are pure when printed; `--install` writes only into the
+    // invoking user's own completion directory. Either way: no config, no lock.
+    if let Some(Subcommand::Completions {
+        shell,
+        install,
+        dry_run,
+    }) = cli.subcommand
+    {
+        return completions::run(shell, install, dry_run);
     }
     // Introspection (ADR-0081): read-only, config-light, and lock-free — all
     // three must work while cola is running and against a broken install.
