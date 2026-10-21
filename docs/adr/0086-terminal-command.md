@@ -350,6 +350,25 @@ now separate facts, and the second one is **not** kept in the per-chat record:
   whatever ended it: a launch that never started has no output, but it has a log
   path and a record, so 「↻ 重跑」 (gated on a written record), 「📄 完整输出」 and
   「问 AI」 stay usable instead of vanishing.
+- **Retention is "until the next run replaces it, or `[bridge] log_days`,
+  whichever comes first"** (spec #821 user story 23: a debugging session must not
+  leave a directory of secrets around forever). The record carries `updated_at` —
+  the run's last real update (pre-spawn, child up, settle); resolutions such as
+  the lost sweep and the 「问 AI」 marker preserve it, so bookkeeping cannot make
+  an old log look young. At startup, after the lost sweep has resolved every
+  `running` record:
+
+  - a record older than the window and `settled` is **expired**: the record and
+    its **Terminal Log** are deleted together;
+  - a `lost` record older than the window expires the same way **only once its
+    recorded process group is provably gone**. The probe is `kill(-pgid, 0)` and
+    never a signal; a group that still has members may be writing its log, so
+    both stay and a later start tries again;
+  - a `running` record is unresolved (its card is retried) and keeps its
+    evidence, and an owed settlement names the log its card still needs, so it
+    protects that record and log;
+  - the ordinary unreferenced-log age sweep, and its fail-safe rule that an
+    incomplete record set deletes nothing, are unchanged.
 
 The same record carries `ask_ai_submitted`: decision 9's one submission per run
 was guarded in memory, which a restart clears, so the same current run's button

@@ -32,7 +32,8 @@
 //! - a long run sends the existing chat-type Completion Notice once
 //!   (decision 12);
 //! - the run's **Terminal Run Record** is written **before** the child is
-//!   spawned and kept until the next run in that chat replaces it, so a
+//!   spawned and kept until the next run in that chat replaces it (or
+//!   `[bridge] log_days` expires it, log and all), so a
 //!   restart can report the run honestly and the card's 「↻ 重跑」 still knows
 //!   its command, cwd and timeout (#827, decision 5). A settle whose card was
 //!   never told is a separate durable obligation beside the records — one file
@@ -737,7 +738,9 @@ async fn run_claimed(
         is_group: request.is_group,
         state: TerminalRunState::Running,
         ask_ai_submitted: false,
+        updated_at: 0,
     };
+    record.touch();
     if let Err(error) = handles.terminal_records.write(&record) {
         let reason = format!("无法写入终端运行记录（{error}）");
         let outcome = TerminalRunOutcome {
@@ -831,6 +834,7 @@ async fn run_claimed(
     // The record completed (ADR-0086 decision 5): the child exists, so its id
     // is recorded for the report. A persisted pid is never signalled.
     record.pids = pgid.into_iter().collect();
+    record.touch();
     handles.terminal_records.update(&record);
     slot.live.store(true, Ordering::SeqCst);
 
@@ -1428,6 +1432,127 @@ async fn patch_card(
     }
 }
 
+/// What the record-retention pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalExpiry {
+    /// Records — and their **Terminal Logs** — removed past `[bridge] log_days`.
+    pub(crate) expired: usize,
+    /// Old `lost` records kept because their process group may still be alive.
+    pub(crate) kept_live: usize,
+}
+
+/// Retention (`[bridge] log_days`) for run records and their logs, not only for
+/// files nobody references (spec #821 user story 23).
+///
+/// A chat's record is kept until the chat's next run replaces it, so the latest
+/// run of an **inactive** chat would keep its log forever — a debugging session
+/// leaving a directory of secrets around. Retention is therefore "until the next
+/// run replaces it, or `log_days`, whichever comes first", with one exception
+/// that is not negotiable: a **lost** run's process group may still be writing
+/// its log (a hand-launched cola's orphan), and its open descriptor keeps writing
+/// to the inode even after unlink. A lost record whose recorded group still has
+/// members therefore keeps both, and a later start tries again; the probe is
+/// `kill(-pgid, 0)`, never a signal.
+///
+/// Only an ending expires. A `running` record is unresolved — the lost sweep
+/// retries its card — and an owed settlement names the log its card still needs,
+/// so both keep their evidence. The view must also be **complete**: a record or
+/// obligation that could not be read may name a newer run, so a partial view
+/// deletes nothing.
+///
+/// `root` is the **Terminal Log** root: a log is unlinked only when it is a direct
+/// child of it, so a crafted or corrupt record can never point this at an
+/// unrelated file.
+pub(crate) fn expire_records(root: &Path, log_days: u32, records: &TerminalRunRecords) -> TerminalExpiry {
+    let mut expiry = TerminalExpiry::default();
+    let (on_disk, complete) = records.scan();
+    let (owed, owed_complete) = records.owed().load_all();
+    if !complete || !owed_complete || !records.dir().exists() {
+        tracing::warn!(
+            "terminal: skipping the record retention sweep — the run records and owed settles must \
+             be present and all readable before a record can be proven expired"
+        );
+        return expiry;
+    }
+    let owing: std::collections::HashSet<&str> = owed
+        .iter()
+        .map(|settlement| settlement.record.run_id.as_str())
+        .collect();
+    let retention = u64::from(log_days.max(1)) * 24 * 60 * 60;
+    let now = crate::bridge::terminal_record::now_epoch_secs();
+    for record in on_disk {
+        // An owed ending still needs its log: its card has not been told.
+        if owing.contains(record.run_id.as_str()) {
+            continue;
+        }
+        let key = record.key();
+        // `updated_at` is the run's last real update, and resolutions preserve
+        // it — so a record the lost sweep resolved in this very startup is still
+        // measured from when the run was last alive. A record from before the
+        // field existed falls back to the file's mtime.
+        let updated = if record.updated_at > 0 {
+            record.updated_at
+        } else {
+            std::fs::metadata(records.path(&key))
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .map(|age| age.as_secs())
+                .unwrap_or(0)
+        };
+        if updated == 0 {
+            continue;
+        }
+        // A clock that jumped backwards makes a record look "from the future";
+        // `saturating_sub` then reads as age zero, and it is left alone.
+        if now.saturating_sub(updated) < retention {
+            continue;
+        }
+        match record.state {
+            // The run ended and its card is settled: nothing needs the evidence.
+            TerminalRunState::Settled => {}
+            TerminalRunState::Lost => {
+                if group_has_members(record.pids.first().copied()) {
+                    expiry.kept_live += 1;
+                    tracing::info!(
+                        "terminal: keeping run {} and its log — its process group may still be alive",
+                        record.run_id
+                    );
+                    continue;
+                }
+            }
+            // Unresolved: the next start retries its card, so the evidence stays.
+            TerminalRunState::Running => continue,
+        }
+        // The record first: if the log removal then fails, the ordinary age
+        // sweep (which runs next) removes the now-unreferenced log. The reverse
+        // order would leave a record whose evidence is already gone.
+        if !records.remove(&key, &record.run_id) {
+            continue;
+        }
+        let log = Path::new(&record.log_path);
+        if log.parent() != Some(root) {
+            tracing::warn!(
+                "terminal: refusing to unlink run {}'s log {} — it is outside the Terminal Log root",
+                record.run_id,
+                record.log_path
+            );
+        } else {
+            match std::fs::remove_file(log) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    "terminal: could not remove the expired log {} of run {}: {error}",
+                    record.log_path,
+                    record.run_id
+                ),
+            }
+        }
+        expiry.expired += 1;
+    }
+    expiry
+}
+
 /// Sweep the **Terminal Log** directory by age (`[bridge] log_days`), never
 /// wholesale (ADR-0086 decision 10), and never a log a **Terminal Run Record**
 /// still names.
@@ -1436,9 +1561,9 @@ async fn patch_card(
 /// has produced no output for longer than the retention has an old mtime, and
 /// unlinking its file would route every later write into an inode nothing can
 /// reach — 「📄 完整输出」 would find no file. A referenced log is the evidence of
-/// the run its record describes (a lost run's included), and it only becomes
-/// unreferenced when the chat's next run replaces the record. So the record set
-/// is the protection, and age decides among the rest.
+/// the run its record describes, so the record set protects it while the record
+/// is kept: until the chat's next run replaces it, or until
+/// [`expire_records`] removes it at `log_days`. Age decides among the rest.
 ///
 /// The reference set must also be **complete**: a record that could not be read
 /// may name the very file this would unlink, so an unreadable record — or an
@@ -1657,6 +1782,8 @@ async fn finish_run(
     outcome: &TerminalRunOutcome,
 ) -> bool {
     record.state = TerminalRunState::Settled;
+    // The settle is the run's last real update; retention measures from here.
+    record.touch();
     let owed = OwedSettlement {
         record: record.clone(),
         outcome: outcome.clone(),

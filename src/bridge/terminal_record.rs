@@ -34,7 +34,11 @@
 //! never rewrite a snapshot taken before the chat's next run existed
 //! (whole-branch review, finding 3).
 //!
-//! It is kept until the next run in that chat replaces it, which is what makes
+//! It is kept until the next run in that chat replaces it **or until
+//! `[bridge] log_days` expires it**, whichever comes first (spec #821 user story
+//! 23: a debugging session must not leave a directory of secrets around
+//! forever). The age sweep deletes an expired record and its log together, except
+//! a `lost` record whose process group may still be writing; that is what makes
 //! a superseded card's buttons stale clicks and keeps the newest card's usable
 //! across a restart.
 //!
@@ -136,6 +140,15 @@ pub(crate) struct TerminalRunRecord {
     /// would submit the same output again (whole-branch review, finding 4).
     #[serde(default)]
     pub(crate) ask_ai_submitted: bool,
+    /// When this run last did something real — the pre-spawn write, the child
+    /// coming up, or the settle — in epoch seconds. Retention (`[bridge]
+    /// log_days`) measures from here, not from the file's mtime: a **resolution**
+    /// (the lost sweep rewriting the state, the 「问 AI」 marker) preserves this
+    /// value, and a bookkeeping write must not make an old log look young
+    /// (spec #821 user story 23). `0` means a record written before this field
+    /// existed; the sweeper then falls back to the file's mtime.
+    #[serde(default)]
+    pub(crate) updated_at: u64,
 }
 
 impl TerminalRunRecord {
@@ -148,6 +161,23 @@ impl TerminalRunRecord {
     pub(crate) fn timeout(&self) -> Duration {
         Duration::from_millis(self.timeout_ms)
     }
+
+    /// This run did something real now: the pre-spawn write, the child coming
+    /// up, or its settle. Retention measures from the last such moment;
+    /// resolutions (a lost sweep, the 「问 AI」 marker) deliberately do not call
+    /// this.
+    pub(crate) fn touch(&mut self) {
+        self.updated_at = now_epoch_secs();
+    }
+}
+
+/// The wall clock in epoch seconds — the unit [`TerminalRunRecord::updated_at`]
+/// is stored in.
+pub(crate) fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
 }
 
 /// One settle whose card has not been told (whole-branch review, finding 1): the
@@ -429,6 +459,33 @@ impl TerminalRunRecords {
     #[cfg(test)]
     pub(crate) fn pause_merge_once(&self, pause: impl FnOnce() + Send + 'static) {
         *self.merge_pause.lock().unwrap_or_else(PoisonError::into_inner) = Some(Box::new(pause));
+    }
+
+    /// Remove the chat's current record when it still names `run_id` — retention's
+    /// last act (spec #821 user story 23).
+    ///
+    /// The re-read under the chat's lock is the point: the caller decided from a
+    /// scan that this chat's record was old, but a successor run could have
+    /// written its own pre-spawn record in between. Only the run the caller
+    /// decided about may be deleted, so a successor's identity is never erased by
+    /// an old decision.
+    pub(crate) fn remove(&self, key: &ThreadKey, run_id: &str) -> bool {
+        let lock = self.chat_lock(key);
+        let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(record) = self.read(key) else {
+            return false;
+        };
+        if record.run_id != run_id {
+            return false;
+        }
+        match std::fs::remove_file(self.path(key)) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                tracing::warn!("terminal record: could not expire run {run_id}: {error}");
+                false
+            }
+        }
     }
 
     /// Every record on disk — the startup sweep's input. A corrupt file is
@@ -742,6 +799,7 @@ mod tests {
             is_group: true,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            updated_at: 0,
         }
     }
 
