@@ -1279,9 +1279,14 @@ fn reconcile_viewer_page_lane(
 /// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
 /// Session Creation, ADR-0041). A persist failure is logged and the caller still
 /// toasts success, parity with the switch card's 新建.
-async fn declare_pending_dir(core: &Arc<SharedCore>, thread_key: &ThreadKey, directory: &str) {
+async fn declare_pending_dir(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    directory: &str,
+    title: Option<String>,
+) {
     if let Err(e) = core
-        .declare_pending(thread_key, directory.to_string(), None)
+        .declare_pending(thread_key, directory.to_string(), title)
         .await
     {
         tracing::warn!("dir card pick: persist failed: {}", e);
@@ -2635,6 +2640,7 @@ impl App {
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
+                "worktree" => self.handle_worktree_card_action(&self.core, &value).await,
                 // Different cards carry `action: "file"` (#739, #742, #778): the
                 // viewer's own 「发为文件」/「🌐 预览网页」 button, whose payload
                 // carries `op: "send"` and transfers the file's whole bytes
@@ -3334,7 +3340,7 @@ impl App {
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
-                declare_pending_dir(core, &thread_key, &directory).await;
+                declare_pending_dir(core, &thread_key, &directory, None).await;
                 Some(CardActionResult {
                     card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                     toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
@@ -3385,6 +3391,81 @@ impl App {
             },
         )
         .await
+    }
+
+    /// Handle a `/worktree` card button (ADR-0088): `op: "pick"` declares a
+    /// **Pending Session** in the checkout — the same meaning as `/dir`'s pick,
+    /// so it never adopts an existing session (that is `/switch`'s job). A
+    /// checkout that vanished between render and click refreshes the card and
+    /// toasts instead of leaving a pending on a missing directory.
+    async fn handle_worktree_card_action(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let thread_key = thread_key_from_value(value);
+        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        if op != "pick" {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        }
+        let directory = value
+            .get("directory")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if directory.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("无效操作".to_string()),
+            });
+        }
+        let current = core.sessions.lock().await.current_directory(&thread_key);
+        if current.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
+            return Some(CardActionResult {
+                card: Some(self.build_worktree_card_for(core, &thread_key).await),
+                toast: Some("已在当前目录".to_string()),
+            });
+        }
+        if !std::path::Path::new(&directory).is_dir() {
+            return Some(CardActionResult {
+                card: Some(self.build_worktree_card_for(core, &thread_key).await),
+                toast: Some(format!("目录已不存在：`{directory}`")),
+            });
+        }
+        let title = value
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        declare_pending_dir(core, &thread_key, &directory, title).await;
+        Some(CardActionResult {
+            card: Some(self.build_worktree_card_for(core, &thread_key).await),
+            toast: Some(format!("下一条消息将在 `{directory}` 创建会话")),
+        })
+    }
+
+    /// Rebuild the `/worktree` card in place (ADR-0088); a project that stopped
+    /// being a git repository degrades to a one-line card carrying the reason.
+    async fn build_worktree_card_for(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+    ) -> serde_json::Value {
+        let handles = core.command_handles();
+        match crate::feishu::card::command::worktree_card_data(&handles, thread_key).await {
+            Ok((rows, repo)) => crate::feishu::card::session::build_worktree_card(thread_key, &rows, &repo),
+            Err(error) => crate::feishu::card::shell::card_shell(
+                "🌲 worktree",
+                "blue",
+                vec![serde_json::json!({
+                    "tag": "markdown",
+                    "content": crate::feishu::card::sanitize::sanitize_markdown(&format!("⚠️ {error}")),
+                })],
+            ),
+        }
     }
 
     /// Rebuild the `/dir` browse card (ADR-0078) for `view.dir`, clamping a
@@ -4332,7 +4413,7 @@ impl App {
                 toast: Some("已在当前目录".to_string()),
             });
         }
-        declare_pending_dir(core, thread_key, &directory).await;
+        declare_pending_dir(core, thread_key, &directory, None).await;
         Some(CardActionResult {
             card: Some(self.build_dir_browse_for(core, thread_key, settled).await),
             toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),

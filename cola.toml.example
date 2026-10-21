@@ -74,3 +74,12 @@ app_secret = "your-app-secret"
 # this per call.
 # [review]
 # base = "origin/main"
+
+# Git worktrees (`/worktree`, ADR-0088). Optional.
+# The parent directory `/worktree new` creates checkouts in. A relative path
+# resolves against the project's MAIN checkout (never the session's own
+# directory, which may itself be a linked worktree); an absolute path is used
+# as given. Defaults to `.worktrees`. Keep a project's .gitignore covering this
+# directory, or the main checkout will read dirty.
+# [worktree]
+# root = ".worktrees"

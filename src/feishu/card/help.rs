@@ -18,6 +18,14 @@ pub fn build_help_card() -> serde_json::Value {
                     "声明在新目录开会话（下一条消息创建；无参弹最近目录卡片，卡片上可进入 📁 浏览目录）",
                 ),
                 (
+                    "/worktree",
+                    "本项目 git 检出卡片（含主检出）：分支 · ⚠ · 会话数；点一行在那里声明会话",
+                ),
+                (
+                    "/worktree new <名字> [--base <ref>]",
+                    "创建 worktree（分支 wt/<名字>）并在那里声明会话，不移动现有会话",
+                ),
+                (
                     "/cat <路径>",
                     "查看宿主机上的文件（相对路径按当前会话目录解析；目录则打开浏览卡）",
                 ),
@@ -109,6 +117,7 @@ mod tests {
         for cmd in [
             "/new",
             "/dir",
+            "/worktree",
             "/cat",
             "/diff",
             "/run",

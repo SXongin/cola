@@ -1334,6 +1334,9 @@ pub(crate) struct TurnConfig {
     /// (`[review] base`, spec #803). `None` leaves the producer's
     /// `origin/main` → `main` resolution.
     review_base: Option<String>,
+    /// The parent directory for `/worktree new` (`[worktree] root`,
+    /// ADR-0088), relative to the primary checkout unless absolute.
+    worktree_root: std::path::PathBuf,
 }
 
 impl TurnConfig {
@@ -1348,6 +1351,7 @@ impl TurnConfig {
         completion_notice_delay_ms: Arc<AtomicU64>,
         work_dir: Option<String>,
         review_base: Option<String>,
+        worktree_root: std::path::PathBuf,
     ) -> Self {
         Self {
             group_completion_notice,
@@ -1359,12 +1363,18 @@ impl TurnConfig {
             completion_notice_delay_ms,
             work_dir,
             review_base,
+            worktree_root,
         }
     }
 
     /// The configured base ref for `/diff` (`[review] base`), if any.
     pub(crate) fn review_base(&self) -> Option<&str> {
         self.review_base.as_deref()
+    }
+
+    /// The configured parent directory for `/worktree new` (`[worktree] root`).
+    pub(crate) fn worktree_root(&self) -> &std::path::Path {
+        &self.worktree_root
     }
 
     /// The directory a brand-new session starts in: `[bridge] work_dir` when

@@ -862,6 +862,95 @@ fn dir_card_row(
     vec![text_row, btn_row]
 }
 
+/// One `/worktree` card row (ADR-0088): a checkout, its branch, whether it is
+/// dirty (`None` = the read missed its bound), how many sessions live there,
+/// and whether the conversation is already rooted there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeRow {
+    pub path: String,
+    pub name: String,
+    pub branch: Option<String>,
+    pub dirty: Option<bool>,
+    pub main: bool,
+    pub sessions: usize,
+    pub current: bool,
+}
+
+/// The `/worktree` picker card (ADR-0088): the project's git checkouts, the
+/// main one included and labelled, each with its branch, dirty marker, session
+/// count and current marker. Picking a row declares a Pending Session there —
+/// the same meaning as the `/dir` card's pick, so it never adopts.
+pub fn build_worktree_card(
+    thread_key: &crate::config::ThreadKey,
+    rows: &[WorktreeRow],
+    repo: &str,
+) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    elements.push(json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(&format!(
+            "项目 `{repo}` 的 git 检出 · {} 个",
+            rows.len()
+        )),
+    }));
+    if rows.is_empty() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": "_(这个项目还没有 worktree。用 `/worktree new <名字>` 创建。)_",
+        }));
+    }
+    for row in rows {
+        let mut title = format!("**{}**", row.name);
+        if row.main {
+            title.push_str(" · 主检出");
+        }
+        if row.current {
+            title.push_str(" · ✅ 当前");
+        }
+        let branch = match &row.branch {
+            Some(branch) => format!("分支 `{branch}`"),
+            None => "detached HEAD".to_string(),
+        };
+        let dirty = match row.dirty {
+            Some(true) => " · ⚠ 有未提交改动",
+            Some(false) => "",
+            None => " · ? 状态未知",
+        };
+        let sessions = if row.sessions == 0 {
+            String::new()
+        } else {
+            format!(" · {} 个会话", row.sessions)
+        };
+        elements.push(card_text_row(&format!("{title}\n{branch}{dirty}{sessions}")));
+        elements.push(json!({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "columns": [{
+                "tag": "column",
+                "width": "auto",
+                "vertical_align": "center",
+                "elements": [{
+                    "tag": "button",
+                    "text": {
+                        "tag": "plain_text",
+                        "content": if row.current { "✅ 当前" } else { "切换到这里" },
+                    },
+                    "type": "default",
+                    "value": {
+                        "action": "worktree",
+                        "op": "pick",
+                        "chat_id": thread_key.chat_id,
+                        "thread_id": thread_key.thread_id,
+                        "directory": row.path,
+                        "name": row.name,
+                    },
+                }]
+            }]
+        }));
+    }
+    card_shell("🌲 worktree", "blue", elements)
+}
+
 /// One child row of the `/dir` browse card (ADR-0078, ADR-0083 §3): the display
 /// name, the absolute path its button acts on, and what the row is. A directory
 /// carries `is_repo` (it holds a `.git` entry — floated to the front and marked

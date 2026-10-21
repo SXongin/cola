@@ -31,6 +31,7 @@ pub mod topic;
 pub mod turn;
 pub(crate) mod turn_diff;
 pub(crate) mod viewer;
+pub(crate) mod worktree;
 
 #[cfg(test)]
 mod attach_live;
