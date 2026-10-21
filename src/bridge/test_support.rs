@@ -409,6 +409,11 @@ pub struct RecordingPlatform {
     /// as) instead of an API response. An ambiguous failure: the PATCH may
     /// have landed, so callers must not treat it as a definite card rejection.
     pub fail_update_transport_count: std::sync::atomic::AtomicUsize,
+    /// `(needle, remaining)`: the next N `update_message` calls whose card JSON
+    /// contains `needle` fail before landing. The live patch loop rewrites its
+    /// card on its own cadence, so a global counter cannot aim at one write under
+    /// test (a pull's freeze, say); a content match can.
+    pub fail_update_containing: std::sync::Mutex<Vec<(String, usize)>>,
     /// The next N `reply_card` calls fail with the same typed rejection, for
     /// the continuation-send recovery path.
     pub fail_reply_card_content_count: std::sync::atomic::AtomicUsize,
@@ -514,6 +519,7 @@ impl RecordingPlatform {
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_transport_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_update_containing: std::sync::Mutex::new(Vec::new()),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_reply_card_after_send_count: std::sync::atomic::AtomicUsize::new(0),
             reply_card_outcomes: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -575,6 +581,15 @@ impl RecordingPlatform {
     /// recorded (it never reached Feishu).
     pub fn given_reply_card_outcome(&self, outcome: ReplyOutcome) {
         self.reply_card_outcomes.lock().unwrap().push_back(outcome);
+    }
+
+    /// Fail the next `count` `update_message` calls whose card JSON contains
+    /// `needle`, leaving every other card's writes alone.
+    pub fn fail_updates_containing(&self, needle: &str, count: usize) {
+        self.fail_update_containing
+            .lock()
+            .unwrap()
+            .push((needle.to_string(), count));
     }
 
     /// Park the first `method` call targeting `target` until `release`, after
@@ -922,6 +937,23 @@ impl feishu::Platform for RecordingPlatform {
     }
 
     async fn update_message(&self, message_id: &str, card: &serde_json::Value) -> crate::error::Result<()> {
+        // A per-content failure the caller can aim: the live patch loop writes
+        // the same card on its own cadence, so a global counter would be eaten
+        // by it before the write under test.
+        let targeted = {
+            let mut failing = self.fail_update_containing.lock().unwrap();
+            let card_json = card.to_string();
+            match failing
+                .iter_mut()
+                .find(|(needle, remaining)| *remaining > 0 && card_json.contains(needle.as_str()))
+            {
+                Some((_, remaining)) => {
+                    *remaining -= 1;
+                    true
+                }
+                None => false,
+            }
+        };
         let rejected = self
             .fail_update_card_content_count
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -950,6 +982,11 @@ impl feishu::Platform for RecordingPlatform {
             message_id: message_id.into(),
             card: card.clone(),
         });
+        if targeted {
+            return Err(crate::error::BridgeError::Feishu(
+                "simulated card update failure".into(),
+            ));
+        }
         if rejected {
             return Err(crate::error::BridgeError::CardContentRejected {
                 code: 230099,

@@ -495,18 +495,29 @@ option, because everything after `/run` is the shell command):
   message that describes what is knowable instead of a card that would be a guess.
 
 The one-way-door part is decision 4's "its own message id at send": the card's identity is now
-**movable while the run is live**, and the order is the invariant that makes it safe, all of it
-under the run's existing card write lock:
+**movable while the run is live**. One sentence decides every path: *a pull either moves the run
+onto a card that carries its controls — the record naming it and the old card frozen — or it
+changes nothing and says so; at no point do two cards both look current, and no failed pull
+leaves the run writing a card that was frozen.* The steps that make it true all run under the
+run's existing card write lock, in this order:
 
-1. post the new card (bounded like every platform call);
-2. swap the run's target, then write the new id into the Terminal Run Record;
-3. only then freeze the old card.
+1. post a **placeholder** that carries no controls. A create has no idempotency key (ADR-0067),
+   so a create whose response is lost may have landed; a control-less orphan is harmless where
+   a live orphan would be a second card offering 终止;
+2. PATCH the placeholder into the live card;
+3. freeze the old card as 「已下移」, retried once;
+4. write the new id into the Terminal Run Record, retried once;
+5. swap the run's target — infallible, and last.
 
-A stall or timeout in (3) therefore leaves the run writing the card the reader is looking at;
-it can only leave the superseded card still looking live, which the next pull or the settle
-makes visible instead of silently wrong. Because the swap happens in the run loop, a pull the
-loop can no longer serve (it just ended) is answered by the record rebuild or by the "updating"
-line — never by silence.
+Every fallible step before the durable write aborts cleanly: the old card is re-painted live
+(step 3's undo), the new message is returned to the placeholder, and the command says the pull
+failed. Step 4 is the only durable one, and its failure aborts the same way rather than leaving
+memory and the record out of step. A crash between 4 and 5 leaves the record naming a card that
+is live and at the newest position, so a restart repairs the card the reader is looking at
+rather than the frozen one.
+
+Because the swap happens in the run loop, a pull the loop can no longer serve (it just ended)
+is answered by the record rebuild or by the "updating" line — never by silence.
 
 Not taken: an automatic repost whenever a run passes a duration threshold (the chat gets noise
 with no one asking), and a pinned control card beside the live one (two 终止 buttons for one

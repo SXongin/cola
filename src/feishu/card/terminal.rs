@@ -193,6 +193,11 @@ pub(crate) enum TerminalState<'a> {
         /// A group member outlived `sh`; the run was still live until it exited.
         survivors: bool,
     },
+    /// A pull posted this card before it could render the live one: it exists so
+    /// a create whose response is lost leaves a card that offers nothing, never
+    /// a second live card. On the ordinary path it is visible for exactly one
+    /// PATCH.
+    Pulling,
     /// A bare `/run` moved the run's card to a newer message: this card keeps
     /// the tail it froze with, offers no controls (the run is still live, and
     /// one run must not show two current 终止 buttons), and says where to look.
@@ -262,6 +267,13 @@ pub(crate) fn build_terminal_card(view: TerminalCard<'_>) -> serde_json::Value {
             "🖥️ 终端命令 · 启动中",
             "blue",
             "⏳ 启动中…".to_string(),
+            "（等待输出…）",
+            false,
+        ),
+        TerminalState::Pulling => (
+            "🖥️ 终端命令 · 正在移动",
+            "blue",
+            "⏳ 正在把终端卡片移到这里…".to_string(),
             "（等待输出…）",
             false,
         ),
@@ -1095,6 +1107,34 @@ mod tests {
         // The same card's 完整输出 keeps its own payload (path + render inputs).
         let full = find_button(&card, "full_output").expect("完整输出");
         assert!(full.get("terminal_card").is_some(), "{full}");
+    }
+
+    /// A pull posted this card before it could render the live one: it exists so
+    /// a create whose response is lost leaves a card that offers nothing, never
+    /// a second live card. On the ordinary path it is visible for exactly one
+    /// PATCH.
+    #[test]
+    fn a_pulling_placeholder_offers_nothing_to_click() {
+        let card = build_terminal_card(TerminalCard {
+            cwd: "/work",
+            command: "make",
+            output: "",
+            output_truncated: false,
+            output_over_limit: false,
+            full_output: None,
+            notice: None,
+            state: TerminalState::Pulling,
+            run_id: "run-829",
+            chat_id: "chat_1",
+            thread_id: "chat_1",
+        });
+        let text = crate::bridge::test_support::card_text(&card);
+        assert!(text.contains("正在移动"), "{text}");
+        assert!(
+            !text.contains("⏹ 终止") && !text.contains("运行中"),
+            "the placeholder claims nothing about the run: {text}"
+        );
+        assert_eq!(card.to_string().matches("\"tag\":\"button\"").count(), 0);
     }
 
     /// A card a bare `/run` superseded says where the run went and offers no

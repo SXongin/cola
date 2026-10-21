@@ -6212,19 +6212,25 @@ async fn a_bare_run_moves_a_live_run_card_to_the_newest_position() {
     .await;
 
     let pulled = wait_for_reply_to(&platform, "msg_pull_command").await;
-    let text = card_text(&pulled);
+    let placeholder = card_text(&pulled);
     assert!(
-        text.contains("运行中"),
-        "the reposted card is the live card, not a settled rebuild: {text}"
+        placeholder.contains("正在移动") && !placeholder.contains("⏹ 终止"),
+        "the reply is a control-less placeholder until it can be rendered: {placeholder}"
     );
-    assert!(text.contains("first-829"), "it carries the tail: {text}");
+
+    // The placeholder becomes the live card, with the tail and the controls.
+    let live = wait_for_patch_containing(&platform, "om_pulled", "运行中").await;
+    let live_text = card_text(&live);
     assert!(
-        button_value(&pulled, "kill").is_some(),
-        "the new card carries 终止: {text}"
+        live_text.contains("first-829"),
+        "it carries the tail: {live_text}"
+    );
+    assert!(
+        button_value(&live, "kill").is_some(),
+        "the new card carries 终止: {live_text}"
     );
 
     // The run now writes the new card, and the old one is frozen in place.
-    wait_for_patch_containing(&platform, "om_pulled", "运行中").await;
     let frozen = wait_for_patch_containing(&platform, "om_original", "已下移").await;
     let frozen_text = card_text(&frozen);
     assert!(
@@ -6385,5 +6391,222 @@ async fn a_bare_run_with_no_terminal_history_answers_usage() {
         platform.replied_cards().await.is_empty(),
         "no card is invented: {:?}",
         platform.replied_cards().await
+    );
+}
+
+/// A pull whose new card cannot be posted (Feishu refuses, or the create's
+/// response is lost) changes nothing: the run stays on the card it was writing,
+/// the record still names it, and the command says so. The card the pull posted
+/// carries no controls, so an ambiguous create cannot leave a second live card.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pull_that_cannot_post_the_new_card_changes_nothing() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform.given_reply_id("om_original");
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 1", key, "msg_pull_run", ConversationKind::P2p).await;
+        }
+    });
+    live_card_with(&platform, "kill").await;
+
+    // The "accepted remotely, response lost" shape: the create may have landed,
+    // but cola has no id to write to.
+    platform.given_reply_card_outcome(ReplyOutcome::Ambiguous);
+    send_command_in(
+        &app,
+        "/run",
+        key.clone(),
+        "msg_pull_failed",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let texts = platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("无法把终端卡片移到最新位置")),
+        "the failed pull is stated: {texts:?}"
+    );
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().card_id,
+        "om_original",
+        "the record still names the card the run writes"
+    );
+    // The run is still on the old card and settles there.
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the run ends")
+        .unwrap();
+    let settled = patches_to(&platform, "om_original")
+        .await
+        .last()
+        .cloned()
+        .expect("the old card keeps receiving writes");
+    assert!(
+        card_text(&settled).contains("退出码 0"),
+        "the settle lands on the card the run never left: {}",
+        card_text(&settled)
+    );
+}
+
+/// A pull whose freeze is refused (both attempts) is undone: the old card is
+/// painted live again and the new card goes back to its control-less
+/// placeholder, so the chat never holds two cards that both look current.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pull_whose_freeze_fails_is_undone() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform.given_reply_id("om_original");
+    platform.given_reply_id("om_pulled");
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 1", key, "msg_pull_run", ConversationKind::P2p).await;
+        }
+    });
+    live_card_with(&platform, "kill").await;
+
+    // Both freeze attempts are refused; the undo (a live card, no 「已下移」)
+    // still lands.
+    platform.fail_updates_containing("已下移", 2);
+    send_command_in(
+        &app,
+        "/run",
+        key.clone(),
+        "msg_pull_failed",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let texts = platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("无法把终端卡片移到最新位置")),
+        "the undone pull is stated: {texts:?}"
+    );
+    assert_eq!(
+        app.terminal_records.read(&key).unwrap().card_id,
+        "om_original",
+        "the record is not re-pointed by an undone pull"
+    );
+    let bubble = patches_to(&platform, "om_pulled").await;
+    let undone = bubble.last().cloned().expect("the new card is written");
+    let undone_text = card_text(&undone);
+    assert!(
+        undone_text.contains("正在移动") && button_value(&undone, "kill").is_none(),
+        "the unused card is back to a control-less placeholder: {undone_text}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the run ends")
+        .unwrap();
+    let settled = patches_to(&platform, "om_original")
+        .await
+        .last()
+        .cloned()
+        .expect("the settle lands on the old card");
+    assert!(
+        card_text(&settled).contains("退出码 0"),
+        "{}",
+        card_text(&settled)
+    );
+}
+
+/// A pull whose durable record write fails is undone the same way: without the
+/// new id on disk, a restart would repair the frozen card, so the run stays on
+/// the card the record names.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_pull_whose_record_write_fails_keeps_the_run_on_the_old_card() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform.given_reply_id("om_original");
+    platform.given_reply_id("om_pulled");
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(&app, "/run sleep 1", key, "msg_pull_run", ConversationKind::P2p).await;
+        }
+    });
+    live_card_with(&platform, "kill").await;
+
+    // Every later record write fails, including the pull's.
+    app.terminal_records.fail_writes_after(0);
+    send_command_in(
+        &app,
+        "/run",
+        key.clone(),
+        "msg_pull_failed",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let texts = platform.texts().await;
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("无法把终端卡片移到最新位置")),
+        "the unrecorded pull is stated: {texts:?}"
+    );
+    let record = app.terminal_records.read(&key).expect("the pre-pull record");
+    assert_eq!(
+        record.card_id, "om_original",
+        "the durable record still names the card the run writes"
+    );
+    let old = patches_to(&platform, "om_original").await;
+    let restored = old.last().cloned().expect("the undo paints the old card");
+    assert!(
+        button_value(&restored, "kill").is_some(),
+        "the old card keeps its controls: {}",
+        card_text(&restored)
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the run ends")
+        .unwrap();
+    let settled = patches_to(&platform, "om_original")
+        .await
+        .last()
+        .cloned()
+        .expect("the settle lands on the old card");
+    assert!(
+        card_text(&settled).contains("退出码 0"),
+        "{}",
+        card_text(&settled)
     );
 }
