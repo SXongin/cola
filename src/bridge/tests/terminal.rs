@@ -2662,6 +2662,85 @@ async fn the_cap_stops_the_tail_but_the_wait_continues() {
     assert!(text.contains("after-cap"), "the post-cap output settles: {text}");
 }
 
+/// #825: the one PATCH that announces the cap can be refused or time out. While
+/// the run is still live, the render loop must retry it until a patch carrying
+/// the cap lands — otherwise a run with no survivor change would never offer
+/// 「继续」. Once announced (and with nothing changing), the retries stop.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_cap_patch_is_retried_until_announced() {
+    use std::sync::atomic::Ordering;
+
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms.store(5, Ordering::Relaxed);
+    // The first PATCH that carries the cap state is rejected (a simulated Feishu
+    // failure); the retry must land.
+    app.core.terminal_fail_cap_patches.store(1, Ordering::SeqCst);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run --timeout 1s sleep 30",
+                key,
+                "msg_cap_retry",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+
+    // No survivor line ever changes here: only the cap retry can put 「继续」 on
+    // the card.
+    let capped = live_card_with(&platform, "continue").await;
+    let text = card_text(&capped);
+    assert!(text.contains("已达时限"), "the retry announced the cap: {text}");
+    assert_eq!(
+        app.core.terminal_fail_cap_patches.load(Ordering::SeqCst),
+        0,
+        "the simulated cap rejection was used"
+    );
+
+    // Announced: with no state change, the loop stops patching the capped card.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let updates = platform.updated_cards().await.len();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        platform.updated_cards().await.len(),
+        updates,
+        "an announced cap is not retried"
+    );
+
+    // 继续 extends the run: the card returns to a live state.
+    let continue_value = button_value(&capped, "continue").expect("the cap offers 继续");
+    let result = app.host_action(continue_value).await.expect("a toast result");
+    assert!(
+        result.toast.unwrap_or_default().contains("延长"),
+        "继续 is accepted past the cap"
+    );
+    wait_for_card_update(&platform, "the extended run", CardUpdates::Any, |card| {
+        let text = card_text(card);
+        !text.contains("已达时限") && text.contains("运行中")
+    })
+    .await;
+
+    let live = platform.updated_cards().await.last().cloned().unwrap();
+    let kill = button_value(&live, "kill").expect("the resumed card carries 终止");
+    app.host_action(kill).await.expect("a toast result");
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the killed run ends")
+        .unwrap();
+}
+
 /// #825 acceptance: 「继续」 is available exactly while the run is past the cap
 /// and live; it extends the cap by the same amount (the tail resumes), the slot
 /// stays claimed until exit/kill, and after settle the click is refused.
