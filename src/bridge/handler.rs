@@ -1570,6 +1570,26 @@ impl App {
         else {
             return;
         };
+        // Retention (spec #821 user story 23), after the lost sweep has resolved
+        // every `running` record: an inactive chat's latest run and its log
+        // expire at `log_days` too, except a lost run whose group may still be
+        // writing. The ordinary unreferenced-log sweep below stays as it is.
+        let expiry =
+            crate::bridge::terminal::expire_records(&root, self.terminal_log_days, &self.terminal_records);
+        if expiry.expired > 0 {
+            tracing::info!(
+                "terminal: expired {} run record(s) and their logs older than {} day(s)",
+                expiry.expired,
+                self.terminal_log_days
+            );
+        }
+        if expiry.kept_live > 0 {
+            tracing::info!(
+                "terminal: kept {} lost run(s) past {} day(s) — their process groups may still be alive",
+                expiry.kept_live,
+                self.terminal_log_days
+            );
+        }
         let removed =
             crate::bridge::terminal::sweep_logs(&root, self.terminal_log_days, &self.terminal_records);
         if removed > 0 {

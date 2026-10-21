@@ -3590,6 +3590,7 @@ async fn a_restart_marks_a_running_run_lost_without_signalling_it() {
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            updated_at: 0,
         })
         .unwrap();
 
@@ -3665,6 +3666,7 @@ async fn a_record_written_before_a_spawn_that_never_happened_is_reported_and_cle
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            updated_at: 0,
         })
         .unwrap();
 
@@ -3713,6 +3715,7 @@ async fn a_lost_run_with_an_unreadable_log_says_why_the_output_is_missing() {
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            updated_at: 0,
         })
         .unwrap();
 
@@ -4133,6 +4136,7 @@ async fn a_lost_run_keeps_rerun_and_full_output_and_refuses_terminate() {
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            updated_at: 0,
         })
         .unwrap();
     let (app2, platform2, prompts) = restart_app_recording(cfg, root).await;
@@ -4324,6 +4328,7 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
             is_group: false,
             state: TerminalRunState::Settled,
             ask_ai_submitted: false,
+            updated_at: 0,
         })
         .unwrap();
     app.sweep_terminal().await;
@@ -4331,6 +4336,255 @@ async fn terminal_logs_are_swept_by_age_and_a_live_write_is_kept() {
     assert!(!stale.exists(), "a log past `[bridge] log_days` is swept");
     assert!(live.exists(), "a file still being written is not unlinked");
     assert!(other.exists(), "the sweep only owns .log files");
+}
+
+/// A record for the retention tests: one chat, one log, the given ending.
+#[cfg(unix)]
+fn expiry_record(
+    key: &ThreadKey,
+    run_id: &str,
+    log: &std::path::Path,
+    state: TerminalRunState,
+    pids: Vec<u32>,
+    age_days: u64,
+) -> TerminalRunRecord {
+    TerminalRunRecord {
+        run_id: run_id.to_string(),
+        chat_id: key.chat_id.clone(),
+        thread_id: key.thread_id.clone(),
+        card_id: "om_card".to_string(),
+        log_path: log.to_string_lossy().into_owned(),
+        command: "printf 'x'".to_string(),
+        cwd: "/tmp".to_string(),
+        timeout_ms: 60_000,
+        pids,
+        is_group: false,
+        state,
+        ask_ai_submitted: false,
+        updated_at: crate::bridge::terminal_record::now_epoch_secs().saturating_sub(age_days * 24 * 60 * 60),
+    }
+}
+
+/// Backdate `path` by `days`, the shape a file left alone for that long has.
+#[cfg(unix)]
+fn age_file(path: &std::path::Path, days: u64) {
+    let when = std::time::SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// Spec #821 user story 23: retention is bounded by `[bridge] log_days`, not by
+/// the chat's next run. An old settled record and its log both go, so an
+/// inactive chat's **latest** log does not survive forever; a fresh record and
+/// its log keep both.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_old_settled_record_and_its_log_expire_together() {
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 7;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, _platform) = restart_app(cfg, root.clone()).await;
+    let old_key = thread();
+    let fresh_key = ThreadKey::new("chat_fresh".into(), "chat_fresh".into());
+    let old_log = root.join("old-settled.log");
+    let fresh_log = root.join("fresh-settled.log");
+    std::fs::write(&old_log, b"old output\n").unwrap();
+    std::fs::write(&fresh_log, b"fresh output\n").unwrap();
+    app.terminal_records
+        .write(&expiry_record(
+            &old_key,
+            "run-old",
+            &old_log,
+            TerminalRunState::Settled,
+            Vec::new(),
+            30,
+        ))
+        .unwrap();
+    app.terminal_records
+        .write(&expiry_record(
+            &fresh_key,
+            "run-fresh",
+            &fresh_log,
+            TerminalRunState::Settled,
+            Vec::new(),
+            0,
+        ))
+        .unwrap();
+    age_file(&old_log, 30);
+
+    app.sweep_terminal().await;
+
+    assert!(!old_log.exists(), "an old log of an inactive chat is removed");
+    assert!(
+        !app.terminal_records.path(&old_key).exists(),
+        "and its record goes with it"
+    );
+    assert!(fresh_log.exists(), "a fresh record still protects its log");
+    assert!(app.terminal_records.path(&fresh_key).exists(), "and is kept");
+}
+
+/// Spec #821 user story 23: a `lost` record's group cannot be confirmed writing,
+/// so retention probes it. A dead group means both the record and its log go.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_old_lost_record_with_a_dead_group_expires_with_its_log() {
+    use std::os::unix::process::CommandExt;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 7;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, _platform) = restart_app(cfg, root.clone()).await;
+    let key = thread();
+    let log = root.join("dead-group.log");
+    std::fs::write(&log, b"old output\n").unwrap();
+
+    // A reaped process in its own group leaves that group id gone.
+    let mut dead = std::process::Command::new("true");
+    dead.process_group(0);
+    let mut dead = dead.spawn().unwrap();
+    let pid = dead.id();
+    dead.wait().unwrap();
+
+    app.terminal_records
+        .write(&expiry_record(
+            &key,
+            "run-dead",
+            &log,
+            TerminalRunState::Lost,
+            vec![pid],
+            30,
+        ))
+        .unwrap();
+    age_file(&log, 30);
+
+    app.sweep_terminal().await;
+
+    assert!(!log.exists(), "a dead group's log expires");
+    assert!(!app.terminal_records.path(&key).exists(), "with its record");
+}
+
+/// Spec #821 user story 23: a `lost` run may still be writing (a hand-launched
+/// cola's orphan), so its group is probed first. While the group lives, the
+/// record and the log stay; once it is gone, a later start expires both.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_old_lost_record_whose_group_still_lives_keeps_its_log() {
+    use std::os::unix::process::CommandExt;
+
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 7;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, _platform) = restart_app(cfg, root.clone()).await;
+    let key = thread();
+    let log = root.join("live-group.log");
+    std::fs::write(&log, b"still writing\n").unwrap();
+
+    // Its own group, so the recorded id is the pgid the sweep probes.
+    let mut alive = std::process::Command::new("sleep");
+    alive.arg("30").process_group(0);
+    let mut alive = alive.spawn().unwrap();
+    let pid = alive.id();
+
+    app.terminal_records
+        .write(&expiry_record(
+            &key,
+            "run-alive",
+            &log,
+            TerminalRunState::Lost,
+            vec![pid],
+            30,
+        ))
+        .unwrap();
+    age_file(&log, 30);
+
+    app.sweep_terminal().await;
+
+    assert!(
+        app.terminal_records.path(&key).exists(),
+        "a lost record whose group may still write is kept"
+    );
+    assert!(log.exists(), "and so is its log");
+
+    alive.kill().unwrap();
+    alive.wait().unwrap();
+    app.sweep_terminal().await;
+
+    assert!(!log.exists(), "once the group is gone, the log expires");
+    assert!(!app.terminal_records.path(&key).exists(), "with its record");
+}
+
+/// Spec #821: a `running` record is first resolved by the lost sweep (its card
+/// is told), and only then follows the retention rule — in the same startup.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_old_running_record_is_resolved_then_expired() {
+    let state = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&state.path().join("sessions.json"));
+    cfg.bridge.log_days = 7;
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let (app, platform) = restart_app(cfg, root.clone()).await;
+    let key = thread();
+    let log = root.join("running-old.log");
+    std::fs::write(&log, b"old output\n").unwrap();
+    app.terminal_records
+        .write(&expiry_record(
+            &key,
+            "run-running",
+            &log,
+            TerminalRunState::Running,
+            Vec::new(),
+            30,
+        ))
+        .unwrap();
+    age_file(&log, 30);
+
+    app.sweep_terminal().await;
+
+    assert!(
+        platform
+            .updated_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("已失去跟踪")),
+        "the lost sweep told the card first"
+    );
+    assert!(!log.exists(), "then retention removed the log");
+    assert!(!app.terminal_records.path(&key).exists(), "and its record");
+}
+
+/// The restart sweeps must run at **startup**, not only when a test calls them
+/// directly: every test above would pass if `App::run` stopped calling
+/// `sweep_terminal`. This pins the production wiring in `run`'s own body.
+#[test]
+fn app_run_invokes_the_terminal_sweeps_at_startup() {
+    let source = include_str!("../handler.rs");
+    let start = source
+        .find("pub async fn run(self: Arc<Self>)")
+        .expect("App::run exists");
+    let run = &source[start..];
+    let end = run
+        .find("pub async fn handle_message(")
+        .expect("run is followed by handle_message");
+    let body = &run[..end];
+    assert!(
+        body.contains("self.sweep_terminal().await;"),
+        "App::run must run the terminal sweeps before its loops"
+    );
 }
 
 /// #827 last guard: a MISSING records directory is not permission to delete.
@@ -4428,6 +4682,7 @@ async fn an_old_log_a_record_still_names_is_kept_and_its_silent_orphan_keeps_wri
             is_group: false,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            updated_at: 0,
         })
         .unwrap();
 
