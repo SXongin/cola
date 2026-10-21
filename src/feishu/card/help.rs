@@ -19,7 +19,7 @@ pub fn build_help_card() -> serde_json::Value {
                 ),
                 (
                     "/worktree",
-                    "本项目 git 检出卡片（含主检出）：分支 · ⚠ · 会话数；点一行在那里声明会话",
+                    "本项目 git 检出卡片（含主检出）：分支 · ⚠ · 会话数；只读，落根用 /dir、接管用 /switch",
                 ),
                 (
                     "/worktree new <名字> [--base <ref>]",

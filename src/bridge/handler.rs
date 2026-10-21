@@ -1279,14 +1279,9 @@ fn reconcile_viewer_page_lane(
 /// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
 /// Session Creation, ADR-0041). A persist failure is logged and the caller still
 /// toasts success, parity with the switch card's 新建.
-async fn declare_pending_dir(
-    core: &Arc<SharedCore>,
-    thread_key: &ThreadKey,
-    directory: &str,
-    title: Option<String>,
-) {
+async fn declare_pending_dir(core: &Arc<SharedCore>, thread_key: &ThreadKey, directory: &str) {
     if let Err(e) = core
-        .declare_pending(thread_key, directory.to_string(), title)
+        .declare_pending(thread_key, directory.to_string(), None)
         .await
     {
         tracing::warn!("dir card pick: persist failed: {}", e);
@@ -2640,7 +2635,6 @@ impl App {
                 "switch" => self.handle_switch_card_action(&self.core, &value).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
                 "dir" => self.handle_dir_card_action(&self.core, &value).await,
-                "worktree" => self.handle_worktree_card_action(&self.core, &value).await,
                 // Different cards carry `action: "file"` (#739, #742, #778): the
                 // viewer's own 「发为文件」/「🌐 预览网页」 button, whose payload
                 // carries `op: "send"` and transfers the file's whole bytes
@@ -3340,7 +3334,7 @@ impl App {
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
-                declare_pending_dir(core, &thread_key, &directory, None).await;
+                declare_pending_dir(core, &thread_key, &directory).await;
                 Some(CardActionResult {
                     card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                     toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
@@ -3391,133 +3385,6 @@ impl App {
             },
         )
         .await
-    }
-
-    /// Handle a `/worktree` card button (ADR-0088): `op: "pick"` declares a
-    /// **Pending Session** in the checkout — the same meaning as `/dir`'s pick,
-    /// so it never adopts an existing session (that is `/switch`'s job).
-    ///
-    /// The click re-reads the inventory once: the payload's directory is
-    /// trusted only if it is still a listed checkout (and still on disk), so a
-    /// stale card can never turn an ordinary directory — or a pruned worktree
-    /// whose folder survived — into the conversation's project.
-    async fn handle_worktree_card_action(
-        self: &Arc<Self>,
-        core: &Arc<SharedCore>,
-        value: &serde_json::Value,
-    ) -> Option<CardActionResult> {
-        let thread_key = thread_key_from_value(value);
-        let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        if op != "pick" {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("无效操作".to_string()),
-            });
-        }
-        let directory = value
-            .get("directory")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if directory.is_empty() {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("无效操作".to_string()),
-            });
-        }
-
-        // The click re-reads git's own inventory before touching the store: the
-        // payload's directory is trusted only if it is still a listed checkout
-        // (and still on disk), so a stale card can never turn an ordinary
-        // directory — or a pruned worktree whose folder survived — into the
-        // conversation's project. One cheap list, bounded so the ack never
-        // waits on a stalled filesystem (CODING_STANDARDS.md: a card callback
-        // runs on a deadline).
-        // One deadline for the WHOLE callback: validation, the store write and
-        // the refresh all share it, so the card's 2 s ack budget is never
-        // raced (CODING_STANDARDS.md: a card callback runs on a deadline). The
-        // margin leaves room for the pending write and the response itself.
-        let handles = core.command_handles();
-        let repo = handles.current_project_directory(&thread_key).await;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1_400);
-        let entries = match tokio::time::timeout_at(deadline, crate::git::list_worktrees(&repo)).await {
-            Ok(Ok(entries)) => entries,
-            Ok(Err(error)) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(format!("⚠️ {error}")),
-                });
-            }
-            Err(_) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("⚠️ 读取 worktree 超时，请稍后重试（未做任何更改）".to_string()),
-                });
-            }
-        };
-        let listed = entries
-            .iter()
-            .any(|entry| crate::bridge::command::same_dir(&entry.path, &directory));
-        if !listed || !std::path::Path::new(&directory).is_dir() {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "目录已不存在或已不是 worktree：`{directory}`（未做任何更改）"
-                )),
-            });
-        }
-
-        let current = core.sessions.lock().await.current_directory(&thread_key);
-        if current.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("已在当前目录".to_string()),
-            });
-        }
-        let title = value
-            .get("name")
-            .and_then(|v| v.as_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string);
-        // The store lock is bounded by the same deadline (a held lock must not
-        // outlive the ack); the small local atomic write itself is the commit
-        // point and is not cancelled — a cancelled `set_pending` could leave
-        // the in-memory store and the file disagreeing.
-        match core
-            .sessions_handle()
-            .declare_pending_until(&thread_key, directory.clone(), title, deadline)
-            .await
-        {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some("⚠️ 处理超时，请重新点选（未做任何更改）".to_string()),
-                });
-            }
-            Err(error) => {
-                // `set_pending` mutates memory before it persists, so the pick
-                // took effect for this process even though the write failed.
-                // Say both halves instead of claiming a clean success.
-                return Some(CardActionResult {
-                    card: None,
-                    toast: Some(format!(
-                        "⚠️ 已切换到 `{directory}`，但保存失败（重启后会丢失）：{error}"
-                    )),
-                });
-            }
-        }
-
-        // Refresh from the inventory already read — after the pending exists,
-        // so the marker is the new current — under the SAME deadline as the
-        // validation, so the callback's total work stays inside the ack.
-        let rows =
-            crate::feishu::card::command::worktree_rows(&handles, &thread_key, entries, deadline).await;
-        let card = crate::feishu::card::session::build_worktree_card(&thread_key, &rows, &repo);
-        Some(CardActionResult {
-            card: Some(card),
-            toast: Some(format!("下一条消息将在 `{directory}` 创建会话")),
-        })
     }
 
     /// Rebuild the `/dir` browse card (ADR-0078) for `view.dir`, clamping a
@@ -4465,7 +4332,7 @@ impl App {
                 toast: Some("已在当前目录".to_string()),
             });
         }
-        declare_pending_dir(core, thread_key, &directory, None).await;
+        declare_pending_dir(core, thread_key, &directory).await;
         Some(CardActionResult {
             card: Some(self.build_dir_browse_for(core, thread_key, settled).await),
             toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),

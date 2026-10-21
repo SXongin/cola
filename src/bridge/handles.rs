@@ -280,30 +280,6 @@ impl SessionsHandle {
         Ok(pending)
     }
 
-    /// [`Self::declare_pending`] under a deadline (ADR-0088): the worktree
-    /// card's pick runs on a card-ack budget, so it must not wait on a held
-    /// store lock indefinitely. `Ok(None)` means the lock was still held at
-    /// `deadline` and nothing was written; the write itself is a small local
-    /// atomic file write and is deliberately not cancellable.
-    pub(crate) async fn declare_pending_until(
-        &self,
-        thread_key: &ThreadKey,
-        directory: impl Into<String>,
-        title: Option<String>,
-        deadline: tokio::time::Instant,
-    ) -> crate::error::Result<Option<PendingEntry>> {
-        let mut pending = self.new_pending(thread_key, directory, title);
-        let Ok(mut store) = tokio::time::timeout_at(deadline, self.store.lock()).await else {
-            return Ok(None);
-        };
-        if let Some(replaced) = store.pending_for(thread_key) {
-            pending.topic_anchor = replaced.topic_anchor.clone();
-            pending.topic_root = replaced.topic_root.clone();
-        }
-        store.set_pending(pending.clone())?;
-        Ok(Some(pending))
-    }
-
     /// The Pending Session a conversation's next prompt will materialise,
     /// carrying the configured `default_auto_accept` (#513). Every production
     /// declaration path (`/new`, `/dir`, `/topic`, the switch card's 新建)

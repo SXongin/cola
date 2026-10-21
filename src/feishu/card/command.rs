@@ -406,7 +406,7 @@ pub(crate) async fn send_worktree_card(
 ) -> Result<()> {
     match worktree_card_data(handles, thread_key).await {
         Ok((rows, repo)) => {
-            let card = super::session::build_worktree_card(thread_key, &rows, &repo);
+            let card = super::session::build_worktree_card(&rows, &repo);
             handles.flow.platform.reply_card(message_id, &card).await?;
         }
         Err(error) => {
