@@ -6126,3 +6126,264 @@ async fn ask_ai_submits_once_across_a_restart() {
         prompts2.lock().await
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bare `/run`: the Terminal Card's locator (the `/card` of this family).
+// ---------------------------------------------------------------------------
+
+/// Every card PATCHed onto `message_id`, in call order — the per-message view
+/// `updated_cards` deliberately flattens away.
+#[cfg(unix)]
+async fn patches_to(platform: &RecordingPlatform, message_id: &str) -> Vec<serde_json::Value> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::UpdateMessage { message_id: id, card } if id == message_id => Some(card.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The card the app replied with under `message_id`, waiting for it to land.
+#[cfg(unix)]
+async fn wait_for_reply_to(platform: &RecordingPlatform, message_id: &str) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some((_, card)) = platform
+                .replied_cards_with_targets()
+                .await
+                .into_iter()
+                .find(|(target, _)| target == message_id)
+            {
+                return card;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the command never replied with a card")
+}
+
+/// A live run's card moves to the newest position, the run keeps patching the
+/// new message and settles there, and the old card is frozen as 「已下移」 with
+/// its controls gone — never two currents cards for one run.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_run_moves_a_live_run_card_to_the_newest_position() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    app.turn_render_poll_ms
+        .store(5, std::sync::atomic::Ordering::Relaxed);
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    platform.given_reply_id("om_original");
+    platform.given_reply_id("om_pulled");
+
+    let running = tokio::spawn({
+        let app = std::sync::Arc::clone(&app);
+        let key = key.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/run printf 'first-829\\n'; sleep 1; printf 'second-829\\n'",
+                key,
+                "msg_pull_run",
+                ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    // The live card exists (its 终止 is rendered) before the pull is sent.
+    live_card_with(&platform, "kill").await;
+
+    send_command_in(
+        &app,
+        "/run",
+        key.clone(),
+        "msg_pull_command",
+        ConversationKind::P2p,
+    )
+    .await;
+
+    let pulled = wait_for_reply_to(&platform, "msg_pull_command").await;
+    let text = card_text(&pulled);
+    assert!(
+        text.contains("运行中"),
+        "the reposted card is the live card, not a settled rebuild: {text}"
+    );
+    assert!(text.contains("first-829"), "it carries the tail: {text}");
+    assert!(
+        button_value(&pulled, "kill").is_some(),
+        "the new card carries 终止: {text}"
+    );
+
+    // The run now writes the new card, and the old one is frozen in place.
+    wait_for_patch_containing(&platform, "om_pulled", "运行中").await;
+    let frozen = wait_for_patch_containing(&platform, "om_original", "已下移").await;
+    let frozen_text = card_text(&frozen);
+    assert!(
+        frozen_text.contains("本条不再更新"),
+        "the frozen card says it stopped updating: {frozen_text}"
+    );
+    assert!(
+        button_value(&frozen, "kill").is_none() && button_value(&frozen, "continue").is_none(),
+        "a superseded card offers no run controls: {frozen_text}"
+    );
+
+    // The record follows the card: a restart would repair the right message.
+    let record = wait_for_record(&app, &key, |record| record.card_id == "om_pulled").await;
+    assert_eq!(record.state, TerminalRunState::Running);
+
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .expect("the run ends")
+        .unwrap();
+    let settled = patches_to(&platform, "om_pulled")
+        .await
+        .last()
+        .cloned()
+        .expect("the settle patches the new card");
+    let settled_text = card_text(&settled);
+    assert!(settled_text.contains("退出码 0"), "{settled_text}");
+    assert!(
+        settled_text.contains("second-829"),
+        "the settle carries the whole run, not just what the pull saw: {settled_text}"
+    );
+    // The superseded card is never written again — not even to settle it.
+    let old = patches_to(&platform, "om_original").await;
+    assert!(
+        old.last().is_some_and(|card| card_text(card).contains("已下移")),
+        "the old card's last write is its freeze: {old:?}"
+    );
+    assert!(
+        !old.iter().any(|card| card_text(card).contains("退出码")),
+        "the settle never lands on the superseded card"
+    );
+}
+
+/// A settled run's card is rebuilt from the record and posted at the newest
+/// position; nothing durable changes and the rebuilt card's buttons still work.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_run_reposts_a_settled_card_at_the_newest_position() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(
+        &app,
+        "/run printf 'settled-829\\n'",
+        key.clone(),
+        "msg_settled_run",
+        ConversationKind::P2p,
+    )
+    .await;
+    let record = wait_for_record(&app, &key, |record| record.state == TerminalRunState::Settled).await;
+
+    send_command_in(&app, "/run", key.clone(), "msg_show_again", ConversationKind::P2p).await;
+
+    let reposted = wait_for_reply_to(&platform, "msg_show_again").await;
+    let text = card_text(&reposted);
+    assert!(
+        text.contains("退出码 0") && text.contains("settled-829"),
+        "the reposted card is the settled result: {text}"
+    );
+    assert!(
+        button_value(&reposted, "rerun").is_some(),
+        "the record still names the run, so 重跑 is offered: {text}"
+    );
+    // A repost is a read: the record keeps its identity.
+    let after = app.terminal_records.read(&key).expect("the record survives");
+    assert_eq!(after.run_id, record.run_id);
+    assert_eq!(after.card_id, record.card_id);
+    assert_eq!(after.state, TerminalRunState::Settled);
+}
+
+/// A lost run (the sweep gave up on it) reposts the same card the sweep wrote:
+/// losing the process is not a reason to lose the evidence.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_run_reposts_a_lost_card_from_its_record() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let logs = tempfile::tempdir().unwrap();
+    let root = logs.path().join("terminal");
+    std::fs::create_dir_all(&root).unwrap();
+    let log = root.join("lost-829.log");
+    std::fs::write(&log, b"lost-marker-829\n").unwrap();
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+    app.terminal_records
+        .write(&TerminalRunRecord {
+            run_id: "run-lost-829".into(),
+            chat_id: key.chat_id.clone(),
+            thread_id: key.thread_id.clone(),
+            card_id: "msg_lost_829".into(),
+            log_path: log.to_string_lossy().into_owned(),
+            command: "printf 'lost-829\\n'".into(),
+            cwd: canonical(proj.path()),
+            timeout_ms: 60_000,
+            pids: vec![4242],
+            is_group: false,
+            state: TerminalRunState::Lost,
+            ask_ai_submitted: false,
+            outcome: None,
+            updated_at: 0,
+        })
+        .unwrap();
+
+    send_command_in(&app, "/run", key.clone(), "msg_show_lost", ConversationKind::P2p).await;
+
+    let reposted = wait_for_reply_to(&platform, "msg_show_lost").await;
+    let text = card_text(&reposted);
+    assert!(
+        text.contains("已失去跟踪") && text.contains("lost-marker-829"),
+        "the lost card is rebuilt with the log's tail: {text}"
+    );
+    let rerun = button_value(&reposted, "rerun").expect("重跑 stays usable on a lost run");
+    assert_eq!(rerun["run_id"].as_str(), Some("run-lost-829"));
+    assert!(
+        button_value(&reposted, "kill").is_none(),
+        "a lost run has nothing left to signal: {text}"
+    );
+}
+
+/// With no run and no record there is nothing to locate, so the usage line stays
+/// the answer (today's behaviour for a bare `/run`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_bare_run_with_no_terminal_history_answers_usage() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let cfg = test_config(&state.path().join("sessions.json"));
+    let (app, platform, _logs) = build_terminal_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = thread();
+    seed_entry(&app, entry(&key, proj.path())).await;
+
+    send_command_in(&app, "/run", key, "msg_no_history", ConversationKind::P2p).await;
+
+    let texts = platform.texts().await;
+    assert!(
+        texts.iter().any(|text| text.contains("用法：`/run")),
+        "the bare form keeps its usage answer: {texts:?}"
+    );
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "no card is invented: {:?}",
+        platform.replied_cards().await
+    );
+}
