@@ -5795,6 +5795,9 @@ impl App {
         notice: &str,
         what: &'static str,
     ) {
+        let timeout_ms = self
+            .viewer_transfer_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         // #828: a payload minted before the settled buttons named their run
         // carries no run id, and rebuilding from it wrote a 「问 AI」 button with
         // an empty id — a button that could only toast 「无效操作」. The chat's
@@ -5802,17 +5805,49 @@ impl App {
         // decision 4), so a legacy payload takes its run id from there; when the
         // record has none either, the button is omitted rather than written with
         // an empty id.
+        let record = self.terminal_records.read(&ThreadKey::new(
+            request.chat_id.clone(),
+            request.thread_id.clone(),
+        ));
         let run_id = if request.run_id.is_empty() {
-            self.terminal_records
-                .read(&ThreadKey::new(
-                    request.chat_id.clone(),
-                    request.thread_id.clone(),
-                ))
-                .map(|record| record.run_id)
+            record
+                .as_ref()
+                .map(|record| record.run_id.clone())
                 .unwrap_or_default()
         } else {
             request.run_id.clone()
         };
+        // The ending is the **record's**, not the payload's: a startup failure
+        // and an unconfirmed termination live only there, and a rebuild that
+        // invented a clean ending would misreport the run (spec #825). The
+        // payload is not trusted to carry them; it is only a route.
+        let outcome = (!request.lost)
+            .then(|| {
+                record
+                    .as_ref()
+                    .filter(|record| !run_id.is_empty() && record.run_id == run_id)
+                    .and_then(|record| record.outcome.as_ref())
+            })
+            .flatten();
+        if !request.lost && outcome.is_none() {
+            // No durable ending for this run (the record expired, a successor
+            // replaced it, or it cannot be read). Rebuilding would have to clear
+            // the startup failure or the survivor warning the clicked card
+            // shows, so leave that card exactly as it is and speak the outcome
+            // under it instead.
+            self.reply_terminal_outcome(&request.message_id, notice, timeout_ms)
+                .await;
+            return;
+        }
+        let exit_code = outcome
+            .map(|outcome| outcome.exit_code)
+            .unwrap_or(request.exit_code);
+        let elapsed = outcome
+            .map(|outcome| std::time::Duration::from_millis(outcome.elapsed_ms))
+            .unwrap_or(request.elapsed);
+        let output_over_limit = outcome
+            .map(|outcome| outcome.output_over_limit)
+            .unwrap_or(request.output_over_limit);
         // The rebuilt card keeps every settled button and its run id, and a run
         // the sweep marked lost is rebuilt AS a lost card: the outcome PATCH
         // must not invent an ending for it (ADR-0086 decisions 4, 5 and 10).
@@ -5827,22 +5862,19 @@ impl App {
             thread_id: &request.thread_id,
             lost: request.lost,
             is_group: request.is_group,
-            exit_code: request.exit_code,
-            elapsed: request.elapsed,
-            output_over_limit: request.output_over_limit,
+            exit_code,
+            elapsed,
+            output_over_limit,
         });
-        let state = if request.lost {
-            crate::feishu::card::terminal::TerminalState::Lost
-        } else {
-            crate::feishu::card::terminal::TerminalState::Settled {
-                exit_code: request.exit_code,
-                spawn_error: None,
-                elapsed: request.elapsed,
-                // The outcome PATCH rebuilds a settled card, so the run
-                // controls stay dead.
-                stopped: false,
-                survivors: false,
-            }
+        let state = match outcome {
+            Some(outcome) => crate::feishu::card::terminal::TerminalState::Settled {
+                exit_code: outcome.exit_code,
+                spawn_error: outcome.spawn_error.as_deref(),
+                elapsed: std::time::Duration::from_millis(outcome.elapsed_ms),
+                stopped: outcome.stopped,
+                survivors: outcome.survivors,
+            },
+            None => crate::feishu::card::terminal::TerminalState::Lost,
         };
         let card =
             crate::feishu::card::terminal::build_terminal_card(crate::feishu::card::terminal::TerminalCard {
@@ -5850,7 +5882,7 @@ impl App {
                 command: &request.command,
                 output,
                 output_truncated,
-                output_over_limit: request.output_over_limit,
+                output_over_limit,
                 full_output,
                 notice: Some(notice),
                 state,
@@ -5858,9 +5890,6 @@ impl App {
                 chat_id: &request.chat_id,
                 thread_id: &request.thread_id,
             });
-        let timeout_ms = self
-            .viewer_transfer_timeout_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
         if !matches!(
             crate::bridge::bounded_call(
                 what,
@@ -5874,10 +5903,11 @@ impl App {
         }
     }
 
-    /// Speak a 「📄 完整输出」 outcome under the clicked card when there is no
-    /// new card to write — a log that could not be read leaves the settled
-    /// card's tail untouched instead of rebuilding it empty. Bounded like every
-    /// other delivery step, so the click is never silently dropped.
+    /// Speak an outcome under the clicked card when there is no new card to
+    /// write — a log that could not be read, or a run whose ending is no longer
+    /// on record, leaves the settled card's own state (a startup failure, a
+    /// survivor warning) untouched instead of rebuilding it cleared. Bounded like
+    /// every other delivery step, so the click is never silently dropped.
     async fn reply_terminal_outcome(&self, message_id: &str, line: &str, timeout_ms: u64) {
         if !matches!(
             crate::bridge::bounded_call(

@@ -346,6 +346,15 @@ now separate facts, and the second one is **not** kept in the per-chat record:
   Feishu works (a read-only record directory), and then the on-disk record still
   says `running`; dropping the obligation there would let the next start's lost
   sweep relabel the card the previous process just settled.
+- The settled record also carries the ending (`outcome`: spawn error, stopped,
+  survivors, over-limit, exit code, elapsed). The settled card's 「📄 完整输出」
+  and 「问 AI」 clicks rebuild the card they were clicked on, and the rebuild takes
+  the ending from the **record**, never from the button payload and never from an
+  assumed clean exit — so a failed launch keeps 「无法启动」 and an unconfirmed
+  termination keeps its survivor warning after either click (spec #825). When no
+  record ending is available (an expired, superseded or unreadable record), the
+  clicked card is left exactly as it is and the outcome is spoken under it
+  instead.
 - A `running` record still sweeps to `lost`. A settled run keeps its buttons
   whatever ended it: a launch that never started has no output, but it has a log
   path and a record, so 「↻ 重跑」 (gated on a written record), 「📄 完整输出」 and

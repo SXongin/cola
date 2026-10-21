@@ -7,10 +7,12 @@
 //! tell its readers it can no longer be tracked, and (b) let that card's
 //! 「↻ 重跑」 and 「📄 完整输出」 still know their data. It carries the run id, the
 //! card's message id and chat, the **Terminal Log** path, the command, the cwd,
-//! the timeout, the process ids, the state (`running` / `settled` / `lost`), and
-//! the 「问 AI」 submission bit. A restart uses the state to report a run it can no
-//! longer track, and the bit to refuse a second submission (whole-branch review,
-//! finding 4).
+//! the timeout, the process ids, the state (`running` / `settled` / `lost`), the
+//! run's ending, the 「问 AI」 submission bit and the run's last update time. A
+//! restart uses the state to report a run it can no longer track, the ending to
+//! rebuild a settled card a button was clicked on, the bit to refuse a second
+//! submission (whole-branch review, finding 4), and the update time for
+//! retention (spec #821 user story 23).
 //!
 //! A settle whose **card has not been told** is a different kind of fact, and it
 //! does NOT live here: the chat's next run replaces this file, so an obligation
@@ -140,6 +142,16 @@ pub(crate) struct TerminalRunRecord {
     /// would submit the same output again (whole-branch review, finding 4).
     #[serde(default)]
     pub(crate) ask_ai_submitted: bool,
+    /// The run's ending, once it has one: exit code, spawn error, elapsed time,
+    /// whether 终止 ended it, whether group members survived, whether the probe
+    /// stopped it. Persisted so the settled card's **buttons** can rebuild the
+    /// same card after a click — 「📄 完整输出」 and 「问 AI」 PATCH the card they
+    /// were clicked on, and a rebuild that forgot a failed launch or an
+    /// unconfirmed termination would misreport the run (spec #825). The owed
+    /// settlement stays the durable obligation for finishing a failed final
+    /// write; this is the display fact that outlives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outcome: Option<TerminalRunOutcome>,
     /// When this run last did something real — the pre-spawn write, the child
     /// coming up, or the settle — in epoch seconds. Retention (`[bridge]
     /// log_days`) measures from here, not from the file's mtime: a **resolution**
@@ -178,16 +190,6 @@ pub(crate) fn now_epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or_default()
-}
-
-/// One settle whose card has not been told (whole-branch review, finding 1): the
-/// run's record snapshot and the ending to render. It is kept **outside** the
-/// per-chat current record on purpose — that file is replaced by the chat's next
-/// run, and the obligation must outlive the replacement.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OwedSettlement {
-    pub(crate) record: TerminalRunRecord,
-    pub(crate) outcome: TerminalRunOutcome,
 }
 
 /// The record directory: one file per **Chat**/**Topic**, beside the session
@@ -397,7 +399,12 @@ impl TerminalRunRecords {
     /// failed — either way the caller must keep the obligation, because a
     /// `running` record behind an unreadable file is exactly what the next
     /// start's lost sweep would act on.
-    pub(crate) fn mark_settled(&self, key: &ThreadKey, run_id: &str) -> bool {
+    pub(crate) fn mark_settled(
+        &self,
+        key: &ThreadKey,
+        run_id: &str,
+        outcome: Option<&TerminalRunOutcome>,
+    ) -> bool {
         let lock = self.chat_lock(key);
         let _guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(mut record) = self.read(key) else {
@@ -407,6 +414,14 @@ impl TerminalRunRecords {
             return true;
         }
         record.state = TerminalRunState::Settled;
+        // The record's own settle write can have failed; the ending the buttons
+        // rebuild from would then be missing too. Fill it in, never overwrite one
+        // already there (this is a resolution, not a new ending).
+        if record.outcome.is_none()
+            && let Some(outcome) = outcome
+        {
+            record.outcome = Some(outcome.clone());
+        }
         match self.write_locked(&record) {
             Ok(()) => true,
             Err(error) => {
@@ -634,11 +649,12 @@ impl TerminalOwedSettlements {
         self.dir.join(owed_file_name(run_id))
     }
 
-    /// Persist one obligation, **checked**: the card may only be told a run
-    /// ended once this landed, otherwise no restart could repeat the write.
-    pub(crate) fn add(&self, owed: &OwedSettlement) -> std::io::Result<()> {
-        let data = serde_json::to_vec(owed).map_err(std::io::Error::other)?;
-        sidecar::write_atomic(&self.path(&owed.record.run_id), &data)
+    /// Persist one obligation — the settled record snapshot, ending included —
+    /// **checked**: the card may only be told a run ended once this landed,
+    /// otherwise no restart could repeat the write.
+    pub(crate) fn add(&self, record: &TerminalRunRecord) -> std::io::Result<()> {
+        let data = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        sidecar::write_atomic(&self.path(&record.run_id), &data)
     }
 
     /// Drop an obligation whose card has been told. Best effort: a failure only
@@ -660,7 +676,7 @@ impl TerminalOwedSettlements {
     /// directory is complete-and-empty (the sidecar convention); an unreadable
     /// one, or a file that will not parse or is not named for its own run, is
     /// not knowing.
-    pub(crate) fn load_all(&self) -> (Vec<OwedSettlement>, bool) {
+    pub(crate) fn load_all(&self) -> (Vec<TerminalRunRecord>, bool) {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), true),
@@ -691,11 +707,11 @@ impl TerminalOwedSettlements {
                 complete = false;
                 continue;
             };
-            match serde_json::from_slice::<OwedSettlement>(&raw) {
+            match serde_json::from_slice::<TerminalRunRecord>(&raw) {
                 // An obligation only means something at the path its OWN run id
                 // names: anything else is unreadable, whether misplaced or
                 // crafted.
-                Ok(settlement) if self.path(&settlement.record.run_id) == path => owed.push(settlement),
+                Ok(record) if self.path(&record.run_id) == path => owed.push(record),
                 Ok(_) => complete = false,
                 Err(e) => {
                     tracing::warn!("terminal owed: could not parse {}: {e}", path.display());
@@ -845,6 +861,7 @@ mod tests {
             is_group: true,
             state: TerminalRunState::Running,
             ask_ai_submitted: false,
+            outcome: None,
             updated_at: 0,
         }
     }
@@ -1020,7 +1037,8 @@ mod tests {
     /// Whole-branch review (finding 1): the ending a restart needs to finish the
     /// card's last write lives in the **owed sidecar**, not in the per-chat
     /// record — the chat's next run replaces that file, and the obligation must
-    /// outlive it.
+    /// outlive it. The snapshot is a whole record, so the ending rides in its
+    /// `outcome`.
     #[test]
     fn an_owed_settle_round_trips_beside_the_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -1028,26 +1046,23 @@ mod tests {
         let key = key("oc_chat", "oc_chat");
         let mut settled = record(&key, "run-1");
         settled.state = TerminalRunState::Settled;
-        let owed = OwedSettlement {
-            record: settled.clone(),
-            outcome: TerminalRunOutcome {
-                exit_code: Some(3),
-                spawn_error: None,
-                elapsed_ms: 1_500,
-                stopped: false,
-                survivors: true,
-                output_over_limit: false,
-            },
-        };
-        records.owed().add(&owed).unwrap();
-        assert_eq!(records.owed().load_all(), (vec![owed.clone()], true));
+        settled.outcome = Some(TerminalRunOutcome {
+            exit_code: Some(3),
+            spawn_error: None,
+            elapsed_ms: 1_500,
+            stopped: false,
+            survivors: true,
+            output_over_limit: false,
+        });
+        records.owed().add(&settled).unwrap();
+        assert_eq!(records.owed().load_all(), (vec![settled.clone()], true));
 
         // Replacing the chat's current record — what the next run does — leaves
         // the obligation untouched.
         records.write(&record(&key, "run-2")).unwrap();
         assert_eq!(
             records.owed().load_all(),
-            (vec![owed.clone()], true),
+            (vec![settled.clone()], true),
             "the obligation is not the per-chat record"
         );
 
@@ -1184,13 +1199,13 @@ mod tests {
         let key = key("oc_chat", "oc_chat");
 
         assert!(
-            records.mark_settled(&key, "run-1"),
+            records.mark_settled(&key, "run-1", None),
             "no record at all is nothing to protect"
         );
 
         std::fs::write(records.path(&key), b"{ not json").unwrap();
         assert!(
-            !records.mark_settled(&key, "run-1"),
+            !records.mark_settled(&key, "run-1", None),
             "an unreadable record may still be running"
         );
 
@@ -1200,14 +1215,17 @@ mod tests {
         std::fs::rename(&records_dir, &backup).unwrap();
         std::fs::write(&records_dir, b"not a directory").unwrap();
         assert!(
-            !records.mark_settled(&key, "run-1"),
+            !records.mark_settled(&key, "run-1", None),
             "a store that is not a directory cannot prove absence"
         );
 
         std::fs::remove_file(&records_dir).unwrap();
         std::fs::rename(&backup, &records_dir).unwrap();
         records.write(&record(&key, "run-1")).unwrap();
-        assert!(records.mark_settled(&key, "run-1"), "a running record is merged");
+        assert!(
+            records.mark_settled(&key, "run-1", None),
+            "a running record is merged"
+        );
         assert_eq!(
             records.read(&key).unwrap().state,
             TerminalRunState::Settled,

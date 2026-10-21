@@ -58,7 +58,7 @@ use tokio::sync::mpsc;
 use crate::bridge::command::RunSpec;
 use crate::bridge::handles::CommandHandles;
 use crate::bridge::terminal_record::{
-    OwedSettlement, TerminalRunOutcome, TerminalRunRecord, TerminalRunRecords, TerminalRunState,
+    TerminalRunOutcome, TerminalRunRecord, TerminalRunRecords, TerminalRunState,
 };
 use crate::config::ThreadKey;
 use crate::feishu::Platform;
@@ -738,6 +738,7 @@ async fn run_claimed(
         is_group: request.is_group,
         state: TerminalRunState::Running,
         ask_ai_submitted: false,
+        outcome: None,
         updated_at: 0,
     };
     record.touch();
@@ -1307,12 +1308,20 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
     let mut sweep = TerminalSweep::default();
     let owed_store = records.owed();
     let (owed, complete) = owed_store.load_all();
-    let owning: std::collections::HashSet<String> = owed
-        .iter()
-        .map(|settlement| settlement.record.run_id.clone())
-        .collect();
-    for settlement in owed {
-        let record = &settlement.record;
+    let owning: std::collections::HashSet<String> = owed.iter().map(|record| record.run_id.clone()).collect();
+    for record in owed {
+        let outcome = record.outcome.clone();
+        let Some(outcome) = outcome else {
+            // An obligation is written by `finish_run`, which always carries the
+            // ending; a snapshot without one can only be older. Nothing can
+            // rebuild its card honestly, so leave it owed rather than invent a
+            // clean ending.
+            tracing::warn!(
+                "terminal: owed settle for run {} carries no ending; leaving it owed",
+                record.run_id
+            );
+            continue;
+        };
         if !record.card_id.is_empty() {
             let card = settled_card(
                 &record.cwd,
@@ -1323,7 +1332,7 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
                 &record.thread_id,
                 record.is_group,
                 true,
-                &settlement.outcome,
+                &outcome,
             );
             if !patch_card(
                 platform,
@@ -1343,7 +1352,7 @@ pub(crate) async fn sweep_records(platform: &dyn Platform, records: &TerminalRun
         // run's record and a later 「问 AI」 bit survive. A failed merge keeps the
         // obligation: dropping it would let the next start's `running` sweep
         // relabel the card we just repaired.
-        if records.mark_settled(&record.key(), &record.run_id) {
+        if records.mark_settled(&record.key(), &record.run_id, record.outcome.as_ref()) {
             owed_store.remove(&record.run_id);
         }
     }
@@ -1505,10 +1514,7 @@ pub(crate) fn expire_records(root: &Path, log_days: u32, records: &TerminalRunRe
         );
         return expiry;
     }
-    let owing: std::collections::HashSet<&str> = owed
-        .iter()
-        .map(|settlement| settlement.record.run_id.as_str())
-        .collect();
+    let owing: std::collections::HashSet<&str> = owed.iter().map(|record| record.run_id.as_str()).collect();
     let retention = u64::from(log_days.max(1)) * 24 * 60 * 60;
     let now = crate::bridge::terminal_record::now_epoch_secs();
     for record in on_disk {
@@ -1645,10 +1651,7 @@ pub(crate) fn sweep_logs(root: &Path, log_days: u32, records: &TerminalRunRecord
     let referenced: std::collections::HashSet<PathBuf> = records_on_disk
         .into_iter()
         .map(|record| PathBuf::from(record.log_path))
-        .chain(
-            owed.into_iter()
-                .map(|settlement| PathBuf::from(settlement.record.log_path)),
-        )
+        .chain(owed.into_iter().map(|record| PathBuf::from(record.log_path)))
         .collect();
     let now = SystemTime::now();
     let mut removed = 0;
@@ -1829,11 +1832,12 @@ async fn finish_run(
     record.state = TerminalRunState::Settled;
     // The settle is the run's last real update; retention measures from here.
     record.touch();
-    let owed = OwedSettlement {
-        record: record.clone(),
-        outcome: outcome.clone(),
-    };
-    if let Err(error) = records.owed().add(&owed) {
+    // The ending also rides the record itself: the settled card's buttons rebuild
+    // from it, and a rebuild must never forget a failed launch or an unconfirmed
+    // termination (spec #825). The owed snapshot is that same record, so there is
+    // one copy of the ending, not two.
+    record.outcome = Some(outcome.clone());
+    if let Err(error) = records.owed().add(record) {
         tracing::warn!(
             "terminal: could not record the owed settle for run {run_id}; leaving its card as it is: {error}"
         );
@@ -1853,7 +1857,7 @@ async fn finish_run(
     // fixes it without discarding what the record learned since. With no record
     // at all (`durable == false`) there is nothing to protect, so the PATCH is
     // the whole condition.
-    if patched && (!durable || records.mark_settled(&record.key(), run_id)) {
+    if patched && (!durable || records.mark_settled(&record.key(), run_id, Some(outcome))) {
         records.owed().remove(run_id);
     }
     patched
