@@ -17,6 +17,19 @@ support request had no single command to paste. We decided to extend the CLI wit
 lifecycle and introspection commands, and to keep session control on the Feishu
 side.
 
+> **Amended 2026-10-21**: `cola completions` gains `--install`, which writes the
+> generated script into the invoking user's shell completion directory instead of
+> stdout. The subcommand still loads no config and takes no lock, and printing
+> (the default) still performs no I/O; only an explicit `--install` writes, and
+> only to the user's own `XDG_DATA_HOME`/`XDG_CONFIG_HOME` tree. Below that base
+> every component is opened through a directory descriptor with `NOFOLLOW`, so a
+> symlinked completion (or component) is refused rather than written through and
+> a symlink can never redirect the write; a hard-linked completion is refused for
+> the same reason. A same-user process that renames an ancestor directory is
+> outside the threat model — a descriptor follows the inode, not the path.
+> Automatic install is Unix-only; Windows users redirect the printed script into
+> their completion file.
+
 ## Decision
 
 Six additions, all **config-light and lock-free** — they must work while cola is
@@ -61,7 +74,16 @@ config/log/lock machinery exactly like `autostart`, `update` and `stop`.
    through the same parser the daemon uses.
 6. **`cola version`** (a subcommand alias of `--version`) and
    **`cola completions <shell>`** (a generated script on stdout, via
-   `clap_complete`).
+   `clap_complete`). `--install` writes that script into the shell's user
+   completion directory — `XDG_DATA_HOME`/`XDG_CONFIG_HOME`-aware, idempotent,
+   `--dry-run` to preview, the shell inferred from `$SHELL` when omitted — and
+   refuses to overwrite a file cola did not generate. There is no automatic
+   PowerShell install (rewriting `$PROFILE` is off-limits), and zsh's target
+   directory is reported for the user to add to `fpath`. A symlinked completion
+   or directory component is refused rather than followed (a hard-linked
+   completion likewise), and automatic install is Unix-only (Windows redirects
+   the script by hand). A same-user process renaming an ancestor directory is
+   outside the threat model: a descriptor follows the inode, not the path.
 
 `status`, `doctor`, `logs`, `config` and `completions` never load the log writer
 or touch the lock; `restart` shares `stop`'s Supervisor-first / PID-fallback

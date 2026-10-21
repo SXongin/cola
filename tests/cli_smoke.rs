@@ -47,6 +47,103 @@ fn doctor_exits_nonzero_when_a_check_fails() {
     assert!(stdout.contains("❌"), "the failed check is shown: {stdout}");
 }
 
+/// Run the built `cola` binary with extra environment variables and return
+/// `(success, stdout, stderr)`.
+#[cfg(unix)]
+fn run_env(args: &[&str], envs: &[(&str, &str)]) -> (bool, String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_cola"))
+        .args(args)
+        .envs(envs.iter().copied())
+        .output()
+        .expect("run the cola binary");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `cola completions --install` writes into the XDG trees it is given (never
+/// `$HOME` directly), is idempotent, infers the shell from `$SHELL`, and
+/// refuses to clobber a completion it did not generate.
+#[cfg(unix)]
+#[test]
+fn completions_install_writes_into_the_xdg_tree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let config = tmp.path().join("config");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let envs = [
+        ("HOME", home.to_str().unwrap()),
+        ("XDG_DATA_HOME", data.to_str().unwrap()),
+        ("XDG_CONFIG_HOME", config.to_str().unwrap()),
+        ("SHELL", "/bin/zsh"),
+    ];
+
+    // An explicit shell installs to that shell's XDG location.
+    let (ok, stdout, stderr) = run_env(&["completions", "bash", "--install"], &envs);
+    assert!(ok, "install must succeed; stderr: {stderr}");
+    let bash = data.join("bash-completion/completions/cola");
+    assert!(bash.is_file(), "written at {}: {stdout}", bash.display());
+    assert!(std::fs::read_to_string(&bash).unwrap().contains("_cola"));
+
+    // A second run is a no-op, not an error.
+    let (ok, stdout, stderr) = run_env(&["completions", "bash", "--install"], &envs);
+    assert!(ok, "reinstalling must succeed; stderr: {stderr}");
+    assert!(stdout.contains("already up to date"), "{stdout}");
+
+    // Omitting the shell infers it from $SHELL.
+    let (ok, stdout, stderr) = run_env(&["completions", "--install"], &envs);
+    assert!(ok, "shell inference must succeed; stderr: {stderr}");
+    let zsh = data.join("zsh/site-functions/_cola");
+    assert!(zsh.is_file(), "zsh completion at {}", zsh.display());
+    assert!(stdout.contains("fpath"), "the zsh note must print: {stdout}");
+    assert!(
+        stdout.contains("fpath=('"),
+        "the fpath entry must be quoted: {stdout}"
+    );
+
+    // An up-to-date zsh install still carries the fpath setup note.
+    let (ok, stdout, stderr) = run_env(&["completions", "--install"], &envs);
+    assert!(ok, "reinstalling must succeed; stderr: {stderr}");
+    assert!(stdout.contains("already up to date"), "{stdout}");
+    assert!(stdout.contains("fpath"), "{stdout}");
+
+    // --dry-run reports without writing.
+    let (ok, stdout, _) = run_env(&["completions", "fish", "--install", "--dry-run"], &envs);
+    assert!(ok, "--dry-run must succeed");
+    assert!(stdout.contains("--dry-run"), "{stdout}");
+    assert!(!config.join("fish/completions/cola.fish").exists());
+
+    // A live singleton lock must not block completions: the subcommand is
+    // dispatched before lock handling (ADR-0081). The recorded PID is this test
+    // process, which is alive, so an implementation that took the lock first
+    // would refuse here.
+    let lock = home.join(".cola").join("cola.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, std::process::id().to_string()).unwrap();
+    let (ok, stdout, stderr) = run_env(&["completions", "bash"], &envs);
+    assert!(
+        ok,
+        "printing completions must ignore the singleton lock; stderr: {stderr}"
+    );
+    assert!(stdout.contains("_cola"), "{stdout}");
+    assert!(lock.is_file(), "the lock file must be left alone");
+
+    // A hand-written completion is left alone and the run fails.
+    let fish = config.join("fish/completions/cola.fish");
+    std::fs::create_dir_all(fish.parent().unwrap()).unwrap();
+    std::fs::write(&fish, "complete -c cola -a mine\n").unwrap();
+    let (ok, _, stderr) = run_env(&["completions", "fish", "--install"], &envs);
+    assert!(!ok, "a foreign file must not be overwritten");
+    assert!(stderr.contains("refusing to overwrite"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&fish).unwrap(),
+        "complete -c cola -a mine\n"
+    );
+}
+
 /// `cola config path` and `cola completions` are pure: no config, no lock.
 #[test]
 fn config_and_completions_run_without_a_config() {

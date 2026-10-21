@@ -167,7 +167,8 @@ to see every command.
 Inspect and control it from the shell: `cola status` (run state, autostart,
 claim, server + generation; `--json` for scripts), `cola doctor` (the
 environment checks a support request needs), `cola logs [-f]`, `cola restart`,
-`cola config path|show|validate`, and `cola completions <shell>`.
+`cola config path|show|validate`, and `cola completions <shell>` (add
+`--install` to write the script into your shell's completion directory).
 
 ### 6. Keep it running
 
