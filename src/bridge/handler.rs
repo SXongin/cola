@@ -3495,7 +3495,17 @@ impl App {
                     toast: Some("⚠️ 处理超时，请重新点选（未做任何更改）".to_string()),
                 });
             }
-            Err(error) => tracing::warn!("worktree pick: persist failed: {}", error),
+            Err(error) => {
+                // `set_pending` mutates memory before it persists, so the pick
+                // took effect for this process even though the write failed.
+                // Say both halves instead of claiming a clean success.
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!(
+                        "⚠️ 已切换到 `{directory}`，但保存失败（重启后会丢失）：{error}"
+                    )),
+                });
+            }
         }
 
         // Refresh from the inventory already read — after the pending exists,

@@ -188,11 +188,21 @@ pub async fn worktree_root(
         return Err(WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")));
     }
     let common = resolve_git_path(dir, common.trim());
-    let primary = common
-        .parent()
-        .map(std::path::Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from(dir));
-    Ok(plain_path(primary).join(configured))
+    // A normal repository (main checkout or linked worktree) keeps its common
+    // dir at `<primary>/.git`, so the parent is the primary checkout. A
+    // submodule's common dir is `<super>/.git/modules/<name>` — its parent is
+    // git metadata, not a checkout — so fall back to the working tree's own
+    // top level there.
+    if common.file_name().is_some_and(|name| name == ".git")
+        && let Some(primary) = common.parent()
+    {
+        return Ok(plain_path(primary.to_path_buf()).join(configured));
+    }
+    let top = git_capture(dir, &["rev-parse", "--show-toplevel"])
+        .await
+        .map_err(|_| WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")))?;
+    let top = plain_path(resolve_git_path(dir, top.trim()));
+    Ok(top.join(configured))
 }
 
 /// List every checkout of the repository containing `dir`, main checkout
@@ -926,6 +936,40 @@ mod tests {
         assert_eq!(git_out(Path::new(&created.path), &["rev-parse", "HEAD"]), first);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A submodule's common dir lives under the super project's
+    /// `.git/modules/<name>`; the root must still resolve against the
+    /// submodule's own checkout, never inside git metadata.
+    #[tokio::test]
+    async fn worktree_root_uses_a_submodules_checkout() {
+        let super_repo = init_repo("git-wt-super");
+        let sub_repo = init_repo("git-wt-sub");
+        run(
+            &super_repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                sub_repo.to_str().unwrap(),
+                "mod",
+            ],
+        );
+        run(&super_repo, &["commit", "-m", "add submodule"]);
+        let sub = super_repo.join("mod");
+
+        let root = worktree_root(&sub.to_string_lossy(), Path::new(".worktrees"))
+            .await
+            .unwrap();
+        assert_eq!(
+            root,
+            plain_path(std::fs::canonicalize(&sub).unwrap()).join(".worktrees"),
+            "the root belongs to the submodule's checkout, not .git/modules"
+        );
+
+        let _ = std::fs::remove_dir_all(&super_repo);
+        let _ = std::fs::remove_dir_all(&sub_repo);
     }
 
     /// A bare repository has no working tree to branch off.
