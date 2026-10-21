@@ -705,6 +705,14 @@ pub(crate) async fn show_card(
         runs.pull(thread_key, message_id, ack)
     };
     if pull == TerminalPull::Requested {
+        // A pull is rare, user-initiated and rewrites the run's durable card
+        // identity, so it names itself in the log — the shape `/card` uses, and
+        // the only evidence left when the card later stops updating.
+        tracing::info!(
+            "terminal: card pull requested for chat {}/{}",
+            thread_key.chat_id,
+            thread_key.thread_id
+        );
         match tokio::time::timeout(TERMINAL_PULL_ACK_TIMEOUT, acked).await {
             Ok(Ok(PullOutcome::Posted)) => return Ok(()),
             Ok(Ok(PullOutcome::Failed)) => {
@@ -717,12 +725,21 @@ pub(crate) async fn show_card(
             Ok(Err(_)) | Err(_) => {}
         }
     }
-    match record_card(handles.terminal_records.read(thread_key)) {
+    let record = handles.terminal_records.read(thread_key);
+    let described = record
+        .as_ref()
+        .map(|record| (record.run_id.clone(), record.state));
+    match record_card(record) {
         Some(card) => {
             platform.reply_card(message_id, &card).await?;
+            if let Some((run_id, state)) = described {
+                tracing::info!(
+                    "terminal: reposted the {state:?} card of run {run_id} at the newest position"
+                );
+            }
         }
         None => {
-            let text = if has_record(handles, thread_key) {
+            let text = if described.is_some() {
                 TERMINAL_PULL_PENDING
             } else {
                 RUN_USAGE
@@ -731,13 +748,6 @@ pub(crate) async fn show_card(
         }
     }
     Ok(())
-}
-
-/// Whether the Chat/Topic has any **Terminal Run Record**, settled or not. Only
-/// used to choose between "the state is still being written" and the bare usage
-/// line, so a failed read (which claims nothing) reads as no record.
-fn has_record(handles: &CommandHandles, thread_key: &ThreadKey) -> bool {
-    handles.terminal_records.read(thread_key).is_some()
 }
 
 /// The card a **Terminal Run Record** can rebuild at the newest position: its
@@ -2199,6 +2209,9 @@ async fn repoint_card(
     // 4. Infallible: the run writes the new card from here on, and the settling
     //    write reads the same target.
     *target.lock().unwrap_or_else(PoisonError::into_inner) = new_id.clone();
+    // The one line an incident report can point at: which run moved, and from
+    // which message to which.
+    tracing::info!("terminal: moved the card of run {run_id} ({old} -> {new_id})");
 
     // 5. Render it live. Not an abort: the card is the run's now, and one failed
     //    render is repaired by the next tick — or, past the cap, by the re-armed
