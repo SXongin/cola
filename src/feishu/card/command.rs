@@ -321,22 +321,23 @@ pub(crate) async fn worktree_card_data(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
 ) -> std::result::Result<(Vec<super::session::WorktreeRow>, String), String> {
-    const LIST_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
-
+    // ONE budget for the whole read — the inventory and the dirty/session
+    // rows — so the card's worst case is the 5 s the ADR promises, not a sum
+    // of per-phase bounds.
+    let deadline = tokio::time::Instant::now() + crate::git::DIRTY_BUDGET;
     let repo = handles.current_project_directory(thread_key).await;
-    let entries = match tokio::time::timeout(LIST_BUDGET, crate::git::list_worktrees(&repo)).await {
+    let entries = match tokio::time::timeout_at(deadline, crate::git::list_worktrees(&repo)).await {
         Ok(Ok(entries)) => entries,
         Ok(Err(error)) => return Err(error.to_string()),
         Err(_) => return Err("读取 worktree 超时，请稍后再试".to_string()),
     };
-    let deadline = tokio::time::Instant::now() + crate::git::DIRTY_BUDGET;
     let rows = worktree_rows(handles, thread_key, entries, deadline).await;
     Ok((rows, repo))
 }
 
 /// Build the card rows for an already-read inventory (ADR-0088): dirty state
-/// under `deadline` (`?` past it), the session count from the cached list, and
-/// the current marker.
+/// and the cached session list under `deadline` (`?` / zero past it), and the
+/// current marker.
 ///
 /// Separate from [`worktree_card_data`] so a card callback — which runs on a
 /// deadline — can reuse the inventory it just read for validation and give the

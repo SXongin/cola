@@ -3433,14 +3433,14 @@ impl App {
         // conversation's project. One cheap list, bounded so the ack never
         // waits on a stalled filesystem (CODING_STANDARDS.md: a card callback
         // runs on a deadline).
+        // One deadline for the WHOLE callback: validation, the store write and
+        // the refresh all share it, so the card's 2 s ack budget is never
+        // raced (CODING_STANDARDS.md: a card callback runs on a deadline). The
+        // margin leaves room for the pending write and the response itself.
         let handles = core.command_handles();
         let repo = handles.current_project_directory(&thread_key).await;
-        let entries = match tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            crate::git::list_worktrees(&repo),
-        )
-        .await
-        {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1_400);
+        let entries = match tokio::time::timeout_at(deadline, crate::git::list_worktrees(&repo)).await {
             Ok(Ok(entries)) => entries,
             Ok(Err(error)) => {
                 return Some(CardActionResult {
@@ -3479,12 +3479,22 @@ impl App {
             .and_then(|v| v.as_str())
             .filter(|name| !name.is_empty())
             .map(str::to_string);
+        // The store write is not cancellable (a cancelled `set_pending` could
+        // leave the in-memory store and the file disagreeing), so a start past
+        // the deadline refuses instead of writing a pending the ack can no
+        // longer show. The write itself is a local JSON file, inside the
+        // margin the deadline leaves.
+        if tokio::time::Instant::now() >= deadline {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("⚠️ 处理超时，请重新点选（未做任何更改）".to_string()),
+            });
+        }
         declare_pending_dir(core, &thread_key, &directory, title).await;
 
         // Refresh from the inventory already read — after the pending exists,
-        // so the marker is the new current — with the remaining dirty/session
-        // reads inside what is left of the ack budget.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+        // so the marker is the new current — under the SAME deadline as the
+        // validation, so the callback's total work stays inside the ack.
         let rows =
             crate::feishu::card::command::worktree_rows(&handles, &thread_key, entries, deadline).await;
         let card = crate::feishu::card::session::build_worktree_card(&thread_key, &rows, &repo);
