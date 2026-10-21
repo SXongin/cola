@@ -133,9 +133,11 @@ nothing is ever moved.
   directory, not **for** a worktree resource.
 - Listing costs one `git worktree list` plus N status reads, bounded at 5 s on
   the command path; a hung filesystem shows `?` instead of blocking the card.
-  A pick is a card callback on a 2 s ack deadline, so it validates with one
-  short list read and gives the refresh only what is left — a read past that
-  bound leaves the row `?` rather than holding the ack hostage.
+  A pick is a card callback on a 2 s ack deadline, so validation, the pending
+  write and the refresh share ONE 1.4 s deadline — a read past that bound
+  leaves the row `?` rather than holding the ack hostage, and a pick that
+  reaches the write already past it refuses instead of persisting a pending
+  the ack can no longer show.
 - ADR-0041 gains a creation surface (`/worktree new`); nothing else in the
   session model changes — a worktree Session is an ordinary Session whose
   directory happens to be a linked checkout.
