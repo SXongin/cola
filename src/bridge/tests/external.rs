@@ -2811,6 +2811,83 @@ async fn a_followed_move_repoints_the_live_card_footer() {
     assert!(worktree, "and the 🌲 marker is on");
 }
 
+/// #450: a move to a directory that is not a git checkout REPLACES the card's
+/// git halves — the pre-move branch and 🌲 belong to a path the card no longer
+/// shows, so they must not survive a follow to a plain directory.
+#[tokio::test]
+async fn a_followed_move_to_a_plain_directory_clears_the_old_git_state() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    let old = crate::git::plain_path(std::fs::canonicalize(repo.path()).unwrap());
+    // A real directory with no repository in it.
+    let plain = tempfile::tempdir().unwrap();
+    let new = crate::git::plain_path(std::fs::canonicalize(plain.path()).unwrap());
+    assert_ne!(old, new);
+
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_sessions(vec![list_session(
+        "ses_moved_plain",
+        "移动到普通目录",
+        &new.to_string_lossy(),
+        100,
+    )]);
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, mock).await;
+
+    let key = crate::config::ThreadKey::new("oc_plain".into(), "oc_plain".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key, "ses_moved_plain", old.to_string_lossy()),
+    )
+    .await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_moved_plain", Some("om_plain")).await;
+    Turn::seed_work_context(&cards, "ses_moved_plain", &old.to_string_lossy()).await;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_moved_plain".into(), now_ms());
+
+    app.external
+        .poll_interval_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let followed = Turn::card_work_context(&cards, "ses_moved_plain")
+            .await
+            .and_then(|(directory, _, _)| directory)
+            .as_deref()
+            == Some(new.to_string_lossy().as_ref());
+        if followed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the live card must follow the move to {new:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let (directory, branch, worktree) = Turn::card_work_context(&cards, "ses_moved_plain")
+        .await
+        .expect("the card is still tracked");
+    assert_eq!(directory, Some(new.to_string_lossy().to_string()));
+    assert_eq!(
+        branch, None,
+        "the pre-move checkout's branch must not label a plain directory"
+    );
+    assert!(!worktree, "and the 🌲 marker is gone");
+}
+
 // ---------------------------------------------------------------------------
 // #568: an external follow's wait is served like a cola request's — the render
 // loop yields ⏳ on live Background Tasks (never ✅), Session Sync resumes the

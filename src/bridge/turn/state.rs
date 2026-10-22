@@ -1678,6 +1678,23 @@ impl StreamAccumulator {
         self.apply_git_state(ctx.git);
     }
 
+    /// Re-point the card to a NEW directory after a followed move (#450):
+    /// unlike [`Self::apply_work_context`], the git halves are REPLACED, not
+    /// merged. The directory itself changed, so the previous checkout's branch,
+    /// dirty flag and 🌲 belong to a path the card no longer shows; a new
+    /// checkout with no branch (a plain directory, or an unreadable git state)
+    /// must clear them rather than keep a branch from somewhere else.
+    pub(super) fn replace_work_context(&mut self, ctx: WorkContext) {
+        if ctx.directory.is_empty() {
+            return;
+        }
+        self.directory = Some(ctx.directory);
+        self.project_name = ctx.project_name;
+        self.branch = ctx.git.branch;
+        self.dirty = ctx.git.dirty;
+        self.worktree = ctx.git.worktree;
+    }
+
     /// Capture the turn's work context (ADR-0019): project name, git branch and
     /// dirty state — measured BEFORE the prompt runs, so the dirty flag reflects
     /// the state the AI operates on, not the changes it leaves behind. Best
@@ -5103,7 +5120,13 @@ pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
     let Some(dir) = dir else { return };
     let state = crate::git::read_state(&dir).await;
     let mut live = cards.cards.lock().await;
-    if let Some(card) = live.get_mut(session_id) {
+    if let Some(card) = live.get_mut(session_id)
+        // The move-follow may have re-pointed the card while the git read was
+        // in flight (#450): applying this read's state then would restore the
+        // pre-move branch. Only the card still captured at the directory this
+        // read is for may take it.
+        && card.acc.directory.as_deref() == Some(dir.as_str())
+    {
         card.acc.apply_git_state(state);
     }
 }
@@ -5115,9 +5138,8 @@ pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
 /// re-pointed — a card that started after the move, or was already re-pointed
 /// by an earlier pass, is left alone. The capture (directory, project name, git
 /// state) is read outside the cards lock; the second check under the lock keeps
-/// a concurrent update from being overwritten. Best effort: no card leaves it
-/// untouched, and a directory that is already gone again keeps the existing
-/// capture rather than clearing it.
+/// a concurrent update from being overwritten. A directory already gone again
+/// is skipped, leaving the existing capture untouched.
 pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, from: &str, to: &str) {
     let captured = {
         let live = cards.cards.lock().await;
@@ -5133,20 +5155,20 @@ pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, f
     if let Some(card) = live.get_mut(session_id)
         && card.acc.directory.as_deref() == Some(from)
     {
-        card.acc.apply_work_context(ctx);
+        card.acc.replace_work_context(ctx);
     }
 }
 
-/// The work context for a followed directory (#450): [`StreamAccumulator::
-/// capture_work_context`] once the path is known to exist. A move the follow
-/// detected but whose path is already gone again (a worktree removed between
-/// the list read and here) is `None` — the caller keeps the card's existing
-/// branch/project fields rather than clearing them.
+/// The work context for a followed directory (#450). A move the follow detected
+/// but whose path is already gone again (a worktree removed between the list
+/// read and here) yields `None` — the caller keeps the card's existing fields
+/// rather than clearing them.
 async fn capture_followed_context(directory: &str) -> Option<WorkContext> {
-    match tokio::fs::metadata(directory).await {
-        Ok(metadata) if metadata.is_dir() => Some(StreamAccumulator::capture_work_context(directory).await),
-        _ => None,
+    let metadata = tokio::fs::metadata(directory).await.ok()?;
+    if !metadata.is_dir() {
+        return None;
     }
+    Some(StreamAccumulator::capture_work_context(directory).await)
 }
 
 /// Test seam for #450's follow: capture a live card's work context at

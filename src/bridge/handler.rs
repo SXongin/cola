@@ -1360,7 +1360,7 @@ async fn declare_pending_dir(
 /// Session that already exists elsewhere.
 fn gone_directory_text(directory: &str) -> String {
     format!(
-        "⚠️ 工作目录已不存在：`{directory}`\n\
+        "⚠️ 工作目录已不存在或不可用：`{directory}`\n\
          可能已被删除（例如 worktree 被移除）。\n\
          用 `/dir <目录>` 重新落根（下一条消息会在新目录创建会话），\
          或用 `/switch` 换一个已有会话。"
@@ -1368,11 +1368,12 @@ fn gone_directory_text(directory: &str) -> String {
 }
 
 /// Whether `directory` is gone from disk, checked before a prompt dispatches
-/// (#450). Only a definitively absent path counts: a permission or transient
-/// I/O error is left to the server to report, because claiming "removed" for
-/// an unmounted or unreadable directory would be wrong. One stat per prompt —
-/// cheap, and it runs before any quoted-context or attachment fetch. The check
-/// is valid because cola and its server share a host (ADR-0013's attach).
+/// (#450). Only a definitively absent path — or one that is not a directory
+/// anymore — counts: a permission or transient I/O error is left to the
+/// server, because claiming "removed" for an unmounted or unreadable
+/// directory would be wrong. One stat per prompt — cheap, and it runs before
+/// any quoted-context or attachment fetch. The check is valid because cola and
+/// its server share a host (ADR-0013's attach).
 ///
 /// Test builds default the CALL off (see [`App::check_missing_directories`]):
 /// the harness seeds Sessions at abstract paths ("/work"), so a real stat
@@ -1380,7 +1381,10 @@ fn gone_directory_text(directory: &str) -> String {
 async fn directory_missing(directory: &str) -> bool {
     match tokio::fs::metadata(directory).await {
         Ok(metadata) => !metadata.is_dir(),
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        Err(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
     }
 }
 
@@ -2287,17 +2291,18 @@ impl App {
             return Ok(None);
         }
         // #450: the conversation's next Session would start in this directory
-        // — a Pending's when one is declared, else the Active Session's, else
-        // the default. A directory deleted underneath it (a removed worktree)
-        // can never run, and the server would answer with its own error, so
-        // end here before the attachment work and the dispatch. Nothing is
+        // — a Pending's when one is declared, else the Active Session's. A
+        // directory deleted underneath it (a removed worktree) can never run,
+        // and the server would answer with its own error, so end here before
+        // the attachment work and the dispatch. Only an existing Pending or
+        // mapping is checked: a fresh conversation has no directory of its own
+        // yet, and its create failure stays the server's to report. Nothing is
         // claimed or created; the mapping and any Pending stay intact so a
         // `/dir` re-root loses nothing.
         let target_directory = {
             let store = self.sessions.lock().await;
             store.current_directory(&thread_key)
-        }
-        .unwrap_or_else(|| self.default_session_directory());
+        };
         // Test builds default the check off: the harness seeds Sessions at
         // abstract paths no disk carries, so the two ending tests opt in.
         #[cfg(test)]
@@ -2306,7 +2311,10 @@ impl App {
             .load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let check_missing = true;
-        if check_missing && directory_missing(&target_directory).await {
+        if check_missing
+            && let Some(target_directory) = target_directory
+            && directory_missing(&target_directory).await
+        {
             self.feishu
                 .reply_text(&message_id, &gone_directory_text(&target_directory))
                 .await?;
