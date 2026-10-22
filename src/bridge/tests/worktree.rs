@@ -317,3 +317,114 @@ async fn the_next_message_creates_the_session_in_the_worktree() {
         "the next message materialises the session in the worktree"
     );
 }
+
+/// #450: a Session whose checkout was removed ends with an explicit ending
+/// before dispatch. The server would answer with its own error ("the directory's
+/// instance cannot boot"), so the prompt path checks locally first and names
+/// the one route out; no card, no claim, no prompt.
+#[tokio::test]
+async fn a_prompt_in_a_removed_worktree_ends_before_dispatch() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    git(
+        repo.path(),
+        &["worktree", "add", "-b", "wt/gone", ".worktrees/gone"],
+    );
+    let gone = repo_canonical(&repo).join(".worktrees").join("gone");
+    git(repo.path(), &["worktree", "remove", ".worktrees/gone"]);
+    assert!(!gone.exists(), "the checkout is really removed");
+
+    let cfg = test_config(&sessions.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let prompts = backend.prompt_calls.clone();
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    app.check_missing_directories
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    seed_session(&app, "ses_gone", &gone.to_string_lossy()).await;
+
+    app.handle_message(incoming(
+        "msg_gone".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "继续".into(),
+        None,
+    ))
+    .await;
+
+    assert!(
+        prompts.lock().await.is_empty(),
+        "a removed directory never reaches the prompt"
+    );
+    assert!(created.lock().await.is_empty(), "and never creates a session");
+    assert!(
+        platform.replied_cards().await.is_empty(),
+        "no turn card opens for a prompt that cannot run"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains("工作目录已不存在"),
+        "the ending names the missing directory: {texts}"
+    );
+    assert!(texts.contains(".worktrees/gone"), "{texts}");
+    assert!(
+        texts.contains("`/dir") && texts.contains("`/switch"),
+        "the ending names both routes out: {texts}"
+    );
+}
+
+/// #450 + ADR-0041: a Pending Session whose directory disappeared is refused
+/// the same way — its first message must not try to create a Session there —
+/// and the pending stays intact so `/dir` can re-root it without losing the
+/// chosen overrides.
+#[tokio::test]
+async fn a_pending_in_a_removed_worktree_ends_before_materialising() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from(".worktrees");
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    app.check_missing_directories
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    send_command(&app, "/worktree new gone", "msg_worktree_gone").await;
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("/worktree new declares a pending");
+    git(repo.path(), &["worktree", "remove", ".worktrees/gone"]);
+    assert!(
+        !std::path::Path::new(&pending.directory).exists(),
+        "the pending's checkout is gone"
+    );
+
+    app.handle_message(incoming(
+        "msg_pending_gone".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "开始吧".into(),
+        None,
+    ))
+    .await;
+
+    assert!(
+        created.lock().await.is_empty(),
+        "a pending in a removed directory creates nothing"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("工作目录已不存在"), "{texts}");
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_some(),
+        "the pending survives so /dir can re-root it"
+    );
+}

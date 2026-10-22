@@ -483,6 +483,12 @@ pub struct App {
     /// the app alive — no reference cycle; `OnceLock` because it is written
     /// exactly once, before any event can arrive.
     self_weak: std::sync::OnceLock<std::sync::Weak<App>>,
+    /// Test-only (#450): whether a prompt stats its working directory before
+    /// dispatching. The harness seeds Sessions at abstract paths ("/work")
+    /// that no disk carries, so this defaults off and the two ending tests turn
+    /// it on; production has no switch and always stats.
+    #[cfg(test)]
+    pub(crate) check_missing_directories: std::sync::atomic::AtomicBool,
 }
 
 impl Deref for App {
@@ -1345,6 +1351,39 @@ async fn declare_pending_dir(
     }
 }
 
+/// #450: the prompt-path ending when the conversation's working directory is
+/// gone (a removed worktree is the common case). The server boots the
+/// directory's instance on every request and `realPath` fails on a missing
+/// path, so dispatching would surface its raw error; this names the situation
+/// and the one route out. `/dir` re-roots the conversation (its Pending
+/// Session creates the next Session in the new directory), `/switch` adopts a
+/// Session that already exists elsewhere.
+fn gone_directory_text(directory: &str) -> String {
+    format!(
+        "⚠️ 工作目录已不存在：`{directory}`\n\
+         可能已被删除（例如 worktree 被移除）。\n\
+         用 `/dir <目录>` 重新落根（下一条消息会在新目录创建会话），\
+         或用 `/switch` 换一个已有会话。"
+    )
+}
+
+/// Whether `directory` is gone from disk, checked before a prompt dispatches
+/// (#450). Only a definitively absent path counts: a permission or transient
+/// I/O error is left to the server to report, because claiming "removed" for
+/// an unmounted or unreadable directory would be wrong. One stat per prompt —
+/// cheap, and it runs before any quoted-context or attachment fetch. The check
+/// is valid because cola and its server share a host (ADR-0013's attach).
+///
+/// Test builds default the CALL off (see [`App::check_missing_directories`]):
+/// the harness seeds Sessions at abstract paths ("/work"), so a real stat
+/// would refuse every fixture. The tests that exercise the ending turn it on.
+async fn directory_missing(directory: &str) -> bool {
+    match tokio::fs::metadata(directory).await {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 /// The card a click answers with, built under the SAME deadline as its store
 /// write (ADR-0089): a refresh can hit the backend for the session list, and a
 /// card that misses the deadline would hold the click past Feishu's ack budget
@@ -1497,6 +1536,8 @@ impl App {
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             turn_diff_sends: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
+            #[cfg(test)]
+            check_missing_directories: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2243,6 +2284,32 @@ impl App {
         // with `/skill` the one prompt-like exception (see
         // [`Self::handle_skill_command`]).
         if !self.ensure_server_for(&message_id).await {
+            return Ok(None);
+        }
+        // #450: the conversation's next Session would start in this directory
+        // — a Pending's when one is declared, else the Active Session's, else
+        // the default. A directory deleted underneath it (a removed worktree)
+        // can never run, and the server would answer with its own error, so
+        // end here before the attachment work and the dispatch. Nothing is
+        // claimed or created; the mapping and any Pending stay intact so a
+        // `/dir` re-root loses nothing.
+        let target_directory = {
+            let store = self.sessions.lock().await;
+            store.current_directory(&thread_key)
+        }
+        .unwrap_or_else(|| self.default_session_directory());
+        // Test builds default the check off: the harness seeds Sessions at
+        // abstract paths no disk carries, so the two ending tests opt in.
+        #[cfg(test)]
+        let check_missing = self
+            .check_missing_directories
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let check_missing = true;
+        if check_missing && directory_missing(&target_directory).await {
+            self.feishu
+                .reply_text(&message_id, &gone_directory_text(&target_directory))
+                .await?;
             return Ok(None);
         }
         let is_group = chat_type == "group";
