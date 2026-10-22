@@ -9,15 +9,22 @@
 //! spells `crate::opencode` is exactly the coupling this guard forbids.
 //!
 //! The allow-list is `src/opencode/` itself — the adapter's own modules may
-//! name each other freely — plus a short, explicitly temporary list of the
-//! adapter's attach/lifecycle plumbing, which the bridge still drives directly
-//! until ticket #875 moves server discovery, attach and lifecycle behind the
-//! seam. Those names are listed one by one rather than by file, so an unrelated
-//! `crate::opencode::something` in the same file still fails; delete each entry
-//! with #875.
+//! name each other freely.
 //!
-//! Matching is by module path, not by prose: only the literal `crate::opencode`
-//! counts, so the word OpenCode and the `[opencode]` config table are fine.
+//! Three item paths are exempt as **batch-local scaffolding**: the adapter's
+//! attach/lifecycle plumbing ([`PENDING_SEAM_MOVE`]) is still driven from the
+//! bridge today, and ticket #875 — in this same batch — moves discovery,
+//! attach and lifecycle behind the client seam. The exemption lets #870 and
+//! #875 land side by side without moving OpenCode-specific types into the
+//! neutral contract before a second adapter earns them (ADR-0090 decision 7).
+//! #875 deletes each entry; the batch is not complete until this list is
+//! **empty**. It is item-scoped, not file-scoped, and must not be extended: an
+//! unrelated `crate::opencode::something` in the same file still fails.
+//!
+//! Matching is by module path, not by prose. Whitespace is irrelevant and
+//! grouped forms count, so `crate::opencode`, `crate :: opencode`,
+//! `crate::{opencode::types}` and a group split across lines all name the
+//! adapter; the word OpenCode and the `[opencode]` config table do not.
 
 use std::path::{Path, PathBuf};
 
@@ -29,11 +36,13 @@ pub(crate) const ALLOWED_PREFIXES: &[&str] = &[
     "src/opencode/",
 ];
 
-/// The adapter plumbing the bridge still names directly, one path at a time.
+/// The adapter plumbing the bridge still names directly, one item path at a
+/// time — batch-local scaffolding that ticket #875 deletes.
 ///
 /// Attach and lifecycle are the last OpenCode-shaped work living in the bridge;
-/// ticket #875 moves it behind the client seam. Until then these three item
-/// paths are the *only* escape, and each disappears with that ticket.
+/// #875 moves them behind the client seam. Until then these three item paths
+/// are the *only* escape, and the batch lands no further entry: when #875 is in,
+/// this list is empty and the guard is strict.
 pub(crate) const PENDING_SEAM_MOVE: &[&str] = &[
     "crate::opencode::generation",
     "crate::opencode::strategy",
@@ -79,65 +88,16 @@ pub(crate) fn scan_tree(root: &Path) -> Result<Vec<Finding>, String> {
             .unwrap_or(&file)
             .to_string_lossy()
             .replace('\\', "/");
-        // Paths are reported relative to the scanned root's parent so the
-        // allow-list reads as a repository path (`src/opencode/`).
         let path = format!("{}/{}", root_name(root), relative);
         findings.extend(scan_source(&path, &content));
     }
     Ok(findings)
 }
 
-/// The directory name of the scanned root (`src`), used to build the
-/// repository-relative path the allow-list matches.
 fn root_name(root: &Path) -> String {
     root.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// Scan one file's content. `path` is the repository-relative path
-/// (`src/...`), used for the allow-list.
-pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
-    if ALLOWED_PREFIXES.iter().any(|allowed| path.starts_with(allowed)) {
-        return Vec::new();
-    }
-    let mut findings = Vec::new();
-    for (index, line) in content.lines().enumerate() {
-        let mut rest = line;
-        while let Some(offset) = rest.find(FORBIDDEN) {
-            let tail = &rest[offset + FORBIDDEN.len()..];
-            if !is_exempt(tail) {
-                findings.push(Finding {
-                    path: path.to_string(),
-                    line: index + 1,
-                    text: line.trim().to_string(),
-                });
-                break;
-            }
-            rest = tail;
-        }
-    }
-    findings
-}
-
-/// Whether the path continues with one of the [`PENDING_SEAM_MOVE`] items.
-///
-/// The segment must end at a path boundary: `::strategy::Generation` is exempt,
-/// `::strategy_builder` is not.
-fn is_exempt(tail: &str) -> bool {
-    let Some(tail) = tail.strip_prefix("::") else {
-        return false;
-    };
-    let segment_end = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
-    let (segment, after) = match segment_end {
-        Some(end) => (&tail[..end], &tail[end..]),
-        None => (tail, ""),
-    };
-    let continues = after.is_empty() || after.starts_with("::");
-    continues
-        && PENDING_SEAM_MOVE
-            .iter()
-            .any(|allowed| allowed.rsplit("::").next() == Some(segment))
 }
 
 fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -153,6 +113,164 @@ fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String
         }
     }
     Ok(())
+}
+
+/// Scan one file's content. `path` is the repository-relative path
+/// (`src/...`), used for the allow-list.
+pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
+    if ALLOWED_PREFIXES.iter().any(|allowed| path.starts_with(allowed)) {
+        return Vec::new();
+    }
+    let source = Normalised::new(content);
+    let lines: Vec<&str> = content.lines().collect();
+    source
+        .adapter_mentions()
+        .into_iter()
+        .map(|offset| {
+            let line = source.line_of(offset);
+            Finding {
+                path: path.to_string(),
+                line,
+                text: lines.get(line - 1).map_or("", |text| text.trim()).to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Whitespace-free source text with a line map, so a module path can be
+/// matched however it is spaced or wrapped (`crate::{\n opencode,\n}`).
+struct Normalised {
+    text: String,
+    /// One 1-based line number per byte of `text`.
+    lines: Vec<usize>,
+}
+
+impl Normalised {
+    fn new(content: &str) -> Self {
+        let mut text = String::new();
+        let mut lines = Vec::new();
+        for (index, line) in content.lines().enumerate() {
+            for ch in line.chars().filter(|ch| !ch.is_whitespace()) {
+                let before = text.len();
+                text.push(ch);
+                for _ in before..text.len() {
+                    lines.push(index + 1);
+                }
+            }
+        }
+        Self { text, lines }
+    }
+
+    /// The byte offset of every mention of the adapter module.
+    ///
+    /// Both a plain path (`crate::opencode::types`) and a group that names it
+    /// at any depth (`crate::{self, opencode::types}`,
+    /// `crate::{opencode::{types, parsing}}`) count; the exempt item paths do
+    /// not.
+    fn adapter_mentions(&self) -> Vec<usize> {
+        let mut mentions = Vec::new();
+        let mut search = 0;
+        while let Some(offset) = self.text[search..].find("crate::") {
+            let start = search + offset + "crate::".len();
+            search = start;
+            let rest = &self.text[start..];
+            if let Some(grouped) = rest.strip_prefix('{') {
+                let Some(close) = matching_brace(grouped) else {
+                    continue;
+                };
+                mentions.extend(group_mentions(&grouped[..close], start + 1));
+            } else if let Some(suffix) = adapter_suffix(rest)
+                && !is_exempt(suffix)
+            {
+                mentions.push(start);
+            }
+        }
+        mentions
+    }
+
+    fn line_of(&self, offset: usize) -> usize {
+        self.lines.get(offset).copied().unwrap_or(1)
+    }
+}
+
+/// The rest of `text` after the adapter name, when it starts the path.
+fn adapter_suffix(text: &str) -> Option<&str> {
+    text.strip_prefix("opencode")
+        .filter(|suffix| !starts_with_identifier_char(suffix))
+}
+
+/// The mentions of the adapter inside a `crate::{…}` group (the content after
+/// the opening brace, whitespace already stripped).
+///
+/// Items are split at top-level commas only, so a nested group stays one item;
+/// a `self::` re-root is skipped before the adapter name.
+fn group_mentions(grouped: &str, base: usize) -> Vec<usize> {
+    let mut mentions = Vec::new();
+    let mut depth = 0usize;
+    let mut item_start = 0usize;
+    for (index, ch) in grouped.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                collect_group_item(&grouped[item_start..index], base + item_start, &mut mentions);
+                item_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    collect_group_item(&grouped[item_start..], base + item_start, &mut mentions);
+    mentions
+}
+
+/// Note one group item if it names the adapter, unless it is an exempt item.
+fn collect_group_item(item: &str, base: usize, mentions: &mut Vec<usize>) {
+    let rooted = item.strip_prefix("self::").unwrap_or(item);
+    let offset = base + (item.len() - rooted.len());
+    if let Some(suffix) = adapter_suffix(rooted)
+        && !is_exempt(suffix)
+    {
+        mentions.push(offset);
+    }
+}
+
+fn matching_brace(after_open: &str) -> Option<usize> {
+    let mut depth = 1usize;
+    for (index, ch) in after_open.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn starts_with_identifier_char(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// Whether the path continues with one of the [`PENDING_SEAM_MOVE`] items.
+///
+/// The item name is the whole identifier after `opencode::`: `strategy` is
+/// exempt, `strategy_builder` is not.
+fn is_exempt(suffix: &str) -> bool {
+    let Some(rest) = suffix.strip_prefix("::") else {
+        return false;
+    };
+    let end = rest
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+        .unwrap_or(rest.len());
+    PENDING_SEAM_MOVE
+        .iter()
+        .any(|allowed| allowed.rsplit("::").next() == Some(&rest[..end]))
 }
 
 /// `cargo xtask check-client-seam`: fail when a file outside the adapter names
@@ -184,43 +302,72 @@ pub(crate) fn run() {
 mod tests {
     use super::*;
 
+    fn findings(path: &str, planted: &str) -> Vec<Finding> {
+        scan_source(path, planted)
+    }
+
     #[test]
     fn a_planted_dto_import_outside_the_seam_is_a_finding() {
-        let findings = scan_source(
+        let found = findings(
             "src/bridge/handler.rs",
             "use crate::opencode::types::Session;\nlet x = 1;\n",
         );
-        assert_eq!(
-            findings.len(),
-            1,
-            "the planted import must be found: {findings:?}"
-        );
-        assert_eq!(findings[0].path, "src/bridge/handler.rs");
-        assert_eq!(findings[0].line, 1);
-        assert_eq!(findings[0].text, "use crate::opencode::types::Session;");
+        assert_eq!(found.len(), 1, "the planted import must be found: {found:?}");
+        assert_eq!(found[0].path, "src/bridge/handler.rs");
+        assert_eq!(found[0].line, 1);
+        assert_eq!(found[0].text, "use crate::opencode::types::Session;");
     }
 
     /// The module alias is as much a seam leak as a DTO import: it makes every
     /// `opencode::…` path in the file legal.
     #[test]
     fn a_planted_module_alias_outside_the_seam_is_a_finding() {
-        let findings = scan_source("src/bridge/snapshot.rs", "use crate::opencode;\n");
-        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings("src/bridge/snapshot.rs", "use crate::opencode;\n").len(),
+            1
+        );
     }
 
     /// A bare `crate::opencode` (no suffix) is a finding too.
     #[test]
     fn a_planted_bare_path_outside_the_seam_is_a_finding() {
-        let findings = scan_source("src/status.rs", "let m = crate::opencode;\n");
-        assert_eq!(findings.len(), 1);
+        assert_eq!(findings("src/status.rs", "let m = crate::opencode;\n").len(), 1);
+    }
+
+    /// Grouped and spaced forms name the same module and must not slip past
+    /// the matcher (adversarial review, #870).
+    #[test]
+    fn grouped_and_spaced_imports_of_the_adapter_are_findings() {
+        for planted in [
+            "use crate::{opencode};\n",
+            "use crate::{opencode::types::Session};\n",
+            "use crate::{self, opencode::types};\n",
+            "use crate :: opencode :: types :: Session;\n",
+            "use crate::{bridge, opencode::{types::Session, parsing}};\n",
+        ] {
+            assert_eq!(
+                findings("src/bridge/handler.rs", planted).len(),
+                1,
+                "{planted} must be found"
+            );
+        }
+    }
+
+    /// A grouped import split across lines is still one path.
+    #[test]
+    fn a_multi_line_grouped_import_is_a_finding() {
+        let found = findings("src/bridge/handler.rs", "use crate::{\n    opencode,\n};\n");
+        assert_eq!(found.len(), 1, "the planted group must be found: {found:?}");
+        assert_eq!(found[0].line, 2);
+        assert_eq!(found[0].text, "opencode,");
     }
 
     #[test]
     fn the_adapter_may_name_itself() {
         let planted = "use crate::opencode::types::Session;\nuse crate::opencode;\n";
-        assert!(scan_source("src/opencode/mod.rs", planted).is_empty());
-        assert!(scan_source("src/opencode/v2/wire.rs", planted).is_empty());
-        assert!(scan_source("src/opencode/tests.rs", planted).is_empty());
+        assert!(findings("src/opencode/mod.rs", planted).is_empty());
+        assert!(findings("src/opencode/v2/wire.rs", planted).is_empty());
+        assert!(findings("src/opencode/tests.rs", planted).is_empty());
     }
 
     /// Attach and lifecycle are still the bridge's (#875): the three documented
@@ -232,7 +379,7 @@ use crate::opencode::generation::{self, ProbeOutcome};
 use crate::opencode::strategy::Generation;
 use crate::opencode::transport::Transport;
 ";
-        assert!(scan_source("src/bridge/attach.rs", planted).is_empty());
+        assert!(findings("src/bridge/attach.rs", planted).is_empty());
         assert_eq!(
             PENDING_SEAM_MOVE,
             [
@@ -243,7 +390,23 @@ use crate::opencode::transport::Transport;
         );
     }
 
-    /// The exemption is per item, not per file, and it stops at a path
+    /// The exemption is a module path, so it survives the normalised forms too.
+    #[test]
+    fn the_pending_exemption_survives_the_normalised_form() {
+        for planted in [
+            "use crate::{opencode::generation};\n",
+            "use crate :: opencode :: strategy :: Generation ;\n",
+            "use crate::{\n    opencode::transport::Transport,\n};\n",
+            "use crate::{self::opencode::generation, opencode::strategy};\n",
+        ] {
+            assert!(
+                findings("src/bridge/attach.rs", planted).is_empty(),
+                "{planted} must stay exempt"
+            );
+        }
+    }
+
+    /// The exemption is per item, not per file, and it stops at an identifier
     /// boundary: a near-miss name is a finding.
     #[test]
     fn a_near_miss_on_an_exempt_item_name_is_a_finding() {
@@ -252,24 +415,31 @@ use crate::opencode::transport::Transport;
             "use crate::opencode::types::Session;\n",
             "use crate::opencode::client::OpenCodeBackend;\n",
             "use crate::opencode::parsing::parse_model;\n",
+            "use crate::{opencode::strategy_builder};\n",
         ] {
             assert_eq!(
-                scan_source("src/bridge/attach.rs", planted).len(),
+                findings("src/bridge/attach.rs", planted).len(),
                 1,
                 "{planted} must not be exempt"
             );
         }
     }
 
-    /// Several paths on one line are all checked: an exempt item does not
-    /// shield a forbidden one beside it.
+    /// An exempt item does not shield a forbidden one beside it, on one line or
+    /// inside one group.
     #[test]
-    fn an_exempt_item_does_not_shield_a_forbidden_one_on_the_same_line() {
-        let findings = scan_source(
-            "src/bridge/attach.rs",
+    fn an_exempt_item_does_not_shield_a_forbidden_one() {
+        for planted in [
             "use crate::opencode::strategy::Generation; use crate::opencode::types::Session;\n",
-        );
-        assert_eq!(findings.len(), 1);
+            "use crate::{opencode::generation, opencode::types::Session};\n",
+            "use crate::{\n    opencode::transport,\n    opencode::client::OpenCodeBackend,\n};\n",
+        ] {
+            assert_eq!(
+                findings("src/bridge/attach.rs", planted).len(),
+                1,
+                "{planted} must report the forbidden item"
+            );
+        }
     }
 
     /// Prose and the config table are not path references.
@@ -279,10 +449,11 @@ use crate::opencode::transport::Transport;
 //! The OpenCode adapter attaches to a shared server.\n\
 let table = cfg.opencode.generation;\n\
 let dir = path.join(\"opencode\").join(\"service.json\");\n";
-        assert_eq!(scan_source("src/bridge/attach.rs", content), Vec::new());
+        assert_eq!(findings("src/bridge/attach.rs", content), Vec::new());
     }
 
-    /// The walk is recursive and only looks at `.rs` files.
+    /// The tree walk is shared with the generation guard; through this guard it
+    /// is still recursive, `.rs`-only, and reports repository-relative paths.
     #[test]
     fn the_tree_walk_reports_nested_rust_files_only() {
         let root = std::env::temp_dir().join(format!("cola-client-seam-{}", std::process::id()));
@@ -299,15 +470,15 @@ let dir = path.join(\"opencode\").join(\"service.json\");\n";
         )
         .unwrap();
 
-        let findings = scan_tree(&root.join("src")).expect("the planted tree is readable");
+        let found = scan_tree(&root.join("src")).expect("the planted tree is readable");
         std::fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(
-            findings.len(),
+            found.len(),
             1,
-            "only the planted Rust file should report: {findings:?}"
+            "only the planted Rust file should report: {found:?}"
         );
-        assert_eq!(findings[0].path, "src/bridge/nested/planted.rs");
+        assert_eq!(found[0].path, "src/bridge/nested/planted.rs");
     }
 
     /// A missing or unreadable scan root is a loud error, never a clean tree.
@@ -330,16 +501,11 @@ let dir = path.join(\"opencode\").join(\"service.json\");\n";
     /// sources are clean, so any future escape fails this test and CI.
     #[test]
     fn the_repository_tree_is_clean() {
-        let findings =
-            scan_tree(&crate::repo_root().join("src")).expect("the repository tree must be readable");
+        let found = scan_tree(&crate::repo_root().join("src")).expect("the repository tree must be readable");
         assert!(
-            findings.is_empty(),
+            found.is_empty(),
             "references to the OpenCode adapter outside it:\n{}",
-            findings
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+            found.iter().map(|f| f.to_string()).collect::<Vec<_>>().join("\n")
         );
     }
 
