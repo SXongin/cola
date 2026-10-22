@@ -13,8 +13,20 @@ A messaging platform integration (e.g. Feishu). Handles message receive, card re
 _Avoid_: Client, frontend, channel
 
 **Backend**:
-An AI code agent provider (e.g. OpenCode). Handles session management, prompt execution, and event streaming.
+An AI code agent provider (e.g. OpenCode, Codex). Handles session management, prompt execution, and event streaming.
 _Avoid_: Engine, model, provider
+
+**Agent Client**:
+A configured **Backend** instance — one `[clients.<id>]` table plus the adapter `kind` behind it. One is active per cola process in the first iteration; switching clients is a config change plus a restart (ADR-0090).
+_Avoid_: client (bare — the Platform's users and the Codex/VS Code clients both use the word), adapter (the adapter is what an Agent Client's `kind` selects)
+
+**Peer Attachment**:
+The sync mode cola sells: one runtime-owned **Session**, two client faces, both seeing the same live **Turn** and able to answer the same pending **Permission**. It is a property of who owns the session, not of rendering (ADR-0090).
+_Avoid_: live sync, mirroring (a mirror is one-way, and the claim is two faces on one session)
+
+**Owned Runtime**:
+The mode where cola starts the agent and is its only client, so the user picks the **Session** up later from history. Never described or configured as peer sync (ADR-0090).
+_Avoid_: gateway (cola is not one), standalone mode
 
 **Generation**:
 An OpenCode protocol era cola can speak: **V1** is the 1.18.x unprefixed compatibility surface; **V2** is the 2.0.x `/api`-only surface. The numbers name OpenCode releases, not protocol versions (ADR-0055).
@@ -545,6 +557,7 @@ _Avoid_: Notification, message, signal
 ## Relationships
 
 - A **Bot** contains one **Platform** and one or more **Backend** adapters
+- A cola process has one active **Agent Client**: a supported one attaches to a runtime as a **Peer Attachment** — one **Session**, two faces, each able to answer the other's **Permission** — while an **Owned Runtime** client is the only face on the agent it started (ADR-0090)
 - A **Backend** attachment speaks exactly one **Generation**; its **Generation Strategy** is the adapter-internal module that owns it, and the **Attached Generation** is a property of the attachment, never of a **Session** (ADR-0055)
 - Every inbound message or card action carries exactly one **Principal** (its sender or clicking user), authorized against the **Access List** before cola acts
 - The first successful **Claim** writes the **Host** into the **Access List**; every other Principal is refused
