@@ -548,7 +548,7 @@ async fn a_tool_completing_after_the_split_renders_on_the_continuation() {
     crate::bridge::turn::Turn::render_and_flush(
         &app.cards_handle(),
         &app.sessions_handle(),
-        &app.opencode,
+        &app.client,
         &app.requests_handle(),
         "ses_test",
         &transcript,

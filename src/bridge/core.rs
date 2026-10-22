@@ -209,7 +209,11 @@ pub struct SharedCore {
     /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
     /// write wrappers and `invalidate_session_list_cache` own it.
     session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
-    pub opencode: Arc<dyn crate::backend::Backend>,
+    /// The active agent client (spec #860): the [`crate::backend::Backend`]
+    /// every bridge path talks to. Named `client`, not `opencode`: the seam is
+    /// a client, and the active one becomes a choice (#872). Today it is always
+    /// the OpenCode adapter.
+    pub client: Arc<dyn crate::backend::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
     /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`,
     /// ADR-0013). Drives the Lazy Start hook and the yield decision.
@@ -308,7 +312,7 @@ pub struct SharedCore {
 impl SharedCore {
     pub fn new(
         cfg: &crate::config::Config,
-        opencode: Arc<dyn crate::backend::Backend>,
+        client: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
         // ADR-0067: every card write goes through the delivery decorator, so a
@@ -350,7 +354,7 @@ impl SharedCore {
         // every later adapter read applies. Its durable tier is attached now,
         // where the Chain Record is built: the handle existed before the record
         // did. Attach is idempotent and replaceable.
-        let tasks = opencode.tasks().clone();
+        let tasks = client.tasks().clone();
         tasks.attach_chains(Arc::clone(&chains));
         Ok(Self {
             sessions: Arc::new(Mutex::new(session_store)),
@@ -422,7 +426,7 @@ impl SharedCore {
                 cfg.bridge.instant_reminder,
             )),
             session_list_cache: Arc::new(Mutex::new(None)),
-            opencode,
+            client,
             feishu,
             server_start: cfg.opencode.start_server,
             preferred_port: cfg.opencode.preferred_port(),
@@ -471,7 +475,7 @@ impl SharedCore {
             cards: self.cards_handle(),
             requests: self.requests_handle(),
             waits: self.waits_handle(),
-            backend: Arc::clone(&self.opencode),
+            backend: Arc::clone(&self.client),
             platform: Arc::clone(&self.feishu),
             config: self.turn_config(),
             runtime_reconcile: Arc::clone(&self.runtime_reconcile),
@@ -486,7 +490,7 @@ impl SharedCore {
             cards: self.cards_handle(),
             requests: self.requests_handle(),
             waits: self.waits_handle(),
-            backend: Arc::clone(&self.opencode),
+            backend: Arc::clone(&self.client),
             platform: Arc::clone(&self.feishu),
             runtime_reconcile: Arc::clone(&self.runtime_reconcile),
         }
@@ -649,7 +653,7 @@ impl SharedCore {
     /// server yet, ADR-0041).
     pub async fn effective_model(&self, settings: &SessionSettings) -> Option<(String, String)> {
         self.sessions_handle()
-            .effective_model(&self.opencode, settings)
+            .effective_model(&self.client, settings)
             .await
     }
 
@@ -660,7 +664,7 @@ impl SharedCore {
         model_spec: &str,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .pick_model(&self.opencode, thread_key, model_spec)
+            .pick_model(&self.client, thread_key, model_spec)
             .await
     }
 
@@ -671,7 +675,7 @@ impl SharedCore {
         variant: Option<String>,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .pick_think(&self.opencode, thread_key, variant)
+            .pick_think(&self.client, thread_key, variant)
             .await
     }
 
@@ -682,7 +686,7 @@ impl SharedCore {
         agent: Option<String>,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .pick_agent(&self.opencode, thread_key, agent)
+            .pick_agent(&self.client, thread_key, agent)
             .await
     }
 
@@ -692,7 +696,7 @@ impl SharedCore {
     /// destroying it on an unknown).
     pub async fn model_variants(&self, provider: &str, model: &str) -> Option<Vec<String>> {
         self.sessions_handle()
-            .model_variants(&self.opencode, provider, model)
+            .model_variants(&self.client, provider, model)
             .await
     }
 
@@ -707,7 +711,7 @@ impl SharedCore {
     pub(crate) async fn cached_session_list(
         &self,
     ) -> crate::error::Result<Vec<crate::backend::types::SessionListInfo>> {
-        self.sessions_handle().cached_session_list(&self.opencode).await
+        self.sessions_handle().cached_session_list(&self.client).await
     }
 
     /// Drop the session-list cache. Called whenever cola creates, adopts, forgets or
@@ -758,7 +762,7 @@ impl SharedCore {
         crate::bridge::request::kind::approve_pending_for_session(
             &self.sessions_handle(),
             &self.requests_handle(),
-            &self.opencode,
+            &self.client,
             session_id,
             directory,
         )
@@ -872,7 +876,7 @@ mod tests {
         crate::bridge::request::kind::set_auto_accept(
             &app.sessions_handle(),
             &app.requests_handle(),
-            &app.opencode,
+            &app.client,
             "ses_b",
             "/work/b",
             true,

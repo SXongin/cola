@@ -2335,18 +2335,12 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
     // No server title → the id-tail alone identifies the session (no cola
     // side name to fall back on; the current prompt is never echoed).
     assert_eq!(
-        crate::bridge::turn::Turn::session_subtitle(
-            &app.sessions_handle(),
-            &app.opencode,
-            &key,
-            "另一个问题"
-        )
-        .await,
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.client, &key, "另一个问题")
+            .await,
         "01ba0ed"
     );
     assert_eq!(
-        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "你好")
-            .await,
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.client, &key, "你好").await,
         "01ba0ed"
     );
 }
@@ -2383,7 +2377,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
     // only) within the bound instead of hanging the prompt flow.
     let subtitle = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题"),
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.client, &key, "问题"),
     )
     .await
     .expect("session_subtitle must not hang when session_info never returns");
@@ -2450,13 +2444,8 @@ async fn subtitle_ignores_server_default_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::turn::Turn::session_subtitle(
-            &app.sessions_handle(),
-            &app.opencode,
-            &key,
-            "另一个问题"
-        )
-        .await,
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.client, &key, "另一个问题")
+            .await,
         "00ea4e7"
     );
 }
@@ -2489,8 +2478,7 @@ async fn subtitle_prefers_server_title() {
     )
     .await;
     assert_eq!(
-        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.opencode, &key, "问题")
-            .await,
+        crate::bridge::turn::Turn::session_subtitle(&app.sessions_handle(), &app.client, &key, "问题").await,
         "OpenChamber 显示的标题 · test"
     );
 }
@@ -2627,7 +2615,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
     let _ = Turn::render_and_flush(
         &app.cards_handle(),
         &app.sessions_handle(),
-        &app.opencode,
+        &app.client,
         &app.requests_handle(),
         sid,
         &transcript(42_000),
@@ -2651,7 +2639,7 @@ async fn render_poll_shows_live_context_and_memoizes_the_window() {
     let _ = Turn::render_and_flush(
         &app.cards_handle(),
         &app.sessions_handle(),
-        &app.opencode,
+        &app.client,
         &app.requests_handle(),
         sid,
         &transcript(55_000),

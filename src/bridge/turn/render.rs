@@ -6808,7 +6808,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &transcript,
@@ -6825,7 +6825,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &transcript,
@@ -6865,7 +6865,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &transcript("第一段"),
@@ -6877,7 +6877,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &transcript("第二段"),
@@ -6972,7 +6972,7 @@ Index: /x/src/main.rs
         render_and_flush(
             cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             transcript,
@@ -8847,7 +8847,7 @@ Index: /x/src/main.rs
             let _ = render_and_flush(
                 &cards,
                 &app.sessions_handle(),
-                &app.opencode,
+                &app.client,
                 &app.requests_handle(),
                 sid,
                 &transcript,
@@ -8971,7 +8971,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &transcript,
@@ -9177,7 +9177,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &parent,
@@ -9193,7 +9193,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &parent,
@@ -9246,7 +9246,7 @@ Index: /x/src/main.rs
         let _ = render_and_flush(
             &cards,
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             &app.requests_handle(),
             sid,
             &parent,
@@ -9314,7 +9314,7 @@ Index: /x/src/main.rs
         let refreshed = refresh_session_title(
             &app.cards_handle(),
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             "ses_test",
         )
         .await;
@@ -9334,7 +9334,7 @@ Index: /x/src/main.rs
             !refresh_session_title(
                 &app.cards_handle(),
                 &app.sessions_handle(),
-                &app.opencode,
+                &app.client,
                 "ses_test"
             )
             .await,
@@ -9346,7 +9346,7 @@ Index: /x/src/main.rs
             !refresh_session_title(
                 &app.cards_handle(),
                 &app.sessions_handle(),
-                &app.opencode,
+                &app.client,
                 "ses_test"
             )
             .await
@@ -9399,7 +9399,7 @@ Index: /x/src/main.rs
         let refreshed = refresh_session_title(
             &app.cards_handle(),
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             "ses_test",
         )
         .await;

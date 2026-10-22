@@ -1528,10 +1528,10 @@ async fn owner_label(core: &Arc<SharedCore>, owner_key: &ThreadKey) -> String {
 impl App {
     pub fn new(
         cfg: Config,
-        opencode: Arc<dyn crate::backend::Backend>,
+        client: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
-        let core = Arc::new(SharedCore::new(&cfg, opencode, feishu)?);
+        let core = Arc::new(SharedCore::new(&cfg, client, feishu)?);
         let access = tokio::sync::Mutex::new(Access::new(cfg.bridge.access_file.clone()));
         Ok(Self {
             self_weak: std::sync::OnceLock::new(),
@@ -1990,7 +1990,7 @@ impl App {
         // empty/unknown directory keeps the server's default location.
         let directory = handles.current_project_directory(&thread_key).await;
         let skills = self
-            .opencode
+            .client
             .list_skills((!directory.is_empty()).then_some(directory.as_str()))
             .await;
         // The distinct resolved skills, in first-occurrence order: ONE
@@ -2194,7 +2194,7 @@ impl App {
         let status = read_session_status(
             "prompt advisory status",
             self.turn_config().follow_read_timeout_ms(),
-            &self.opencode,
+            &self.client,
             session_id,
             directory.as_deref(),
         )
@@ -2433,7 +2433,7 @@ impl App {
 
         let subtitle = crate::bridge::turn::Turn::session_subtitle(
             &self.sessions_handle(),
-            &self.opencode,
+            &self.client,
             &thread_key,
             &text,
         )
@@ -2488,7 +2488,7 @@ impl App {
                 // cola-authored id (ADR-0026), never reused.
                 let cola_msg_id = crate::backend::parsing::cola_message_id();
                 let submitted = match self
-                    .opencode
+                    .client
                     .prompt(
                         &session_id,
                         &text,
@@ -2615,8 +2615,8 @@ impl App {
         message_id: &str,
     ) -> crate::error::Result<String> {
         let session = self
-            .opencode
-            .create_session(&self.opencode.new_session_input(Some(&pending.directory)))
+            .client
+            .create_session(&self.client.new_session_input(Some(&pending.directory)))
             .await?;
         // ADR-0041 + V2's durable selection: the pending's picks become
         // session switches now that a session exists (and on V1 the same
@@ -2632,7 +2632,7 @@ impl App {
         // create a second one), so it warns and keeps the server-generated
         // title.
         if let Some(title) = &pending.title
-            && let Err(e) = self.opencode.update_session_title(&session.id, title).await
+            && let Err(e) = self.client.update_session_title(&session.id, title).await
         {
             tracing::warn!(
                 "materialise: title patch failed for {} ({e}); keeping the server title",
@@ -2676,7 +2676,7 @@ impl App {
             Some(spec) => Some(spec),
             None if pending.variant.is_some() => {
                 match self
-                    .opencode
+                    .client
                     .session_info(session_id, Some(&pending.directory))
                     .await
                 {
@@ -2695,14 +2695,14 @@ impl App {
         if let Some(model_spec) = model_spec
             && let Err(e) = self
                 .sessions_handle()
-                .apply_model_selection(&self.opencode, session_id, &model_spec, &mut pending.variant)
+                .apply_model_selection(&self.client, session_id, &model_spec, &mut pending.variant)
                 .await
         {
             tracing::warn!("materialise: model switch failed for {session_id}: {e}");
             failures.push(format!("模型/思考等级未生效（{e}）"));
         }
         if let Some(agent) = &pending.agent
-            && let Err(e) = self.opencode.switch_session_agent(session_id, agent).await
+            && let Err(e) = self.client.switch_session_agent(session_id, agent).await
         {
             tracing::warn!("materialise: agent switch failed for {session_id}: {e}");
             failures.push(format!("Agent 未生效（{e}）"));
@@ -4651,7 +4651,7 @@ impl App {
         if value.get("level").and_then(|v| v.as_str())
             == Some(crate::feishu::card::picker::PickerLevel::Provider.as_str())
         {
-            let providers = core.opencode.list_models().await;
+            let providers = core.client.list_models().await;
             let cards = if picked == crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS {
                 let current =
                     crate::feishu::card::command::current_model_label(&core.command_handles(), &thread_key)
@@ -5056,7 +5056,7 @@ impl App {
     ) -> serde_json::Value {
         let directory = self.command_handles().current_project_directory(thread_key).await;
         let skills = self
-            .opencode
+            .client
             .list_skills((!directory.is_empty()).then_some(directory.as_str()))
             .await;
         let filtered = crate::feishu::card::picker::filter_skills(&skills, keyword);
@@ -5375,7 +5375,7 @@ impl App {
         match crate::bridge::bounded_call(
             "turn diff read",
             timeout_ms,
-            self.opencode.session_diff(&click.session_id, from, None, Some(3)),
+            self.client.session_diff(&click.session_id, from, None, Some(3)),
         )
         .await
         {
@@ -5409,7 +5409,7 @@ impl App {
         match crate::bridge::bounded_call(
             "turn diff transcript",
             timeout_ms,
-            self.opencode.transcript(&click.session_id),
+            self.client.transcript(&click.session_id),
         )
         .await
         {

@@ -706,7 +706,7 @@ async fn default_server_title_does_not_patch_cover_card() {
     let settled = crate::bridge::topic::sync_topic_cover_title(
         &app.cards_handle(),
         &app.sessions_handle(),
-        &app.opencode,
+        &app.client,
         "ses_test",
     )
     .await;
@@ -767,7 +767,7 @@ async fn cover_title_retry_ladder_catches_late_auto_title() {
     crate::bridge::topic::spawn_cover_title_retry_at(
         &app.cards_handle(),
         &app.sessions_handle(),
-        &app.opencode,
+        &app.client,
         "ses_test",
         &[
             std::time::Duration::from_millis(50),
