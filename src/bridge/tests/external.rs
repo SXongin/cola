@@ -2722,6 +2722,95 @@ async fn session_sync_follows_a_moved_session_to_its_new_directory() {
     );
 }
 
+/// #450: the follow re-points a live card captured at the pre-move directory,
+/// so a card that settles after the move shows the new worktree — its 📁 name,
+/// 🌲 marker and branch — instead of the turn-start checkout.
+#[tokio::test]
+async fn a_followed_move_repoints_the_live_card_footer() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    git_in(
+        repo.path(),
+        &["worktree", "add", "-b", "wt/moved", ".worktrees/moved"],
+    );
+    let old = crate::git::plain_path(std::fs::canonicalize(repo.path()).unwrap());
+    let new = crate::git::plain_path(std::fs::canonicalize(repo.path().join(".worktrees/moved")).unwrap());
+
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_sessions(vec![list_session(
+        "ses_moved_card",
+        "移动到 worktree",
+        &new.to_string_lossy(),
+        100,
+    )]);
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, mock).await;
+
+    let key = crate::config::ThreadKey::new("oc_moved".into(), "oc_moved".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key, "ses_moved_card", old.to_string_lossy()),
+    )
+    .await;
+    // The live card a Turn started before the move would carry: captured at
+    // the old checkout and still tracked while the Session moves.
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_moved_card", Some("om_live")).await;
+    Turn::seed_work_context(&cards, "ses_moved_card", &old.to_string_lossy()).await;
+    assert_eq!(
+        Turn::card_work_context(&cards, "ses_moved_card")
+            .await
+            .map(|(directory, branch, _)| (directory, branch)),
+        Some((Some(old.to_string_lossy().to_string()), Some("main".to_string()))),
+        "the card starts at the pre-move checkout"
+    );
+    // Baseline the watermark so the pass stays off the notify path.
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_moved_card".into(), now_ms());
+
+    app.external
+        .poll_interval_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let followed = Turn::card_work_context(&cards, "ses_moved_card")
+            .await
+            .and_then(|(directory, _, _)| directory)
+            .as_deref()
+            == Some(new.to_string_lossy().as_ref());
+        if followed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the live card must follow the move to {new:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let (directory, branch, worktree) = Turn::card_work_context(&cards, "ses_moved_card")
+        .await
+        .expect("the card is still tracked");
+    assert_eq!(directory, Some(new.to_string_lossy().to_string()));
+    assert_eq!(
+        branch.as_deref(),
+        Some("wt/moved"),
+        "the footer shows the new checkout's branch, not the pre-move one"
+    );
+    assert!(worktree, "and the 🌲 marker is on");
+}
+
 // ---------------------------------------------------------------------------
 // #568: an external follow's wait is served like a cola request's — the render
 // loop yields ⏳ on live Background Tasks (never ✅), Session Sync resumes the
