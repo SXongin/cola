@@ -5108,6 +5108,74 @@ pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
     }
 }
 
+/// Re-point a live card whose turn started at `from` to `to` after the Session
+/// Sync followed a location move (#450, #433): the card's captured directory is
+/// the turn-start path, so without this the card that settles later still shows
+/// the pre-move branch in its footer. Only a card still captured at `from` is
+/// re-pointed — a card that started after the move, or was already re-pointed
+/// by an earlier pass, is left alone. The capture (directory, project name, git
+/// state) is read outside the cards lock; the second check under the lock keeps
+/// a concurrent update from being overwritten. Best effort: no card leaves it
+/// untouched, and a directory that is already gone again keeps the existing
+/// capture rather than clearing it.
+pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, from: &str, to: &str) {
+    let captured = {
+        let live = cards.cards.lock().await;
+        live.get(session_id).and_then(|c| c.acc.directory.clone())
+    };
+    if captured.as_deref() != Some(from) {
+        return;
+    }
+    let Some(ctx) = capture_followed_context(to).await else {
+        return;
+    };
+    let mut live = cards.cards.lock().await;
+    if let Some(card) = live.get_mut(session_id)
+        && card.acc.directory.as_deref() == Some(from)
+    {
+        card.acc.apply_work_context(ctx);
+    }
+}
+
+/// The work context for a followed directory (#450): [`StreamAccumulator::
+/// capture_work_context`] once the path is known to exist. A move the follow
+/// detected but whose path is already gone again (a worktree removed between
+/// the list read and here) is `None` — the caller keeps the card's existing
+/// branch/project fields rather than clearing them.
+async fn capture_followed_context(directory: &str) -> Option<WorkContext> {
+    match tokio::fs::metadata(directory).await {
+        Ok(metadata) if metadata.is_dir() => Some(StreamAccumulator::capture_work_context(directory).await),
+        _ => None,
+    }
+}
+
+/// Test seam for #450's follow: capture a live card's work context at
+/// `directory`, standing in for the Turn that started there.
+#[cfg(test)]
+pub(super) async fn seed_work_context(cards: &CardsHandle, session_id: &str, directory: &str) {
+    let ctx = StreamAccumulator::capture_work_context(directory).await;
+    if let Some(card) = cards.cards.lock().await.get_mut(session_id) {
+        card.acc.apply_work_context(ctx);
+    }
+}
+
+/// Test seam for #450's follow: the card's captured `(directory, branch,
+/// worktree)` triple. The fields are private to this module.
+#[cfg(test)]
+pub(super) async fn card_work_context(
+    cards: &CardsHandle,
+    session_id: &str,
+) -> Option<(Option<String>, Option<String>, bool)> {
+    let live = cards.cards.lock().await;
+    live.get(session_id).map(|card| {
+        (
+            card.acc.directory.clone(),
+            card.acc.branch.clone(),
+            card.acc.worktree,
+        )
+    })
+}
+
 /// Fetch and memoize the answering model's context-window size for the live
 /// turn (ADR-0044) — the denominator of the footer's 📊 segment. The lookup is
 /// the only cost of the live refresh and is paid at most once per

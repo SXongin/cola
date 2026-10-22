@@ -117,6 +117,22 @@ impl ExternalFlow {
         // verdict's baseline for a record that carries no directory of its own
         // (#439).
         let moved_from = self.follow_locations(handles).await;
+        // #450: a live card captured at the turn-start path follows the move
+        // too, so the card that settles later shows the new checkout (its
+        // footer's 📁/🌲/branch halves) rather than the pre-move state. This
+        // is card presentation only — the Turn's own `directory` stays the
+        // drain's routing key, and the next turn captures the new location.
+        for (session_id, previous) in &moved_from {
+            if let Some(directory) = handles.sessions.directory_for_session(session_id).await {
+                crate::bridge::turn::Turn::follow_work_context(
+                    &handles.cards,
+                    session_id,
+                    previous,
+                    &directory,
+                )
+                .await;
+            }
+        }
         // Only each thread's ACTIVE session is synced (ADR-0017): a lobby
         // (p2p/group) can stack several sessions via /new and /switch, and
         // notifying for a historical one would interleave its cards with the

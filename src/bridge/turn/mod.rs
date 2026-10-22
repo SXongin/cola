@@ -3535,6 +3535,28 @@ impl Turn {
         state::refresh_work_context(cards, session_id).await;
     }
 
+    /// #450: a Session Sync follow re-points the live card captured at `from`
+    /// to `to`, so the card that settles later shows the post-move worktree.
+    pub(crate) async fn follow_work_context(cards: &CardsHandle, session_id: &str, from: &str, to: &str) {
+        state::follow_work_context(cards, session_id, from, to).await;
+    }
+
+    /// Test seam for #450's follow: capture a live card's work context at
+    /// `directory`, standing in for the Turn that started there.
+    #[cfg(test)]
+    pub(crate) async fn seed_work_context(cards: &CardsHandle, session_id: &str, directory: &str) {
+        state::seed_work_context(cards, session_id, directory).await;
+    }
+
+    /// Test seam for #450's follow: the card's `(directory, branch, worktree)`.
+    #[cfg(test)]
+    pub(crate) async fn card_work_context(
+        cards: &CardsHandle,
+        session_id: &str,
+    ) -> Option<(Option<String>, Option<String>, bool)> {
+        state::card_work_context(cards, session_id).await
+    }
+
     /// Apply an ending `disposition` only while the card's accumulator is
     /// still `anchor`'s — the check and the application share ONE lock, so a
     /// renderer whose bound fired after a successor replaced the accumulator
