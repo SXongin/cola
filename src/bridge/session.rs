@@ -1,6 +1,7 @@
 use crate::config::{SessionEntry, ThreadKey};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::bridge::sidecar;
 
@@ -127,9 +128,14 @@ impl LoadedStore {
 /// unless the thread has a Pending Session.
 pub struct SessionStore {
     path: PathBuf,
-    entries: Vec<SessionEntry>,
+    /// The two halves are refcounted so a snapshot (what the writer serializes)
+    /// is O(1) to take under the store lock — the callback never renders JSON
+    /// (ADR-0089). A mutation copies the vector only when a snapshot is
+    /// outstanding, and the writer drops its snapshot as soon as it has the
+    /// bytes, so a stalled DISK never makes a mutation copy.
+    entries: Arc<Vec<SessionEntry>>,
     /// At most one Pending Session per ThreadKey (ADR-0041).
-    pending: Vec<PendingEntry>,
+    pending: Arc<Vec<PendingEntry>>,
     /// The one thread that writes `sessions.json` (ADR-0089); `None` only when
     /// the thread could not be started, in which case writes stay synchronous.
     writer: Option<crate::bridge::store_writer::StoreWriter>,
@@ -164,10 +170,23 @@ impl SessionStore {
         };
         Ok(Self {
             path,
-            entries,
-            pending,
+            entries: Arc::new(entries),
+            pending: Arc::new(pending),
             writer,
         })
+    }
+
+    /// The two halves as mutable vectors. `Arc::make_mut` copies only when a
+    /// writer snapshot is outstanding, and the writer drops its snapshot as soon
+    /// as it holds the bytes — so a stalled DISK never makes a mutation copy
+    /// (ADR-0089); only a mutation racing an in-flight serialization does.
+    fn entries_mut(&mut self) -> &mut Vec<SessionEntry> {
+        Arc::make_mut(&mut self.entries)
+    }
+
+    /// [`Self::entries_mut`] for the Pending Sessions.
+    fn pending_mut(&mut self) -> &mut Vec<PendingEntry> {
+        Arc::make_mut(&mut self.pending)
     }
 
     /// Get the active session for a thread (first match). `None` while the
@@ -187,15 +206,15 @@ impl SessionStore {
 
     /// Declare (or replace) the conversation's Pending Session and persist.
     pub fn set_pending(&mut self, pending: PendingEntry) -> crate::error::Result<()> {
-        self.pending.retain(|p| p.thread_key != pending.thread_key);
-        self.pending.push(pending);
+        self.pending_mut().retain(|p| p.thread_key != pending.thread_key);
+        self.pending_mut().push(pending);
         self.write_to_disk()
     }
 
     /// Drop the conversation's Pending Session and persist.
     #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) clear pendings
     pub fn clear_pending(&mut self, key: &ThreadKey) -> crate::error::Result<()> {
-        self.pending.retain(|p| &p.thread_key != key);
+        self.pending_mut().retain(|p| &p.thread_key != key);
         self.write_to_disk()
     }
 
@@ -213,7 +232,7 @@ impl SessionStore {
     /// a thread cannot have both (ADR-0041). Centralised here so no activation
     /// path can leave a pending behind to supersede the session it activated.
     fn promote(&mut self, mut entry: SessionEntry) {
-        self.pending.retain(|p| p.thread_key != entry.thread_key);
+        self.pending_mut().retain(|p| p.thread_key != entry.thread_key);
         // Replace any existing mapping of this session. ADR-0041 keeps the
         // per-session overrides on the session: an adoption flow rebuilds the
         // mapping fields but never sets model/variant/auto_accept, so
@@ -226,7 +245,7 @@ impl SessionStore {
         // Everything the flow owns — thread key, directory, agent, topic
         // anchors — stays as the new entry set it.
         if let Some(pos) = self.entries.iter().position(|e| e.session_id == entry.session_id) {
-            let previous = self.entries.remove(pos);
+            let previous = self.entries_mut().remove(pos);
             if entry.model.is_none() {
                 entry.model = previous.model;
             }
@@ -237,7 +256,7 @@ impl SessionStore {
                 entry.auto_accept = previous.auto_accept;
             }
         }
-        self.entries.insert(0, entry);
+        self.entries_mut().insert(0, entry);
     }
 
     /// Promote `entry` as its thread's active session and persist the store.
@@ -264,7 +283,7 @@ impl SessionStore {
     where
         F: FnOnce(&mut SessionEntry),
     {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.session_id == session_id) else {
+        let Some(entry) = self.entries_mut().iter_mut().find(|e| e.session_id == session_id) else {
             return Ok(None);
         };
         f(entry);
@@ -293,7 +312,7 @@ impl SessionStore {
             .map(|(session_id, directory)| (session_id.as_str(), directory.as_str()))
             .collect();
         let mut moved = Vec::new();
-        for entry in &mut self.entries {
+        for entry in self.entries_mut().iter_mut() {
             let Some(directory) = listed.get(entry.session_id.as_str()) else {
                 continue;
             };
@@ -317,7 +336,7 @@ impl SessionStore {
     where
         F: FnOnce(&mut PendingEntry),
     {
-        let Some(pending) = self.pending.iter_mut().find(|p| &p.thread_key == key) else {
+        let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
             return Ok(false);
         };
         f(pending);
@@ -362,17 +381,17 @@ impl SessionStore {
             settings.auto_accept,
         );
         let applied = if let Some(id) = settings.session_id.as_deref() {
-            match self.entries.iter_mut().find(|e| e.session_id == id) {
+            match self.entries_mut().iter_mut().find(|e| e.session_id == id) {
                 Some(e) => {
                     (e.agent, e.model, e.variant, e.auto_accept) = overrides.clone();
                     true
                 }
                 None => false,
             }
-        } else if let Some(p) = self.pending.iter_mut().find(|p| &p.thread_key == key) {
+        } else if let Some(p) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
             (p.agent, p.model, p.variant, p.auto_accept) = overrides;
             true
-        } else if let Some(e) = self.entries.iter_mut().find(|e| &e.thread_key == key) {
+        } else if let Some(e) = self.entries_mut().iter_mut().find(|e| &e.thread_key == key) {
             // The pending materialised between the read and this write: the
             // overrides belong on the session it created.
             (e.agent, e.model, e.variant, e.auto_accept) = overrides;
@@ -388,11 +407,8 @@ impl SessionStore {
 
     /// Remove a session entry by session ID.
     fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
-        if let Some(pos) = self.entries.iter().position(|e| e.session_id == session_id) {
-            Some(self.entries.remove(pos))
-        } else {
-            None
-        }
+        let pos = self.entries.iter().position(|e| e.session_id == session_id)?;
+        Some(self.entries_mut().remove(pos))
     }
 
     /// Remove a mapping and persist the store.
@@ -405,14 +421,14 @@ impl SessionStore {
     /// Remove every session entry mapped to a thread, together with any
     /// Pending Session (ADR-0041: forget clears both in the same write).
     fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
-        self.pending.retain(|p| &p.thread_key != key);
+        self.pending_mut().retain(|p| &p.thread_key != key);
         let removed: Vec<SessionEntry> = self
             .entries
             .iter()
             .filter(|e| &e.thread_key == key)
             .cloned()
             .collect();
-        self.entries.retain(|e| &e.thread_key != key);
+        self.entries_mut().retain(|e| &e.thread_key != key);
         removed
     }
 
@@ -451,7 +467,7 @@ impl SessionStore {
     /// instance the bot has created sessions in.
     pub fn directories(&self) -> Vec<String> {
         let mut dirs: Vec<String> = Vec::new();
-        for e in &self.entries {
+        for e in self.entries.iter() {
             if !dirs.contains(&e.directory) {
                 dirs.push(e.directory.clone());
             }
@@ -470,59 +486,75 @@ impl SessionStore {
     }
 
     fn write_to_disk(&self) -> crate::error::Result<()> {
-        let data = self.serialize()?;
         // Atomic, and the failure is returned: this is the one sidecar whose
         // loss is not recoverable, so its writer must not log-and-continue.
         // The blocking form keeps that contract; a caller that must not wait
         // (a card callback) uses `write_to_disk_deferred` (ADR-0089).
         match &self.writer {
-            Some(writer) => writer.write_blocking(data)?,
-            None => sidecar::write_atomic(&self.path, &data)?,
+            Some(writer) => writer.write_blocking(self.snapshot())?,
+            None => {
+                let bytes = self.snapshot().to_bytes()?;
+                sidecar::write_atomic(&self.path, &bytes)?
+            }
         }
         Ok(())
     }
 
-    /// The snapshot bytes: serialized under the store lock, right after the
-    /// mutation, so writer-thread order equals mutation order (ADR-0089).
-    fn serialize(&self) -> crate::error::Result<Vec<u8>> {
-        #[derive(Serialize)]
-        struct StoreFileRef<'a> {
-            entries: &'a [SessionEntry],
-            pending: &'a [PendingEntry],
-        }
-        let data = serde_json::to_string_pretty(&StoreFileRef {
-            entries: &self.entries,
-            pending: &self.pending,
-        })?;
-        Ok(data.into_bytes())
+    /// The state to persist, handed over by reference count (ADR-0089): O(1)
+    /// under the store lock, so the *callback* never renders JSON — the writer
+    /// thread does, right after taking the snapshot, before it touches the disk.
+    fn snapshot(&self) -> crate::bridge::store_writer::StoreSnapshot {
+        crate::bridge::store_writer::StoreSnapshot::new(Arc::clone(&self.entries), Arc::clone(&self.pending))
     }
 
     /// Persist this snapshot without waiting for the write: the caller bounds
     /// its own wait on the returned receipt. The write itself still happens, in
     /// order, on the store's single writer thread.
-    #[allow(dead_code)] // TODO(#449 follow-up): remove once the card callbacks defer.
+    ///
+    /// `Err` means nothing was written and nothing will be: the writer thread
+    /// could not be started, so there is no path that would keep the caller
+    /// bounded AND durable. The mutation stays in memory and the next blocking
+    /// write persists it, so the caller should answer "saved failed, kept for
+    /// this process" rather than claim the file has it.
     pub(crate) fn write_to_disk_deferred(
         &self,
     ) -> crate::error::Result<crate::bridge::store_writer::DeferredWrite> {
-        let data = self.serialize()?;
         match &self.writer {
-            Some(writer) => Ok(writer.write_deferred(data)?),
-            None => Ok(crate::bridge::store_writer::DeferredWrite::settled(
-                sidecar::write_atomic(&self.path, &data),
-            )),
+            Some(writer) => Ok(writer.write_deferred(self.snapshot())),
+            None => Err(crate::bridge::store_writer::writer_unavailable().into()),
         }
     }
 
     /// [`Self::set_pending`] whose durability is reported later (ADR-0089):
     /// the mutation is in memory now, the receipt settles when the file does.
-    #[allow(dead_code)] // TODO(#449 follow-up): remove once the card callbacks defer.
+    ///
+    /// `Ok(None)` means the scans that apply the mutation ran past `deadline`:
+    /// they are memory-only but proportional to the store, so the change is
+    /// ROLLED BACK and the click must refuse — a callback never commits a
+    /// pending it can no longer confirm. `Err` means the mutation stuck and
+    /// only the save failed.
     pub(crate) fn set_pending_deferred(
         &mut self,
         pending: PendingEntry,
-    ) -> crate::error::Result<crate::bridge::store_writer::DeferredWrite> {
-        self.pending.retain(|p| p.thread_key != pending.thread_key);
-        self.pending.push(pending);
-        self.write_to_disk_deferred()
+        deadline: tokio::time::Instant,
+    ) -> crate::error::Result<Option<crate::bridge::store_writer::DeferredWrite>> {
+        // Replace in place and remember what was displaced, so an overrun can
+        // be undone without holding a second handle to the vector up front —
+        // that would force the copy-on-write below to copy every time.
+        let index = self
+            .pending
+            .iter()
+            .position(|p| p.thread_key == pending.thread_key);
+        let displaced = index.map(|index| (index, self.pending_mut().remove(index)));
+        self.pending_mut().push(pending);
+        if tokio::time::Instant::now() >= deadline {
+            self.pending_mut().pop();
+            if let Some((index, displaced)) = displaced {
+                self.pending_mut().insert(index, displaced);
+            }
+            return Ok(None);
+        }
+        self.write_to_disk_deferred().map(Some)
     }
 
     /// Test-only durable write; production reaches it only through
@@ -530,6 +562,32 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn persist(&self) -> crate::error::Result<()> {
         self.write_to_disk()
+    }
+
+    /// Test-only: the gate the writer thread stops at before each write, so a
+    /// test can keep a write in flight (`None` without a writer thread).
+    #[cfg(test)]
+    pub(crate) fn pause_writes(&self) -> Option<crate::bridge::store_writer::WritePause> {
+        self.writer.as_ref().map(|writer| writer.pause.clone())
+    }
+
+    /// Test-only: how many writes actually reached the disk, so a test can pin
+    /// that a superseded snapshot is never written (ADR-0089).
+    #[cfg(test)]
+    pub(crate) fn writes(&self) -> usize {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.writes.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// Test-only: this store without its writer thread — the degraded state
+    /// `new` logs about, where a deferred save cannot stay both bounded and
+    /// durable.
+    #[cfg(test)]
+    pub(crate) fn without_writer(mut self) -> Self {
+        self.writer = None;
+        self
     }
 }
 
@@ -546,6 +604,11 @@ fn same_directory(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A deadline far enough away that a test's mutation is inside it.
+    fn far() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+    }
 
     fn make_entry(chat_id: &str, root_id: &str, session_id: &str, dir: &str) -> SessionEntry {
         SessionEntry {
@@ -1246,8 +1309,9 @@ mod tests {
         let key = ThreadKey::new("chat1".into(), "root1".into());
 
         let receipt = store
-            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"))
-            .unwrap();
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"), far())
+            .unwrap()
+            .expect("the mutation is inside the deadline");
         assert_eq!(
             store.pending_for(&key).unwrap().directory,
             "/tmp/wt",
@@ -1268,11 +1332,13 @@ mod tests {
         let mut store = SessionStore::new(path.clone()).unwrap();
 
         let first = store
-            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/first"))
-            .unwrap();
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/first"), far())
+            .unwrap()
+            .expect("first within the deadline");
         let second = store
-            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/second"))
-            .unwrap();
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/second"), far())
+            .unwrap()
+            .expect("second within the deadline");
         first.settle().await.unwrap();
         second.settle().await.unwrap();
 
@@ -1293,8 +1359,97 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
 
         let receipt = store
-            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"))
-            .unwrap();
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"), far())
+            .unwrap()
+            .expect("the mutation is inside the deadline");
         assert!(receipt.settle().await.is_err());
+    }
+
+    /// Handing a snapshot over never blocks, so a newer one replaces an older
+    /// one still waiting for the writer — and BOTH callers settle on the write
+    /// that lands (their mutation is in it). This is what keeps a click bounded
+    /// when the disk stalls.
+    #[tokio::test]
+    async fn a_superseded_snapshot_settles_on_the_newer_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        let pause = store.pause_writes().unwrap();
+        pause.hold();
+
+        let first = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/first"), far())
+            .unwrap()
+            .expect("first within the deadline");
+        let second = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/second"), far())
+            .unwrap()
+            .expect("second within the deadline");
+        // Neither can have landed: the writer is held before its first write.
+        assert!(!path.exists(), "no write while the writer is held");
+        pause.release();
+
+        first.settle().await.unwrap();
+        second.settle().await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("/tmp/second"), "{text}");
+        assert!(!text.contains("/tmp/first"), "the stale snapshot lost: {text}");
+        assert_eq!(
+            store.writes(),
+            1,
+            "the superseded snapshot was replaced, not queued behind it"
+        );
+    }
+
+    /// ADR-0089: if applying the mutation itself runs past the deadline, it is
+    /// rolled back — a click never commits a pending whose answer is gone.
+    #[tokio::test]
+    async fn an_overrun_declaration_rolls_the_mutation_back() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/before"))
+            .unwrap();
+
+        let past = tokio::time::Instant::now() + std::time::Duration::from_millis(1);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let declared = store
+            .set_pending_deferred(make_pending("chat1", "root1", "/tmp/after"), past)
+            .unwrap();
+        assert!(declared.is_none(), "an overrun declaration enqueues nothing");
+        assert_eq!(
+            store.pending_for(&key).unwrap().directory,
+            "/tmp/before",
+            "the pending is the one from before the click"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("/tmp/after"), "nothing was saved: {text}");
+    }
+
+    /// Without a writer thread a deferred save cannot be both bounded and
+    /// durable, so it reports the failure instead of writing synchronously
+    /// (which is exactly what a card callback cannot afford). The mutation
+    /// stays in memory for the next blocking write.
+    #[tokio::test]
+    async fn a_deferred_save_without_a_writer_reports_the_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap().without_writer();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+
+        assert!(
+            store
+                .set_pending_deferred(make_pending("chat1", "root1", "/tmp/wt"), far())
+                .is_err(),
+            "no writer means the save is refused, not performed inline"
+        );
+        assert_eq!(
+            store.pending_for(&key).unwrap().directory,
+            "/tmp/wt",
+            "the mutation is applied in memory"
+        );
+        assert!(!path.exists(), "nothing was written");
     }
 }

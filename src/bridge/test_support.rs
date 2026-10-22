@@ -3976,6 +3976,27 @@ pub(crate) async fn seed_pending(app: &Arc<App>, pending: crate::bridge::session
         .expect("seed_pending: persisting the seeded store failed");
 }
 
+/// The directories `sessions.json` records for its Pending Sessions, read back
+/// through JSON: a Windows path appears escaped in the file, so a raw
+/// `contains(path)` would never match.
+pub(crate) fn saved_pending_dirs(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(store) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    store["pending"]
+        .as_array()
+        .map(|pending| {
+            pending
+                .iter()
+                .filter_map(|entry| entry["directory"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Seed the cover-title cache for `session_id` (the topic cover card's title
 /// memory) — the `app.core` setup tests would otherwise do by hand.
 pub(crate) async fn seed_cover_title(app: &Arc<App>, session_id: &str, title: &str) {

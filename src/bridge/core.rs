@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
+use crate::bridge::session::{SessionSettings, SessionStore};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
 use crate::opencode;
@@ -726,38 +726,6 @@ impl SharedCore {
     /// a card on 「⏳ 等待后台任务」.
     pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
         self.flow_handles().activate(entry).await
-    }
-
-    /// Declare (or replace) a Pending Session rooted at an explicit
-    /// `directory` (ADR-0041) — the shape `/dir`, its card pick and the other
-    /// explicit-directory forms share. Returns the declared pending, whose
-    /// directory the confirmation names. Replacing a topic's pending keeps its
-    /// `topic_root`/`topic_anchor` (ADR-0023): they are properties of the
-    /// Feishu topic, not of the abandoned directory intent, so a corrected
-    /// pending still routes fallback cards into the topic and still suppresses
-    /// the topic's own creation messages from Quoted Context.
-    pub(crate) async fn declare_pending(
-        &self,
-        thread_key: &ThreadKey,
-        directory: impl Into<String>,
-        title: Option<String>,
-    ) -> crate::error::Result<PendingEntry> {
-        self.sessions_handle()
-            .declare_pending(thread_key, directory, title)
-            .await
-    }
-
-    /// Declare (or replace) the conversation's Pending Session in its current
-    /// project (ADR-0041) — the shape `/new` and the switch card's 新建 share.
-    /// Returns the declared pending, whose directory the confirmation names.
-    pub(crate) async fn declare_pending_in_current_project(
-        &self,
-        thread_key: &ThreadKey,
-        title: Option<String>,
-    ) -> crate::error::Result<PendingEntry> {
-        self.command_handles()
-            .declare_pending_in_current_project(thread_key, title)
-            .await
     }
 
     /// The settings the conversation's next prompt will use (ADR-0041): the

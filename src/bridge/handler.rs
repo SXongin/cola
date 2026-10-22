@@ -36,6 +36,17 @@ const GROUP_LOBBY_GUIDANCE: &str = "\
 /// line so an oversize attachment is reported instead of sent.
 const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
+/// How long a card callback waits for a `sessions.json` write before it answers
+/// anyway (ADR-0089). Feishu drops a callback it has not heard from within 3 s
+/// and cola answers at `CARD_ACK_BUDGET`; the margin left here is for the
+/// card's other work and the response itself, which must not be raced.
+const CARD_STORE_BUDGET: std::time::Duration =
+    crate::feishu::ws::CARD_ACK_BUDGET.saturating_sub(std::time::Duration::from_millis(600));
+
+/// The toast for a card callback that found its store lock still held at
+/// `CARD_STORE_BUDGET`: nothing was mutated, so no pending was declared.
+const CARD_STORE_TIMEOUT: &str = "⚠️ 处理超时，请重新点选（未做任何更改）";
+
 /// One inbound attachment cola could not attach, with the reason to show
 /// (ADR-0076's inbound amendment: nothing is dropped silently).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,6 +585,18 @@ pub(crate) struct BrowseState {
     notice: Option<String>,
 }
 
+impl BrowseState {
+    /// The state a failed scan reports: the card still renders, saying why.
+    fn unavailable() -> Self {
+        Self {
+            dir: String::new(),
+            children: Vec::new(),
+            show_filter: false,
+            notice: Some("目录不可用".to_string()),
+        }
+    }
+}
+
 /// How many directory entries one browse render will `stat`. A pathological
 /// directory (tens of thousands of children on a slow filesystem) must not
 /// outrun the card callback's budget — the WS layer drops a late card result
@@ -596,12 +619,7 @@ fn browse_dir_state(view: BrowseView<'_>) -> BrowseState {
     let keyword = view.keyword;
     let show_hidden = view.show_hidden;
     let Some(mut dir) = resolve_browse_path(view.dir) else {
-        return BrowseState {
-            dir: String::new(),
-            children: Vec::new(),
-            show_filter: false,
-            notice: Some("目录不可用".to_string()),
-        };
+        return BrowseState::unavailable();
     };
     let mut notice = None;
     if !dir.is_dir() {
@@ -769,7 +787,25 @@ pub(crate) async fn build_dir_browse_card_for(
     thread_key: &ThreadKey,
     view: BrowseView<'_>,
 ) -> serde_json::Value {
-    let state = browse_dir_state(view);
+    // The directory scan is synchronous filesystem work, and a synchronous scan
+    // cannot be interrupted by a caller's timeout (CODING_STANDARDS.md: a card
+    // callback runs on a deadline). Run it on the blocking pool so a click can
+    // abandon the refresh at its deadline while the scan finishes harmlessly in
+    // the background; the scan itself is capped by `BROWSE_SCAN_CAP` entries.
+    let dir = view.dir.to_string();
+    let keyword = view.keyword.to_string();
+    let page = view.page;
+    let show_hidden = view.show_hidden;
+    let state = tokio::task::spawn_blocking(move || {
+        browse_dir_state(BrowseView {
+            dir: &dir,
+            show_hidden,
+            keyword: &keyword,
+            page,
+        })
+    })
+    .await
+    .unwrap_or_else(|_| BrowseState::unavailable());
     let current_dir = sessions.current_directory(thread_key).await;
     // The card renders the RESOLVED directory (post-resolution/ancestor
     // fallback), not the requested one.
@@ -1277,15 +1313,49 @@ fn reconcile_viewer_page_lane(
 
 /// Declare (or replace) the conversation's Pending Session at `directory` — the
 /// shared tail of the Recent Directories and browse cards' pick/选择 (Lazy
-/// Session Creation, ADR-0041). A persist failure is logged and the caller still
-/// toasts success, parity with the switch card's 新建.
-async fn declare_pending_dir(core: &Arc<SharedCore>, thread_key: &ThreadKey, directory: &str) {
-    if let Err(e) = core
-        .declare_pending(thread_key, directory.to_string(), None)
+/// Session Creation, ADR-0041). Bounded by `deadline`, the callback's own
+/// budget (ADR-0089): the mutation lands in memory at once and only the file
+/// write is waited for.
+///
+/// `Some(toast)` means a pending was declared — the save may still have failed,
+/// which the toast says. `None` means the store lock was still held at
+/// `deadline` (or the deadline passed before the mutation), so nothing changed
+/// and the caller refuses the click instead of refreshing the card.
+async fn declare_pending_dir(
+    core: &Arc<SharedCore>,
+    thread_key: &ThreadKey,
+    directory: &str,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    match core
+        .sessions_handle()
+        .declare_pending_until(thread_key, directory, None, deadline)
         .await
     {
-        tracing::warn!("dir card pick: persist failed: {}", e);
+        Ok(Some(_)) => Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
+        Ok(None) => None,
+        Err(e) => {
+            // The pending IS declared in memory; only the save failed. Say
+            // both halves instead of claiming a clean success.
+            tracing::warn!("dir card pick: persist failed: {}", e);
+            Some(format!(
+                "⚠️ 已切换到 `{directory}`，但保存失败（重启后会丢失）：{e}"
+            ))
+        }
     }
+}
+
+/// The card a click answers with, built under the SAME deadline as its store
+/// write (ADR-0089): a refresh can hit the backend for the session list, and a
+/// card that misses the deadline would hold the click past Feishu's ack budget
+/// — the answer is dropped and the user never sees the confirmation. `None`
+/// means the card could not be built in time; the toast still answers, and the
+/// next render poll repaints.
+async fn card_before(
+    deadline: tokio::time::Instant,
+    build: impl std::future::Future<Output = serde_json::Value>,
+) -> Option<serde_json::Value> {
+    tokio::time::timeout_at(deadline, build).await.ok()
 }
 
 /// Open a NEW topic for `directory`, anchored on the card's own message
@@ -2604,12 +2674,23 @@ impl App {
     /// every line the action and its awaits produce is then retrievable by the
     /// Session it worked on.
     pub async fn handle_card_action(self: &Arc<Self>, value: serde_json::Value) -> Option<CardActionResult> {
+        // ONE deadline for the click, started HERE: the ack budget starts when
+        // Feishu's callback reaches us, so a slow pre-dispatch store read must
+        // spend the same budget the later work is bounded by — a fresh deadline
+        // after it would let a pending commit after the ack was already lost
+        // (ADR-0089).
+        let deadline = tokio::time::Instant::now() + CARD_STORE_BUDGET;
         if let Some(refusal) = self.gate_card_action(&value).await {
             return Some(refusal);
         }
         let action = value.get("action").and_then(|v| v.as_str()).unwrap_or("");
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
-        let (session_id, thread_key) = self.card_action_span_context(&value).await;
+        // The span context may read the store; a click whose context cannot be
+        // resolved in time is still dispatched (the span then carries none).
+        let (session_id, thread_key) =
+            tokio::time::timeout_at(deadline, self.card_action_span_context(&value))
+                .await
+                .unwrap_or((None, None));
         let action_span = span::action(session_id.as_deref(), thread_key.as_ref());
         let dispatch = async {
             // The Turn card's 「🔍 查看完整变化」 carries `op` and NO `action`
@@ -2632,9 +2713,9 @@ impl App {
                 "retry" => self.handle_retry_action(&value).await,
                 "cleanup" => self.handle_cleanup_action(&value).await,
                 "resume" => self.handle_resume_action(&value).await,
-                "switch" => self.handle_switch_card_action(&self.core, &value).await,
+                "switch" => self.handle_switch_card_action(&self.core, &value, deadline).await,
                 "sub" => self.handle_sub_card_action(&self.core, &value).await,
-                "dir" => self.handle_dir_card_action(&self.core, &value).await,
+                "dir" => self.handle_dir_card_action(&self.core, &value, deadline).await,
                 // Different cards carry `action: "file"` (#739, #742, #778): the
                 // viewer's own 「发为文件」/「🌐 预览网页」 button, whose payload
                 // carries `op: "send"` and transfers the file's whole bytes
@@ -2746,6 +2827,7 @@ impl App {
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        deadline: tokio::time::Instant,
     ) -> Option<CardActionResult> {
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
@@ -2883,15 +2965,37 @@ impl App {
                 // declare a Pending Session; the first message materialises it.
                 // The active filter survives (ADR-0052), so the refreshed list
                 // stays on the same keyword/scope/page.
-                if let Err(e) = core.declare_pending_in_current_project(&thread_key, None).await {
-                    tracing::warn!("switch card new: persist failed: {}", e);
-                }
+                //
+                // The declaration and its write ride the click's ONE deadline
+                // (ADR-0089): a click must never commit a pending after Feishu
+                // has stopped listening for its answer.
+                let toast = match core
+                    .command_handles()
+                    .declare_pending_in_current_project_until(&thread_key, None, deadline)
+                    .await
+                {
+                    Ok(Some(_)) => "下一条消息创建会话".to_string(),
+                    // The store lock was still held: nothing changed, so there
+                    // is no refreshed card to show.
+                    Ok(None) => {
+                        return Some(CardActionResult {
+                            card: None,
+                            toast: Some(CARD_STORE_TIMEOUT.to_string()),
+                        });
+                    }
+                    // The pending IS declared in memory; only the save failed.
+                    Err(e) => {
+                        tracing::warn!("switch card new: persist failed: {}", e);
+                        format!("⚠️ 已新建待创建会话，但保存失败（重启后会丢失）：{e}")
+                    }
+                };
                 Some(CardActionResult {
-                    card: Some(
-                        self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
-                            .await,
-                    ),
-                    toast: Some("下一条消息创建会话".to_string()),
+                    card: card_before(
+                        deadline,
+                        self.build_switch_card_for(core, &thread_key, &keyword, scope, page),
+                    )
+                    .await,
+                    toast: Some(toast),
                 })
             }
             "search" => {
@@ -3262,11 +3366,12 @@ impl App {
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        deadline: tokio::time::Instant,
     ) -> Option<CardActionResult> {
         // ADR-0078: the browse card multiplexes through the same `dir` action,
         // distinguished by `view: "browse"`, so one dispatch arm serves both.
         if value.get("view").and_then(|v| v.as_str()) == Some("browse") {
-            return self.handle_dir_browse_action(core, value).await;
+            return self.handle_dir_browse_action(core, value, deadline).await;
         }
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
@@ -3327,18 +3432,36 @@ impl App {
                 // when one exists, else the active session's. The equality rule
                 // is the browse card's own ✅ 当前 rule (`command::same_dir`), so
                 // the two pick surfaces agree on what "current" means.
-                let current_dir = core.sessions.lock().await.current_directory(&thread_key);
+                let current_dir = tokio::time::timeout_at(deadline, core.sessions.lock())
+                    .await
+                    .ok()
+                    .and_then(|store| store.current_directory(&thread_key));
                 if current_dir.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
                     return Some(CardActionResult {
-                        card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
+                        card: card_before(
+                            deadline,
+                            self.build_dir_card_for(core, &thread_key, &keyword, page),
+                        )
+                        .await,
                         toast: Some("已在当前目录".to_string()),
                     });
                 }
-                declare_pending_dir(core, &thread_key, &directory).await;
-                Some(CardActionResult {
-                    card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
-                    toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
-                })
+                Some(
+                    match declare_pending_dir(core, &thread_key, &directory, deadline).await {
+                        Some(toast) => CardActionResult {
+                            card: card_before(
+                                deadline,
+                                self.build_dir_card_for(core, &thread_key, &keyword, page),
+                            )
+                            .await,
+                            toast: Some(toast),
+                        },
+                        None => CardActionResult {
+                            card: None,
+                            toast: Some(CARD_STORE_TIMEOUT.to_string()),
+                        },
+                    },
+                )
             }
             "topic" => {
                 // A topic can only be created from a non-topic message
@@ -3412,6 +3535,7 @@ impl App {
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        deadline: tokio::time::Instant,
     ) -> Option<CardActionResult> {
         let op = value.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let thread_key = thread_key_from_value(value);
@@ -3502,7 +3626,7 @@ impl App {
                 ),
                 toast: None,
             }),
-            "pick" => self.browse_pick(core, &thread_key, base).await,
+            "pick" => self.browse_pick(core, &thread_key, base, deadline).await,
             "topic" => {
                 let Some(directory) = resolve_browse_dir(&target) else {
                     return Some(CardActionResult {
@@ -4295,7 +4419,12 @@ impl App {
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         view: BrowseView<'_>,
+        deadline: tokio::time::Instant,
     ) -> Option<CardActionResult> {
+        // The whole click shares ONE deadline (ADR-0089), started by
+        // `handle_card_action`: the topic guard's read, the current-directory
+        // read, the pending write and the refresh below all ride it, so a click
+        // can never commit a pending after Feishu has stopped listening.
         // ADR-0007: a bound topic owns exactly one session. `/dir` and the
         // `/dir` card are refused there at command entry
         // (`Command::topic_rejection`), but `/cat <directory>` legitimately
@@ -4303,40 +4432,82 @@ impl App {
         // gated — spec #669 story 41). Its 选择/切换到这里 must therefore
         // refuse the same way here, or a click would supersede the topic's
         // session through the pending declaration below.
-        if thread_key.thread_id != thread_key.chat_id
-            && core.sessions.lock().await.get_active(thread_key).is_some()
-        {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some(crate::bridge::command::TOPIC_SELECTION_REJECTION.to_string()),
-            });
+        if thread_key.thread_id != thread_key.chat_id {
+            match tokio::time::timeout_at(deadline, core.sessions.lock()).await {
+                Ok(store) if store.get_active(thread_key).is_some() => {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(crate::bridge::command::TOPIC_SELECTION_REJECTION.to_string()),
+                    });
+                }
+                // A guard that cannot answer in time also refuses: the topic's
+                // one-session rule must not be bypassed by a slow store.
+                Err(_) => {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(CARD_STORE_TIMEOUT.to_string()),
+                    });
+                }
+                Ok(_) => {}
+            }
         }
-        let Some(directory) = resolve_browse_dir(view.dir) else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some(format!("目录不存在：{}", view.dir)),
-            });
+        // Resolving the target is filesystem work (`canonicalize` + `is_dir`),
+        // and a synchronous call blocks the executor thread where no deadline
+        // can reach it — so it runs on the blocking pool, bounded by the click's
+        // deadline. Past that, the click refuses like any other overrun.
+        let target = view.dir.to_string();
+        let resolution = tokio::time::timeout_at(
+            deadline,
+            tokio::task::spawn_blocking(move || resolve_browse_dir(&target)),
+        )
+        .await;
+        let directory = match resolution {
+            Ok(Ok(Some(directory))) => directory,
+            // The scan itself failed (a join error): report the path as
+            // unusable, exactly as an absent directory reads.
+            Ok(Err(_)) | Ok(Ok(None)) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(format!("目录不存在：{}", view.dir)),
+                });
+            }
+            Err(_) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some(CARD_STORE_TIMEOUT.to_string()),
+                });
+            }
         };
         // Pending-first (ADR-0041): 当前 is the pending's directory when one
         // exists, else the active session's. The comparison is the SAME one the
         // card's ✅ 当前 mark uses (`command::same_dir`), so a directory the card
         // marks current is never re-declared by a click.
-        let current_dir = core.sessions.lock().await.current_directory(thread_key);
+        let current_dir = tokio::time::timeout_at(deadline, core.sessions.lock())
+            .await
+            .ok()
+            .and_then(|store| store.current_directory(thread_key));
         let settled = BrowseView {
             dir: &directory,
             ..view
         };
         if current_dir.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
             return Some(CardActionResult {
-                card: Some(self.build_dir_browse_for(core, thread_key, settled).await),
+                card: card_before(deadline, self.build_dir_browse_for(core, thread_key, settled)).await,
                 toast: Some("已在当前目录".to_string()),
             });
         }
-        declare_pending_dir(core, thread_key, &directory).await;
-        Some(CardActionResult {
-            card: Some(self.build_dir_browse_for(core, thread_key, settled).await),
-            toast: Some(format!("下一条消息将在目录 `{directory}` 创建会话")),
-        })
+        Some(
+            match declare_pending_dir(core, thread_key, &directory, deadline).await {
+                Some(toast) => CardActionResult {
+                    card: card_before(deadline, self.build_dir_browse_for(core, thread_key, settled)).await,
+                    toast: Some(toast),
+                },
+                None => CardActionResult {
+                    card: None,
+                    toast: Some(CARD_STORE_TIMEOUT.to_string()),
+                },
+            },
+        )
     }
 
     /// Handle an `/agent` picker-card button: record the per-session override

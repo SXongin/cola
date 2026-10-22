@@ -61,7 +61,10 @@ impl DedupeSet {
 /// within 3 s, and 2 s leaves room for delivery while every legitimate handler
 /// finishes in milliseconds. On expiry the handler keeps running; only its
 /// final card update is forfeited (it must never hold the ack hostage).
-const CARD_ACK_BUDGET: Duration = Duration::from_secs(2);
+///
+/// `pub(crate)` because a callback's own store-write bound is derived from it
+/// (`handler::CARD_STORE_BUDGET`, ADR-0089): the two must not drift apart.
+pub(crate) const CARD_ACK_BUDGET: Duration = Duration::from_secs(2);
 
 /// State the ws platform owns, folded out of the bridge core: event-id dedupe
 /// (Feishu re-delivers at-least-once), cola's own open_id (needed to strip

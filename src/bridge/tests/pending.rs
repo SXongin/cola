@@ -5,6 +5,418 @@ fn key() -> crate::config::ThreadKey {
     crate::config::ThreadKey::new("chat_1".into(), "chat_1".into())
 }
 
+/// ADR-0089: a card callback's declaration is bounded. When the store lock is
+/// still held at the deadline, the declaration mutates NOTHING and says so —
+/// a click must not commit a pending the callback can no longer confirm.
+#[tokio::test]
+async fn declare_pending_until_gives_up_without_mutating_when_the_lock_is_held() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let handle = app.sessions_handle();
+
+    // Hold the store's lock the way a concurrent write path does. Holding it
+    // is the only deterministic way to miss a deadline: `timeout_at` polls its
+    // future first, so a free lock is acquired even past the deadline.
+    let guard = app.sessions.lock().await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+    let declared = handle
+        .declare_pending_until(&key(), "/work/b", None, deadline)
+        .await;
+    assert!(
+        declared.is_ok_and(|pending| pending.is_none()),
+        "the lock outlived the deadline, so nothing was declared"
+    );
+    drop(guard);
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "a timed-out declaration must not mutate the store"
+    );
+}
+
+/// The deadline is hard at the mutation: a deadline that has already passed is
+/// a refusal even when the store lock is FREE — `timeout_at` polls its future
+/// first, so without the check an expired click would still acquire the lock and
+/// mutate, committing a change Feishu has already stopped waiting for.
+#[tokio::test]
+async fn declare_pending_until_refuses_an_expired_deadline() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let handle = app.sessions_handle();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let declared = handle
+        .declare_pending_until(&key(), "/work/b", None, deadline)
+        .await;
+    assert!(
+        declared.is_ok_and(|pending| pending.is_none()),
+        "an expired deadline declares nothing, free lock or not"
+    );
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "a stale click must not mutate the store"
+    );
+}
+
+/// ADR-0089: a card callback stays inside the ack budget when the store's
+/// writer stalls. The click still answers (the mutation is in memory), the file
+/// catches up once the writer is released, and the user is never told a pending
+/// exists that memory does not have.
+#[tokio::test]
+async fn a_stalled_writer_does_not_stall_the_dir_pick_callback() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the app's store has a writer thread");
+    // Hold the writer BEFORE the click, so the click's write is in flight for
+    // the whole callback.
+    pause.hold();
+
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+        }))
+        .await
+        .expect("the click still answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the callback answered inside the ack budget with the write stalled: {elapsed:?}"
+    );
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(
+        toast.contains("/work/b"),
+        "the pending took effect, so the toast says so: {toast:?}"
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .is_some_and(|pending| pending.directory == "/work/b"),
+        "the mutation is in memory before the file"
+    );
+    assert!(!sessions.exists(), "the stalled write has not landed yet");
+
+    // Releasing the writer lands it, in order, after the callback answered.
+    pause.release();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("/work/b")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deferred write landed after the callback"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// ADR-0089's documented price: a write still in flight at the deadline
+/// forfeits its ERROR, never the write — and never the mutation, which is
+/// already in memory. Here the held write then fails on disk; the click has
+/// already answered "declared", so the failure is only logged.
+#[tokio::test]
+async fn a_failure_after_the_deadline_forfeits_the_error_not_the_mutation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    // A directory squatting on the target makes the write fail.
+    std::fs::create_dir(&sessions).unwrap();
+    let handle = app.sessions_handle();
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the app's store has a writer thread");
+    pause.hold();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(60);
+    let declared = handle
+        .declare_pending_until(&key(), "/work/b", None, deadline)
+        .await;
+    assert!(
+        declared.is_ok_and(|pending| pending.is_some()),
+        "the in-flight write is not an error: the mutation already happened"
+    );
+    pause.release();
+    // Let the writer hit the failure; nothing observes it by design.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .is_some_and(|pending| pending.directory == "/work/b"),
+        "the mutation stays in memory for the next blocking write"
+    );
+}
+
+/// A store lock held across the whole click must not produce a late commit:
+/// the deadline starts when the callback arrives, so the pre-dispatch read (the
+/// action span's context) spends the same budget, and the declaration past it
+/// refuses instead of committing after Feishu dropped the ack.
+#[tokio::test]
+async fn a_lock_held_across_the_click_refuses_instead_of_committing_late() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_old", "/work/proj"),
+    )
+    .await;
+
+    // Hold the store past the click's budget from another task, so the click's
+    // own awaits cannot deadlock the test.
+    let store = std::sync::Arc::clone(&app.sessions);
+    let (held, lock_taken) = tokio::sync::oneshot::channel::<()>();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let holder = tokio::spawn(async move {
+        let guard = store.lock().await;
+        let _ = held.send(());
+        let _ = released.await;
+        drop(guard);
+    });
+    lock_taken.await.expect("the holder takes the lock");
+
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "switch",
+            "op": "new",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("the click still answers");
+    let elapsed = started.elapsed();
+    let _ = release.send(());
+    holder.await.expect("the holder releases the lock");
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the click answered inside the ack budget: {elapsed:?}"
+    );
+    let toast = result.toast.unwrap_or_default();
+    assert!(
+        toast.contains("处理超时"),
+        "a click that could not reach the store in time refuses: {toast:?}"
+    );
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "and commits nothing"
+    );
+}
+
+/// The same bound on the browse card's 选择, the second call site of
+/// `declare_pending_dir` — a regression to a blocking write here would not be
+/// caught by the Recent Directories test.
+#[tokio::test]
+async fn a_stalled_writer_does_not_stall_the_browse_pick_callback() {
+    let _wd = test_work_dir();
+    let proj = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the app's store has a writer thread");
+    pause.hold();
+
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "view": "browse",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "dir": proj.path().to_string_lossy(),
+        }))
+        .await
+        .expect("the click still answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the callback answered inside the ack budget with the write stalled: {elapsed:?}"
+    );
+    let expected = std::fs::canonicalize(proj.path()).unwrap();
+    let toast = result.toast.unwrap_or_default();
+    assert!(
+        toast.contains(&expected.to_string_lossy().to_string()),
+        "the pending took effect, so the toast says so: {toast:?}"
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .is_some_and(|pending| pending.directory == expected.to_string_lossy()),
+        "the mutation is in memory before the file"
+    );
+
+    pause.release();
+    let expected = expected.to_string_lossy().to_string();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if saved_pending_dirs(&sessions) == vec![expected.clone()] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deferred write landed after the callback"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The same bound on the `/switch` card's 新建, which declares through
+/// `declare_pending_in_current_project_until` rather than `declare_pending_dir`
+/// — a regression to a blocking write there would not be caught by the `/dir`
+/// test.
+#[tokio::test]
+async fn a_stalled_writer_does_not_stall_the_switch_new_callback() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    // The card's current project needs a session to inherit.
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key(), "ses_old", "/work/proj"),
+    )
+    .await;
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the app's store has a writer thread");
+    pause.hold();
+
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "switch",
+            "op": "new",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("the click still answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the callback answered inside the ack budget with the write stalled: {elapsed:?}"
+    );
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("下一条消息创建会话"),
+        "the pending took effect, so the toast says so"
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .is_some_and(|pending| pending.directory == "/work/proj"),
+        "the mutation is in memory before the file"
+    );
+
+    pause.release();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("/work/proj")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deferred write landed after the callback"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The click's card refresh is bounded by the same deadline as its store write:
+/// a stalled session-list fetch costs the refresh, not the confirmation. The
+/// toast (the answer the user actually reads) still arrives inside the ack
+/// budget, and the pending is declared.
+#[tokio::test]
+async fn a_stalled_refresh_costs_the_card_not_the_confirmation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    // The refresh's session list never answers.
+    backend.hang_session_lists(1);
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    let started = std::time::Instant::now();
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "dir",
+            "op": "pick",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "directory": "/work/b",
+        }))
+        .await
+        .expect("the click still answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the refresh forfeited its card instead of the click's answer: {elapsed:?}"
+    );
+    let toast = result.toast.unwrap_or_default();
+    assert!(
+        toast.contains("/work/b"),
+        "the confirmation is the toast, and it arrived: {toast:?}"
+    );
+    assert!(
+        result.card.is_none(),
+        "a refresh that missed the deadline must not be returned half-built"
+    );
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .is_some_and(|pending| pending.directory == "/work/b"),
+        "the pending is declared"
+    );
+}
+
 /// ADR-0041: `current_project_directory` reads the Pending Session first, even
 /// though `get_active` is `None` for the thread while the pending exists.
 #[tokio::test]
