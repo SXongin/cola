@@ -13,9 +13,9 @@ use std::sync::{Arc, RwLock};
 use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
 use crate::bridge::tasks::TasksHandle;
 
-use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
+use crate::backend::parsing::parse_model;
 use crate::backend::types::{
     AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, ModelInfo, PermissionRequest,
     PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,

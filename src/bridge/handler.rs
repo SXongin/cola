@@ -2486,7 +2486,7 @@ impl App {
             PromptRoute::Supplement => {
                 // Each supplement is its own logical user message: fresh
                 // cola-authored id (ADR-0026), never reused.
-                let cola_msg_id = crate::opencode::parsing::cola_message_id();
+                let cola_msg_id = crate::backend::parsing::cola_message_id();
                 let submitted = match self
                     .opencode
                     .prompt(
@@ -4675,7 +4675,7 @@ impl App {
         // Level 2: a concrete model — record the override (and on a durable
         // generation switch the session's model), carrying or clearing the
         // `/think` variant (ADR-0020), same as the `/model` text form.
-        if crate::opencode::parsing::parse_model(&picked).is_none() {
+        if crate::backend::parsing::parse_model(&picked).is_none() {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),

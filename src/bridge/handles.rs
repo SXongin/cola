@@ -43,7 +43,7 @@ use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
 use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
 use crate::bridge::turn::{CardSession, CollectReason, Turn};
 use crate::config::{ServerStartPolicy, SessionEntry, ThreadKey};
-use crate::{feishu, opencode};
+use crate::feishu;
 
 /// The session map, the session-list cache its write paths invalidate, and the
 /// settings/model resolution the conversation reads.
@@ -190,7 +190,7 @@ impl SessionsHandle {
             .await
             .entry_for_session(session_id)
             .and_then(|e| e.model.as_deref())
-            .and_then(opencode::parsing::parse_model)
+            .and_then(crate::backend::parsing::parse_model)
     }
 
     /// The per-session agent override set by `/agent`.
@@ -492,7 +492,11 @@ impl SessionsHandle {
         }
         // The `/model` mirror. Its variant is the separate `/think` field on
         // the settings, so the model ref is assembled here.
-        if let Some(mut model) = settings.model.as_deref().and_then(opencode::parsing::parse_model) {
+        if let Some(mut model) = settings
+            .model
+            .as_deref()
+            .and_then(crate::backend::parsing::parse_model)
+        {
             model.variant = settings.variant.clone();
             return Some(model);
         }
@@ -648,7 +652,7 @@ impl SessionsHandle {
         model_spec: &str,
     ) -> Option<String> {
         if let Some(v) = variant.clone()
-            && let Some(m) = opencode::parsing::parse_model(model_spec)
+            && let Some(m) = crate::backend::parsing::parse_model(model_spec)
             && let Some(variants) = self.model_variants(backend, &m.provider_id, &m.id).await
             && !variants.iter().any(|x| x == &v)
         {
@@ -673,7 +677,7 @@ impl SessionsHandle {
         variant: &mut Option<String>,
     ) -> crate::error::Result<Option<String>> {
         let cleared = self.clear_variant_for_model(backend, variant, model_spec).await;
-        let model = opencode::parsing::parse_model(model_spec).ok_or_else(|| {
+        let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
             crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
         })?;
         backend

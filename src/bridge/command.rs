@@ -1382,7 +1382,7 @@ pub(crate) async fn handle_command(
             // immediate feedback instead of a silent no-op. On a Pending
             // Session the override is recorded on the pending and lands on the
             // created session at materialisation (ADR-0041).
-            if crate::opencode::parsing::parse_model(&name).is_none() {
+            if crate::backend::parsing::parse_model(&name).is_none() {
                 handles.flow.platform
                         .reply_text(
                             message_id,

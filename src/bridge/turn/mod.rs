@@ -453,7 +453,7 @@ impl Turn {
         // This logical user message keeps ONE id across every attempt of this
         // turn (ADR-0026): a retry carries the previous attempt's id so the
         // server deduplicates; a fresh message generates a new one.
-        let cola_message_id = cola_message_id.unwrap_or_else(crate::opencode::parsing::cola_message_id);
+        let cola_message_id = cola_message_id.unwrap_or_else(crate::backend::parsing::cola_message_id);
         // Serialize prompts per session: if one is already in flight, don't let
         // a second message overwrite its accumulator (the two would race on the
         // same card). Reply with a notice only when we own a fresh message.
@@ -1737,7 +1737,7 @@ impl Turn {
         if let Some(anchor) = anchor.as_ref()
             && let Some(newest_user) = transcript.newest_user()
             && let Some(created) = newest_user.time.map(|time| time.created)
-            && crate::opencode::parsing::is_cola_message_id(newest_user.id.as_str())
+            && crate::backend::parsing::is_cola_message_id(newest_user.id.as_str())
             && created > anchor.created_ms
         {
             // No assistant message after it: either its new Turn has not

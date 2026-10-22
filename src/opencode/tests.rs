@@ -5,7 +5,7 @@
 //! both sides of the exchange (ADR-0031).
 
 use super::client::OpenCodeBackend;
-use super::parsing::parse_model;
+use crate::backend::parsing::parse_model;
 use crate::backend::types::{CreateSessionInput, Location};
 use crate::test_http::{RecordedRequest, TestHttpServer};
 
