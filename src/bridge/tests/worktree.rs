@@ -368,7 +368,10 @@ async fn a_prompt_in_a_removed_worktree_ends_before_dispatch() {
         texts.contains("工作目录已不存在"),
         "the ending names the missing directory: {texts}"
     );
-    assert!(texts.contains(".worktrees/gone"), "{texts}");
+    assert!(
+        texts.contains(".worktrees") && texts.contains("gone"),
+        "the ending names the removed checkout (Windows uses `\\`): {texts}"
+    );
     assert!(
         texts.contains("`/dir") && texts.contains("`/switch"),
         "the ending names both routes out: {texts}"
