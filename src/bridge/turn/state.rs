@@ -5138,8 +5138,10 @@ pub(super) async fn refresh_work_context(cards: &CardsHandle, session_id: &str) 
 /// re-pointed — a card that started after the move, or was already re-pointed
 /// by an earlier pass, is left alone. The capture (directory, project name, git
 /// state) is read outside the cards lock; the second check under the lock keeps
-/// a concurrent update from being overwritten. A directory already gone again
-/// is skipped, leaving the existing capture untouched.
+/// a concurrent update from being overwritten. A target that is already gone
+/// again (a worktree removed between the list read and here) is still the
+/// Session's location: the card moves there with no git facts rather than
+/// keeping the previous checkout's branch and 🌲.
 pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, from: &str, to: &str) {
     let captured = {
         let live = cards.cards.lock().await;
@@ -5148,9 +5150,7 @@ pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, f
     if captured.as_deref() != Some(from) {
         return;
     }
-    let Some(ctx) = capture_followed_context(to).await else {
-        return;
-    };
+    let ctx = followed_context(to).await;
     let mut live = cards.cards.lock().await;
     if let Some(card) = live.get_mut(session_id)
         && card.acc.directory.as_deref() == Some(from)
@@ -5159,16 +5159,24 @@ pub(super) async fn follow_work_context(cards: &CardsHandle, session_id: &str, f
     }
 }
 
-/// The work context for a followed directory (#450). A move the follow detected
-/// but whose path is already gone again (a worktree removed between the list
-/// read and here) yields `None` — the caller keeps the card's existing fields
-/// rather than clearing them.
-async fn capture_followed_context(directory: &str) -> Option<WorkContext> {
-    let metadata = tokio::fs::metadata(directory).await.ok()?;
-    if !metadata.is_dir() {
-        return None;
+/// The work context for a followed directory (#450). A path that no longer
+/// exists still yields a context naming it, with empty git facts: the store
+/// followed the Session there, so the card must not keep pointing at the
+/// pre-move checkout (its branch and 🌲 belong to another path). The next
+/// prompt then answers with #450's gone-directory ending.
+async fn followed_context(directory: &str) -> WorkContext {
+    let usable = tokio::fs::metadata(directory)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false);
+    if usable {
+        return StreamAccumulator::capture_work_context(directory).await;
     }
-    Some(StreamAccumulator::capture_work_context(directory).await)
+    WorkContext {
+        directory: directory.to_string(),
+        project_name: crate::git::project_name(directory),
+        git: crate::git::GitState::default(),
+    }
 }
 
 /// Test seam for #450's follow: capture a live card's work context at
@@ -5182,18 +5190,19 @@ pub(super) async fn seed_work_context(cards: &CardsHandle, session_id: &str, dir
 }
 
 /// Test seam for #450's follow: the card's captured `(directory, branch,
-/// worktree)` triple. The fields are private to this module.
+/// worktree, project name)`. The fields are private to this module.
 #[cfg(test)]
 pub(super) async fn card_work_context(
     cards: &CardsHandle,
     session_id: &str,
-) -> Option<(Option<String>, Option<String>, bool)> {
+) -> Option<(Option<String>, Option<String>, bool, Option<String>)> {
     let live = cards.cards.lock().await;
     live.get(session_id).map(|card| {
         (
             card.acc.directory.clone(),
             card.acc.branch.clone(),
             card.acc.worktree,
+            card.acc.project_name.clone(),
         )
     })
 }

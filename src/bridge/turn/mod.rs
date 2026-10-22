@@ -3548,12 +3548,13 @@ impl Turn {
         state::seed_work_context(cards, session_id, directory).await;
     }
 
-    /// Test seam for #450's follow: the card's `(directory, branch, worktree)`.
+    /// Test seam for #450's follow: the card's `(directory, branch, worktree,
+    /// project name)`.
     #[cfg(test)]
     pub(crate) async fn card_work_context(
         cards: &CardsHandle,
         session_id: &str,
-    ) -> Option<(Option<String>, Option<String>, bool)> {
+    ) -> Option<(Option<String>, Option<String>, bool, Option<String>)> {
         state::card_work_context(cards, session_id).await
     }
 

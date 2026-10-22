@@ -2761,7 +2761,7 @@ async fn a_followed_move_repoints_the_live_card_footer() {
     assert_eq!(
         Turn::card_work_context(&cards, "ses_moved_card")
             .await
-            .map(|(directory, branch, _)| (directory, branch)),
+            .map(|(directory, branch, _, _)| (directory, branch)),
         Some((Some(old.to_string_lossy().to_string()), Some("main".to_string()))),
         "the card starts at the pre-move checkout"
     );
@@ -2786,7 +2786,7 @@ async fn a_followed_move_repoints_the_live_card_footer() {
     loop {
         let followed = Turn::card_work_context(&cards, "ses_moved_card")
             .await
-            .and_then(|(directory, _, _)| directory)
+            .and_then(|(directory, _, _, _)| directory)
             .as_deref()
             == Some(new.to_string_lossy().as_ref());
         if followed {
@@ -2799,7 +2799,7 @@ async fn a_followed_move_repoints_the_live_card_footer() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    let (directory, branch, worktree) = Turn::card_work_context(&cards, "ses_moved_card")
+    let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_card")
         .await
         .expect("the card is still tracked");
     assert_eq!(directory, Some(new.to_string_lossy().to_string()));
@@ -2809,6 +2809,11 @@ async fn a_followed_move_repoints_the_live_card_footer() {
         "the footer shows the new checkout's branch, not the pre-move one"
     );
     assert!(worktree, "and the 🌲 marker is on");
+    assert_eq!(
+        project_name.as_deref(),
+        Some("moved"),
+        "the 📁 segment names the new checkout, not the pre-move project"
+    );
 }
 
 /// #450: a move to a directory that is not a git checkout REPLACES the card's
@@ -2864,7 +2869,7 @@ async fn a_followed_move_to_a_plain_directory_clears_the_old_git_state() {
     loop {
         let followed = Turn::card_work_context(&cards, "ses_moved_plain")
             .await
-            .and_then(|(directory, _, _)| directory)
+            .and_then(|(directory, _, _, _)| directory)
             .as_deref()
             == Some(new.to_string_lossy().as_ref());
         if followed {
@@ -2877,7 +2882,7 @@ async fn a_followed_move_to_a_plain_directory_clears_the_old_git_state() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    let (directory, branch, worktree) = Turn::card_work_context(&cards, "ses_moved_plain")
+    let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_plain")
         .await
         .expect("the card is still tracked");
     assert_eq!(directory, Some(new.to_string_lossy().to_string()));
@@ -2886,6 +2891,91 @@ async fn a_followed_move_to_a_plain_directory_clears_the_old_git_state() {
         "the pre-move checkout's branch must not label a plain directory"
     );
     assert!(!worktree, "and the 🌲 marker is gone");
+    assert_eq!(
+        project_name,
+        new.file_name().map(|name| name.to_string_lossy().into_owned()),
+        "the 📁 segment names the directory the Session moved to"
+    );
+}
+
+/// #450: the Session Sync can report a move to a checkout that is already gone
+/// by the time the card follows (a worktree removed in between). The card still
+/// moves — the store did — and drops the old checkout's branch and 🌲 rather
+/// than keeping facts from a path it no longer shows.
+#[tokio::test]
+async fn a_followed_move_to_a_vanished_target_still_moves_the_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    let old = crate::git::plain_path(std::fs::canonicalize(repo.path()).unwrap());
+    // The target exists in the session list but not on disk: removed between
+    // that read and the follow.
+    let parent = tempfile::tempdir().unwrap();
+    let new = parent.path().join("already-gone");
+    assert!(!new.exists());
+
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.given_sessions(vec![list_session(
+        "ses_moved_gone",
+        "移动到已删除目录",
+        &new.to_string_lossy(),
+        100,
+    )]);
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (app, _platform) = build_app(cfg, mock).await;
+
+    let key = crate::config::ThreadKey::new("oc_gone".into(), "oc_gone".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry::new(key, "ses_moved_gone", old.to_string_lossy()),
+    )
+    .await;
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_moved_gone", Some("om_gone")).await;
+    Turn::seed_work_context(&cards, "ses_moved_gone", &old.to_string_lossy()).await;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_moved_gone".into(), now_ms());
+
+    app.external
+        .poll_interval_ms
+        .store(20, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let followed = Turn::card_work_context(&cards, "ses_moved_gone")
+            .await
+            .and_then(|(directory, _, _, _)| directory)
+            .as_deref()
+            == Some(new.to_string_lossy().as_ref());
+        if followed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the live card must follow the move to {new:?}, even though it is gone"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let (directory, branch, worktree, project_name) = Turn::card_work_context(&cards, "ses_moved_gone")
+        .await
+        .expect("the card is still tracked");
+    assert_eq!(directory, Some(new.to_string_lossy().to_string()));
+    assert_eq!(
+        branch, None,
+        "a vanished target has no branch to show, and the old one must not survive"
+    );
+    assert!(!worktree, "nor the old checkout's 🌲");
+    assert_eq!(project_name.as_deref(), Some("already-gone"));
 }
 
 // ---------------------------------------------------------------------------
