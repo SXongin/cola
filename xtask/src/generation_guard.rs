@@ -24,7 +24,9 @@
 //! root (`/agent`, which collides with cola's own Feishu command) is matched in
 //! URL-call form.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::source_scan;
 
 /// Paths (relative to the scanned root, `/`-separated) exempt from the guard.
 pub(crate) const ALLOWED_PREFIXES: &[&str] = &[
@@ -83,38 +85,17 @@ impl std::fmt::Display for Finding {
     }
 }
 
-/// Scan `root`'s Rust sources recursively.
+/// Scan `root`'s Rust sources with this guard's matcher.
 ///
-/// IO failures are errors, never skipped files: a missing or unreadable `src/`
-/// must fail the command loudly rather than report a clean tree (a guard that
-/// fails open is no guard).
+/// The walk, the repository-relative paths and the loud IO errors are shared
+/// with the other source guards ([`source_scan`]); only the matching is this
+/// guard's own.
 pub(crate) fn scan_tree(root: &Path) -> Result<Vec<Finding>, String> {
-    let mut files = Vec::new();
-    collect_rust_files(root, &mut files)?;
-    files.sort();
     let mut findings = Vec::new();
-    for file in files {
-        let content = std::fs::read_to_string(&file)
-            .map_err(|e| format!("error: cannot read scan candidate {}: {e}", file.display()))?;
-        let relative = file
-            .strip_prefix(root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
-        // Paths are reported relative to the scanned root's parent so the
-        // allow-list reads as a repository path (`src/opencode/v1/`).
-        let path = format!("{}/{}", root_name(root), relative);
-        findings.extend(scan_source(&path, &content));
+    for file in source_scan::read_sources(root, "generation-guard")? {
+        findings.extend(scan_source(&file.path, &file.content));
     }
     Ok(findings)
-}
-
-/// The directory name of the scanned root (`src`), used to build the
-/// repository-relative path the allow-list matches.
-fn root_name(root: &Path) -> String {
-    root.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
 }
 
 /// Scan one file's content. `path` is the repository-relative path
@@ -138,25 +119,6 @@ pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
         }
     }
     findings
-}
-
-fn collect_rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir).map_err(|e| {
-        format!(
-            "error: cannot scan generation-guard directory {}: {e}",
-            dir.display()
-        )
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("error: cannot read an entry of {}: {e}", dir.display()))?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rust_files(&path, files)?;
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-    Ok(())
 }
 
 /// `cargo xtask check-generation`: fail when a V1 wire literal escaped the V1

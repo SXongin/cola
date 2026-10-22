@@ -6,6 +6,7 @@ mod codex_gate;
 mod doc_drift;
 mod generation_guard;
 mod release;
+mod source_scan;
 
 fn main() {
     let task = std::env::args().nth(1).unwrap_or_else(|| {
