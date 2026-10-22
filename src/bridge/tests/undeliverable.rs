@@ -10,19 +10,19 @@ use std::sync::Arc;
 use crate::bridge::test_support::*;
 
 /// A one-field form, the shape an MCP elicitation lists.
-fn question(id: &str, session_id: &str) -> crate::opencode::types::QuestionRequest {
-    crate::opencode::types::QuestionRequest {
+fn question(id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    crate::backend::types::QuestionRequest {
         id: id.into(),
         session_id: session_id.into(),
-        questions: vec![crate::opencode::types::QuestionInfo {
+        questions: vec![crate::backend::types::QuestionInfo {
             question: "继续吗？".into(),
             header: "下一步".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "继续".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }],
@@ -32,8 +32,8 @@ fn question(id: &str, session_id: &str) -> crate::opencode::types::QuestionReque
 
 /// A permission whose session id is absent (V1 leaves it optional; the neutral
 /// type maps absence to "").
-fn permission_without_session(request_id: &str) -> crate::opencode::types::PermissionRequest {
-    crate::opencode::types::PermissionRequest {
+fn permission_without_session(request_id: &str) -> crate::backend::types::PermissionRequest {
+    crate::backend::types::PermissionRequest {
         request_id: request_id.into(),
         session_id: None,
         permission: Some("bash".into()),

@@ -132,7 +132,7 @@ fn picker_card(
 /// session should run as.
 pub fn build_agent_card(
     thread_key: &crate::config::ThreadKey,
-    agents: &[crate::opencode::types::AgentInfo],
+    agents: &[crate::backend::types::AgentInfo],
     override_agent: Option<&str>,
     default_agent: Option<&str>,
 ) -> serde_json::Value {
@@ -185,7 +185,7 @@ pub fn build_agent_card(
 /// so the user can see what a pick would replace.
 pub fn build_model_provider_cards(
     thread_key: &crate::config::ThreadKey,
-    providers: &[crate::opencode::types::ProviderModels],
+    providers: &[crate::backend::types::ProviderModels],
     current: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let options: Vec<(String, String)> = providers
@@ -238,7 +238,7 @@ fn current_model_line(current: Option<&str>) -> String {
 pub fn build_model_picker_cards(
     thread_key: &crate::config::ThreadKey,
     provider: &str,
-    models: &[crate::opencode::types::ModelOption],
+    models: &[crate::backend::types::ModelOption],
 ) -> Vec<serde_json::Value> {
     // The provider is already chosen (step 1), so the button LABEL shows just
     // the model name — a `provider/model` label truncates in Feishu's button
@@ -617,10 +617,10 @@ mod tests {
     fn provider_cards_chunk_without_exceeding_feishu_limits() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         // A shared server advertising hundreds of providers.
-        let providers: Vec<crate::opencode::types::ProviderModels> = (0..212)
-            .map(|p| crate::opencode::types::ProviderModels {
+        let providers: Vec<crate::backend::types::ProviderModels> = (0..212)
+            .map(|p| crate::backend::types::ProviderModels {
                 provider: format!("provider-{p}"),
-                models: vec![crate::opencode::types::ModelOption {
+                models: vec![crate::backend::types::ModelOption {
                     id: "m".into(),
                     variants: Vec::new(),
                 }],
@@ -650,8 +650,8 @@ mod tests {
     #[test]
     fn model_picker_chunks_and_has_back_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let models: Vec<crate::opencode::types::ModelOption> = (0..400)
-            .map(|i| crate::opencode::types::ModelOption {
+        let models: Vec<crate::backend::types::ModelOption> = (0..400)
+            .map(|i| crate::backend::types::ModelOption {
                 id: format!("model-{i}"),
                 variants: Vec::new(),
             })
@@ -745,19 +745,19 @@ mod tests {
     fn agent_card_lists_current_and_clear_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let agents = vec![
-            crate::opencode::types::AgentInfo {
+            crate::backend::types::AgentInfo {
                 name: "default".into(),
                 description: None,
                 mode: Some("primary".into()),
                 hidden: Some(false),
             },
-            crate::opencode::types::AgentInfo {
+            crate::backend::types::AgentInfo {
                 name: "build".into(),
                 description: None,
                 mode: Some("primary".into()),
                 hidden: Some(true),
             },
-            crate::opencode::types::AgentInfo {
+            crate::backend::types::AgentInfo {
                 name: "explore".into(),
                 description: None,
                 mode: Some("subagent".into()),
@@ -812,13 +812,13 @@ mod tests {
     fn agent_card_degrades_when_every_agent_is_filtered() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let agents = vec![
-            crate::opencode::types::AgentInfo {
+            crate::backend::types::AgentInfo {
                 name: "explore".into(),
                 description: None,
                 mode: Some("subagent".into()),
                 hidden: Some(false),
             },
-            crate::opencode::types::AgentInfo {
+            crate::backend::types::AgentInfo {
                 name: "hidden-primary".into(),
                 description: None,
                 mode: Some("primary".into()),

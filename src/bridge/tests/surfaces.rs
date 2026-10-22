@@ -11,8 +11,8 @@ use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
 /// A two-question request the question flow can replay and reply to.
-fn question_request(request_id: &str, session_id: &str) -> crate::opencode::types::QuestionRequest {
-    use crate::opencode::types::{QuestionInfo, QuestionOption, QuestionRequest};
+fn question_request(request_id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    use crate::backend::types::{QuestionInfo, QuestionOption, QuestionRequest};
     let question = |text: &str, header: &str, label: &str| QuestionInfo {
         question: text.into(),
         header: header.into(),
@@ -21,7 +21,7 @@ fn question_request(request_id: &str, session_id: &str) -> crate::opencode::type
             description: String::new(),
             ..Default::default()
         }],
-        kind: crate::opencode::types::FormFieldKind::String,
+        kind: crate::backend::types::FormFieldKind::String,
         custom: None,
         ..Default::default()
     };
@@ -523,7 +523,7 @@ async fn restart_reconciles_an_inline_block_resolved_while_down() {
     // The restarted process finds the request already resolved while the run
     // is still live (another client answered it).
     let (app, platform, _backend) = restart_app(&session_file, |backend| {
-        backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+        backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     })
     .await;
     sweep(&app.permission, &app).await;
@@ -578,7 +578,7 @@ async fn restart_marks_a_standalone_card_stale_when_resolved_while_down() {
     // Resolved while cola was down by another client, and the run is still
     // live: the neutral copy.
     let (app, platform, _backend) = restart_app(&session_file, |backend| {
-        backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+        backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     })
     .await;
     sweep(&app.permission, &app).await;

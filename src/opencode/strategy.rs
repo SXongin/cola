@@ -22,7 +22,7 @@ use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, T
 use crate::error::Result;
 
 use super::transport::Transport;
-use super::types::{
+use crate::backend::types::{
     AgentInfo, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels, QuestionRequest,
     SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };

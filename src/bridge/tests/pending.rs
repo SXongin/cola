@@ -1200,7 +1200,7 @@ async fn settings_commands_write_the_pending_and_materialise() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("test", &["high"])],
     }]);
@@ -1276,11 +1276,11 @@ async fn model_switch_on_a_pending_clears_an_undeclared_variant() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_models(vec![
-        crate::opencode::types::ProviderModels {
+        crate::backend::types::ProviderModels {
             provider: "p".into(),
             models: vec![model_option("test", &["low", "high"])],
         },
-        crate::opencode::types::ProviderModels {
+        crate::backend::types::ProviderModels {
             provider: "q".into(),
             models: vec![model_option("other", &[])],
         },
@@ -1332,7 +1332,7 @@ async fn think_on_a_pending_validates_against_the_pending_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("test", &["low", "high"])],
     }]);
@@ -1390,11 +1390,11 @@ async fn settings_cards_render_and_configure_a_pending() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("test", &["low", "high"])],
     }]);
-    backend.with_agents(vec![crate::opencode::types::AgentInfo {
+    backend.with_agents(vec![crate::backend::types::AgentInfo {
         name: "build".into(),
         description: None,
         mode: Some("primary".into()),
@@ -1559,7 +1559,7 @@ async fn switch_forget_clears_the_pending_too() {
 /// per-prompt fields (V1's switches are no-ops; its prompt still carries them).
 #[tokio::test]
 async fn pending_picks_are_switched_when_the_session_materialises() {
-    use crate::opencode::types::ModelInfo;
+    use crate::backend::types::ModelInfo;
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
@@ -1617,7 +1617,7 @@ async fn pending_variant_is_cleared_when_the_model_does_not_declare_it() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("plain", &[])],
     }]);
@@ -1662,11 +1662,11 @@ async fn variant_only_pending_switches_the_creates_recorded_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("plain", &["high"])],
     }]);
-    backend.with_session_model(crate::opencode::types::SessionModel {
+    backend.with_session_model(crate::backend::types::SessionModel {
         provider_id: "p".into(),
         id: "plain".into(),
     });

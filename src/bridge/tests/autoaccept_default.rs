@@ -26,7 +26,7 @@ async fn configured_default_marks_a_fresh_session_and_answers_permissions() {
     let mut cfg = test_config(&dir.path().join("sessions.json"));
     cfg.bridge.default_auto_accept = true;
     let mut mock = MockBackend::new(realistic_parts());
-    mock.ask_permissions(vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_default".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),

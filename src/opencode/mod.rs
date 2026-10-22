@@ -25,11 +25,15 @@ pub(crate) mod strategy;
 #[cfg(test)]
 mod tests;
 pub(crate) mod transport;
-pub mod types;
 pub(crate) mod v1;
 pub(crate) mod v2;
 #[cfg(test)]
 mod wire;
+
+// The shared DTOs are the contract's own vocabulary and live at
+// [`crate::backend::types`] (spec #860, #870). This re-export keeps the old
+// path compiling for one release; new code imports the contract module.
+pub use crate::backend::types;
 
 use std::sync::Arc;
 

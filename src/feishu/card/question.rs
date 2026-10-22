@@ -65,7 +65,7 @@ pub fn build_permission_card(
 /// question's header (or a clipped question text), joined, clipped to stay a
 /// residue (ADR-0038, rule 4). Shared by the inline block's receipt and the
 /// standalone-card path that names the same request.
-pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]) -> String {
+pub(crate) fn question_target(questions: &[crate::backend::types::QuestionInfo]) -> String {
     super::truncate_md(
         &questions
             .iter()
@@ -83,7 +83,7 @@ pub(crate) fn question_target(questions: &[crate::opencode::types::QuestionInfo]
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.
-pub fn question_summary(questions: &[crate::opencode::types::QuestionInfo]) -> String {
+pub fn question_summary(questions: &[crate::backend::types::QuestionInfo]) -> String {
     let mut s = String::new();
     for (i, q) in questions.iter().enumerate() {
         s.push_str(&format!("{}. {}\n", i + 1, q.question));
@@ -117,12 +117,12 @@ pub fn question_summary(questions: &[crate::opencode::types::QuestionInfo]) -> S
 pub fn question_elements(
     request_id: &str,
     session_id: &str,
-    questions: &[crate::opencode::types::QuestionInfo],
+    questions: &[crate::backend::types::QuestionInfo],
     directory: &str,
     answered: &[Option<Vec<String>>],
     done: &[bool],
 ) -> Vec<serde_json::Value> {
-    use crate::opencode::types::FormFieldKind;
+    use crate::backend::types::FormFieldKind;
 
     let is_done = |i: usize| -> bool { done.get(i).copied().unwrap_or(false) };
     let selected = |i: usize| -> Option<&Vec<String>> { answered.get(i).and_then(|slot| slot.as_ref()) };
@@ -493,7 +493,7 @@ pub fn build_question_card(
     title: &str,
     request_id: &str,
     session_id: &str,
-    questions: &[crate::opencode::types::QuestionInfo],
+    questions: &[crate::backend::types::QuestionInfo],
     directory: &str,
     answered: &[Option<Vec<String>>],
     done: &[bool],
@@ -513,22 +513,22 @@ mod tests {
 
     #[test]
     fn question_card_has_option_buttons_with_answer_payload() {
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "选择要在哪个目录继续".into(),
             header: "目录".into(),
             options: vec![
-                crate::opencode::types::QuestionOption {
+                crate::backend::types::QuestionOption {
                     label: "/a".into(),
                     description: "dir a".into(),
                     ..Default::default()
                 },
-                crate::opencode::types::QuestionOption {
+                crate::backend::types::QuestionOption {
                     label: "/b".into(),
                     description: String::new(),
                     ..Default::default()
                 },
             ],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }];
@@ -570,19 +570,19 @@ mod tests {
 
     /// A single-select question with 5 options — past `MAX_VISIBLE_OPTIONS`,
     /// so its controls take the `overflow` path rather than raw buttons.
-    fn many_option_question() -> crate::opencode::types::QuestionInfo {
+    fn many_option_question() -> crate::backend::types::QuestionInfo {
         let options = (0..5)
-            .map(|i| crate::opencode::types::QuestionOption {
+            .map(|i| crate::backend::types::QuestionOption {
                 label: format!("/a{}", i),
                 description: String::new(),
                 ..Default::default()
             })
             .collect();
-        crate::opencode::types::QuestionInfo {
+        crate::backend::types::QuestionInfo {
             question: "选一个目录".into(),
             header: "目录".into(),
             options,
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }
@@ -658,15 +658,15 @@ mod tests {
 
     #[test]
     fn question_card_custom_answer_form_added_when_custom_allowed() {
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "q".into(),
             header: "h".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None, // default: custom answers allowed,
             ..Default::default()
         }];
@@ -699,15 +699,15 @@ mod tests {
 
     #[test]
     fn question_card_custom_disabled_has_no_input_form() {
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "q".into(),
             header: "h".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: Some(false),
             ..Default::default()
         }];
@@ -730,15 +730,15 @@ mod tests {
 
     #[test]
     fn multi_select_question_gets_confirm_button_and_custom_form() {
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "选择水果".into(),
             header: "水果".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "苹果".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::Multiselect,
+            kind: crate::backend::types::FormFieldKind::Multiselect,
             custom: None,
             ..Default::default()
         }];
@@ -779,15 +779,15 @@ mod tests {
 
     #[test]
     fn multi_select_custom_answers_render_as_removable_buttons() {
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "选择水果".into(),
             header: "水果".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "苹果".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::Multiselect,
+            kind: crate::backend::types::FormFieldKind::Multiselect,
             custom: None,
             ..Default::default()
         }];
@@ -843,15 +843,15 @@ mod tests {
         // Defensive: a single-select custom answer replaces and finalizes on
         // submit, so a non-option label never gets a removable chip (the chip
         // path is multi-only). Rendered with done=false to exercise the guard.
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "选择目录".into(),
             header: "目录".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }];
@@ -877,15 +877,15 @@ mod tests {
 
     #[test]
     fn question_card_done_multi_select_collapses_to_selection_line() {
-        let questions = vec![crate::opencode::types::QuestionInfo {
+        let questions = vec![crate::backend::types::QuestionInfo {
             question: "选择水果".into(),
             header: "水果".into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "苹果".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::Multiselect,
+            kind: crate::backend::types::FormFieldKind::Multiselect,
             custom: None,
             ..Default::default()
         }];
@@ -920,18 +920,18 @@ mod tests {
 
     #[test]
     fn multi_question_card_groups_by_header_with_dividers() {
-        let mk = |q: &str, h: &str, multi: bool| crate::opencode::types::QuestionInfo {
+        let mk = |q: &str, h: &str, multi: bool| crate::backend::types::QuestionInfo {
             question: q.into(),
             header: h.into(),
-            options: vec![crate::opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "选项".into(),
                 description: String::new(),
                 ..Default::default()
             }],
             kind: if multi {
-                crate::opencode::types::FormFieldKind::Multiselect
+                crate::backend::types::FormFieldKind::Multiselect
             } else {
-                crate::opencode::types::FormFieldKind::String
+                crate::backend::types::FormFieldKind::String
             },
             custom: None,
             ..Default::default()
@@ -1032,7 +1032,7 @@ mod tests {
     /// button.
     #[test]
     fn form_card_renders_typed_fields() {
-        use crate::opencode::types::{FormFieldKind, QuestionInfo, QuestionOption};
+        use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionOption};
         let string_field = QuestionInfo {
             key: "q0".into(),
             question: "选哪个目录？".into(),
@@ -1132,7 +1132,7 @@ mod tests {
     /// collapsed but is carried verbatim in the click payload.
     #[test]
     fn form_card_maps_values_to_labels_and_keeps_custom_verbatim() {
-        use crate::opencode::types::{FormFieldKind, QuestionInfo, QuestionOption};
+        use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionOption};
         let field = QuestionInfo {
             key: "q0".into(),
             question: "选水果".into(),

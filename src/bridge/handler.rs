@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::types::{PromptFile, SessionStatus};
 use crate::backend::{PromptSkill, SkillInfo, TaskRetirementEnding};
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
@@ -15,7 +16,6 @@ use crate::bridge::{OmitReason, OmittedAttachment};
 use crate::config::{Config, ConversationKind, ThreadKey};
 use crate::feishu;
 use crate::feishu::card::session::BrowseView;
-use crate::opencode::types::{PromptFile, SessionStatus};
 
 /// Shown once when the first top-level message in a group auto-creates the
 /// group's lobby session.
@@ -3208,7 +3208,7 @@ impl App {
         &self,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
-        target: &crate::opencode::types::SessionListInfo,
+        target: &crate::backend::types::SessionListInfo,
         open_message_id: Option<String>,
         back: Option<&crate::feishu::card::session::BackToList>,
     ) -> CardActionResult {
@@ -3307,7 +3307,7 @@ impl App {
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
-        target: &crate::opencode::types::SessionListInfo,
+        target: &crate::backend::types::SessionListInfo,
         open_message_id: &str,
         keyword: &str,
         scope: crate::feishu::card::session::SwitchScope,
@@ -4662,7 +4662,7 @@ impl App {
                     current.as_deref(),
                 )
             } else {
-                let models: Vec<crate::opencode::types::ModelOption> = providers
+                let models: Vec<crate::backend::types::ModelOption> = providers
                     .iter()
                     .find(|p| p.provider == picked)
                     .map(|p| p.models.clone())

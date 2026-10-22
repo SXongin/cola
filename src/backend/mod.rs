@@ -5,14 +5,14 @@
 //! typed parts — instead of backend wire JSON. Backend protocol field names
 //! for that read live only in the adapter's private decoders, so a protocol
 //! change is an adapter change, not a Bridge-and-card change. The public
-//! session/permission/provider/agent DTOs in [`crate::opencode::types`] are
+//! session/permission/provider/agent DTOs in [`crate::backend::types`] are
 //! the known out-of-scope exception (spec #332): they still spell the
 //! list/read wire fields, and the session list's raw `model` payload is
 //! normalized where it is displayed (`bridge::display::model_display`).
 //!
 //! Every caller imports these traits from here, never from the adapter; the
-//! HTTP adapter ([`crate::opencode::client::OpenCodeBackend`]) and the test mock
-//! implement them.
+//! OpenCode HTTP adapter and the test mock implement them. The DTOs the trait
+//! speaks live in [`types`], beside it (spec #860, #870).
 
 // #801 (the turn card's button) and #803 (repository review) are this
 // generator's consumers; until one lands, nothing in the binary names it and a
@@ -22,6 +22,7 @@ pub mod diff_html;
 pub mod file_content;
 pub mod transcript;
 pub mod turn_diff;
+pub mod types;
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
@@ -38,7 +39,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::opencode::types::{
+
+use types::{
     AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
     QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
@@ -99,8 +101,8 @@ pub trait DirectoryBackend: Send + Sync {
 
 /// The single concrete [`DirectoryBackend`]: wraps any [`Backend`] and forwards
 /// the carried directory into its directory-scoped methods. Both the real
-/// [`OpenCodeBackend`](crate::opencode::client::OpenCodeBackend) and test mocks produce this via
-/// [`Backend::for_directory`], so the directory-scoped seam is implemented once.
+/// OpenCode adapter and test mocks produce this via [`Backend::for_directory`],
+/// so the directory-scoped seam is implemented once.
 pub struct BackendDirectory {
     backend: Arc<dyn Backend>,
     directory: String,
@@ -146,9 +148,9 @@ impl DirectoryBackend for BackendDirectory {
 }
 
 /// The backend, abstracted so tests can drive the bridge with canned responses
-/// instead of a live server. The real implementation is the adapter's
-/// [`OpenCodeBackend`](crate::opencode::client::OpenCodeBackend); mock implementations feed
-/// scripted transcripts/permissions and verify what cola renders from them.
+/// instead of a live server. The real implementation is the OpenCode adapter;
+/// mock implementations feed scripted transcripts/permissions and verify what
+/// cola renders from them.
 #[async_trait]
 pub trait Backend: Send + Sync {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;

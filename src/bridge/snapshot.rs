@@ -20,7 +20,7 @@ pub struct SnapshotData {
     /// The server's run state for the session at activation time. `None` when
     /// the status read failed or returned an unrecognised type — the chip is
     /// omitted rather than guessed (ADR-0028).
-    pub status: Option<opencode::types::SessionStatus>,
+    pub status: Option<crate::backend::types::SessionStatus>,
     /// Whether the Session is in a Waiting turn (ADR-0059) at activation time:
     /// the newest user message's Turn has finished while the read's transcript
     /// still carries live Background Tasks, so the Turn will wake by itself.
@@ -198,12 +198,12 @@ pub(crate) fn re_switch_emit(data: &SnapshotData) -> SnapshotEmit {
 /// suppresses — first-time adoption always emits.
 pub fn should_emit_snapshot(
     already_mapped_to_this_thread: bool,
-    status: Option<opencode::types::SessionStatus>,
+    status: Option<crate::backend::types::SessionStatus>,
     has_pending: bool,
     newest_user_is_cola_authored: bool,
 ) -> bool {
     let suppressed = already_mapped_to_this_thread
-        && status == Some(opencode::types::SessionStatus::Idle)
+        && status == Some(crate::backend::types::SessionStatus::Idle)
         && !has_pending
         && newest_user_is_cola_authored;
     !suppressed
@@ -276,7 +276,7 @@ pub(crate) async fn gather_snapshot(
     // settle decision turns into the ⏳ yield. A running Execution takes the
     // busy arm; a retry, an unread status, or a newer user message whose Turn
     // has not finished is never guessed into a wait.
-    let waiting = status == Some(opencode::types::SessionStatus::Idle)
+    let waiting = status == Some(crate::backend::types::SessionStatus::Idle)
         && newest_user_anchor.as_ref().is_some_and(|anchor| {
             transcript.turn_for_user(anchor).complete
                 && transcript.settle(Some(anchor)) == crate::backend::TurnSettle::Waiting
@@ -310,7 +310,7 @@ pub(crate) async fn gather_snapshot(
 pub(crate) async fn snapshot_card_for(
     handles: &SnapshotHandles,
     verb: &str,
-    info: &crate::opencode::types::SessionListInfo,
+    info: &crate::backend::types::SessionListInfo,
     back: Option<&crate::feishu::card::session::BackToList>,
 ) -> (serde_json::Value, SnapshotData) {
     let thread_key = crate::bridge::span::thread_key_of(&handles.sessions, &info.id).await;
@@ -528,9 +528,9 @@ mod tests {
         // idle + no pending + cola-authored newest (ADR-0028): a first adoption
         // always snapshots, and an unknown status is never treated as idle.
         let statuses = [
-            ("idle", Some(opencode::types::SessionStatus::Idle)),
-            ("busy", Some(opencode::types::SessionStatus::Busy)),
-            ("retry", Some(opencode::types::SessionStatus::Retry)),
+            ("idle", Some(crate::backend::types::SessionStatus::Idle)),
+            ("busy", Some(crate::backend::types::SessionStatus::Busy)),
+            ("retry", Some(crate::backend::types::SessionStatus::Retry)),
             ("unknown", None),
         ];
         for (sname, status) in statuses {
@@ -694,10 +694,10 @@ mod tests {
 
     #[tokio::test]
     async fn gather_filters_pending_to_the_adopted_session_and_reads_status() {
-        use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionRequest};
+        use crate::backend::types::{PermissionRequest, QuestionInfo, QuestionRequest};
 
         let mut mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
-        mock.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Busy));
+        mock.with_session_status("ses_adopted", Some(crate::backend::types::SessionStatus::Busy));
         // A permission and a question for the ADOPTED session, plus one of each
         // for a sibling session in the SAME directory — only the former belong
         // on the snapshot.
@@ -727,7 +727,7 @@ mod tests {
                     question: "继续?".into(),
                     header: "确认".into(),
                     options: vec![],
-                    kind: crate::opencode::types::FormFieldKind::String,
+                    kind: crate::backend::types::FormFieldKind::String,
                     custom: None,
                     ..Default::default()
                 }],
@@ -742,7 +742,7 @@ mod tests {
         ]);
         let snap = gather_from_typed_backend(mock).await;
 
-        assert_eq!(snap.status, Some(opencode::types::SessionStatus::Busy));
+        assert_eq!(snap.status, Some(crate::backend::types::SessionStatus::Busy));
         assert!(snap.has_pending());
         let ids: Vec<_> = snap.pending.iter().map(|p| p.id().to_string()).collect();
         assert_eq!(
@@ -779,7 +779,7 @@ mod tests {
     async fn gather_maps_absent_session_to_idle() {
         let mock = typed_backend(vec![user("msg_u1", 1000, &["你好"])]);
         let snap = gather_from_typed_backend(mock).await;
-        assert_eq!(snap.status, Some(opencode::types::SessionStatus::Idle));
+        assert_eq!(snap.status, Some(crate::backend::types::SessionStatus::Idle));
     }
 
     /// #586: the Waiting fact holds only when the server reads idle AND the
@@ -798,7 +798,7 @@ mod tests {
         assert!(!idle.waiting, "idle with no live task is not waiting");
 
         let mut busy = typed_backend_with_tasks(finished(), vec![background_shell(1100)]);
-        busy.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Busy));
+        busy.with_session_status("ses_adopted", Some(crate::backend::types::SessionStatus::Busy));
         let snap = gather_from_typed_backend(busy).await;
         assert!(
             !snap.waiting,
@@ -806,7 +806,7 @@ mod tests {
         );
 
         let mut retry = typed_backend_with_tasks(finished(), vec![background_shell(1100)]);
-        retry.with_session_status("ses_adopted", Some(opencode::types::SessionStatus::Retry));
+        retry.with_session_status("ses_adopted", Some(crate::backend::types::SessionStatus::Retry));
         let snap = gather_from_typed_backend(retry).await;
         assert!(!snap.waiting, "retry is never guessed into a wait");
 

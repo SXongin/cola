@@ -10,7 +10,7 @@ async fn model_no_arg_sends_picker_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![
             model_option("deepseek-v4-flash", &[]),
@@ -81,11 +81,11 @@ async fn model_card_falls_back_to_the_configured_default_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![model_option("gpt-4o", &[])],
     }]);
-    backend.with_default_model(crate::opencode::types::ModelInfo {
+    backend.with_default_model(crate::backend::types::ModelInfo {
         id: "gpt-4o".into(),
         provider_id: "opencode".into(),
         variant: None,
@@ -140,11 +140,11 @@ async fn model_card_falls_back_to_the_server_recorded_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![model_option("gpt-4o", &[])],
     }]);
-    backend.with_session_model(crate::opencode::types::SessionModel {
+    backend.with_session_model(crate::backend::types::SessionModel {
         provider_id: "opencode".into(),
         id: "gpt-4o".into(),
     });
@@ -199,7 +199,7 @@ async fn model_card_button_records_override() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode".into(),
         models: vec![
             model_option("deepseek-v4-flash", &[]),
@@ -266,11 +266,11 @@ async fn model_picker_back_button_returns_to_providers() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_models(vec![
-        crate::opencode::types::ProviderModels {
+        crate::backend::types::ProviderModels {
             provider: "opencode".into(),
             models: vec![model_option("deepseek-v4-flash", &[])],
         },
-        crate::opencode::types::ProviderModels {
+        crate::backend::types::ProviderModels {
             provider: "openrouter".into(),
             models: vec![model_option("gpt-4o", &[])],
         },
@@ -325,19 +325,19 @@ async fn agent_card_picker_and_button() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_agents(vec![
-        crate::opencode::types::AgentInfo {
+        crate::backend::types::AgentInfo {
             name: "sec-agent".into(),
             description: Some("a subagent".into()),
             mode: Some("subagent".into()),
             hidden: Some(false),
         },
-        crate::opencode::types::AgentInfo {
+        crate::backend::types::AgentInfo {
             name: "build".into(),
             description: Some("build agent".into()),
             mode: Some("primary".into()),
             hidden: Some(false),
         },
-        crate::opencode::types::AgentInfo {
+        crate::backend::types::AgentInfo {
             name: "default".into(),
             description: Some("an agent literally named default".into()),
             mode: Some("primary".into()),
@@ -927,7 +927,7 @@ async fn think_command_rejects_undeclared_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1033,7 +1033,7 @@ async fn think_bare_default_undeclared_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1083,7 +1083,7 @@ async fn think_bare_default_declared_is_stored() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "default"])],
     }]);
@@ -1133,7 +1133,7 @@ async fn think_no_arg_sends_variant_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1199,7 +1199,7 @@ async fn think_card_button_records_variant() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1284,11 +1284,11 @@ async fn model_switch_clears_undeclared_variant() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.with_models(vec![
-        crate::opencode::types::ProviderModels {
+        crate::backend::types::ProviderModels {
             provider: "opencode-go".into(),
             models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
         },
-        crate::opencode::types::ProviderModels {
+        crate::backend::types::ProviderModels {
             provider: "openrouter".into(),
             models: vec![model_option("other-model", &["low"])],
         },
@@ -1360,7 +1360,7 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1633,13 +1633,13 @@ async fn model_override_persists_across_store_reload() {
 /// same switch (ADR-0020).
 #[tokio::test]
 async fn model_pick_switches_the_session_and_carries_the_servers_variant() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![
             model_option("alt-with-variants", &["low", "high"]),
@@ -1727,13 +1727,13 @@ async fn model_pick_switches_the_session_and_carries_the_servers_variant() {
 /// with the variant inside it; `--reset` rewrites it without one.
 #[tokio::test]
 async fn think_pick_rewrites_the_model_ref_with_the_variant() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1817,13 +1817,13 @@ async fn think_pick_rewrites_the_model_ref_with_the_variant() {
 /// current model on a working session.
 #[tokio::test]
 async fn think_card_falls_back_to_the_last_run_model_on_v2() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1894,13 +1894,13 @@ async fn think_card_falls_back_to_the_last_run_model_on_v2() {
 /// "pick a model" refusal.
 #[tokio::test]
 async fn think_pick_uses_the_last_run_model_on_v2() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "opencode-go".into(),
         models: vec![model_option("deepseek-v4-flash", &["low", "high"])],
     }]);
@@ -1961,7 +1961,7 @@ async fn think_pick_uses_the_last_run_model_on_v2() {
 /// explanation, never a hang or a guessed model.
 #[tokio::test]
 async fn think_card_degrades_when_the_last_run_read_fails() {
-    use crate::opencode::types::SessionSelection;
+    use crate::backend::types::SessionSelection;
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
@@ -2007,7 +2007,7 @@ async fn think_card_degrades_when_the_last_run_read_fails() {
 /// reset switches to the server's default agent id (V2 has no unset arm).
 #[tokio::test]
 async fn agent_pick_switches_the_session_and_reset_switches_the_default() {
-    use crate::opencode::types::{AgentInfo, SessionSelection};
+    use crate::backend::types::{AgentInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
@@ -2102,7 +2102,7 @@ async fn agent_pick_switches_the_session_and_reset_switches_the_default() {
 /// land on the session.
 #[tokio::test]
 async fn agent_reset_refuses_when_no_default_agent_resolves() {
-    use crate::opencode::types::SessionSelection;
+    use crate::backend::types::SessionSelection;
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
@@ -2158,7 +2158,7 @@ async fn agent_reset_refuses_when_no_default_agent_resolves() {
 /// they were and the failure is reported.
 #[tokio::test]
 async fn a_failed_session_switch_leaves_the_mirror_untouched() {
-    use crate::opencode::types::SessionSelection;
+    use crate::backend::types::SessionSelection;
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
@@ -2217,13 +2217,13 @@ async fn a_failed_session_switch_leaves_the_mirror_untouched() {
 /// variants, and `/think` rewrites that same ref.
 #[tokio::test]
 async fn the_ladder_reads_the_servers_selection_over_the_local_mirror() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![
             model_option("server-model", &["high"]),
@@ -2318,13 +2318,13 @@ async fn the_ladder_reads_the_servers_selection_over_the_local_mirror() {
 /// mirror, and touches no session.
 #[tokio::test]
 async fn a_failed_durable_read_never_confirms_a_think_pick() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("server-model", &["high"])],
     }]);
@@ -2398,13 +2398,13 @@ async fn a_failed_durable_read_never_confirms_a_think_pick() {
 /// the mirror's.
 #[tokio::test]
 async fn a_failed_durable_read_hides_the_mirror_and_drops_an_unknown_variant() {
-    use crate::opencode::types::{ModelInfo, SessionSelection};
+    use crate::backend::types::{ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![
             model_option("new-model", &["high"]),
@@ -2493,13 +2493,13 @@ async fn a_failed_durable_read_hides_the_mirror_and_drops_an_unknown_variant() {
 /// `high`), and the `/agent` picker's button switches the agent.
 #[tokio::test]
 async fn picker_buttons_switch_the_session_on_a_durable_generation() {
-    use crate::opencode::types::{AgentInfo, ModelInfo, SessionSelection};
+    use crate::backend::types::{AgentInfo, ModelInfo, SessionSelection};
 
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_models(vec![crate::opencode::types::ProviderModels {
+    backend.with_models(vec![crate::backend::types::ProviderModels {
         provider: "p".into(),
         models: vec![model_option("alt-model", &["low", "high"])],
     }]);

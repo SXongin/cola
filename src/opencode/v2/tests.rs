@@ -6,12 +6,12 @@
 //! 204 mutations, the run-state derivation, the admit-then-return prompt, the
 //! session-scoped switches, and the permission/form surface.
 
+use crate::backend::types::{PromptFile, SessionStatus};
 use crate::backend::{ChildEvidence, ChildRuntime, ShellEnd, ShellRuntime, TurnDiff, TurnDiffFile};
 use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
-use crate::opencode::types::{PromptFile, SessionStatus};
 use crate::test_http::{DynamicResponse, MockResponse, RecordedRequest, TestHttpServer};
 
 /// A client pointed at the fake server with both Basic-auth parts set, speaking
@@ -1716,7 +1716,7 @@ async fn session_last_run_model_reads_the_newest_assistant_ref() {
 /// answering 204. A tagged 404 is session-not-found, not a bare proxy 404.
 #[tokio::test]
 async fn switch_model_and_agent_post_the_durable_selection_and_accept_204() {
-    use crate::opencode::types::ModelInfo;
+    use crate::backend::types::ModelInfo;
 
     let server = TestHttpServer::start().await;
     server.route("POST", "/api/session/ses_1/model", 204, "");
@@ -1815,7 +1815,7 @@ async fn list_agents_maps_the_wire_id_to_the_selectable_name() {
     assert_eq!(agents[1].name, "explore");
     assert_eq!(agents[1].mode.as_deref(), Some("subagent"));
     assert_eq!(
-        crate::opencode::types::AgentInfo::default_agent(&agents).as_deref(),
+        crate::backend::types::AgentInfo::default_agent(&agents).as_deref(),
         Some("build"),
         "the server's first primary visible agent is its default"
     );
@@ -2069,15 +2069,15 @@ async fn list_questions_decodes_typed_form_fields_from_the_location_list() {
     assert_eq!(fields[0].question, "选哪个目录？");
     assert!(fields[0].required);
     assert!(fields[0].custom_allowed());
-    assert_eq!(fields[0].kind, crate::opencode::types::FormFieldKind::String);
+    assert_eq!(fields[0].kind, crate::backend::types::FormFieldKind::String);
     // The submitted value and the display label are distinct.
     assert_eq!(fields[0].options[0].answer_value(), "/a");
     assert_eq!(fields[0].options[0].label, "目录 A");
     assert_eq!(fields[0].display_values(&["/a".into()]), vec!["目录 A"]);
     assert!(fields[1].is_multi());
-    assert_eq!(fields[2].kind, crate::opencode::types::FormFieldKind::Boolean);
-    assert_eq!(fields[3].kind, crate::opencode::types::FormFieldKind::Integer);
-    assert_eq!(fields[4].kind, crate::opencode::types::FormFieldKind::External);
+    assert_eq!(fields[2].kind, crate::backend::types::FormFieldKind::Boolean);
+    assert_eq!(fields[3].kind, crate::backend::types::FormFieldKind::Integer);
+    assert_eq!(fields[4].kind, crate::backend::types::FormFieldKind::External);
     assert_eq!(fields[4].url.as_deref(), Some("https://example.com/x"));
 
     let request = last_request(&server);
@@ -2143,7 +2143,7 @@ async fn pending_list_reads_keep_their_body_diagnostics_at_debug() {
 /// "already handled" outcome as a missing one (404).
 #[tokio::test]
 async fn reply_question_posts_the_keyed_typed_answer_object() {
-    use crate::opencode::types::{FormAnswer, FormValue};
+    use crate::backend::types::{FormAnswer, FormValue};
 
     let server = TestHttpServer::start().await;
     server.route("POST", "/api/session/ses_1/form/frm_1/reply", 204, "");

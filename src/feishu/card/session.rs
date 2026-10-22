@@ -329,7 +329,7 @@ pub(super) fn pager_element(
 #[allow(clippy::too_many_arguments)] // card builder: every knob is a first-class card axis
 pub fn build_switch_card(
     thread_key: &crate::config::ThreadKey,
-    sessions: &[crate::opencode::types::SessionListInfo],
+    sessions: &[crate::backend::types::SessionListInfo],
     keyword: &str,
     scope: SwitchScope,
     page: usize,
@@ -486,7 +486,7 @@ pub const CHILD_RUNNING: &str = "⚙️ 运行中";
 pub const CHILD_IDLE: &str = "✅ 空闲";
 
 /// The run-state label for one child's status read; `None` = no report.
-fn child_state_label(status: Option<crate::opencode::types::SessionStatus>) -> Option<&'static str> {
+fn child_state_label(status: Option<crate::backend::types::SessionStatus>) -> Option<&'static str> {
     match status {
         None => None,
         // Anything but Idle is a child still doing work: `is_live` is Busy
@@ -503,8 +503,8 @@ fn child_state_label(status: Option<crate::opencode::types::SessionStatus>) -> O
 /// run-state`, omitting the segments the payload does not carry (an absent
 /// agent, server time, or status read) instead of filling them with a guess.
 fn child_row_text(
-    child: &crate::opencode::types::SessionListInfo,
-    status: Option<crate::opencode::types::SessionStatus>,
+    child: &crate::backend::types::SessionListInfo,
+    status: Option<crate::backend::types::SessionStatus>,
     now_ms: i64,
 ) -> String {
     let mut title = crate::bridge::display::title_or_id_tail(child);
@@ -565,8 +565,8 @@ fn strip_task_agent_suffix(title: &str, agent: &str) -> Option<String> {
 /// the relative last-activity stamps count from.
 pub fn build_child_card(
     thread_key: &crate::config::ThreadKey,
-    children: &[crate::opencode::types::SessionListInfo],
-    statuses: &std::collections::HashMap<String, Option<crate::opencode::types::SessionStatus>>,
+    children: &[crate::backend::types::SessionListInfo],
+    statuses: &std::collections::HashMap<String, Option<crate::backend::types::SessionStatus>>,
     keyword: &str,
     page: usize,
     now_ms: i64,
@@ -644,7 +644,7 @@ pub fn build_child_card(
 #[allow(clippy::too_many_arguments)] // card builder: every knob is a first-class card axis
 pub fn build_force_confirm_card(
     thread_key: &crate::config::ThreadKey,
-    target: &crate::opencode::types::SessionListInfo,
+    target: &crate::backend::types::SessionListInfo,
     owner_name: &str,
     force_op: &str,
     force_label: &str,
@@ -1468,7 +1468,7 @@ mod tests {
     #[test]
     fn switch_card_has_no_schema_v2_unsupported_action_container() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let sessions = vec![crate::opencode::types::SessionListInfo {
+        let sessions = vec![crate::backend::types::SessionListInfo {
             id: "ses_alpha01".into(),
             title: "重写登录".into(),
             directory: "/work/auth".into(),
@@ -1832,10 +1832,10 @@ mod tests {
 
     /// `n` sessions 项目N rooted in `/work/projN`, in display order (most
     /// recently active first) — the builder slices what its caller hands it.
-    fn switch_sessions(n: i64) -> Vec<crate::opencode::types::SessionListInfo> {
+    fn switch_sessions(n: i64) -> Vec<crate::backend::types::SessionListInfo> {
         (1..=n)
             .rev()
-            .map(|i| crate::opencode::types::SessionListInfo {
+            .map(|i| crate::backend::types::SessionListInfo {
                 id: format!("ses_p{i}"),
                 title: format!("项目{i}"),
                 directory: format!("/work/proj{i}"),
@@ -1878,7 +1878,7 @@ mod tests {
     /// Idle reads 空闲, and an unknown/failed read reports nothing.
     #[test]
     fn child_state_label_maps_busy_and_retry_to_running_and_idle_to_idle() {
-        use crate::opencode::types::SessionStatus;
+        use crate::backend::types::SessionStatus;
         assert_eq!(child_state_label(Some(SessionStatus::Busy)), Some(CHILD_RUNNING));
         assert_eq!(child_state_label(Some(SessionStatus::Retry)), Some(CHILD_RUNNING));
         assert_eq!(child_state_label(Some(SessionStatus::Idle)), Some(CHILD_IDLE));
@@ -1892,7 +1892,7 @@ mod tests {
     /// title, and a title that is only the suffix all behave as documented.
     #[test]
     fn child_row_text_strips_the_redundant_task_agent_suffix() {
-        use crate::opencode::types::SessionStatus;
+        use crate::backend::types::SessionStatus;
         let now = 1_700_000_000_000;
 
         // The realistic fixture: title suffix + matching agent.
@@ -1963,11 +1963,11 @@ mod tests {
         let statuses = std::collections::HashMap::from([
             (
                 "ses_child_aa".to_string(),
-                Some(crate::opencode::types::SessionStatus::Busy),
+                Some(crate::backend::types::SessionStatus::Busy),
             ),
             (
                 "ses_child_bb".to_string(),
-                Some(crate::opencode::types::SessionStatus::Retry),
+                Some(crate::backend::types::SessionStatus::Retry),
             ),
         ]);
         let card = build_child_card(&key, &children, &statuses, "", 1, now);
@@ -2147,7 +2147,7 @@ mod tests {
     }
 
     /// `n` children of `ses_root`, newest activity first, each with an agent.
-    fn child_sessions(n: i64, now: i64) -> Vec<crate::opencode::types::SessionListInfo> {
+    fn child_sessions(n: i64, now: i64) -> Vec<crate::backend::types::SessionListInfo> {
         (1..=n)
             .map(|i| {
                 child_session(
@@ -2166,15 +2166,15 @@ mod tests {
         title: &str,
         agent: Option<&str>,
         updated: i64,
-    ) -> crate::opencode::types::SessionListInfo {
-        crate::opencode::types::SessionListInfo {
+    ) -> crate::backend::types::SessionListInfo {
+        crate::backend::types::SessionListInfo {
             id: id.into(),
             title: title.into(),
             directory: "/work/child".into(),
             parent_id: Some("ses_root".into()),
             agent: agent.map(str::to_string),
             model: None,
-            time: Some(crate::opencode::types::SessionTime {
+            time: Some(crate::backend::types::SessionTime {
                 created: updated,
                 updated,
                 archived: None,

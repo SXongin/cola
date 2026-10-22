@@ -32,6 +32,7 @@ use super::drain::{
     assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn,
     user, wait_for_card_text,
 };
+use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ChildEvidence, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, Part,
     SessionTranscript, ShellEnd, ShellRuntime, StepFinish, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
@@ -42,7 +43,6 @@ use crate::bridge::tasks::TaskRunId;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::feishu::card::CardState;
-use crate::opencode::types::SessionStatus;
 
 /// A live Background Task of the `shell` kind: the tool call that started it
 /// and the shell it runs in.

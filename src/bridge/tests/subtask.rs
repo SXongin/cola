@@ -11,7 +11,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
     let child = "ses_child_task";
     let parent = backend.session_id.clone();
     backend.with_session_parent(child, &parent);
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
         permission: Some("bash".into()),
@@ -131,7 +131,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
     let child = "ses_child_task";
     let parent = backend.session_id.clone();
     backend.with_session_parent(child, &parent);
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some(child.into()),
         permission: Some("bash".into()),

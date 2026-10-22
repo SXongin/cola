@@ -20,7 +20,7 @@
 //! on a generation.
 //!
 //! The public session/permission/provider/agent DTOs in
-//! [`crate::opencode::types`] are the known out-of-scope exception (spec
+//! [`crate::backend::types`] are the known out-of-scope exception (spec
 //! #332): they still spell the list/read wire fields, and the session list's
 //! raw `model` payload is normalized where it is displayed
 //! (`crate::bridge::display::model_display`).

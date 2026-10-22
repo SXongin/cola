@@ -6,7 +6,7 @@
 //! resolution. Protocol payload shapes live in the generation strategies (V1
 //! under [`super::v1`]), never in this module.
 
-use super::types::ModelInfo;
+use crate::backend::types::ModelInfo;
 
 /// The id prefix cola assigns to every user message it submits (ADR-0026).
 /// cola picks the message's id (`PromptInput.messageID`) at send time and the

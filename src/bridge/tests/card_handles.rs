@@ -35,8 +35,8 @@ async fn add_question_block(app: &Arc<App>, request_id: &str, session_id: &str, 
 }
 
 /// A two-question request the QUESTION flow can replay and reply to.
-fn question_request(request_id: &str, session_id: &str) -> crate::opencode::types::QuestionRequest {
-    use crate::opencode::types::{QuestionInfo, QuestionOption, QuestionRequest};
+fn question_request(request_id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    use crate::backend::types::{QuestionInfo, QuestionOption, QuestionRequest};
     let question = |text: &str, header: &str, label: &str| QuestionInfo {
         question: text.into(),
         header: header.into(),
@@ -45,7 +45,7 @@ fn question_request(request_id: &str, session_id: &str) -> crate::opencode::type
             description: String::new(),
             ..Default::default()
         }],
-        kind: crate::opencode::types::FormFieldKind::String,
+        kind: crate::backend::types::FormFieldKind::String,
         custom: None,
         ..Default::default()
     };
@@ -275,7 +275,7 @@ async fn sweep_repaints_a_non_current_card_from_its_cache() {
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permission(perm_request("per_old", "ses_old", "ls -la"));
     // The run is still live: another client answered it.
-    backend.with_session_status("ses_old", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_old", Some(crate::backend::types::SessionStatus::Busy));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());

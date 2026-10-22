@@ -1194,7 +1194,7 @@ async fn topic_adopt_rejects_child_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.given_sessions(vec![opencode::types::SessionListInfo {
+    backend.given_sessions(vec![crate::backend::types::SessionListInfo {
         parent_id: Some("ses_parent".into()),
         ..list_session("ses_child09", "Child session - x", "/work/auth", 100)
     }]);

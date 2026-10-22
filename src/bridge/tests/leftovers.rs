@@ -13,19 +13,19 @@
 use crate::bridge::test_support::*;
 
 /// A minimal one-question request for `session_id`.
-fn question_request(id: &str, session_id: &str) -> opencode::types::QuestionRequest {
-    opencode::types::QuestionRequest {
+fn question_request(id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    crate::backend::types::QuestionRequest {
         id: id.into(),
         session_id: session_id.into(),
-        questions: vec![opencode::types::QuestionInfo {
+        questions: vec![crate::backend::types::QuestionInfo {
             question: "选择目录".into(),
             header: "目录".into(),
-            options: vec![opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }],

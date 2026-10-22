@@ -26,7 +26,7 @@ use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
 use super::transport::{REPLY_TIMEOUT, Transport, read_failure, read_failure_quiet};
-use super::types::{
+use crate::backend::types::{
     AgentInfo, FormAnswer, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, PromptFile,
     ProviderModels, QuestionInfo, QuestionOption, QuestionRequest, SessionInfo, SessionListInfo,
     SessionSelection, SessionStatus,
@@ -541,7 +541,7 @@ impl GenerationStrategy for V1Strategy {
                 answer
                     .value
                     .as_ref()
-                    .map_or_else(Vec::new, super::types::FormValue::to_strings)
+                    .map_or_else(Vec::new, crate::backend::types::FormValue::to_strings)
             })
             .collect();
         let body = serde_json::json!({ "answers": positional });

@@ -16,8 +16,8 @@ use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::ThreadKey;
 
-fn permission(request_id: &str, session_id: &str) -> opencode::types::PermissionRequest {
-    opencode::types::PermissionRequest {
+fn permission(request_id: &str, session_id: &str) -> crate::backend::types::PermissionRequest {
+    crate::backend::types::PermissionRequest {
         request_id: request_id.into(),
         session_id: Some(session_id.into()),
         permission: Some("bash".into()),
@@ -27,19 +27,19 @@ fn permission(request_id: &str, session_id: &str) -> opencode::types::Permission
     }
 }
 
-fn question(id: &str, session_id: &str) -> opencode::types::QuestionRequest {
-    opencode::types::QuestionRequest {
+fn question(id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    crate::backend::types::QuestionRequest {
         id: id.into(),
         session_id: session_id.into(),
-        questions: vec![opencode::types::QuestionInfo {
+        questions: vec![crate::backend::types::QuestionInfo {
             question: "继续吗？".into(),
             header: "下一步".into(),
-            options: vec![opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "继续".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }],

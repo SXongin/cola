@@ -68,10 +68,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::time::sleep;
 
+use crate::backend::types::SessionStatus;
 use crate::backend::{ContentBlock, MessageRole, Part, SessionTranscript, ToolStatus};
 use crate::opencode::client::OpenCodeBackend;
 use crate::opencode::strategy::Generation;
-use crate::opencode::types::SessionStatus;
 
 use server::LiveServer;
 
@@ -821,8 +821,8 @@ async fn live_v2_scripted_write_chain() {
 #[tokio::test]
 #[ignore = "live: needs a V2 binary (see the module docs)"]
 async fn live_v2_scripted_selection_chain() {
+    use crate::backend::types::ModelInfo;
     use crate::bridge::handles::{PickOutcome, SessionsHandle};
-    use crate::opencode::types::ModelInfo;
 
     let binary = live_v2_binary();
     let version = server::ensure_v2_binary(&binary).await;
@@ -1040,7 +1040,7 @@ async fn live_v2_scripted_selection_chain() {
     // the server sorts it first in `GET /agent` and the heuristic must return
     // exactly that (not the built-in `build` fallback).
     let agents = backend.list_agents().await;
-    let default = crate::opencode::types::AgentInfo::default_agent(&agents);
+    let default = crate::backend::types::AgentInfo::default_agent(&agents);
     assert_eq!(
         default.as_deref(),
         Some(provider::AGENT),
@@ -1252,7 +1252,7 @@ async fn live_v2_scripted_permission_chain() {
 #[tokio::test]
 #[ignore = "live: needs a V2 binary (see the module docs)"]
 async fn live_v2_scripted_form_chain() {
-    use crate::opencode::types::{FormAnswer, FormFieldKind, FormValue};
+    use crate::backend::types::{FormAnswer, FormFieldKind, FormValue};
     use server::V2Permissions;
 
     let binary = live_v2_binary();
@@ -1786,7 +1786,7 @@ async fn scratch_session(
     backend: &OpenCodeBackend,
     work_dir: &str,
     server: &LiveServer,
-) -> crate::opencode::types::Session {
+) -> crate::backend::types::Session {
     backend
         .create_session(&backend.new_session_input(Some(work_dir)))
         .await
@@ -2094,7 +2094,7 @@ async fn answer_permission(
     directory: &str,
     session_id: &str,
     server: &LiveServer,
-) -> crate::opencode::types::PermissionRequest {
+) -> crate::backend::types::PermissionRequest {
     let what = format!("a permission ask for session {session_id}");
     let permission = poll_until(
         &what,

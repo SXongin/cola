@@ -18,6 +18,7 @@ use super::drain::{
     assistant, ctx, script_transcript, scripted_app, settle_tool, spawn_sync, spawn_sync_with_timeout,
     spawn_turn, tool_assistant, user, wait_for_card_header, wait_for_card_text, wait_for_guard_release,
 };
+use crate::backend::types::{SessionListInfo, SessionStatus};
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageId, MessageRole, MessageTime, Part,
     ReasoningPart, SessionTranscript, StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
@@ -32,7 +33,6 @@ use crate::bridge::test_support::*;
 use crate::bridge::turn::Turn;
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu::card::CardState;
-use crate::opencode::types::{SessionListInfo, SessionStatus};
 
 /// The sidecar path the app's own rule derives from the session file.
 fn sidecar(session_file: &Path) -> PathBuf {

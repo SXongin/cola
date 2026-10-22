@@ -17,7 +17,6 @@ use crate::feishu::card::lang::language_for_path;
 use crate::feishu::card::tool_render::{
     DIFF_MAX_ESCAPED_BYTES, DIFF_TRUNCATION_NOTE, clip_fenced_body, diff_from_metadata, parse_edit_diff,
 };
-use crate::opencode;
 
 use super::delivery::{
     DENIED_PREFIX, HANDLED_ELSEWHERE_PREFIX, Origin, RECEIPT_MAX_CHARS, Residue, ack_inline_card,
@@ -30,8 +29,8 @@ use super::flow::{RequestFlow, session_belongs_to};
 /// whichever backend payload the kind produced — permission or question.
 #[derive(Clone)]
 pub enum PendingRequest {
-    Permission(opencode::types::PermissionRequest),
-    Question(opencode::types::QuestionRequest),
+    Permission(crate::backend::types::PermissionRequest),
+    Question(crate::backend::types::QuestionRequest),
 }
 
 impl PendingRequest {
@@ -742,7 +741,10 @@ fn permission_receipt(target: &str, reply: &str) -> String {
 /// question text) with the answers chosen for it; a skipped slot reads
 /// 未作答. `answers[i]` is the finalized selection for field `i` (`None` =
 /// never answered); option values render as their display labels.
-fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Option<Vec<String>>]) -> String {
+fn question_receipt(
+    questions: &[crate::backend::types::QuestionInfo],
+    answers: &[Option<Vec<String>>],
+) -> String {
     let parts: Vec<String> = questions
         .iter()
         .enumerate()
@@ -774,7 +776,7 @@ fn question_receipt(questions: &[opencode::types::QuestionInfo], answers: &[Opti
 /// no command panel on the parent card; a toggle resolves several at once).
 /// Backticks in a pattern are flattened so the markdown element cannot be
 /// broken by server-provided content.
-pub(crate) fn permission_target(p: &opencode::types::PermissionRequest) -> String {
+pub(crate) fn permission_target(p: &crate::backend::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     let pattern = p
@@ -1142,7 +1144,8 @@ impl RequestKind for QuestionKind {
                                 .await,
                         );
                     };
-                    let answers = opencode::types::build_form_answers(&snapshot.fields, &snapshot.answers);
+                    let answers =
+                        crate::backend::types::build_form_answers(&snapshot.fields, &snapshot.answers);
                     if let Some(r) = settle_question_reply(
                         flow,
                         &handles.cards,
@@ -1284,7 +1287,7 @@ impl RequestKind for QuestionKind {
                             .await,
                     );
                 };
-                let answers = opencode::types::build_form_answers(&snapshot.fields, &snapshot.answers);
+                let answers = crate::backend::types::build_form_answers(&snapshot.fields, &snapshot.answers);
                 if let Some(r) = settle_question_reply(
                     flow,
                     &handles.cards,
@@ -1477,7 +1480,7 @@ async fn reply_question_scoped(
     backend: &Arc<dyn crate::backend::Backend>,
     session_id: &str,
     req_id: &str,
-    answers: Option<&[opencode::types::FormAnswer]>,
+    answers: Option<&[crate::backend::types::FormAnswer]>,
     directory: Option<&str>,
 ) -> crate::error::Result<()> {
     let Some(dir) = directory else {
@@ -1535,7 +1538,7 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by the snapshot card's pending block,
 /// ADR-0028 — the adopt-time block must look and behave like today's cards).
-pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> String {
+pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) -> String {
     let action = p.permission.as_deref().unwrap_or("?");
     let (emoji, label) = describe_action(action);
     let mut s = format!("{} **{}**\n", emoji, label);
@@ -1634,8 +1637,8 @@ pub(crate) fn describe_permission(p: &opencode::types::PermissionRequest) -> Str
 mod tests {
     use super::*;
 
-    fn perm(action: &str, metadata: serde_json::Value) -> crate::opencode::types::PermissionRequest {
-        crate::opencode::types::PermissionRequest {
+    fn perm(action: &str, metadata: serde_json::Value) -> crate::backend::types::PermissionRequest {
+        crate::backend::types::PermissionRequest {
             request_id: "per_1".into(),
             session_id: Some("ses_1".into()),
             permission: Some(action.into()),

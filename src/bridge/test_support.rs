@@ -5,7 +5,6 @@ pub(crate) use std::sync::Arc;
 pub(crate) use crate::bridge::handler::App;
 pub(crate) use crate::bridge::turn::Turn;
 pub(crate) use crate::feishu;
-pub(crate) use crate::opencode;
 
 use crate::backend::{
     BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus, ContentBlock, Execution,
@@ -255,7 +254,7 @@ pub(crate) async fn card_posts(platform: &RecordingPlatform) -> usize {
 type QuestionReplyRecord = (String, Vec<Vec<String>>);
 
 /// A recorded keyed `reply_question` call: (request_id, form answers).
-type KeyedQuestionReply = (String, Vec<opencode::types::FormAnswer>);
+type KeyedQuestionReply = (String, Vec<crate::backend::types::FormAnswer>);
 
 /// One `session_diff` read's arguments, in call order: `(session_id, from,
 /// to, context)` (#801).
@@ -1417,7 +1416,7 @@ pub(crate) type TranscriptReadHook = Box<dyn Fn(usize) + Send + Sync>;
 pub struct MockBackend {
     /// The parts the default assistant turn carries: reasoning → tool → text.
     pub parts: Vec<Part>,
-    pub permissions: Vec<opencode::types::PermissionRequest>,
+    pub permissions: Vec<crate::backend::types::PermissionRequest>,
     /// Number of initial `list_permissions` calls to hang forever — simulates
     /// an in-flight request stuck on a half-open connection while the server
     /// restarts. Each hung call decrements the counter; once it reaches zero
@@ -1506,7 +1505,7 @@ pub struct MockBackend {
     pub reply_question_not_found: bool,
     /// Requests a test adds AFTER the app is built (simulating a request that
     /// arrives after the snapshot was sent, ADR-0028).
-    pub extra_permissions: Arc<tokio::sync::Mutex<Vec<opencode::types::PermissionRequest>>>,
+    pub extra_permissions: Arc<tokio::sync::Mutex<Vec<crate::backend::types::PermissionRequest>>>,
     /// session_id → server title (simulates OpenChamber's session title).
     /// `std::sync::Mutex` for interior mutability: `update_session_title`
     /// writes it through `&self` (the trait requires `&self`).
@@ -1555,7 +1554,7 @@ pub struct MockBackend {
     /// must degrade without failing the whole turn. Armable through `&self`.
     pub fail_transcript_reads: Arc<std::sync::atomic::AtomicUsize>,
     /// Pending questions served by `list_questions`.
-    pub questions: Vec<opencode::types::QuestionRequest>,
+    pub questions: Vec<crate::backend::types::QuestionRequest>,
     /// Records `reply_question` calls: (request_id, answers). The answers are
     /// the positional string form the keyed neutral answers flatten to, so the
     /// existing click assertions read the submitted selection.
@@ -1638,7 +1637,7 @@ pub struct MockBackend {
     pub session_parents: std::collections::HashMap<String, String>,
     /// The shared store served by `list_sessions` (for `/attach` and
     /// `/switch` tests).
-    pub session_list: Vec<opencode::types::SessionListInfo>,
+    pub session_list: Vec<crate::backend::types::SessionListInfo>,
     /// Records `update_session_title` calls: (session_id, title).
     pub update_title_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     /// When true, `update_session_title` fails — materialisation must keep the
@@ -1647,7 +1646,7 @@ pub struct MockBackend {
     /// Counts `list_sessions` invocations (asserts the 30 s cache).
     pub list_sessions_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Available agents served by `list_agents` (for the `/agent` card).
-    pub agents: Vec<opencode::types::AgentInfo>,
+    pub agents: Vec<crate::backend::types::AgentInfo>,
     /// Registered skills served by `list_skills` (for the `/skill` picker and
     /// the `/skill <id>` resolution, spec #652, ticket #656).
     pub skills: Vec<crate::backend::SkillInfo>,
@@ -1664,10 +1663,10 @@ pub struct MockBackend {
     pub serverless: bool,
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
-    pub provider_models: Vec<opencode::types::ProviderModels>,
+    pub provider_models: Vec<crate::backend::types::ProviderModels>,
     /// The configured default model served by `configured_default_model` (the
     /// second rung of the `/think` effective-model resolution).
-    pub default_model: Option<opencode::types::ModelInfo>,
+    pub default_model: Option<crate::backend::types::ModelInfo>,
     /// The context-window size `model_context_window` reports; `None`
     /// simulates a server that reports none (ADR-0044's used-only fallback).
     pub context_window: Option<i64>,
@@ -1676,11 +1675,11 @@ pub struct MockBackend {
     pub context_window_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// The server-recorded session model served by `session_info` (the third
     /// rung of the `/think` effective-model resolution).
-    pub session_model: Option<opencode::types::SessionModel>,
+    pub session_model: Option<crate::backend::types::SessionModel>,
     /// Per-session last-run models served by `session_last_run_model` (the
     /// model of the newest assistant message — the durable ladder's last rung
     /// when the session has no selection and no configured default).
-    pub session_last_run_models: std::collections::HashMap<String, opencode::types::ModelInfo>,
+    pub session_last_run_models: std::collections::HashMap<String, crate::backend::types::ModelInfo>,
     /// When set, `session_last_run_model` fails with this message (the ladder
     /// must degrade to "no current model", never hang or guess).
     pub session_last_run_model_error: Option<String>,
@@ -1688,7 +1687,7 @@ pub struct MockBackend {
     /// session-scoped switches). Empty by default: the mock speaks V1's
     /// per-prompt selection until a scenario seeds one or a switch lands.
     pub session_selections:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, opencode::types::SessionSelection>>>,
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::backend::types::SessionSelection>>>,
     /// Whether the mock speaks a generation with durable session selection
     /// (V2): `session_selection` serves the map and `keeps_session_selection`
     /// is true. Default false (V1: picks ride each prompt); a scenario that
@@ -1721,7 +1720,7 @@ pub struct MockBackend {
     /// The message counted `resume` failures report; `None` keeps the generic.
     pub fail_resume_message: Option<String>,
     /// Records `switch_session_model` calls: `(session_id, model)`.
-    pub switch_model_calls: Arc<tokio::sync::Mutex<Vec<(String, opencode::types::ModelInfo)>>>,
+    pub switch_model_calls: Arc<tokio::sync::Mutex<Vec<(String, crate::backend::types::ModelInfo)>>>,
     /// Records `switch_session_agent` calls: `(session_id, agent)`.
     pub switch_agent_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
     /// When set, both `switch_session_*` calls fail with this message.
@@ -1732,8 +1731,9 @@ pub struct MockBackend {
     /// present but with an unrecognised status type (unknown). Behind a lock so
     /// a test can flip a session Busy → Idle while a loop (e.g. the #284 drain
     /// follow) is watching it.
-    pub session_statuses:
-        Arc<tokio::sync::Mutex<std::collections::HashMap<String, Option<opencode::types::SessionStatus>>>>,
+    pub session_statuses: Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, Option<crate::backend::types::SessionStatus>>>,
+    >,
     /// Records the session ids each `session_status` read targeted — the `/sub`
     /// card asserts one read per rendered row (spec #344).
     pub session_status_reads: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -1969,33 +1969,42 @@ impl MockBackend {
 
     /// Scenario: the shared store holds exactly `sessions` (drives `/switch`,
     /// `/dir` and the external poller's discovery).
-    pub(crate) fn given_sessions(&mut self, sessions: Vec<opencode::types::SessionListInfo>) -> &mut Self {
+    pub(crate) fn given_sessions(
+        &mut self,
+        sessions: Vec<crate::backend::types::SessionListInfo>,
+    ) -> &mut Self {
         self.session_list = sessions;
         self
     }
 
     /// Scenario: `request` is pending on the server (appends to the pending
     /// list `list_permissions` serves).
-    pub(crate) fn ask_permission(&mut self, request: opencode::types::PermissionRequest) -> &mut Self {
+    pub(crate) fn ask_permission(&mut self, request: crate::backend::types::PermissionRequest) -> &mut Self {
         self.permissions.push(request);
         self
     }
 
     /// Scenario: exactly these permissions are pending.
-    pub(crate) fn ask_permissions(&mut self, requests: Vec<opencode::types::PermissionRequest>) -> &mut Self {
+    pub(crate) fn ask_permissions(
+        &mut self,
+        requests: Vec<crate::backend::types::PermissionRequest>,
+    ) -> &mut Self {
         self.permissions = requests;
         self
     }
 
     /// Scenario: `request` is pending on the server (appends to the pending
     /// list `list_questions` serves).
-    pub(crate) fn ask_question(&mut self, request: opencode::types::QuestionRequest) -> &mut Self {
+    pub(crate) fn ask_question(&mut self, request: crate::backend::types::QuestionRequest) -> &mut Self {
         self.questions.push(request);
         self
     }
 
     /// Scenario: exactly these questions are pending.
-    pub(crate) fn ask_questions(&mut self, requests: Vec<opencode::types::QuestionRequest>) -> &mut Self {
+    pub(crate) fn ask_questions(
+        &mut self,
+        requests: Vec<crate::backend::types::QuestionRequest>,
+    ) -> &mut Self {
         self.questions = requests;
         self
     }
@@ -2050,13 +2059,13 @@ impl MockBackend {
     }
 
     /// Scenario: `list_models` serves `models`.
-    pub(crate) fn with_models(&mut self, models: Vec<opencode::types::ProviderModels>) -> &mut Self {
+    pub(crate) fn with_models(&mut self, models: Vec<crate::backend::types::ProviderModels>) -> &mut Self {
         self.provider_models = models;
         self
     }
 
     /// Scenario: `list_agents` serves `agents`.
-    pub(crate) fn with_agents(&mut self, agents: Vec<opencode::types::AgentInfo>) -> &mut Self {
+    pub(crate) fn with_agents(&mut self, agents: Vec<crate::backend::types::AgentInfo>) -> &mut Self {
         self.agents = agents;
         self
     }
@@ -2069,13 +2078,13 @@ impl MockBackend {
     }
 
     /// Scenario: `configured_default_model` serves `model`.
-    pub(crate) fn with_default_model(&mut self, model: opencode::types::ModelInfo) -> &mut Self {
+    pub(crate) fn with_default_model(&mut self, model: crate::backend::types::ModelInfo) -> &mut Self {
         self.default_model = Some(model);
         self
     }
 
     /// Scenario: the server records `model` for the session (`session_info`).
-    pub(crate) fn with_session_model(&mut self, model: opencode::types::SessionModel) -> &mut Self {
+    pub(crate) fn with_session_model(&mut self, model: crate::backend::types::SessionModel) -> &mut Self {
         self.session_model = Some(model);
         self
     }
@@ -2086,7 +2095,7 @@ impl MockBackend {
     pub(crate) fn with_session_last_run_model(
         &mut self,
         session_id: &str,
-        model: opencode::types::ModelInfo,
+        model: crate::backend::types::ModelInfo,
     ) -> &mut Self {
         self.durable_selection = true;
         self.session_last_run_models.insert(session_id.to_string(), model);
@@ -2114,7 +2123,7 @@ impl MockBackend {
     pub(crate) fn with_session_selection(
         &mut self,
         session_id: &str,
-        selection: opencode::types::SessionSelection,
+        selection: crate::backend::types::SessionSelection,
     ) -> &mut Self {
         self.durable_selection = true;
         self.session_selections
@@ -2334,7 +2343,7 @@ impl MockBackend {
     pub(crate) fn with_session_status(
         &mut self,
         session_id: &str,
-        status: Option<opencode::types::SessionStatus>,
+        status: Option<crate::backend::types::SessionStatus>,
     ) -> &mut Self {
         self.session_statuses
             .try_lock()
@@ -2349,7 +2358,7 @@ impl MockBackend {
     pub(crate) async fn set_session_status(
         &self,
         session_id: &str,
-        status: Option<opencode::types::SessionStatus>,
+        status: Option<crate::backend::types::SessionStatus>,
     ) {
         self.session_statuses
             .lock()
@@ -2465,7 +2474,7 @@ impl MockBackend {
 
     /// Scenario: `request` arrives AFTER the app was built (the snapshot was
     /// already sent, ADR-0028).
-    pub(crate) fn ask_permission_later(&self, request: opencode::types::PermissionRequest) -> &Self {
+    pub(crate) fn ask_permission_later(&self, request: crate::backend::types::PermissionRequest) -> &Self {
         self.extra_permissions
             .try_lock()
             .expect("ask_permission_later before the app is built")
@@ -2524,7 +2533,7 @@ impl MockBackend {
         &self,
         request_id: &str,
         answers: Vec<Vec<String>>,
-        keyed: Vec<opencode::types::FormAnswer>,
+        keyed: Vec<crate::backend::types::FormAnswer>,
     ) -> crate::error::Result<()> {
         self.reply_question_calls
             .lock()
@@ -2658,16 +2667,16 @@ async fn hang_if_scripted(counter: &std::sync::atomic::AtomicUsize) {
 
 #[async_trait::async_trait]
 impl crate::backend::Backend for MockBackend {
-    fn new_session_input(&self, directory: Option<&str>) -> opencode::types::CreateSessionInput {
-        opencode::types::CreateSessionInput {
+    fn new_session_input(&self, directory: Option<&str>) -> crate::backend::types::CreateSessionInput {
+        crate::backend::types::CreateSessionInput {
             id: None,
             agent: None,
-            model: Some(opencode::types::ModelInfo {
+            model: Some(crate::backend::types::ModelInfo {
                 id: "m".into(),
                 provider_id: "p".into(),
                 variant: None,
             }),
-            location: directory.map(|d| opencode::types::Location {
+            location: directory.map(|d| crate::backend::types::Location {
                 directory: d.to_string(),
             }),
         }
@@ -2675,8 +2684,8 @@ impl crate::backend::Backend for MockBackend {
 
     async fn create_session(
         &self,
-        input: &opencode::types::CreateSessionInput,
-    ) -> crate::error::Result<opencode::types::Session> {
+        input: &crate::backend::types::CreateSessionInput,
+    ) -> crate::error::Result<crate::backend::types::Session> {
         self.created_session_dirs
             .lock()
             .await
@@ -2692,7 +2701,7 @@ impl crate::backend::Backend for MockBackend {
                 "Simulated create failure".into(),
             ));
         }
-        Ok(opencode::types::Session {
+        Ok(crate::backend::types::Session {
             id: self.session_id.clone(),
             project_id: None,
             agent: None,
@@ -2703,7 +2712,7 @@ impl crate::backend::Backend for MockBackend {
         })
     }
 
-    async fn list_sessions(&self) -> crate::error::Result<Vec<opencode::types::SessionListInfo>> {
+    async fn list_sessions(&self) -> crate::error::Result<Vec<crate::backend::types::SessionListInfo>> {
         hang_if_scripted(&self.hang_list_sessions).await;
         self.list_sessions_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2738,9 +2747,9 @@ impl crate::backend::Backend for MockBackend {
         &self,
         session_id: &str,
         text: &str,
-        files: &[opencode::types::PromptFile],
+        files: &[crate::backend::types::PromptFile],
         skills: &[crate::backend::PromptSkill],
-        _model: Option<&opencode::types::ModelInfo>,
+        _model: Option<&crate::backend::types::ModelInfo>,
         variant: Option<&str>,
         agent: Option<&str>,
         message_id: Option<&str>,
@@ -2981,7 +2990,7 @@ impl crate::backend::Backend for MockBackend {
     async fn list_permissions(
         &self,
         _d: Option<&str>,
-    ) -> crate::error::Result<Vec<opencode::types::PermissionRequest>> {
+    ) -> crate::error::Result<Vec<crate::backend::types::PermissionRequest>> {
         self.list_permission_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_permissions).await;
@@ -3009,7 +3018,7 @@ impl crate::backend::Backend for MockBackend {
     async fn list_questions(
         &self,
         _d: Option<&str>,
-    ) -> crate::error::Result<Vec<opencode::types::QuestionRequest>> {
+    ) -> crate::error::Result<Vec<crate::backend::types::QuestionRequest>> {
         self.list_question_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         hang_if_scripted(&self.hang_list_questions).await;
@@ -3028,11 +3037,11 @@ impl crate::backend::Backend for MockBackend {
         Ok(self.context_window)
     }
 
-    fn configured_default_model(&self) -> Option<opencode::types::ModelInfo> {
+    fn configured_default_model(&self) -> Option<crate::backend::types::ModelInfo> {
         self.default_model.clone()
     }
 
-    async fn list_agents(&self) -> Vec<opencode::types::AgentInfo> {
+    async fn list_agents(&self) -> Vec<crate::backend::types::AgentInfo> {
         self.agents.clone()
     }
 
@@ -3046,7 +3055,7 @@ impl crate::backend::Backend for MockBackend {
         self.skills.clone()
     }
 
-    async fn list_models(&self) -> Vec<opencode::types::ProviderModels> {
+    async fn list_models(&self) -> Vec<crate::backend::types::ProviderModels> {
         self.provider_models.clone()
     }
 
@@ -3054,7 +3063,7 @@ impl crate::backend::Backend for MockBackend {
         &self,
         _session_id: &str,
         request_id: &str,
-        answers: &[opencode::types::FormAnswer],
+        answers: &[crate::backend::types::FormAnswer],
         _d: Option<&str>,
     ) -> crate::error::Result<()> {
         let positional = answers
@@ -3063,7 +3072,7 @@ impl crate::backend::Backend for MockBackend {
                 answer
                     .value
                     .as_ref()
-                    .map_or_else(Vec::new, opencode::types::FormValue::to_strings)
+                    .map_or_else(Vec::new, crate::backend::types::FormValue::to_strings)
             })
             .collect();
         self.record_question_reply(request_id, positional, answers.to_vec())
@@ -3118,10 +3127,10 @@ impl crate::backend::Backend for MockBackend {
         &self,
         session_id: &str,
         _d: Option<&str>,
-    ) -> crate::error::Result<opencode::types::SessionInfo> {
+    ) -> crate::error::Result<crate::backend::types::SessionInfo> {
         self.session_info_calls.lock().await.push(session_id.to_string());
         hang_if_scripted(&self.hang_session_info).await;
-        Ok(opencode::types::SessionInfo {
+        Ok(crate::backend::types::SessionInfo {
             id: session_id.to_string(),
             parent_id: self.session_parents.get(session_id).cloned(),
             title: self.session_titles.lock().unwrap().get(session_id).cloned(),
@@ -3133,7 +3142,7 @@ impl crate::backend::Backend for MockBackend {
         &self,
         session_id: &str,
         _d: Option<&str>,
-    ) -> crate::error::Result<Option<opencode::types::SessionSelection>> {
+    ) -> crate::error::Result<Option<crate::backend::types::SessionSelection>> {
         if let Some(error) = &self.session_selection_error {
             return Err(crate::error::BridgeError::OpenCode(error.clone()));
         }
@@ -3147,7 +3156,7 @@ impl crate::backend::Backend for MockBackend {
         &self,
         session_id: &str,
         _d: Option<&str>,
-    ) -> crate::error::Result<Option<opencode::types::ModelInfo>> {
+    ) -> crate::error::Result<Option<crate::backend::types::ModelInfo>> {
         if let Some(error) = &self.session_last_run_model_error {
             return Err(crate::error::BridgeError::OpenCode(error.clone()));
         }
@@ -3169,7 +3178,7 @@ impl crate::backend::Backend for MockBackend {
     async fn switch_session_model(
         &self,
         session_id: &str,
-        model: &opencode::types::ModelInfo,
+        model: &crate::backend::types::ModelInfo,
     ) -> crate::error::Result<()> {
         if let Some(error) = &self.switch_error {
             return Err(crate::error::BridgeError::OpenCode(error.clone()));
@@ -3208,7 +3217,7 @@ impl crate::backend::Backend for MockBackend {
         &self,
         session_id: &str,
         _d: Option<&str>,
-    ) -> crate::error::Result<Option<opencode::types::SessionStatus>> {
+    ) -> crate::error::Result<Option<crate::backend::types::SessionStatus>> {
         self.session_status_reads
             .lock()
             .await
@@ -3231,13 +3240,13 @@ impl crate::backend::Backend for MockBackend {
             .status_busy_once
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            return Ok(Some(opencode::types::SessionStatus::Busy));
+            return Ok(Some(crate::backend::types::SessionStatus::Busy));
         }
         // A scripted entry is served verbatim (`Some(None)` → unknown); a
         // missing key means idle (the server removes finished runs).
         Ok(match self.session_statuses.lock().await.get(session_id) {
             Some(status) => *status,
-            None => Some(opencode::types::SessionStatus::Idle),
+            None => Some(crate::backend::types::SessionStatus::Idle),
         })
     }
 
@@ -3497,8 +3506,8 @@ pub fn long_answer_parts() -> Vec<Part> {
 }
 
 /// Build a `ModelOption` with the given id and declared variants.
-pub(crate) fn model_option(id: &str, variants: &[&str]) -> crate::opencode::types::ModelOption {
-    crate::opencode::types::ModelOption {
+pub(crate) fn model_option(id: &str, variants: &[&str]) -> crate::backend::types::ModelOption {
+    crate::backend::types::ModelOption {
         id: id.to_string(),
         variants: variants.iter().map(|s| s.to_string()).collect(),
     }
@@ -4209,15 +4218,15 @@ pub(crate) fn list_session(
     title: &str,
     directory: &str,
     updated: i64,
-) -> opencode::types::SessionListInfo {
-    opencode::types::SessionListInfo {
+) -> crate::backend::types::SessionListInfo {
+    crate::backend::types::SessionListInfo {
         id: id.into(),
         title: title.into(),
         directory: directory.into(),
         parent_id: None,
         agent: None,
         model: None,
-        time: Some(opencode::types::SessionTime {
+        time: Some(crate::backend::types::SessionTime {
             created: updated,
             updated,
             archived: None,
@@ -4263,8 +4272,8 @@ pub(crate) fn perm_request(
     request_id: &str,
     session_id: &str,
     pattern: &str,
-) -> opencode::types::PermissionRequest {
-    opencode::types::PermissionRequest {
+) -> crate::backend::types::PermissionRequest {
+    crate::backend::types::PermissionRequest {
         request_id: request_id.into(),
         session_id: Some(session_id.into()),
         permission: Some("bash".into()),

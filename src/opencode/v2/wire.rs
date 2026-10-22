@@ -28,16 +28,16 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::backend::types::{
+    AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
+    QuestionRequest, SessionInfo, SessionListInfo, SessionModel, SessionSelection, SessionTime,
+};
 use crate::backend::{
     BackgroundLaunch, BackgroundTask, ChildEvidence, Compaction, CompactionReason, CompactionStatus,
     ContentBlock, DEFAULT_FILE_MIME, Execution, ExecutionOutcome, FileContent, FinishReason, MessageId,
     MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, ShellEnd,
     ShellRuntime, SkillInfo, StepFinish, TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput,
     ToolStatus, TranscriptMessage, TurnDiffFile, Wake, WakeSource,
-};
-use crate::opencode::types::{
-    AgentInfo, FormFieldKind, ModelInfo, ModelOption, PermissionRequest, QuestionInfo, QuestionOption,
-    QuestionRequest, SessionInfo, SessionListInfo, SessionModel, SessionSelection, SessionTime,
 };
 
 /// `{data: T}` — the envelope most V2 reads share (R2's "unwrap per route —

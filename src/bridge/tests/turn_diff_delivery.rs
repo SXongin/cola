@@ -528,7 +528,7 @@ async fn the_terminal_card_index_is_the_settle_session_diff_read() {
     ];
     let (_dir, app, backend, platform) = super::drain::scripted_app(
         vec![SessionTranscript::new(timeline)],
-        Some(crate::opencode::types::SessionStatus::Idle),
+        Some(crate::backend::types::SessionStatus::Idle),
     )
     .await;
     backend
@@ -616,7 +616,7 @@ async fn an_empty_settle_read_leaves_the_terminal_card_without_an_index() {
     ];
     let (_dir, app, backend, platform) = super::drain::scripted_app(
         vec![SessionTranscript::new(timeline)],
-        Some(crate::opencode::types::SessionStatus::Idle),
+        Some(crate::backend::types::SessionStatus::Idle),
     )
     .await;
     backend
@@ -710,7 +710,7 @@ async fn a_failed_settle_read_leaves_the_terminal_card_without_an_index() {
     ];
     let (_dir, app, backend, platform) = super::drain::scripted_app(
         vec![SessionTranscript::new(timeline)],
-        Some(crate::opencode::types::SessionStatus::Idle),
+        Some(crate::backend::types::SessionStatus::Idle),
     )
     .await;
     backend
@@ -752,7 +752,7 @@ async fn a_v1_turn_terminates_without_an_index() {
     ];
     let (_dir, app, backend, platform) = super::drain::scripted_app(
         vec![SessionTranscript::new(timeline)],
-        Some(crate::opencode::types::SessionStatus::Idle),
+        Some(crate::backend::types::SessionStatus::Idle),
     )
     .await;
 

@@ -381,10 +381,9 @@ pub(crate) async fn claim_snapshot_pendings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::opencode;
 
     fn perm(request_id: &str) -> PendingRequest {
-        PendingRequest::Permission(opencode::types::PermissionRequest {
+        PendingRequest::Permission(crate::backend::types::PermissionRequest {
             request_id: request_id.into(),
             session_id: Some("ses_1".into()),
             permission: Some("bash".into()),

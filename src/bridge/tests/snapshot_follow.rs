@@ -7,19 +7,19 @@ use crate::bridge::test_support::*;
 
 /// A minimal one-question request, owned by a chosen session (the claim tests
 /// only need an id and an owner; the block's shape is the card layer's).
-fn claim_question(request_id: &str, session_id: &str) -> opencode::types::QuestionRequest {
-    opencode::types::QuestionRequest {
+fn claim_question(request_id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    crate::backend::types::QuestionRequest {
         id: request_id.into(),
         session_id: session_id.into(),
-        questions: vec![opencode::types::QuestionInfo {
+        questions: vec![crate::backend::types::QuestionInfo {
             question: "选择目录".into(),
             header: "目录".into(),
-            options: vec![opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "/a".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: None,
             ..Default::default()
         }],
@@ -506,38 +506,38 @@ async fn snapshot_question_block_answers_and_patches() {
         "/work/ext",
         100,
     )]);
-    backend.ask_questions(vec![opencode::types::QuestionRequest {
+    backend.ask_questions(vec![crate::backend::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
         questions: vec![
-            opencode::types::QuestionInfo {
+            crate::backend::types::QuestionInfo {
                 question: "选择语言".into(),
                 header: "language".into(),
                 options: vec![
-                    opencode::types::QuestionOption {
+                    crate::backend::types::QuestionOption {
                         label: "rust".into(),
                         description: String::new(),
                         ..Default::default()
                     },
-                    opencode::types::QuestionOption {
+                    crate::backend::types::QuestionOption {
                         label: "go".into(),
                         description: String::new(),
                         ..Default::default()
                     },
                 ],
-                kind: crate::opencode::types::FormFieldKind::String,
+                kind: crate::backend::types::FormFieldKind::String,
                 custom: Some(false),
                 ..Default::default()
             },
-            opencode::types::QuestionInfo {
+            crate::backend::types::QuestionInfo {
                 question: "选择框架".into(),
                 header: "framework".into(),
-                options: vec![opencode::types::QuestionOption {
+                options: vec![crate::backend::types::QuestionOption {
                     label: "axum".into(),
                     description: String::new(),
                     ..Default::default()
                 }],
-                kind: crate::opencode::types::FormFieldKind::String,
+                kind: crate::backend::types::FormFieldKind::String,
                 custom: Some(false),
                 ..Default::default()
             },
@@ -626,7 +626,7 @@ async fn busy_adopt_streams_turn_into_snapshot() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     let reply_ready = backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
@@ -704,7 +704,7 @@ async fn a_busy_follow_repeats_the_pending_overflow_line() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     let reply_ready = backend.external_reply(realistic_parts());
     for i in 1..=6 {
@@ -766,7 +766,7 @@ async fn a_completed_external_follow_stops_reading() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     let reply_ready = backend.external_reply(realistic_parts());
     let backend = Arc::new(backend);
@@ -823,7 +823,7 @@ async fn busy_follow_permission_approved_resumes() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
     let reply_ready = backend.external_reply(realistic_parts());
@@ -987,7 +987,7 @@ async fn busy_follow_skips_cola_authored_turn() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     // The newest user message is cola's OWN (a cola prompt mid-turn).
     backend.cola_message("ses_alpha01", "我在问的问题");
     backend.ask_permission(perm_request("per_1", "ses_alpha01", "ls -la"));
@@ -1020,20 +1020,20 @@ async fn busy_follow_question_block_resolves() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
-    backend.ask_questions(vec![opencode::types::QuestionRequest {
+    backend.ask_questions(vec![crate::backend::types::QuestionRequest {
         id: "q_1".into(),
         session_id: "ses_alpha01".into(),
-        questions: vec![opencode::types::QuestionInfo {
+        questions: vec![crate::backend::types::QuestionInfo {
             question: "选择语言".into(),
             header: "language".into(),
-            options: vec![opencode::types::QuestionOption {
+            options: vec![crate::backend::types::QuestionOption {
                 label: "rust".into(),
                 description: String::new(),
                 ..Default::default()
             }],
-            kind: crate::opencode::types::FormFieldKind::String,
+            kind: crate::backend::types::FormFieldKind::String,
             custom: Some(false),
             ..Default::default()
         }],
@@ -1095,7 +1095,7 @@ async fn user_prompt_during_follow_merges_as_a_supplement() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.external_message_for("ses_alpha01", "帮我重构这个模块");
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
@@ -1216,7 +1216,7 @@ async fn busy_snapshot_follow_yields_and_resumes_in_place() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.given_transcript("ses_alpha01", vec![snapshot_waiting_read()]);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
@@ -1245,7 +1245,7 @@ async fn busy_snapshot_follow_yields_and_resumes_in_place() {
     // the snapshot card in place.
     spawn_sync(&app);
     backend
-        .set_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Idle))
+        .set_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Idle))
         .await;
     backend
         .given_transcript_after_build("ses_alpha01", vec![snapshot_woken_read()])
@@ -1468,7 +1468,7 @@ async fn busy_follow_static_tail_records_a_file_line() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     // The newest user message carries text AND a File Content; its turn is
     // already complete, so the follow finalizes the snapshot card Done.
     backend.given_transcript(
@@ -1548,7 +1548,7 @@ async fn busy_follow_shows_a_compaction_once() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     backend.given_transcript(
         "ses_alpha01",
         vec![SessionTranscript::new(vec![
@@ -1624,7 +1624,7 @@ async fn busy_follow_renders_no_empty_tail_header_for_a_marker_only_tail() {
         "/work/ext",
         100,
     )]);
-    backend.with_session_status("ses_alpha01", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_alpha01", Some(crate::backend::types::SessionStatus::Busy));
     // The newest user message carries nothing conversational (a part this build
     // does not model), so no tail entry is a message: the markers stand alone.
     backend.given_transcript(

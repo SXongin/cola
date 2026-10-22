@@ -313,7 +313,7 @@ async fn a_surfaced_permission_carries_its_session_chat_and_topic() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -586,7 +586,7 @@ async fn a_snapshot_settle_carries_the_session() {
     let data = crate::bridge::snapshot::SnapshotData {
         session_id: "ses_test".into(),
         directory: "/work/project".into(),
-        status: Some(crate::opencode::types::SessionStatus::Busy),
+        status: Some(crate::backend::types::SessionStatus::Busy),
         waiting: false,
         pending: Vec::new(),
         pending_elsewhere: None,

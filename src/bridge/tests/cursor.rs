@@ -15,6 +15,7 @@ use super::drain::{
     assistant, ctx, scripted_app, settle_tool, spawn_sync, spawn_turn, tool_assistant, user,
     wait_for_card_text,
 };
+use crate::backend::types::SessionStatus;
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, MessageId, MessageRole, MessageTime, Part,
     SessionTranscript, TextPart, ToolStatus, TranscriptMessage,
@@ -25,7 +26,6 @@ use crate::bridge::test_support::{
     test_work_dir, text_part, two_parts_at_one_time, typed_message, wait_for_transcript_reads,
 };
 use crate::bridge::turn::Turn;
-use crate::opencode::types::SessionStatus;
 
 /// Wait until a reply to `reply_to` carries `needle`, or panic after 5 s: the
 /// restart's projection successor (spec #561's adoption).

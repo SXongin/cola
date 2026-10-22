@@ -78,6 +78,7 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::types::SessionStatus;
 use crate::backend::{
     MessageId, MessageRole, PromptSkill, SessionTranscript, TurnAnchor, TurnDiffStats, TurnSettle,
 };
@@ -86,7 +87,6 @@ use crate::bridge::handles::{CardsHandle, NoticeRules, RequestsHandle, SessionsH
 use crate::bridge::span;
 use crate::bridge::turn::state::{EndingWrite, StreamAccumulator};
 use crate::config::ThreadKey;
-use crate::opencode::types::SessionStatus;
 
 /// How many consecutive drain reads must see no run before an unobserved
 /// submit is treated as never having registered. A prompt admit only
@@ -279,7 +279,7 @@ pub(crate) struct PromptContext {
     pub(crate) cola_message_id: Option<String>,
     /// The prompt file parts this turn attaches (Prompt Attachments, ADR-0076):
     /// classified and size-checked by the handler, ready to send.
-    pub(crate) files: Vec<crate::opencode::types::PromptFile>,
+    pub(crate) files: Vec<crate::backend::types::PromptFile>,
     /// The skills this turn loads into the prompt (spec #652, ticket #654): the
     /// generation-neutral attachment parsed from a `/skill <id>` command. Empty
     /// for an ordinary message. Carried across a recovery, unlike `files` (see
@@ -312,7 +312,7 @@ pub(crate) struct Turn {
     thread_key: ThreadKey,
     text: String,
     cola_message_id: String,
-    files: Vec<crate::opencode::types::PromptFile>,
+    files: Vec<crate::backend::types::PromptFile>,
     /// The skills this turn loads into the prompt (spec #652, ticket #654),
     /// captured at turn start — passed to every attempt's submit.
     skills: Vec<PromptSkill>,
@@ -5189,7 +5189,7 @@ mod tests {
     /// be sent (or tagged) when the session's model ref carries none.
     #[tokio::test]
     async fn turn_variant_ignores_the_mirror_on_a_durable_generation() {
-        use crate::opencode::types::{ModelInfo, SessionSelection};
+        use crate::backend::types::{ModelInfo, SessionSelection};
 
         let _wd = test_work_dir();
         let dir = tempfile::tempdir().unwrap();

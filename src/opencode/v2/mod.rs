@@ -45,7 +45,7 @@ use crate::error::Result;
 
 use super::strategy::GenerationStrategy;
 use super::transport::{Transport, body_preview, read_failure, read_failure_quiet};
-use super::types::{
+use crate::backend::types::{
     AgentInfo, FormAnswer, FormValue, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
     QuestionRequest, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };

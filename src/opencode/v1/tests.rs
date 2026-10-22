@@ -915,7 +915,7 @@ async fn list_questions_sends_the_directory_scope_and_parses_questions() {
     // Multiselect field, keyed positionally, with the label as its value.
     assert_eq!(
         questions[0].questions[0].kind,
-        crate::opencode::types::FormFieldKind::Multiselect
+        crate::backend::types::FormFieldKind::Multiselect
     );
     assert_eq!(questions[0].questions[0].key, "q0");
     assert_eq!(questions[0].questions[0].options[1].answer_value(), "B");
@@ -938,13 +938,13 @@ async fn reply_question_posts_answers_with_the_directory_scope() {
             "ses_1",
             "q_1",
             &[
-                crate::opencode::types::FormAnswer {
+                crate::backend::types::FormAnswer {
                     key: "q0".into(),
-                    value: Some(crate::opencode::types::FormValue::Text("A".into())),
+                    value: Some(crate::backend::types::FormValue::Text("A".into())),
                 },
-                crate::opencode::types::FormAnswer {
+                crate::backend::types::FormAnswer {
                     key: "q1".into(),
-                    value: Some(crate::opencode::types::FormValue::List(vec![
+                    value: Some(crate::backend::types::FormValue::List(vec![
                         "B".into(),
                         "C".into(),
                     ])),
@@ -1259,7 +1259,7 @@ async fn transcript_surfaces_a_failed_message_read() {
 /// keeps sending model/variant/agent per prompt.
 #[tokio::test]
 async fn session_selection_is_none_and_switches_are_no_ops_on_v1() {
-    use crate::opencode::types::ModelInfo;
+    use crate::backend::types::ModelInfo;
 
     let server = TestHttpServer::start().await;
     let client = v1_wire_client(&server, None);

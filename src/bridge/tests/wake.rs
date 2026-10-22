@@ -41,6 +41,7 @@ use super::drain::{
     assistant, ctx, noticed, script_transcript, scripted_app, scripted_app_with, spawn_sync, spawn_turn,
     user, wait_for_card_header, wait_for_card_text,
 };
+use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ContentBlock, FinishReason, MessageRole, Part, ReasoningPart, SessionTranscript,
     StepFinish, TextPart, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, Wake,
@@ -49,7 +50,6 @@ use crate::backend::{
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{CardOwnership, Turn};
 use crate::feishu::card::CardState;
-use crate::opencode::types::SessionStatus;
 
 /// A finished assistant turn whose newest message recorded a failure.
 fn failed_assistant(created: i64, text: &str, error: &str) -> TranscriptMessage {

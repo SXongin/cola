@@ -592,7 +592,7 @@ pub(super) struct PendingPermission {
 pub(super) struct PendingQuestion {
     pub(super) request_id: String,
     pub(super) session_id: String,
-    pub(super) questions: Vec<crate::opencode::types::QuestionInfo>,
+    pub(super) questions: Vec<crate::backend::types::QuestionInfo>,
     pub(super) directory: String,
     /// Display selection per question (locked answer, or live multi-select
     /// toggles). Mirrors `question_elements`' `answered` slice.
@@ -7350,15 +7350,15 @@ mod tests {
         let question = InteractionBlock::Question(PendingQuestion {
             request_id: "q".into(),
             session_id: "s".into(),
-            questions: vec![crate::opencode::types::QuestionInfo {
+            questions: vec![crate::backend::types::QuestionInfo {
                 question: "继续?".into(),
                 header: "确认".into(),
-                options: vec![crate::opencode::types::QuestionOption {
+                options: vec![crate::backend::types::QuestionOption {
                     label: "继续".into(),
                     description: String::new(),
                     ..Default::default()
                 }],
-                kind: crate::opencode::types::FormFieldKind::String,
+                kind: crate::backend::types::FormFieldKind::String,
                 custom: None,
                 ..Default::default()
             }],

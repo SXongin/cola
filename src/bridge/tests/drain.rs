@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::backend::types::SessionStatus;
 use crate::backend::{
     BackgroundTask, ChildRuntime, ContentBlock, FinishReason, MessageRole, Part, SessionTranscript, ShellEnd,
     ShellRuntime, StepFinish, TextPart, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage,
@@ -18,7 +19,6 @@ use crate::bridge::test_support::*;
 use crate::bridge::turn::{PromptContext, Turn};
 use crate::config::ThreadKey;
 use crate::feishu::card::CardState;
-use crate::opencode::types::SessionStatus;
 
 /// A user message cola would have persisted (its `msg_cola_` id identifies it).
 pub(crate) fn user(id: &str, created: i64, text: &str) -> TranscriptMessage {
@@ -1219,7 +1219,7 @@ async fn pending_permission_app() -> (
         ])],
     );
     backend.with_session_status("ses_test", Some(SessionStatus::Busy));
-    backend.ask_permissions(vec![crate::opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
