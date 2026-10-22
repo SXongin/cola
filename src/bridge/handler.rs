@@ -1362,7 +1362,7 @@ fn gone_directory_text(directory: &str) -> String {
     format!(
         "⚠️ 工作目录已不存在或不可用：`{directory}`\n\
          可能已被删除（例如 worktree 被移除）。\n\
-         用 `/dir <目录>` 重新落根（下一条消息会在新目录创建会话），\
+         用 `/dir <目录>` 切换目录（下一条消息会在新目录创建会话），\
          或用 `/switch` 换一个已有会话。"
     )
 }
