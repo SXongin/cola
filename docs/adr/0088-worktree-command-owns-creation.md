@@ -81,14 +81,14 @@ nothing is ever moved.
   Session is replaced, as repeating `/dir` is.
 - **The card is read-only.** Rows carry the directory's name, branch, dirty
   marker, session count and current marker; the main checkout is a row labelled
-  「主检出」, and the card names the two routes out of it. It carries no
-  callback and no button: re-rooting keeps the one meaning it has everywhere
-  (`/dir` declares the Pending Session), and adopting an existing Session stays
-  `/switch`'s job. A pick button would have made this feature's only callback
-  write the session store — the one operation a callback cannot bound
-  (ADR-0089). The current
-  marker falls back to `bridge.work_dir` when the conversation has neither a
-  session nor a pending, matching `/new`.
+  「主检出」. It carries no callback, no button and no how-to footer: a hint
+  line reads as a required procedure rather than a list you can just read, so
+  the routes stay in `/help` and the user guide. Moving the conversation into a
+  checkout stays `/dir`'s job and adopting an existing Session stays
+  `/switch`'s; a pick button would have made this feature's only callback write
+  the session store — the one operation a callback cannot bound (ADR-0089). The
+  current marker falls back to `bridge.work_dir` when the conversation has
+  neither a session nor a pending, matching `/new`.
 - **Dirty is measured, bounded.** One `git status --porcelain` per worktree,
   concurrency 4 under a 5 s overall bound; a row that misses the bound renders
   `?` rather than pretending to be clean. The list is not cached.

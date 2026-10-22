@@ -149,7 +149,6 @@ async fn worktree_card_data_lists_main_and_linked_checkouts() {
         !card.contains("\"tag\":\"button\""),
         "the list is read-only: {card}"
     );
-    assert!(card.contains("/dir <路径>"), "the re-root route is named: {card}");
 }
 
 /// A non-git project answers text, not an empty card.
