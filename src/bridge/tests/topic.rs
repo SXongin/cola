@@ -1990,3 +1990,45 @@ async fn switch_card_adopt_inside_pending_topic_repoints_in_place() {
         patched.last()
     );
 }
+
+/// #450: a Pending topic opened in a linked worktree marks the cover with the
+/// same 🌲 the Turn Footer uses (#433), so the chat-list entry says "worktree"
+/// before the user opens it.
+#[tokio::test]
+async fn a_topic_cover_marks_a_linked_worktree() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = git_repo();
+    git_in(
+        repo.path(),
+        &["worktree", "add", "-b", "wt/cover", ".worktrees/cover"],
+    );
+    let checkout =
+        crate::git::plain_path(std::fs::canonicalize(repo.path().join(".worktrees/cover")).unwrap());
+    let cfg = test_config(&sessions.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, platform) = build_app(cfg, backend).await;
+
+    send_command(
+        &app,
+        &format!("/topic {}", checkout.to_string_lossy()),
+        "msg_topic_worktree",
+    )
+    .await;
+
+    let cover = platform
+        .sent_cards()
+        .await
+        .into_iter()
+        .next()
+        .map(|card| card.to_string())
+        .expect("a cover card is sent to the chat");
+    assert!(
+        cover.contains("🌲"),
+        "the cover marks the linked checkout: {cover}"
+    );
+    assert!(
+        cover.contains("`cover` 🌲"),
+        "the marker follows the checkout name, as on the Turn Footer: {cover}"
+    );
+}

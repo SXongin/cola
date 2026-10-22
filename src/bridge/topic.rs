@@ -347,6 +347,12 @@ async fn pending_topic_cover_text(title: &str, dir: &str) -> String {
 async fn topic_cover_head(title: &str, dir: &str) -> String {
     let git = crate::git::read_state(dir).await;
     let mut s = format!("💬 `{title}`\n`{}`", dir_basename(dir));
+    // #450: a linked worktree is marked exactly as the Turn Footer marks it
+    // (#433) — the cover is the chat-list entry, so a worktree Session must be
+    // recognizable before the user opens it.
+    if git.worktree {
+        s.push_str(" 🌲");
+    }
     if let Some(branch) = git.branch.as_deref() {
         s.push_str(&format!(" · `{branch}`{}", if git.dirty { " ⚠" } else { "" }));
     }
