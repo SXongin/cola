@@ -271,10 +271,11 @@ that boundary, merge on the required checks; anything else is a real signal —
 cover the new logic, or say in the PR why it stays uncovered. Two rules, in the
 same spirit as *Security scanning*: never restructure or obfuscate code just to
 move a line out of the report, and never add an assertion-free "coverage
-filler" test. `#[coverage(off)]` is still nightly-only (verified on stable
-1.95), so line-level exclusion is not an option; a permanently-unreachable file
-or region goes on the `ignore` list with its reason, or into the boundary list
-above.
+filler" test. `#[coverage(off)]` is still nightly-only — re-checked on stable
+1.99.1, where it is rejected with `error[E0658]` ("the `coverage` attribute is
+an experimental feature", rust-lang/rust#84605) — so line-level exclusion is
+not an option; a permanently-unreachable file or region goes on the `ignore`
+list with its reason, or into the boundary list above.
 
 The description template is `.github/pull_request_template.md` — keep its
 `## What` / `## Why` / `## How tested` sections and take the rendering from the
