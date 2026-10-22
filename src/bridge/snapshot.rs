@@ -4,7 +4,6 @@ use tracing::Instrument;
 
 use crate::backend::{SessionTranscript, TailEntry, TurnAnchor};
 use crate::bridge::handles::SnapshotHandles;
-use crate::opencode;
 
 /// Read-side state for the Session Snapshot card (ADR-0028). Built purely from
 /// server reads at the moment a Chat/Topic activates a session — never from a
@@ -267,7 +266,7 @@ pub(crate) async fn gather_snapshot(
     let newest_user = transcript.newest_user();
     let newest_user_anchor = newest_user.and_then(|message| message.anchor());
     let newest_user_is_cola_authored = newest_user
-        .map(|message| opencode::parsing::is_cola_message_id(message.id.as_str()))
+        .map(|message| crate::backend::parsing::is_cola_message_id(message.id.as_str()))
         .unwrap_or(false);
     let tail = transcript.transcript_tail();
     // The ADR-0059 Waiting fact (#586): the newest user message's Turn is

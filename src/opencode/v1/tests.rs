@@ -6,10 +6,10 @@
 //! beside its strategy has the same shape.
 
 use super::*;
+use crate::backend::parsing::parse_model;
 use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
 use crate::error::BridgeError;
 use crate::opencode::client::OpenCodeBackend;
-use crate::opencode::parsing::parse_model;
 use crate::test_http::{MockResponse, RecordedRequest, TestHttpServer};
 use base64::Engine;
 

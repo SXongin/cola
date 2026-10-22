@@ -20,7 +20,6 @@ mod conformance;
 pub(crate) mod generation;
 #[cfg(test)]
 mod live;
-pub(crate) mod parsing;
 pub(crate) mod strategy;
 #[cfg(test)]
 mod tests;

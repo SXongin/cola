@@ -494,7 +494,7 @@ async fn live_v2_scripted_transcript_read() {
         .find(|message| message.id.as_str() == message_id)
         .expect("the admitted user message is in the transcript");
     assert!(
-        crate::opencode::parsing::is_cola_message_id(user.id.as_str()),
+        crate::backend::parsing::is_cola_message_id(user.id.as_str()),
         "V2 must persist the cola-chosen message id: {user:#?}"
     );
     // The Session Snapshot tail: the newest text-bearing conversation, with the
@@ -642,7 +642,7 @@ async fn live_v2_scripted_write_chain() {
     );
     assert_eq!(supplement.text(), SUPPLEMENT_TEXT);
     assert!(
-        crate::opencode::parsing::is_cola_message_id(supplement.id.as_str()),
+        crate::backend::parsing::is_cola_message_id(supplement.id.as_str()),
         "V2 must persist the supplement's cola-chosen id: {supplement:#?}"
     );
     assert_tool_call(

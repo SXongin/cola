@@ -20,6 +20,7 @@
 #[allow(dead_code)]
 pub mod diff_html;
 pub mod file_content;
+pub mod parsing;
 pub mod transcript;
 pub mod turn_diff;
 pub mod types;

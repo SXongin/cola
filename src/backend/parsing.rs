@@ -1,10 +1,12 @@
-//! Generation-neutral cola-side helpers for the OpenCode adapter.
+//! Generation-neutral cola-side helpers (spec #860, #870).
 //!
 //! Only the pieces that are cola's own contract live here, not a protocol
 //! generation's: the self-identifying user-message id (ADR-0026) and the
 //! `provider/model` spec parser behind `/model` and the effective-model
-//! resolution. Protocol payload shapes live in the generation strategies (V1
-//! under [`super::v1`]), never in this module.
+//! resolution. They were the OpenCode adapter's because it was the only
+//! client; a second adapter needs the same two facts, so they sit with the
+//! contract. Protocol payload shapes live in the generation strategies (V1
+//! under `opencode::v1`), never in this module.
 
 use crate::backend::types::ModelInfo;
 

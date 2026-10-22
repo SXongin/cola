@@ -30,7 +30,7 @@ fn assert_completed_turn(transcript: &SessionTranscript) {
     assert_eq!(user.role, MessageRole::User);
     assert_eq!(user.text(), "run the live harness command");
     assert!(
-        crate::opencode::parsing::is_cola_message_id(user.id.as_str()),
+        crate::backend::parsing::is_cola_message_id(user.id.as_str()),
         "the recorded user message is cola-authored: {user:#?}"
     );
 
