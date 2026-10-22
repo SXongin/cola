@@ -1076,7 +1076,7 @@ async fn busy_retry_without_an_anchor_leaves_the_card_retryable() {
         .lock()
         .await
         .entry("ses_test".into())
-        .or_default() = Some(crate::opencode::types::SessionStatus::Busy);
+        .or_default() = Some(crate::backend::types::SessionStatus::Busy);
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
         .await;
@@ -1122,7 +1122,7 @@ async fn busy_retry_reattaches_and_finalizes_done_from_the_transcript() {
     let (app, backend, platform) = error_card_app(cfg, false, None).await;
 
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
         .await;
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
@@ -1157,7 +1157,7 @@ async fn busy_retry_reattaches_and_finalizes_done_from_the_transcript() {
         )],
     )];
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Idle))
         .await;
     wait_for_card_update(
         &platform,
@@ -1185,7 +1185,7 @@ async fn busy_retry_reattach_finalizes_error_with_a_working_retry() {
 
     // `Retry` is the matrix's other live status: it must re-attach too.
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Retry))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Retry))
         .await;
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
@@ -1214,7 +1214,7 @@ async fn busy_retry_reattach_finalizes_error_with_a_working_retry() {
         .get_mut("ses_test")
         .unwrap() = vec![window_with(REATTACH_ANCHOR, vec![failed])];
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Idle))
         .await;
     wait_for_card_update(
         &platform,
@@ -1262,7 +1262,7 @@ async fn stop_after_a_reattach_ends_the_card_promptly() {
         .store(60_000, std::sync::atomic::Ordering::Relaxed);
 
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
         .await;
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
@@ -1337,7 +1337,7 @@ async fn a_message_during_a_reattach_follow_splits_the_live_chain() {
     let (app, backend, platform) = error_card_app(cfg, false, None).await;
 
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
         .await;
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
@@ -1415,7 +1415,7 @@ async fn a_message_during_a_reattach_follow_splits_the_live_chain() {
         )],
     )];
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Idle))
         .await;
     wait_for_card_update(
         &platform,
@@ -1464,7 +1464,7 @@ async fn a_quick_reattached_end_does_not_measure_the_original_turn() {
     );
 
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
         .await;
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
@@ -1494,7 +1494,7 @@ async fn a_quick_reattached_end_does_not_measure_the_original_turn() {
         )],
     )];
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Idle))
         .await;
     wait_for_card_update(
         &platform,
@@ -1524,7 +1524,7 @@ async fn a_long_reattached_run_still_sends_the_notice() {
         .store(50, std::sync::atomic::Ordering::Relaxed);
 
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Busy))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Busy))
         .await;
     let retry = app
         .host_action(serde_json::json!({ "action": "retry", "session_id": "ses_test" }))
@@ -1555,7 +1555,7 @@ async fn a_long_reattached_run_still_sends_the_notice() {
         )],
     )];
     backend
-        .set_session_status("ses_test", Some(crate::opencode::types::SessionStatus::Idle))
+        .set_session_status("ses_test", Some(crate::backend::types::SessionStatus::Idle))
         .await;
     wait_for_card_update(
         &platform,

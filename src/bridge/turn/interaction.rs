@@ -10,7 +10,6 @@
 use std::collections::HashSet;
 
 use crate::bridge::handles::CardsHandle;
-use crate::opencode;
 
 use super::{InlineResidue, Turn, TurnPinSource, state};
 
@@ -60,7 +59,7 @@ impl Turn {
     pub(crate) async fn add_permission(
         cards: &CardsHandle,
         session_id: &str,
-        p: &opencode::types::PermissionRequest,
+        p: &crate::backend::types::PermissionRequest,
         directory: &str,
     ) -> bool {
         let block = state::InteractionBlock::Permission(state::PendingPermission {
@@ -82,7 +81,7 @@ impl Turn {
     pub(crate) async fn add_question(
         cards: &CardsHandle,
         session_id: &str,
-        q: &opencode::types::QuestionRequest,
+        q: &crate::backend::types::QuestionRequest,
         directory: &str,
         answers: &[Option<Vec<String>>],
         done: &[bool],

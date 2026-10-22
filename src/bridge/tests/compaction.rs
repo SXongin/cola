@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use crate::backend::types::SessionStatus;
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, MessageRole, Part, SessionTranscript, TokenUsage,
     TranscriptMessage,
@@ -15,7 +16,6 @@ use crate::bridge::chain::{CursorFrontier, CursorPartKind, RenderedCursor, curso
 use crate::bridge::test_support::*;
 use crate::bridge::tests::drain::{assistant, ctx, scripted_app, scripted_app_with, spawn_turn, user};
 use crate::bridge::turn::PromptContext;
-use crate::opencode::types::SessionStatus;
 
 /// One compaction message: the neutral typed fact on a message of its own, the
 /// way V2 persists it (its server time is the MESSAGE's `time.created`).

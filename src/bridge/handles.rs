@@ -184,7 +184,7 @@ impl SessionsHandle {
 
     /// The per-session model override set by `/model`, parsed from the persisted
     /// "provider/model" string.
-    pub(crate) async fn model_override(&self, session_id: &str) -> Option<opencode::types::ModelInfo> {
+    pub(crate) async fn model_override(&self, session_id: &str) -> Option<crate::backend::types::ModelInfo> {
         self.store
             .lock()
             .await
@@ -424,7 +424,7 @@ impl SessionsHandle {
     pub(crate) async fn cached_session_list(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
-    ) -> crate::error::Result<Vec<opencode::types::SessionListInfo>> {
+    ) -> crate::error::Result<Vec<crate::backend::types::SessionListInfo>> {
         let now = std::time::Instant::now();
         {
             let cache = self.cache.lock().await;
@@ -464,7 +464,7 @@ impl SessionsHandle {
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         settings: &SessionSettings,
-    ) -> Option<opencode::types::ModelInfo> {
+    ) -> Option<crate::backend::types::ModelInfo> {
         if let Some(session_id) = settings.session_id.as_deref()
             && backend.keeps_session_selection()
         {
@@ -512,7 +512,7 @@ impl SessionsHandle {
             .await
             && let Some(model) = info.model
         {
-            return Some(opencode::types::ModelInfo {
+            return Some(crate::backend::types::ModelInfo {
                 id: model.id,
                 provider_id: model.provider_id,
                 variant: settings.variant.clone(),
@@ -563,7 +563,7 @@ impl SessionsHandle {
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: Option<&str>,
-    ) -> crate::error::Result<Option<opencode::types::SessionSelection>> {
+    ) -> crate::error::Result<Option<crate::backend::types::SessionSelection>> {
         match tokio::time::timeout(
             SESSION_INFO_TIMEOUT,
             backend.session_selection(session_id, directory),
@@ -596,7 +596,7 @@ impl SessionsHandle {
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: &str,
-    ) -> Option<opencode::types::ModelInfo> {
+    ) -> Option<crate::backend::types::ModelInfo> {
         match tokio::time::timeout(
             SESSION_INFO_TIMEOUT,
             backend.session_last_run_model(session_id, Some(directory)),
@@ -679,7 +679,7 @@ impl SessionsHandle {
         backend
             .switch_session_model(
                 session_id,
-                &opencode::types::ModelInfo {
+                &crate::backend::types::ModelInfo {
                     id: model.id,
                     provider_id: model.provider_id,
                     variant: variant.clone(),
@@ -763,7 +763,7 @@ impl SessionsHandle {
             backend
                 .switch_session_model(
                     &session_id,
-                    &opencode::types::ModelInfo {
+                    &crate::backend::types::ModelInfo {
                         id: model.id,
                         provider_id: model.provider_id,
                         variant: settings.variant.clone(),
@@ -801,7 +801,7 @@ impl SessionsHandle {
                 Some(picked) => backend.switch_session_agent(&session_id, picked).await?,
                 None => {
                     let Some(default) =
-                        opencode::types::AgentInfo::default_agent(&backend.list_agents().await)
+                        crate::backend::types::AgentInfo::default_agent(&backend.list_agents().await)
                     else {
                         return Ok(PickOutcome::NoDefaultAgent);
                     };

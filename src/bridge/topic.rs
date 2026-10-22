@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use tracing::Instrument;
 
+use crate::backend::types::SessionListInfo;
 use crate::bridge::display::{dir_basename, id_tail, model_display};
 use crate::bridge::handles::{CardsHandle, SessionsHandle, TopicHandles};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::error::BridgeError;
 use crate::feishu;
-use crate::opencode::types::SessionListInfo;
 
 /// What kind of topic to open: one around a brand-new session (`/topic`, the
 /// `/dir` card's 建话题 op) or one around an EXISTING server session

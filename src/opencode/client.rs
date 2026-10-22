@@ -16,7 +16,7 @@ use crate::bridge::tasks::TasksHandle;
 use super::parsing::parse_model;
 use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
-use super::types::{
+use crate::backend::types::{
     AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, ModelInfo, PermissionRequest,
     PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
     SessionStatus,

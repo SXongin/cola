@@ -18,11 +18,11 @@ use std::time::Duration;
 
 use super::drain::{assistant, ctx, noticed, script_transcript, scripted_app, spawn_sync, user};
 use crate::backend::SessionTranscript;
+use crate::backend::types::SessionStatus;
 use crate::bridge::test_support::*;
 use crate::bridge::turn::{CardOwnership, Turn};
 use crate::config::{ConversationKind, ThreadKey};
 use crate::feishu::card::CardState;
-use crate::opencode::types::SessionStatus;
 
 /// The collected headers under test (the card module owns the copy).
 const SUPERSEDED: &str = "已由新消息接管";

@@ -5,7 +5,6 @@ use tokio::sync::Mutex;
 use crate::bridge::session::{SessionSettings, SessionStore};
 use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
-use crate::opencode;
 
 /// A cached session-list snapshot (cross-store, most recently active first)
 /// with its fetch time. The 30 s TTL keeps `/switch`/`/attach` off the
@@ -13,7 +12,7 @@ use crate::opencode;
 #[derive(Clone)]
 pub struct SessionListCache {
     pub fetched_at: std::time::Instant,
-    pub sessions: Vec<opencode::types::SessionListInfo>,
+    pub sessions: Vec<crate::backend::types::SessionListInfo>,
 }
 
 impl SessionListCache {
@@ -628,7 +627,7 @@ impl SharedCore {
     /// persisted "provider/model" string. `None` when the session has no
     /// override (the client then falls back to the configured default model, or
     /// the server's own default if none is configured).
-    pub async fn session_model_override(&self, session_id: &str) -> Option<opencode::types::ModelInfo> {
+    pub async fn session_model_override(&self, session_id: &str) -> Option<crate::backend::types::ModelInfo> {
         self.sessions_handle().model_override(session_id).await
     }
 
@@ -707,7 +706,7 @@ impl SharedCore {
     /// reuse stays off the wire.
     pub(crate) async fn cached_session_list(
         &self,
-    ) -> crate::error::Result<Vec<opencode::types::SessionListInfo>> {
+    ) -> crate::error::Result<Vec<crate::backend::types::SessionListInfo>> {
         self.sessions_handle().cached_session_list(&self.opencode).await
     }
 

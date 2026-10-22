@@ -367,7 +367,7 @@ async fn switch_reeswitch_snapshots_on_external_newest_message() {
 async fn switch_reeswitch_snapshots_on_busy_status() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_session_status("ses_own1", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_own1", Some(crate::backend::types::SessionStatus::Busy));
     // Cola-authored newest alone is NOT enough to suppress a busy session.
     backend.cola_message("ses_own1", "上次的问题");
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
@@ -395,7 +395,7 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
     let _wd = test_work_dir();
     let mut backend = MockBackend::new(realistic_parts());
     backend.cola_message("ses_own1", "上次的问题");
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "req_own".into(),
         session_id: Some("ses_own1".into()),
         permission: Some("bash".into()),
@@ -441,9 +441,9 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
     cfg.bridge.instant_reminder = pins_enabled;
     let mut backend = MockBackend::new(realistic_parts());
     // Busy proves the pointer outranks the server run state.
-    backend.with_session_status("ses_own1", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_own1", Some(crate::backend::types::SessionStatus::Busy));
     backend.cola_message("ses_own1", "上次的问题");
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "req_own".into(),
         session_id: Some("ses_own1".into()),
         permission: Some("bash".into()),

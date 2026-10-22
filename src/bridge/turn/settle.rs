@@ -31,8 +31,8 @@
 //! so a fix to one loop cannot leave the other diverged.
 
 use crate::backend::TurnAnchor;
+use crate::backend::types::SessionStatus;
 use crate::bridge::handles::FlowHandles;
-use crate::opencode::types::SessionStatus;
 
 use super::{CardOwnership, SettleTiming, Turn, disposition::Disposition, ownership::Ticket};
 

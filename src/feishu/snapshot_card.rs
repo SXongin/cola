@@ -1,7 +1,6 @@
 use crate::backend::{MessageRole, TailEntry, TailMessage};
 use crate::bridge::snapshot::{ElsewherePending, PendingOverflow, SnapshotData};
 use crate::feishu::card::session::{BackToList, back_to_list_button};
-use crate::opencode;
 use serde_json::json;
 
 /// The update promise both live-adoption chips carry (ADR-0028): the busy chip
@@ -51,7 +50,7 @@ fn status_chip(
     has_pending: bool,
     pending_elsewhere: Option<ElsewherePending>,
     waiting: bool,
-    status: Option<opencode::types::SessionStatus>,
+    status: Option<crate::backend::types::SessionStatus>,
 ) -> Option<String> {
     if has_pending {
         return Some(WAITING_CHIP.to_string());
@@ -69,9 +68,9 @@ fn status_chip(
         return Some(format!("{WAITING_BACKGROUND_CHIP}\n{FOLLOW_HINT}"));
     }
     match status {
-        Some(opencode::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{FOLLOW_HINT}")),
-        Some(opencode::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
-        Some(opencode::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
+        Some(crate::backend::types::SessionStatus::Busy) => Some(format!("{BUSY_CHIP}\n{FOLLOW_HINT}")),
+        Some(crate::backend::types::SessionStatus::Retry) => Some(RETRY_CHIP.to_string()),
+        Some(crate::backend::types::SessionStatus::Idle) => Some(IDLE_CHIP.to_string()),
         None => None,
     }
 }
@@ -81,7 +80,7 @@ fn status_chip_element(
     has_pending: bool,
     pending_elsewhere: Option<ElsewherePending>,
     waiting: bool,
-    status: Option<opencode::types::SessionStatus>,
+    status: Option<crate::backend::types::SessionStatus>,
 ) -> Option<serde_json::Value> {
     status_chip(has_pending, pending_elsewhere, waiting, status)
         .map(|content| json!({ "tag": "markdown", "content": content }))
@@ -672,9 +671,9 @@ pub fn build_switched_state_card(
 mod tests {
     use super::*;
     use crate::backend::TailMarker;
+    use crate::backend::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
     use crate::bridge::request::kind::PendingRequest;
     use crate::bridge::snapshot::SnapshotData;
-    use crate::opencode::types::{PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest};
 
     fn permission(req_id: &str, session_id: &str, action: &str) -> PermissionRequest {
         PermissionRequest {
@@ -706,7 +705,7 @@ mod tests {
                         ..Default::default()
                     },
                 ],
-                kind: crate::opencode::types::FormFieldKind::String,
+                kind: crate::backend::types::FormFieldKind::String,
                 custom: None,
                 ..Default::default()
             }],
@@ -715,7 +714,7 @@ mod tests {
     }
 
     fn data(
-        status: Option<opencode::types::SessionStatus>,
+        status: Option<crate::backend::types::SessionStatus>,
         pending: Vec<PendingRequest>,
         tail: Vec<TailEntry>,
     ) -> SnapshotData {
@@ -758,7 +757,7 @@ mod tests {
     /// adoption builds it.
     fn snapshot_of(transcript: &crate::backend::SessionTranscript) -> serde_json::Value {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             transcript.transcript_tail(),
         );
@@ -799,7 +798,7 @@ mod tests {
 
     #[test]
     fn header_has_verb_and_title() {
-        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
+        let d = data(Some(crate::backend::types::SessionStatus::Idle), vec![], vec![]);
         let card = build_snapshot_card("接管", "重写登录模块", &d, None);
         let h = card["header"]["title"]["content"].as_str().unwrap();
         assert_eq!(h, "已接管 重写登录模块", "header: {card}");
@@ -810,27 +809,50 @@ mod tests {
     fn status_chip_precedence_matrix() {
         // The Waiting fact (idle + live Background Tasks, #586): the chip names
         // the wait instead of 空闲, with the follow hint.
-        let waiting = status_chip(false, None, true, Some(opencode::types::SessionStatus::Idle))
-            .expect("a Waiting turn renders its chip");
+        let waiting = status_chip(
+            false,
+            None,
+            true,
+            Some(crate::backend::types::SessionStatus::Idle),
+        )
+        .expect("a Waiting turn renders its chip");
         assert!(waiting.contains(WAITING_BACKGROUND_CHIP), "{waiting}");
         assert!(waiting.contains(FOLLOW_HINT), "{waiting}");
         assert!(!waiting.contains(IDLE_CHIP), "{waiting}");
 
         // Pending beats every run state and the Waiting fact.
         assert_eq!(
-            status_chip(true, None, false, Some(opencode::types::SessionStatus::Busy)).as_deref(),
+            status_chip(
+                true,
+                None,
+                false,
+                Some(crate::backend::types::SessionStatus::Busy)
+            )
+            .as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, None, false, Some(opencode::types::SessionStatus::Retry)).as_deref(),
+            status_chip(
+                true,
+                None,
+                false,
+                Some(crate::backend::types::SessionStatus::Retry)
+            )
+            .as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, None, false, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(
+                true,
+                None,
+                false,
+                Some(crate::backend::types::SessionStatus::Idle)
+            )
+            .as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
-            status_chip(true, None, true, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(true, None, true, Some(crate::backend::types::SessionStatus::Idle)).as_deref(),
             Some(WAITING_CHIP)
         );
         assert_eq!(
@@ -845,7 +867,7 @@ mod tests {
                 true,
                 Some(ElsewherePending::Unpinned),
                 false,
-                Some(opencode::types::SessionStatus::Busy)
+                Some(crate::backend::types::SessionStatus::Busy)
             )
             .as_deref(),
             Some(WAITING_CHIP)
@@ -859,7 +881,7 @@ mod tests {
                 false,
                 Some(ElsewherePending::Pinned),
                 true,
-                Some(opencode::types::SessionStatus::Idle)
+                Some(crate::backend::types::SessionStatus::Idle)
             )
             .as_deref(),
             Some(WAITING_ELSEWHERE_PINNED_CHIP)
@@ -869,7 +891,7 @@ mod tests {
                 false,
                 Some(ElsewherePending::Pinned),
                 false,
-                Some(opencode::types::SessionStatus::Busy)
+                Some(crate::backend::types::SessionStatus::Busy)
             )
             .as_deref(),
             Some(WAITING_ELSEWHERE_PINNED_CHIP)
@@ -879,7 +901,7 @@ mod tests {
                 false,
                 Some(ElsewherePending::Unpinned),
                 false,
-                Some(opencode::types::SessionStatus::Idle)
+                Some(crate::backend::types::SessionStatus::Idle)
             )
             .as_deref(),
             Some(WAITING_ELSEWHERE_CHIP)
@@ -887,16 +909,33 @@ mod tests {
 
         // No pending and not waiting: the server state decides.
         assert!(
-            status_chip(false, None, false, Some(opencode::types::SessionStatus::Busy))
-                .unwrap()
-                .contains(BUSY_CHIP)
+            status_chip(
+                false,
+                None,
+                false,
+                Some(crate::backend::types::SessionStatus::Busy)
+            )
+            .unwrap()
+            .contains(BUSY_CHIP)
         );
         assert_eq!(
-            status_chip(false, None, false, Some(opencode::types::SessionStatus::Retry)).as_deref(),
+            status_chip(
+                false,
+                None,
+                false,
+                Some(crate::backend::types::SessionStatus::Retry)
+            )
+            .as_deref(),
             Some(RETRY_CHIP)
         );
         assert_eq!(
-            status_chip(false, None, false, Some(opencode::types::SessionStatus::Idle)).as_deref(),
+            status_chip(
+                false,
+                None,
+                false,
+                Some(crate::backend::types::SessionStatus::Idle)
+            )
+            .as_deref(),
             Some(IDLE_CHIP)
         );
         // Unknown status and nothing pending → no chip, never guessed.
@@ -909,7 +948,7 @@ mod tests {
     /// busy hint.
     #[test]
     fn pending_elsewhere_points_at_the_host_card_without_the_busy_state() {
-        let mut d = data(Some(opencode::types::SessionStatus::Busy), vec![], vec![]);
+        let mut d = data(Some(crate::backend::types::SessionStatus::Busy), vec![], vec![]);
         d.pending_elsewhere = Some(ElsewherePending::Unpinned);
         let card = build_snapshot_card("接管", "t", &d, None);
         let body = elements(&card)[0]["content"].as_str().unwrap();
@@ -937,7 +976,7 @@ mod tests {
     #[test]
     fn embedded_pending_keeps_the_plain_waiting_chip() {
         let mut d = data(
-            Some(opencode::types::SessionStatus::Busy),
+            Some(crate::backend::types::SessionStatus::Busy),
             vec![PendingRequest::Permission(permission(
                 "req_1",
                 "ses_adopted",
@@ -954,7 +993,7 @@ mod tests {
 
     #[test]
     fn busy_chip_carries_one_hint() {
-        let d = data(Some(opencode::types::SessionStatus::Busy), vec![], vec![]);
+        let d = data(Some(crate::backend::types::SessionStatus::Busy), vec![], vec![]);
         let card = build_snapshot_card("接管", "t", &d, None);
         let body = elements(&card)[0]["content"].as_str().unwrap();
         assert!(body.contains(BUSY_CHIP));
@@ -966,7 +1005,7 @@ mod tests {
     /// about to yield ⏳ with the ledger, and the chip says so up front.
     #[test]
     fn waiting_chip_names_the_background_wait() {
-        let mut d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
+        let mut d = data(Some(crate::backend::types::SessionStatus::Idle), vec![], vec![]);
         d.waiting = true;
         let card = build_snapshot_card("接管", "t", &d, None);
         let body = elements(&card)[0]["content"].as_str().unwrap();
@@ -994,7 +1033,7 @@ mod tests {
     #[test]
     fn pending_permission_block_reuses_buttons() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![PendingRequest::Permission(permission(
                 "req_1",
                 "ses_adopted",
@@ -1023,7 +1062,7 @@ mod tests {
     #[test]
     fn pending_question_block_reuses_question_elements() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![PendingRequest::Question(question("q_1", "ses_adopted"))],
             vec![],
         );
@@ -1037,7 +1076,7 @@ mod tests {
     #[test]
     fn no_pending_block_renders_for_a_different_session() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![
                 PendingRequest::Permission(permission("req_own", "ses_adopted", "bash")),
                 PendingRequest::Permission(permission("req_other", "ses_sibling", "bash")),
@@ -1057,13 +1096,13 @@ mod tests {
     #[test]
     fn empty_and_full_tail() {
         // Empty tail → no 最近对话 section at all.
-        let empty = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
+        let empty = data(Some(crate::backend::types::SessionStatus::Idle), vec![], vec![]);
         let card = build_snapshot_card("接管", "t", &empty, None);
         assert!(!card.to_string().contains("最近对话"));
 
         // Full tail (4) → four role-marked folded panels + the header.
         let full = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![
                 tail(MessageRole::User, 1000, "问题一"),
@@ -1097,7 +1136,7 @@ mod tests {
     #[test]
     fn a_file_bearing_tail_entry_records_the_file_line() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![
                 TailEntry::Message(TailMessage {
@@ -1159,7 +1198,7 @@ mod tests {
         };
         let summary = "摘要正文。".repeat(1_200);
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![
                 tail(MessageRole::User, 1_000, "问题一"),
@@ -1250,7 +1289,7 @@ mod tests {
     #[test]
     fn a_tail_entry_renders_no_skill_fold() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![tail(MessageRole::User, 1000, "/skill implement-spec 644")],
         );
@@ -1298,7 +1337,7 @@ mod tests {
             ),
         ));
         let d = data(
-            Some(opencode::types::SessionStatus::Busy),
+            Some(crate::backend::types::SessionStatus::Busy),
             vec![
                 PendingRequest::Permission(permission("req_1", "ses_adopted", "bash")),
                 PendingRequest::Question(question("q_1", "ses_adopted")),
@@ -1337,7 +1376,7 @@ mod tests {
         let marker_summary =
             "压缩摘要。".repeat(crate::feishu::card::compaction::MAX_COMPACTION_SUMMARY_CHARS / 5);
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![
                 tail(MessageRole::User, 1000, &long("第一条")),
@@ -1386,7 +1425,7 @@ mod tests {
     fn a_tail_entry_larger_than_the_card_is_dropped_and_named() {
         let giant = "巨".repeat(crate::feishu::card::MAX_CARD_JSON_CHARS * 4);
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![tail(MessageRole::User, 1000, &giant)],
         );
@@ -1413,7 +1452,7 @@ mod tests {
             .map(|i| format!("回执{i}：{}", "已由其他客户端处理。".repeat(200)))
             .collect();
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             (0..2)
                 .map(|i| tail(MessageRole::User, i * 1000, &format!("第{i}条短消息")))
@@ -1450,7 +1489,7 @@ mod tests {
             .map(|i| PendingRequest::Permission(permission(&format!("req_{i}"), "ses_adopted", "bash")))
             .collect();
         let d = data(
-            Some(opencode::types::SessionStatus::Busy),
+            Some(crate::backend::types::SessionStatus::Busy),
             pending,
             vec![tail_message(MessageRole::User, 1000, "保留的对话")],
         );
@@ -1499,7 +1538,7 @@ mod tests {
             })
             .collect();
         let d = data(
-            Some(opencode::types::SessionStatus::Busy),
+            Some(crate::backend::types::SessionStatus::Busy),
             pending,
             vec![tail_message(MessageRole::User, 1000, "对话")],
         );
@@ -1524,7 +1563,7 @@ mod tests {
     #[test]
     fn a_fitting_pending_set_is_embedded_whole() {
         let d = data(
-            Some(opencode::types::SessionStatus::Busy),
+            Some(crate::backend::types::SessionStatus::Busy),
             vec![PendingRequest::Permission(permission(
                 "req_1",
                 "ses_adopted",
@@ -1547,7 +1586,7 @@ mod tests {
     #[test]
     fn a_rebuilt_card_names_the_overflow_without_a_count() {
         let mut d = data(
-            Some(opencode::types::SessionStatus::Busy),
+            Some(crate::backend::types::SessionStatus::Busy),
             vec![PendingRequest::Permission(permission(
                 "req_1",
                 "ses_adopted",
@@ -1590,7 +1629,7 @@ mod tests {
             })
             .collect();
         tail.push(tail_message(MessageRole::User, 9000, "最后一条消息"));
-        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], tail);
+        let d = data(Some(crate::backend::types::SessionStatus::Idle), vec![], tail);
         let card = build_snapshot_card("接管", "t", &d, None);
         let s = card.to_string();
 
@@ -1616,7 +1655,7 @@ mod tests {
     fn evicted_entries_do_not_renumber_the_kept_panels() {
         let huge = "巨".repeat(12_000);
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             vec![
                 tail_message(MessageRole::User, 1000, &huge),
@@ -1645,7 +1684,7 @@ mod tests {
     #[test]
     fn a_fitting_card_is_the_full_build_verbatim() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             (0..4)
                 .map(|i| {
@@ -1690,7 +1729,7 @@ mod tests {
     #[test]
     fn a_tail_within_budget_is_not_degraded() {
         let d = data(
-            Some(opencode::types::SessionStatus::Idle),
+            Some(crate::backend::types::SessionStatus::Idle),
             vec![],
             (0..4)
                 .map(|i| {
@@ -1725,7 +1764,7 @@ mod tests {
             scope: crate::feishu::card::session::SwitchScope::All,
             page: 2,
         };
-        let d = data(Some(opencode::types::SessionStatus::Idle), vec![], vec![]);
+        let d = data(Some(crate::backend::types::SessionStatus::Idle), vec![], vec![]);
 
         let card = build_snapshot_card("接管", "t", &d, Some(&back));
         let button = elements(&card)

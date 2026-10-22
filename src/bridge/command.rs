@@ -1727,7 +1727,7 @@ async fn handle_switch(
             .map(|e| e.session_id.clone())
             .collect()
     };
-    let thread_hits: Vec<&crate::opencode::types::SessionListInfo> = sessions
+    let thread_hits: Vec<&crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| thread_ids.contains(&s.id) && matches_keyword(s, &lower))
         .collect();
@@ -1801,7 +1801,7 @@ async fn handle_switch(
     }
 
     // 2. Global search, children excluded.
-    let global_hits: Vec<&crate::opencode::types::SessionListInfo> = sessions
+    let global_hits: Vec<&crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| !s.is_child() && matches_keyword(s, &lower))
         .collect();
@@ -1836,9 +1836,9 @@ async fn handle_switch(
 /// unique title substring — the same order both commands documented.
 enum SessionResolution<'a> {
     /// Exactly one session matched.
-    Hit(&'a crate::opencode::types::SessionListInfo),
+    Hit(&'a crate::backend::types::SessionListInfo),
     /// Several sessions matched; the caller should list candidates.
-    Ambiguous(Vec<&'a crate::opencode::types::SessionListInfo>),
+    Ambiguous(Vec<&'a crate::backend::types::SessionListInfo>),
     /// Nothing matched.
     None,
 }
@@ -1853,21 +1853,21 @@ enum SessionResolution<'a> {
 /// are NOT excluded here — exclusion is a per-command policy (ADR-0008,
 /// ADR-0016).
 fn resolve_session<'a>(
-    sessions: &'a [crate::opencode::types::SessionListInfo],
+    sessions: &'a [crate::backend::types::SessionListInfo],
     query: &str,
 ) -> SessionResolution<'a> {
     let lower = query.to_lowercase();
     if let Some(s) = sessions.iter().find(|s| s.id == query) {
         return SessionResolution::Hit(s);
     }
-    let full_prefix: Vec<&crate::opencode::types::SessionListInfo> = sessions
+    let full_prefix: Vec<&crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| s.id.to_lowercase().starts_with(&lower))
         .collect();
     if let Some(r) = decide_id_hits(full_prefix) {
         return r;
     }
-    let bare_prefix: Vec<&crate::opencode::types::SessionListInfo> = sessions
+    let bare_prefix: Vec<&crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| {
             let id = s.id.to_lowercase();
@@ -1877,7 +1877,7 @@ fn resolve_session<'a>(
     if let Some(r) = decide_id_hits(bare_prefix) {
         return r;
     }
-    let suffix: Vec<&crate::opencode::types::SessionListInfo> = sessions
+    let suffix: Vec<&crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| {
             let id = s.id.to_lowercase();
@@ -1887,7 +1887,7 @@ fn resolve_session<'a>(
     if let Some(r) = decide_id_hits(suffix) {
         return r;
     }
-    let titles: Vec<&crate::opencode::types::SessionListInfo> = sessions
+    let titles: Vec<&crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| s.title.to_lowercase().contains(&lower))
         .collect();
@@ -1903,7 +1903,7 @@ fn resolve_session<'a>(
 /// Turn one id-match tier into a resolution, or `None` when the tier is empty
 /// (so the caller falls through to the next, lower-precedence tier).
 fn decide_id_hits<'a>(
-    hits: Vec<&'a crate::opencode::types::SessionListInfo>,
+    hits: Vec<&'a crate::backend::types::SessionListInfo>,
 ) -> Option<SessionResolution<'a>> {
     match hits.len() {
         0 => None,
@@ -1923,7 +1923,7 @@ fn decide_id_hits<'a>(
 pub(crate) fn child_adoption_refusal(
     store: &crate::bridge::session::SessionStore,
     thread_key: &ThreadKey,
-    info: &crate::opencode::types::SessionListInfo,
+    info: &crate::backend::types::SessionListInfo,
 ) -> Option<String> {
     if !info.is_child() {
         return None;
@@ -2024,7 +2024,7 @@ async fn handle_sub_attach(
         .sessions
         .cached_session_list(&handles.flow.backend)
         .await?;
-    let children: Vec<crate::opencode::types::SessionListInfo> = sessions
+    let children: Vec<crate::backend::types::SessionListInfo> = sessions
         .iter()
         .filter(|s| s.is_child_of(&active_id) && !s.is_archived())
         .cloned()
@@ -2068,7 +2068,7 @@ async fn handle_sub_attach(
             // a scope refusal apart from a plain no-match. Archived sessions
             // (children included) are no more adoptable than they are listable,
             // so they read as no-match.
-            let out_of_scope: Vec<crate::opencode::types::SessionListInfo> = sessions
+            let out_of_scope: Vec<crate::backend::types::SessionListInfo> = sessions
                 .iter()
                 .filter(|s| !s.is_child_of(&active_id) && !s.is_archived())
                 .cloned()
@@ -2247,7 +2247,7 @@ async fn handle_topic_adopt(
 async fn adopt_session(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
-    info: &crate::opencode::types::SessionListInfo,
+    info: &crate::backend::types::SessionListInfo,
     message_id: &str,
     kind: ConversationKind,
     force: bool,
@@ -2463,7 +2463,7 @@ async fn resolve_directory_or_reply(
 /// hit somewhere in the session's title/dir/id — an AND over tokens. This makes
 /// the multiline `/switch` search box usable: pasted/typed multi-line input is
 /// searched as its words, not as one literal string (which could never match).
-pub(crate) fn matches_keyword(s: &crate::opencode::types::SessionListInfo, lower: &str) -> bool {
+pub(crate) fn matches_keyword(s: &crate::backend::types::SessionListInfo, lower: &str) -> bool {
     let haystack = format!(
         "{} {} {}",
         s.title.to_lowercase(),
@@ -2521,7 +2521,7 @@ pub(crate) fn same_dir(a: &str, b: &str) -> bool {
 
 /// The "ambiguous match" candidate list shown when a keyword or id resolves to
 /// several sessions: `title · dir · id-tail`, capped at 8.
-fn candidates_list(header: &str, sessions: &[&crate::opencode::types::SessionListInfo]) -> String {
+fn candidates_list(header: &str, sessions: &[&crate::backend::types::SessionListInfo]) -> String {
     let mut list = String::from(header);
     for s in sessions.iter().take(8) {
         list.push_str(&format!("- {} · {} · {}\n", s.title, s.directory, id_tail(&s.id)));
@@ -2539,8 +2539,8 @@ mod tests {
         assert_eq!(parse_command("fix the bug"), None);
     }
 
-    fn session(id: &str, title: &str) -> crate::opencode::types::SessionListInfo {
-        crate::opencode::types::SessionListInfo {
+    fn session(id: &str, title: &str) -> crate::backend::types::SessionListInfo {
+        crate::backend::types::SessionListInfo {
             id: id.into(),
             title: title.into(),
             directory: "/work/x".into(),

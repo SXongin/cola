@@ -7,7 +7,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -117,7 +117,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_1".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -386,7 +386,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_hung".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -450,7 +450,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend.ask_permissions(vec![
-        opencode::types::PermissionRequest {
+        crate::backend::types::PermissionRequest {
             request_id: "per_aa_toggle".into(),
             session_id: Some("ses_test".into()),
             permission: Some("bash".into()),
@@ -461,7 +461,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
         // A second, already-pending request for the same session — the
         // toggle approves it too and must drop its inline section in the
         // same interaction, not leave it lingering until the next poll.
-        opencode::types::PermissionRequest {
+        crate::backend::types::PermissionRequest {
             request_id: "per_aa_other".into(),
             session_id: Some("ses_test".into()),
             permission: Some("edit".into()),
@@ -894,7 +894,7 @@ async fn autoaccept_command_keeps_the_standalone_card_for_the_sweep() {
     backend.ask_permission(perm_request("per_1", "ses_1", "ls -la"));
     // The session is still live (an external/other-client run): the stale copy
     // keeps the neutral vocabulary.
-    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     // The poller surfaced this one as a standalone card (no live turn card).
@@ -947,7 +947,7 @@ async fn auto_accept_session_answers_permission_without_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.ask_permissions(vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_aa".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -1024,7 +1024,7 @@ async fn autoaccept_on_approves_already_pending_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.ask_permissions(vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_pending".into(),
         session_id: Some("ses_test".into()),
         permission: Some("bash".into()),
@@ -1082,7 +1082,7 @@ async fn autoaccept_on_approves_child_session_permission() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut mock = MockBackend::new(realistic_parts());
-    mock.ask_permissions(vec![opencode::types::PermissionRequest {
+    mock.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_child".into(),
         session_id: Some("ses_child".into()),
         permission: Some("bash".into()),
@@ -1128,7 +1128,7 @@ async fn stale_permission_card_marked_handled_when_resolved_elsewhere() {
     // No pending permissions on the server — the card cola sent is stale —
     // and the run is still live: another client answered it.
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
     app.permission.sent_cards.lock().await.insert(
         "per_stale".into(),
@@ -1182,7 +1182,7 @@ async fn failed_directory_list_keeps_permission_surfaces() {
     // The requests are resolved elsewhere while the run stays live, so the
     // healed directory's cleanup leaves the neutral receipt.
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
@@ -1275,7 +1275,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.ask_permissions(vec![opencode::types::PermissionRequest {
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
         request_id: "per_topic".into(),
         session_id: Some("ses_topic".into()),
         permission: Some("bash".into()),
@@ -1339,8 +1339,8 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
 
 // ===== Interaction Receipts (ADR-0038) =====
 
-fn perm_req(id: &str, session: &str, pattern: &str) -> opencode::types::PermissionRequest {
-    opencode::types::PermissionRequest {
+fn perm_req(id: &str, session: &str, pattern: &str) -> crate::backend::types::PermissionRequest {
+    crate::backend::types::PermissionRequest {
         request_id: id.into(),
         session_id: Some(session.into()),
         permission: Some("bash".into()),
@@ -1676,7 +1676,7 @@ async fn sweep_repaints_a_live_turn_card_when_the_request_resolves_elsewhere() {
     // The server no longer lists the request AND the run is still live:
     // another client resolved it while the turn continued.
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_session_status("ses_1", Some(opencode::types::SessionStatus::Busy));
+    backend.with_session_status("ses_1", Some(crate::backend::types::SessionStatus::Busy));
     let (app, platform) = build_app(cfg, backend).await;
     seed_session(&app, "ses_1", "/work").await;
     seed_inline_permission_card(&app, "ses_1", "per_1").await;

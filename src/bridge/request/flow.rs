@@ -19,7 +19,6 @@ use crate::bridge::pollers::{
 use crate::bridge::question::{QuestionState, stale_question_card};
 use crate::bridge::surfaces::{StandaloneSurface, Surfaces};
 use crate::bridge::turn::Turn;
-use crate::opencode;
 
 use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, resolve_blocks, vanished_receipt,
@@ -31,7 +30,7 @@ use super::kind::{PendingRequest, RequestKind};
 /// until the field is finalized). Named because the pair travels together
 /// through the reply path; captured under one lock, cloned for the reply.
 pub(crate) struct QuestionSnapshot {
-    pub fields: Vec<opencode::types::QuestionInfo>,
+    pub fields: Vec<crate::backend::types::QuestionInfo>,
     pub answers: Vec<Option<Vec<String>>>,
 }
 
@@ -238,7 +237,7 @@ impl RequestFlow {
     /// resolve: the full request (card rebuilds) and its owning directory
     /// (routing a reply whose callback no longer carries one). Refreshing an
     /// already-remembered request keeps its recorded answers/toggles.
-    pub(crate) async fn remember_question(&self, req: &opencode::types::QuestionRequest, dir: &str) {
+    pub(crate) async fn remember_question(&self, req: &crate::backend::types::QuestionRequest, dir: &str) {
         let mut states = self.question_state.lock().await;
         match states.entry(req.id.clone()) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
@@ -274,7 +273,10 @@ impl RequestFlow {
     }
 
     /// The remembered question request, cloned for a card rebuild.
-    pub(crate) async fn question_request(&self, req_id: &str) -> Option<opencode::types::QuestionRequest> {
+    pub(crate) async fn question_request(
+        &self,
+        req_id: &str,
+    ) -> Option<crate::backend::types::QuestionRequest> {
         self.question_state
             .lock()
             .await

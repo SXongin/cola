@@ -441,7 +441,7 @@ async fn session_info_exposes_parent_and_model_on_every_generation() {
 /// status line cannot tell them apart.
 #[tokio::test]
 async fn session_status_maps_idle_busy_retry_on_every_generation() {
-    use crate::opencode::types::SessionStatus;
+    use crate::backend::types::SessionStatus;
 
     for case in cases() {
         let generation = case.generation.as_str();
@@ -909,7 +909,7 @@ async fn permission_list_and_reply_round_trip_on_every_generation() {
 /// option whose submitted value is what a click sends back.
 #[tokio::test]
 async fn form_list_and_keyed_reply_round_trip_on_every_generation() {
-    use crate::opencode::types::{FormAnswer, FormFieldKind, FormValue};
+    use crate::backend::types::{FormAnswer, FormFieldKind, FormValue};
 
     for case in cases() {
         let generation = case.generation.as_str();
@@ -985,7 +985,7 @@ async fn form_cancel_round_trips_on_every_generation() {
 /// caller sees one shape either way: [`SessionSelection`].
 #[tokio::test]
 async fn session_switches_round_trip_only_where_the_generation_keeps_them() {
-    use crate::opencode::types::ModelInfo;
+    use crate::backend::types::ModelInfo;
 
     for case in cases() {
         let generation = case.generation.as_str();

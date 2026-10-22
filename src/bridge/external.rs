@@ -689,7 +689,7 @@ impl ExternalFlow {
                 .backend
                 .session_status(session_id, Some(&data.directory))
                 .await,
-            Ok(Some(crate::opencode::types::SessionStatus::Busy))
+            Ok(Some(crate::backend::types::SessionStatus::Busy))
         );
         if !busy_now && !data.waiting {
             tracing::info!(
@@ -1390,7 +1390,7 @@ pub(crate) async fn settle_snapshot_after_send(
         // (server-idle with live Background Tasks, ADR-0059) — the follow's
         // first settle read then stamps the ⏳ yield in place and Session Sync
         // serves the wait (#586). Anything else keeps the static snapshot.
-        let followed = (data.status == Some(crate::opencode::types::SessionStatus::Busy) || data.waiting)
+        let followed = (data.status == Some(crate::backend::types::SessionStatus::Busy) || data.waiting)
             && external
                 .start_snapshot_follow(handles, &data.session_id, snapshot_message_id, verb, title, data)
                 .await;

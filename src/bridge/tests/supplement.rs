@@ -17,8 +17,8 @@ use crate::bridge::test_support::*;
 use crate::feishu::card::CardState;
 
 /// One question with a single option, for the two-question fixtures below.
-fn question_fixture(text: &str, header: &str, label: &str) -> crate::opencode::types::QuestionInfo {
-    use crate::opencode::types::{QuestionInfo, QuestionOption};
+fn question_fixture(text: &str, header: &str, label: &str) -> crate::backend::types::QuestionInfo {
+    use crate::backend::types::{QuestionInfo, QuestionOption};
     QuestionInfo {
         question: text.into(),
         header: header.into(),
@@ -27,15 +27,15 @@ fn question_fixture(text: &str, header: &str, label: &str) -> crate::opencode::t
             description: String::new(),
             ..Default::default()
         }],
-        kind: crate::opencode::types::FormFieldKind::String,
+        kind: crate::backend::types::FormFieldKind::String,
         custom: None,
         ..Default::default()
     }
 }
 
 /// The question request the question flow replays and replies to.
-fn question_request(request_id: &str, session_id: &str) -> crate::opencode::types::QuestionRequest {
-    crate::opencode::types::QuestionRequest {
+fn question_request(request_id: &str, session_id: &str) -> crate::backend::types::QuestionRequest {
+    crate::backend::types::QuestionRequest {
         id: request_id.into(),
         session_id: session_id.into(),
         questions: vec![

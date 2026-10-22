@@ -49,7 +49,7 @@ pub(crate) async fn switch_card_data(
     keyword: &str,
     scope: SwitchScope,
 ) -> (
-    Vec<crate::opencode::types::SessionListInfo>,
+    Vec<crate::backend::types::SessionListInfo>,
     Option<String>,
     Vec<String>,
     SwitchScope,
@@ -78,7 +78,7 @@ pub(crate) async fn switch_card_data(
         SwitchScope::All
     };
     let lower = keyword.to_lowercase();
-    let mut shown: Vec<crate::opencode::types::SessionListInfo> = sessions
+    let mut shown: Vec<crate::backend::types::SessionListInfo> = sessions
         .into_iter()
         .filter(|s| {
             !s.is_child()
@@ -151,8 +151,8 @@ pub(crate) async fn child_card_data(
     keyword: &str,
     page: usize,
 ) -> (
-    Vec<crate::opencode::types::SessionListInfo>,
-    std::collections::HashMap<String, Option<crate::opencode::types::SessionStatus>>,
+    Vec<crate::backend::types::SessionListInfo>,
+    std::collections::HashMap<String, Option<crate::backend::types::SessionStatus>>,
 ) {
     let Some(active_id) = handles.flow.sessions.get_session_id(thread_key).await else {
         return (Vec::new(), std::collections::HashMap::new());
@@ -164,7 +164,7 @@ pub(crate) async fn child_card_data(
         .await
         .unwrap_or_default();
     let lower = keyword.to_lowercase();
-    let mut children: Vec<crate::opencode::types::SessionListInfo> = sessions
+    let mut children: Vec<crate::backend::types::SessionListInfo> = sessions
         .into_iter()
         .filter(|s| {
             s.is_child_of(active_id.as_str())
@@ -632,10 +632,10 @@ pub(crate) fn build_viewer_for_classified(
 /// own agent service sorts the configured default (or `build`) first, so the
 /// first primary visible agent in that order IS the server default — no
 /// `/config` round trip needed. A thin alias over
-/// [`AgentInfo::default_agent`](crate::opencode::types::AgentInfo::default_agent)
+/// [`AgentInfo::default_agent`](crate::backend::types::AgentInfo::default_agent)
 /// so the card and V2's `/agent --reset` switch resolve one rule.
-fn server_default_agent(agents: &[crate::opencode::types::AgentInfo]) -> Option<String> {
-    crate::opencode::types::AgentInfo::default_agent(agents)
+fn server_default_agent(agents: &[crate::backend::types::AgentInfo]) -> Option<String> {
+    crate::backend::types::AgentInfo::default_agent(agents)
 }
 
 /// Resolve what the `/agent` card should show for a thread's target session:
@@ -997,7 +997,7 @@ mod tests {
         let mut child = list_session("ses_child", "子任务", "/work/a", 999);
         child.parent_id = Some("ses_root".into());
         let mut archived = list_session("ses_arch", "归档", "/work/arch", 888);
-        archived.time = Some(opencode::types::SessionTime {
+        archived.time = Some(crate::backend::types::SessionTime {
             created: 1,
             updated: 888,
             archived: Some(1),
@@ -1065,7 +1065,7 @@ mod tests {
         let cfg = test_config(&dir.path().join("sessions.json"));
         let mut backend = MockBackend::new(realistic_parts());
         let mut archived = list_session("ses_arch", "归档", "/work/arch", 888);
-        archived.time = Some(opencode::types::SessionTime {
+        archived.time = Some(crate::backend::types::SessionTime {
             created: 1,
             updated: 888,
             archived: Some(1),

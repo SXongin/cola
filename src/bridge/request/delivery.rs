@@ -7,7 +7,6 @@ use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, RequestsHandle};
 use crate::bridge::pollers::result_card;
 use crate::bridge::turn::Turn;
-use crate::opencode;
 
 use super::flow::RequestFlow;
 
@@ -393,7 +392,7 @@ pub(super) async fn refresh_question_block(
     session_id: &str,
     clicked: Option<&str>,
     req_id: &str,
-    request: &opencode::types::QuestionRequest,
+    request: &crate::backend::types::QuestionRequest,
     directory: &str,
     display: &[Option<Vec<String>>],
     done: &[bool],

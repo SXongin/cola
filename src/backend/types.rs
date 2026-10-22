@@ -1,20 +1,27 @@
-//! Wire types for the OpenCode Server REST API.
+//! The shared DTOs of the backend contract (spec #860, #870).
 //!
-//! Every type mirrors the server's JSON contract; camelCase fields carry
-//! `#[serde(rename)]` (AGENTS.md pitfall `wire-shapes`). Request-body builders and
-//! payload parsing live with the generation strategy (`v1`), never here.
+//! They carry the request and response shapes the `Backend` trait speaks —
+//! sessions, permissions, questions, providers, agents, models — so they live
+//! beside the trait instead of inside one adapter. A second adapter is written
+//! against these names (ADR-0090); neutralising them is decision 7 of that ADR
+//! and is deliberately *not* done here: this module is the relocation, not a
+//! reshape.
 //!
-//! These DTOs are the [`crate::backend`] contract's shapes and the documented
-//! out-of-scope exception to the generation seam (spec #332): a strategy
-//! decodes its generation's payloads into them, so a few generation-flavoured
-//! shapes (the session-list entry, the permission request's V1 field names, the
-//! status fan-out) still surface here. The typed form model
-//! ([`QuestionRequest`]/[`QuestionInfo`]) is genuinely neutral: the V1 strategy
-//! maps its positional questions onto it and the V2 strategy decodes its
-//! `Form.Field` union into it, so the card layer never learns a generation
-//! (spec #364, S6). Generation-private wire structs live with the strategy
-//! instead (the V2 read model's landed in `opencode::v2::wire`, spec #364 S4a)
-//! and convert into these neutral shapes.
+//! Today every type mirrors the OpenCode server's JSON contract; camelCase
+//! fields carry `#[serde(rename)]` (AGENTS.md pitfall `wire-shapes`).
+//! Request-body builders and payload parsing live with the generation strategy
+//! (`opencode::v1`), never here.
+//!
+//! These DTOs are the documented out-of-scope exception to the generation seam
+//! (spec #332): a strategy decodes its generation's payloads into them, so a
+//! few generation-flavoured shapes (the session-list entry, the permission
+//! request's V1 field names, the status fan-out) still surface here. The typed
+//! form model ([`QuestionRequest`]/[`QuestionInfo`]) is genuinely neutral: the
+//! V1 strategy maps its positional questions onto it and the V2 strategy
+//! decodes its `Form.Field` union into it, so the card layer never learns a
+//! generation (spec #364, S6). Generation-private wire structs live with the
+//! strategy instead (the V2 read model's landed in `opencode::v2::wire`, spec
+//! #364 S4a) and convert into these neutral shapes.
 
 #![allow(dead_code)] // protocol types — field coverage matches server contract
 

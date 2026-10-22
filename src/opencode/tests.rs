@@ -6,7 +6,7 @@
 
 use super::client::OpenCodeBackend;
 use super::parsing::parse_model;
-use super::types::{CreateSessionInput, Location};
+use crate::backend::types::{CreateSessionInput, Location};
 use crate::test_http::{RecordedRequest, TestHttpServer};
 
 /// A backend pointed at the fake server with both Basic-auth parts set — what

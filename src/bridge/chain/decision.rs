@@ -23,9 +23,9 @@
 //! probe's collect arms target the recorded orphan, never the held successor.
 
 use super::records::{ChainRecord, WakeMark};
+use crate::backend::types::SessionStatus;
 use crate::backend::{SessionTranscript, TurnAnchor, TurnSettle};
 use crate::bridge::turn::CursorSeed;
-use crate::opencode::types::SessionStatus;
 
 /// The disposition of one reconcile pass over a
 /// [Chain Record](ChainRecord) — the reap's whole vocabulary (ADR-0063,

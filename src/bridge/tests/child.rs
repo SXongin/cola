@@ -3,9 +3,9 @@
 //! live status read per rendered row), the `/sub attach` takeover, and the
 //! child policy that keeps the general session surfaces roots-only.
 
+use crate::backend::types::SessionStatus;
 use crate::bridge::test_support::*;
 use crate::feishu::card::session::{CHILD_IDLE, CHILD_RUNNING};
-use crate::opencode::types::SessionStatus;
 
 fn key() -> crate::config::ThreadKey {
     crate::config::ThreadKey::new("chat_1".into(), "chat_1".into())
@@ -20,7 +20,7 @@ fn child_of(
     updated: i64,
     parent: &str,
     agent: &str,
-) -> crate::opencode::types::SessionListInfo {
+) -> crate::backend::types::SessionListInfo {
     let mut s = list_session(id, title, directory, updated);
     s.parent_id = Some(parent.to_string());
     s.agent = Some(agent.to_string());
