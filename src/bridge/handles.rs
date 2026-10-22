@@ -280,6 +280,57 @@ impl SessionsHandle {
         Ok(pending)
     }
 
+    /// [`Self::declare_pending`] for a **card callback**, which runs on a
+    /// deadline (ADR-0089): the pending is mutated in memory under the store
+    /// lock, the write is deferred to the store's writer thread, and only the
+    /// wait for the file is bounded by `deadline`.
+    ///
+    /// `Ok(None)` means the store lock was still held at `deadline`, so nothing
+    /// was mutated and the callback must not claim the pending was declared.
+    /// `Err` means the pending IS declared in memory and only the save failed.
+    /// Running out of time while the write is in flight is not an error: the
+    /// write still lands, in order, after the callback has answered.
+    pub(crate) async fn declare_pending_until(
+        &self,
+        thread_key: &ThreadKey,
+        directory: impl Into<String>,
+        title: Option<String>,
+        deadline: tokio::time::Instant,
+    ) -> crate::error::Result<Option<PendingEntry>> {
+        let mut pending = self.new_pending(thread_key, directory, title);
+        let Ok(mut store) = tokio::time::timeout_at(deadline, self.store.lock()).await else {
+            return Ok(None);
+        };
+        // `timeout_at` polls its future first, so a lock released a moment
+        // after the deadline is still acquired. Mutating then would commit a
+        // click whose answer Feishu has already given up on, so the deadline is
+        // hard HERE — the one place a mutation could still slip through.
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if let Some(replaced) = store.pending_for(thread_key) {
+            pending.topic_anchor = replaced.topic_anchor.clone();
+            pending.topic_root = replaced.topic_root.clone();
+        }
+        let Some(receipt) = store.set_pending_deferred(pending.clone(), deadline)? else {
+            // The mutation overran the deadline and was rolled back: the click
+            // is answered as "nothing changed".
+            return Ok(None);
+        };
+        drop(store);
+        match receipt.settle_until(deadline).await {
+            Some(Ok(())) => Ok(Some(pending)),
+            Some(Err(error)) => Err(error.into()),
+            None => {
+                // The write outlived the callback's bound; it still lands. The
+                // pending is already in memory, so the next message routes to
+                // it even though the user's confirmation raced the file.
+                tracing::warn!("pending write still in flight at the card deadline");
+                Ok(Some(pending))
+            }
+        }
+    }
+
     /// The Pending Session a conversation's next prompt will materialise,
     /// carrying the configured `default_auto_accept` (#513). Every production
     /// declaration path (`/new`, `/dir`, `/topic`, the switch card's 新建)
@@ -1752,6 +1803,30 @@ impl CommandHandles {
         self.flow
             .sessions
             .declare_pending(thread_key, directory, title)
+            .await
+    }
+
+    /// [`Self::declare_pending_in_current_project`] for a **card callback**
+    /// (ADR-0089): the resolution and the declaration share `deadline`, and
+    /// only their wait is bounded — a lock still held at the deadline returns
+    /// `Ok(None)` with nothing mutated.
+    pub(crate) async fn declare_pending_in_current_project_until(
+        &self,
+        thread_key: &ThreadKey,
+        title: Option<String>,
+        deadline: tokio::time::Instant,
+    ) -> crate::error::Result<Option<PendingEntry>> {
+        // The same resolution as [`Self::declare_pending_in_current_project`]
+        // (including its `bridge.work_dir` fallback), only bounded: it must not
+        // be re-derived here, or the two would drift.
+        let Ok(directory) =
+            tokio::time::timeout_at(deadline, self.current_project_directory(thread_key)).await
+        else {
+            return Ok(None);
+        };
+        self.flow
+            .sessions
+            .declare_pending_until(thread_key, directory, title, deadline)
             .await
     }
 

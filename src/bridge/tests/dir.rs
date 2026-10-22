@@ -132,7 +132,8 @@ async fn new_command_falls_back_to_work_dir_without_active_session() {
 async fn dir_card_pick_declares_a_pending_and_refreshes_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
     let mut backend = MockBackend::new(realistic_parts());
     backend.given_sessions(vec![
         list_session("ses_a", "项目A", "/work/a", 100),
@@ -180,6 +181,54 @@ async fn dir_card_pick_declares_a_pending_and_refreshes_card() {
     assert!(
         card_str.contains("当前"),
         "refreshed card marks current: {card_str}"
+    );
+    // ADR-0089: the deferred write is settled before the callback answers, so
+    // the confirmation the user saw is already durable.
+    let text = std::fs::read_to_string(&sessions).unwrap();
+    assert!(text.contains("/work/b"), "the pending reached the file: {text}");
+}
+
+/// A pick whose `sessions.json` write fails says BOTH halves (ADR-0089): the
+/// pending took effect in memory, the save did not. A clean success toast would
+/// hide a change that is lost on restart.
+#[tokio::test]
+async fn dir_card_pick_reports_a_failed_save_without_denying_the_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.given_sessions(vec![list_session("ses_a", "项目A", "/work/a", 100)]);
+    let (app, _platform) = build_app(cfg, backend).await;
+    // A directory squatting on the target makes the atomic rename fail — the
+    // same shape `session.rs`'s failed-deferred-write test uses.
+    std::fs::create_dir(&sessions).unwrap();
+
+    let value = serde_json::json!({
+        "action": "dir",
+        "op": "pick",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "directory": "/work/b",
+    });
+    let result = app
+        .host_action(value)
+        .await
+        .expect("dir pick should return a result");
+    let toast = result.toast.clone().unwrap_or_default();
+    assert!(
+        toast.contains("保存失败") && toast.contains("/work/b"),
+        "the toast names the failed save and the new directory: {toast:?}"
+    );
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key)
+            .map(|p| p.directory.clone()),
+        Some("/work/b".to_string()),
+        "the pending is declared in memory even though the save failed"
     );
 }
 
@@ -1091,7 +1140,8 @@ async fn dir_browse_pick_declares_a_pending_in_the_child() {
     let proj_dir = proj.path().to_string_lossy().to_string();
     let child = proj.path().join("alpha");
     let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
     let created = MockBackend::new(realistic_parts());
     let created_dirs = created.created_session_dirs.clone();
     let (app, _platform) = build_app(cfg, created).await;
@@ -1116,6 +1166,9 @@ async fn dir_browse_pick_declares_a_pending_in_the_child() {
         "pending rooted at the canonical child"
     );
     assert!(created_dirs.lock().await.is_empty(), "no server session created");
+    // ADR-0089: the deferred write settles before the callback answers.
+    let text = std::fs::read_to_string(&sessions).unwrap();
+    assert!(text.contains("alpha"), "the pending reached the file: {text}");
 }
 
 /// The 前往 submit navigates to the typed path; an invalid one clamps to the

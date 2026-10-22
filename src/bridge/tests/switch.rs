@@ -1161,7 +1161,8 @@ async fn switch_card_adopt_in_topic_persists_anchor() {
 async fn switch_card_new_action_declares_pending_in_current_project() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
     let backend = MockBackend::new(realistic_parts());
     let created = backend.created_session_dirs.clone();
     let (app, _platform) = build_app(cfg, backend).await;
@@ -1211,6 +1212,50 @@ async fn switch_card_new_action_declares_pending_in_current_project() {
         .cloned()
         .expect("a pending is declared");
     assert_eq!(pending.directory, "/work/proj", "inherits the current project");
+    // ADR-0089: the deferred write settles before the callback answers.
+    let text = std::fs::read_to_string(&sessions).unwrap();
+    assert!(
+        text.contains("/work/proj"),
+        "the pending reached the file: {text}"
+    );
+}
+
+/// The `/switch` card's 新建 with no session and no pending falls back to
+/// `bridge.work_dir` — the same resolution `/new` uses (ADR-0041), so the card
+/// and the command cannot disagree about the project.
+#[tokio::test]
+async fn switch_card_new_falls_back_to_work_dir_without_active_session() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = test_config(&dir.path().join("sessions.json"));
+    let work = dir.path().join("work");
+    cfg.bridge.work_dir = Some(work.clone());
+    let (app, _platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "switch",
+            "op": "new",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+        }))
+        .await
+        .expect("switch new should return a result");
+    assert_eq!(result.toast.as_deref(), Some("下一条消息创建会话"));
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key)
+        .cloned()
+        .expect("a pending is declared");
+    assert_eq!(pending.directory, work.to_string_lossy().to_string());
+    assert_eq!(
+        saved_pending_dirs(&dir.path().join("sessions.json")),
+        vec![work.to_string_lossy().to_string()],
+        "the fallback pending reached the file too"
+    );
 }
 
 /// Re-adopting an already-mapped session through the switch card must not

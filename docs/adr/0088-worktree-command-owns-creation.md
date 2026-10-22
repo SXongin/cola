@@ -85,8 +85,9 @@ nothing is ever moved.
   line reads as a required procedure rather than a list you can just read, so
   the routes stay in `/help` and the user guide. Moving the conversation into a
   checkout stays `/dir`'s job and adopting an existing Session stays
-  `/switch`'s; a pick button would have made this feature's only callback write
-  the session store — the one operation a callback cannot bound (ADR-0089). The
+  `/switch`'s; a pick button would have duplicated both, and it was a callback
+  writing the session store — which ADR-0089's writer now makes boundable, so
+  the duplicate is the whole reason it stays out. The
   current marker falls back to `bridge.work_dir` when the conversation has
   neither a session nor a pending, matching `/new`.
 - **Dirty is measured, bounded.** One `git status --porcelain` per worktree,
@@ -121,9 +122,10 @@ nothing is ever moved.
   wrong, for a value the user can choose in English.
 - **Make the card a picker.** Rejected on the second look: re-rooting is
   `/dir`'s job and adopting is `/switch`'s, so a pick button would duplicate
-  both — and, unlike either, it would be a card callback writing the session
-  store, the one operation a callback cannot bound (ADR-0089). The card's rows
-  still say what a picker would show; the routes out are named under it.
+  both. Its write to the session store is boundable since ADR-0089 (the
+  callback defers the write and only bounds its wait), which leaves the
+  duplication as the reason — and the card's rows still say what a picker would
+  show, with the routes out named under it.
 - **Removal in the same change.** Rejected: clean/dirty and force guards plus
   mappings that outlive a directory are a separate decision with their own
   failure modes.
