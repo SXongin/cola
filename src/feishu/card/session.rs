@@ -919,13 +919,10 @@ pub fn build_worktree_card(rows: &[WorktreeRow], repo: &str) -> serde_json::Valu
         };
         elements.push(card_text_row(&format!("{title}\n{branch}{dirty}{sessions}")));
     }
-    // ADR-0088: the list is read-only. Re-rooting keeps the ONE meaning it has
-    // everywhere (`/dir`'s Pending Session) and adopting an existing Session
-    // stays `/switch`'s job, so this card needs no callback and no button.
-    elements.push(json!({
-        "tag": "markdown",
-        "content": "用 `/dir <路径>` 在该 worktree 重新落根；已有会话用 `/switch <名字>` 接管。",
-    }));
+    // ADR-0088: the list is read-only and carries no how-to footer — re-rooting
+    // keeps the one meaning `/dir` already has, adopting stays `/switch`'s, and
+    // a hint line read as a required procedure rather than a card you can just
+    // read. The card needs no callback and no button.
     card_shell("🌲 worktree", "blue", elements)
 }
 
@@ -2547,7 +2544,6 @@ mod tests {
             !text.contains("\"tag\":\"button\""),
             "the list is read-only: {text}"
         );
-        assert!(text.contains("/dir <路径>"), "the re-root route is named: {text}");
 
         let empty = build_worktree_card(&[], "/r").to_string();
         assert!(empty.contains("还没有 worktree"), "{empty}");
