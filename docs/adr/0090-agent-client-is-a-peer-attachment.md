@@ -191,9 +191,10 @@ config half (`ThreadKey`'s `root_id` alias: add, tolerate, never rename).
 
 ## Open questions (gate the adapter, not this ADR)
 
-**Resolved** by the 2026-10-23 amendment at the end of this file, on
-`codex-cli 0.163.0`. Kept for history: the questions below are what the spike
-was run against.
+**Answered in part** by the 2026-10-23 amendment at the end of this file, on
+`codex-cli 0.163.0`: questions 1 and 2 fully, question 3 at the protocol level
+(the TUI half is #884's), question 4 on Linux only. Kept for history: the
+questions below are what the spike was run against.
 
 1. With two connections subscribed to one thread, does a server-initiated
    approval go to every subscriber, only the turn's initiator, or the first to
@@ -213,13 +214,18 @@ Run on WSL2/Linux with the standalone install: `codex app-server --listen
 ws://127.0.0.1:4501`, two raw JSON-RPC WebSocket connections (A = the turn's
 initiator, B = a second client that joined with `thread/resume`), and model
 traffic through a custom `[model_providers.*]` entry with
-`wire_api = "responses"`. No ChatGPT sign-in was involved, which is itself the
-answer to the configuration question below.
+`wire_api = "responses"`. No ChatGPT sign-in was involved — a provider-keyed
+setup, which is the configuration decision 3 has to support.
+
+Status: 1 and 2 are answered; 3 is answered at the protocol level, with the TUI
+half left to #884; 4 is answered for Linux, with Windows still open. Each
+answer says which it is.
 
 ### The four questions
 
-**1. An approval reaches every subscriber, and any of them can answer it.** A's
-turn raised `item/commandExecution/requestApproval`; both A and B received it
+**1. An approval reaches every subscriber, and any of them can answer it.**
+_Answered._ A's turn raised `item/commandExecution/requestApproval`; both A
+and B received it (A: 1, B: 1). B — the non-initiating client — answered
 (A: 1, B: 1). B — the non-initiating client — answered
 `{"decision":"accept"}`, both connections then received
 `serverRequest/resolved`, and the turn completed normally on both streams.
@@ -227,24 +233,33 @@ Peer Attachment for Codex is therefore **read-plus-write**, not
 read-plus-start: the ADR's stronger claim holds.
 
 **2. `thread/resume` is the subscription, and it requires a persisted
-rollout.** On a thread that has not yet run a turn, resume fails with
-`-32600 no rollout found for thread id …`, so a freshly `thread/start`-ed
-thread cannot be adopted until it has history — cola must present that as a
-named state, not a transport error. A second client's resume does not disturb
-the first subscriber: A kept receiving the full `turn/*` and `item/*` stream
-while B received it too. `thread/unsubscribe` answers `notSubscribed` when the
-connection never subscribed, and does not unload a thread another subscriber
-holds (the server keeps it for the 30-minute inactivity grace).
+rollout.** _Answered._ On a thread that has not yet run a turn, resume fails
+with `-32600 no rollout found for thread id …`, so a freshly
+`thread/start`-ed thread cannot be adopted until it has history — cola must
+present that as a named state, not a transport error. A second client's resume
+does not disturb the first subscriber: A kept receiving the full `turn/*` and
+`item/*` stream while B received it too. Across reconnects the subscription is
+clean and idempotent: B dropped its socket, a new connection resumed the same
+thread successfully and received the next turn's item stream, a second resume on
+that same connection also succeeded, and A was never disturbed. The thread stays
+loaded while any subscriber holds it. `thread/unsubscribe` answers
+`notSubscribed` when the connection never subscribed, and does not unload a
+thread another subscriber holds (the server keeps it for the 30-minute
+inactivity grace).
 
-**3. A second client can act on an in-flight turn.** A `turn/start` from B while
-A's turn was running was accepted and folded into the active turn — it returned
-A's `turnId`, and no second turn was created. `turn/steer` from B was accepted
-immediately, its text appeared as a user-message item in **A's** stream, and the
-model answered the steer on both connections. There is no dedicated steer
-notification: a steer is a user message inside the turn, so the adapter renders
-it through the ordinary item path.
+**3. A second client can act on an in-flight turn.** _Answered at the protocol
+level; the TUI half is open._ A `turn/start` from B while A's turn was running
+was accepted and folded into the active turn — it returned A's `turnId`, and no
+second turn was created. `turn/steer` from B was accepted immediately, its text
+appeared as a user-message item in **A's** stream, and the model answered the
+steer on both connections. There is no dedicated steer notification: a steer is
+a user message inside the turn, so the adapter renders it through the ordinary
+item path. Whether the **TUI** paints that steer — and another client's approval
+— was not observed here: the spike used raw WebSocket clients, so it is
+inference from the shared item stream until #884 checks it on a real TUI.
 
-**4. `CODEX_HOME` relocation works, and the control socket is a symlink.** The
+**4. `CODEX_HOME` relocation works, and the control socket is a symlink.**
+_Answered for Linux; Windows open._ The
 socket follows `$CODEX_HOME/app-server-control/app-server-control.sock`, and
 that path is a symlink into `/tmp/codex-daemon-0/<hash>`; discovery must follow
 it rather than require a regular socket file. A `CODEX_HOME` under `/tmp` makes
@@ -268,9 +283,11 @@ server still serves). Windows remains untested.
   support requirement — a provider-keyed `[model_providers.*]` entry is a fully
   supported configuration.
 - Pinned surface for `0.163.0`: **105 client→server methods, 85 notifications,
-  10 server→client requests**. `codex app-server generate-json-schema --out
-  <dir>` emits the schema for the running binary; that output, generated from
-  the pinned version, is what the adapter's contract is checked against.
+  10 server→client requests**. The three lists are checked in at
+  `docs/reference/codex-app-server-0.163.0.md`, generated from the binary with
+  `codex app-server generate-json-schema --out <dir>`, so a CLI bump is a diff
+  against that file rather than a re-derivation — and that output, generated
+  from the pinned version, is what the adapter's contract is checked against.
 
 ### Corrections to this ADR
 
