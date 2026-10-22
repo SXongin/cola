@@ -762,7 +762,7 @@ mod tests {
     async fn walker_matches_the_starting_session_without_a_hop() {
         let core = core_with_parents(vec![]).await;
         // Predicate matches the start id directly — no session_info call.
-        let found = walk_parent_chain(&core.opencode, "s0", Some("/w"), |current| {
+        let found = walk_parent_chain(&core.client, "s0", Some("/w"), |current| {
             let current = current.to_string();
             async move { (current == "s0").then_some(current) }
         })
@@ -773,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn walker_follows_the_chain_until_the_predicate_matches() {
         let core = core_with_parents(vec![("child".into(), "parent".into())]).await;
-        let found = walk_parent_chain(&core.opencode, "child", Some("/w"), |current| {
+        let found = walk_parent_chain(&core.client, "child", Some("/w"), |current| {
             let current = current.to_string();
             async move { (current == "parent").then_some(current) }
         })
@@ -784,8 +784,7 @@ mod tests {
     #[tokio::test]
     async fn walker_stops_at_a_self_parent_loop() {
         let core = core_with_parents(vec![("a".into(), "a".into())]).await;
-        let found =
-            walk_parent_chain(&core.opencode, "a", Some("/w"), |_| async move { None::<String> }).await;
+        let found = walk_parent_chain(&core.client, "a", Some("/w"), |_| async move { None::<String> }).await;
         assert_eq!(found, None);
     }
 
@@ -797,13 +796,8 @@ mod tests {
             .map(|i| (format!("s{}", i), format!("s{}", i + 1)))
             .collect();
         let core = core_with_parents(parents).await;
-        let found = walk_parent_chain(
-            &core.opencode,
-            "s0",
-            Some("/w"),
-            |_| async move { None::<String> },
-        )
-        .await;
+        let found =
+            walk_parent_chain(&core.client, "s0", Some("/w"), |_| async move { None::<String> }).await;
         assert_eq!(found, None);
     }
 
@@ -811,7 +805,7 @@ mod tests {
     async fn walker_without_a_directory_checks_only_the_start_session() {
         // No directory handle → the parent chain can't be walked (ADR-0010).
         let core = core_with_parents(vec![("child".into(), "parent".into())]).await;
-        let found = walk_parent_chain(&core.opencode, "child", None, |current| {
+        let found = walk_parent_chain(&core.client, "child", None, |current| {
             let current = current.to_string();
             async move { (current == "parent").then_some(current) }
         })

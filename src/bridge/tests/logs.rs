@@ -651,7 +651,7 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
         crate::bridge::topic::sync_topic_cover_title(
             &app.cards_handle(),
             &app.sessions_handle(),
-            &app.opencode,
+            &app.client,
             "ses_test",
         )
         .await
