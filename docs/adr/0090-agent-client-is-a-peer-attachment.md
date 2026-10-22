@@ -70,8 +70,8 @@ not ChatGPT. cola becomes an app-server client: `initialize` + `initialized`,
 `thread/resume` to subscribe, the item/turn notification stream for rendering,
 `turn/start`/`turn/steer`/`turn/interrupt` for prompts and `/stop`,
 `thread/compact/start` for `/compact`, `model/list` and `skills/list` for the
-pickers. Approval requests raise Permission cards; `tool/requestUserInput` and
-elicitation raise Question cards. `thread/status/changed` feeds Session Sync.
+pickers. Approval requests raise Permission cards; `item/tool/requestUserInput`
+and elicitation raise Question cards. `thread/status/changed` feeds Session Sync.
 
 **3. The user's client must be pointed at that server, and cola diagnoses when
 it is not.** A daemon-attached TUI (`codex app-server daemon start`, then
@@ -191,8 +191,9 @@ config half (`ThreadKey`'s `root_id` alias: add, tolerate, never rename).
 
 ## Open questions (gate the adapter, not this ADR)
 
-These are answered by a live spike before the adapter merges, and each one can
-change the shape of a card path:
+**Resolved** by the 2026-10-23 amendment at the end of this file, on
+`codex-cli 0.163.0`. Kept for history: the questions below are what the spike
+was run against.
 
 1. With two connections subscribed to one thread, does a server-initiated
    approval go to every subscriber, only the turn's initiator, or the first to
@@ -205,3 +206,91 @@ change the shape of a card path:
 4. Does the daemon's implicit attachment work on every supported platform
    (Windows AF_UNIX limits are documented), and how does discovery behave when
    `CODEX_HOME` is relocated?
+
+## Amendment (2026-10-23): the gating spike's answers, on `codex-cli 0.163.0`
+
+Run on WSL2/Linux with the standalone install: `codex app-server --listen
+ws://127.0.0.1:4501`, two raw JSON-RPC WebSocket connections (A = the turn's
+initiator, B = a second client that joined with `thread/resume`), and model
+traffic through a custom `[model_providers.*]` entry with
+`wire_api = "responses"`. No ChatGPT sign-in was involved, which is itself the
+answer to the configuration question below.
+
+### The four questions
+
+**1. An approval reaches every subscriber, and any of them can answer it.** A's
+turn raised `item/commandExecution/requestApproval`; both A and B received it
+(A: 1, B: 1). B — the non-initiating client — answered
+`{"decision":"accept"}`, both connections then received
+`serverRequest/resolved`, and the turn completed normally on both streams.
+Peer Attachment for Codex is therefore **read-plus-write**, not
+read-plus-start: the ADR's stronger claim holds.
+
+**2. `thread/resume` is the subscription, and it requires a persisted
+rollout.** On a thread that has not yet run a turn, resume fails with
+`-32600 no rollout found for thread id …`, so a freshly `thread/start`-ed
+thread cannot be adopted until it has history — cola must present that as a
+named state, not a transport error. A second client's resume does not disturb
+the first subscriber: A kept receiving the full `turn/*` and `item/*` stream
+while B received it too. `thread/unsubscribe` answers `notSubscribed` when the
+connection never subscribed, and does not unload a thread another subscriber
+holds (the server keeps it for the 30-minute inactivity grace).
+
+**3. A second client can act on an in-flight turn.** A `turn/start` from B while
+A's turn was running was accepted and folded into the active turn — it returned
+A's `turnId`, and no second turn was created. `turn/steer` from B was accepted
+immediately, its text appeared as a user-message item in **A's** stream, and the
+model answered the steer on both connections. There is no dedicated steer
+notification: a steer is a user message inside the turn, so the adapter renders
+it through the ordinary item path.
+
+**4. `CODEX_HOME` relocation works, and the control socket is a symlink.** The
+socket follows `$CODEX_HOME/app-server-control/app-server-control.sock`, and
+that path is a symlink into `/tmp/codex-daemon-0/<hash>`; discovery must follow
+it rather than require a regular socket file. A `CODEX_HOME` under `/tmp` makes
+Codex warn that it declines to install helper binaries there (warning only; the
+server still serves). Windows remains untested.
+
+### Facts the adapter is written against
+
+- `thread/list` and `thread/loaded/list` are **server-global**, not
+  per-connection.
+- `thread/started`, `thread/status/changed`, `remoteControl/status/changed` and
+  the `thread/goal/*` family are **broadcast to every connection**, subscribed
+  or not; `turn/*`, `item/*` and `error` go **only to subscribers**. Session
+  Sync can read status without subscribing; rendering must `thread/resume`.
+- A turn started with no usable credential is **accepted first** and then fails
+  as an `error` notification (`codexErrorInfo.responseStreamDisconnected.httpStatusCode
+  = 401`, `willRetry: true`, 5 retries). An unreachable or uncredentialed
+  backend therefore looks like a live turn that never completes. Decision 3's
+  diagnosis gains a second, stronger check: **`cola doctor` must establish that
+  the configured provider can complete a turn.** A ChatGPT sign-in is not a
+  support requirement — a provider-keyed `[model_providers.*]` entry is a fully
+  supported configuration.
+- Pinned surface for `0.163.0`: **105 client→server methods, 85 notifications,
+  10 server→client requests**. `codex app-server generate-json-schema --out
+  <dir>` emits the schema for the running binary; that output, generated from
+  the pinned version, is what the adapter's contract is checked against.
+
+### Corrections to this ADR
+
+- `tool/requestUserInput` is spelled **`item/tool/requestUserInput`** in
+  0.163.0 (corrected inline above).
+- Server→client requests are **10**, not the four listed in the decision: add
+  `item/permissions/requestApproval`, `item/tool/call`,
+  `account/chatgptAuthTokens/refresh` and `attestation/generate`, alongside the
+  legacy `applyPatchApproval` / `execCommandApproval` pair.
+- The read-side consequence stands as written: the adapter owns the
+  subscription and serves cola's poll-shaped reads from it. Nothing in the
+  spike argues for a Bridge redesign.
+
+### Left unverified
+
+- Whether a real **TUI** renders another client's steer and approvals. The
+  spike used raw WebSocket clients; the item stream is shared, so it should,
+  but that is inference until #884 observes it.
+- The Windows half of the daemon/socket matrix (AF_UNIX limits).
+- Whether cola's `thread/resume` can race a TUI-side unload inside the
+  server's 30-minute grace window.
+
+Spec #860's ticket map is cut from these answers.
