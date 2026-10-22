@@ -3,7 +3,7 @@
 //! Discovery produces candidate servers; this module is the one place that
 //! turns a candidate into an attachment: probe `GET /api/info` with the
 //! credentials discovery resolved, apply the `[opencode] generation` override
-//! ([`crate::opencode::generation`]), log the evidence, and carry the resolved
+//! (the adapter's generation probe), log the evidence, and carry the resolved
 //! generation on the [`ResolvedServer`].
 //!
 //! An inconclusive probe returns its evidence as an error: the caller stays

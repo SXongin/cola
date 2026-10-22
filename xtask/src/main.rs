@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
+mod client_seam_guard;
 mod codex_gate;
 mod doc_drift;
 mod generation_guard;
@@ -11,7 +12,7 @@ fn main() {
         eprintln!("Usage: cargo xtask <task>");
         eprintln!(
             "Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, \
-             check-doc-drift, release"
+             check-client-seam, check-doc-drift, release"
         );
         exit(1);
     });
@@ -24,12 +25,13 @@ fn main() {
         "audit" => run_audit(),
         "check-commit-msg" => run_check_commit_msg(),
         "check-generation" => generation_guard::run(),
+        "check-client-seam" => client_seam_guard::run(),
         "check-doc-drift" => doc_drift::run(),
         "release" => release::cli(),
         other => {
             eprintln!(
                 "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
-                 check-generation, check-doc-drift, release"
+                 check-generation, check-client-seam, check-doc-drift, release"
             );
             exit(1);
         }
