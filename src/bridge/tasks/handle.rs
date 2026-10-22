@@ -22,8 +22,8 @@
 //! when the read happens (see that method).
 //!
 //! **One instance, two holders.** The handle is created by `src/main.rs` and
-//! threaded into `OpenCodeBackend` **at construction**
-//! ([`crate::opencode::client::OpenCodeBackend::with_tasks`], ticket #682): the
+//! threaded into the OpenCode adapter **at construction**
+//! (`OpenCodeBackend::with_tasks`, ticket #682): the
 //! adapter holds it and applies the liveness tier to **every** transcript read
 //! at the pinned apply seam, while the Bridge reaches the SAME handle through
 //! [`crate::backend::Backend::tasks`] and records through

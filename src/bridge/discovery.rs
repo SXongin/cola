@@ -11,7 +11,7 @@
 //! breaks the real-time sync they expect.
 //!
 //! The server's protocol generation is not discovery's call: it is learned by
-//! probing at attach time (`crate::opencode::generation`, spec #364 §2). A V2
+//! probing at attach time (the adapter's generation probe, spec #364 §2). A V2
 //! managed service (`serve --service`) carries no `--port` flag, so its port
 //! and private password come from the registration file its state dir holds —
 //! the official client's discovery contract.

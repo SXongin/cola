@@ -122,6 +122,7 @@ Commits, `pre-push` runs the dependency audit. The full loop CI runs:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask check-generation
+cargo xtask check-client-seam
 cargo xtask check-doc-drift
 cargo test --workspace --locked
 cargo build --release --locked
@@ -131,6 +132,15 @@ cargo build --release --locked
 literals and wire field names may live only in the V1 generation strategy
 (`src/opencode/v1/`) or the explicitly allow-listed tool-render surface, so V1
 retirement stays a deletion rather than a scavenger hunt.
+
+`cargo xtask check-client-seam` is the client seam guard (spec #860): no file
+under `src/` outside `src/opencode/` may name the OpenCode adapter's module path
+(`crate::opencode`). The seam's vocabulary is `crate::backend` — the DTOs in
+`crate::backend::types`, the `Backend` trait, the neutral read model — and the
+bridge reaches the active client through `SharedCore::client`, so a second
+adapter does not have to edit the bridge to exist (ADR-0090). The only
+exemptions are the adapter's own modules and, until #875, its attach/lifecycle
+plumbing (`generation`, `strategy`, `transport`), listed one item at a time.
 
 `cargo xtask check-doc-drift` is the translation drift guard: it compares the
 Simplified Chinese user guide (`docs/user-guide.zh-CN.md`) with its English
