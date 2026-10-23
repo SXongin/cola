@@ -226,9 +226,11 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   accepts `url`, `start_server`, `generation` and `model`, exactly as
   `[opencode]` does. A named Agent Client does not inherit `[opencode]`'s
   values.
-- **Only those keys are accepted.** Any other key — a typo such as
-  `model_typo`, or a nested `[clients.ada.opencode]` table — is a config error
-  naming `clients.<id>.<key>`, never a silently ignored setting.
+- **Only those keys are accepted, and only on `opencode`.** Any other key — a
+  typo such as `model_typo`, or a nested `[clients.ada.opencode]` table — is a
+  config error naming `clients.<id>.<key>`, and so is an `opencode` option on
+  a client of another kind (for example `kind = "codex"` plus `model`), which
+  the running client would ignore. Never a silently ignored setting.
 - **`default_client`** — the id of the active Agent Client. Unset means
   `default` (`[opencode]`). Exactly one Agent Client is active per cola process
   (ADR-0090); switching Agent Clients is this key plus a restart.
