@@ -400,9 +400,8 @@ impl<'de> Deserialize<'de> for ClientEntry {
 
 /// `[clients.<id>]` is one table: `kind` plus that kind's options. An
 /// `opencode` Agent Client prints its keys; any other kind prints them only
-/// when the file actually spelled one, so a config `config show` would
-/// otherwise hide — and resolution rejects — stays visible until the error is
-/// read.
+/// when the file actually spelled one, so an option that resolution rejects
+/// stays visible in `config show` until the error is read.
 impl Serialize for ClientEntry {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
