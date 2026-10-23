@@ -1526,12 +1526,28 @@ async fn owner_label(core: &Arc<SharedCore>, owner_key: &ThreadKey) -> String {
 }
 
 impl App {
+    /// The test-suite constructor: the production daemon builds the layout once
+    /// and calls [`Self::with_layout`].
+    #[cfg(test)]
     pub fn new(
         cfg: Config,
         client: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
-        let core = Arc::new(SharedCore::new(&cfg, client, feishu)?);
+        let layout = crate::state::StateLayout::from_config(&cfg);
+        Self::with_layout(cfg, layout, client, feishu)
+    }
+
+    /// The daemon's constructor: it builds the layout once and shares it with
+    /// the boot-time server resolution. The test suite uses the layout-building
+    /// `new` instead.
+    pub fn with_layout(
+        cfg: Config,
+        layout: crate::state::StateLayout,
+        client: Arc<dyn crate::backend::Backend>,
+        feishu: Arc<dyn feishu::Platform>,
+    ) -> anyhow::Result<Self> {
+        let core = Arc::new(SharedCore::new(&cfg, layout, client, feishu)?);
         let access = tokio::sync::Mutex::new(Access::new(cfg.bridge.access_file.clone()));
         Ok(Self {
             self_weak: std::sync::OnceLock::new(),
@@ -1681,7 +1697,7 @@ impl App {
             .terminal_log_root
             .get()
             .cloned()
-            .or_else(crate::bridge::terminal::default_terminal_root)
+            .or_else(|| self.layout.terminal_root())
         else {
             return;
         };
@@ -1728,7 +1744,7 @@ impl App {
         let _ = self.self_weak.set(Arc::downgrade(&self));
         // After a `/restart` or self-update, announce it where the command was
         // issued: inside the Topic when there was one, else in the chat.
-        let notify_path = command::restart_notify_path();
+        let notify_path = command::restart_notify_path(&self.layout);
         if let Ok(raw) = std::fs::read_to_string(&notify_path)
             && let Ok(notify) = serde_json::from_str::<command::RestartNotify>(&raw)
         {

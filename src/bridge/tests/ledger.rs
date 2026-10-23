@@ -1842,9 +1842,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // reached a card, so no bit may be set — a later card must still render it.
     assert!(
         !ChainRecords::load(
-            dir.path()
-                .join("sessions.json")
-                .with_file_name("chain_records.json")
+            crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records()
         )
         .ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
         "a permanently refused write flips no shown bit either"
@@ -1853,9 +1851,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // it (ADR-0080): durable and OWED, so the entry renders on the next card
     // that can carry it.
     let persisted = ChainRecords::load(
-        dir.path()
-            .join("sessions.json")
-            .with_file_name("chain_records.json"),
+        crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records(),
     );
     assert!(
         persisted.endings("ses_test").iter().any(|record| {
@@ -1925,9 +1921,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // refused write flipped nothing (the entry never reached a card), and the
     // accepted successor write — which really carried the entry — flips it.
     let persisted = ChainRecords::load(
-        dir.path()
-            .join("sessions.json")
-            .with_file_name("chain_records.json"),
+        crate::state::StateLayout::new(dir.path().join("sessions.json"), None).chain_records(),
     );
     assert!(
         persisted.ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
@@ -3730,7 +3724,10 @@ async fn a_cleanup_never_advances_the_durable_watermark_for_a_late_wake() {
     // the CLEANUP class, which must never stand in for the run's end (issue
     // #659).
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert_eq!(
         persisted.announced("ses_test"),
         None,
@@ -3805,7 +3802,10 @@ async fn a_cleanup_mark_never_gates_a_late_wakes_completion() {
     })
     .await;
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Cleanup),
         "the delivered 🧹 entry shows the cleanup's own ending"
@@ -3899,7 +3899,10 @@ async fn a_runtime_retirement_never_advances_the_durable_watermark_for_a_late_wa
     .await;
 
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert_eq!(
         persisted.announced("ses_test"),
         None,
@@ -4082,7 +4085,10 @@ async fn a_late_wake_after_a_restart_joins_the_retirements_shown_bit() {
     .await;
 
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Evidence),
         "life 1's delivered retirement leaves its shown bit"
@@ -4160,7 +4166,10 @@ async fn a_confirmed_write_persists_the_wake_ending_and_a_restart_suppresses_it(
     .await;
 
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.ending_shown("ses_test", &run_of("sh_bg"), TaskEndingClass::Wake),
         "the confirmed card write persists the Wake ending's shown bit: {:?}",
@@ -4231,7 +4240,10 @@ async fn a_delivered_retirement_marks_shown_without_moving_the_wake_mark() {
     .await;
 
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.ending_shown("ses_test", &run_of("call_bg"), TaskEndingClass::Evidence),
         "the delivered entry leaves its durable shown bit"
@@ -6752,7 +6764,10 @@ async fn a_wake_less_retirement_renders_once_across_a_restart() {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.ending_shown("ses_test", &run_of("call_sub"), TaskEndingClass::Evidence),
         "the delivered entry leaves its durable shown bit past the record's release"
@@ -6825,7 +6840,10 @@ async fn a_restart_renders_the_owed_ending_the_read_no_longer_derives() {
         .unwrap();
 
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.endings("ses_test").iter().any(|record| {
             record.run.names("call_bg")
@@ -6911,7 +6929,10 @@ async fn a_cleanup_survives_a_restart() {
     .await;
 
     let session_file = dir.path().join("sessions.json");
-    let persisted = ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted.endings("ses_test").iter().any(|record| {
             record.run.names("call_sub")

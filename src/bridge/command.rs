@@ -823,12 +823,9 @@ pub(crate) fn restart_process() -> std::io::Result<()> {
 }
 
 /// The file the restart flow uses to tell the new process which chat to
-/// announce the restart in.
-pub(crate) fn restart_notify_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cola")
-        .join("restart-notify.json")
+/// announce the restart in. The path is the layout's (`~/.cola`).
+pub(crate) fn restart_notify_path(layout: &crate::state::StateLayout) -> std::path::PathBuf {
+    layout.restart_notify()
 }
 
 /// The announcement `/restart` and `/update` leave for the successor process
@@ -877,9 +874,9 @@ pub(crate) enum RestartKind {
 
 /// Persist the announcement for the successor process. Best effort: a failed
 /// write only means the restart isn't announced.
-fn write_restart_notify(notify: &RestartNotify) {
+fn write_restart_notify(layout: &crate::state::StateLayout, notify: &RestartNotify) {
     if let Ok(raw) = serde_json::to_string(notify) {
-        let _ = std::fs::write(restart_notify_path(), raw);
+        let _ = std::fs::write(restart_notify_path(layout), raw);
     }
 }
 
@@ -1529,7 +1526,7 @@ pub(crate) async fn handle_command(
             // Remember where to announce the restart: the chat, plus the
             // command message/thread so an in-Topic command announces back
             // inside its topic.
-            write_restart_notify(&RestartNotify::new(&thread_key, message_id));
+            write_restart_notify(&handles.flow.layout, &RestartNotify::new(&thread_key, message_id));
             // Under a systemd unit, do NOT spawn a child: `KillMode=control-group`
             // would kill it when the unit stops. Exit with the supervisor-restart
             // code and let `Restart=on-failure` bring the unit back up from the
@@ -1554,7 +1551,12 @@ pub(crate) async fn handle_command(
             // A server launched by another tool is never touched: cola has
             // no record of its configuration, and killing it could take
             // down another application's runtime.
-            match crate::bridge::discovery::restart_self_spawned_server(handles.preferred_port).await {
+            match crate::bridge::discovery::restart_self_spawned_server(
+                &handles.flow.layout,
+                handles.preferred_port,
+            )
+            .await
+            {
                 Ok(crate::bridge::discovery::RestartOutcome::Restarted) => {
                     handles
                         .flow
@@ -1614,7 +1616,7 @@ pub(crate) async fn handle_command(
                 let mut notify = RestartNotify::new(&thread_key, message_id);
                 notify.kind = RestartKind::Update;
                 notify.version = Some(new_version.to_string());
-                write_restart_notify(&notify);
+                write_restart_notify(&handles.flow.layout, &notify);
                 crate::update::restart();
             }
         }

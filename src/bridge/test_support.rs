@@ -3434,7 +3434,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
         },
         bridge: crate::config::BridgeConfig {
             session_file: session_file.to_path_buf(),
-            access_file: session_file.with_file_name("access.json"),
+            access_file: crate::state::StateLayout::beside(session_file, "access.json"),
             work_dir: None,
             default_auto_accept: false,
             group_completion_notice: true,
@@ -3455,7 +3455,7 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
 /// A config whose Access List does not exist — the bot is unclaimed.
 pub fn test_config_unclaimed(session_file: &std::path::Path) -> crate::config::Config {
     let mut cfg = test_config(session_file);
-    cfg.bridge.access_file = session_file.with_file_name("access-unclaimed.json");
+    cfg.bridge.access_file = crate::state::StateLayout::beside(session_file, "access-unclaimed.json");
     cfg
 }
 

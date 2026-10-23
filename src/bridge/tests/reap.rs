@@ -36,7 +36,7 @@ use crate::feishu::card::CardState;
 
 /// The sidecar path the app's own rule derives from the session file.
 fn sidecar(session_file: &Path) -> PathBuf {
-    session_file.with_file_name("chain_records.json")
+    crate::state::StateLayout::beside(session_file, "chain_records.json")
 }
 
 /// Seed the record a previous cola life left behind — the card that was live
@@ -3385,11 +3385,11 @@ async fn a_projection_never_re_announces_a_wake_the_watermark_covers() {
     .with_executions(vec![execution(2_600), execution(4_000)])
     .with_wakes(vec![shell_wake(2_900)]);
     // An earlier card already announced this Wake: the durable mark covers it.
-    crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json")).advance(
-        "ses_test",
-        "msg_wake_2900",
-        2_900,
-    );
+    crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ))
+    .advance("ses_test", "msg_wake_2900", 2_900);
     let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
@@ -3445,11 +3445,11 @@ async fn a_projection_announces_a_wake_newer_than_the_watermark() {
     .with_executions(vec![execution(2_600), execution(3_400), execution(4_200)])
     .with_wakes(vec![shell_wake(2_900), shell_wake(3_600)]);
     // The durable mark already announced the older Wake.
-    crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json")).advance(
-        "ses_test",
-        "msg_wake_2900",
-        2_900,
-    );
+    crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ))
+    .advance("ses_test", "msg_wake_2900", 2_900);
     let (app, platform, _backend) =
         restarted_app_with_backend(&session_file, transcript, Some(SessionStatus::Idle)).await;
     platform.given_card_view("om_frozen", live_tail_orphan_view());
@@ -6905,7 +6905,11 @@ async fn a_live_adoption_announces_the_wake_its_successor_rendered() {
 /// The persisted interactive-surface record's raw JSON, or `None` when the
 /// file is gone (the surfaces test's own read).
 fn persisted_surfaces(session_file: &Path) -> Option<String> {
-    std::fs::read_to_string(session_file.with_file_name("interactive_surfaces.json")).ok()
+    std::fs::read_to_string(crate::state::StateLayout::beside(
+        session_file,
+        "interactive_surfaces.json",
+    ))
+    .ok()
 }
 
 /// The adoption and the pending-request migration are one sequence (spec #561,
@@ -7300,8 +7304,10 @@ async fn an_ambiguous_adoption_create_is_never_retried() {
     // The attempt's write-ahead intent is durable (spec #561, review #569): a
     // crash between the create and the re-point leaves it behind, so the next
     // life treats the create as ambiguous too.
-    let persisted =
-        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         persisted
             .get("ses_test")
@@ -8593,8 +8599,10 @@ async fn a_mid_chain_projection_failure_keeps_only_the_landed_slices() {
         app.cards_handle().chains.get("ses_test").is_some(),
         "the record stays for the next life's recovery"
     );
-    let persisted =
-        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert_eq!(
         persisted
             .cursor("ses_test")
@@ -9737,8 +9745,11 @@ async fn a_crash_after_the_successor_create_never_re_posts_on_restart() {
     );
     // The state the crash leaves: the create landed (nothing re-pointed the
     // record) and only the intent is durable.
-    crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"))
-        .note_projection_intent("ses_test", "om_frozen");
+    crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ))
+    .note_projection_intent("ses_test", "om_frozen");
 
     let transcript = SessionTranscript::new(vec![
         user("msg_cola_anchor", 1_000, "问题"),
@@ -9816,8 +9827,10 @@ async fn a_definite_refusal_leaves_no_durable_intent_across_a_restart() {
         spawn_sync_with_timeout(&app, 300);
         wait_for_transcript_reads(&_backend, "ses_test", 1).await;
     }
-    let persisted =
-        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert!(
         !persisted
             .get("ses_test")

@@ -1535,6 +1535,9 @@ pub(crate) struct TurnHandles {
     /// The shared Background Task runtime reconciliation (#589): the drain's
     /// read observes it, so a task that dies mid-turn ends the turn directly.
     pub(crate) runtime_reconcile: Arc<crate::bridge::runtime::RuntimeReconcile>,
+    /// The one owner of the on-disk layout (ADR-0090 §6). A Turn's flows reach
+    /// the pid record, the restart notice and the Terminal Log root through it.
+    pub(crate) layout: crate::state::StateLayout,
 }
 
 impl TurnHandles {
@@ -1550,6 +1553,7 @@ impl TurnHandles {
             backend: Arc::clone(&self.backend),
             platform: Arc::clone(&self.platform),
             runtime_reconcile: Arc::clone(&self.runtime_reconcile),
+            layout: self.layout.clone(),
         }
     }
 }
@@ -1572,6 +1576,8 @@ pub(crate) struct FlowHandles {
     /// and the out-of-turn settle loop observe through the one process-wide
     /// throttle this carries.
     pub(crate) runtime_reconcile: Arc<crate::bridge::runtime::RuntimeReconcile>,
+    /// The one owner of the on-disk layout (ADR-0090 §6).
+    pub(crate) layout: crate::state::StateLayout,
 }
 
 impl FlowHandles {

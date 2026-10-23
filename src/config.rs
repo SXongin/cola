@@ -25,7 +25,7 @@ pub fn resolve_config_path(explicit: Option<&str>, cwd: &Path, home: &Path) -> O
     if cwd_config.exists() {
         return Some(cwd_config);
     }
-    let home_config = home.join(".cola").join("cola.toml");
+    let home_config = crate::state::StateLayout::for_home(home).config_file();
     if home_config.exists() {
         return Some(home_config);
     }
@@ -256,17 +256,11 @@ fn default_log_days() -> u32 {
 }
 
 fn default_session_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cola")
-        .join("sessions.json")
+    crate::state::StateLayout::default().session_file().to_path_buf()
 }
 
 fn default_access_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cola")
-        .join("access.json")
+    crate::state::StateLayout::default().access_file()
 }
 
 /// A key that uniquely identifies a session context on the Feishu side.
@@ -752,8 +746,9 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         std::fs::write(cwd.path().join("cola.toml"), "").unwrap();
-        std::fs::create_dir_all(home.path().join(".cola")).unwrap();
-        std::fs::write(home.path().join(".cola/cola.toml"), "").unwrap();
+        let home_config = crate::state::StateLayout::for_home(home.path()).config_file();
+        std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        std::fs::write(home_config, "").unwrap();
         let p = resolve_config_path(None, cwd.path(), home.path());
         assert_eq!(p.unwrap(), cwd.path().join("cola.toml"));
     }
@@ -762,10 +757,11 @@ mod tests {
     fn resolve_config_falls_back_to_home_when_cwd_missing() {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join(".cola")).unwrap();
-        std::fs::write(home.path().join(".cola/cola.toml"), "").unwrap();
+        let home_config = crate::state::StateLayout::for_home(home.path()).config_file();
+        std::fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        std::fs::write(&home_config, "").unwrap();
         let p = resolve_config_path(None, cwd.path(), home.path());
-        assert_eq!(p.unwrap(), home.path().join(".cola/cola.toml"));
+        assert_eq!(p.unwrap(), home_config);
     }
 
     #[test]

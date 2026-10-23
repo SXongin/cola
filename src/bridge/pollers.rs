@@ -60,7 +60,11 @@ fn needs_reattach(current_url: &str, attached_pid: Option<i32>, picked: &ServerC
 /// to a Coexistent one. The yield (ADR-0013). The pid file is cleared only
 /// after the process is confirmed dead (SIGTERM, escalating to SIGKILL) — a
 /// lingering process cola lost the record of could never be reaped.
-async fn reap_owned_server(candidates: &[ServerCandidate], self_pid: Option<i32>) {
+async fn reap_owned_server(
+    layout: &crate::state::StateLayout,
+    candidates: &[ServerCandidate],
+    self_pid: Option<i32>,
+) {
     let Some(self_pid) = self_pid else { return };
     if !candidates.iter().any(|c| c.pid == self_pid) {
         return;
@@ -71,7 +75,7 @@ async fn reap_owned_server(candidates: &[ServerCandidate], self_pid: Option<i32>
         return;
     }
     if wait_dead(self_pid, 5000).await {
-        discovery::clear_self_spawned();
+        discovery::clear_self_spawned(layout);
         return;
     }
     tracing::warn!(
@@ -80,7 +84,7 @@ async fn reap_owned_server(candidates: &[ServerCandidate], self_pid: Option<i32>
     );
     let _ = discovery::force_kill(self_pid);
     if wait_dead(self_pid, 5000).await {
-        discovery::clear_self_spawned();
+        discovery::clear_self_spawned(layout);
     } else {
         tracing::warn!(
             "yield: Owned Server {} did not exit after SIGKILL; keeping its pid record",
@@ -172,17 +176,20 @@ async fn reconcile(
     heal_when_busy: bool,
 ) -> crate::error::Result<bool> {
     let candidates = discovery::scan_processes();
-    let self_pid = discovery::self_spawned_pid();
+    let self_pid = discovery::self_spawned_pid(&handles.flow.layout);
     let Some(server) = discovery::pick_server(&candidates, handles.server.preferred_port, self_pid) else {
         // No default-store server at all. Lazy Start: start a server on demand
         // (the Shared Service first, else an Owned `serve --port`); otherwise
         // stay serverless (the caller replies that OpenCode is unavailable).
         let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(&handles.flow.waits).await);
         if want_spawn && handles.server.start_policy.spawns_when_needed() {
-            let spawned =
-                discovery::spawn_own_server(handles.server.preferred_port, handles.server.generation)
-                    .await
-                    .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
+            let spawned = discovery::spawn_own_server(
+                &handles.flow.layout,
+                handles.server.preferred_port,
+                handles.server.generation,
+            )
+            .await
+            .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
             handles.flow.backend.reconnect(Some(&spawned)).await?;
             // The spawned server only serves requests after a short startup
             // window (requests landing in it are swallowed forever). Wait until
@@ -196,13 +203,13 @@ async fn reconcile(
                 // re-runs this reconcile and spawns a fresh one — leaving the
                 // record in place would re-attach a scan-found wedged server
                 // (its requests are swallowed, hanging the turn again).
-                if let Some(pid) = discovery::self_spawned_pid() {
+                if let Some(pid) = discovery::self_spawned_pid(&handles.flow.layout) {
                     if discovery::terminate_process(pid).is_ok() && wait_dead(pid, 5000).await {
-                        discovery::clear_self_spawned();
+                        discovery::clear_self_spawned(&handles.flow.layout);
                     } else {
                         let _ = discovery::force_kill(pid);
                         if wait_dead(pid, 5000).await {
-                            discovery::clear_self_spawned();
+                            discovery::clear_self_spawned(&handles.flow.layout);
                         }
                     }
                 }
@@ -306,7 +313,7 @@ async fn reconcile(
         if busy(&handles.flow.waits).await {
             return Ok(true);
         }
-        reap_owned_server(&candidates, self_pid).await;
+        reap_owned_server(&handles.flow.layout, &candidates, self_pid).await;
     }
     Ok(true)
 }
@@ -754,8 +761,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config(&dir.path().join("sessions.json"));
+        let layout = crate::state::StateLayout::from_config(&cfg);
         let platform = Arc::new(RecordingPlatform::new());
-        Arc::new(SharedCore::new(&cfg, Arc::new(backend), platform).unwrap())
+        Arc::new(SharedCore::new(&cfg, layout, Arc::new(backend), platform).unwrap())
     }
 
     #[tokio::test]
