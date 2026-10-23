@@ -92,6 +92,12 @@ impl ThreadProjection {
         }
     }
 
+    /// Whether a turn has ever been folded in (from a live event or resumed
+    /// history). An unseeded projection cannot answer a run-state question.
+    pub(crate) fn is_seeded(&self) -> bool {
+        !self.turn_order.is_empty()
+    }
+
     /// Whether a turn is currently between `turn/started` and `turn/completed`.
     /// The neutral transcript has no live flag of its own (a message's missing
     /// completion stamp and the session status carry that fact); this
@@ -349,6 +355,8 @@ impl ThreadProjection {
             kind,
             started_at_ms: None,
             completed_at_ms: None,
+            completed: false,
+            started_seen: false,
         });
         self.index.insert(id.to_string(), index);
         index
@@ -463,18 +471,33 @@ impl ThreadProjection {
         let kind = ItemKind::from_wire(&notification.item);
         let started = notification.started_at_ms;
         if let Some(index) = self.index.get(&id) {
-            // A replay of the sequence starts here again. A completed item is
-            // never downgraded by a late start; a live one is rebuilt from the
-            // start payload so its deltas re-apply without doubling.
-            if self.items[*index].completed_at_ms.is_none() {
-                let turn_id = self.items[*index].turn_id.clone();
-                self.items[*index] = Item {
+            let index = *index;
+            // A completed item is never downgraded by a late start.
+            if self.items[index].completed {
+                return;
+            }
+            if self.items[index].started_seen {
+                // A replay of the sequence starts here again: rebuild from the
+                // start payload so the deltas that follow re-apply without
+                // doubling the first pass's text.
+                let turn_id = self.items[index].turn_id.clone();
+                self.items[index] = Item {
                     id,
                     turn_id,
                     kind,
                     started_at_ms: started,
                     completed_at_ms: None,
+                    completed: false,
+                    started_seen: true,
                 };
+            } else {
+                // Deltas created this item before its start. Fold the start
+                // over them instead of erasing content the server already
+                // streamed: an empty start field preserves the accumulated
+                // one (the delta-before-start ordering).
+                self.items[index].kind.apply_completed(&notification.item);
+                self.items[index].started_at_ms = started.or(self.items[index].started_at_ms);
+                self.items[index].started_seen = true;
             }
             return;
         }
@@ -485,6 +508,8 @@ impl ThreadProjection {
             kind,
             started_at_ms: started,
             completed_at_ms: None,
+            completed: false,
+            started_seen: true,
         });
         self.index.insert(id, index);
     }
@@ -511,6 +536,8 @@ impl ThreadProjection {
             kind: ItemKind::from_completed(&notification.item),
             started_at_ms: turn_started,
             completed_at_ms: completed,
+            completed: true,
+            started_seen: true,
         });
         self.index.insert(id, index);
     }
@@ -592,11 +619,32 @@ struct Item {
     kind: ItemKind,
     started_at_ms: Option<i64>,
     completed_at_ms: Option<i64>,
+    /// Whether `item/completed` has been folded in. The event is authoritative
+    /// even when its optional timestamp is missing, so tool state reads this
+    /// rather than inferring completion from the clock.
+    completed: bool,
+    /// Whether `item/started` has already been seen for this item. A delta can
+    /// create the entry first (the server emits the start before its deltas,
+    /// but a resumed stream is not guaranteed to replay that start), so the
+    /// first start must merge into the accumulated deltas; a *replayed* start
+    /// resets the item so replaying the same sequence cannot double its text.
+    started_seen: bool,
 }
 
 impl Item {
     fn is_assistant(&self) -> bool {
         !matches!(self.kind, ItemKind::UserMessage { .. })
+    }
+
+    /// The tool state of an item whose wire type carries no status field
+    /// (`webSearch`, `image`, `contextCompaction`): live until its
+    /// `item/completed` arrives, completed only then.
+    fn tool_completion_status(&self) -> ToolStatus {
+        if self.completed {
+            ToolStatus::Completed
+        } else {
+            ToolStatus::Running
+        }
     }
 
     /// The neutral role and parts of this item. One item becomes one message:
@@ -752,7 +800,7 @@ impl Item {
                         name: "web_search".to_string(),
                         call_id: self.id.clone(),
                     },
-                    status: ToolStatus::Completed,
+                    status: self.tool_completion_status(),
                     started_at: self.started_at_ms,
                     input: Some(json!({ "query": query, "action": action })),
                     metadata: Some(json!({ "results": results })),
@@ -770,7 +818,7 @@ impl Item {
                         name: "image".to_string(),
                         call_id: self.id.clone(),
                     },
-                    status: ToolStatus::Completed,
+                    status: self.tool_completion_status(),
                     started_at: self.started_at_ms,
                     input: Some(json!({ "path": path })),
                     metadata: Some(json!({ "path": path })),
@@ -787,7 +835,11 @@ impl Item {
             ItemKind::Compaction => (
                 MessageRole::Assistant,
                 vec![Part::Compaction(Compaction {
-                    status: CompactionStatus::Completed,
+                    status: if self.completed {
+                        CompactionStatus::Completed
+                    } else {
+                        CompactionStatus::Running
+                    },
                     reason: CompactionReason::Auto,
                     summary: String::new(),
                     usage: None,
@@ -810,7 +862,19 @@ impl Item {
     /// preserved rather than dropped.
     fn complete_with(&mut self, item: &Value, completed_at_ms: Option<i64>) {
         self.completed_at_ms = completed_at_ms.or(self.completed_at_ms);
-        match &mut self.kind {
+        self.completed = true;
+        self.started_seen = true;
+        self.kind.apply_completed(item);
+    }
+}
+
+impl ItemKind {
+    /// Apply an item payload over the accumulated kind. The completed payload
+    /// is authoritative, but a field it does not carry is preserved rather
+    /// than dropped; `item/started` uses the same rule to merge over deltas
+    /// that arrived before the start.
+    fn apply_completed(&mut self, item: &Value) {
+        match self {
             ItemKind::AgentMessage { text } => {
                 if let Some(final_text) = item.get("text").and_then(Value::as_str)
                     && !final_text.is_empty()
@@ -1762,6 +1826,173 @@ mod tests {
             matches!(call.output.blocks.first(), Some(ContentBlock::Text(text)) if text.contains("error[E0425]"))
         );
         assert!(call.output.error.is_some(), "the failure text survives");
+    }
+
+    /// The kinds whose wire item has no status field are live until their
+    /// completion arrives: a started web search, image or compaction must not
+    /// render as a finished tool.
+    #[test]
+    fn statusless_items_are_running_until_their_completion_arrives() {
+        let events = recording();
+        let mut projection = ThreadProjection::new("thread-1");
+        for event in &events {
+            let method = event["method"].as_str().unwrap();
+            let params = &event["params"];
+            let Some(item) = params.get("item") else {
+                continue;
+            };
+            let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+            if !["item-web", "item-image", "item-compaction"].contains(&id) {
+                continue;
+            }
+            if method == ITEM_STARTED {
+                projection.apply(method, params);
+            }
+        }
+
+        let started = projection.transcript();
+        let find = |id: &str| {
+            started
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == id)
+                .and_then(|message| message.parts.first())
+                .unwrap_or_else(|| panic!("{id} is projected"))
+        };
+        for id in ["item-web", "item-image"] {
+            let Part::Tool(call) = find(id) else {
+                panic!("{id} maps to a tool part");
+            };
+            assert_eq!(call.status, ToolStatus::Running, "{id} is still streaming");
+        }
+        let Part::Compaction(fact) = find("item-compaction") else {
+            panic!("item-compaction maps to a compaction part");
+        };
+        assert_eq!(fact.status, CompactionStatus::Running);
+
+        // The completions settle them.
+        for event in &events {
+            if event["method"] == ITEM_COMPLETED {
+                let id = event["params"]["item"]["id"].as_str().unwrap_or("");
+                if ["item-web", "item-image", "item-compaction"].contains(&id) {
+                    projection.apply(ITEM_COMPLETED, &event["params"]);
+                }
+            }
+        }
+        let completed = projection.transcript();
+        for (id, expected) in [
+            ("item-web", ToolStatus::Completed),
+            ("item-image", ToolStatus::Completed),
+        ] {
+            let Part::Tool(call) = completed
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == id)
+                .and_then(|message| message.parts.first())
+                .unwrap()
+            else {
+                panic!("{id} maps to a tool part");
+            };
+            assert_eq!(call.status, expected, "{id} settles when completed");
+        }
+        let Part::Compaction(fact) = completed
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-compaction")
+            .and_then(|message| message.parts.first())
+            .unwrap()
+        else {
+            panic!("item-compaction maps to a compaction part");
+        };
+        assert_eq!(fact.status, CompactionStatus::Completed);
+    }
+
+    /// A delta may arrive before its `item/started` (a resumed stream need not
+    /// replay the start). The start folds over the accumulated text instead of
+    /// erasing what the server already streamed.
+    #[test]
+    fn a_start_after_a_delta_preserves_the_delta() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            AGENT_DELTA,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-agent",
+                "delta": "Hello",
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_000_i64,
+                "item": { "type": "agentMessage", "id": "item-agent", "text": "" },
+            }),
+        );
+        projection.apply(
+            AGENT_DELTA,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-agent",
+                "delta": " world",
+            }),
+        );
+        let transcript = projection.transcript();
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == "item-agent")
+                .unwrap()
+                .text(),
+            "Hello world",
+            "the start must not erase an already-applied delta"
+        );
+
+        // The same merge keeps command output that arrived before its start.
+        projection.apply(
+            COMMAND_OUTPUT_DELTA,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-command",
+                "delta": "partial output\n",
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_100_i64,
+                "item": {
+                    "type": "commandExecution",
+                    "id": "item-command",
+                    "command": "cargo test",
+                    "cwd": "/work/cola",
+                    "status": "inProgress",
+                    "aggregatedOutput": null,
+                    "exitCode": null,
+                },
+            }),
+        );
+        let transcript = projection.transcript();
+        let Part::Tool(call) = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-command")
+            .and_then(|message| message.parts.first())
+            .unwrap()
+        else {
+            panic!("the command maps to a tool part");
+        };
+        assert!(
+            matches!(call.output.blocks.first(), Some(ContentBlock::Text(text)) if text == "partial output\n"),
+            "the start preserved the output delta"
+        );
     }
 
     /// Acceptance 4: a turn that changed files has its Turn Diff and its token

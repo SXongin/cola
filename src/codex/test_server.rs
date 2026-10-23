@@ -194,6 +194,14 @@ pub(crate) struct ScriptedThread {
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) has_history: bool,
+    /// The persisted turns `thread/read` and `thread/resume` carry. A real
+    /// `thread/read` page is bounded, so a test can cap it with
+    /// [`Self::read_turn_limit`] while `thread/turns/list` still pages the
+    /// whole history.
+    pub(crate) turns: Vec<Value>,
+    /// How many turns a `thread/read`/`thread/resume` response carries. `None`
+    /// carries every stored turn.
+    pub(crate) read_turn_limit: Option<usize>,
 }
 
 impl ScriptedThread {
@@ -210,6 +218,8 @@ impl ScriptedThread {
             created_at: 1_700_000_000,
             updated_at: 1_700_000_000,
             has_history: true,
+            turns: Vec::new(),
+            read_turn_limit: None,
         }
     }
 
@@ -249,6 +259,8 @@ struct State {
     list_calls: AtomicUsize,
     list_params: std::sync::Mutex<Vec<Value>>,
     resume_calls: AtomicUsize,
+    turns_calls: AtomicUsize,
+    turns_params: std::sync::Mutex<Vec<Value>>,
     unsubscribe_calls: AtomicUsize,
     /// Answer `thread/resume` without a response, so a test can cancel a
     /// pending adopt.
@@ -273,6 +285,8 @@ impl Default for State {
             list_calls: AtomicUsize::new(0),
             list_params: std::sync::Mutex::new(Vec::new()),
             resume_calls: AtomicUsize::new(0),
+            turns_calls: AtomicUsize::new(0),
+            turns_params: std::sync::Mutex::new(Vec::new()),
             unsubscribe_calls: AtomicUsize::new(0),
             silent_resume: std::sync::atomic::AtomicBool::new(false),
             page_size: 2,
@@ -491,6 +505,16 @@ impl FakeServer {
         wait_until(|| self.resume_calls(), expected, "resume calls").await;
     }
 
+    /// `thread/turns/list` calls received so far.
+    pub(crate) fn turns_calls(&self) -> usize {
+        self.state.turns_calls.load(Ordering::SeqCst)
+    }
+
+    /// Every `thread/turns/list` params object, in call order.
+    pub(crate) fn turns_params(&self) -> Vec<Value> {
+        self.state.turns_params.lock().expect("turns params").clone()
+    }
+
     /// `thread/unsubscribe` calls received so far.
     pub(crate) fn unsubscribe_calls(&self) -> usize {
         self.state.unsubscribe_calls.load(Ordering::SeqCst)
@@ -680,6 +704,42 @@ where
                 None => reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await,
             }
         }
+        Some("thread/turns/list") => {
+            state.turns_calls.fetch_add(1, Ordering::SeqCst);
+            state
+                .turns_params
+                .lock()
+                .expect("turns params")
+                .push(params.clone());
+            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            let Some(thread) = find_thread(state, thread_id) else {
+                return reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await;
+            };
+            let offset = params
+                .get("cursor")
+                .and_then(Value::as_str)
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(thread.turns.len());
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit as usize)
+                .filter(|limit| *limit > 0)
+                .unwrap_or(2);
+            let end = (offset + limit).min(thread.turns.len());
+            let next = (end < thread.turns.len()).then(|| json!(end.to_string()));
+            replying(
+                sink,
+                id,
+                json!({
+                    "data": thread.turns[offset..end],
+                    "nextCursor": next,
+                    "backwardsCursor": null,
+                }),
+            )
+            .await
+        }
         Some("test/malformed") => {
             // A broken peer: a text frame that is not JSON. The client must
             // close the connection and fail the request instead of waiting.
@@ -828,6 +888,10 @@ fn list_threads(state: &State, params: &Value) -> Value {
 /// One thread in the wire shape `0.163.0` defines. The full required set is
 /// present so the client decodes the real contract, not a relaxed fixture.
 fn thread_json(thread: &ScriptedThread) -> Value {
+    let turns = match thread.read_turn_limit {
+        Some(limit) => &thread.turns[..thread.turns.len().min(limit)],
+        None => &thread.turns[..],
+    };
     json!({
         "id": thread.id,
         "sessionId": thread.session_id,
@@ -843,7 +907,7 @@ fn thread_json(thread: &ScriptedThread) -> Value {
         "projectId": null,
         "source": thread.source,
         "status": { "type": "notLoaded" },
-        "turns": [],
+        "turns": turns,
     })
 }
 
