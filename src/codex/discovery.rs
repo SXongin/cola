@@ -243,6 +243,31 @@ pub(crate) struct EmbeddedClient {
     pub(crate) evidence: &'static str,
 }
 
+/// A local Codex TUI that a daemon exists for, but whose argv cannot establish
+/// that it joined that daemon.
+///
+/// A TUI launched with neither `--remote` nor `--no-daemon` normally attaches to
+/// the shared daemon — but one started **before** the daemon appeared fell back
+/// to its own embedded server and stays there. The process table cannot tell
+/// the two apart, and claiming sharing cola cannot establish is exactly the
+/// silence ADR-0090 decision 3 rejects. So the state is reported as
+/// **unverified** for `cola doctor` (#883) to settle against the live daemon
+/// (its loaded threads / a turn), never assumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnverifiedClient {
+    pub(crate) pid: i32,
+    pub(crate) binary: String,
+}
+
+/// The local Codex clients one process-table scan observed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LocalClients {
+    /// Clients proven to run their own app-server.
+    pub(crate) embedded: Vec<EmbeddedClient>,
+    /// Clients sharing the daemon cannot be confirmed from argv.
+    pub(crate) unverified: Vec<UnverifiedClient>,
+}
+
 /// One discovery pass.
 #[derive(Debug, Clone)]
 pub(crate) struct Discovery {
@@ -250,8 +275,8 @@ pub(crate) struct Discovery {
     /// The socket's on-disk identity when one exists; a later pass compares it
     /// to notice a replaced daemon.
     pub(crate) socket: Option<SocketIdentity>,
-    /// Local clients on an embedded server, in pid order.
-    pub(crate) embedded: Vec<EmbeddedClient>,
+    /// Local Codex clients, in pid order.
+    pub(crate) clients: LocalClients,
 }
 
 /// Discover the daemon under `environment.home`.
@@ -295,7 +320,7 @@ pub(crate) async fn discover(environment: &Environment) -> Result<Discovery> {
     Ok(Discovery {
         daemon,
         socket: identity,
-        embedded: embedded_clients(running),
+        clients: local_clients(running),
     })
 }
 
@@ -346,16 +371,25 @@ fn parse_info(stdout: &[u8]) -> Result<DaemonInfo> {
     })
 }
 
-/// Start the daemon through Codex's own management command and wait for its
-/// control socket to appear.
+/// Start the daemon through Codex's own management command and wait for a
+/// **new** control socket to appear.
 ///
 /// This is the only place cola causes a daemon to exist, and it does so by
 /// running the CLI's documented command — never by spawning the server itself,
 /// writing a pid record, or holding a handle it could signal. A timeout that
 /// drops the CLI's child does **not** kill it: cola does not reap what it does
 /// not own.
+///
+/// The socket must *change*, not merely exist: a daemon that crashed can leave
+/// its Unix socket path behind, and treating that corpse as the new daemon
+/// would report a dead server as started. Codex re-links the path into a fresh
+/// runtime directory, so a successful start always produces a new identity.
 pub(crate) async fn start(environment: &Environment) -> Result<()> {
     let socket = environment.socket();
+    // A socket path left behind by a crashed daemon is not a fresh one: the
+    // launcher must produce a **new** socket (Codex re-links the path into a new
+    // runtime directory), or the readiness check would pass on the corpse.
+    let before = socket_identity(&socket)?;
     let output = run_cli(
         environment,
         &["app-server", "daemon", "start"],
@@ -372,12 +406,15 @@ pub(crate) async fn start(environment: &Environment) -> Result<()> {
     }
     let deadline = tokio::time::Instant::now() + environment.socket_ready_timeout;
     loop {
-        if socket_identity(&socket)?.is_some() {
+        if let Some(identity) = socket_identity(&socket)?
+            && Some(identity) != before
+        {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(CodexError::Daemon(format!(
-                "`{} app-server daemon start` reported success, but {} did not appear within {:?}",
+                "`{} app-server daemon start` reported success, but {} did not appear (or was \
+                 not replaced) within {:?}",
                 environment.cli.display(),
                 socket.display(),
                 environment.socket_ready_timeout
@@ -427,12 +464,12 @@ fn first_line(stderr: &[u8]) -> String {
         .to_string()
 }
 
-/// Read the process table once for local Codex clients on an embedded server.
+/// Read the process table once for local Codex clients.
 ///
-/// Thin I/O: the decision is [`embedded_from`], unit-tested on its own. The
+/// Thin I/O: the decisions are [`observe_client`], unit-tested on their own. The
 /// table is read with sysinfo so this works on every platform (there is no
 /// `/proc` on macOS or Windows).
-pub(crate) fn embedded_clients(daemon_running: bool) -> Vec<EmbeddedClient> {
+pub(crate) fn local_clients(daemon_running: bool) -> LocalClients {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -441,26 +478,28 @@ pub(crate) fn embedded_clients(daemon_running: bool) -> Vec<EmbeddedClient> {
             .without_tasks()
             .with_cmd(UpdateKind::Always),
     );
-    let mut found: Vec<EmbeddedClient> = system
-        .processes()
-        .values()
-        .filter_map(|process| {
-            let arguments: Vec<String> = process
-                .cmd()
-                .iter()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect();
-            embedded_from(
-                process.pid().as_u32() as i32,
-                &process.name().to_string_lossy(),
-                &arguments,
-                daemon_running,
-            )
-        })
-        .collect();
+    let mut found = LocalClients::default();
+    for process in system.processes().values() {
+        let arguments: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        match observe_client(
+            process.pid().as_u32() as i32,
+            &process.name().to_string_lossy(),
+            &arguments,
+            daemon_running,
+        ) {
+            Some(Observation::Embedded(client)) => found.embedded.push(client),
+            Some(Observation::Unverified(client)) => found.unverified.push(client),
+            None => {}
+        }
+    }
     // sysinfo enumerates in a randomized order; a report that changes shape
     // between two identical scans would be noise.
-    found.sort_by_key(|client| client.pid);
+    found.embedded.sort_by_key(|client| client.pid);
+    found.unverified.sort_by_key(|client| client.pid);
     found
 }
 
@@ -538,20 +577,29 @@ fn tui_invocation(arguments: &[String]) -> bool {
     true
 }
 
-/// Whether one process is a local Codex client whose app-server is embedded.
+/// What a Codex TUI process proves about where its app-server lives.
+#[derive(Debug, PartialEq, Eq)]
+enum Observation {
+    Embedded(EmbeddedClient),
+    Unverified(UnverifiedClient),
+}
+
+/// Read one process as a local Codex TUI.
 ///
 /// `--no-daemon` is the documented, decisive opt-out (`Run without the shared
 /// background server`), and Codex only accepts it on the TUI. A TUI with no
 /// daemon running and no `--remote` endpoint has nowhere else to attach, so it
-/// fell back to its in-process server — the state ADR-0090 decision 3 says must
-/// be diagnosed rather than silently mirrored. This is a process-table
-/// inference, so it stays conservative: a `--remote` client is never reported.
-fn embedded_from(
+/// fell back to its in-process server. With a daemon present, a TUI's argv does
+/// **not** prove it joined it — one started before the daemon appeared stays on
+/// its private server — so it is reported as unverified, never assumed to
+/// share. A `--remote` client names its server, which a process scan cannot
+/// judge, so it is not reported either way.
+fn observe_client(
     pid: i32,
     process_name: &str,
     arguments: &[String],
     daemon_running: bool,
-) -> Option<EmbeddedClient> {
+) -> Option<Observation> {
     let is_codex_client = arguments
         .first()
         .is_some_and(|binary| Path::new(binary).file_name().is_some_and(|name| name == "codex"))
@@ -561,23 +609,26 @@ fn embedded_from(
     }
     let binary = arguments.first().cloned().unwrap_or_else(|| "codex".to_string());
     if arguments.iter().any(|argument| argument == "--no-daemon") {
-        return Some(EmbeddedClient {
+        return Some(Observation::Embedded(EmbeddedClient {
             pid,
             binary,
             evidence: "runs with `--no-daemon`, so its app-server is in-process",
-        });
+        }));
     }
-    let remote = arguments
+    if arguments
         .iter()
-        .any(|argument| argument == "--remote" || argument.starts_with("--remote="));
-    if !daemon_running && !remote {
-        return Some(EmbeddedClient {
+        .any(|argument| argument == "--remote" || argument.starts_with("--remote="))
+    {
+        return None;
+    }
+    if !daemon_running {
+        return Some(Observation::Embedded(EmbeddedClient {
             pid,
             binary,
             evidence: "no daemon is running, so the TUI fell back to an embedded app-server",
-        });
+        }));
     }
-    None
+    Some(Observation::Unverified(UnverifiedClient { pid, binary }))
 }
 
 #[cfg(test)]
@@ -712,15 +763,27 @@ mod tests {
     /// The explicit opt-out is the decisive signal, on a TUI only.
     #[test]
     fn a_no_daemon_tui_is_an_embedded_client() {
-        let client = embedded_from(42, "codex", &args("codex --no-daemon"), true)
-            .expect("--no-daemon is embedded even with a daemon running");
+        let Some(Observation::Embedded(client)) =
+            observe_client(42, "codex", &args("codex --no-daemon"), true)
+        else {
+            panic!("--no-daemon is embedded even with a daemon running");
+        };
         assert_eq!(client.pid, 42);
         assert!(client.evidence.contains("--no-daemon"), "{}", client.evidence);
 
         // A prompt is still the TUI.
-        assert!(embedded_from(7, "codex", &args("codex --no-daemon fix the tests"), false).is_some());
+        assert!(embedded(7, &args("codex --no-daemon fix the tests"), false));
         // Options before the flag do not hide it.
-        assert!(embedded_from(7, "codex", &args("codex -m gpt-5 --no-daemon"), false).is_some());
+        assert!(embedded(7, &args("codex -m gpt-5 --no-daemon"), false));
+    }
+
+    /// One convenience predicate over [`observe_client`] for the cases whose
+    /// outcome is "embedded, or not reported at all".
+    fn embedded(pid: i32, arguments: &[String], daemon_running: bool) -> bool {
+        matches!(
+            observe_client(pid, "codex", arguments, daemon_running),
+            Some(Observation::Embedded(_))
+        )
     }
 
     /// A non-TUI subcommand never starts an embedded TUI server, even when the
@@ -735,7 +798,7 @@ mod tests {
             "codex mcp list",
         ] {
             assert!(
-                embedded_from(7, "codex", &args(line), false).is_none(),
+                observe_client(7, "codex", &args(line), false).is_none(),
                 "{line} is not a TUI"
             );
         }
@@ -745,24 +808,41 @@ mod tests {
     /// unless it names a remote server.
     #[test]
     fn a_tui_without_a_daemon_fell_back_to_embedded() {
-        let client = embedded_from(9, "codex", &args("codex"), false).expect("no daemon");
+        let Some(Observation::Embedded(client)) = observe_client(9, "codex", &args("codex"), false) else {
+            panic!("no daemon means the TUI fell back to an embedded app-server");
+        };
         assert_eq!(client.pid, 9);
         assert!(client.evidence.contains("embedded"), "{}", client.evidence);
         assert!(
-            embedded_from(9, "codex", &args("codex"), true).is_none(),
-            "a daemon-attached TUI is the supported configuration"
+            observe_client(9, "codex", &args("codex --remote ws://host:1"), false).is_none(),
+            "a remote client is not judged by a process scan"
         );
-        assert!(
-            embedded_from(9, "codex", &args("codex --remote ws://host:1"), false).is_none(),
-            "a remote client is not embedded"
-        );
+    }
+
+    /// The transition the scan cannot settle: a daemon exists, and a TUI names
+    /// no `--remote`. It may be attached (the supported configuration) or it may
+    /// have started embedded before the daemon appeared and stayed there. That
+    /// is **unverified**, not sharing-and-not-embedded: reporting nothing would
+    /// be the silent assumption ADR-0090 decision 3 rejects.
+    #[test]
+    fn a_tui_with_a_daemon_is_unverified_not_assumed_sharing() {
+        let Some(Observation::Unverified(client)) = observe_client(9, "codex", &args("codex"), true) else {
+            panic!("a daemon-present TUI is recorded, not assumed to share");
+        };
+        assert_eq!(client.pid, 9);
+        assert!(!embedded(9, &args("codex"), true));
+
+        // `--no-daemon` stays decisive even with a daemon running, and a
+        // `--remote` client is outside what this scan can judge either way.
+        assert!(embedded(9, &args("codex --no-daemon"), true));
+        assert!(observe_client(9, "codex", &args("codex --remote ws://host:1"), true).is_none());
     }
 
     #[test]
     fn a_process_that_is_not_codex_is_never_reported() {
-        assert!(embedded_from(9, "node", &args("node server.js --no-daemon"), false).is_none());
+        assert!(observe_client(9, "node", &args("node server.js --no-daemon"), false).is_none());
         assert!(
-            embedded_from(
+            observe_client(
                 9,
                 "not-codex",
                 &args("/opt/other/bin/not-codex --no-daemon"),
@@ -898,8 +978,10 @@ mod tests {
         // bounded and the failure names the missing socket.
         let empty_home = root.path().join("empty-home");
         let empty_socket = empty_home.join(CONTROL_DIR).join(CONTROL_SOCKET);
+        let second_cli = root.path().join("cli-2");
+        std::fs::create_dir_all(&second_cli).expect("second cli dir");
         let cli = FakeCodex::write(
-            root.path(),
+            &second_cli,
             &empty_socket,
             None,
             None,

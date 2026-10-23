@@ -15,10 +15,18 @@
 //!   is ever sent, including on shutdown. cola's daemon is another tool's
 //!   process, exactly like a Coexistent Server.
 //!
+//! "Attached" is a claim about an **answering** daemon, not about a socket path:
+//! the steady-state pass proves the cached connection with one read-only call,
+//! so a crashed daemon that leaves its Unix socket behind reads unattached, and
+//! the socket identity is captured around the handshake so a replacement cannot
+//! bind two servers to one attachment.
+//!
 //! A local client on an *embedded* server is diagnosed rather than mirrored
 //! (ADR-0090 decision 3): the pass logs it once and [`CodexLifecycle::diagnosis`]
 //! reports it for `cola doctor`, while the attach outcome stays `Serverless` —
-//! there is no daemon to attach to, and cola will not pretend otherwise.
+//! there is no daemon to attach to, and cola will not pretend otherwise. A TUI
+//! whose sharing the process table cannot settle is reported as
+//! **unverified**, never assumed.
 //!
 //! The `Backend` implementation that serves Sessions is a later ticket (#879);
 //! this type is the lifecycle half it will build on.
@@ -32,7 +40,7 @@ use crate::config::CodexConfig;
 use crate::error::BridgeError;
 
 use super::client::{CodexClient, CodexOptions};
-use super::discovery::{self, Daemon, DaemonState, Discovery, EmbeddedClient, Environment, SocketIdentity};
+use super::discovery::{self, Daemon, DaemonState, Discovery, Environment, LocalClients, SocketIdentity};
 use super::error::{CodexError, Result};
 use super::schema::{AutoProbe, SurfaceProbe};
 use super::transport::Endpoint;
@@ -59,6 +67,62 @@ impl ProbeSource for ManagedProbe {
 struct Attachment {
     client: CodexClient,
     identity: SocketIdentity,
+}
+
+/// How long the cached connection gets to answer the steady-state liveness
+/// probe. A daemon that has gone away must be noticed on the next pass, but a
+/// wedged one must not hold the pass for long.
+const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The one request the liveness probe sends. It is in the required contract
+/// (ticket #876 checks for it at construction), is server-global and read-only,
+/// and answers from the daemon's own state — so `Ok` proves the connection is
+/// still served by a live daemon.
+const LIVENESS_METHOD: &str = "thread/loaded/list";
+
+/// How many times one attach pass re-dials when the control socket is replaced
+/// under it. Two is enough for the deterministic race; a third race in a row is
+/// reported unattached and retried on the next pass.
+const ATTACH_ATTEMPTS: usize = 2;
+
+/// How one dial ended, for the pass's next decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    Attached,
+    /// The daemon was there a moment ago but does not accept now — a stale
+    /// socket or a daemon that just died. A start policy may apply.
+    Unreachable,
+    /// The control path was re-pointed mid-handshake, twice. There *is* a
+    /// daemon; it just cannot be attached under this race. Do not start one.
+    Raced,
+}
+
+/// Whether the cached connection still answers. A dead daemon behind a stale
+/// socket path fails here (its connection is closed / times out), which is what
+/// separates "same inode" from "same live daemon".
+async fn answers(attachment: &mut Attachment) -> bool {
+    match tokio::time::timeout(
+        LIVENESS_TIMEOUT,
+        attachment
+            .client
+            .connection()
+            .request(LIVENESS_METHOD, serde_json::json!({})),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            tracing::warn!("the cached codex attachment no longer answers `{LIVENESS_METHOD}`: {error}");
+            false
+        }
+        Err(_) => {
+            tracing::warn!(
+                "the cached codex attachment did not answer `{LIVENESS_METHOD}` within \
+                 {LIVENESS_TIMEOUT:?}"
+            );
+            false
+        }
+    }
 }
 
 /// The active Codex Agent Client's lifecycle.
@@ -95,8 +159,9 @@ impl CodexLifecycle {
     }
 
     /// What discovery last observed — the read `cola doctor` needs for ADR-0090
-    /// decision 3 (daemon presence, the binary it runs, embedded clients).
-    /// No caller until #883.
+    /// decision 3 (daemon presence, the binary it runs, clients proven to be on
+    /// an embedded server and clients whose sharing cannot be established from
+    /// the process table). No caller until #883.
     #[allow(dead_code)]
     pub(crate) async fn diagnosis(&self) -> Result<Discovery> {
         discovery::discover(&self.environment).await
@@ -104,58 +169,82 @@ impl CodexLifecycle {
 
     /// One attach to a discovered daemon.
     ///
+    /// The socket identity is read **before** the dial and again after the
+    /// handshake: a re-pointed symlink in between means the connection may
+    /// belong to a daemon the path no longer names, so recording the new
+    /// identity would bind two servers into one attachment. Such an attach is
+    /// void and retried once; a second race reports unattached for this pass.
+    ///
     /// A transport-level failure means the daemon went away between the socket
     /// check and the dial: it is reported as unattached and retried on the next
     /// pass, never reaped. A daemon that answers and is unusable (a contract or
     /// probe failure) stays loud — retrying cannot fix it.
-    async fn attach(&self, daemon: &Daemon) -> Result<AttachOutcome> {
+    async fn attach(&self, daemon: &Daemon) -> Result<Attempt> {
         let probe = self.probes.probe(daemon);
         let options = CodexOptions::new(Endpoint::Unix(daemon.socket.clone()));
-        match CodexClient::connect(&options, probe.as_ref()).await {
-            Ok(client) => {
-                let identity = discovery::socket_identity(&daemon.socket)?.ok_or_else(|| {
-                    CodexError::Daemon(format!(
-                        "the control socket at {} vanished during the attach",
-                        daemon.socket.display()
-                    ))
-                })?;
-                tracing::info!(
-                    socket = %daemon.socket.display(),
-                    version = %client.server_info().version,
-                    surface = %client.server_info().surface_source,
-                    "attached to the codex app-server daemon"
-                );
-                *self.attached.lock().await = Some(Attachment { client, identity });
-                Ok(AttachOutcome::Attached)
+        for _ in 0..ATTACH_ATTEMPTS {
+            let Some(identity) = discovery::socket_identity(&daemon.socket)? else {
+                return Ok(Attempt::Unreachable);
+            };
+            match CodexClient::connect(&options, probe.as_ref()).await {
+                Ok(client) => {
+                    if discovery::socket_identity(&daemon.socket)? != Some(identity) {
+                        tracing::warn!(
+                            "the codex control socket at {} was replaced during the attach; \
+                             discarding a connection of unknown identity",
+                            daemon.socket.display()
+                        );
+                        // Dropping `client` closes the connection to the daemon
+                        // the path no longer names. Nothing is sent to it.
+                        continue;
+                    }
+                    tracing::info!(
+                        socket = %daemon.socket.display(),
+                        version = %client.server_info().version,
+                        surface = %client.server_info().surface_source,
+                        "attached to the codex app-server daemon"
+                    );
+                    *self.attached.lock().await = Some(Attachment { client, identity });
+                    return Ok(Attempt::Attached);
+                }
+                Err(error) if daemon_gone(&error) => {
+                    tracing::warn!(
+                        "the codex daemon at {} is gone or unreachable; staying unattached: {}",
+                        daemon.socket.display(),
+                        error
+                    );
+                    return Ok(Attempt::Unreachable);
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) if daemon_gone(&error) => {
-                tracing::warn!(
-                    "the codex daemon at {} is gone or unreachable; staying unattached: {}",
-                    daemon.socket.display(),
-                    error
-                );
-                Ok(AttachOutcome::Serverless)
-            }
-            Err(error) => Err(error),
         }
+        Ok(Attempt::Raced)
     }
 
-    /// Log a local client that runs its own app-server, once per client, rather
-    /// than letting cola mirror nothing in silence (ADR-0090 decision 3).
-    fn report_embedded(&self, embedded: &[EmbeddedClient]) {
-        let Some(client) = embedded.first() else {
-            return;
-        };
-        if self.reported_embedded.swap(client.pid, Ordering::Relaxed) == client.pid {
-            return;
+    /// Log the local clients a discovery pass observed: a proven embedded
+    /// server once per client at WARN (ADR-0090 decision 3 — the alternative is
+    /// a bot that silently mirrors nothing), and an unprovable sharing state at
+    /// DEBUG for `cola doctor` to settle, never as a sharing claim.
+    fn report_clients(&self, clients: &LocalClients) {
+        if let Some(client) = clients.embedded.first()
+            && self.reported_embedded.swap(client.pid, Ordering::Relaxed) != client.pid
+        {
+            tracing::warn!(
+                "a local Codex client (pid {}, {}) is running on an embedded app-server; it shares \
+                 no thread with the shared daemon, so cola cannot mirror it — start the daemon (and \
+                 attach the client to it) for Peer Attachment",
+                client.pid,
+                client.evidence
+            );
         }
-        tracing::warn!(
-            "a local Codex client (pid {}, {}) is running on an embedded app-server; it shares no \
-             thread with the shared daemon, so cola cannot mirror it — start the daemon (and attach \
-             the client to it) for Peer Attachment",
-            client.pid,
-            client.evidence
-        );
+        for client in &clients.unverified {
+            tracing::debug!(
+                "a local Codex client (pid {}, {}) names no `--remote`; whether it shares the \
+                 daemon cannot be established from its argv — `cola doctor` must verify it",
+                client.pid,
+                client.binary
+            );
+        }
     }
 }
 
@@ -182,38 +271,60 @@ impl ServerLifecycle for CodexLifecycle {
     async fn ensure_attached(&self, request: EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
         let _pass = self.pass.lock().await;
 
-        // Steady state: the socket we dialled is still there (same inode), so
-        // stay attached. This costs one `stat`, not a management-CLI spawn, and
-        // the embedded diagnosis is still evaluated from the process table.
+        // Steady state: the socket we dialled is still there (same inode) **and
+        // the cached connection still answers**. Identity alone proves nothing —
+        // a crashed daemon can leave its Unix socket path behind — so a failed
+        // liveness probe drops the attachment and falls through to a re-attach,
+        // which is what turns a stale socket into "unattached". The probe is a
+        // read-only call in the pinned contract, never a signal to the daemon.
         let identity = discovery::socket_identity(&self.environment.socket()).map_err(client_error)?;
-        if let Some(identity) = identity
-            && self
-                .attached
-                .lock()
-                .await
+        if let Some(identity) = identity {
+            let mut slot = self.attached.lock().await;
+            if slot
                 .as_ref()
                 .is_some_and(|attachment| attachment.identity == identity)
-        {
-            self.report_embedded(&discovery::embedded_clients(true));
-            return Ok(AttachOutcome::Attached);
+            {
+                let alive = match slot.as_mut() {
+                    Some(attachment) => answers(attachment).await,
+                    None => false,
+                };
+                if alive {
+                    drop(slot);
+                    self.report_clients(&discovery::local_clients(true));
+                    return Ok(AttachOutcome::Attached);
+                }
+                // The connection is dead or wedged: forget it. Nothing is sent
+                // to the daemon — it is not cola's to stop.
+                slot.take();
+            }
         }
 
         let discovered = discovery::discover(&self.environment)
             .await
             .map_err(client_error)?;
-        self.report_embedded(&discovered.embedded);
+        self.report_clients(&discovered.clients);
 
-        // Gone or replaced: drop the stale connection. Nothing is sent to the
-        // daemon — it is not cola's to stop.
+        // Gone or replaced: drop the stale connection.
         self.attached.lock().await.take();
 
+        // A discovered daemon is dialled; one behind a stale socket fails here
+        // as unreachable (`Serverless`), which is exactly the case the start
+        // policy below must get a chance at. A daemon that answers and refuses
+        // the contract is a different thing and stays an error.
         if let DaemonState::Running(daemon) = &discovered.daemon {
-            return self.attach(daemon).await.map_err(client_error);
+            match self.attach(daemon).await.map_err(client_error)? {
+                Attempt::Attached => return Ok(AttachOutcome::Attached),
+                // A daemon exists; it just lost a race with its own control
+                // path. Starting another would be wrong, so report unattached
+                // and let the next pass dial the daemon the path names.
+                Attempt::Raced => return Ok(AttachOutcome::Serverless),
+                Attempt::Unreachable => {}
+            }
         }
 
-        // No daemon. `never` is enforced here, on every path, which is why the
-        // policy is checked before the request's allowances: a demand-path or
-        // mid-turn-heal start can never override it.
+        // No answering daemon. `never` is enforced here, on every path, which is
+        // why the policy is checked before the request's allowances: a
+        // demand-path or mid-turn-heal start can never override it.
         let want_start = self.settings.start_server.spawns_when_needed()
             && (request.allow_spawn || (request.heal_when_busy && (request.busy)()));
         if !want_start {
@@ -234,7 +345,10 @@ impl ServerLifecycle for CodexLifecycle {
                 ))));
             }
         };
-        self.attach(&daemon).await.map_err(client_error)
+        Ok(match self.attach(&daemon).await.map_err(client_error)? {
+            Attempt::Attached => AttachOutcome::Attached,
+            Attempt::Unreachable | Attempt::Raced => AttachOutcome::Serverless,
+        })
     }
 
     /// Restarting is never cola's call: the daemon is not owned or reaped
@@ -276,6 +390,56 @@ mod tests {
                 .expect("probe log")
                 .push(daemon.managed_binary.clone());
             Box::new(PinnedProbe)
+        }
+    }
+
+    /// The pinned probe, plus one side effect on the first `surface()` call:
+    /// re-point the control symlink **during** the handshake, after it has
+    /// reached the old daemon. That is the identity race `attach` must refuse to
+    /// record. (`surface()` is called after `initialize`, inside
+    /// `CodexClient::connect`, so this lands mid-attach.)
+    struct RepointingProbe {
+        once: Arc<std::sync::Once>,
+        control: PathBuf,
+        target: PathBuf,
+        seen: Arc<Mutex<Vec<PathBuf>>>,
+    }
+
+    impl ProbeSource for RepointingProbe {
+        fn probe(&self, daemon: &Daemon) -> Box<dyn SurfaceProbe> {
+            self.seen
+                .lock()
+                .expect("probe log")
+                .push(daemon.managed_binary.clone());
+            Box::new(RepointingSurface {
+                once: Arc::clone(&self.once),
+                control: self.control.clone(),
+                target: self.target.clone(),
+            })
+        }
+    }
+
+    struct RepointingSurface {
+        once: Arc<std::sync::Once>,
+        control: PathBuf,
+        target: PathBuf,
+    }
+
+    #[async_trait]
+    impl SurfaceProbe for RepointingSurface {
+        async fn surface(
+            &self,
+            server: &super::super::client::ServerVersion,
+        ) -> Result<super::super::schema::Surface> {
+            self.once.call_once(|| {
+                std::fs::remove_file(&self.control).expect("remove the old link");
+                std::os::unix::fs::symlink(&self.target, &self.control).expect("re-point the link");
+            });
+            PinnedProbe.surface(server).await
+        }
+
+        fn source(&self) -> String {
+            PinnedProbe.source()
         }
     }
 
@@ -419,8 +583,9 @@ mod tests {
         assert_eq!(fixture.cli.starts(), 1, "{:?}", fixture.cli.invocations());
         assert_eq!(fixture.probe_binaries.lock().unwrap().len(), 1);
 
-        // A second pass is the fast path: already attached to the same socket,
-        // and it costs no management-CLI call at all.
+        // A second pass is the steady state: same socket, the cached connection
+        // still answers a read-only call, no redial and no management-CLI call.
+        let connections = _server.connections();
         let invocations = fixture.cli.invocations().len();
         assert_eq!(
             lifecycle
@@ -440,6 +605,12 @@ mod tests {
             1,
             "one daemon per absence, not one per pass: {:?}",
             fixture.cli.invocations()
+        );
+        _server.wait_for_liveness(1).await;
+        assert_eq!(
+            _server.connections(),
+            connections,
+            "a steady attachment proves liveness on the existing connection"
         );
 
         // cola never writes a pid record: it has no pid record to write, and
@@ -476,6 +647,158 @@ mod tests {
                 .any(|line| line.contains("daemon stop") || line.contains("daemon restart")),
             "cola never asks Codex to stop or restart the daemon: {log:?}"
         );
+    }
+
+    /// The review's case: a daemon that dies **without unlinking its socket**
+    /// leaves the inode in place. Identity alone would keep reporting attached
+    /// forever; the liveness probe must turn it into `Serverless`, and nothing
+    /// is reaped.
+    #[tokio::test]
+    async fn a_dead_daemon_with_a_stale_socket_reads_unattached() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("started and attached"),
+            AttachOutcome::Attached
+        );
+        let daemon_pid = *fixture.daemon_pids().first().expect("daemon pid");
+        assert_eq!(fixture.cli.starts(), 1);
+
+        server.die().await;
+        // The socket path is still there and still a socket — the corpse.
+        assert!(
+            fixture.environment.socket().exists(),
+            "a crashed daemon leaves its path behind"
+        );
+        assert!(
+            discovery::socket_identity(&fixture.environment.socket())
+                .expect("identity")
+                .is_some()
+        );
+
+        assert_eq!(
+            lifecycle
+                .ensure_attached(EnsureAttached {
+                    allow_spawn: false,
+                    heal_when_busy: false,
+                    busy: &never_busy,
+                    boot: false,
+                })
+                .await
+                .expect("a stale socket is not an error"),
+            AttachOutcome::Serverless,
+            "same inode is not the same as an answering daemon"
+        );
+        assert_eq!(
+            fixture.cli.starts(),
+            1,
+            "the poll pass never starts a daemon for a stale socket"
+        );
+        assert!(
+            crate::process::alive(daemon_pid),
+            "the daemon process was never killed"
+        );
+    }
+
+    /// `auto` reaches `daemon start` for a stale socket (it is not "attached" to
+    /// a corpse), and attaches to the replacement once the launcher re-links the
+    /// path. The old daemon is never touched.
+    #[tokio::test]
+    async fn auto_revives_a_stale_socket_through_the_launcher() {
+        let fixture = Fixture::new();
+        let first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("started and attached"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(fixture.cli.starts(), 1);
+        let first_pid = *fixture.daemon_pids().first().expect("daemon pid");
+
+        // The daemon dies, its socket path stays, and the launcher now links a
+        // new daemon in: the same shape as `codex app-server daemon start`
+        // replacing a crashed daemon's socket.
+        first.die().await;
+        let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
+        std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        fixture.cli.point_at(&replacement_path);
+
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("the launcher revives the daemon"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(fixture.cli.starts(), 2, "one revive, not a start per pass");
+        assert_eq!(second.connections(), 1, "the replacement is dialled");
+        assert!(
+            crate::process::alive(first_pid),
+            "the dead daemon's process was never killed"
+        );
+    }
+
+    /// A control socket re-pointed **during** the handshake: the connection may
+    /// belong to the old daemon, so recording the new identity would bind two
+    /// servers into one attachment. The pass re-dials and stores the daemon the
+    /// path actually names now.
+    #[tokio::test]
+    async fn a_replacement_during_the_handshake_voids_the_attach() {
+        let fixture = Fixture::new();
+        let first_path = fixture.root.path().join("daemon-0").join("app-server-control");
+        std::fs::create_dir_all(first_path.parent().expect("dir")).expect("dir");
+        let first = FakeServer::unix(&first_path, "codex-tui/0.163.0 (test)").await;
+        let second_path = fixture.root.path().join("daemon-1").join("app-server-control");
+        std::fs::create_dir_all(second_path.parent().expect("dir")).expect("dir");
+        let second = FakeServer::unix(&second_path, "codex-tui/0.163.0 (test)").await;
+        let control = fixture.environment.socket();
+        std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
+        std::os::unix::fs::symlink(&first_path, &control).expect("symlink");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let lifecycle = CodexLifecycle::new(
+            CodexConfig {
+                start_server: crate::config::ServerStartPolicy::Never,
+            },
+            fixture.environment.clone(),
+            Box::new(RepointingProbe {
+                once: Arc::new(std::sync::Once::new()),
+                control: control.clone(),
+                target: second_path.clone(),
+                seen: Arc::clone(&seen),
+            }),
+        );
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("the retry attaches to the daemon the path now names"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(first.connections(), 1, "the old daemon was dialled once");
+        assert_eq!(second.connections(), 1, "the retry dialled the replacement");
+        // The stored identity is the replacement: a steady pass probes *it*,
+        // never the old connection.
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("steady"),
+            AttachOutcome::Attached
+        );
+        second.wait_for_liveness(1).await;
+        assert_eq!(first.liveness_probes(), 0, "the voided connection is gone");
     }
 
     /// A daemon that disappears is unattached on the next pass — and nothing is
@@ -679,18 +1002,7 @@ mod tests {
             .spawn()
             .expect("spawn the fake TUI");
         let pid = child.id() as i32;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let found = lifecycle.diagnosis().await.expect("diagnosis").embedded;
-            if found.iter().any(|client| client.pid == pid) {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the fake TUI must be discovered: {found:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_for_embedded(&lifecycle, pid).await;
 
         let never_busy = || false;
         assert_eq!(
@@ -702,6 +1014,65 @@ mod tests {
         );
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The transition the process table cannot settle: with a daemon present, a
+    /// TUI that names no `--remote` may or may not have joined it. Discovery
+    /// reports it as **unverified**, never as sharing it cannot establish — and
+    /// the lifecycle does not call it embedded either.
+    #[tokio::test]
+    async fn a_daemon_present_tui_is_unverified_not_assumed_sharing() {
+        let fixture = Fixture::new();
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
+            .expect("control dir");
+        std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+
+        let tui_dir = fixture.root.path().join("tui");
+        std::fs::create_dir_all(&tui_dir).expect("tui dir");
+        let fake_tui = tui_dir.join("codex");
+        std::os::unix::fs::symlink("/bin/sh", &fake_tui).expect("symlink");
+        let mut child = std::process::Command::new(&fake_tui)
+            .args(["-c", "sleep 30; :"])
+            .spawn()
+            .expect("spawn the fake TUI");
+        let pid = child.id() as i32;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let clients = lifecycle.diagnosis().await.expect("diagnosis").clients;
+            if clients.unverified.iter().any(|client| client.pid == pid) {
+                assert!(
+                    clients.embedded.iter().all(|client| client.pid != pid),
+                    "an unproven sharing state is not an embedded claim"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fake TUI must be recorded as unverified: {clients:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Wait until the process scan has seen `pid` as a proven embedded client.
+    async fn wait_for_embedded(lifecycle: &CodexLifecycle, pid: i32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let clients = lifecycle.diagnosis().await.expect("diagnosis").clients;
+            if clients.embedded.iter().any(|client| client.pid == pid) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fake TUI must be discovered as embedded: {clients:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// The production probe asks for the managed binary, so the surface check
@@ -783,6 +1154,15 @@ mod tests {
             .await
             .expect("the running daemon attaches");
         assert_eq!(outcome, AttachOutcome::Attached);
+        // The steady-state pass proves the cached connection with a real
+        // `thread/loaded/list` on the daemon's own state — no redial.
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("the liveness probe answers on the real daemon"),
+            AttachOutcome::Attached
+        );
         assert_eq!(
             lifecycle.restart_server().await.expect("read"),
             RestartOutcome::NotOwned

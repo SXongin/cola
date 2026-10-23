@@ -40,6 +40,10 @@ pub(crate) fn shell_single_quote(value: &str) -> String {
 pub(crate) struct FakeCodex {
     pub(crate) binary: std::path::PathBuf,
     pub(crate) log: std::path::PathBuf,
+    /// The file `daemon start` reads its link target from, so a test can point a
+    /// later start at another socket **without rewriting the executable** (which
+    /// can hit `ETXTBSY` while the previous instance is still mapped).
+    target: Option<std::path::PathBuf>,
 }
 
 #[cfg(unix)]
@@ -68,20 +72,28 @@ impl FakeCodex {
             "appServerVersion": "0.163.0",
         })
         .to_string();
-        let start = match real_socket {
-            Some(real_socket) => format!(
-                "mkdir -p {}\nln -sfn {} {}\nprintf '%s\\n' '{{\"status\":\"started\"}}'\n",
-                shell_single_quote(
-                    &control_socket
-                        .parent()
-                        .expect("control dir")
-                        .display()
-                        .to_string()
-                ),
-                shell_single_quote(&real_socket.display().to_string()),
-                shell_single_quote(&control_socket.display().to_string()),
-            ),
-            None => "printf '%s\\n' '{\"status\":\"started\"}'\n".to_string(),
+        let (start, target) = match real_socket {
+            Some(real_socket) => {
+                let target = directory.join("link-target");
+                std::fs::write(&target, real_socket.display().to_string())
+                    .expect("write the fake link target");
+                (
+                    format!(
+                        "mkdir -p {}\nln -sfn \"$(cat {})\" {}\nprintf '%s\\n' '{{\"status\":\"started\"}}'\n",
+                        shell_single_quote(
+                            &control_socket
+                                .parent()
+                                .expect("control dir")
+                                .display()
+                                .to_string()
+                        ),
+                        shell_single_quote(&target.display().to_string()),
+                        shell_single_quote(&control_socket.display().to_string()),
+                    ),
+                    Some(target),
+                )
+            }
+            None => ("printf '%s\\n' '{\"status\":\"started\"}'\n".to_string(), None),
         };
         // The fake daemon is a detached process of its own, with its own pid
         // record — the shape cola must never adopt as its own. Its stdio is
@@ -122,7 +134,17 @@ impl FakeCodex {
         std::fs::write(&binary, script).expect("write the fake codex CLI");
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .expect("make the fake codex CLI executable");
-        Self { binary, log }
+        Self { binary, log, target }
+    }
+
+    /// Point the next `daemon start` at another socket, without rewriting the
+    /// script. Only meaningful when the CLI was written with a target.
+    pub(crate) fn point_at(&self, socket: &Path) {
+        let target = self
+            .target
+            .as_ref()
+            .expect("this fake CLI was written without a link target");
+        std::fs::write(target, socket.display().to_string()).expect("re-point the fake link target");
     }
 
     /// Every invocation, one `CODEX_HOME=… ARGS=…` line each.
@@ -150,10 +172,18 @@ struct State {
     reject_initialize: Option<String>,
     connections: AtomicUsize,
     initialized: AtomicUsize,
+    /// `thread/loaded/list` calls: the lifecycle's liveness probe.
+    liveness: AtomicUsize,
+    /// Per-connection serving tasks, so a test can make the daemon *die*
+    /// (break its live connections) while leaving its socket path on disk.
+    tasks: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 pub(crate) struct FakeServer {
     state: Arc<State>,
+    /// Set on a server that can be stopped; `None` for the TCP constructors,
+    /// which no test kills.
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl FakeServer {
@@ -168,12 +198,50 @@ impl FakeServer {
             ..State::default()
         });
         let serving = Arc::clone(&state);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let signal = Arc::clone(&shutdown);
         tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                accept_connection(stream, Arc::clone(&serving));
+            loop {
+                tokio::select! {
+                    _ = signal.notified() => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        accept_connection(stream, Arc::clone(&serving));
+                    }
+                }
             }
+            // Dropping the listener closes the socket, but the *path* stays on
+            // disk: exactly a crashed daemon's stale control socket.
         });
-        Self { state }
+        Self {
+            state,
+            shutdown: Some(shutdown),
+        }
+    }
+
+    /// Make the fake daemon die: stop accepting, break every live connection,
+    /// and leave the socket path behind. Unix only, matching [`Self::unix`].
+    ///
+    /// `tokio`'s `UnixListener` does not unlink on drop, so a later dial gets
+    /// `ECONNREFUSED` at a path that still exists — the stale-socket shape the
+    /// lifecycle must not read as a live daemon.
+    #[cfg(unix)]
+    pub(crate) async fn die(&self) {
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.notify_one();
+        }
+        let tasks: Vec<_> = self
+            .state
+            .tasks
+            .lock()
+            .expect("connection tasks")
+            .drain(..)
+            .collect();
+        for task in tasks {
+            task.abort();
+        }
+        // Give the aborted tasks a tick to actually drop their sockets.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     /// Serve a loopback TCP socket; returns the server and its `ws://` URL.
@@ -203,7 +271,13 @@ impl FakeServer {
                 accept_connection(stream, Arc::clone(&serving));
             }
         });
-        (Self { state }, format!("ws://{address}"))
+        (
+            Self {
+                state,
+                shutdown: None,
+            },
+            format!("ws://{address}"),
+        )
     }
 
     /// Connections accepted so far (one per client handshake).
@@ -227,6 +301,16 @@ impl FakeServer {
     pub(crate) async fn wait_for_connections(&self, expected: usize) {
         wait_until(|| self.connections(), expected, "connections").await;
     }
+
+    /// `thread/loaded/list` calls received so far (the liveness probe).
+    pub(crate) fn liveness_probes(&self) -> usize {
+        self.state.liveness.load(Ordering::SeqCst)
+    }
+
+    /// Wait until `expected` liveness probes have been answered.
+    pub(crate) async fn wait_for_liveness(&self, expected: usize) {
+        wait_until(|| self.liveness_probes(), expected, "liveness probes").await;
+    }
 }
 
 /// Count one accepted connection and serve it on its own task. The accept loop
@@ -237,7 +321,11 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     state.connections.fetch_add(1, Ordering::SeqCst);
-    tokio::spawn(async move { serve(stream, state).await });
+    let serving = Arc::clone(&state);
+    let handle = tokio::spawn(async move { serve(stream, serving).await });
+    // Registered so a test can make the daemon die mid-life (`FakeServer::die`)
+    // and break the live connection, not only the listener.
+    state.tasks.lock().expect("connection tasks").push(handle);
 }
 
 async fn wait_until(count: impl Fn() -> usize, expected: usize, what: &str) {
@@ -302,6 +390,15 @@ where
             }
             Some("initialized") => {
                 state.initialized.fetch_add(1, Ordering::SeqCst);
+            }
+            Some("thread/loaded/list") => {
+                state.liveness.fetch_add(1, Ordering::SeqCst);
+                let reply = json!({
+                    "jsonrpc": "2.0",
+                    "id": value.get("id").cloned().unwrap_or(Value::Null),
+                    "result": { "data": [] },
+                });
+                let _ = socket.send(Message::Text(reply.to_string().into())).await;
             }
             _ => {}
         }
