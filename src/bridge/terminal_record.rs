@@ -206,6 +206,82 @@ struct TerminalRecordFile {
     record: TerminalRunRecord,
 }
 
+/// The Agent Client a parsed record file belongs to: its stamped id, or the
+/// default client for a version-0 file (which had no client) and for a current
+/// file whose id is empty.
+fn record_file_owner(file: &TerminalRecordFile) -> &str {
+    if file.version == 0 || file.client_id.is_empty() {
+        crate::config::DEFAULT_CLIENT_ID
+    } else {
+        &file.client_id
+    }
+}
+
+/// Rewrite every version-0 record file in `dir` once (ADR-0091), preserving the
+/// record's facts and assigning it to the default client. `path_matches` keeps
+/// a misplaced file untouched. An unsupported version is refused loudly — never
+/// read as 0 — and a corrupt/unreadable file is left alone.
+fn migrate_record_dir(
+    dir: &Path,
+    what: &str,
+    path_matches: impl Fn(&TerminalRunRecord, &Path) -> bool,
+) -> anyhow::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            tracing::warn!("{what}: could not read {} for migration: {error}", dir.display());
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(raw) = read_bounded(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        match sidecar::classify_version(value.get("version")) {
+            sidecar::DeclaredVersion::Unsupported(declared) => {
+                anyhow::bail!(
+                    "{} declares unsupported format version {declared} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    crate::state::STATE_FORMAT_VERSION
+                );
+            }
+            sidecar::DeclaredVersion::Current => continue,
+            sidecar::DeclaredVersion::Legacy => {}
+        }
+        let Ok(file) = serde_json::from_slice::<TerminalRecordFile>(&raw) else {
+            continue;
+        };
+        if !path_matches(&file.record, &path) {
+            continue;
+        }
+        let migrated = TerminalRecordFile {
+            version: crate::state::STATE_FORMAT_VERSION,
+            client_id: crate::config::DEFAULT_CLIENT_ID.to_string(),
+            record: file.record,
+        };
+        let data = serde_json::to_vec(&migrated).map_err(std::io::Error::other)?;
+        if let Err(error) = sidecar::write_atomic(&path, &data) {
+            tracing::warn!(
+                "{what}: could not migrate {} to the current format: {error}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The record directory: one file per **Chat**/**Topic**, beside the session
 /// mapping (`~/.cola/terminal-runs` in production, `<dir>` of
 /// `[bridge] session_file`). One file per conversation is deliberate — a write
@@ -248,6 +324,10 @@ impl TerminalRunRecords {
     pub(crate) fn open(dir: PathBuf, client_id: &str) -> anyhow::Result<Self> {
         let records = Self::for_client(dir, client_id);
         records.migrate_version_0()?;
+        // The owed-settlement journal is part of the same durable tree and
+        // carries the same envelope (ADR-0091), so it migrates in the same
+        // startup pass.
+        records.owed().migrate_version_0()?;
         Ok(records)
     }
 
@@ -268,67 +348,9 @@ impl TerminalRunRecords {
     /// misplaced file is left untouched: it fails open on read, exactly as
     /// before.
     fn migrate_version_0(&self) -> anyhow::Result<()> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                tracing::warn!(
-                    "terminal record: could not read the record directory {} for migration: {error}",
-                    self.dir.display()
-                );
-                return Ok(());
-            }
-        };
-        for entry in entries {
-            let Ok(entry) = entry else {
-                continue;
-            };
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(raw) = read_bounded(&path) else {
-                continue;
-            };
-            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-                continue;
-            };
-            let version = value
-                .get("version")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|version| u32::try_from(version).ok())
-                .unwrap_or(0);
-            if version > crate::state::STATE_FORMAT_VERSION {
-                anyhow::bail!(
-                    "{} declares unsupported format version {version} (this build writes {}); \
-                     refusing to read it as version 0",
-                    path.display(),
-                    crate::state::STATE_FORMAT_VERSION
-                );
-            }
-            if version == crate::state::STATE_FORMAT_VERSION {
-                continue;
-            }
-            let Ok(record) = serde_json::from_slice::<TerminalRecordFile>(&raw) else {
-                continue;
-            };
-            if self.path(&record.record.key()) != path {
-                continue;
-            }
-            let migrated = TerminalRecordFile {
-                version: crate::state::STATE_FORMAT_VERSION,
-                client_id: crate::config::DEFAULT_CLIENT_ID.to_string(),
-                record: record.record,
-            };
-            let data = serde_json::to_vec(&migrated).map_err(std::io::Error::other)?;
-            if let Err(error) = sidecar::write_atomic(&path, &data) {
-                tracing::warn!(
-                    "terminal record: could not migrate {} to the current format: {error}",
-                    path.display()
-                );
-            }
-        }
-        Ok(())
+        migrate_record_dir(&self.dir, "terminal record", |record, path| {
+            self.path(&record.key()) == path
+        })
     }
 
     /// The directory the records live in. The log sweep asks whether it exists
@@ -357,7 +379,10 @@ impl TerminalRunRecords {
     /// stale card pass after a restart.
     pub(crate) fn read(&self, key: &ThreadKey) -> Option<TerminalRunRecord> {
         let path = self.path(key);
-        let record = Self::load_file(&path)?;
+        let (record, owner) = Self::load_file(&path)?;
+        if owner != self.client_id {
+            return None;
+        }
         if record.chat_id != key.chat_id || record.thread_id != key.thread_id {
             tracing::warn!(
                 "terminal record: {} names chat {}/{} instead of the file's {}/{}; ignoring it",
@@ -379,20 +404,32 @@ impl TerminalRunRecords {
     /// The read is **bounded** to [`TERMINAL_RECORD_MAX_BYTES`]: this runs
     /// synchronously in a card callback for the stale-click guards, so it must
     /// not grow with whatever sits at the path.
-    fn load_file(path: &Path) -> Option<TerminalRunRecord> {
+    /// Read and parse one record file, returning the record and the Agent
+    /// Client it belongs to. A legacy file (no `version`, no `client_id`) is the
+    /// default client's; any other client's record is still readable here so
+    /// [`Self::scan`] can tell "not mine" from "unreadable".
+    fn load_file(path: &Path) -> Option<(TerminalRunRecord, String)> {
         let raw = read_bounded(path)?;
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+            tracing::warn!("terminal record: could not parse {}: not JSON", path.display());
+            return None;
+        };
+        if let sidecar::DeclaredVersion::Unsupported(declared) =
+            sidecar::classify_version(value.get("version"))
+        {
+            tracing::error!(
+                "terminal record: {} declares unsupported format version {declared} \
+                 (this build writes {}); refusing to read it as version 0",
+                path.display(),
+                crate::state::STATE_FORMAT_VERSION
+            );
+            return None;
+        }
         match serde_json::from_slice::<TerminalRecordFile>(&raw) {
-            Ok(file) if file.version > crate::state::STATE_FORMAT_VERSION => {
-                tracing::error!(
-                    "terminal record: {} declares unsupported format version {} (this build writes {}); \
-                     refusing to read it as version 0",
-                    path.display(),
-                    file.version,
-                    crate::state::STATE_FORMAT_VERSION
-                );
-                None
+            Ok(file) => {
+                let owner = record_file_owner(&file).to_string();
+                Some((file.record, owner))
             }
-            Ok(file) => Some(file.record),
             Err(e) => {
                 tracing::warn!("terminal record: could not parse {}: {e}", path.display());
                 None
@@ -712,10 +749,13 @@ impl TerminalRunRecords {
                 continue;
             }
             match Self::load_file(&path) {
+                // Another client's record is not this process's set: it is
+                // neither read nor treated as damage (ADR-0091).
+                Some((_, owner)) if owner != self.client_id => {}
                 // A record only means something at the path its OWN key names:
                 // a file under another chat's name is unreadable, whether it was
                 // misplaced or crafted, so the set is not complete.
-                Some(record) if self.path(&record.key()) == path => records.push(record),
+                Some((record, _)) if self.path(&record.key()) == path => records.push(record),
                 Some(_) | None => complete = false,
             }
         }
@@ -760,8 +800,16 @@ impl TerminalOwedSettlements {
         &self.dir
     }
 
-    fn path(&self, run_id: &str) -> PathBuf {
+    pub(crate) fn path(&self, run_id: &str) -> PathBuf {
         self.dir.join(owed_file_name(run_id))
+    }
+
+    /// Rewrite every version-0 obligation once (ADR-0091), preserving the
+    /// settled record and assigning it to the default client.
+    fn migrate_version_0(&self) -> anyhow::Result<()> {
+        migrate_record_dir(&self.dir, "terminal owed", |record, path| {
+            self.path(&record.run_id) == path
+        })
     }
 
     /// Persist one obligation — the settled record snapshot, ending included —
@@ -827,21 +875,29 @@ impl TerminalOwedSettlements {
                 complete = false;
                 continue;
             };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                tracing::warn!("terminal owed: could not parse {}: not JSON", path.display());
+                complete = false;
+                continue;
+            };
+            if let sidecar::DeclaredVersion::Unsupported(declared) =
+                sidecar::classify_version(value.get("version"))
+            {
+                tracing::error!(
+                    "terminal owed: {} declares unsupported format version {declared} \
+                     (this build writes {}); refusing to read it as version 0",
+                    path.display(),
+                    crate::state::STATE_FORMAT_VERSION
+                );
+                complete = false;
+                continue;
+            }
             match serde_json::from_slice::<TerminalRecordFile>(&raw) {
+                // Another client's obligation is not this process's set.
+                Ok(file) if record_file_owner(&file) != self.client_id => {}
                 // An obligation only means something at the path its OWN run id
                 // names: anything else is unreadable, whether misplaced or
-                // crafted. A version this build does not know is not knowing
-                // either — never read as version 0 (ADR-0091).
-                Ok(file) if file.version > crate::state::STATE_FORMAT_VERSION => {
-                    tracing::error!(
-                        "terminal owed: {} declares unsupported format version {} (this build writes {}); \
-                         refusing to read it as version 0",
-                        path.display(),
-                        file.version,
-                        crate::state::STATE_FORMAT_VERSION
-                    );
-                    complete = false;
-                }
+                // crafted.
                 Ok(file) if self.path(&file.record.run_id) == path => owed.push(file.record),
                 Ok(_) => complete = false,
                 Err(e) => {
@@ -1361,6 +1417,106 @@ mod tests {
             records.read(&key).unwrap().state,
             TerminalRunState::Settled,
             "the merge is the targeted state change"
+        );
+    }
+
+    /// ADR-0091: only the exact integer 0 and the current integer are readable
+    /// versions. A float, a string, a suffixed string or a negative is refused
+    /// loudly with its raw value — never treated as corrupt-then-zero.
+    #[test]
+    fn a_malformed_or_future_version_is_refused_not_read_as_zero() {
+        let current = crate::state::STATE_FORMAT_VERSION;
+        let shapes = [
+            (current + 1).to_string(),
+            format!("{}.0", current + 1),
+            format!("\"{}\"", current + 1),
+            format!("\"{}-beta\"", current + 1),
+            "-1".to_string(),
+        ];
+        for declared in shapes {
+            let dir = tempfile::tempdir().unwrap();
+            let runs = dir.path().join("terminal-runs");
+            std::fs::create_dir_all(&runs).unwrap();
+            let path = runs.join("record.json");
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"version":{declared},"run_id":"run","chat_id":"c","thread_id":"c","log_path":"/tmp/x","command":"ls","cwd":"/tmp","timeout_ms":1,"state":"running"}}"#
+                ),
+            )
+            .unwrap();
+            assert!(
+                TerminalRunRecords::load_file(&path).is_none(),
+                "the read path refuses {declared} too"
+            );
+            let error = TerminalRunRecords::open(runs, crate::config::DEFAULT_CLIENT_ID)
+                .err()
+                .expect("a malformed version is refused");
+            assert!(
+                error.to_string().contains(&declared),
+                "the refusal names the raw value {declared}: {error}"
+            );
+        }
+    }
+
+    /// The owed journal is part of the same tree and refuses a malformed header
+    /// the same way, reporting the set as incomplete rather than reading it as
+    /// version 0.
+    #[test]
+    fn the_owed_journal_refuses_a_malformed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = store(&dir);
+        let owed = records.owed();
+        std::fs::create_dir_all(owed.dir()).unwrap();
+        std::fs::write(
+            owed.dir().join("anything.json"),
+            r#"{"version":"2-beta","run_id":"run"}"#,
+        )
+        .unwrap();
+        let (settled, complete) = owed.load_all();
+        assert!(settled.is_empty());
+        assert!(!complete, "an unreadable version is not knowing");
+    }
+
+    /// ADR-0091: a record belongs to the client that wrote it. Another client's
+    /// run cannot be read as this client's, and a legacy file with no client id
+    /// belongs to the default client.
+    #[test]
+    fn a_run_record_belongs_to_the_client_that_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let chat_key = key("oc_chat", "oc_chat");
+        let default = store(&dir);
+        default.write(&record(&chat_key, "run-default")).unwrap();
+
+        let codex = TerminalRunRecords::open(dir.path().join("terminal-runs"), "codex").unwrap();
+        assert_eq!(
+            codex.read(&chat_key),
+            None,
+            "another client's run is not this client's"
+        );
+        assert!(codex.load_all().is_empty());
+
+        // A version-0 file (no version, no client id) is the default client's.
+        let legacy_key = key("oc_legacy", "oc_legacy");
+        std::fs::write(
+            default.path(&legacy_key),
+            serde_json::to_vec(&record(&legacy_key, "run-legacy")).unwrap(),
+        )
+        .unwrap();
+        let default_reader = TerminalRunRecords::new(dir.path().join("terminal-runs"));
+        assert!(default_reader.read(&legacy_key).is_some());
+        assert!(codex.read(&legacy_key).is_none());
+
+        // A codex run replacing the chat's record is codex's alone.
+        codex.write(&record(&chat_key, "run-codex")).unwrap();
+        assert!(codex.is_current(&chat_key, "run-codex"));
+        let default_after = TerminalRunRecords::new(dir.path().join("terminal-runs"));
+        assert_eq!(default_after.read(&chat_key), None);
+        assert!(
+            default_after
+                .load_all()
+                .iter()
+                .all(|record| record.run_id != "run-codex")
         );
     }
 }

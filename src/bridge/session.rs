@@ -176,19 +176,23 @@ impl SessionStore {
                     crate::state::STATE_FORMAT_VERSION
                 )));
             }
-            sidecar::VersionedRead::Legacy(raw) => {
-                let (mut entries, pending) = parse_store(&raw, &path);
-                // ADR-0091: a version-0 file belongs to the default client,
-                // whatever client this process happens to run.
-                for entry in &mut entries {
-                    entry.client_id = crate::config::DEFAULT_CLIENT_ID.to_string();
+            sidecar::VersionedRead::Legacy(raw) => match parse_store(&raw, &path) {
+                Some((mut entries, pending)) => {
+                    // ADR-0091: a version-0 file belongs to the default client,
+                    // whatever client this process happens to run.
+                    for entry in &mut entries {
+                        entry.client_id = crate::config::DEFAULT_CLIENT_ID.to_string();
+                    }
+                    (entries, pending, true)
                 }
-                (entries, pending, true)
-            }
-            sidecar::VersionedRead::Current(raw) => {
-                let (entries, pending) = parse_store(&raw, &path);
-                (entries, pending, false)
-            }
+                // A version-0 body this build cannot parse fails open and is
+                // not rewritten: the bytes stay for a human to inspect.
+                None => (Vec::new(), Vec::new(), false),
+            },
+            sidecar::VersionedRead::Current(raw) => match parse_store(&raw, &path) {
+                Some((entries, pending)) => (entries, pending, false),
+                None => (Vec::new(), Vec::new(), false),
+            },
         };
         let writer = match crate::bridge::store_writer::StoreWriter::start(path.clone()) {
             Ok(writer) => Some(writer),
@@ -670,15 +674,15 @@ impl SessionStore {
 /// Parse either historical shape: the pre-ADR-0041 bare array, or the object
 /// with `entries`/`pending`. A corrupt body fails open with a warning, exactly
 /// as the store did before ADR-0091.
-fn parse_store(raw: &str, path: &std::path::Path) -> (Vec<SessionEntry>, Vec<PendingEntry>) {
+fn parse_store(raw: &str, path: &std::path::Path) -> Option<(Vec<SessionEntry>, Vec<PendingEntry>)> {
     match serde_json::from_str::<LoadedStore>(raw) {
-        Ok(loaded) => loaded.into_parts(),
+        Ok(loaded) => Some(loaded.into_parts()),
         Err(err) => {
             tracing::warn!(
                 "could not parse {} ({err}); starting with an empty mapping",
                 path.display()
             );
-            (Vec::new(), Vec::new())
+            None
         }
     }
 }

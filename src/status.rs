@@ -143,7 +143,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Ba
     };
     let (claimed, host) = match cfg {
         Some(cfg) => {
-            let list = crate::bridge::access::AccessList::load(&cfg.bridge.access_file);
+            let list = crate::bridge::access::AccessList::load_read_only(&cfg.bridge.access_file);
             (Some(list.is_claimed()), list.host().map(str::to_string))
         }
         None => (None, None),

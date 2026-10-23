@@ -74,6 +74,50 @@ fn write_pins_file(path: &Path, pins: &[PinnedChat]) {
     );
 }
 
+/// Rewrite a version-0 pin file once in the current form (ADR-0091). A corrupt
+/// file is left untouched (the orphan clears it records must not be lost), and
+/// an unsupported version is refused loudly rather than read as 0.
+fn migrate_pins_file(path: &Path) {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return; // Missing (or unreadable) means nothing recorded.
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        tracing::warn!(
+            "instant reminder: could not parse {}; leaving it untouched",
+            path.display()
+        );
+        return;
+    };
+    match crate::bridge::sidecar::classify_version(value.get("version")) {
+        crate::bridge::sidecar::DeclaredVersion::Current => {}
+        crate::bridge::sidecar::DeclaredVersion::Legacy => {
+            match serde_json::from_str::<PinnedChatsFile>(&raw) {
+                // A migration lands the version even for an empty pin set; the
+                // normal writer removes an empty file only for later mutations.
+                Ok(file) => crate::bridge::sidecar::store(
+                    path,
+                    "instant reminder",
+                    &PinnedChatsFile {
+                        version: crate::state::STATE_FORMAT_VERSION,
+                        pins: file.pins,
+                    },
+                    false,
+                ),
+                Err(e) => tracing::warn!(
+                    "instant reminder: could not parse {} ({e}); leaving it untouched",
+                    path.display()
+                ),
+            }
+        }
+        crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) => tracing::error!(
+            "instant reminder: {} declares unsupported format version {declared} (this build writes {}); \
+             refusing to read it as version 0",
+            path.display(),
+            crate::state::STATE_FORMAT_VERSION
+        ),
+    }
+}
+
 /// The reminder cola believes is currently ON at Feishu, the generation that
 /// owns it, and the pinned user(s). The generation is the highest ever
 /// recorded for the Chat/Topic (a retarget never downgrades it), so a stale
@@ -140,6 +184,9 @@ pub(crate) struct ReminderState {
 
 impl ReminderState {
     pub(crate) fn new(enabled: bool, pins_file: Option<PathBuf>) -> Self {
+        if let Some(path) = &pins_file {
+            migrate_pins_file(path);
+        }
         Self {
             enabled,
             pins_file,
@@ -465,6 +512,24 @@ impl ReminderState {
         let Ok(raw) = std::fs::read_to_string(path) else {
             return; // Missing (or unreadable) means nothing recorded.
         };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            tracing::warn!(
+                "instant reminder: could not parse {}; leaving it untouched",
+                path.display()
+            );
+            return;
+        };
+        if let crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) =
+            crate::bridge::sidecar::classify_version(value.get("version"))
+        {
+            tracing::error!(
+                "instant reminder: {} declares unsupported format version {declared} (this build writes {}); \
+                 refusing to read it as version 0",
+                path.display(),
+                crate::state::STATE_FORMAT_VERSION
+            );
+            return;
+        }
         let file: PinnedChatsFile = match serde_json::from_str(&raw) {
             Ok(file) => file,
             Err(e) => {
@@ -475,16 +540,6 @@ impl ReminderState {
                 return;
             }
         };
-        if file.version > crate::state::STATE_FORMAT_VERSION {
-            tracing::error!(
-                "instant reminder: {} declares unsupported format version {} (this build writes {}); \
-                 refusing to read it as version 0",
-                path.display(),
-                file.version,
-                crate::state::STATE_FORMAT_VERSION
-            );
-            return;
-        }
         let mut remaining = Vec::new();
         for entry in file.pins {
             let mut inner = self.inner.lock().await;
@@ -915,5 +970,18 @@ mod tests {
         .await;
         assert_eq!(reminder_calls(&platform).await.len(), 3);
         assert_line_level(&logs, "instant reminder: pin chat_1 recovered", "INFO");
+    }
+
+    /// ADR-0091: a version-0 pin file is rewritten once at construction, even
+    /// when it records no pins.
+    #[test]
+    fn a_version_0_pin_file_is_rewritten_versioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinned_chats.json");
+        std::fs::write(&path, "{}").unwrap();
+        let _ = ReminderState::new(true, Some(path.clone()));
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], crate::state::STATE_FORMAT_VERSION);
+        assert!(raw["pins"].as_array().unwrap().is_empty());
     }
 }

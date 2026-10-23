@@ -8,9 +8,10 @@ use std::path::Path;
 
 use crate::bridge::access::AccessList;
 use crate::bridge::chain::ChainRecords;
+use crate::bridge::reminder::ReminderState;
 use crate::bridge::session::SessionStore;
 use crate::bridge::surfaces::Surfaces;
-use crate::bridge::terminal_record::TerminalRunRecords;
+use crate::bridge::terminal_record::{TerminalRunRecords, TerminalRunState};
 use crate::config::{DEFAULT_CLIENT_ID, ThreadKey};
 use crate::state::STATE_FORMAT_VERSION;
 
@@ -88,7 +89,29 @@ const TERMINAL_V0: &str = r#"{
   "command": "ls",
   "cwd": "/work/one",
   "timeout_ms": 1000,
-  "state": "running"
+  "pids": [4242],
+  "state": "settled",
+  "outcome": { "exit_code": 0, "elapsed_ms": 12, "stopped": false, "survivors": false, "output_over_limit": false }
+}"#;
+
+const TERMINAL_OWED_V0: &str = r#"{
+  "run_id": "run_owed",
+  "chat_id": "chat_1",
+  "thread_id": "chat_1",
+  "card_id": "om_owed",
+  "log_path": "/tmp/owed.log",
+  "command": "make",
+  "cwd": "/work/one",
+  "timeout_ms": 2000,
+  "pids": [5151],
+  "state": "settled",
+  "outcome": { "exit_code": 2, "elapsed_ms": 99, "stopped": false, "survivors": true, "output_over_limit": false }
+}"#;
+
+const PINNED_V0: &str = r#"{
+  "pins": [
+    { "chat_id": "chat_1", "is_group": false, "user_ids": ["ou_requester"] }
+  ]
 }"#;
 
 fn key(chat: &str) -> ThreadKey {
@@ -100,27 +123,36 @@ fn write_fixture(dir: &Path) {
     std::fs::write(dir.join("chain_records.json"), CHAIN_V0).unwrap();
     std::fs::write(dir.join("interactive_surfaces.json"), SURFACES_V0).unwrap();
     std::fs::write(dir.join("access.json"), r#"{ "host": "ou_host" }"#).unwrap();
+    std::fs::write(dir.join("pinned_chats.json"), PINNED_V0).unwrap();
     let runs = dir.join("terminal-runs");
     std::fs::create_dir_all(&runs).unwrap();
     // The record's file name is the Chat/Topic key; ask the store for the path
     // rather than reproducing the slug rule.
     let naming = TerminalRunRecords::new(runs.clone());
     std::fs::write(naming.path(&key("chat_1")), TERMINAL_V0).unwrap();
+    let owed = naming.owed();
+    std::fs::create_dir_all(owed.dir()).unwrap();
+    std::fs::write(owed.path("run_owed"), TERMINAL_OWED_V0).unwrap();
 }
 
-/// Every file's bytes, so "the second process did not rewrite" is exact.
+/// Every file's bytes, recursively — the nested `terminal-runs/` and its owed
+/// journal are part of "the second process did not rewrite" too.
 fn file_bytes(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_file())
-        .map(|entry| {
-            (
-                entry.file_name().to_string_lossy().into_owned(),
-                std::fs::read(entry.path()).unwrap(),
-            )
-        })
-        .collect();
+    fn walk(root: &Path, dir: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, files);
+            } else if path.is_file() {
+                files.push((
+                    path.strip_prefix(root).unwrap().to_string_lossy().into_owned(),
+                    std::fs::read(&path).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
     files.sort();
     files
 }
@@ -167,10 +199,34 @@ fn a_release_written_fixture_loads_every_section_and_upgrades_once() {
     let records = terminals.load_all();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].run_id, "run_1");
+    assert_eq!(records[0].pids, vec![4242], "migration keeps the pids");
+    assert_eq!(
+        records[0].state,
+        TerminalRunState::Settled,
+        "migration keeps the state"
+    );
+    assert_eq!(
+        records[0].outcome.as_ref().and_then(|outcome| outcome.exit_code),
+        Some(0),
+        "migration keeps the outcome"
+    );
+    let owed = terminals.owed().load_all().0;
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].run_id, "run_owed");
+    assert_eq!(owed[0].pids, vec![5151], "the owed journal keeps the pids");
+    assert_eq!(owed[0].state, TerminalRunState::Settled);
+    assert_eq!(
+        owed[0].outcome.as_ref().and_then(|outcome| outcome.exit_code),
+        Some(2),
+        "the owed journal keeps the outcome"
+    );
 
-    let mut access = AccessList::load(&dir.path().join("access.json"));
+    // The pinned set migrates at construction, once.
+    let pins_path = dir.path().join("pinned_chats.json");
+    let _reminder = ReminderState::new(true, Some(pins_path.clone()));
+
+    let access = AccessList::load(&dir.path().join("access.json"));
     assert_eq!(access.host(), Some("ou_host"));
-    access.migrate();
 
     // Every file now carries the current version and the default client id.
     for name in [
@@ -178,6 +234,7 @@ fn a_release_written_fixture_loads_every_section_and_upgrades_once() {
         "chain_records.json",
         "interactive_surfaces.json",
         "access.json",
+        "pinned_chats.json",
     ] {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join(name)).unwrap()).unwrap();
@@ -206,6 +263,14 @@ fn a_release_written_fixture_loads_every_section_and_upgrades_once() {
     assert_eq!(terminal["version"], STATE_FORMAT_VERSION);
     assert_eq!(terminal["client_id"], DEFAULT_CLIENT_ID);
 
+    let owed_raw = std::fs::read_to_string(terminals.owed().path("run_owed")).unwrap();
+    let owed_json: serde_json::Value = serde_json::from_str(&owed_raw).unwrap();
+    assert_eq!(owed_json["version"], STATE_FORMAT_VERSION);
+    assert_eq!(owed_json["client_id"], DEFAULT_CLIENT_ID);
+    assert_eq!(owed_json["pids"][0], 5151);
+    assert_eq!(owed_json["state"], "settled");
+    assert_eq!(owed_json["outcome"]["exit_code"], 2);
+
     // Exactly once: a second process reads version 1 and writes nothing.
     let before = file_bytes(dir.path());
     let sessions = SessionStore::for_client(dir.path().join("sessions.json"), DEFAULT_CLIENT_ID).unwrap();
@@ -215,6 +280,7 @@ fn a_release_written_fixture_loads_every_section_and_upgrades_once() {
     let _ = Surfaces::open(dir.path().join("interactive_surfaces.json"), DEFAULT_CLIENT_ID).unwrap();
     let _ = TerminalRunRecords::open(dir.path().join("terminal-runs"), DEFAULT_CLIENT_ID).unwrap();
     let _ = AccessList::load(&dir.path().join("access.json"));
+    let _ = ReminderState::new(true, Some(pins_path));
     assert_eq!(
         before,
         file_bytes(dir.path()),
@@ -257,6 +323,18 @@ fn a_corrupt_or_absent_file_still_fails_open() {
 
     let terminals = TerminalRunRecords::open(corrupt.join("terminal-runs"), DEFAULT_CLIENT_ID).unwrap();
     assert!(terminals.load_all().is_empty());
+
+    // Valid JSON with a body the version-0 shape cannot parse: fail open, and
+    // leave the bytes alone (only a parsed version-0 body is migrated).
+    let wrong_shape = r#"{"entries":"not a list"}"#;
+    std::fs::write(corrupt.join("sessions.json"), wrong_shape).unwrap();
+    let sessions = SessionStore::for_client(corrupt.join("sessions.json"), DEFAULT_CLIENT_ID).unwrap();
+    assert!(sessions.all_entries().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(corrupt.join("sessions.json")).unwrap(),
+        wrong_shape,
+        "an unparsable version-0 body is not rewritten"
+    );
 }
 
 #[test]
@@ -298,18 +376,47 @@ fn a_future_version_refuses_to_load_instead_of_reading_version_zero() {
         STATE_FORMAT_VERSION + 1
     );
     std::fs::write(dir.path().join("access.json"), &access).unwrap();
-    let mut list = AccessList::load(&dir.path().join("access.json"));
+    let list = AccessList::load(&dir.path().join("access.json"));
     assert_eq!(list.host(), None, "a future Access List is not read as version 0");
-    list.migrate();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("access.json")).unwrap(),
         access,
         "a refused file is never rewritten"
     );
 
-    // The files are untouched — refusing must never rewrite what it cannot read.
+    let malformed_sessions = r#"{"version":"2-beta","entries":[]}"#;
+    std::fs::write(dir.path().join("sessions.json"), malformed_sessions).unwrap();
+    assert!(
+        SessionStore::for_client(dir.path().join("sessions.json"), DEFAULT_CLIENT_ID).is_err(),
+        "a suffixed version string is refused, not read as 0"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("sessions.json")).unwrap(),
-        future
+        malformed_sessions
+    );
+
+    let malformed = r#"{"version":"2-beta","host":"ou_host"}"#;
+    std::fs::write(dir.path().join("access.json"), malformed).unwrap();
+    let list = AccessList::load(&dir.path().join("access.json"));
+    assert_eq!(list.host(), None, "a malformed Access List version is refused");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("access.json")).unwrap(),
+        malformed,
+        "a malformed version is left untouched"
+    );
+
+    let malformed_pins = r#"{"version":"2-beta","pins":[]}"#;
+    std::fs::write(dir.path().join("pinned_chats.json"), malformed_pins).unwrap();
+    let _ = ReminderState::new(true, Some(dir.path().join("pinned_chats.json")));
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("pinned_chats.json")).unwrap(),
+        malformed_pins,
+        "a malformed pin version is left untouched"
+    );
+
+    // The file is untouched — refusing must never rewrite what it cannot read.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("sessions.json")).unwrap(),
+        malformed_sessions
     );
 }
