@@ -70,8 +70,16 @@ struct Attachment {
 }
 
 /// How long the cached connection gets to answer the steady-state liveness
-/// probe. A daemon that has gone away must be noticed on the next pass, but a
-/// wedged one must not hold the pass for long.
+/// probe.
+///
+/// Deliberately **smaller** than the 10 s handshake budget: the probe is served
+/// from the daemon's in-memory thread table over an already-warm connection, so
+/// no model, provider or disk work can delay it — a busy daemon (a streaming
+/// turn, a compaction) still answers instantly, and a miss therefore means the
+/// transport is gone or wedged. Even a false negative is cheap: the attachment
+/// is dropped for this pass and the next pass re-attaches; nothing is killed.
+/// What the bound buys is that a wedged connection cannot stall the lifecycle
+/// locks for the handshake's full budget on every poll tick.
 const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The one request the liveness probe sends. It is in the required contract
@@ -144,6 +152,12 @@ pub(crate) struct CodexLifecycle {
     /// The embedded client last reported at WARN, so a poll loop does not log
     /// the same diagnosis every tick.
     reported_embedded: AtomicI32,
+    /// Test-only: a one-shot hook run after the connection attempt returns and
+    /// before the identity is re-read, so a test can re-point the control socket
+    /// inside that window (a successful dial and a failed one alike). The field
+    /// exists only in a test build.
+    #[cfg(test)]
+    dial_hook: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl CodexLifecycle {
@@ -155,7 +169,15 @@ impl CodexLifecycle {
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
+            #[cfg(test)]
+            dial_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Test-only: install the one-shot pre-dial hook.
+    #[cfg(test)]
+    pub(crate) fn set_dial_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        *self.dial_hook.lock().expect("dial hook") = Some(hook);
     }
 
     /// What discovery last observed — the read `cola doctor` needs for ADR-0090
@@ -180,26 +202,44 @@ impl CodexLifecycle {
     /// pass, never reaped. A daemon that answers and is unusable (a contract or
     /// probe failure) stays loud — retrying cannot fix it.
     async fn attach(&self, daemon: &Daemon) -> Result<Attempt> {
-        let probe = self.probes.probe(daemon);
-        let options = CodexOptions::new(Endpoint::Unix(daemon.socket.clone()));
-        for _ in 0..ATTACH_ATTEMPTS {
-            let Some(identity) = discovery::socket_identity(&daemon.socket)? else {
+        // The daemon of the attempt, not the daemon discovery saw first: a retry
+        // follows a re-pointed path, and the probe must ask the binary *that*
+        // daemon runs (a different build is a different schema).
+        let mut current = daemon.clone();
+        for attempt in 0..ATTACH_ATTEMPTS {
+            if attempt > 0 {
+                current = match self.current_daemon().await? {
+                    Some(daemon) => daemon,
+                    // The path is gone between attempts: no daemon, so a start
+                    // policy may apply.
+                    None => return Ok(Attempt::Unreachable),
+                };
+            }
+            let Some(identity) = discovery::socket_identity(&current.socket)? else {
                 return Ok(Attempt::Unreachable);
             };
-            match CodexClient::connect(&options, probe.as_ref()).await {
+            let probe = self.probes.probe(&current);
+            let options = CodexOptions::new(Endpoint::Unix(current.socket.clone()));
+            let dialed = CodexClient::connect(&options, probe.as_ref()).await;
+            // Test-only: a replacement can land between the connection attempt
+            // and the identity re-read right below. The hook opens exactly that
+            // window, for both a successful dial and a failed one.
+            #[cfg(test)]
+            self.fire_dial_hook();
+            match dialed {
                 Ok(client) => {
-                    if discovery::socket_identity(&daemon.socket)? != Some(identity) {
+                    if discovery::socket_identity(&current.socket)? != Some(identity) {
                         tracing::warn!(
                             "the codex control socket at {} was replaced during the attach; \
                              discarding a connection of unknown identity",
-                            daemon.socket.display()
+                            current.socket.display()
                         );
                         // Dropping `client` closes the connection to the daemon
                         // the path no longer names. Nothing is sent to it.
                         continue;
                     }
                     tracing::info!(
-                        socket = %daemon.socket.display(),
+                        socket = %current.socket.display(),
                         version = %client.server_info().version,
                         surface = %client.server_info().surface_source,
                         "attached to the codex app-server daemon"
@@ -208,9 +248,21 @@ impl CodexLifecycle {
                     return Ok(Attempt::Attached);
                 }
                 Err(error) if daemon_gone(&error) => {
+                    // A failed dial can race a replacement too: A refused while
+                    // the path moved to a healthy B. Reporting `Unreachable`
+                    // would let a start run against B, so re-check the identity
+                    // and re-dial the daemon the path now names.
+                    if discovery::socket_identity(&current.socket)? != Some(identity) {
+                        tracing::warn!(
+                            "the codex control socket at {} was replaced while the dial failed; \
+                             re-dialling the daemon the path now names",
+                            current.socket.display()
+                        );
+                        continue;
+                    }
                     tracing::warn!(
                         "the codex daemon at {} is gone or unreachable; staying unattached: {}",
-                        daemon.socket.display(),
+                        current.socket.display(),
                         error
                     );
                     return Ok(Attempt::Unreachable);
@@ -219,6 +271,25 @@ impl CodexLifecycle {
             }
         }
         Ok(Attempt::Raced)
+    }
+
+    /// The daemon the control path names right now, if one is discoverable.
+    async fn current_daemon(&self) -> Result<Option<Daemon>> {
+        Ok(match discovery::discover(&self.environment).await?.daemon {
+            DaemonState::Running(daemon) => Some(daemon),
+            DaemonState::Absent { .. } => None,
+        })
+    }
+
+    /// Test-only: run the dial hook once, after a connection attempt and before
+    /// its identity is re-read. It lets a test re-point the control socket
+    /// inside the window the transport-race fix covers.
+    #[cfg(test)]
+    fn fire_dial_hook(&self) {
+        let hook = self.dial_hook.lock().expect("dial hook").take();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// Log the local clients a discovery pass observed: a proven embedded
@@ -289,12 +360,26 @@ impl ServerLifecycle for CodexLifecycle {
                     None => false,
                 };
                 if alive {
-                    drop(slot);
-                    self.report_clients(&discovery::local_clients(true));
-                    return Ok(AttachOutcome::Attached);
+                    // The path can move while the old daemon keeps answering:
+                    // `Attached` must describe the daemon the control path names
+                    // now, so re-read the identity after the probe and fall
+                    // through to a re-attach when it changed.
+                    let still =
+                        discovery::socket_identity(&self.environment.socket()).map_err(client_error)?;
+                    if still == Some(identity) {
+                        drop(slot);
+                        self.report_clients(&discovery::local_clients(true));
+                        return Ok(AttachOutcome::Attached);
+                    }
+                    tracing::warn!(
+                        "the codex control socket at {} was replaced while the previous daemon \
+                         still answered; re-attaching to the daemon the path names now",
+                        self.environment.socket().display()
+                    );
                 }
-                // The connection is dead or wedged: forget it. Nothing is sent
-                // to the daemon — it is not cola's to stop.
+                // The connection is dead, wedged, or no longer the one the path
+                // names: forget it. Nothing is sent to the daemon — it is not
+                // cola's to stop.
                 slot.take();
             }
         }
@@ -821,6 +906,11 @@ mod tests {
         );
         assert_eq!(first.connections(), 1, "the old daemon was dialled once");
         assert_eq!(second.connections(), 1, "the retry dialled the replacement");
+        assert_eq!(
+            seen.lock().expect("probe log").len(),
+            2,
+            "the retry builds its probe from the daemon it re-discovered, not the first one"
+        );
         // The stored identity is the replacement: a steady pass probes *it*,
         // never the old connection.
         assert_eq!(
@@ -832,6 +922,56 @@ mod tests {
         );
         second.wait_for_liveness(1).await;
         assert_eq!(first.liveness_probes(), 0, "the voided connection is gone");
+    }
+
+    /// A dial that fails while the control path moves to a **healthy** daemon
+    /// must be read as a replacement race, not as "no daemon": treating it as
+    /// `Unreachable` would let `auto` run `daemon start` against the live
+    /// replacement, whose idempotent start has no identity change to wait for.
+    #[tokio::test]
+    async fn a_failed_dial_that_raced_a_replacement_does_not_start() {
+        let fixture = Fixture::new();
+        // A's listener is gone but its socket path stays, so the dial fails
+        // fast (`ECONNREFUSED`) at a path that still looks like a daemon.
+        let stale = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        stale.die().await;
+        let control = fixture.environment.socket();
+        std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
+        std::os::unix::fs::symlink(&fixture.daemon_socket, &control).expect("symlink the corpse");
+
+        // The healthy daemon the path moves to while that dial fails.
+        let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
+        std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
+        let replacement = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        fixture.cli.point_at(&replacement_path);
+
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let hook_control = control.clone();
+        let hook_target = replacement_path.clone();
+        lifecycle.set_dial_hook(Arc::new(move || {
+            std::fs::remove_file(&hook_control).expect("remove the old link");
+            std::os::unix::fs::symlink(&hook_target, &hook_control).expect("re-point the link");
+        }));
+
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("the retry attaches to the daemon the path now names"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(
+            fixture.cli.starts(),
+            0,
+            "a live replacement is never started over: {:?}",
+            fixture.cli.invocations()
+        );
+        assert_eq!(
+            replacement.connections(),
+            1,
+            "the healthy daemon the path names is dialled"
+        );
     }
 
     /// A daemon that disappears is unattached on the next pass — and nothing is
