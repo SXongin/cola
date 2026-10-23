@@ -364,10 +364,14 @@ const OPENCODE_CLIENT_KEYS: &[&str] = &["url", "model", "start_server", "generat
 /// against the kind's own list, never rejected as "another kind's".
 const CODEX_CLIENT_KEYS: &[&str] = &["start_server"];
 
-/// Every option key any kind accepts. The table is parsed before `kind` is
-/// validated, so this union is what must be kept out of `unknown`; resolution
-/// then rejects a key the selected kind does not own.
-const CLIENT_OPTION_KEYS: &[&str] = &["url", "model", "start_server", "generation"];
+/// Every option key any kind accepts, derived rather than repeated: the table
+/// is parsed before `kind` is validated, so this union is what must be kept out
+/// of `unknown`; resolution then rejects a key the selected kind does not own.
+/// A shared key appears twice, which the parser tolerates (the second
+/// `remove` simply finds nothing).
+fn client_option_keys() -> impl Iterator<Item = &'static str> {
+    OPENCODE_CLIENT_KEYS.iter().chain(CODEX_CLIENT_KEYS).copied()
+}
 
 /// One `[clients.<id>]` table: a `kind` plus that kind's options (ADR-0090
 /// decision 5).
@@ -421,8 +425,8 @@ impl<'de> Deserialize<'de> for ClientEntry {
         };
         let mut options = toml::Table::new();
         let mut present = std::collections::BTreeSet::new();
-        for key in CLIENT_OPTION_KEYS {
-            if let Some(value) = table.remove(*key) {
+        for key in client_option_keys() {
+            if let Some(value) = table.remove(key) {
                 present.insert((*key).to_string());
                 options.insert((*key).to_string(), value);
             }
@@ -1512,10 +1516,10 @@ mod tests {
     }
 
     /// The same rule for the second kind: every `CodexConfig` field is an
-    /// accepted client key, and every key any kind accepts is parsed out of the
-    /// raw table (`CLIENT_OPTION_KEYS` must cover the union).
+    /// accepted client key, and the union the parser removes from `unknown` is
+    /// derived from the per-kind lists — one source of truth per kind.
     #[test]
-    fn the_key_lists_match_the_codex_config_and_cover_every_kind() {
+    fn the_key_lists_match_the_codex_config_and_the_union_is_derived() {
         use std::collections::BTreeSet;
 
         let full = CodexConfig {
@@ -1531,15 +1535,16 @@ mod tests {
             "CODEX_CLIENT_KEYS must list every CodexConfig field"
         );
 
-        let union: BTreeSet<&str> = OPENCODE_CLIENT_KEYS
+        let union: BTreeSet<&str> = client_option_keys().collect();
+        let expected: BTreeSet<&str> = OPENCODE_CLIENT_KEYS
             .iter()
             .chain(CODEX_CLIENT_KEYS)
             .copied()
             .collect();
-        let parsed: BTreeSet<&str> = CLIENT_OPTION_KEYS.iter().copied().collect();
-        assert_eq!(
-            parsed, union,
-            "CLIENT_OPTION_KEYS must cover both kinds, or a shared key becomes an unknown setting"
+        assert_eq!(union, expected);
+        assert!(
+            OPENCODE_CLIENT_KEYS.contains(&"start_server") && CODEX_CLIENT_KEYS.contains(&"start_server"),
+            "start_server is the one key both kinds accept, read from each kind's own list"
         );
     }
 
