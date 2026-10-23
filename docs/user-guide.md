@@ -233,17 +233,19 @@ default_client = "ada"           # which Agent Client is active (default: "defau
 
 - **`kind`** — required, and it selects the adapter. `opencode` is the only
   kind this build can attach to; `codex` (the `app-server` adapter, ADR-0090)
-  is reserved for the next phase, so a config that makes it active parses and
-  resolves but cola refuses to start until that adapter ships.
+  resolves, discovers the daemon under `$CODEX_HOME` and probes its surface,
+  but cola still refuses to start until that adapter's `Backend` lands.
 - **Options live in the same table as `kind`.** An `opencode` Agent Client
   accepts `url`, `start_server`, `generation` and `model`, exactly as
-  `[opencode]` does. A named Agent Client does not inherit `[opencode]`'s
-  values.
-- **Only those keys are accepted, and only on `opencode`.** Any other key — a
-  typo such as `model_typo`, or a nested `[clients.ada.opencode]` table — is a
-  config error naming `clients.<id>.<key>`, and so is an `opencode` option on
-  a client of another kind (for example `kind = "codex"` plus `model`), which
-  the running client would ignore. Never a silently ignored setting.
+  `[opencode]` does. A `codex` Agent Client accepts `start_server`
+  (`auto`/`never`/`eager`): `never` is attach-only, while the others may start
+  the shared daemon through `codex app-server daemon start` — cola never owns
+  or reaps it. A named Agent Client does not inherit `[opencode]`'s values.
+- **Only a kind's own keys are accepted.** Any other key — a typo such as
+  `model_typo`, or a nested `[clients.ada.opencode]` table — is a config error
+  naming `clients.<id>.<key>`, and so is an option on a kind that ignores it
+  (for example `kind = "codex"` plus `model`), which the running client would
+  never read. Never a silently ignored setting.
 - **`default_client`** — the id of the active Agent Client. Unset means
   `default` (`[opencode]`). Exactly one Agent Client is active per cola process
   (ADR-0090); switching Agent Clients is this key plus a restart.
