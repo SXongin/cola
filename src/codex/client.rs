@@ -20,6 +20,7 @@ use crate::config::{ActiveClient, ClientKind};
 
 use super::error::{CodexError, Result};
 use super::schema::{PINNED_VERSION, SurfaceProbe};
+use super::threads::Threads;
 use super::transport::{Endpoint, RpcConnection};
 
 /// How long the handshake (connect + `initialize` + `initialized`) may take.
@@ -119,11 +120,16 @@ pub(crate) struct ServerInfo {
 }
 
 /// One attached app-server. Construction is the whole contract check; the
-/// subscription and Backend implementation arrive in later tickets.
+/// thread surface (#878) and the Backend implementation (#879) build on it.
 pub(crate) struct CodexClient {
     /// Owned so a second connection is independent and the socket lives as long
-    /// as the client does.
+    /// as the client does. Cloning the handle shares this one connection — the
+    /// thread adapter needs the same socket the handshake opened, because a
+    /// subscription is connection-scoped.
     connection: RpcConnection,
+    /// Discovery and subscriptions over `connection`, with its own dispatcher
+    /// for the push traffic a resumed thread produces.
+    threads: Threads,
     server: ServerInfo,
 }
 
@@ -139,7 +145,7 @@ impl fmt::Debug for CodexClient {
 impl CodexClient {
     /// Connect, handshake, and verify the server's surface.
     pub(crate) async fn connect(options: &CodexOptions, probe: &dyn SurfaceProbe) -> Result<Self> {
-        let mut connection = RpcConnection::open(&options.endpoint, options.timeout).await?;
+        let connection = RpcConnection::open(&options.endpoint, options.timeout).await?;
 
         let initialize = tokio::time::timeout(
             options.timeout,
@@ -191,6 +197,7 @@ impl CodexClient {
         );
 
         Ok(Self {
+            threads: Threads::new(connection.clone()),
             connection,
             server: ServerInfo {
                 user_agent,
@@ -209,9 +216,15 @@ impl CodexClient {
         &self.server
     }
 
-    /// The live connection, for the subscription loop later tickets add.
-    pub(crate) fn connection(&mut self) -> &mut RpcConnection {
-        &mut self.connection
+    /// The live connection, shared by the lifecycle's probe and the thread
+    /// adapter. Clones address the same socket.
+    pub(crate) fn connection(&self) -> &RpcConnection {
+        &self.connection
+    }
+
+    /// The thread discovery and subscription surface over this connection.
+    pub(crate) fn threads(&self) -> &Threads {
+        &self.threads
     }
 }
 
@@ -343,7 +356,7 @@ mod tests {
             .await
             .expect_err("an initialize error fails construction");
         match error {
-            CodexError::Rpc { method, detail } => {
+            CodexError::Rpc { method, detail, .. } => {
                 assert_eq!(method, "initialize");
                 assert!(detail.contains("not a codex client"), "{detail}");
             }
@@ -472,7 +485,7 @@ mod tests {
             .expect("endpoint");
         let probe = crate::codex::schema::AutoProbe::new(binary);
 
-        let mut first = CodexClient::connect(&CodexOptions::new(endpoint.clone()), &probe)
+        let first = CodexClient::connect(&CodexOptions::new(endpoint.clone()), &probe)
             .await
             .expect("first live connection");
         let second = CodexClient::connect(&CodexOptions::new(endpoint), &probe)

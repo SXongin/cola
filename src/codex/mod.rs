@@ -1,10 +1,11 @@
-//! A client for `codex app-server` (spec #860, ticket #876).
+//! A client for `codex app-server` (spec #860, tickets #876/#877/#878).
 //!
-//! This is the first adapter slice: transport, handshake and the pinned schema
-//! contract, and nothing above them. The bridge never names this module — it
-//! reaches the active client through `SharedCore::client` and the
-//! `crate::backend` contract (ADR-0090); `cargo xtask check-client-seam` keeps
-//! the OpenCode adapter's module path out of everything beside it.
+//! This is the adapter's first slices: transport, handshake and the pinned
+//! schema contract; daemon discovery and the lifecycle; and thread discovery,
+//! adoption and subscription. The bridge never names this module — it reaches
+//! the active client through `SharedCore::client` and the `crate::backend`
+//! contract (ADR-0090); `cargo xtask check-client-seam` keeps the OpenCode
+//! adapter's module path out of everything beside it.
 //!
 //! The surface the adapter is written against is pinned in
 //! `docs/reference/codex-app-server-0.163.0.md`, generated from
@@ -32,6 +33,7 @@ pub(crate) mod discovery;
 pub(crate) mod error;
 pub(crate) mod lifecycle;
 pub(crate) mod schema;
+pub(crate) mod threads;
 pub(crate) mod transport;
 
 #[cfg(test)]
@@ -46,4 +48,9 @@ pub(crate) use lifecycle::{CodexLifecycle, ManagedProbe, ProbeSource};
 #[allow(unused_imports)]
 pub(crate) use schema::{AutoProbe, PinnedProbe, Surface, SurfaceProbe};
 #[allow(unused_imports)]
-pub(crate) use transport::Endpoint;
+pub(crate) use threads::{
+    Adoption, INTERACTIVE_SOURCE_KINDS, Thread, ThreadEvent, ThreadPage, ThreadSubscription, Threads,
+    UnsubscribeStatus,
+};
+#[allow(unused_imports)]
+pub(crate) use transport::{Endpoint, Inbound, RpcConnection};
