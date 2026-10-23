@@ -705,6 +705,39 @@ mod tests {
         );
     }
 
+    /// The review's other half: with **no cached attachment** at all, a stale
+    /// socket path must not be read as a running daemon that is never started
+    /// over. Discovery still reports the path, the dial proves it dead
+    /// (`Unreachable`), and `auto` reaches the launcher.
+    #[tokio::test]
+    async fn auto_starts_over_a_stale_socket_without_a_cached_attachment() {
+        let fixture = Fixture::new();
+        let stale = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        stale.die().await;
+
+        // A fresh lifecycle has never attached; the corpse is all it can see.
+        std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
+            .expect("control dir");
+        std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket())
+            .expect("symlink the corpse");
+        let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
+        std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        fixture.cli.point_at(&replacement_path);
+
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("auto starts over the corpse"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(fixture.cli.starts(), 1);
+        assert_eq!(second.connections(), 1, "the started daemon is attached");
+    }
+
     /// `auto` reaches `daemon start` for a stale socket (it is not "attached" to
     /// a corpse), and attaches to the replacement once the launcher re-links the
     /// path. The old daemon is never touched.
