@@ -32,7 +32,7 @@ use crate::config::CodexConfig;
 use crate::error::BridgeError;
 
 use super::client::{CodexClient, CodexOptions};
-use super::discovery::{self, Daemon, DaemonState, Discovery, Environment, SocketIdentity};
+use super::discovery::{self, Daemon, DaemonState, Discovery, EmbeddedClient, Environment, SocketIdentity};
 use super::error::{CodexError, Result};
 use super::schema::{AutoProbe, SurfaceProbe};
 use super::transport::Endpoint;
@@ -142,8 +142,8 @@ impl CodexLifecycle {
 
     /// Log a local client that runs its own app-server, once per client, rather
     /// than letting cola mirror nothing in silence (ADR-0090 decision 3).
-    fn report_embedded(&self, discovered: &Discovery) {
-        let Some(client) = discovered.embedded.first() else {
+    fn report_embedded(&self, embedded: &[EmbeddedClient]) {
+        let Some(client) = embedded.first() else {
             return;
         };
         if self.reported_embedded.swap(client.pid, Ordering::Relaxed) == client.pid {
@@ -182,15 +182,11 @@ impl ServerLifecycle for CodexLifecycle {
     async fn ensure_attached(&self, request: EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
         let _pass = self.pass.lock().await;
 
-        let discovered = discovery::discover(&self.environment)
-            .await
-            .map_err(client_error)?;
-        self.report_embedded(&discovered);
-
-        // The same daemon on the same socket: stay attached. Comparative
-        // identity, not just the path — a restarted daemon re-points its
-        // symlink, and a new inode means a new server behind it.
-        if let Some(identity) = discovered.socket
+        // Steady state: the socket we dialled is still there (same inode), so
+        // stay attached. This costs one `stat`, not a management-CLI spawn, and
+        // the embedded diagnosis is still evaluated from the process table.
+        let identity = discovery::socket_identity(&self.environment.socket()).map_err(client_error)?;
+        if let Some(identity) = identity
             && self
                 .attached
                 .lock()
@@ -198,8 +194,15 @@ impl ServerLifecycle for CodexLifecycle {
                 .as_ref()
                 .is_some_and(|attachment| attachment.identity == identity)
         {
+            self.report_embedded(&discovery::embedded_clients(true));
             return Ok(AttachOutcome::Attached);
         }
+
+        let discovered = discovery::discover(&self.environment)
+            .await
+            .map_err(client_error)?;
+        self.report_embedded(&discovered.embedded);
+
         // Gone or replaced: drop the stale connection. Nothing is sent to the
         // daemon — it is not cola's to stop.
         self.attached.lock().await.take();
@@ -416,13 +419,21 @@ mod tests {
         assert_eq!(fixture.cli.starts(), 1, "{:?}", fixture.cli.invocations());
         assert_eq!(fixture.probe_binaries.lock().unwrap().len(), 1);
 
-        // A second pass is the fast path: already attached to the same socket.
+        // A second pass is the fast path: already attached to the same socket,
+        // and it costs no management-CLI call at all.
+        let invocations = fixture.cli.invocations().len();
         assert_eq!(
             lifecycle
                 .ensure_attached(request(&never_busy))
                 .await
                 .expect("still attached"),
             AttachOutcome::Attached
+        );
+        assert_eq!(
+            fixture.cli.invocations().len(),
+            invocations,
+            "a steady attachment runs no CLI: {:?}",
+            fixture.cli.invocations()
         );
         assert_eq!(
             fixture.cli.starts(),
