@@ -470,6 +470,13 @@ impl Threads {
         }
     }
 
+    /// End every live subscription's stream (test-only), as a broken
+    /// connection would.
+    #[cfg(test)]
+    pub(crate) fn simulate_close(&self) {
+        self.registry.close_all();
+    }
+
     /// Deliver a lag marker to every live subscription (test-only): the same
     /// path the connection dispatcher takes when it falls behind, so the
     /// subscriber's resync is exercised rather than simulated separately.
@@ -544,7 +551,9 @@ struct ResumeResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TurnsResponse {
-    #[serde(default)]
+    /// Required: a page without `data` is malformed, not an empty page. A
+    /// default here would let a broken response clear the resync's incomplete
+    /// marker with no turns at all.
     data: Vec<Value>,
     #[serde(default)]
     next_cursor: Option<String>,

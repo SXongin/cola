@@ -92,12 +92,6 @@ impl ThreadProjection {
         }
     }
 
-    /// Whether a turn has ever been folded in (from a live event or resumed
-    /// history). An unseeded projection cannot answer a run-state question.
-    pub(crate) fn is_seeded(&self) -> bool {
-        !self.turn_order.is_empty()
-    }
-
     /// Whether a turn is currently between `turn/started` and `turn/completed`.
     /// The neutral transcript has no live flag of its own (a message's missing
     /// completion stamp and the session status carry that fact); this
@@ -491,11 +485,11 @@ impl ThreadProjection {
                     started_seen: true,
                 };
             } else {
-                // Deltas created this item before its start. Fold the start
-                // over them instead of erasing content the server already
-                // streamed: an empty start field preserves the accumulated
-                // one (the delta-before-start ordering).
-                self.items[index].kind.apply_completed(&notification.item);
+                // Deltas created this item before its start. The start is
+                // replay metadata now: fill fields the deltas did not (command,
+                // cwd, status), but never overwrite accumulated text or output,
+                // even when the start payload carries a non-empty value.
+                self.items[index].kind.merge_start(&notification.item);
                 self.items[index].started_at_ms = started.or(self.items[index].started_at_ms);
                 self.items[index].started_seen = true;
             }
@@ -873,6 +867,80 @@ impl ItemKind {
     /// is authoritative, but a field it does not carry is preserved rather
     /// than dropped; `item/started` uses the same rule to merge over deltas
     /// that arrived before the start.
+    fn merge_start(&mut self, item: &Value) {
+        match self {
+            ItemKind::AgentMessage { .. }
+            | ItemKind::Reasoning { .. }
+            | ItemKind::Plan { .. }
+            | ItemKind::Compaction
+            | ItemKind::Other { .. }
+            | ItemKind::UserMessage { .. } => {}
+            ItemKind::Command {
+                command,
+                cwd,
+                status,
+                exit_code,
+                ..
+            } => {
+                if let Some(value) = item.get("command").and_then(Value::as_str) {
+                    *command = value.to_string();
+                }
+                if let Some(value) = item.get("cwd").and_then(Value::as_str) {
+                    *cwd = value.to_string();
+                }
+                if let Some(value) = item.get("status").and_then(Value::as_str) {
+                    *status = Some(value.to_string());
+                }
+                if let Some(value) = item.get("exitCode").and_then(Value::as_i64) {
+                    *exit_code = Some(value);
+                }
+            }
+            ItemKind::FileChange { status, .. } => {
+                if let Some(value) = item.get("status").and_then(Value::as_str) {
+                    *status = Some(value.to_string());
+                }
+            }
+            ItemKind::Mcp {
+                server,
+                tool,
+                status,
+                arguments,
+                ..
+            } => {
+                if let Some(value) = item.get("server").and_then(Value::as_str) {
+                    *server = value.to_string();
+                }
+                if let Some(value) = item.get("tool").and_then(Value::as_str) {
+                    *tool = value.to_string();
+                }
+                if let Some(value) = item.get("status").and_then(Value::as_str) {
+                    *status = Some(value.to_string());
+                }
+                if let Some(value) = item.get("arguments") {
+                    *arguments = value.clone();
+                }
+            }
+            ItemKind::WebSearch { query, action, .. } => {
+                if let Some(value) = item.get("query").and_then(Value::as_str) {
+                    *query = value.to_string();
+                }
+                if let Some(value) = item.get("action") {
+                    *action = Some(value.clone());
+                }
+            }
+            ItemKind::Image { path } => {
+                if path.is_none()
+                    && let Some(value) = item
+                        .get("path")
+                        .or_else(|| item.get("savedPath"))
+                        .and_then(Value::as_str)
+                {
+                    *path = Some(value.to_string());
+                }
+            }
+        }
+    }
+
     fn apply_completed(&mut self, item: &Value) {
         match self {
             ItemKind::AgentMessage { text } => {
@@ -1928,7 +1996,9 @@ mod tests {
                 "threadId": "thread-1",
                 "turnId": "turn-1",
                 "startedAtMs": 1_700_000_000_000_i64,
-                "item": { "type": "agentMessage", "id": "item-agent", "text": "" },
+                // A late start with non-empty text must still be replay
+                // metadata only: the deltas already folded are authoritative.
+                "item": { "type": "agentMessage", "id": "item-agent", "text": "FROM START" },
             }),
         );
         projection.apply(
@@ -1949,7 +2019,7 @@ mod tests {
                 .unwrap()
                 .text(),
             "Hello world",
-            "the start must not erase an already-applied delta"
+            "the start must not overwrite an already-applied delta"
         );
 
         // The same merge keeps command output that arrived before its start.
