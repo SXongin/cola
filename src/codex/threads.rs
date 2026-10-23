@@ -364,8 +364,9 @@ impl Threads {
     }
 
     /// Read one thread's metadata. `include_turns` asks the server for its
-    /// persisted turns; the read model (#879) pages them separately when it
-    /// needs full history.
+    /// persisted turns, but that page is **bounded** — the read model (#879)
+    /// must page [`Self::all_turns`] when it needs the whole history, or it
+    /// would mistake a prefix for the thread.
     pub(crate) async fn read(&self, thread_id: &str, include_turns: bool) -> Result<Thread> {
         let result = self
             .connection
@@ -376,6 +377,41 @@ impl Threads {
             .await?;
         let response: ReadResponse = decode("thread/read", result)?;
         Ok(response.thread)
+    }
+
+    /// Every persisted turn of `thread_id`, oldest first, following
+    /// `nextCursor` until exhaustion. `thread/read` returns a bounded page, so
+    /// a resync that needs the complete history reads turns through this
+    /// method — never through the `thread/read` prefix.
+    pub(crate) async fn all_turns(&self, thread_id: &str) -> Result<Vec<Value>> {
+        let mut turns = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let mut params = json!({
+                "threadId": thread_id,
+                "sortDirection": "asc",
+                "itemsView": "full",
+            });
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = json!(cursor);
+            }
+            let result = self.connection.request("thread/turns/list", params).await?;
+            let page: TurnsResponse = decode("thread/turns/list", result)?;
+            turns.extend(page.data);
+            match page.next_cursor {
+                None => return Ok(turns),
+                Some(next) => {
+                    if !seen.insert(next.clone()) {
+                        return Err(CodexError::Protocol {
+                            method: "thread/turns/list".to_string(),
+                            detail: format!("the server repeated pagination cursor `{next}`"),
+                        });
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
     }
 
     /// Start a new thread (`thread/start`). The server assigns the thread id;
@@ -432,6 +468,14 @@ impl Threads {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Deliver a lag marker to every live subscription (test-only): the same
+    /// path the connection dispatcher takes when it falls behind, so the
+    /// subscriber's resync is exercised rather than simulated separately.
+    #[cfg(test)]
+    pub(crate) fn simulate_lag(&self, skipped: u64) {
+        self.registry.lag_all(skipped);
     }
 
     /// The local handle count for a thread (test-only): proves a cancelled
@@ -495,6 +539,15 @@ struct ReadResponse {
 #[derive(Debug, Deserialize)]
 struct ResumeResponse {
     thread: Thread,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnsResponse {
+    #[serde(default)]
+    data: Vec<Value>,
+    #[serde(default)]
+    next_cursor: Option<String>,
 }
 
 /// The local subscription table: one broadcast channel per adopted thread.

@@ -43,19 +43,16 @@ use super::read_model::ThreadProjection;
 use super::threads::{Adoption, ThreadEvent, ThreadSubscription, Threads};
 use super::transport::Endpoint;
 
-/// The seed cursor reads: a bounded read of persisted history, used only by the
-/// `Lagged` resync. The cache serves the transcript, so paging history is a
-/// recovery path, not the read path.
-const RESYNC_INCLUDE_TURNS: bool = true;
-
 /// One thread's projection and the state of its subscription.
 #[derive(Default)]
 pub(crate) struct Projections {
     threads: Mutex<HashMap<String, Arc<Mutex<ThreadProjection>>>>,
     states: Mutex<HashMap<String, SubscriptionState>>,
-    /// Serialises adoption, so two concurrent reads of the same new thread do
-    /// not both send `thread/resume` and register two holders.
-    adopting: tokio::sync::Mutex<()>,
+    /// One adoption lock per thread. Two concurrent reads of the same new
+    /// thread must not both send `thread/resume`, but an unrelated thread (a
+    /// repeatedly polled never-run thread included) must never block another's
+    /// first adoption.
+    adopting: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// The subscriber tasks this cache owns. Aborted when the last client
     /// holding the cache is dropped, so a replaced attachment stops folding
     /// into a cache nothing reads.
@@ -82,6 +79,27 @@ enum SubscriptionState {
 }
 
 impl Projections {
+    fn adoption_lock(&self, thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.adopting
+            .lock()
+            .expect("codex adoption locks")
+            .entry(thread_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Whether this thread's run state has been observed: a subscription is
+    /// live, or a resumed history seeded at least one turn. An unseeded
+    /// projection must not answer `Idle` as if it had read the server.
+    pub(crate) fn is_seeded(&self, thread_id: &str) -> bool {
+        self.state(thread_id) == Some(SubscriptionState::Live)
+            || self
+                .projection(thread_id)
+                .lock()
+                .expect("codex projection")
+                .is_seeded()
+    }
+
     fn projection(&self, thread_id: &str) -> Arc<Mutex<ThreadProjection>> {
         let mut threads = self.threads.lock().expect("codex projections");
         threads
@@ -217,7 +235,8 @@ impl CodexClient {
         if self.projections.state(thread_id).is_some() {
             return Ok(());
         }
-        let _adopting = self.projections.adopting.lock().await;
+        let adoption = self.projections.adoption_lock(thread_id);
+        let _adopting = adoption.lock().await;
         if self.projections.state(thread_id).is_some() {
             return Ok(());
         }
@@ -258,18 +277,18 @@ async fn consume(
         // aborts this task when the last client is gone, so a replaced
         // attachment cannot keep folding into an unread cache.
         let event = subscription.next_event().await;
-        let Some(projections) = projections.upgrade() else {
-            return;
-        };
         match event {
             Ok(ThreadEvent::Notification { method, params }) => {
+                let Some(projections) = projections.upgrade() else {
+                    return;
+                };
                 projections.apply(&thread_id, &method, &params);
             }
             Ok(ThreadEvent::Lagged { skipped }) => {
                 tracing::warn!(
                     thread = %thread_id,
                     skipped,
-                    "the codex push stream dropped events; resyncing the projection from thread/read"
+                    "the codex push stream dropped events; resyncing the projection from paged turns"
                 );
                 resync(&threads, &projections, &thread_id).await;
             }
@@ -277,7 +296,7 @@ async fn consume(
                 tracing::warn!(
                     thread = %thread_id,
                     skipped,
-                    "the codex subscription fell behind; resyncing the projection from thread/read"
+                    "the codex subscription fell behind; resyncing the projection from paged turns"
                 );
                 resync(&threads, &projections, &thread_id).await;
             }
@@ -286,7 +305,9 @@ async fn consume(
                     thread = %thread_id,
                     "the codex thread subscription ended: {error}"
                 );
-                projections.forget(&thread_id);
+                if let Some(projections) = projections.upgrade() {
+                    projections.forget(&thread_id);
+                }
                 return;
             }
         }
@@ -295,13 +316,24 @@ async fn consume(
 
 /// Rebuild a projection from persisted turns. A failed read leaves the
 /// projection marked incomplete — the gap stays visible rather than vanishing.
-async fn resync(threads: &Threads, projections: &Projections, thread_id: &str) {
-    projections.mark_incomplete(thread_id);
-    match threads.read(thread_id, RESYNC_INCLUDE_TURNS).await {
-        Ok(thread) => projections.resync(thread_id, &thread.turns),
+///
+/// `thread/read` carries only a bounded page, so the resync pages
+/// `thread/turns/list` to exhaustion. The cache handle is re-upgraded around
+/// each step rather than held across the network await: a replaced attachment
+/// can still drop the cache (and abort this task) while a request is in flight.
+async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, thread_id: &str) {
+    if let Some(projections) = projections.upgrade() {
+        projections.mark_incomplete(thread_id);
+    }
+    match threads.all_turns(thread_id).await {
+        Ok(turns) => {
+            if let Some(projections) = projections.upgrade() {
+                projections.resync(thread_id, &turns);
+            }
+        }
         Err(error) => tracing::warn!(
             thread = %thread_id,
-            "could not resync the codex projection from thread/read: {error}"
+            "could not resync the codex projection from thread/turns/list: {error}"
         ),
     }
 }
@@ -502,6 +534,13 @@ impl Backend for CodexClient {
         session_id: &str,
         _directory: Option<&str>,
     ) -> Result<Option<SessionStatus>> {
+        // The cache is not the server's status service: an unseeded projection
+        // answering `Idle` would present "never observed" as an authoritative
+        // idle run. Adopt the thread first (which seeds its live turn from the
+        // resume history); a never-run thread then genuinely has no live run.
+        if !self.projections.is_seeded(session_id) {
+            self.ensure_subscription(session_id).await.map_err(client_error)?;
+        }
         Ok(self.projections.status(session_id))
     }
 
@@ -771,6 +810,27 @@ mod tests {
         serde_json::from_str(RECORDING).expect("the recording is a JSON array")
     }
 
+    /// One persisted turn in the fake server's history: one agent-message
+    /// item, with the turn status the projection reads.
+    fn scripted_turn(id: &str, status: &str, started_at: i64, item_id: &str, text: &str) -> Value {
+        json!({
+            "id": id,
+            "status": status,
+            "startedAt": started_at,
+            "completedAt": (status != "inProgress").then_some(started_at + 1),
+            "error": null,
+            "items": [{ "type": "agentMessage", "id": item_id, "text": text }],
+        })
+    }
+
+    fn tokens_total(transcript: &SessionTranscript) -> Option<i64> {
+        transcript
+            .messages
+            .iter()
+            .filter_map(|message| message.tokens.map(|tokens| tokens.total))
+            .next()
+    }
+
     async fn wait_for_text(client: &CodexClient, thread_id: &str, needle: &str) -> SessionTranscript {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -823,15 +883,87 @@ mod tests {
 
         let first = wait_for_text(&client, "thread-1", "The fix").await;
         assert!(!first.truncated, "a complete recording is not a prefix");
-        let second = client.transcript("thread-1").await.expect("second read");
-        assert_eq!(first.messages, second.messages, "reads are stable");
 
-        let ids: std::collections::HashSet<&str> =
-            first.messages.iter().map(|message| message.id.as_str()).collect();
+        // Replay the whole recording over the live subscription, then push a
+        // sentinel usage update: WebSocket order means seeing the sentinel
+        // proves the second pass was fully folded, not merely that a stale
+        // read happened to match.
+        for event in recording() {
+            let method = event["method"].as_str().unwrap();
+            server.push_to_thread("thread-1", method, event["params"].clone());
+        }
+        server.push_to_thread(
+            "thread-1",
+            "thread/tokenUsage/updated",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 24690,
+                        "inputTokens": 16000,
+                        "cachedInputTokens": 8000,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 690,
+                        "reasoningOutputTokens": 100
+                    },
+                    "last": {
+                        "totalTokens": 99999,
+                        "inputTokens": 1,
+                        "cachedInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 1,
+                        "reasoningOutputTokens": 0
+                    },
+                    "modelContextWindow": 128000
+                }
+            }),
+        );
+        let second = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let read = client.transcript("thread-1").await.expect("second read");
+                if tokens_total(&read) == Some(99_999) {
+                    break read;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for the second replay to fold"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        // The only expected difference is the sentinel usage; the second
+        // replay must not add a message or double any streamed text.
+        let mut first_messages = first.messages.clone();
+        let mut second_messages = second.messages.clone();
+        for message in first_messages.iter_mut().chain(second_messages.iter_mut()) {
+            message.tokens = None;
+        }
         assert_eq!(
-            first.messages.len(),
+            first_messages, second_messages,
+            "a replayed recording produces the same transcript"
+        );
+        let ids: std::collections::HashSet<&str> = second
+            .messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(
+            second.messages.len(),
             ids.len(),
-            "a read must not duplicate an item"
+            "a replayed read must not duplicate an item"
+        );
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == "item-agent")
+                .unwrap()
+                .text(),
+            "The fix",
+            "the replay must not double the streamed text"
         );
 
         // The turn boundary reached the status read: completed is idle.
@@ -842,6 +974,129 @@ mod tests {
                 .expect("session status"),
             Some(SessionStatus::Idle)
         );
+    }
+
+    /// Contract finding: `session_status` is the server's live run state, so
+    /// the first call on a busy thread must adopt and seed before answering —
+    /// never present an unseeded cache as `Idle`.
+    #[tokio::test]
+    async fn a_status_first_read_on_a_busy_thread_is_busy() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a real thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "inProgress",
+            1_700_000_000,
+            "item-live",
+            "working",
+        )];
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        assert_eq!(
+            client
+                .session_status("thread-1", None)
+                .await
+                .expect("status read"),
+            Some(SessionStatus::Busy),
+            "the status read seeded the live turn instead of guessing idle"
+        );
+        assert_eq!(server.resume_calls(), 1);
+        server.wait_for_subscribers("thread-1", 1).await;
+    }
+
+    /// Contract finding + lag test: a resync pages `thread/turns/list` to
+    /// exhaustion rather than trusting the bounded `thread/read` page, and the
+    /// `ThreadEvent::Lagged` path through the subscriber performs it.
+    #[tokio::test]
+    async fn a_lagged_subscription_resyncs_every_paged_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
+        thread.turns = vec![
+            scripted_turn("turn-1", "completed", 1_700_000_000, "item-1", "one"),
+            scripted_turn("turn-2", "completed", 1_700_000_010, "item-2", "two"),
+            scripted_turn("turn-3", "completed", 1_700_000_020, "item-3", "three"),
+        ];
+        // `thread/read`/`thread/resume` carry only the first turn, exactly the
+        // bounded page the review flagged. `thread/turns/list` pages all three.
+        thread.read_turn_limit = Some(1);
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        let seeded = client.transcript("thread-1").await.expect("adopt");
+        assert_eq!(seeded.messages.len(), 1, "the bounded read seeds one turn");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client.threads().simulate_lag(3);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let resynced = loop {
+            let transcript = client.transcript("thread-1").await.expect("resynced read");
+            if transcript.messages.len() == 3 {
+                break transcript;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the lag resync dropped history: {} message(s)",
+                transcript.messages.len()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(!resynced.truncated, "a full paged resync is complete");
+        assert_eq!(
+            resynced
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["item-1", "item-2", "item-3"]
+        );
+        assert!(
+            server.turns_calls() >= 2,
+            "three turns at two per page need paging"
+        );
+        let params = server.turns_params();
+        assert_eq!(params[0]["itemsView"], "full");
+        assert_eq!(params[0]["sortDirection"], "asc");
+    }
+
+    /// Contract finding: adoption locks are per thread. A hung `thread/resume`
+    /// for one never-run thread must not block an unrelated thread's first
+    /// read.
+    #[tokio::test]
+    async fn a_hung_adoption_does_not_block_an_unrelated_thread() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut other =
+            ScriptedThread::adopted("thread-other", "session-other", "/work/cola", "another thread");
+        other.turns = vec![scripted_turn(
+            "turn-other",
+            "completed",
+            1_700_000_000,
+            "item-other",
+            "ready",
+        )];
+        server.seed_thread(other);
+        server.seed_thread(ScriptedThread::never_run(
+            "thread-new",
+            "session-new",
+            "/work/cola",
+        ));
+        let client = connect(&url).await;
+
+        server.silence_next_resume();
+        let hung = tokio::spawn({
+            let client = client.clone();
+            async move { client.transcript("thread-new").await }
+        });
+        server.wait_for_resume_calls(1).await;
+
+        let other = tokio::time::timeout(Duration::from_secs(1), client.transcript("thread-other"))
+            .await
+            .expect("an unrelated adoption must not wait on the hung one")
+            .expect("the unrelated thread reads");
+        assert_eq!(other.messages.len(), 1);
+
+        hung.abort();
     }
 
     /// A mid-turn read must not block on the push stream, and it keeps the
