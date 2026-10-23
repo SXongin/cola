@@ -154,8 +154,12 @@ pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
 async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
     let preferred_port = cfg.and_then(|c| c.opencode.preferred_port());
     let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default();
+    let layout = cfg
+        .map(crate::state::StateLayout::from_config)
+        .unwrap_or_default();
     let candidates = discovery::scan_processes();
-    let candidate = discovery::pick_server(&candidates, preferred_port, discovery::self_spawned_pid())?;
+    let candidate =
+        discovery::pick_server(&candidates, preferred_port, discovery::self_spawned_pid(&layout))?;
     let other_servers: Vec<OtherServer> = discovery::other_servers(&candidates, candidate)
         .into_iter()
         .map(|c| OtherServer {

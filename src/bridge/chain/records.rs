@@ -1070,16 +1070,12 @@ impl ChainRecords {
     pub(crate) fn load(path: PathBuf) -> Self {
         let folded = !path.exists();
         let state = if folded {
-            let records = sidecar::load::<LegacySessions<ChainRecord>>(
-                &path.with_file_name("live_cards.json"),
-                "live-card record",
-            )
-            .sessions;
-            let announcements = sidecar::load::<LegacySessions<WakeMark>>(
-                &path.with_file_name("wake_watermarks.json"),
-                "Wake watermark",
-            )
-            .sessions;
+            let (legacy_live_cards, legacy_wake_watermarks) =
+                crate::state::StateLayout::legacy_chain_sidecars(&path);
+            let records =
+                sidecar::load::<LegacySessions<ChainRecord>>(&legacy_live_cards, "live-card record").sessions;
+            let announcements =
+                sidecar::load::<LegacySessions<WakeMark>>(&legacy_wake_watermarks, "Wake watermark").sessions;
             State {
                 records,
                 announcements,

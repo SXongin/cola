@@ -899,7 +899,7 @@ async fn run_claimed(
         .terminal_log_root
         .get()
         .cloned()
-        .or_else(default_terminal_root)
+        .or_else(|| handles.flow.layout.terminal_root())
     else {
         platform
             .reply_text(request.message_id, "⚠️ 无法创建终端日志：找不到 home 目录。")
@@ -2687,14 +2687,6 @@ impl TerminalLog {
         let writer = options.open(&path)?;
         Ok(Self { path, writer })
     }
-}
-
-/// The production **Terminal Log** root: `~/.cola/terminal` (glossary). `None`
-/// when the Host has no home directory — [`execute`] then refuses rather than
-/// inventing a relative path, which could place command output in an unrelated
-/// working tree.
-pub(crate) fn default_terminal_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".cola").join("terminal"))
 }
 
 /// A process-unique run id for the log's name: the wall clock plus a counter,

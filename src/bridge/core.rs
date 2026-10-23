@@ -62,6 +62,10 @@ pub(crate) const SETTLING_CLAIM_TTL: std::time::Duration = std::time::Duration::
 /// aggregate — [`SharedCore::turn_handles`] is the Turn's bundle (spec #298).
 pub struct SharedCore {
     pub sessions: Arc<Mutex<SessionStore>>,
+    /// The one owner of the on-disk layout (ADR-0090 §6): every state path —
+    /// the Session sidecars, the Terminal Run Records, the Terminal Log root,
+    /// the pid record and the restart notice — is read from here.
+    pub layout: crate::state::StateLayout,
     /// session_id → the session's one live card (accumulator + card id chain).
     pub cards: Arc<Mutex<HashMap<String, crate::bridge::turn::CardSession>>>,
     /// The card handles (ADR-0038, rule 2): `request_id → message_id` plus, for
@@ -312,6 +316,7 @@ pub struct SharedCore {
 impl SharedCore {
     pub fn new(
         cfg: &crate::config::Config,
+        layout: crate::state::StateLayout,
         client: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
@@ -320,15 +325,13 @@ impl SharedCore {
         // it lands. The raw platform stays the single Feishu transport; the
         // decorator is what the bridge (and the WS loop) holds.
         let feishu: Arc<dyn feishu::Platform> = Arc::new(crate::feishu::delivery::CardDelivery::new(feishu));
-        let session_store = SessionStore::new(cfg.bridge.session_file.clone())?;
+        let session_store = SessionStore::new(layout.session_file().to_path_buf())?;
         // The interactive surfaces a previous process persisted (ADR-0038
         // restart re-adoption), beside the session mapping like the reminder's
         // pin file. Loaded once here; the registry and both flows hydrate from
         // it and write their mutations back through it.
         let surfaces = Arc::new(crate::bridge::surfaces::Surfaces::load(
-            cfg.bridge
-                .session_file
-                .with_file_name("interactive_surfaces.json"),
+            layout.interactive_surfaces(),
         ));
         // The long-task notice threshold, created once: the Turn config and
         // Session Sync's quiet true-end settle (ADR-0060) must read the SAME
@@ -344,9 +347,7 @@ impl SharedCore {
         ));
         // The durable Chain Record, created once beside the Background Task
         // State handle that seeds from it (ADR-0069/0079).
-        let chains = Arc::new(crate::bridge::chain::ChainRecords::load(
-            cfg.bridge.session_file.with_file_name("chain_records.json"),
-        ));
+        let chains = Arc::new(crate::bridge::chain::ChainRecords::load(layout.chain_records()));
         // The Background Task State handle is the process's ONE instance:
         // `src/main.rs` creates it and threads it into the adapter at
         // construction (#682), and the Bridge takes that same handle here rather
@@ -405,11 +406,9 @@ impl SharedCore {
             terminal_runs: Arc::new(std::sync::Mutex::new(
                 crate::bridge::terminal::TerminalRuns::default(),
             )),
-            terminal_records: Arc::new(
-                crate::bridge::terminal_record::TerminalRunRecords::beside_session_file(
-                    &cfg.bridge.session_file,
-                ),
-            ),
+            terminal_records: Arc::new(crate::bridge::terminal_record::TerminalRunRecords::new(
+                layout.terminal_runs(),
+            )),
             terminal_log_days: cfg.bridge.log_days,
             default_auto_accept: cfg.bridge.default_auto_accept,
             group_completion_notice: cfg.bridge.group_completion_notice,
@@ -420,7 +419,7 @@ impl SharedCore {
                 cfg.bridge.instant_reminder,
                 // The persisted pin set lives beside the session mapping
                 // (#249), so startup can clear reminders a crash orphaned.
-                Some(cfg.bridge.session_file.with_file_name("pinned_chats.json")),
+                Some(layout.pinned_chats()),
             )),
             message_pins: Arc::new(crate::bridge::message_pins::MessagePins::new(
                 cfg.bridge.instant_reminder,
@@ -462,6 +461,7 @@ impl SharedCore {
             viewer_fs_read_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::bridge::viewer::MAX_CONCURRENT_VIEWER_FS_READS,
             )),
+            layout,
         })
     }
 
@@ -479,6 +479,7 @@ impl SharedCore {
             platform: Arc::clone(&self.feishu),
             config: self.turn_config(),
             runtime_reconcile: Arc::clone(&self.runtime_reconcile),
+            layout: self.layout.clone(),
         }
     }
 
@@ -493,6 +494,7 @@ impl SharedCore {
             backend: Arc::clone(&self.client),
             platform: Arc::clone(&self.feishu),
             runtime_reconcile: Arc::clone(&self.runtime_reconcile),
+            layout: self.layout.clone(),
         }
     }
 

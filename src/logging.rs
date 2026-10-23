@@ -469,7 +469,7 @@ fn file_stem(path: &Path) -> String {
 }
 
 fn dated_path(base: &Path, day: &str) -> PathBuf {
-    base.with_file_name(format!("{}-{}.log", file_stem(base), day))
+    crate::state::StateLayout::rotated_log_path(base, day)
 }
 
 fn is_date(s: &str) -> bool {

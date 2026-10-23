@@ -5545,7 +5545,7 @@ async fn an_obligation_survives_a_record_write_failure_so_the_lost_sweep_cannot_
     })
     .await;
     let records_dir = app.terminal_records.dir().to_path_buf();
-    let backup = records_dir.with_file_name("terminal-runs.bak");
+    let backup = crate::state::StateLayout::beside(&records_dir, "terminal-runs.bak");
     std::fs::rename(&records_dir, &backup).unwrap();
     std::fs::write(&records_dir, b"not a directory").unwrap();
 

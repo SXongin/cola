@@ -23,6 +23,7 @@ use crate::bridge::attach;
 use crate::config::{GenerationOverride, port_from_url};
 use crate::opencode::strategy::Generation;
 use crate::opencode::transport::Transport;
+use crate::state::StateLayout;
 
 /// What a discovered `opencode serve` process is to cola, in selection order.
 ///
@@ -585,36 +586,14 @@ pub fn service_start_command() -> SpawnCommand {
     }
 }
 
-/// The file recording the pid of the OpenCode server cola itself spawned.
-/// Written when cola starts its own server; read by `/restart-opencode` to
-/// decide whether cola owns the running server and may restart it. Persisted so
-/// cola still recognises its own server after a `/restart` of cola itself.
-fn self_spawned_pid_path_in(state_dir: &std::path::Path) -> std::path::PathBuf {
-    state_dir.join("self-opencode.pid")
-}
-
-fn self_spawned_pid_path() -> std::path::PathBuf {
-    self_spawned_pid_path_in(&cola_state_dir())
-}
-
-/// cola's own state directory (`~/.cola`): the Owned Server's pid record, the
-/// singleton lock, and the Shared Service's log.
-fn cola_state_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cola")
-}
-
-/// Where a detached `serve --service` child's stdout/stderr is appended. Its
-/// output is the only diagnostic when a start fails, so it goes to a file —
-/// never an unread pipe, which would block the daemon on its first write.
-fn service_log_path() -> std::path::PathBuf {
-    cola_state_dir().join("opencode-service.log")
-}
-
 /// Record the pid of the OpenCode server cola just spawned.
-pub fn record_self_spawned(pid: i32) {
-    record_self_spawned_in(&self_spawned_pid_path(), pid);
+///
+/// The record lives at `layout.self_spawned_pid()`. It is written when cola
+/// starts its own server and read by `/restart-opencode` to decide whether cola
+/// owns the running server and may restart it. Persisted so cola still
+/// recognises its own server after a `/restart` of cola itself.
+pub fn record_self_spawned(layout: &StateLayout, pid: i32) {
+    record_self_spawned_in(&layout.self_spawned_pid(), pid);
 }
 
 fn record_self_spawned_in(path: &std::path::Path, pid: i32) {
@@ -628,8 +607,8 @@ fn record_self_spawned_in(path: &std::path::Path, pid: i32) {
 
 /// Forget the recorded self-spawned pid (called when that server exits or cola
 /// restarts it). Returns the previous pid if one was recorded.
-pub fn clear_self_spawned() -> Option<i32> {
-    clear_self_spawned_in(&self_spawned_pid_path())
+pub fn clear_self_spawned(layout: &StateLayout) -> Option<i32> {
+    clear_self_spawned_in(&layout.self_spawned_pid())
 }
 
 fn clear_self_spawned_in(path: &std::path::Path) -> Option<i32> {
@@ -646,8 +625,8 @@ fn read_self_spawned_pid_in(path: &std::path::Path) -> Option<i32> {
 
 /// The recorded pid of cola's Owned Server, if any. Not verified live — use
 /// [`is_self_spawned`] when liveness matters (e.g. before deciding to kill).
-pub fn self_spawned_pid() -> Option<i32> {
-    read_self_spawned_pid_in(&self_spawned_pid_path())
+pub fn self_spawned_pid(layout: &StateLayout) -> Option<i32> {
+    read_self_spawned_pid_in(&layout.self_spawned_pid())
 }
 
 /// Whether the pid of the server cola is attached to is a server cola itself
@@ -655,8 +634,8 @@ pub fn self_spawned_pid() -> Option<i32> {
 /// pid that is genuinely a live `opencode serve` — a stale file for a dead or
 /// recycled pid is treated as NOT owned, so cola never kills something it can't
 /// verify it started.
-pub fn is_self_spawned(pid: i32) -> bool {
-    is_self_spawned_record(&self_spawned_pid_path(), pid) && is_live_opencode_serve(pid)
+pub fn is_self_spawned(layout: &StateLayout, pid: i32) -> bool {
+    is_self_spawned_record(&layout.self_spawned_pid(), pid) && is_live_opencode_serve(pid)
 }
 
 /// Pure record-match check: does the pid file record this pid? (No liveness —
@@ -800,7 +779,7 @@ pub fn force_kill(pid: i32) -> anyhow::Result<()> {
 /// Spawn an `opencode serve` on the default store (same semantics as main's
 /// self-start), record its pid, and return it. Used both at cola startup and by
 /// `/restart-opencode` to re-raise the server cola owns.
-pub fn spawn_self_server(port: u16, password: &str) -> anyhow::Result<i32> {
+pub fn spawn_self_server(layout: &StateLayout, port: u16, password: &str) -> anyhow::Result<i32> {
     let cmd = self_start_command(port, password);
     let mut child = std::process::Command::new("opencode");
     child.args(&cmd.args).envs(cmd.env.iter().cloned());
@@ -817,7 +796,7 @@ pub fn spawn_self_server(port: u16, password: &str) -> anyhow::Result<i32> {
     // it would make those cards unreachable.
     let child = child.spawn()?;
     let pid = child.id() as i32;
-    record_self_spawned(pid);
+    record_self_spawned(layout, pid);
     Ok(pid)
 }
 
@@ -1482,15 +1461,19 @@ struct OpencodeStarter<H: ServiceHost> {
     /// in the way (the wire-test pattern, ADR-0031 — production attach
     /// transports keep honoring env proxies by design, ticket 09).
     probe_transport: fn(&ServerCandidate) -> Transport,
+    /// The one owner of the state paths this starter touches (the pid record
+    /// and the Shared Service's log).
+    layout: StateLayout,
 }
 
 impl OpencodeStarter<RealServiceHost> {
-    fn new() -> Self {
+    fn new(layout: &StateLayout) -> Self {
         Self {
             host: RealServiceHost,
             registration_path: own_service_registration_path(),
-            log_path: service_log_path(),
+            log_path: layout.service_log(),
             probe_transport: attach::candidate_transport,
+            layout: layout.clone(),
         }
     }
 }
@@ -1508,6 +1491,7 @@ impl<H: ServiceHost> ServerStarter for OpencodeStarter<H> {
         // must never reap it (ADR-0085).
         let transport = (self.probe_transport)(&candidate);
         match resolve_spawned_server_over(
+            &self.layout,
             &transport,
             &candidate,
             generation_override,
@@ -1535,7 +1519,7 @@ impl<H: ServiceHost> ServerStarter for OpencodeStarter<H> {
             port += 1;
         }
         let password = "cola-secret".to_string();
-        let pid = spawn_self_server(port, &password)?;
+        let pid = spawn_self_server(&self.layout, port, &password)?;
         wait_for_port(port).await?;
         // The Owned Server is described as a candidate and resolved through the
         // SAME attach path as any discovered server: the `opencode` binary's
@@ -1552,6 +1536,7 @@ impl<H: ServiceHost> ServerStarter for OpencodeStarter<H> {
         };
         let transport = attach::candidate_transport(&candidate);
         resolve_spawned_server_over(
+            &self.layout,
             &transport,
             &candidate,
             generation_override,
@@ -1580,6 +1565,7 @@ impl<H: ServiceHost> ServerStarter for OpencodeStarter<H> {
 /// Service and an Owned Server are both just the endpoint cola attaches to
 /// (ADR-0013).
 pub async fn spawn_own_server(
+    layout: &StateLayout,
     preferred_port: Option<u16>,
     generation_override: GenerationOverride,
 ) -> anyhow::Result<ResolvedServer> {
@@ -1588,7 +1574,7 @@ pub async fn spawn_own_server(
         preferred_port,
         generation_override,
         disabled,
-        &OpencodeStarter::new(),
+        &OpencodeStarter::new(layout),
     )
     .await
 }
@@ -1671,6 +1657,7 @@ impl std::fmt::Display for SpawnResolveFailure {
 /// retried until `timeout` or the child dies. The last probe evidence travels on
 /// failure; the credential never does (the attach path's promise).
 async fn resolve_spawned_server_over(
+    layout: &StateLayout,
     transport: &Transport,
     candidate: &ServerCandidate,
     generation_override: GenerationOverride,
@@ -1682,8 +1669,8 @@ async fn resolve_spawned_server_over(
             Ok(resolved) => return Ok(resolved),
             Err(evidence) => {
                 if !process_alive(candidate.pid) {
-                    if self_spawned_pid() == Some(candidate.pid) {
-                        clear_self_spawned();
+                    if self_spawned_pid(layout) == Some(candidate.pid) {
+                        clear_self_spawned(layout);
                     }
                     return Err(SpawnResolveFailure::Exited(evidence));
                 }
@@ -1777,9 +1764,12 @@ const SERVICE_RESTART_CLI_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// `preferred_port` is the `[opencode] url` tiebreaker: the restart follows
 /// the canonical pick, so among several servers of one class it restarts the
 /// configured one rather than a lower-port sibling (spec #809, ADR-0085).
-pub async fn restart_self_spawned_server(preferred_port: Option<u16>) -> anyhow::Result<RestartOutcome> {
+pub async fn restart_self_spawned_server(
+    layout: &StateLayout,
+    preferred_port: Option<u16>,
+) -> anyhow::Result<RestartOutcome> {
     let candidates = scan_processes();
-    match restart_plan(&candidates, preferred_port, self_spawned_pid()) {
+    match restart_plan(&candidates, preferred_port, self_spawned_pid(layout)) {
         RestartPlan::NoServer => Ok(RestartOutcome::NoServer),
         RestartPlan::NotOwned => Ok(RestartOutcome::NotOwned),
         RestartPlan::Service { pid, port } => {
@@ -1789,10 +1779,10 @@ pub async fn restart_self_spawned_server(preferred_port: Option<u16>) -> anyhow:
             // Confirm ownership against the live process before killing: the
             // record must still name this pid AND it must be a real
             // `opencode serve` (a recycled pid is never killed).
-            if !is_self_spawned(pid) {
+            if !is_self_spawned(layout, pid) {
                 return Ok(RestartOutcome::NotOwned);
             }
-            restart_owned_server(pid, port, password).await
+            restart_owned_server(layout, pid, port, password).await
         }
     }
 }
@@ -1972,8 +1962,13 @@ async fn wait_for_live_service(
 
 /// The Owned Server path: kill our own process, wait for the port to release,
 /// re-raise it on the same port/password, and wait until it accepts.
-async fn restart_owned_server(pid: i32, port: u16, password: String) -> anyhow::Result<RestartOutcome> {
-    let _ = clear_self_spawned();
+async fn restart_owned_server(
+    layout: &StateLayout,
+    pid: i32,
+    port: u16,
+    password: String,
+) -> anyhow::Result<RestartOutcome> {
+    let _ = clear_self_spawned(layout);
     if let Err(e) = terminate_process(pid) {
         tracing::warn!("terminate self-spawned opencode {} failed: {}", pid, e);
         return Err(e);
@@ -1992,7 +1987,7 @@ async fn restart_owned_server(pid: i32, port: u16, password: String) -> anyhow::
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
-    let new_pid = spawn_self_server(port, &password)?;
+    let new_pid = spawn_self_server(layout, port, &password)?;
     wait_for_port(port).await?;
     tracing::info!(
         "restarted self-spawned opencode on port {} (pid {})",
@@ -2005,6 +2000,12 @@ async fn restart_owned_server(pid: i32, port: u16, password: String) -> anyhow::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A layout rooted at `dir`, so a test's pid record and service log never
+    /// touch the real `~/.cola`.
+    fn test_layout(dir: &std::path::Path) -> StateLayout {
+        StateLayout::new(dir.join("sessions.json"), Some(dir.to_path_buf()))
+    }
 
     fn cand(pid: i32, port: u16, password: &str, uses_default_store: bool) -> ServerCandidate {
         ServerCandidate {
@@ -2652,21 +2653,23 @@ mod tests {
     #[test]
     fn self_spawned_pid_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let path = self_spawned_pid_path_in(dir.path());
+        let layout = test_layout(dir.path());
+        let path = layout.self_spawned_pid();
         assert_eq!(read_self_spawned_pid_in(&path), None);
-        record_self_spawned_in(&path, 4242);
+        record_self_spawned(&layout, 4242);
         assert_eq!(read_self_spawned_pid_in(&path), Some(4242));
-        assert_eq!(clear_self_spawned_in(&path), Some(4242));
+        assert_eq!(clear_self_spawned(&layout), Some(4242));
         assert_eq!(read_self_spawned_pid_in(&path), None);
     }
 
     #[test]
     fn self_spawned_ownership_matches_only_recorded_pid() {
         let dir = tempfile::tempdir().unwrap();
-        let path = self_spawned_pid_path_in(dir.path());
+        let layout = test_layout(dir.path());
+        let path = layout.self_spawned_pid();
         // Nothing recorded → no server is "owned".
         assert!(!is_self_spawned_record(&path, 1));
-        record_self_spawned_in(&path, 7);
+        record_self_spawned(&layout, 7);
         assert!(is_self_spawned_record(&path, 7));
         assert!(!is_self_spawned_record(&path, 8));
     }
@@ -2686,7 +2689,8 @@ mod tests {
         // live `opencode serve` — a stale record for a dead pid must not grant
         // ownership (the running server may be a recycled pid).
         let dir = tempfile::tempdir().unwrap();
-        let path = self_spawned_pid_path_in(dir.path());
+        let layout = test_layout(dir.path());
+        let path = layout.self_spawned_pid();
         record_self_spawned_in(&path, 999_999_999);
         // Record matches, but pid is not a live serve → not owned.
         assert!(is_self_spawned_record(&path, 999_999_999));
@@ -3033,8 +3037,11 @@ mod tests {
         let pid = std::process::id() as i32;
         let candidate = cand(pid, spawn_test_port(&server), "cola-secret", true);
         let transport = spawn_test_transport(&server, "cola-secret");
+        let dir = tempfile::tempdir().unwrap();
+        let layout = test_layout(dir.path());
 
         let resolved = resolve_spawned_server_over(
+            &layout,
             &transport,
             &candidate,
             GenerationOverride::Auto,
@@ -3069,8 +3076,11 @@ mod tests {
             true,
         );
         let transport = spawn_test_transport(&server, "spawn-secret");
+        let dir = tempfile::tempdir().unwrap();
+        let layout = test_layout(dir.path());
 
         let error = resolve_spawned_server_over(
+            &layout,
             &transport,
             &candidate,
             GenerationOverride::Auto,
@@ -3111,8 +3121,11 @@ mod tests {
             true,
         );
         let transport = spawn_test_transport(&server, "cola-secret");
+        let dir = tempfile::tempdir().unwrap();
+        let layout = test_layout(dir.path());
 
         let resolved = resolve_spawned_server_over(
+            &layout,
             &transport,
             &candidate,
             GenerationOverride::Auto,
@@ -3134,9 +3147,12 @@ mod tests {
         // A far-out pid is dead everywhere (see `process_alive_detects_own_process`).
         let candidate = cand(i32::MAX - 1, spawn_test_port(&server), "cola-secret", true);
         let transport = spawn_test_transport(&server, "cola-secret");
+        let dir = tempfile::tempdir().unwrap();
+        let layout = test_layout(dir.path());
 
         let started = std::time::Instant::now();
         let error = resolve_spawned_server_over(
+            &layout,
             &transport,
             &candidate,
             GenerationOverride::Auto,
@@ -3592,9 +3608,11 @@ mod tests {
             own_service_config_path()
         );
         assert!(
-            service_log_path().ends_with(".cola/opencode-service.log"),
+            StateLayout::default()
+                .service_log()
+                .ends_with(".cola/opencode-service.log"),
             "{:?}",
-            service_log_path()
+            StateLayout::default().service_log()
         );
     }
 
@@ -4068,7 +4086,9 @@ mod tests {
         // resolves and the start reports `Exited` — the outcome does not
         // matter here, only that the real path ran without recording a pid.
         let dead_pid = i32::MAX - 1;
-        let pid_path = self_spawned_pid_path();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = test_layout(dir.path());
+        let pid_path = layout.self_spawned_pid();
         let before = std::fs::read(&pid_path).ok();
         let host = FakeServiceHost::new()
             .registration(&service_registration_json(dead_pid, 49374, "reg-pw"))
@@ -4078,6 +4098,7 @@ mod tests {
             registration_path: std::path::PathBuf::from("/state/opencode/service.json"),
             log_path: std::path::PathBuf::from("/log/opencode-service.log"),
             probe_transport: no_proxy_probe,
+            layout: layout.clone(),
         };
 
         let failure = starter
@@ -4117,7 +4138,9 @@ mod tests {
         );
         // A live stand-in for the daemon: the test process itself.
         let pid = std::process::id() as i32;
-        let pid_path = self_spawned_pid_path();
+        let dir = tempfile::tempdir().unwrap();
+        let layout = test_layout(dir.path());
+        let pid_path = layout.self_spawned_pid();
         let before = std::fs::read(&pid_path).ok();
         let host = FakeServiceHost::new()
             .registration(&service_registration_json(
@@ -4131,6 +4154,7 @@ mod tests {
             registration_path: std::path::PathBuf::from("/state/opencode/service.json"),
             log_path: std::path::PathBuf::from("/log/opencode-service.log"),
             probe_transport: no_proxy_probe,
+            layout: layout.clone(),
         };
 
         let resolved = starter

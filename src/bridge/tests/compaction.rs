@@ -1157,7 +1157,7 @@ async fn a_sidecar_without_the_delivered_section_replays_a_compaction_once() {
             // released the chain's record, and the file has no `delivered`
             // section at all.
             std::fs::write(
-                cfg.bridge.session_file.with_file_name("chain_records.json"),
+                crate::state::StateLayout::beside(&cfg.bridge.session_file, "chain_records.json"),
                 r#"{"records":{},"announcements":{}}"#,
             )
             .unwrap();

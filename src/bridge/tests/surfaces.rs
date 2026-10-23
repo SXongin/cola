@@ -97,7 +97,11 @@ async fn last_update_of(platform: &RecordingPlatform, message_id: &str) -> Optio
 
 /// The persisted surface record's raw JSON, or `None` when the file is gone.
 fn persisted(session_file: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(session_file.with_file_name("interactive_surfaces.json")).ok()
+    std::fs::read_to_string(crate::state::StateLayout::beside(
+        session_file,
+        "interactive_surfaces.json",
+    ))
+    .ok()
 }
 
 /// A pending permission inlined on the live card survives the restart on that

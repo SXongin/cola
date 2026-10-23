@@ -218,12 +218,6 @@ pub(crate) struct TerminalRunRecords {
 }
 
 impl TerminalRunRecords {
-    /// Records beside the session mapping, the same placement the reminder's
-    /// pin set uses.
-    pub(crate) fn beside_session_file(session_file: &Path) -> Self {
-        Self::new(session_file.with_file_name("terminal-runs"))
-    }
-
     pub(crate) fn new(dir: PathBuf) -> Self {
         Self {
             dir,
@@ -505,12 +499,7 @@ impl TerminalRunRecords {
     /// only place an ending can be recorded, or the card could never be told the
     /// run ended at all.
     pub(crate) fn owed(&self) -> TerminalOwedSettlements {
-        let name = self
-            .dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "terminal-runs".to_string());
-        TerminalOwedSettlements::new(self.dir.with_file_name(format!("{name}-owed")))
+        TerminalOwedSettlements::new(crate::state::StateLayout::terminal_owed_beside(&self.dir))
     }
 
     /// Test-only: park the next 「问 AI」 merge after its re-read and before its
@@ -1211,7 +1200,7 @@ mod tests {
 
         std::fs::remove_file(records.path(&key)).unwrap();
         let records_dir = records.dir().to_path_buf();
-        let backup = records_dir.with_file_name("terminal-runs.bak");
+        let backup = crate::state::StateLayout::beside(&records_dir, "terminal-runs.bak");
         std::fs::rename(&records_dir, &backup).unwrap();
         std::fs::write(&records_dir, b"not a directory").unwrap();
         assert!(

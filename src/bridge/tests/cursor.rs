@@ -644,8 +644,10 @@ async fn an_older_confirmation_never_overwrites_a_newer_durable_cursor() {
         Some(staged_b.clone()),
         "the newer confirmation's cursor is the durable one"
     );
-    let persisted =
-        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert_eq!(
         persisted.cursor("ses_test"),
         Some(staged_b),
@@ -735,8 +737,10 @@ async fn a_delivered_cursor_survives_a_newer_stage_that_replaces_it() {
         Some(staged_b.clone()),
         "the newer stage is left untouched for its own confirmation"
     );
-    let persisted =
-        crate::bridge::chain::ChainRecords::load(session_file.with_file_name("chain_records.json"));
+    let persisted = crate::bridge::chain::ChainRecords::load(crate::state::StateLayout::beside(
+        &session_file,
+        "chain_records.json",
+    ));
     assert_eq!(
         persisted.cursor("ses_test"),
         Some(staged_a.clone()),

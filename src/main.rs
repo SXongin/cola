@@ -11,6 +11,7 @@ mod git;
 mod logging;
 mod opencode;
 mod review;
+mod state;
 mod status;
 #[cfg(test)]
 mod test_http;
@@ -129,10 +130,7 @@ enum Subcommand {
 
 /// The default append log file, used when `--log-file` is not given.
 fn default_log_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cola")
-        .join("cola.log")
+    state::StateLayout::default().log()
 }
 
 /// Resolve the config file, walking the fallback chain and giving a first-use
@@ -147,7 +145,7 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
     match config::resolve_path_from_env(explicit.as_deref()) {
         Some(path) => path,
         None => {
-            let home_cfg = home.join(".cola").join("cola.toml");
+            let home_cfg = state::StateLayout::for_home(&home).config_file();
             eprintln!(
                 "首次使用 cola：未找到配置文件（已依次查找 `./cola.toml`、`{}`）。\n\
                  请从仓库中的 `cola.toml.example` 复制并填写飞书 app_id / app_secret：\n\
@@ -175,9 +173,10 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
 /// credentials (discovery always supplies both username and password).
 async fn resolve_opencode_server(
     cfg: &config::OpenCodeConfig,
+    layout: &state::StateLayout,
 ) -> anyhow::Result<Option<bridge::discovery::ResolvedServer>> {
     let candidates = bridge::discovery::scan_processes();
-    let self_pid = bridge::discovery::self_spawned_pid();
+    let self_pid = bridge::discovery::self_spawned_pid(layout);
     if let Some(server) = bridge::discovery::pick_server(&candidates, cfg.preferred_port(), self_pid) {
         // Attach-time generation detection (spec #364 §2): probe the server
         // with the credentials discovery resolved and log the positive
@@ -196,7 +195,7 @@ async fn resolve_opencode_server(
     }
 
     if cfg.start_server == config::ServerStartPolicy::Eager {
-        match bridge::discovery::spawn_own_server(cfg.preferred_port(), cfg.generation).await {
+        match bridge::discovery::spawn_own_server(layout, cfg.preferred_port(), cfg.generation).await {
             Ok(spawned) => {
                 tracing::info!(
                     "Started cola's OpenCode server at {} — generation={} (Shared Service when one could be raised, else self-started `opencode serve`)",
@@ -236,10 +235,7 @@ async fn resolve_opencode_server(
 /// cola process refuses to start and stays out of the Feishu WS + permission
 /// flow (two instances double-answer permission cards and double-send events).
 fn lock_file_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cola")
-        .join("cola.lock")
+    state::StateLayout::default().lock()
 }
 
 /// Hold the singleton lock for the lifetime of the process. Fails fast if
@@ -946,6 +942,10 @@ async fn main() -> anyhow::Result<()> {
     // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
     let config_path = resolve_config_or_exit(&cli.config);
     let cfg = config::load(&config_path)?;
+    // The one owner of the on-disk layout (ADR-0090 §6): every path below —
+    // the log, the singleton lock, the Owned Server's pid record, the Session
+    // sidecars — is derived from it rather than from a hand-joined `.cola`.
+    let layout = state::StateLayout::from_config(&cfg);
 
     // Logs always append to a file (default ~/.cola/cola.log; --log-file
     // overrides) so a restart keeps history instead of wiping it like a shell
@@ -956,7 +956,7 @@ async fn main() -> anyhow::Result<()> {
     // stays clean and the file is authoritative. `logging` owns the wiring —
     // including the mirror layer's own field formatter, which keeps its
     // span-fields extension private (see `logging::subscriber`).
-    let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
+    let log_path = cli.log_file.clone().unwrap_or_else(|| layout.log());
     let daily = logging::DailyLog::new(log_path.clone(), cfg.bridge.log_days)?;
     // The mirror layer's default writer is the `fn() -> Stdout` maker, which
     // is what implements `MakeWriter` (a bare `Stdout` does not).
@@ -1003,7 +1003,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let server = resolve_opencode_server(&cfg.opencode).await?;
+    let server = resolve_opencode_server(&cfg.opencode, &layout).await?;
 
     tracing::info!(
         "cola starting — OpenCode: {}, Feishu app: {}",
@@ -1021,8 +1021,9 @@ async fn main() -> anyhow::Result<()> {
         server,
         bridge::tasks::TasksHandle::new(),
     );
-    let app = Arc::new(bridge::App::new(
+    let app = Arc::new(bridge::App::with_layout(
         cfg.clone(),
+        layout,
         Arc::new(opencode_client),
         Arc::new(feishu_client),
     )?);
