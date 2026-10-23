@@ -152,6 +152,33 @@ impl DirectoryBackend for BackendDirectory {
 /// instead of a live server. The real implementation is the OpenCode adapter;
 /// mock implementations feed scripted transcripts/permissions and verify what
 /// cola renders from them.
+///
+/// # The core, and the surfaces a client may lack
+///
+/// Some methods describe one runtime's own surface, not a fact every agent
+/// client has. They carry a default body stating **this client has no such
+/// surface**, in the vocabulary the trait already uses: `Ok(None)`, `false`,
+/// the no-op `Ok(())`, `Ok(TaskRuntime::default())`,
+/// `Ok(ChildEvidence::Unfinished)`. The twelve are
+/// [`Self::session_selection`], [`Self::session_last_run_model`],
+/// [`Self::switch_session_model`], [`Self::switch_session_agent`],
+/// [`Self::keeps_session_selection`], [`Self::reuse_continues_an_admitted_turn`],
+/// [`Self::resume_supported`], [`Self::resume`], [`Self::session_diff`],
+/// [`Self::task_runtime`], [`Self::shell_output`] and
+/// [`Self::child_evidence`].
+///
+/// A future adapter (spec #860) is expected to leave all twelve defaulted when
+/// the runtime it attaches to publishes no equivalent surface, and to override
+/// the ones it does publish; the rest of the trait — session lifecycle,
+/// [`Self::prompt`], [`Self::transcript`], permissions/questions,
+/// [`Self::session_status`], the pickers, the tasks handle and the
+/// directory handle — is the core it must always implement.
+///
+/// The distinction is the trait's throughout: a default shape means *not
+/// applicable to this client*, never that a read failed. A client that has the
+/// surface overrides the method, answers the default shape only where the read
+/// or write genuinely has nothing to report, and reports a failure as an
+/// `Err`. A default must never look like a failed read.
 #[async_trait]
 pub trait Backend: Send + Sync {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;
@@ -236,11 +263,18 @@ pub trait Backend: Send + Sync {
     ///
     /// This is what the next turn will actually run: shared session state that
     /// another client may have changed, not cola's local mirror.
+    ///
+    /// The default answers `Ok(None)`: a client that keeps no durable
+    /// selection has no such surface, so `None` is **not applicable to this
+    /// client**, never a failed read. A client that has the surface overrides
+    /// this and still answers `Err` when the read itself fails.
     async fn session_selection(
         &self,
-        session_id: &str,
-        directory: Option<&str>,
-    ) -> Result<Option<SessionSelection>>;
+        _session_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<SessionSelection>> {
+        Ok(None)
+    }
 
     /// The model the session last actually ran with — the newest assistant
     /// message's model ref (variant inside it). A durable generation records a
@@ -250,29 +284,57 @@ pub trait Backend: Send + Sync {
     /// last rung before giving up. `None` on V1, whose ladder already reads
     /// the server-recorded session model through `session_info`, and for a
     /// session with no assistant message yet.
+    ///
+    /// The default answers `Ok(None)`: a client with no assistant-message
+    /// model record has no such surface, so `None` is **not applicable to this
+    /// client**, never a failed read. A client that has the surface overrides
+    /// this and still answers `Err` when the read itself fails.
     async fn session_last_run_model(
         &self,
-        session_id: &str,
-        directory: Option<&str>,
-    ) -> Result<Option<ModelInfo>>;
+        _session_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<ModelInfo>> {
+        Ok(None)
+    }
 
     /// Make the session's model selection durable so subsequent turns use it
     /// with nothing re-sent (V2's `POST /api/session/{id}/model`); the variant
     /// rides inside `model`. A no-op on V1, where the selection rides each
     /// prompt.
-    async fn switch_session_model(&self, session_id: &str, model: &ModelInfo) -> Result<()>;
+    ///
+    /// The default is a no-op (`Ok(())`): a client whose selection rides each
+    /// prompt has no durable switch to make, so the no-op is **not applicable
+    /// to this client**. A client that has the switch overrides this and
+    /// answers `Err` when the write fails.
+    async fn switch_session_model(&self, _session_id: &str, _model: &ModelInfo) -> Result<()> {
+        Ok(())
+    }
 
     /// Make the session's agent selection durable (V2's
     /// `POST /api/session/{id}/agent`). A no-op on V1, where the selection
     /// rides each prompt.
-    async fn switch_session_agent(&self, session_id: &str, agent: &str) -> Result<()>;
+    ///
+    /// The default is a no-op (`Ok(())`): a client whose selection rides each
+    /// prompt has no durable switch to make, so the no-op is **not applicable
+    /// to this client**. A client that has the switch overrides this and
+    /// answers `Err` when the write fails.
+    async fn switch_session_agent(&self, _session_id: &str, _agent: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Whether this generation keeps model/agent choices as durable session
     /// state (V2's session switches) rather than sending them with each prompt
     /// (V1). A caller uses this to know a server-side switch is REQUIRED for a
     /// pick to take effect; it must never infer it from a failed selection
     /// read (which only says "unknown").
-    fn keeps_session_selection(&self) -> bool;
+    ///
+    /// The default answers `false`: a client with no durable selection keeps
+    /// none, so `false` is **not applicable to this client** — not a failed
+    /// read (a failed selection read is that read's own `Err`, and must never
+    /// be folded into this answer).
+    fn keeps_session_selection(&self) -> bool {
+        false
+    }
 
     /// Whether a same-id re-post of a user message this server has ALREADY
     /// admitted can still continue that turn. True on V1, where re-posting an
@@ -282,7 +344,15 @@ pub trait Backend: Send + Sync {
     /// running (only a never-admitted id runs). The retry matrix reads this to
     /// choose id reuse vs a fresh id; it states the server contract, never a
     /// policy.
-    fn reuse_continues_an_admitted_turn(&self) -> bool;
+    ///
+    /// The default answers `false`: a client with no continuation-by-re-post
+    /// surface cannot promise the turn continues, so `false` is **not
+    /// applicable to this client** and the retry matrix posts a fresh id (the
+    /// conservative cell). There is no read here, so there is no `Err`; a
+    /// client that would answer `true` must override this explicitly.
+    fn reuse_continues_an_admitted_turn(&self) -> bool {
+        false
+    }
 
     /// Whether this generation can resume a Session through [`Self::resume`]
     /// (`POST /api/session/{id}/resume`, V2): a message queued in the session
@@ -290,7 +360,14 @@ pub trait Backend: Send + Sync {
     /// no resume endpoint, so the Unreceived card's 重新发起 action degrades to
     /// resubmitting the message as a new Turn there (#437). States the server
     /// contract, never a policy.
-    fn resume_supported(&self) -> bool;
+    ///
+    /// The default answers `false`: a client with no resume endpoint has no
+    /// such surface, so `false` is **not applicable to this client** and the
+    /// action degrades to a resubmit. There is no read here, so there is no
+    /// `Err`; a client that answers `true` must override [`Self::resume`] too.
+    fn resume_supported(&self) -> bool {
+        false
+    }
 
     /// Resume a Session: promote the queued steer at a new run's start
     /// (`POST /api/session/{id}/resume`, 204). The 重新发起 action pairs it
@@ -299,7 +376,15 @@ pub trait Backend: Send + Sync {
     /// resume promotes cola's already-admitted message into a fresh run —
     /// pressing the button never duplicates the transcript message. Only
     /// called where [`Self::resume_supported`] is true.
-    async fn resume(&self, session_id: &str) -> Result<()>;
+    ///
+    /// The default is a no-op (`Ok(())`): a client with no resume endpoint has
+    /// nothing to promote, so the no-op is **not applicable to this client**.
+    /// It is reachable only where [`Self::resume_supported`] is true, so a
+    /// defaulted pair is never called; a client that answers `true` overrides
+    /// this, and a resume that was attempted and failed is its `Err`.
+    async fn resume(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Reply to a pending permission with a decision (`once` / `always` /
     /// `reject`). `session_id` is the requesting session (the child session for
@@ -357,13 +442,20 @@ pub trait Backend: Send + Sync {
     ///
     /// The Turn card's settle index and its 「查看完整变化」 callback (#801)
     /// read this one source.
+    ///
+    /// The default answers `Ok(None)`: a client with no session diff endpoint
+    /// has no Turn Diff at all, so `None` is **not applicable to this client**
+    /// — never an empty diff and never a failed read. A client that has the
+    /// endpoint overrides this and still answers `Err` when the read fails.
     async fn session_diff(
         &self,
-        session_id: &str,
-        from: Option<&str>,
-        to: Option<&str>,
-        context: Option<u32>,
-    ) -> Result<Option<TurnDiff>>;
+        _session_id: &str,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        _context: Option<u32>,
+    ) -> Result<Option<TurnDiff>> {
+        Ok(None)
+    }
 
     /// The server's live run state for one session (`GET /session/status`).
     /// `directory` selects the instance (ADR-0010). A successful read always
@@ -385,13 +477,21 @@ pub trait Backend: Send + Sync {
     /// answers `Missing` for shells it never hosted. V1 carries no Background
     /// Tasks, so its callers never ask (it still answers an empty read without
     /// a request).
+    ///
+    /// The default answers `Ok(TaskRuntime::default())` — an empty verdict for
+    /// every id asked about, which is no evidence at all: a client with no live
+    /// runtime registry has no such surface, so the empty verdict is **not
+    /// applicable to this client**, never a failed read. A client that has the
+    /// surface overrides this and still answers `Err` when the read fails.
     async fn task_runtime(
         &self,
-        session_id: &str,
-        directory: Option<&str>,
-        shells: &[String],
-        children: &[String],
-    ) -> Result<TaskRuntime>;
+        _session_id: &str,
+        _directory: Option<&str>,
+        _shells: &[String],
+        _children: &[String],
+    ) -> Result<TaskRuntime> {
+        Ok(TaskRuntime::default())
+    }
 
     /// The Background Task State module's handle (ADR-0079, tickets #681/#682)
     /// — the one instance the adapter was constructed with and the Bridge
@@ -429,11 +529,19 @@ pub trait Backend: Send + Sync {
     ///
     /// Display-only: the read never prompts, never changes a task's liveness
     /// and never settles anything.
+    ///
+    /// The default answers `Ok(None)`: a client with no shell records has no
+    /// record to read, so `None` is **not applicable to this client**, never a
+    /// failed read. A client that has the surface overrides this and still
+    /// answers `Err` when the read fails (and `Ok(None)` only for a record the
+    /// runtime no longer keeps).
     async fn shell_output(
         &self,
-        shell_id: &str,
-        directory: Option<&str>,
-    ) -> Result<Option<ShellOutputWindow>>;
+        _shell_id: &str,
+        _directory: Option<&str>,
+    ) -> Result<Option<ShellOutputWindow>> {
+        Ok(None)
+    }
     /// The evidence one child session's newest assistant message carries about
     /// its Background Task's run (#591, issue #464): one page of projected
     /// messages, newest assistant first (V2 reads
@@ -444,7 +552,14 @@ pub trait Backend: Send + Sync {
     /// `Ok(ChildEvidence::Unfinished)` is no evidence at all (the caller must
     /// not retire from it), and an `Err` is an unreadable child (same). V1
     /// carries no Background Tasks; it answers `Unfinished` without a request.
-    async fn child_evidence(&self, session_id: &str) -> Result<ChildEvidence>;
+    ///
+    /// The default answers `Ok(ChildEvidence::Unfinished)`: a client with no
+    /// child sessions has no evidence to read, so no-evidence is **not
+    /// applicable to this client**, never a failed read. A client that has the
+    /// surface overrides this and still answers `Err` for an unreadable child.
+    async fn child_evidence(&self, _session_id: &str) -> Result<ChildEvidence> {
+        Ok(ChildEvidence::Unfinished)
+    }
 
     /// The model's context-window size (tokens), from `GET /provider`. Used to
     /// compute the context-usage ratio for the card footer. Best-effort: None
@@ -517,4 +632,233 @@ pub trait Backend: Send + Sync {
     /// call site can silently omit it and hit the server cwd instance
     /// (ADR-0010).
     fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend>;
+}
+
+/// The second adapter's shape, pinned: a client that implements the core and
+/// leaves every generation-specific surface defaulted (spec #860, ticket #873).
+///
+/// This module is the executable half of the trait-level doc comment — if a
+/// future change removes a default, or a default starts answering something
+/// other than "not applicable to this client", this stops compiling or fails.
+/// The body of [`CoreClient`] is deliberately trivial: the point is which
+/// methods it does NOT have to write.
+#[cfg(test)]
+mod core_only_client {
+    use super::*;
+    use crate::backend::types::CreateSessionInput;
+
+    /// A client with the neutral core and no OpenCode-generation surface.
+    #[derive(Default)]
+    struct CoreClient {
+        tasks: crate::bridge::tasks::TasksHandle,
+    }
+
+    #[async_trait]
+    impl Backend for CoreClient {
+        fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
+            CreateSessionInput {
+                id: None,
+                agent: None,
+                model: None,
+                location: directory.map(|directory| crate::backend::types::Location {
+                    directory: directory.to_string(),
+                }),
+            }
+        }
+
+        async fn create_session(&self, _input: &CreateSessionInput) -> Result<Session> {
+            Ok(Session {
+                id: "ses_core".into(),
+                project_id: None,
+                agent: None,
+                title: None,
+                location: None,
+                cost: None,
+                time: None,
+            })
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<SessionListInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn update_session_title(&self, _session_id: &str, _title: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn prompt(
+            &self,
+            _session_id: &str,
+            _text: &str,
+            _files: &[PromptFile],
+            _skills: &[PromptSkill],
+            _model: Option<&ModelInfo>,
+            _variant: Option<&str>,
+            _agent: Option<&str>,
+            _message_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reply_permission(
+            &self,
+            _session_id: &str,
+            _request_id: &str,
+            _reply: &str,
+            _directory: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_permissions(&self, _directory: Option<&str>) -> Result<Vec<PermissionRequest>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_questions(&self, _directory: Option<&str>) -> Result<Vec<QuestionRequest>> {
+            Ok(Vec::new())
+        }
+
+        async fn reply_question(
+            &self,
+            _session_id: &str,
+            _request_id: &str,
+            _answers: &[FormAnswer],
+            _directory: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reject_question(
+            &self,
+            _session_id: &str,
+            _request_id: &str,
+            _directory: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn transcript(&self, _session_id: &str) -> Result<SessionTranscript> {
+            Ok(SessionTranscript::new(Vec::new()))
+        }
+
+        async fn session_status(
+            &self,
+            _session_id: &str,
+            _directory: Option<&str>,
+        ) -> Result<Option<SessionStatus>> {
+            Ok(Some(SessionStatus::Idle))
+        }
+
+        fn tasks(&self) -> &crate::bridge::tasks::TasksHandle {
+            &self.tasks
+        }
+
+        async fn model_context_window(&self, _provider: &str, _model: &str) -> Result<Option<i64>> {
+            Ok(None)
+        }
+
+        fn configured_default_model(&self) -> Option<ModelInfo> {
+            None
+        }
+
+        async fn list_agents(&self) -> Vec<AgentInfo> {
+            Vec::new()
+        }
+
+        async fn list_skills(&self, _directory: Option<&str>) -> Vec<SkillInfo> {
+            Vec::new()
+        }
+
+        async fn list_models(&self) -> Vec<ProviderModels> {
+            Vec::new()
+        }
+
+        async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
+            Ok(SessionInfo {
+                id: session_id.to_string(),
+                parent_id: None,
+                title: None,
+                model: None,
+            })
+        }
+
+        async fn interrupt(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn compact(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reconnect(&self, _server: Option<&crate::bridge::discovery::ResolvedServer>) -> Result<()> {
+            Ok(())
+        }
+
+        fn base_url(&self) -> String {
+            String::new()
+        }
+
+        fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend> {
+            Arc::new(BackendDirectory::new(self, directory.to_string()))
+        }
+    }
+
+    /// Every defaulted method answers "this client has no such surface" — an
+    /// inert value, never an `Err` that would read as a failed read.
+    #[tokio::test]
+    async fn the_defaulted_surfaces_answer_not_applicable() {
+        use crate::backend::types::ModelInfo;
+
+        let client = CoreClient::default();
+        let model = ModelInfo {
+            id: "m".into(),
+            provider_id: "p".into(),
+            variant: None,
+        };
+
+        assert!(
+            client
+                .session_selection("ses_core", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .session_last_run_model("ses_core", None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .session_diff("ses_core", None, None, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!client.keeps_session_selection());
+        assert!(!client.reuse_continues_an_admitted_turn());
+        assert!(!client.resume_supported());
+        client.resume("ses_core").await.unwrap();
+        client.switch_session_model("ses_core", &model).await.unwrap();
+        client.switch_session_agent("ses_core", "build").await.unwrap();
+        assert!(client.shell_output("sh_1", None).await.unwrap().is_none());
+
+        let runtime = client
+            .task_runtime("ses_core", None, &["sh_1".into()], &["ses_child".into()])
+            .await
+            .unwrap();
+        assert!(runtime.shell("sh_1").is_none(), "an empty verdict is no evidence");
+        assert!(runtime.child("ses_child").is_none());
+
+        assert_eq!(
+            client.child_evidence("ses_child").await.unwrap(),
+            ChildEvidence::Unfinished
+        );
+    }
 }
