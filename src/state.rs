@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
-/// Every path cola derives under `~/.cola`.
+/// The single owner of cola's on-disk paths: the Session-keyed sidecars beside
+/// `[bridge] session_file` plus the process-owned files under the home state
+/// directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StateLayout {
     /// The configured session mapping (`[bridge] session_file`).
@@ -151,9 +153,10 @@ impl StateLayout {
 
     // ---- Naming helpers for paths received from elsewhere ----
 
-    /// A sidecar beside a state file the caller already holds (a test fixture's
-    /// access file). The path names a file that is not derived from the layout,
-    /// so only its sibling placement is owned here.
+    /// Test-only: place a sidecar beside a path the caller already owns, such
+    /// as a fixture's access file. This is **not** a second derivation route —
+    /// production paths come from the layout's named methods; constructing a
+    /// layout here would invent a home for a path the fixture already holds.
     #[cfg(test)]
     pub(crate) fn beside(path: &Path, name: &str) -> PathBuf {
         path.with_file_name(name)

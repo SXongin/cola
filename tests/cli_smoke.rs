@@ -120,6 +120,11 @@ fn completions_install_writes_into_the_xdg_tree() {
     // dispatched before lock handling (ADR-0081). The recorded PID is this test
     // process, which is alive, so an implementation that took the lock first
     // would refuse here.
+    //
+    // This fixture mirrors `StateLayout`'s lock path (`~/.cola/cola.lock`). The
+    // crate is binary-only (`[[bin]]`, no lib target), so this integration test
+    // cannot link `StateLayout`; if the lock path changes, the unit test in
+    // `src/state.rs` is the owner that must change with it.
     let lock = home.join(".cola").join("cola.lock");
     std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
     std::fs::write(&lock, std::process::id().to_string()).unwrap();
