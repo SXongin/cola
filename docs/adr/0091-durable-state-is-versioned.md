@@ -162,6 +162,16 @@ before the new bytes are durable.
   writes; the bot does not start rather than rewrite state it cannot understand.
   A store loaded outside startup (the Access List) logs the refusal and behaves
   unclaimed/fails closed.
+- **A duplicate top-level `version` key is refused too.** `serde_json` keeps only
+  the last duplicate, so `{"version":2,"version":1}` would otherwise read as
+  current. The raw header is scanned depth-aware, ignoring strings, before the
+  body is interpreted; a nested record body's `version` field is not a header
+  and never trips it.
+- **A refusal is sticky for the process.** An unsupported Access List offers no
+  claim code and refuses a claim, so nothing writes over the Host entry; an
+  unsupported pin file is never persisted over by a reminder sync or orphan
+  sweep. `cola status` reports the unsupported Access List version instead of
+  silently "unclaimed" (it still does not write).
 - A version-0 file whose body still will not parse fails open and is **not**
   rewritten; only a body that parsed as version 0 is migrated.
 

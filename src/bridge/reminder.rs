@@ -75,21 +75,22 @@ fn write_pins_file(path: &Path, pins: &[PinnedChat]) {
 }
 
 /// Rewrite a version-0 pin file once in the current form (ADR-0091). A corrupt
-/// file is left untouched (the orphan clears it records must not be lost), and
-/// an unsupported version is refused loudly rather than read as 0.
-fn migrate_pins_file(path: &Path) {
+/// file is left untouched (the orphan clears it records must not be lost). An
+/// unsupported version is returned so the owner can refuse to write the file
+/// for the rest of the process.
+fn migrate_pins_file(path: &Path) -> Option<String> {
     let Ok(raw) = std::fs::read_to_string(path) else {
-        return; // Missing (or unreadable) means nothing recorded.
+        return None; // Missing (or unreadable) means nothing recorded.
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
         tracing::warn!(
             "instant reminder: could not parse {}; leaving it untouched",
             path.display()
         );
-        return;
+        return None;
     };
-    match crate::bridge::sidecar::classify_version(value.get("version")) {
-        crate::bridge::sidecar::DeclaredVersion::Current => {}
+    match crate::bridge::sidecar::classify_raw_version(&raw, &value) {
+        crate::bridge::sidecar::DeclaredVersion::Current => None,
         crate::bridge::sidecar::DeclaredVersion::Legacy => {
             match serde_json::from_str::<PinnedChatsFile>(&raw) {
                 // A migration lands the version even for an empty pin set; the
@@ -108,13 +109,9 @@ fn migrate_pins_file(path: &Path) {
                     path.display()
                 ),
             }
+            None
         }
-        crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) => tracing::error!(
-            "instant reminder: {} declares unsupported format version {declared} (this build writes {}); \
-             refusing to read it as version 0",
-            path.display(),
-            crate::state::STATE_FORMAT_VERSION
-        ),
+        crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) => Some(declared),
     }
 }
 
@@ -179,18 +176,46 @@ pub(crate) struct ReminderState {
     /// Where the live pins are mirrored (`pinned_chats.json`, beside
     /// `sessions.json`). `None` in unit tests that never touch disk.
     pins_file: Option<PathBuf>,
+    /// Sticky: the pin file declared a version this build refused, so no sync
+    /// or clear may write over it for the rest of the process (ADR-0091).
+    pins_refused: std::sync::atomic::AtomicBool,
+    /// The refusal is logged once, not on every sync.
+    pins_refusal_logged: std::sync::atomic::AtomicBool,
     inner: Mutex<Inner>,
 }
 
 impl ReminderState {
     pub(crate) fn new(enabled: bool, pins_file: Option<PathBuf>) -> Self {
-        if let Some(path) = &pins_file {
-            migrate_pins_file(path);
-        }
-        Self {
+        let refused = pins_file.as_deref().and_then(migrate_pins_file);
+        let state = Self {
             enabled,
             pins_file,
+            pins_refused: std::sync::atomic::AtomicBool::new(refused.is_some()),
+            pins_refusal_logged: std::sync::atomic::AtomicBool::new(false),
             inner: Mutex::new(Inner::default()),
+        };
+        if let Some(declared) = refused {
+            state.refuse_pins(&declared);
+        }
+        state
+    }
+
+    /// Record a sticky refusal and log it once. Every writer of the pin file
+    /// must check [`Self::pins_refused`] first.
+    fn refuse_pins(&self, declared: &str) {
+        use std::sync::atomic::Ordering;
+        self.pins_refused.store(true, Ordering::SeqCst);
+        if !self.pins_refusal_logged.swap(true, Ordering::SeqCst) {
+            let path = self
+                .pins_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "pinned_chats.json".to_string());
+            tracing::error!(
+                "instant reminder: {path} declares unsupported format version {declared} \
+                 (this build writes {}); refusing to overwrite it",
+                crate::state::STATE_FORMAT_VERSION
+            );
         }
     }
 
@@ -476,6 +501,9 @@ impl ReminderState {
     /// is what a restarted cola clears at startup. Best-effort — the pin state
     /// itself is unaffected by a failed write. An empty set removes the file.
     fn persist_locked(&self, inner: &Inner) {
+        if self.pins_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let Some(path) = &self.pins_file else {
             return;
         };
@@ -501,6 +529,9 @@ impl ReminderState {
         if !self.enabled {
             return;
         }
+        if self.pins_refused.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         let Some(path) = &self.pins_file else {
             return;
         };
@@ -520,14 +551,9 @@ impl ReminderState {
             return;
         };
         if let crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) =
-            crate::bridge::sidecar::classify_version(value.get("version"))
+            crate::bridge::sidecar::classify_raw_version(&raw, &value)
         {
-            tracing::error!(
-                "instant reminder: {} declares unsupported format version {declared} (this build writes {}); \
-                 refusing to read it as version 0",
-                path.display(),
-                crate::state::STATE_FORMAT_VERSION
-            );
+            self.refuse_pins(&declared);
             return;
         }
         let file: PinnedChatsFile = match serde_json::from_str(&raw) {
@@ -983,5 +1009,61 @@ mod tests {
         let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["version"], crate::state::STATE_FORMAT_VERSION);
         assert!(raw["pins"].as_array().unwrap().is_empty());
+    }
+
+    /// ADR-0091: an unsupported pin-file version is sticky. A sweep still pins
+    /// (the platform call is independent), but neither it nor the orphan clear
+    /// may write over the file.
+    #[tokio::test]
+    async fn an_unsupported_pin_version_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinned_chats.json");
+        let raw = r#"{"version":3,"pins":[{"chat_id":"chat_9","is_group":false,"user_ids":["ou_host"]}]}"#;
+        std::fs::write(&path, raw).unwrap();
+
+        let platform = Arc::new(RecordingPlatform::new());
+        let feishu: Arc<dyn Platform> = platform.clone();
+        let (_, logs) = capture_logs(async {
+            let pins = ReminderState::new(true, Some(path.clone()));
+            pins.sync(&feishu, ClaimKind::Permission, &[target("chat_1", 1)])
+                .await;
+            pins.clear_orphans(&feishu).await;
+        })
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            raw,
+            "the refused pin file is never overwritten"
+        );
+        assert!(
+            !reminder_calls(&platform).await.is_empty(),
+            "the pin itself is still attempted"
+        );
+        assert!(
+            logs.contains("unsupported format version 3"),
+            "the refusal names the version: {logs}"
+        );
+        assert_eq!(
+            logs.matches("unsupported format version 3").count(),
+            1,
+            "the refusal is logged once, not per sweep:\n{logs}"
+        );
+    }
+
+    /// A top-level duplicate `"version"` key is a refusal, not "the last one
+    /// wins" (serde_json would keep the current integer).
+    #[tokio::test]
+    async fn a_duplicate_version_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pinned_chats.json");
+        let raw = r#"{"version":2,"version":1,"pins":[]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let platform = Arc::new(RecordingPlatform::new());
+        let feishu: Arc<dyn Platform> = platform.clone();
+        let pins = ReminderState::new(true, Some(path.clone()));
+        pins.sync(&feishu, ClaimKind::Permission, &[target("chat_1", 1)])
+            .await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }
 }
