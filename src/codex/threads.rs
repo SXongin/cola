@@ -51,9 +51,10 @@ pub(crate) const INTERACTIVE_SOURCE_KINDS: &[&str] = &["cli", "vscode", "appServ
 const EVENT_CAPACITY: usize = 1024;
 
 /// The `-32600` detail `thread/resume` returns for a thread with no rollout
-/// (ADR-0090's amendment, question 2). Matched together with the code, never on
-/// its own: the message is the server's, the code is the protocol's.
-const NO_ROLLOUT: &str = "no rollout found";
+/// (ADR-0090's amendment, question 2): `no rollout found for thread id <id>`.
+/// Matched together with the code and this thread's id, never on the phrase
+/// alone.
+const NO_ROLLOUT: &str = "no rollout found for thread id ";
 
 /// One app-server thread, as `thread/list`, `thread/read` and `thread/resume`
 /// return it. Only the fields cola reads today are decoded; turns and status
@@ -103,8 +104,15 @@ impl Thread {
     /// The neutral row the session list consumes (spec #860, #870). `id` is the
     /// **thread** id — the identity every thread-scoped call takes — while the
     /// session tree root stays on [`Thread::session_id`], where `/attach` reads
-    /// it (ADR-0090, ticket #878). `model` and `agent` have no equivalent on
-    /// this wire yet, so they stay empty rather than being guessed at; the read
+    /// it (ADR-0090, ticket #878).
+    ///
+    /// `SessionListInfo` has **no field for the session tree root**, and the
+    /// adapter does not smuggle one into `agent`/`model`: a list row is a
+    /// selection/display surface only. Before attaching, the root is the one
+    /// [`Threads::read`] returns for the selected id (or the `Thread` inside
+    /// the [`Adoption::Subscribed`] response), and that read — never the listed
+    /// id — is authoritative. `model` and `agent` have no equivalent on this
+    /// wire yet, so they stay empty rather than being guessed at; the read
     /// model (#879) owns that mapping when it needs it.
     pub(crate) fn list_info(&self) -> SessionListInfo {
         SessionListInfo {
@@ -153,13 +161,18 @@ pub(crate) enum UnsubscribeStatus {
     Unsubscribed,
 }
 
-/// One notification the server pushed for a subscribed thread. The method and
-/// params are kept as the wire sent them; the read model (#879) decodes them
-/// into transcript parts.
+/// What a subscription delivers. The method and params are kept as the wire
+/// sent them; the read model (#879) decodes them into transcript parts.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ThreadEvent {
-    pub(crate) method: String,
-    pub(crate) params: Value,
+pub(crate) enum ThreadEvent {
+    /// A notification the server pushed for this thread.
+    Notification { method: String, params: Value },
+    /// The dispatcher fell behind the connection's push stream and dropped
+    /// `skipped` events. A silent gap would render a transcript with holes, so
+    /// this is delivered to every live subscriber, which can resync through
+    /// `thread/read` (or end its subscription) instead of assuming the stream
+    /// is complete.
+    Lagged { skipped: u64 },
 }
 
 /// A live subscription to one thread.
@@ -189,7 +202,8 @@ impl ThreadSubscription {
         &self.thread
     }
 
-    /// The next pushed notification for this thread.
+    /// The next event for this thread: a notification, or an explicit `Lagged`
+    /// marker when the dispatcher dropped events before this one.
     pub(crate) async fn next_event(&mut self) -> Result<ThreadEvent> {
         match self.events.recv().await {
             Ok(event) => Ok(event),
@@ -207,7 +221,8 @@ impl ThreadSubscription {
     /// Leave the subscription. Returns the server's answer when this was the
     /// last local handle for the thread, or `None` when another handle still
     /// holds it (no `thread/unsubscribe` is sent: the server must keep
-    /// streaming to that handle).
+    /// streaming to that handle). This is the **only** unsubscribe path, so a
+    /// caller cannot stop a stream another handle is reading.
     pub(crate) async fn release(mut self) -> Result<Option<UnsubscribeStatus>> {
         // Claim the local release atomically: two handles releasing at once
         // cannot both decide they are the last (and neither can both skip).
@@ -323,6 +338,17 @@ impl Threads {
     /// amendment, question 2). The receiver is registered **before** the call,
     /// so a turn that starts while the response is in flight is not lost.
     pub(crate) async fn adopt(&self, thread_id: &str) -> Result<Adoption> {
+        // The holder is counted before the await and released by `guard`'s
+        // `Drop` on every exit that does not hand it to a returned
+        // subscription — including a caller cancelling this future while
+        // `thread/resume` is in flight. A holder that survived a cancellation
+        // would make the next real handle look non-last and skip
+        // `thread/unsubscribe` forever.
+        let guard = ReleaseGuard {
+            thread_id: thread_id.to_string(),
+            registry: Arc::clone(&self.registry),
+            released: false,
+        };
         let events = self.registry.subscribe(thread_id);
         let result = self
             .connection
@@ -331,35 +357,37 @@ impl Threads {
 
         match result {
             Ok(result) => {
-                let response: ResumeResponse = match decode("thread/resume", result) {
-                    Ok(response) => response,
-                    Err(error) => {
-                        self.registry.release(thread_id);
-                        return Err(error);
-                    }
-                };
+                let response: ResumeResponse = decode("thread/resume", result)?;
+                // `guard` moves into the subscription: its holder now lives as
+                // long as the subscription and is released by `release` or by
+                // dropping it.
                 Ok(Adoption::Subscribed(Box::new(ThreadSubscription {
                     thread: response.thread,
                     events,
-                    guard: ReleaseGuard {
-                        thread_id: thread_id.to_string(),
-                        registry: Arc::clone(&self.registry),
-                        released: false,
-                    },
+                    guard,
                     connection: self.connection.clone(),
                 })))
             }
             // A never-run thread has no rollout; that is a state of the
             // thread, not a transport failure (the spike's exact answer).
-            Err(CodexError::Rpc { code, detail, .. }) if no_history(code, &detail) => {
-                self.registry.release(thread_id);
+            Err(CodexError::Rpc { code, detail, .. }) if no_history(code, thread_id, &detail) => {
                 Ok(Adoption::NoHistoryYet)
             }
-            Err(error) => {
-                self.registry.release(thread_id);
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
+    }
+
+    /// The local handle count for a thread (test-only): proves a cancelled
+    /// adopt did not leak a holder.
+    #[cfg(test)]
+    pub(crate) fn local_holders(&self, thread_id: &str) -> usize {
+        self.registry
+            .threads
+            .lock()
+            .expect("thread registry")
+            .get(thread_id)
+            .map(|entry| entry.holders)
+            .unwrap_or(0)
     }
 
     /// Rename a thread (`thread/name/set`); the next `thread/list` reads the
@@ -370,22 +398,20 @@ impl Threads {
             .await?;
         Ok(())
     }
-
-    /// Send `thread/unsubscribe` for `thread_id`, regardless of local handles.
-    /// This is the explicit release path; normal consumers use
-    /// [`ThreadSubscription::release`].
-    pub(crate) async fn unsubscribe(&self, thread_id: &str) -> Result<UnsubscribeStatus> {
-        let result = self
-            .connection
-            .request("thread/unsubscribe", json!({ "threadId": thread_id }))
-            .await?;
-        let response: UnsubscribeResponse = decode("thread/unsubscribe", result)?;
-        Ok(response.status)
-    }
 }
 
-fn no_history(code: Option<i64>, detail: &str) -> bool {
-    code == Some(-32600) && detail.to_ascii_lowercase().contains(NO_ROLLOUT)
+/// Whether `thread/resume`'s error is the documented no-rollout answer for
+/// **this** thread: `-32600` and exactly `no rollout found for thread id
+/// <id>`. A near-match (another code, another thread's id, or a message that
+/// merely contains the phrase) is not this state and stays an error.
+fn no_history(code: Option<i64>, thread_id: &str, detail: &str) -> bool {
+    if code != Some(-32600) {
+        return false;
+    }
+    let Some(rest) = detail.trim().strip_prefix(NO_ROLLOUT) else {
+        return false;
+    };
+    rest.trim() == thread_id
 }
 
 fn decode<T: DeserializeOwned>(method: &str, value: Value) -> Result<T> {
@@ -484,6 +510,20 @@ impl Registry {
             .map(|entry| entry.sender.clone())
     }
 
+    /// Deliver an explicit lag marker to every live subscription.
+    fn lag_all(&self, skipped: u64) {
+        let senders: Vec<_> = self
+            .threads
+            .lock()
+            .expect("thread registry")
+            .values()
+            .map(|entry| entry.sender.clone())
+            .collect();
+        for sender in senders {
+            let _ = sender.send(ThreadEvent::Lagged { skipped });
+        }
+    }
+
     /// Drop every per-thread sender, so each subscription's stream reports
     /// `Closed` when the connection ends instead of waiting forever.
     fn close_all(&self) {
@@ -540,7 +580,7 @@ async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Regi
                     // No receiver means every local handle already dropped;
                     // the server stops sending once the connection unsubscribes
                     // or closes, so a dropped event costs nothing.
-                    let _ = sender.send(ThreadEvent { method, params });
+                    let _ = sender.send(ThreadEvent::Notification { method, params });
                 }
             }
             Ok(Inbound::Request { .. }) => continue,
@@ -549,10 +589,14 @@ async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Regi
                 return;
             }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // Losing events here would silently punch holes in a
+                // transcript. Tell every live subscription how many were
+                // dropped so its consumer can resync from `thread/read`.
                 tracing::warn!(
                     "the codex connection's push stream outran the thread dispatcher by \
-                     {skipped} event(s)"
+                     {skipped} event(s); marking every subscription lagged"
                 );
+                registry.lag_all(skipped);
             }
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -568,6 +612,13 @@ mod tests {
     use crate::codex::schema::PinnedProbe;
     use crate::codex::test_server::{FakeServer, ScriptedThread};
     use crate::codex::transport::Endpoint;
+
+    fn notification(event: ThreadEvent) -> (String, Value) {
+        match event {
+            ThreadEvent::Notification { method, params } => (method, params),
+            other => panic!("expected a notification, got {other:?}"),
+        }
+    }
 
     async fn connect(url: &str) -> CodexClient {
         let endpoint = Endpoint::parse(url).expect("endpoint");
@@ -698,9 +749,10 @@ mod tests {
             .await
             .expect("the item arrives on this connection")
             .expect("a thread event");
-        assert_eq!(event.method, "item/completed");
-        assert_eq!(event.params["item"]["text"], "hello from the server");
-        assert_eq!(event.params["threadId"], "thread-1");
+        let (method, params) = notification(event);
+        assert_eq!(method, "item/completed");
+        assert_eq!(params["item"]["text"], "hello from the server");
+        assert_eq!(params["threadId"], "thread-1");
     }
 
     /// Ticket #878 acceptance 3: a never-run thread reports the documented
@@ -795,7 +847,8 @@ mod tests {
                 .await
                 .expect("both streams receive the first item")
                 .expect("a thread event");
-            assert_eq!(event.params["item"]["text"], "both see this");
+            let (_, params) = notification(event);
+            assert_eq!(params["item"]["text"], "both see this");
         }
 
         let status = first_subscription
@@ -814,7 +867,8 @@ mod tests {
             .await
             .expect("the remaining stream is intact")
             .expect("a thread event");
-        assert_eq!(event.params["item"]["text"], "only the second sees this");
+        let (_, params) = notification(event);
+        assert_eq!(params["item"]["text"], "only the second sees this");
 
         assert_eq!(
             second_subscription
@@ -860,7 +914,8 @@ mod tests {
             .await
             .expect("the remaining handle still reads")
             .expect("a thread event");
-        assert_eq!(event.params["item"]["text"], "still streaming");
+        let (_, params) = notification(event);
+        assert_eq!(params["item"]["text"], "still streaming");
 
         assert_eq!(
             second.release().await.expect("release the last handle"),
@@ -896,7 +951,8 @@ mod tests {
             .await
             .expect("the stream survives the surface")
             .expect("a thread event");
-        assert_eq!(event.params["item"]["text"], "still here");
+        let (_, params) = notification(event);
+        assert_eq!(params["item"]["text"], "still here");
     }
 
     /// A connection that dies ends the subscription's stream instead of
@@ -937,9 +993,144 @@ mod tests {
 
     #[test]
     fn only_the_documented_no_rollout_answer_is_a_named_state() {
-        assert!(no_history(Some(-32600), "no rollout found for thread id 019a"));
-        assert!(!no_history(Some(-32602), "no rollout found"));
-        assert!(!no_history(Some(-32600), "thread not found"));
-        assert!(!no_history(None, "no rollout found"));
+        let id = "019a";
+        assert!(no_history(
+            Some(-32600),
+            id,
+            "no rollout found for thread id 019a"
+        ));
+        // Near matches stay errors: another thread's id, the right phrase in
+        // the wrong shape, another code, or no code at all.
+        assert!(!no_history(
+            Some(-32600),
+            id,
+            "no rollout found for thread id 019b"
+        ));
+        assert!(!no_history(
+            Some(-32600),
+            id,
+            "prefix: no rollout found for thread id 019a"
+        ));
+        assert!(!no_history(
+            Some(-32600),
+            id,
+            "no rollout found for thread id 019a and more"
+        ));
+        assert!(!no_history(Some(-32600), id, "no rollout found"));
+        assert!(!no_history(
+            Some(-32602),
+            id,
+            "no rollout found for thread id 019a"
+        ));
+        assert!(!no_history(None, id, "no rollout found for thread id 019a"));
+    }
+
+    /// `SessionListInfo` has no field for the session tree root, so a list row
+    /// is selection/display only: `/attach` must take the root from
+    /// `thread/read` (or the resume response), never from the listed id. This
+    /// pins the decision the list API cannot express.
+    #[tokio::test]
+    async fn the_session_root_comes_from_read_not_the_list_row() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+
+        let listed = client.threads().list_all("/work/cola").await.expect("list");
+        assert_eq!(listed[0].id, "thread-1");
+
+        let thread = client
+            .threads()
+            .read(&listed[0].id, false)
+            .await
+            .expect("the attach read");
+        assert_eq!(thread.session_id, "session-root");
+        assert_ne!(
+            thread.session_id, thread.id,
+            "the root is read from the wire, never derived from the thread id"
+        );
+    }
+
+    /// A cancelled adopt releases its local holder: without RAII the phantom
+    /// holder makes the next handle look non-last and the release below skips
+    /// `thread/unsubscribe` (this test then fails on the call count).
+    #[tokio::test]
+    async fn cancelling_an_adopt_releases_the_local_holder() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        server.silence_next_resume();
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(150), client.threads().adopt("thread-1")).await;
+        assert!(cancelled.is_err(), "the resume is deliberately unanswered");
+        server.wait_for_resume_calls(1).await;
+        assert_eq!(
+            client.threads().local_holders("thread-1"),
+            0,
+            "a cancelled adopt must not leave a phantom holder"
+        );
+
+        // A real adopt on the same thread must still be the last holder, so
+        // its release reaches the server.
+        let Adoption::Subscribed(subscription) = client.threads().adopt("thread-1").await.expect("adopt")
+        else {
+            panic!("must subscribe");
+        };
+        assert_eq!(
+            subscription.release().await.expect("release"),
+            Some(UnsubscribeStatus::Unsubscribed)
+        );
+        assert_eq!(server.unsubscribe_calls(), 1);
+    }
+
+    /// A dispatcher that falls behind the connection's push stream delivers an
+    /// explicit lag marker instead of silently skipping events: every live
+    /// subscriber learns how many were dropped and can resync.
+    #[tokio::test]
+    async fn a_lagging_dispatcher_tells_subscriptions_how_many_events_were_lost() {
+        let registry = Arc::new(Registry::default());
+        let mut events = registry.subscribe("thread-1");
+        let (inbound, receiver) = broadcast::channel::<Inbound>(1);
+        let dispatcher = tokio::spawn(dispatch(receiver, Arc::downgrade(&registry)));
+
+        // Three sends with no await in between over a capacity-1 channel: the
+        // dispatcher has to observe two losses before the last event.
+        for text in ["dropped-1", "dropped-2", "delivered"] {
+            inbound
+                .send(Inbound::Notification {
+                    method: "item/completed".to_string(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "item": { "type": "agentMessage", "id": "i", "text": text },
+                    }),
+                })
+                .expect("the test receiver is alive");
+        }
+
+        let marker = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the lag marker arrives")
+            .expect("the subscription is open");
+        assert_eq!(marker, ThreadEvent::Lagged { skipped: 2 });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("the retained event arrives")
+            .expect("the subscription is open");
+        let (method, params) = notification(delivered);
+        assert_eq!(method, "item/completed");
+        assert_eq!(params["item"]["text"], "delivered");
+
+        dispatcher.abort();
     }
 }

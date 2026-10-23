@@ -250,6 +250,9 @@ struct State {
     list_params: std::sync::Mutex<Vec<Value>>,
     resume_calls: AtomicUsize,
     unsubscribe_calls: AtomicUsize,
+    /// Answer `thread/resume` without a response, so a test can cancel a
+    /// pending adopt.
+    silent_resume: std::sync::atomic::AtomicBool,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
 }
@@ -271,6 +274,7 @@ impl Default for State {
             list_params: std::sync::Mutex::new(Vec::new()),
             resume_calls: AtomicUsize::new(0),
             unsubscribe_calls: AtomicUsize::new(0),
+            silent_resume: std::sync::atomic::AtomicBool::new(false),
             page_size: 2,
         }
     }
@@ -470,9 +474,21 @@ impl FakeServer {
         self.state.list_params.lock().expect("list params").clone()
     }
 
+    /// Leave the next `thread/resume` unanswered (the connection stays open),
+    /// so a test can cancel the adopt future mid-await. One-shot: the resume
+    /// after it answers normally.
+    pub(crate) fn silence_next_resume(&self) {
+        self.state.silent_resume.store(true, Ordering::SeqCst);
+    }
+
     /// `thread/resume` calls received so far.
     pub(crate) fn resume_calls(&self) -> usize {
         self.state.resume_calls.load(Ordering::SeqCst)
+    }
+
+    /// Wait until `expected` `thread/resume` calls have arrived.
+    pub(crate) async fn wait_for_resume_calls(&self, expected: usize) {
+        wait_until(|| self.resume_calls(), expected, "resume calls").await;
     }
 
     /// `thread/unsubscribe` calls received so far.
@@ -649,8 +665,16 @@ where
                 None => reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await,
             }
         }
+        Some("test/malformed") => {
+            // A broken peer: a text frame that is not JSON. The client must
+            // close the connection and fail the request instead of waiting.
+            return send_text(sink, "this frame is not json").await;
+        }
         Some("thread/resume") => {
             state.resume_calls.fetch_add(1, Ordering::SeqCst);
+            if state.silent_resume.swap(false, Ordering::SeqCst) {
+                return true;
+            }
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let Some(thread) = find_thread(state, thread_id) else {
                 return reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await;
@@ -806,6 +830,16 @@ fn thread_json(thread: &ScriptedThread) -> Value {
         "status": { "type": "notLoaded" },
         "turns": [],
     })
+}
+
+async fn send_text<S>(
+    sink: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    text: &str,
+) -> bool
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    sink.send(Message::Text(text.to_string().into())).await.is_ok()
 }
 
 async fn send<S>(
