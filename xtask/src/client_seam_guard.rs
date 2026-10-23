@@ -31,16 +31,22 @@
 //!   where it is dropped — so `crate :: opencode`, grouped imports, and an
 //!   import split across lines all name the same path, while `crate::opencode
 //!   as oc` keeps the ` as oc` boundary that makes the alias a finding;
-//! - `$crate` is the same root as `crate`.
+//! - `$crate` is the same root as `crate`, and a raw identifier is the
+//!   identifier it spells: `crate::r#opencode` is the adapter,
+//!   `crate::r#opencode_foo` is not.
 //!
 //! A crate re-root is itself a finding — `use crate as <ident>`,
 //! `use crate::{self as <ident>}` and `extern crate self as <ident>` — because
-//! renaming the crate root renames the adapter path everywhere in the file. It
-//! is forbidden at the one point it is born. This is a **textual** guard and
-//! says so: a path assembled at runtime, through a re-exported type alias, or
-//! through a name this scanner cannot resolve (a generic alias parameter) is
-//! out of scope — the same limit the V1 coupling guard (`generation_guard`)
-//! accepts, because no source scanner can follow a name it cannot see.
+//! renaming the crate root renames the adapter path everywhere in the file. At
+//! a crate-root file (`src/main.rs`, `src/lib.rs`, `src/<name>.rs`) the path may
+//! also be rooted at `self::`, so `use self::opencode as oc;` is the same leak;
+//! inside a submodule `self::` names a sibling module, not the crate, and is
+//! not reported.
+//!
+//! This is a **textual** guard, the same class as `generation_guard`, and it
+//! accepts the limits that come with that: it does not follow `include!` of
+//! files outside the scanned tree, it cannot see a path assembled at runtime,
+//! and it cannot see an alias re-exported as a value.
 
 use std::path::Path;
 
@@ -133,7 +139,7 @@ pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
     }
     let source = Normalised::new(content);
     let lines: Vec<&str> = content.lines().collect();
-    let mut leaks = source.adapter_mentions();
+    let mut leaks = source.adapter_mentions(is_crate_root(path));
     leaks.extend(source.crate_alias_mentions());
     leaks.sort_by_key(|&(offset, _)| offset);
     leaks
@@ -148,6 +154,14 @@ pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
             }
         })
         .collect()
+}
+
+/// Whether this scanned path is a crate-root file, where `self::` is the crate
+/// root: `src/main.rs`, `src/lib.rs` or `src/<name>.rs`. In a submodule
+/// (`src/bridge/foo.rs`) `self::` names a sibling module instead.
+fn is_crate_root(path: &str) -> bool {
+    path.strip_prefix("src/")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
 }
 
 /// The token stream of one file, normalised for path matching.
@@ -178,23 +192,31 @@ impl Normalised {
     /// Both a plain path (`crate::opencode::types`) and a group that names it
     /// at any depth (`crate::{self, opencode::types}`,
     /// `crate::{opencode::{types, parsing}}`) count; the exempt item paths do
-    /// not.
-    fn adapter_mentions(&self) -> Vec<(usize, Leak)> {
+    /// not. `self::opencode` is the same path only in a crate-root file, where
+    /// `self` is the crate; a submodule's `self` names a sibling.
+    fn adapter_mentions(&self, crate_root: bool) -> Vec<(usize, Leak)> {
+        let roots: &[&str] = if crate_root {
+            &["crate::", "self::"]
+        } else {
+            &["crate::"]
+        };
         let mut mentions = Vec::new();
-        let mut search = 0;
-        while let Some(offset) = self.text[search..].find("crate::") {
-            let start = search + offset + "crate::".len();
-            search = start;
-            let rest = &self.text[start..];
-            if let Some(grouped) = rest.strip_prefix('{') {
-                let Some(close) = matching_brace(grouped) else {
-                    continue;
-                };
-                mentions.extend(group_mentions(&grouped[..close], start + 1));
-            } else if let Some(suffix) = adapter_suffix(rest)
-                && !is_exempt(suffix)
-            {
-                mentions.push((start, Leak::AdapterPath));
+        for root in roots {
+            let mut search = 0;
+            while let Some(offset) = self.text[search..].find(root) {
+                let start = search + offset + root.len();
+                search = start;
+                let rest = &self.text[start..];
+                if let Some(grouped) = rest.strip_prefix('{') {
+                    let Some(close) = matching_brace(grouped) else {
+                        continue;
+                    };
+                    mentions.extend(group_mentions(&grouped[..close], start + 1));
+                } else if let Some(suffix) = adapter_suffix(rest)
+                    && !is_exempt(suffix)
+                {
+                    mentions.push((start, Leak::AdapterPath));
+                }
             }
         }
         mentions
@@ -306,6 +328,28 @@ impl Token {
                     line,
                 });
                 index += 1 + "crate".len();
+                continue;
+            }
+            if let Some(raw) = rest.strip_prefix("r#")
+                && raw.chars().next().is_some_and(is_identifier_start)
+            {
+                // A raw identifier is the identifier it spells: `r#opencode` is
+                // `opencode`, `r#opencode_foo` is a different name.
+                let start = index + 2;
+                let mut end = start;
+                while end < content.len() {
+                    let next = content[end..].chars().next().expect("char boundary");
+                    if is_identifier_continue(next) {
+                        end += next.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                tokens.push(Self {
+                    text: content[start..end].to_string(),
+                    line,
+                });
+                index = end;
                 continue;
             }
             if is_identifier_start(ch) {
@@ -621,6 +665,53 @@ mod tests {
             "use crate::{\n    opencode, // the adapter\n};\n",
         ] {
             assert_eq!(findings(planted).len(), 1, "{planted} must be found");
+        }
+    }
+
+    /// `self::` is the crate root only in a crate-root file; in a submodule it
+    /// names a sibling module.
+    #[test]
+    fn a_crate_root_self_path_is_a_finding_only_at_the_root() {
+        for (path, planted) in [
+            ("src/main.rs", "use self::opencode as oc;\n"),
+            ("src/lib.rs", "use self::opencode::types::Session;\n"),
+            ("src/status.rs", "use self::{opencode};\n"),
+        ] {
+            assert_eq!(scan_source(path, planted).len(), 1, "{path}: {planted}");
+        }
+        for path in [
+            "src/bridge/foo.rs",
+            "src/bridge/handler.rs",
+            "src/opencode/v2/wire.rs",
+        ] {
+            if path.starts_with("src/opencode/") {
+                continue;
+            }
+            assert!(
+                scan_source(path, "use self::opencode as oc;\n").is_empty(),
+                "{path} must not treat self:: as the crate root"
+            );
+        }
+    }
+
+    /// A raw identifier is the identifier it spells.
+    #[test]
+    fn a_raw_identifier_spelling_the_adapter_is_a_finding() {
+        for planted in [
+            "use crate::r#opencode::types::Session;\n",
+            "use crate::{r#opencode::types::Session};\n",
+        ] {
+            assert_eq!(findings(planted).len(), 1, "{planted} must be found");
+        }
+        assert_eq!(
+            scan_source("src/main.rs", "use self::r#opencode::types::Session;\n").len(),
+            1
+        );
+        for planted in ["use crate::r#opencode_foo::Thing;\n", "let r#opencode = 1;\n"] {
+            assert!(
+                findings(planted).is_empty(),
+                "{planted} is a different identifier"
+            );
         }
     }
 
