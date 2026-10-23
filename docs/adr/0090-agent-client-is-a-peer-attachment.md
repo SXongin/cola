@@ -311,3 +311,33 @@ server still serves). Windows remains untested.
   server's 30-minute grace window.
 
 Spec #860's ticket map is cut from these answers.
+
+## Amendment (2026-10-23, later): the running daemon is `0.164.0`
+
+The pin above is `0.163.0`, but the managed daemon on the spike machine is a
+**different binary**: `codex app-server daemon version` reports
+`cliVersion: 0.163.0`, `appServerVersion: 0.164.0`, and
+`managedCodexPath: ~/.codex/packages/app-server-daemon/current/bin/codex`. The
+adapter must therefore probe the *running* binary, not the CLI on `PATH`.
+
+Regenerating the schema from both binaries and diffing (ticket #876):
+
+- `0.163.0` (the local `codex` CLI) reproduces the checked-in reference exactly:
+  **105 client→server methods, 85 notifications, 10 server→client requests**.
+- `0.164.0` (the daemon's managed binary) has **106 client→server methods**, one
+  added — `feedback/save`; notifications and server→client requests are
+  unchanged at **85** and **10**.
+- Every other schema file diff is additive on the response side (v2
+  image-generation attachment items, `ListMcpServerStatusResponse` and
+  `PluginReadResponse` fields); no required field was removed and no method the
+  adapter uses changed shape.
+
+The adapter's declared contract stays the `0.163.0` surface. Construction reads
+`initialize`'s `userAgent` (`codex-tui/0.164.0 …`), and a version other than the
+pin is checked against a schema regenerated from the binary the server is
+*actually running*; a binary whose `--version` does not match the server's
+reported version is refused, so a local `0.163.0` CLI can never vouch for a
+`0.164.0` daemon. The required method subset is then checked; a missing method
+fails construction with its name, and an older server is refused outright. The
+live daemon at `~/.codex/app-server-control/app-server-control.sock` (a symlink
+into `/tmp/codex-daemon-0/<hash>`) passes both connections under that rule.

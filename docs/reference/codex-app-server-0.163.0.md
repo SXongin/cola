@@ -235,3 +235,19 @@ list here is the complete set for this version.
 - `warning`
 - `windows/worldWritableWarning`
 - `windowsSandbox/setupCompleted`
+
+## Next version (`0.164.0`) — probed, not assumed
+
+Regenerated from the running daemon's managed binary (ticket #876;
+`codex app-server daemon version` reports `appServerVersion: 0.164.0`):
+
+- client→server methods: **106**, one added — `feedback/save`;
+- notifications: **85**, unchanged;
+- server→client requests: **10**, unchanged;
+- other schema diffs are additive response fields only (v2 image-generation
+  attachment items, `ListMcpServerStatusResponse`, `PluginReadResponse`).
+
+The adapter's contract above remains pinned to `0.163.0`. A server reporting
+another version is checked against a schema generated from the binary it is
+actually running; a mismatch between that binary's `--version` and the version
+in `initialize`'s `userAgent` is refused rather than trusted.
