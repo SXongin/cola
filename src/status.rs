@@ -104,6 +104,20 @@ impl ConfigState {
         self.loaded.as_ref().and_then(|r| r.as_ref().ok())
     }
 
+    /// The active Agent Client's effective OpenCode settings — the same fold
+    /// [`Config::resolve_active_client`] applies at boot.
+    ///
+    /// Deliberately lenient: `None` when the config cannot resolve an active
+    /// client (broken table, unknown kind) or the active kind is not OpenCode.
+    /// `status`/`doctor` narrow their report in that case rather than failing,
+    /// and they must never probe the raw `[opencode]` table when a named
+    /// `kind = "opencode"` client is active: its `url`/`generation` are the
+    /// ones boot would use (spec #860, ticket #872/#875).
+    pub fn effective_opencode(&self) -> Option<config::OpenCodeConfig> {
+        let mut cfg = self.cfg()?.clone();
+        cfg.resolve_active_client().ok()?.opencode().cloned()
+    }
+
     /// Whether a config file was found AND parsed.
     pub fn ok(&self) -> bool {
         matches!(self.loaded, Some(Ok(_)))
@@ -135,7 +149,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Ba
         None => (None, None),
     };
     let server = probe_server(client).await;
-    let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default().to_string();
+    let generation_override = effective_generation_override(state);
 
     Status {
         version: crate::version::display_version(),
@@ -171,6 +185,18 @@ async fn probe_server(client: Option<&dyn Backend>) -> Option<ServerStatus> {
         evidence: status.evidence,
         other_servers,
     })
+}
+
+/// The generation label `cola status` prints (`auto`/`v1`/`v2`) for the
+/// **active** Agent Client. A config that cannot resolve one falls back to the
+/// raw `[opencode]` table, preserving the old lenient display.
+fn effective_generation_override(state: &ConfigState) -> String {
+    state
+        .effective_opencode()
+        .or_else(|| state.cfg().map(|cfg| cfg.opencode.clone()))
+        .map(|settings| settings.generation)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The human-readable `cola status` report.
@@ -835,6 +861,40 @@ mod tests {
         let s = ConfigState::from_env(good.to_str());
         assert!(s.cfg().is_some());
         assert!(s.ok());
+    }
+
+    /// The report's generation override follows the **active** Agent Client
+    /// (#872/#875): with `default_client = "ada"`, `[opencode] generation =
+    /// "v1"` must not leak into the line — `ada`'s `v2` is what boot and the
+    /// probe use.
+    #[test]
+    fn the_reported_generation_override_is_the_active_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            r#"
+[feishu]
+app_id = "cli_test"
+app_secret = "secret"
+
+[bridge]
+default_client = "ada"
+
+[opencode]
+url = "http://localhost:1111"
+generation = "v1"
+
+[clients.ada]
+kind = "opencode"
+url = "http://localhost:2222"
+generation = "v2"
+"#,
+        )
+        .unwrap();
+
+        let state = ConfigState::from_env(path.to_str());
+        assert_eq!(effective_generation_override(&state), "v2");
     }
 
     #[test]
