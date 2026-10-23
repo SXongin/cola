@@ -88,7 +88,7 @@ impl FakeCodex {
         // detached so `output()` does not wait on the pipe it inherits.
         let start = match daemon_pid_record {
             Some(record) => format!(
-                "{}sleep 30 >/dev/null 2>&1 &\necho $! > {}\n",
+                "{}sleep 30 >/dev/null 2>&1 &\necho $! >> {}\n",
                 start,
                 shell_single_quote(&record.display().to_string())
             ),

@@ -336,16 +336,18 @@ mod tests {
             crate::state::StateLayout::for_home(self.root.path())
         }
 
-        /// The fake daemon's own pid record, once its launcher has run.
-        fn daemon_pid(&self) -> Option<i32> {
+        /// The fake daemons' own pid records, once their launcher has run.
+        fn daemon_pids(&self) -> Vec<i32> {
             std::fs::read_to_string(&self.daemon_pid)
-                .ok()
-                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| line.trim().parse().ok())
+                .collect()
         }
 
-        /// Stop the fake daemon process the test spawned; cola never does.
+        /// Stop the fake daemon processes the test spawned; cola never does.
         fn reap(&self) {
-            if let Some(pid) = self.daemon_pid() {
+            for pid in self.daemon_pids() {
                 let _ = crate::process::force_kill(pid);
             }
         }
@@ -439,9 +441,9 @@ mod tests {
         );
         assert!(!pid_record.parent().expect("state dir").exists());
 
-        let daemon_pid = fixture
-            .daemon_pid()
-            .expect("the fake daemon recorded its own pid");
+        let daemon_pids = fixture.daemon_pids();
+        assert_eq!(daemon_pids.len(), 1, "exactly one daemon was started");
+        let daemon_pid = daemon_pids[0];
         assert!(crate::process::alive(daemon_pid), "the daemon is running");
 
         drop(lifecycle);
@@ -480,7 +482,7 @@ mod tests {
                 .expect("attached"),
             AttachOutcome::Attached
         );
-        let daemon_pid = fixture.daemon_pid().expect("daemon pid");
+        let daemon_pid = *fixture.daemon_pids().first().expect("daemon pid");
 
         // The daemon goes away and unlinks its control socket: the path is
         // gone, which discovery reads as absent.
@@ -729,5 +731,50 @@ mod tests {
     fn the_lifecycle_is_send_and_sync() {
         fn requires<T: Send + Sync>() {}
         requires::<CodexLifecycle>();
+    }
+
+    /// Live: discover and attach to the daemon already running on this machine,
+    /// through the binary that daemon actually runs.
+    ///
+    /// Opt-in like the repository's other live suites: set
+    /// `COLA_LIVE_CODEX_HOME` (or an ambient `CODEX_HOME`) and run
+    /// `cargo test -- --ignored live_`; it skips with a message when neither is
+    /// set. Read-only by construction — `start_server = "never"` — so it never
+    /// starts or stops the user's daemon. The hermetic tests above are the
+    /// proof of the policy; this one validates the real socket, the symlink and
+    /// the managed 0.164.0 binary the daemon runs.
+    #[tokio::test]
+    #[ignore = "live codex app-server daemon: set COLA_LIVE_CODEX_HOME or CODEX_HOME"]
+    async fn live_attach_to_the_running_daemon() {
+        let Some(home) = std::env::var_os("COLA_LIVE_CODEX_HOME")
+            .or_else(|| std::env::var_os("CODEX_HOME"))
+            .map(PathBuf::from)
+        else {
+            eprintln!("skipping live codex discovery: neither COLA_LIVE_CODEX_HOME nor CODEX_HOME is set");
+            return;
+        };
+        let lifecycle = CodexLifecycle::new(
+            CodexConfig {
+                start_server: crate::config::ServerStartPolicy::Never,
+            },
+            Environment {
+                home,
+                cli: PathBuf::from("codex"),
+                version_timeout: Duration::from_secs(10),
+                start_timeout: Duration::from_secs(10),
+                socket_ready_timeout: Duration::from_secs(2),
+            },
+            Box::new(ManagedProbe),
+        );
+        let never_busy = || false;
+        let outcome = lifecycle
+            .ensure_attached(request(&never_busy))
+            .await
+            .expect("the running daemon attaches");
+        assert_eq!(outcome, AttachOutcome::Attached);
+        assert_eq!(
+            lifecycle.restart_server().await.expect("read"),
+            RestartOutcome::NotOwned
+        );
     }
 }
