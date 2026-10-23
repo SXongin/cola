@@ -23,6 +23,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod client;
+pub(crate) mod discovery;
 pub(crate) mod error;
 pub(crate) mod schema;
 pub(crate) mod transport;

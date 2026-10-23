@@ -102,4 +102,22 @@ pub(crate) enum CodexError {
         missing: String,
         pinned: String,
     },
+
+    /// No shared `CODEX_HOME` can be resolved: neither the variable nor a home
+    /// directory is set, or the configured value is relative (Codex requires an
+    /// absolute path, and cola must read the same store as the user's client).
+    #[error("cannot locate the shared CODEX_HOME: {0}")]
+    CodexHome(String),
+
+    /// A management-command failure (`codex app-server daemon …`): the CLI
+    /// could not be run, did not return within its bound, or refused. This is
+    /// the CLI's own surface, not the app-server protocol.
+    #[error("codex daemon command failed: {0}")]
+    Daemon(String),
+
+    /// The daemon's control path exists but is not something this client can
+    /// dial (not a unix socket, or unreadable). Absence is a state;
+    /// this is a misconfiguration and fails loudly.
+    #[error("the codex daemon control socket at `{socket}` is unusable: {detail}")]
+    DaemonSocket { socket: String, detail: String },
 }
