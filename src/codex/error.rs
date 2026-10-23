@@ -28,6 +28,16 @@ pub(crate) enum CodexError {
     #[error("{context}: {detail}")]
     Transport { context: String, detail: String },
 
+    /// The endpoint is a unix-domain socket, and this build's platform does
+    /// not provide one. Windows has AF_UNIX limits (ADR-0090's open question
+    /// 4), so the failure is named rather than surfacing as an obscure IO
+    /// error.
+    #[error(
+        "codex app-server endpoint `unix://{path}` needs a unix domain socket, which this build \
+         does not support on {platform}; use `ws://HOST:PORT` instead"
+    )]
+    UnsupportedPlatform { path: String, platform: &'static str },
+
     /// The connection or handshake did not answer inside the budget. A wedged
     /// server must not hold cola's boot.
     #[error("codex app-server did not answer within {0:?}")]

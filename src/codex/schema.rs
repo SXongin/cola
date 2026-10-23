@@ -16,6 +16,17 @@
 //! version the server reported, so a 0.163 CLI cannot vouch for a 0.164
 //! daemon. A missing required method fails construction, named — never at the
 //! first prompt. An older binary is refused outright.
+//!
+//! The check is at **method-name granularity by design**. The generated method
+//! lists are the protocol's stable surface (a build either registers a method
+//! or it does not); payload shapes are consumed by the adapter's typed
+//! decoders in the tickets that implement the read model and the approval
+//! flow, where a changed field fails as a named decode error on the read that
+//! uses it. Shipping the full per-method JSON Schema and diffing every shape
+//! would pin the adapter's boot path to a machine-local document for a check
+//! the typed decoders already make strictly, so the constructor keeps the
+//! method contract and records the version; the ADR amendment carries the
+//! measured shape diff for the pinned-to-running delta.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -266,7 +277,10 @@ impl SurfaceProbe for AutoProbe {
 async fn probe_binary(binary: &Path) -> Result<(ServerVersion, Surface)> {
     let version = tokio::time::timeout(
         PROBE_TIMEOUT,
-        tokio::process::Command::new(binary).arg("--version").output(),
+        tokio::process::Command::new(binary)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output(),
     )
     .await
     .map_err(|_| {
@@ -276,6 +290,13 @@ async fn probe_binary(binary: &Path) -> Result<(ServerVersion, Surface)> {
         ))
     })?
     .map_err(|error| CodexError::Probe(format!("run `{} --version`: {error}", binary.display())))?;
+    if !version.status.success() {
+        return Err(CodexError::Probe(format!(
+            "`{} --version` exited with {}; a failing binary is not trusted",
+            binary.display(),
+            version.status
+        )));
+    }
     let printed = String::from_utf8_lossy(&version.stdout);
     let binary_version = ServerVersion::parse(&printed).ok_or_else(|| {
         CodexError::Probe(format!(
@@ -291,6 +312,7 @@ async fn probe_binary(binary: &Path) -> Result<(ServerVersion, Surface)> {
         tokio::process::Command::new(binary)
             .args(["app-server", "generate-json-schema", "--out"])
             .arg(directory.path())
+            .kill_on_drop(true)
             .status(),
     )
     .await
@@ -397,6 +419,39 @@ fn collect_methods(value: &Value, methods: &mut BTreeSet<String>) {
     }
 }
 
+/// Write a `generate-json-schema`-shaped fixture directory. Tests only: the
+/// schema directories the probe reads are machine-generated, so a unit test
+/// writes the three list files with the shape the parser expects.
+#[cfg(test)]
+pub(crate) fn write_generated_surface(
+    directory: &Path,
+    client_requests: &[&str],
+    notifications: &[&str],
+    server_requests: &[&str],
+) -> std::io::Result<()> {
+    for (file, methods) in [
+        ("ClientRequest.json", client_requests),
+        ("ServerNotification.json", notifications),
+        ("ServerRequest.json", server_requests),
+    ] {
+        let one_of: Vec<Value> = methods
+            .iter()
+            .map(|method| {
+                serde_json::json!({
+                    "properties": { "method": { "enum": [method] } },
+                    "required": ["method"],
+                    "type": "object",
+                })
+            })
+            .collect();
+        std::fs::write(
+            directory.join(file),
+            serde_json::json!({ "oneOf": one_of }).to_string(),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,27 +474,9 @@ mod tests {
     #[test]
     fn a_generated_directory_yields_the_same_lists() {
         let directory = tempfile::tempdir().expect("tempdir");
-        for (file, methods) in [
-            ("ClientRequest.json", &["alpha", "beta"] as &[&str]),
-            ("ServerNotification.json", &["gamma"]),
-            ("ServerRequest.json", &["delta"]),
-        ] {
-            let one_of: Vec<Value> = methods
-                .iter()
-                .map(|method| {
-                    serde_json::json!({
-                        "properties": { "method": { "enum": [method] } },
-                        "required": ["method"],
-                        "type": "object",
-                    })
-                })
-                .collect();
-            std::fs::write(
-                directory.path().join(file),
-                serde_json::json!({ "oneOf": one_of }).to_string(),
-            )
+        write_generated_surface(directory.path(), &["alpha", "beta"], &["gamma"], &["delta"])
             .expect("write schema fixture");
-        }
+
         let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
         assert!(surface.client_requests.contains("alpha"));
         assert!(surface.client_requests.contains("beta"));
@@ -538,5 +575,26 @@ printf '%s' '{"oneOf":[{"properties":{"method":{"enum":["item/tool/requestUserIn
             .await
             .expect_err("an unusable binary is refused");
         assert!(matches!(error, CodexError::Probe(_)), "{error}");
+    }
+
+    /// A `--version` that prints a plausible string but exits unsuccessfully is
+    /// not evidence of identity.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_version_command_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let binary = directory.path().join("codex");
+        std::fs::write(&binary, "#!/bin/sh\necho \"codex-cli 0.164.0\"\nexit 3\n").expect("write fake codex");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake codex executable");
+
+        let newer = ServerVersion::parse("codex-tui/0.164.0 (test)").expect("version");
+        let error = AutoProbe::new(&binary)
+            .surface(&newer)
+            .await
+            .expect_err("a failing binary is refused");
+        assert!(error.to_string().contains("exited with"), "{error}");
     }
 }

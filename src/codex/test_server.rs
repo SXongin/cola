@@ -7,6 +7,7 @@
 //! pinned protocol requires and counts `initialized` notifications. Compiled
 //! only for tests.
 
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,7 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio_tungstenite::tungstenite::Message;
 
 /// The state one fake server exposes to its test.
@@ -32,7 +35,9 @@ pub(crate) struct FakeServer {
 
 impl FakeServer {
     /// Serve a unix socket at `path`. The caller may point a symlink at it —
-    /// that is the shipped control-socket shape.
+    /// that is the shipped control-socket shape. Unix-only, like the
+    /// transport it exercises.
+    #[cfg(unix)]
     pub(crate) async fn unix(path: &Path, user_agent: &str) -> Self {
         let listener = UnixListener::bind(path).expect("bind fake unix app-server");
         let state = Arc::new(State {
@@ -42,9 +47,7 @@ impl FakeServer {
         let serving = Arc::clone(&state);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                serving.connections.fetch_add(1, Ordering::SeqCst);
-                let state = Arc::clone(&serving);
-                tokio::spawn(async move { serve(stream, state).await });
+                accept_connection(stream, Arc::clone(&serving));
             }
         });
         Self { state }
@@ -74,9 +77,7 @@ impl FakeServer {
         let serving = Arc::clone(&state);
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                serving.connections.fetch_add(1, Ordering::SeqCst);
-                let state = Arc::clone(&serving);
-                tokio::spawn(async move { serve(stream, state).await });
+                accept_connection(stream, Arc::clone(&serving));
             }
         });
         (Self { state }, format!("ws://{address}"))
@@ -103,6 +104,17 @@ impl FakeServer {
     pub(crate) async fn wait_for_connections(&self, expected: usize) {
         wait_until(|| self.connections(), expected, "connections").await;
     }
+}
+
+/// Count one accepted connection and serve it on its own task. The accept loop
+/// is the only platform-specific part of a fake server; this half is shared by
+/// the TCP and unix listeners.
+fn accept_connection<S>(stream: S, state: Arc<State>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    state.connections.fetch_add(1, Ordering::SeqCst);
+    tokio::spawn(async move { serve(stream, state).await });
 }
 
 async fn wait_until(count: impl Fn() -> usize, expected: usize, what: &str) {
