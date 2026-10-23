@@ -3441,9 +3441,11 @@ pub fn test_config(session_file: &std::path::Path) -> crate::config::Config {
             long_task_notice: false,
             instant_reminder: false,
             log_days: 14,
+            default_client: None,
         },
         review: crate::config::ReviewConfig::default(),
         worktree: crate::config::WorktreeConfig::default(),
+        clients: Default::default(),
     };
     // A test config comes claimed for TEST_HOST: the suite's apps are ready to
     // use. The gate tests build an unclaimed config explicitly.

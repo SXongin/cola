@@ -147,6 +147,33 @@ start_server = "auto"            # auto (default) | never | eager
   若设置，该模型必须在 cola 连接的服务器上存在（通常是 `opencode/...`）。
   会话级覆盖用 `/model` 设置。
 
+### `[clients.<id>]` —— 可选，用于第二个 Agent Client
+
+```toml
+# `[opencode]` 已经是隐式客户端 `default`——不要改名。
+[clients.ada]
+kind = "codex"                   # 必填：opencode | codex
+
+[bridge]
+default_client = "ada"           # 哪个客户端处于活动状态（默认 "default"）
+```
+
+- **`kind`** —— 必填，用于选择适配器。`opencode` 是本版本唯一能附加的 kind；
+  `codex`（`app-server` 适配器，ADR-0090）留给下一阶段，因此把它设为活动
+  客户端的配置能解析成功，但在该适配器落地前 cola 会拒绝启动。
+- **选项与 `kind` 写在同一个表里。** `opencode` 客户端接受 `url`、
+  `start_server`、`generation` 与 `model`，和 `[opencode]` 完全一样；
+  具名客户端不会继承 `[opencode]` 的取值。
+- **`default_client`** —— 活动客户端的 id。不设置时是 `default`（即
+  `[opencode]`）。每个 cola 进程只有一个活动客户端（ADR-0090）；切换客户端
+  就是改这个键并重启。
+- **`[opencode]` 永远有效。** cola 把它当作隐式的 `clients.default` /
+  `kind = "opencode"` 读取，并且从不改写你的文件——不会生成任何
+  `[clients.*]` 表，也不会重命名任何键。显式的 `[clients.default]` 会作为
+  隐式客户端的重复被拒绝：请给表换一个 id，或把它的选项移进 `[opencode]`。
+- **客户端 id 是持久状态。** cola 会把活动 id 记录在每个会话旁，因此重命名
+  id 是一次状态迁移，而不是一次配置修改。
+
 ### `[bridge]` —— 全部可选
 
 ```toml
@@ -159,6 +186,7 @@ start_server = "auto"            # auto (default) | never | eager
 # long_task_notice = true
 # instant_reminder = true
 # log_days = 14
+# default_client = "default"
 ```
 
 - **`session_file`** —— 话题↔会话映射的持久化位置。
@@ -193,6 +221,8 @@ start_server = "auto"            # auto (default) | never | eager
   被忽略；短轮次保持安静。群聊已通过 `group_completion_notice` 在每个轮次
   结束时通知。
 - **`log_days`** —— 轮转后的每日日志保留多少天（默认 14）。
+- **`default_client`** —— 活动 Agent Client 的 id，见上面的 `[clients.<id>]`。
+  不设置时是 `default`（`[opencode]`）。
 
 ### `[review]` —— 全部可选
 
