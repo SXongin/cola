@@ -1193,7 +1193,7 @@ async fn a_sidecar_without_the_delivered_section_replays_a_compaction_once() {
     let sidecar: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
     assert_eq!(
-        sidecar["delivered"]["ses_test"], "msg_a_3000",
+        sidecar["delivered"]["default"]["ses_test"], "msg_a_3000",
         "the first card's confirmed write gives the Session its position: {sidecar}"
     );
 

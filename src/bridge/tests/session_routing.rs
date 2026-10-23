@@ -130,6 +130,7 @@ async fn topic_message_isolates_session_from_lobby() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_lobby".into(),
             directory: "/tmp/lobby".into(),
@@ -145,6 +146,7 @@ async fn topic_message_isolates_session_from_lobby() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "omt_topic_1".into()),
             session_id: "ses_topic".into(),
             directory: "/tmp/topic".into(),
@@ -226,6 +228,7 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "oc_p2p_1".into()),
             session_id: "ses_top".into(),
             directory: "/tmp/top".into(),
@@ -241,6 +244,7 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_p2p_1".into(), "omt_p2p_1".into()),
             session_id: "ses_p2p_topic".into(),
             directory: "/tmp/ptopic".into(),
@@ -310,6 +314,7 @@ async fn stale_session_mapping_is_recreated_on_404() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: thread.clone(),
             session_id: "ses_old2".into(),
             directory: "/tmp/old2".into(),
@@ -325,6 +330,7 @@ async fn stale_session_mapping_is_recreated_on_404() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: thread.clone(),
             session_id: "ses_old".into(),
             directory: "/tmp/old".into(),
@@ -414,6 +420,7 @@ async fn stale_session_recreate_retry_button_names_the_fresh_session() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: thread,
             session_id: "ses_old".into(),
             directory: "/tmp/old".into(),
@@ -469,6 +476,7 @@ async fn stale_topic_recreate_preserves_creation_messages() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: topic_key.clone(),
             session_id: "ses_old".into(),
             directory: "/work/topic".into(),
@@ -562,6 +570,7 @@ async fn message_during_inflight_goes_to_supplement_path() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),

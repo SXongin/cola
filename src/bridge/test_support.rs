@@ -4046,6 +4046,7 @@ pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &s
     seed_entry(
         app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: session_id.into(),
             directory: directory.into(),
@@ -4272,6 +4273,7 @@ pub(crate) async fn build_reeswitch_app(
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),

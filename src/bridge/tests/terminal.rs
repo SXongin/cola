@@ -58,6 +58,7 @@ async fn build_terminal_app(
 /// A seeded active session rooted at `directory`.
 fn entry(key: &ThreadKey, directory: &std::path::Path) -> SessionEntry {
     SessionEntry {
+        client_id: crate::config::DEFAULT_CLIENT_ID.into(),
         thread_key: key.clone(),
         session_id: "ses_seed".into(),
         directory: directory.to_string_lossy().to_string(),

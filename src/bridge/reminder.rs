@@ -66,7 +66,10 @@ fn write_pins_file(path: &Path, pins: &[PinnedChat]) {
     crate::bridge::sidecar::store(
         path,
         "instant reminder",
-        &PinnedChatsFile { pins: pins.to_vec() },
+        &PinnedChatsFile {
+            version: crate::state::STATE_FORMAT_VERSION,
+            pins: pins.to_vec(),
+        },
         pins.is_empty(),
     );
 }
@@ -93,9 +96,13 @@ struct PinnedChat {
 }
 
 /// The persisted pin set (`pinned_chats.json`). A missing file means "nothing
-/// recorded", never an error.
+/// recorded", never an error. ADR-0091: version 1; the file is deliberately not
+/// client-scoped (a pin is a Chat/Topic fact), but it carries a format version
+/// like every durable file.
 #[derive(Default, Serialize, Deserialize)]
 struct PinnedChatsFile {
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     pins: Vec<PinnedChat>,
 }
@@ -468,6 +475,16 @@ impl ReminderState {
                 return;
             }
         };
+        if file.version > crate::state::STATE_FORMAT_VERSION {
+            tracing::error!(
+                "instant reminder: {} declares unsupported format version {} (this build writes {}); \
+                 refusing to read it as version 0",
+                path.display(),
+                file.version,
+                crate::state::STATE_FORMAT_VERSION
+            );
+            return;
+        }
         let mut remaining = Vec::new();
         for entry in file.pins {
             let mut inner = self.inner.lock().await;

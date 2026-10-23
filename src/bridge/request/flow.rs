@@ -1122,6 +1122,7 @@ impl RequestFlow {
             self.surfaces.set_standalone(
                 req.id(),
                 StandaloneSurface {
+                    client_id: String::new(),
                     kind: self.kind.claim_kind(),
                     message_id: mid,
                     summary,

@@ -307,19 +307,24 @@ impl SharedCore {
         client: Arc<dyn crate::backend::Backend>,
         feishu: Arc<dyn feishu::Platform>,
     ) -> anyhow::Result<Self> {
+        // ADR-0090 decision 5 / ADR-0091: the active client's id is durable
+        // state, recorded beside every Session-keyed record.
+        let active = cfg.active_client()?;
+        let client_id = active.id.as_str();
         // ADR-0067: every card write goes through the delivery decorator, so a
         // failed one is remembered as a Pending Card Update and retried until
         // it lands. The raw platform stays the single Feishu transport; the
         // decorator is what the bridge (and the WS loop) holds.
         let feishu: Arc<dyn feishu::Platform> = Arc::new(crate::feishu::delivery::CardDelivery::new(feishu));
-        let session_store = SessionStore::new(layout.session_file().to_path_buf())?;
+        let session_store = SessionStore::for_client(layout.session_file().to_path_buf(), client_id)?;
         // The interactive surfaces a previous process persisted (ADR-0038
         // restart re-adoption), beside the session mapping like the reminder's
         // pin file. Loaded once here; the registry and both flows hydrate from
         // it and write their mutations back through it.
-        let surfaces = Arc::new(crate::bridge::surfaces::Surfaces::load(
+        let surfaces = Arc::new(crate::bridge::surfaces::Surfaces::open(
             layout.interactive_surfaces(),
-        ));
+            client_id,
+        )?);
         // The long-task notice threshold, created once: the Turn config and
         // Session Sync's quiet true-end settle (ADR-0060) must read the SAME
         // atomic, so a test's tiny injection moves both.
@@ -334,7 +339,10 @@ impl SharedCore {
         ));
         // The durable Chain Record, created once beside the Background Task
         // State handle that seeds from it (ADR-0069/0079).
-        let chains = Arc::new(crate::bridge::chain::ChainRecords::load(layout.chain_records()));
+        let chains = Arc::new(crate::bridge::chain::ChainRecords::load_for(
+            layout.chain_records(),
+            client_id,
+        )?);
         // The Background Task State handle is the process's ONE instance:
         // `src/main.rs` creates it and threads it into the adapter at
         // construction (#682), and the Bridge takes that same handle here rather
@@ -393,9 +401,10 @@ impl SharedCore {
             terminal_runs: Arc::new(std::sync::Mutex::new(
                 crate::bridge::terminal::TerminalRuns::default(),
             )),
-            terminal_records: Arc::new(crate::bridge::terminal_record::TerminalRunRecords::new(
+            terminal_records: Arc::new(crate::bridge::terminal_record::TerminalRunRecords::open(
                 layout.terminal_runs(),
-            )),
+                client_id,
+            )?),
             terminal_log_days: cfg.bridge.log_days,
             default_auto_accept: cfg.bridge.default_auto_accept,
             group_completion_notice: cfg.bridge.group_completion_notice,

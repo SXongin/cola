@@ -12,6 +12,7 @@ use crate::bridge::test_support::*;
 /// A seeded active SessionEntry rooted at `directory`.
 fn seeded_entry(key: &crate::config::ThreadKey, directory: &str) -> crate::config::SessionEntry {
     crate::config::SessionEntry {
+        client_id: crate::config::DEFAULT_CLIENT_ID.into(),
         thread_key: key.clone(),
         session_id: "ses_seed".into(),
         directory: directory.to_string(),

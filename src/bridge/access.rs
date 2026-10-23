@@ -14,12 +14,18 @@ use std::path::{Path, PathBuf};
 pub struct AccessList {
     path: PathBuf,
     host: Option<String>,
+    /// The file read as version 0 — [`Self::migrate`] may rewrite it. A future
+    /// version is never rewritten.
+    legacy: bool,
 }
 
-/// The on-disk shape. Versionless by design: one optional Host today, room to
-/// grow into the server-mode shape (ADR-0036) without a migration.
+/// The on-disk shape. ADR-0091: version 1. It is deliberately **not**
+/// client-scoped — the Access List names the Host, not a Session — but it still
+/// carries a format version like every durable file.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AccessFile {
+    #[serde(default)]
+    version: u32,
     #[serde(default)]
     host: Option<String>,
 }
@@ -27,14 +33,47 @@ struct AccessFile {
 impl AccessList {
     /// Load the list from `path`. An absent, unreadable, or malformed file is
     /// an unclaimed list — never an error: a broken store must fail closed.
+    /// A version-0 file is read as such and rewritten once in the current form
+    /// (ADR-0091); a newer version is refused loudly and left untouched.
     pub fn load(path: &Path) -> Self {
-        let host = std::fs::read_to_string(path)
+        let file = std::fs::read_to_string(path)
             .ok()
-            .and_then(|data| serde_json::from_str::<AccessFile>(&data).ok())
-            .and_then(|file| file.host);
+            .and_then(|data| serde_json::from_str::<AccessFile>(&data).ok());
+        let (host, legacy) = match &file {
+            Some(file) if file.version > crate::state::STATE_FORMAT_VERSION => {
+                tracing::error!(
+                    "{} declares unsupported format version {} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    file.version,
+                    crate::state::STATE_FORMAT_VERSION
+                );
+                (None, false)
+            }
+            Some(file) => (
+                file.host.clone(),
+                file.version < crate::state::STATE_FORMAT_VERSION,
+            ),
+            None => (None, false),
+        };
         Self {
             path: path.to_path_buf(),
             host,
+            legacy,
+        }
+    }
+
+    /// Rewrite a version-0 file once in the current form (ADR-0091). Called by
+    /// the daemon's startup path ([`Access::new`]), never by a read-only CLI
+    /// such as `cola status`. Best effort: a failed write logs and leaves the
+    /// version-0 file for the next start.
+    pub(crate) fn migrate(&mut self) {
+        if !self.legacy {
+            return;
+        }
+        match write_access_file(&self.path, self.host.as_deref()) {
+            Ok(()) => self.legacy = false,
+            Err(error) => tracing::warn!("access list: could not migrate {}: {error}", self.path.display()),
         }
     }
 
@@ -62,15 +101,22 @@ impl AccessList {
     }
 
     fn persist(&self, host: Option<&str>) -> crate::error::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let data = serde_json::to_string_pretty(&AccessFile {
-            host: host.map(str::to_string),
-        })?;
-        std::fs::write(&self.path, data)?;
+        write_access_file(&self.path, host)?;
         Ok(())
     }
+}
+
+/// Write the current on-disk shape (ADR-0091), atomically enough for a
+/// best-effort store.
+fn write_access_file(path: &Path, host: Option<&str>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_string_pretty(&AccessFile {
+        version: crate::state::STATE_FORMAT_VERSION,
+        host: host.map(str::to_string),
+    })?;
+    std::fs::write(path, data)
 }
 
 /// The runtime gate state: the Access List plus the startup Claim Code.
@@ -108,7 +154,8 @@ impl Access {
     /// The code is logged once here — the startup log is the only place it is
     /// ever shown.
     pub fn new(path: PathBuf) -> Self {
-        let list = AccessList::load(&path);
+        let mut list = AccessList::load(&path);
+        list.migrate();
         let claim_code = (!list.is_claimed()).then(generate_claim_code);
         let access = Self { list, claim_code };
         if let Some(code) = access.claim_code() {

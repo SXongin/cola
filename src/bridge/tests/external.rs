@@ -127,6 +127,7 @@ async fn external_message_from_shared_store_notifies_feishu() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -218,6 +219,7 @@ async fn a_compaction_carrier_is_never_the_external_message() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -287,6 +289,7 @@ async fn external_file_message_notifies_with_the_record_line() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -374,6 +377,7 @@ async fn external_poller_recovers_when_messages_hangs() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -452,6 +456,7 @@ async fn external_reply_completion_comes_from_the_transcript() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -519,6 +524,7 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -600,6 +606,7 @@ async fn newer_external_message_after_cola_own_still_notifies() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -671,6 +678,7 @@ async fn external_message_to_historical_session_is_not_notified() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_historical".into(),
             directory: "/tmp/hist".into(),
@@ -686,6 +694,7 @@ async fn external_message_to_historical_session_is_not_notified() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_active".into(),
             directory: "/tmp/active".into(),
@@ -777,6 +786,7 @@ async fn reactivated_session_resyncs_silently() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_new".into(),
             directory: "/tmp/new".into(),
@@ -792,6 +802,7 @@ async fn reactivated_session_resyncs_silently() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_old".into(),
             directory: "/tmp/old".into(),
@@ -882,6 +893,7 @@ async fn external_message_to_topic_session_notifies_into_thread() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_ext".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -976,6 +988,7 @@ async fn external_message_reply_renders_into_notification_card() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: repo.path().to_string_lossy().to_string(),
@@ -1224,6 +1237,7 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1320,6 +1334,7 @@ async fn external_reply_render_renews_its_idle_bound_while_parts_arrive() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1382,6 +1397,7 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1517,6 +1533,7 @@ async fn external_reply_render_renews_on_tool_panel_revisions() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1581,6 +1598,7 @@ async fn external_reply_render_idles_out_when_reads_fail() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1700,6 +1718,7 @@ async fn external_reply_render_renews_on_child_liveness() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1769,6 +1788,7 @@ async fn external_reply_render_idles_out_when_reads_hang() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -1872,6 +1892,7 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -2016,6 +2037,7 @@ async fn external_reply_render_idles_out_when_a_child_read_hangs() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -2104,6 +2126,7 @@ async fn external_reply_render_renews_on_progress_rendered_before_a_stall() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -2177,6 +2200,7 @@ async fn external_render_follows_a_supplement_into_the_continuation() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -2350,6 +2374,7 @@ async fn external_reply_render_honors_a_stop_and_drops_a_stale_marker() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: "/tmp/ext".into(),
@@ -2456,6 +2481,7 @@ async fn external_reply_keeps_the_user_message_above_it() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
             session_id: "ses_ext".into(),
             directory: dir.path().to_string_lossy().to_string(),
@@ -3045,6 +3071,7 @@ fn assistant_text(id: &str, created: i64, text: &str) -> TranscriptMessage {
 /// The mapped entry every test in this batch follows.
 fn external_entry() -> crate::config::SessionEntry {
     crate::config::SessionEntry {
+        client_id: crate::config::DEFAULT_CLIENT_ID.into(),
         thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
         session_id: "ses_ext".into(),
         directory: "/tmp/ext".into(),

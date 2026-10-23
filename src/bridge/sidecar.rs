@@ -20,6 +20,72 @@ use std::path::Path;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+/// What a durable file's format header says (ADR-0091). A file with no
+/// `version` field — or a pre-ADR-0041 bare JSON array — is [`Self::Legacy`]:
+/// version 0, read as the shape the release before ADR-0091 wrote. A version
+/// newer than this build is [`Self::Unsupported`], never silently read as 0.
+pub(crate) enum VersionedRead {
+    /// No file at the path.
+    Missing,
+    /// The file exists but could not be read.
+    Unreadable,
+    /// The file is not valid JSON, or its `version` is not a number.
+    Corrupt,
+    /// Version 0, or no `version` field at all.
+    Legacy(String),
+    /// The version this build writes.
+    Current(String),
+    /// A version newer than this build knows.
+    Unsupported(u32),
+}
+
+/// Read `path` and classify its format header without parsing the body.
+///
+/// The classification fails open (a missing, unreadable or corrupt file is
+/// reported, never an error) except for a future version, which the caller
+/// must refuse rather than rewrite as its own older shape. `what` names the
+/// record in the warning lines ("Wake watermark", "Chain Record", ...).
+pub(crate) fn read_versioned(path: &Path, what: &str) -> VersionedRead {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return VersionedRead::Missing,
+        Err(e) => {
+            tracing::warn!(
+                "could not read {} ({e}); starting with an empty {what}",
+                path.display()
+            );
+            return VersionedRead::Unreadable;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                "could not parse {} ({e}); starting with an empty {what}",
+                path.display()
+            );
+            return VersionedRead::Corrupt;
+        }
+    };
+    // A non-object is a version-0 shape (the pre-ADR-0041 bare session array);
+    // a body the concrete record cannot parse still fails open in its loader.
+    let Some(version) = value.get("version") else {
+        return VersionedRead::Legacy(raw);
+    };
+    let Some(version) = version.as_u64().and_then(|version| u32::try_from(version).ok()) else {
+        tracing::warn!(
+            "could not parse {} (version is not a number); starting with an empty {what}",
+            path.display()
+        );
+        return VersionedRead::Corrupt;
+    };
+    match version {
+        0 => VersionedRead::Legacy(raw),
+        version if version == crate::state::STATE_FORMAT_VERSION => VersionedRead::Current(raw),
+        version => VersionedRead::Unsupported(version),
+    }
+}
+
 /// Load the record `T` from `path`, or `T::default()` (the empty record) when
 /// the file is missing, unreadable or unparseable. `what` names the record in
 /// the warning lines ("Wake watermark", "live-card record", ...). Never an
@@ -28,8 +94,8 @@ pub(crate) fn load<T>(path: &Path, what: &str) -> T
 where
     T: DeserializeOwned + Default,
 {
-    match std::fs::read_to_string(path) {
-        Ok(raw) => match serde_json::from_str::<T>(&raw) {
+    match read_versioned(path, what) {
+        VersionedRead::Legacy(raw) | VersionedRead::Current(raw) => match serde_json::from_str::<T>(&raw) {
             Ok(record) => record,
             Err(e) => {
                 tracing::warn!(
@@ -39,11 +105,13 @@ where
                 T::default()
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
-        Err(e) => {
-            tracing::warn!(
-                "could not read {} ({e}); starting with an empty {what}",
-                path.display()
+        VersionedRead::Missing | VersionedRead::Unreadable | VersionedRead::Corrupt => T::default(),
+        VersionedRead::Unsupported(version) => {
+            tracing::error!(
+                "{} declares unsupported format version {version} (this build writes {}); \
+                 refusing to read it as version 0",
+                path.display(),
+                crate::state::STATE_FORMAT_VERSION
             );
             T::default()
         }

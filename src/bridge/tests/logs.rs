@@ -633,6 +633,7 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
     seed_entry(
         &app,
         SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: ThreadKey::new("oc_chat".into(), "omt_topic".into()),
             session_id: "ses_test".into(),
             directory: "/work/project".into(),

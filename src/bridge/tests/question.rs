@@ -26,6 +26,7 @@ async fn seed_work_dir(app: &Arc<App>) {
     seed_entry(
         app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_1".into(),
             directory: "/work".into(),
@@ -154,6 +155,7 @@ async fn question_card_action_posts_answer_back() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_1".into(),
             directory: "/work".into(),
@@ -239,6 +241,7 @@ async fn form_reply_submits_keyed_answers_and_keeps_custom_verbatim() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_1".into(),
             directory: "/work".into(),
@@ -354,6 +357,7 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_1".into(),
             directory: "/work".into(),

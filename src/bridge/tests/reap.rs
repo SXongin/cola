@@ -3300,6 +3300,7 @@ async fn a_record_without_a_directory_is_never_decided() {
     seed_entry(
         &app,
         SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_other".into(),
             directory: "/work".into(),

@@ -290,6 +290,12 @@ fn default_access_file() -> PathBuf {
 /// `[bridge] default_client` is unset.
 pub const DEFAULT_CLIENT_ID: &str = "default";
 
+/// The serde default for a record written before ADR-0091: a version-0 file is
+/// read as the default client's.
+fn default_client_id() -> String {
+    DEFAULT_CLIENT_ID.to_string()
+}
+
 /// The adapter a configured agent client selects (ADR-0090 decision 1/2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
@@ -698,6 +704,11 @@ impl ConversationKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
+    /// The Agent Client this Session belongs to (ADR-0091). Defaults to
+    /// [`DEFAULT_CLIENT_ID`] so a mapping written before the field existed
+    /// reads as the implicit client's.
+    #[serde(default = "default_client_id")]
+    pub client_id: String,
     pub thread_key: ThreadKey,
     pub session_id: String,
     pub directory: String,
@@ -745,6 +756,7 @@ impl SessionEntry {
     /// creates the mapping sets exactly the extras it carries.
     pub fn new(thread_key: ThreadKey, session_id: impl Into<String>, directory: impl Into<String>) -> Self {
         Self {
+            client_id: default_client_id(),
             thread_key,
             session_id: session_id.into(),
             directory: directory.into(),

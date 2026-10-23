@@ -2370,6 +2370,7 @@ async fn a_wake_on_a_non_active_session_is_not_rendered() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_hist".into(),
             directory: "/tmp/hist".into(),
@@ -2385,6 +2386,7 @@ async fn a_wake_on_a_non_active_session_is_not_rendered() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_active".into(),
             directory: "/tmp/active".into(),
@@ -3108,6 +3110,7 @@ async fn a_settled_restart_continuation_is_not_re_split() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "om_wake_topic".into()),
             session_id: "ses_test".into(),
             directory: "/work".into(),
