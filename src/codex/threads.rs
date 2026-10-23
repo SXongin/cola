@@ -1,0 +1,945 @@
+//! Thread discovery, adoption and subscription over `codex app-server`
+//! (spec #860, ticket #878).
+//!
+//! app-server owns a thread store. `thread/list` and `thread/read` are the
+//! discovery reads (server-global, cursor-paged); adopting a thread is
+//! [`Threads::adopt`], which sends `thread/resume` — that call **is** the
+//! subscription, and after it the server pushes `turn/*` and `item/*`
+//! notifications on this connection only (ADR-0090's amendment, question 2).
+//! The reader loop in [`super::transport`] routes those frames here; this
+//! module fans them to the subscriber of the thread they name.
+//!
+//! Two facts from the spike shape the API:
+//!
+//! - **`thread/sessionId` is the session tree root**, not something derived
+//!   from the thread id. Every [`Thread`] carries it as read from the wire.
+//! - **A thread created by `thread/start` cannot be resumed until it has run a
+//!   turn.** `thread/resume` answers `-32600 no rollout found` until then, so
+//!   [`Threads::adopt`] reports [`Adoption::NoHistoryYet`] — a named state, not
+//!   a transport error.
+//!
+//! Releasing a subscription sends `thread/unsubscribe`; the server keeps the
+//! thread loaded for another subscriber (and for its 30-minute grace), and this
+//! module never unsubscribes a thread another local handle still holds.
+//!
+//! The poll-shaped `Backend` (#879) will serve `transcript` from what these
+//! subscriptions accumulate; this ticket deliberately exposes the event stream
+//! rather than caching it, so the read model is designed once, with its
+//! consumer.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, Weak};
+
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
+use tokio::sync::broadcast;
+
+use crate::backend::types::{SessionListInfo, SessionTime};
+
+use super::error::{CodexError, Result};
+use super::transport::{Inbound, RpcConnection};
+
+/// The source kinds a human-facing session list shows: a TUI (`cli`), VS Code
+/// (`vscode`) and another app-server client. `exec` is a one-shot run and the
+/// `subAgent*` kinds are a thread's children, neither of which belongs in
+/// cola's session list.
+pub(crate) const INTERACTIVE_SOURCE_KINDS: &[&str] = &["cli", "vscode", "appServer"];
+
+/// How many thread events one subscriber may fall behind before the broadcast
+/// drops the oldest (reported as [`CodexError::SubscriptionLagged`]).
+const EVENT_CAPACITY: usize = 1024;
+
+/// The `-32600` detail `thread/resume` returns for a thread with no rollout
+/// (ADR-0090's amendment, question 2). Matched together with the code, never on
+/// its own: the message is the server's, the code is the protocol's.
+const NO_ROLLOUT: &str = "no rollout found";
+
+/// One app-server thread, as `thread/list`, `thread/read` and `thread/resume`
+/// return it. Only the fields cola reads today are decoded; turns and status
+/// are the read model's (#879).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Thread {
+    /// The thread's identity, used for every thread-scoped call.
+    pub(crate) id: String,
+    /// **The session tree root** (ADR-0090, ticket #878). Read from the wire;
+    /// coalescing threads by session must never hash the thread id for it.
+    pub(crate) session_id: String,
+    /// The user-facing title, when the thread has one.
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    /// The parent thread of a sub-agent thread; absent for a top-level one.
+    /// Mapped onto [`SessionListInfo::parent_id`], so the neutral child filter
+    /// works unchanged.
+    #[serde(default)]
+    pub(crate) parent_thread_id: Option<String>,
+    /// Usually the first user message — the title fallback.
+    #[serde(default)]
+    pub(crate) preview: String,
+    pub(crate) cwd: String,
+    #[serde(default)]
+    pub(crate) created_at: i64,
+    #[serde(default)]
+    pub(crate) updated_at: i64,
+    #[serde(default)]
+    pub(crate) source: Value,
+    #[serde(default)]
+    pub(crate) status: Value,
+    #[serde(default)]
+    pub(crate) turns: Vec<Value>,
+}
+
+impl Thread {
+    /// The title the session list shows: the server's `name`, or its preview
+    /// fallback (the first user message) when the thread was never named.
+    pub(crate) fn title(&self) -> &str {
+        self.name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(&self.preview)
+    }
+
+    /// The neutral row the session list consumes (spec #860, #870). `id` is the
+    /// **thread** id — the identity every thread-scoped call takes — while the
+    /// session tree root stays on [`Thread::session_id`], where `/attach` reads
+    /// it (ADR-0090, ticket #878). `model` and `agent` have no equivalent on
+    /// this wire yet, so they stay empty rather than being guessed at; the read
+    /// model (#879) owns that mapping when it needs it.
+    pub(crate) fn list_info(&self) -> SessionListInfo {
+        SessionListInfo {
+            id: self.id.clone(),
+            title: self.title().to_string(),
+            directory: self.cwd.clone(),
+            parent_id: self.parent_thread_id.clone(),
+            agent: None,
+            model: None,
+            time: Some(SessionTime {
+                created: self.created_at,
+                updated: self.updated_at,
+                archived: None,
+            }),
+        }
+    }
+}
+
+/// One page of [`Threads::list`], in the neutral session shape the list
+/// surface consumes. `next_cursor` is `None` on the last page.
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadPage {
+    pub(crate) sessions: Vec<SessionListInfo>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+/// How adopting a thread ended.
+#[derive(Debug)]
+pub(crate) enum Adoption {
+    /// `thread/resume` succeeded: the server now pushes this thread's
+    /// `turn/*` and `item/*` notifications here.
+    Subscribed(Box<ThreadSubscription>),
+    /// The thread exists but has never run a turn, so it has no rollout to
+    /// resume (`-32600 no rollout found`). Named, not an error: the caller can
+    /// tell the user to run one turn in their client first.
+    NoHistoryYet,
+}
+
+/// `thread/unsubscribe`'s answer. `NotSubscribed` is the server's reply for a
+/// connection that holds no subscription to the thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum UnsubscribeStatus {
+    NotLoaded,
+    NotSubscribed,
+    Unsubscribed,
+}
+
+/// One notification the server pushed for a subscribed thread. The method and
+/// params are kept as the wire sent them; the read model (#879) decodes them
+/// into transcript parts.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ThreadEvent {
+    pub(crate) method: String,
+    pub(crate) params: Value,
+}
+
+/// A live subscription to one thread.
+///
+/// Dropping it releases the local handle (the server-side subscription stays
+/// until the connection closes); [`ThreadSubscription::release`] is the
+/// explicit, server-acknowledged path the bridge's release will use.
+pub(crate) struct ThreadSubscription {
+    thread: Thread,
+    events: broadcast::Receiver<ThreadEvent>,
+    guard: ReleaseGuard,
+    connection: RpcConnection,
+}
+
+impl std::fmt::Debug for ThreadSubscription {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThreadSubscription")
+            .field("thread", &self.thread.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ThreadSubscription {
+    /// The thread that was resumed.
+    pub(crate) fn thread(&self) -> &Thread {
+        &self.thread
+    }
+
+    /// The next pushed notification for this thread.
+    pub(crate) async fn next_event(&mut self) -> Result<ThreadEvent> {
+        match self.events.recv().await {
+            Ok(event) => Ok(event),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => Err(CodexError::SubscriptionLagged {
+                thread_id: self.thread.id.clone(),
+                skipped,
+            }),
+            Err(broadcast::error::RecvError::Closed) => Err(CodexError::NoResponse(format!(
+                "thread subscription {}",
+                self.thread.id
+            ))),
+        }
+    }
+
+    /// Leave the subscription. Returns the server's answer when this was the
+    /// last local handle for the thread, or `None` when another handle still
+    /// holds it (no `thread/unsubscribe` is sent: the server must keep
+    /// streaming to that handle).
+    pub(crate) async fn release(mut self) -> Result<Option<UnsubscribeStatus>> {
+        // Claim the local release atomically: two handles releasing at once
+        // cannot both decide they are the last (and neither can both skip).
+        if !self.guard.take() {
+            return Ok(None);
+        }
+        let result = self
+            .connection
+            .request("thread/unsubscribe", json!({ "threadId": self.thread.id }))
+            .await?;
+        let response: UnsubscribeResponse = decode("thread/unsubscribe", result)?;
+        Ok(Some(response.status))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UnsubscribeResponse {
+    status: UnsubscribeStatus,
+}
+
+/// The thread surface over one attached connection.
+pub(crate) struct Threads {
+    connection: RpcConnection,
+    /// Outlives every subscription it handed out: the dispatcher is owned here,
+    /// not by [`Threads`], so a subscription taken from a client that is later
+    /// dropped still receives its stream.
+    registry: Arc<Registry>,
+}
+
+impl std::fmt::Debug for Threads {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Threads").finish_non_exhaustive()
+    }
+}
+
+impl Threads {
+    /// Start the dispatcher over an attached connection. One per
+    /// [`super::CodexClient`]; the client owns it for its lifetime.
+    pub(crate) fn new(connection: RpcConnection) -> Self {
+        let registry = Registry::start(connection.clone());
+        Self { connection, registry }
+    }
+
+    /// List threads whose session cwd is exactly `cwd`, newest-page first as
+    /// the server orders them. Pass the returned cursor back for the next
+    /// page; [`Self::list_all`] does that until the end.
+    pub(crate) async fn list(
+        &self,
+        cwd: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<ThreadPage> {
+        let mut params = json!({
+            "cwd": cwd,
+            "sourceKinds": INTERACTIVE_SOURCE_KINDS,
+        });
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(cursor);
+        }
+        if let Some(limit) = limit {
+            params["limit"] = json!(limit);
+        }
+
+        let result = self.connection.request("thread/list", params).await?;
+        let response: ListResponse = decode("thread/list", result)?;
+        Ok(ThreadPage {
+            sessions: response.data.iter().map(Thread::list_info).collect(),
+            next_cursor: response.next_cursor,
+        })
+    }
+
+    /// Every thread for `cwd`, following `nextCursor` until the end. A server
+    /// that repeats a cursor would otherwise loop forever, so that is a named
+    /// protocol failure instead.
+    pub(crate) async fn list_all(&self, cwd: &str) -> Result<Vec<SessionListInfo>> {
+        let mut sessions = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let page = self.list(cwd, cursor.as_deref(), None).await?;
+            sessions.extend(page.sessions);
+            match page.next_cursor {
+                None => return Ok(sessions),
+                Some(next) => {
+                    if !seen.insert(next.clone()) {
+                        return Err(CodexError::Protocol {
+                            method: "thread/list".to_string(),
+                            detail: format!("the server repeated pagination cursor `{next}`"),
+                        });
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+    }
+
+    /// Read one thread's metadata. `include_turns` asks the server for its
+    /// persisted turns; the read model (#879) pages them separately when it
+    /// needs full history.
+    pub(crate) async fn read(&self, thread_id: &str, include_turns: bool) -> Result<Thread> {
+        let result = self
+            .connection
+            .request(
+                "thread/read",
+                json!({ "threadId": thread_id, "includeTurns": include_turns }),
+            )
+            .await?;
+        let response: ReadResponse = decode("thread/read", result)?;
+        Ok(response.thread)
+    }
+
+    /// Adopt a thread: `thread/resume` is the subscription (ADR-0090's
+    /// amendment, question 2). The receiver is registered **before** the call,
+    /// so a turn that starts while the response is in flight is not lost.
+    pub(crate) async fn adopt(&self, thread_id: &str) -> Result<Adoption> {
+        let events = self.registry.subscribe(thread_id);
+        let result = self
+            .connection
+            .request("thread/resume", json!({ "threadId": thread_id }))
+            .await;
+
+        match result {
+            Ok(result) => {
+                let response: ResumeResponse = match decode("thread/resume", result) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        self.registry.release(thread_id);
+                        return Err(error);
+                    }
+                };
+                Ok(Adoption::Subscribed(Box::new(ThreadSubscription {
+                    thread: response.thread,
+                    events,
+                    guard: ReleaseGuard {
+                        thread_id: thread_id.to_string(),
+                        registry: Arc::clone(&self.registry),
+                        released: false,
+                    },
+                    connection: self.connection.clone(),
+                })))
+            }
+            // A never-run thread has no rollout; that is a state of the
+            // thread, not a transport failure (the spike's exact answer).
+            Err(CodexError::Rpc { code, detail, .. }) if no_history(code, &detail) => {
+                self.registry.release(thread_id);
+                Ok(Adoption::NoHistoryYet)
+            }
+            Err(error) => {
+                self.registry.release(thread_id);
+                Err(error)
+            }
+        }
+    }
+
+    /// Rename a thread (`thread/name/set`); the next `thread/list` reads the
+    /// stored name.
+    pub(crate) async fn rename(&self, thread_id: &str, name: &str) -> Result<()> {
+        self.connection
+            .request("thread/name/set", json!({ "threadId": thread_id, "name": name }))
+            .await?;
+        Ok(())
+    }
+
+    /// Send `thread/unsubscribe` for `thread_id`, regardless of local handles.
+    /// This is the explicit release path; normal consumers use
+    /// [`ThreadSubscription::release`].
+    pub(crate) async fn unsubscribe(&self, thread_id: &str) -> Result<UnsubscribeStatus> {
+        let result = self
+            .connection
+            .request("thread/unsubscribe", json!({ "threadId": thread_id }))
+            .await?;
+        let response: UnsubscribeResponse = decode("thread/unsubscribe", result)?;
+        Ok(response.status)
+    }
+}
+
+fn no_history(code: Option<i64>, detail: &str) -> bool {
+    code == Some(-32600) && detail.to_ascii_lowercase().contains(NO_ROLLOUT)
+}
+
+fn decode<T: DeserializeOwned>(method: &str, value: Value) -> Result<T> {
+    serde_json::from_value(value).map_err(|error| CodexError::Protocol {
+        method: method.to_string(),
+        detail: error.to_string(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListResponse {
+    #[serde(default)]
+    data: Vec<Thread>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadResponse {
+    thread: Thread,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResumeResponse {
+    thread: Thread,
+}
+
+/// The local subscription table: one broadcast channel per adopted thread.
+///
+/// `holders` counts local handles, not server subscribers: the server fans a
+/// thread to every connection that resumed it, and this table only decides when
+/// *this* connection's last handle may unsubscribe.
+#[derive(Default)]
+struct Registry {
+    threads: Mutex<HashMap<String, Entry>>,
+    /// The dispatcher task. It captures only a `Weak`, so this handle does not
+    /// keep the registry alive; aborting it on the registry's drop stops the
+    /// routing when the last subscription and the [`Threads`] are gone.
+    dispatcher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        if let Some(dispatcher) = self.dispatcher.get_mut().expect("dispatcher").take() {
+            dispatcher.abort();
+        }
+    }
+}
+
+struct Entry {
+    sender: broadcast::Sender<ThreadEvent>,
+    holders: usize,
+}
+
+impl Registry {
+    /// Build the registry and start its dispatcher over `connection`'s
+    /// notification broadcast.
+    fn start(connection: RpcConnection) -> Arc<Self> {
+        let registry = Arc::new(Self::default());
+        let dispatcher = tokio::spawn(dispatch(connection.inbound(), Arc::downgrade(&registry)));
+        *registry.dispatcher.lock().expect("dispatcher") = Some(dispatcher);
+        registry
+    }
+
+    fn subscribe(&self, thread_id: &str) -> broadcast::Receiver<ThreadEvent> {
+        let mut threads = self.threads.lock().expect("thread registry");
+        let entry = threads.entry(thread_id.to_string()).or_insert_with(|| {
+            let (sender, _) = broadcast::channel(EVENT_CAPACITY);
+            Entry { sender, holders: 0 }
+        });
+        entry.holders += 1;
+        entry.sender.subscribe()
+    }
+
+    /// Drop one local handle. Returns whether it was the last one.
+    fn release(&self, thread_id: &str) -> bool {
+        let mut threads = self.threads.lock().expect("thread registry");
+        let Some(entry) = threads.get_mut(thread_id) else {
+            return true;
+        };
+        entry.holders = entry.holders.saturating_sub(1);
+        if entry.holders == 0 {
+            threads.remove(thread_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sender(&self, thread_id: &str) -> Option<broadcast::Sender<ThreadEvent>> {
+        self.threads
+            .lock()
+            .expect("thread registry")
+            .get(thread_id)
+            .map(|entry| entry.sender.clone())
+    }
+
+    /// Drop every per-thread sender, so each subscription's stream reports
+    /// `Closed` when the connection ends instead of waiting forever.
+    fn close_all(&self) {
+        self.threads.lock().expect("thread registry").clear();
+    }
+}
+
+/// The handle whose drop releases one local subscription. Kept separate so
+/// `ThreadSubscription::release` can ask whether it is the last **before**
+/// consuming itself.
+struct ReleaseGuard {
+    thread_id: String,
+    registry: Arc<Registry>,
+    released: bool,
+}
+
+impl ReleaseGuard {
+    /// Drop this local handle and report whether it was the last one.
+    fn take(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        self.released = true;
+        self.registry.release(&self.thread_id)
+    }
+}
+
+impl Drop for ReleaseGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            self.registry.release(&self.thread_id);
+        }
+    }
+}
+
+/// Route notifications by `params.threadId` to the subscriber of that thread.
+/// Broadcasts without a thread (`thread/started`, `remoteControl/…`) and
+/// server requests (the approval surface, #882) are not a subscription's
+/// traffic.
+async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Registry>) {
+    loop {
+        let event = inbound.recv().await;
+        // Upgrade per event, never across the await above: a strong handle held
+        // by this task would keep the registry (and this task) alive forever.
+        let Some(registry) = registry.upgrade() else {
+            return;
+        };
+        match event {
+            Ok(Inbound::Notification { method, params }) => {
+                let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(sender) = registry.sender(thread_id) {
+                    // No receiver means every local handle already dropped;
+                    // the server stops sending once the connection unsubscribes
+                    // or closes, so a dropped event costs nothing.
+                    let _ = sender.send(ThreadEvent { method, params });
+                }
+            }
+            Ok(Inbound::Request { .. }) => continue,
+            Ok(Inbound::Closed) => {
+                registry.close_all();
+                return;
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    "the codex connection's push stream outran the thread dispatcher by \
+                     {skipped} event(s)"
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::codex::client::{CodexClient, CodexOptions};
+    use crate::codex::schema::PinnedProbe;
+    use crate::codex::test_server::{FakeServer, ScriptedThread};
+    use crate::codex::transport::Endpoint;
+
+    async fn connect(url: &str) -> CodexClient {
+        let endpoint = Endpoint::parse(url).expect("endpoint");
+        CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
+            .await
+            .expect("attach to the scripted app-server")
+    }
+
+    /// Ticket #878 acceptance 1: the list is scoped to the directory, shows
+    /// the stored titles, reads `sessionId` from the wire, and paging reaches
+    /// the end (the scripted page size is 2, so five threads are three calls).
+    #[tokio::test]
+    async fn the_list_pages_to_the_end_for_the_directory() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        for index in 0..5 {
+            server.seed_thread(ScriptedThread::adopted(
+                &format!("thread-{index}"),
+                &format!("session-root-{index}"),
+                "/work/cola",
+                &format!("title {index}"),
+            ));
+        }
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-elsewhere",
+            "session-elsewhere",
+            "/work/other",
+            "not this directory",
+        ));
+        // A sub-agent thread in the same directory keeps its parent, so the
+        // neutral child filter (`parent_id`) sees it.
+        let mut child = ScriptedThread::adopted(
+            "thread-child",
+            "session-root-0",
+            "/work/cola",
+            "a sub-agent thread",
+        );
+        child.parent_thread_id = Some("thread-0".to_string());
+        server.seed_thread(child);
+        let client = connect(&url).await;
+
+        let sessions = client
+            .threads()
+            .list_all("/work/cola")
+            .await
+            .expect("the list pages to the end");
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "thread-0",
+                "thread-1",
+                "thread-2",
+                "thread-3",
+                "thread-4",
+                "thread-child"
+            ]
+        );
+        assert!(sessions[5].is_child(), "a sub-agent thread keeps its parent");
+        assert_eq!(sessions[0].title, "title 0");
+        assert_eq!(sessions[3].directory, "/work/cola");
+        assert_eq!(
+            sessions[0].time.as_ref().map(|time| time.updated),
+            Some(1_700_000_000)
+        );
+        assert_eq!(server.list_calls(), 3, "6 threads at 2 per page is 3 calls");
+
+        let params = server.list_params();
+        assert_eq!(params[0]["cwd"], "/work/cola");
+        assert_eq!(
+            params[0]["sourceKinds"],
+            json!(INTERACTIVE_SOURCE_KINDS),
+            "the list asks for the interactive source kinds"
+        );
+        assert!(params[0].get("cursor").is_none(), "the first page has no cursor");
+        assert_eq!(params[1]["cursor"], "2");
+        assert_eq!(params[2]["cursor"], "4");
+    }
+
+    /// `thread/read` returns one thread with the same identity fields; a title
+    /// falls back to the preview when the thread was never named.
+    #[tokio::test]
+    async fn read_returns_one_thread_and_title_falls_back_to_the_preview() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::never_run(
+            "thread-new",
+            "session-root",
+            "/work/cola",
+        ));
+        let client = connect(&url).await;
+
+        let thread = client.threads().read("thread-new", false).await.expect("read");
+        assert_eq!(thread.id, "thread-new");
+        assert_eq!(thread.session_id, "session-root");
+        assert_eq!(thread.title(), "", "a never-run thread has no preview yet");
+        assert_eq!(thread.cwd, "/work/cola");
+    }
+
+    /// Ticket #878 acceptance 2: adopting a thread with history subscribes it,
+    /// and an item event for it arrives on this connection.
+    #[tokio::test]
+    async fn adopting_a_thread_with_history_streams_its_items() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+
+        let Adoption::Subscribed(mut subscription) = client
+            .threads()
+            .adopt("thread-1")
+            .await
+            .expect("adopt the thread")
+        else {
+            panic!("a thread with history must subscribe");
+        };
+        assert_eq!(subscription.thread().session_id, "session-root");
+        assert_eq!(server.resume_calls(), 1);
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        assert_eq!(server.push_item("thread-1", "item-1", "hello from the server"), 1);
+        let event = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+            .await
+            .expect("the item arrives on this connection")
+            .expect("a thread event");
+        assert_eq!(event.method, "item/completed");
+        assert_eq!(event.params["item"]["text"], "hello from the server");
+        assert_eq!(event.params["threadId"], "thread-1");
+    }
+
+    /// Ticket #878 acceptance 3: a never-run thread reports the documented
+    /// state, not a transport error, and leaves no local subscription behind.
+    #[tokio::test]
+    async fn adopting_a_never_run_thread_reports_no_history_yet() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::never_run(
+            "thread-new",
+            "session-root",
+            "/work/cola",
+        ));
+        let client = connect(&url).await;
+
+        let adoption = client
+            .threads()
+            .adopt("thread-new")
+            .await
+            .expect("a never-run thread is a state, not a failure");
+
+        assert!(matches!(adoption, Adoption::NoHistoryYet));
+        assert_eq!(server.subscribers("thread-new"), 0);
+        assert_eq!(
+            server.unsubscribe_calls(),
+            0,
+            "this connection never subscribed, so it sends no unsubscribe"
+        );
+    }
+
+    /// Ticket #878 acceptance 4: a rename reaches the server and the next list
+    /// read shows it.
+    #[tokio::test]
+    async fn a_rename_round_trips_through_the_next_list() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "first message");
+        thread.name = None;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        let listed = client.threads().list_all("/work/cola").await.expect("list");
+        assert_eq!(listed[0].title, "first message");
+
+        client
+            .threads()
+            .rename("thread-1", "renamed in Feishu")
+            .await
+            .expect("rename");
+        assert_eq!(
+            server.thread_name("thread-1").as_deref(),
+            Some("renamed in Feishu")
+        );
+
+        let listed = client.threads().list_all("/work/cola").await.expect("re-list");
+        assert_eq!(listed[0].title, "renamed in Feishu");
+    }
+
+    /// Ticket #878 acceptance 5: two connections subscribe to one thread;
+    /// releasing one leaves the other's stream intact (the spike's guarantee
+    /// that `thread/unsubscribe` does not unload a thread another subscriber
+    /// holds).
+    #[tokio::test]
+    async fn releasing_one_subscription_leaves_another_connection_streaming() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "shared thread",
+        ));
+        let first = connect(&url).await;
+        let second = connect(&url).await;
+
+        let Adoption::Subscribed(mut first_subscription) =
+            first.threads().adopt("thread-1").await.expect("first adopts")
+        else {
+            panic!("the first connection must subscribe");
+        };
+        let Adoption::Subscribed(mut second_subscription) =
+            second.threads().adopt("thread-1").await.expect("second adopts")
+        else {
+            panic!("the second connection must subscribe");
+        };
+        server.wait_for_subscribers("thread-1", 2).await;
+
+        assert_eq!(
+            server.push_item("thread-1", "item-1", "both see this"),
+            2,
+            "a subscribed thread fans out to both connections"
+        );
+        for subscription in [&mut first_subscription, &mut second_subscription] {
+            let event = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+                .await
+                .expect("both streams receive the first item")
+                .expect("a thread event");
+            assert_eq!(event.params["item"]["text"], "both see this");
+        }
+
+        let status = first_subscription
+            .release()
+            .await
+            .expect("release the first subscription");
+        assert_eq!(status, Some(UnsubscribeStatus::Unsubscribed));
+        assert_eq!(server.subscribers("thread-1"), 1, "only the first left");
+
+        assert_eq!(
+            server.push_item("thread-1", "item-2", "only the second sees this"),
+            1,
+            "the remaining connection still owns the subscription"
+        );
+        let event = tokio::time::timeout(Duration::from_secs(2), second_subscription.next_event())
+            .await
+            .expect("the remaining stream is intact")
+            .expect("a thread event");
+        assert_eq!(event.params["item"]["text"], "only the second sees this");
+
+        assert_eq!(
+            second_subscription
+                .release()
+                .await
+                .expect("release the last subscription"),
+            Some(UnsubscribeStatus::Unsubscribed)
+        );
+        assert_eq!(server.subscribers("thread-1"), 0);
+    }
+
+    /// Two local handles on one connection: releasing either one must not send
+    /// `thread/unsubscribe` while the other still reads.
+    #[tokio::test]
+    async fn a_second_local_handle_keeps_the_server_subscription() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "shared thread",
+        ));
+        let client = connect(&url).await;
+
+        let Adoption::Subscribed(first) = client.threads().adopt("thread-1").await.expect("adopt") else {
+            panic!("must subscribe");
+        };
+        let Adoption::Subscribed(mut second) = client.threads().adopt("thread-1").await.expect("adopt")
+        else {
+            panic!("must subscribe");
+        };
+        assert_eq!(server.subscribers("thread-1"), 1, "one connection, two resumes");
+
+        assert_eq!(
+            first.release().await.expect("release one handle"),
+            None,
+            "another local handle still holds the thread"
+        );
+        assert_eq!(server.unsubscribe_calls(), 0);
+
+        assert_eq!(server.push_item("thread-1", "item-1", "still streaming"), 1);
+        let event = tokio::time::timeout(Duration::from_secs(2), second.next_event())
+            .await
+            .expect("the remaining handle still reads")
+            .expect("a thread event");
+        assert_eq!(event.params["item"]["text"], "still streaming");
+
+        assert_eq!(
+            second.release().await.expect("release the last handle"),
+            Some(UnsubscribeStatus::Unsubscribed)
+        );
+        assert_eq!(server.unsubscribe_calls(), 1);
+    }
+
+    /// A subscription owns what it needs: it keeps streaming after the
+    /// [`Threads`] surface (and the client) that handed it out is dropped,
+    /// because the dispatcher lives with the registry, not with that surface.
+    #[tokio::test]
+    async fn a_subscription_outlives_the_surface_that_created_it() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let mut subscription = {
+            let client = connect(&url).await;
+            let Adoption::Subscribed(subscription) = client.threads().adopt("thread-1").await.expect("adopt")
+            else {
+                panic!("must subscribe");
+            };
+            subscription
+        };
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        assert_eq!(server.push_item("thread-1", "item-1", "still here"), 1);
+        let event = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+            .await
+            .expect("the stream survives the surface")
+            .expect("a thread event");
+        assert_eq!(event.params["item"]["text"], "still here");
+    }
+
+    /// A connection that dies ends the subscription's stream instead of
+    /// leaving `next_event` waiting forever, and later reads fail rather than
+    /// hanging on a response that cannot come.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lost_connection_ends_the_subscription() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("app-server.sock");
+        let server = FakeServer::unix(&socket, "codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let endpoint = Endpoint::Unix(socket);
+        let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
+            .await
+            .expect("attach");
+        let Adoption::Subscribed(mut subscription) = client.threads().adopt("thread-1").await.expect("adopt")
+        else {
+            panic!("must subscribe");
+        };
+
+        server.die().await;
+
+        let ended = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+            .await
+            .expect("the stream ends instead of hanging forever");
+        assert!(ended.is_err(), "a closed connection is not an event: {ended:?}");
+        assert!(
+            client.threads().read("thread-1", false).await.is_err(),
+            "a read after the socket died fails instead of waiting for a response"
+        );
+    }
+
+    #[test]
+    fn only_the_documented_no_rollout_answer_is_a_named_state() {
+        assert!(no_history(Some(-32600), "no rollout found for thread id 019a"));
+        assert!(!no_history(Some(-32602), "no rollout found"));
+        assert!(!no_history(Some(-32600), "thread not found"));
+        assert!(!no_history(None, "no rollout found"));
+    }
+}

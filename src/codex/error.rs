@@ -43,13 +43,26 @@ pub(crate) enum CodexError {
     #[error("codex app-server did not answer within {0:?}")]
     Timeout(Duration),
 
-    /// A JSON-RPC call answered with the protocol's `error` member.
+    /// A JSON-RPC call answered with the protocol's `error` member. `code` is
+    /// kept because the protocol encodes *named states* there — the spike's
+    /// `-32600 no rollout found` on a never-run thread is one (ticket #878) —
+    /// and matching on a message alone would be guessing.
     #[error("codex app-server `{method}` failed: {detail}")]
-    Rpc { method: String, detail: String },
+    Rpc {
+        method: String,
+        code: Option<i64>,
+        detail: String,
+    },
 
     /// The peer closed or sent no frame where a response was required.
     #[error("codex app-server closed the connection before answering `{0}`")]
     NoResponse(String),
+
+    /// A thread subscription could not keep up with the server's push stream:
+    /// the broadcast dropped `skipped` events. A silent gap would render a
+    /// transcript with holes, so the adapter reports it by name.
+    #[error("codex subscription for thread `{thread_id}` fell behind by {skipped} event(s)")]
+    SubscriptionLagged { thread_id: String, skipped: u64 },
 
     /// A frame was valid JSON but not the JSON-RPC shape the call expected.
     #[error("codex app-server reply to `{method}` is not valid JSON-RPC: {detail}")]
