@@ -1551,20 +1551,15 @@ pub(crate) async fn handle_command(
             // A server launched by another tool is never touched: cola has
             // no record of its configuration, and killing it could take
             // down another application's runtime.
-            match crate::bridge::discovery::restart_self_spawned_server(
-                &handles.flow.layout,
-                handles.preferred_port,
-            )
-            .await
-            {
-                Ok(crate::bridge::discovery::RestartOutcome::Restarted) => {
+            match handles.flow.backend.restart_server().await {
+                Ok(crate::backend::RestartOutcome::Restarted) => {
                     handles
                         .flow
                         .platform
                         .reply_text(message_id, "♻️ 已重启 OpenCode 服务器。")
                         .await?;
                 }
-                Ok(crate::bridge::discovery::RestartOutcome::RestartedService) => {
+                Ok(crate::backend::RestartOutcome::RestartedService) => {
                     handles
                         .flow
                         .platform
@@ -1574,7 +1569,7 @@ pub(crate) async fn handle_command(
                         )
                         .await?;
                 }
-                Ok(crate::bridge::discovery::RestartOutcome::NotOwned) => {
+                Ok(crate::backend::RestartOutcome::NotOwned) => {
                     handles
                         .flow
                         .platform
@@ -1584,7 +1579,7 @@ pub(crate) async fn handle_command(
                         )
                         .await?;
                 }
-                Ok(crate::bridge::discovery::RestartOutcome::NoServer) => {
+                Ok(crate::backend::RestartOutcome::NoServer) => {
                     handles
                         .flow
                         .platform

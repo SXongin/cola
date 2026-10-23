@@ -219,19 +219,6 @@ pub struct SharedCore {
     /// the OpenCode adapter.
     pub client: Arc<dyn crate::backend::Backend>,
     pub feishu: Arc<dyn feishu::Platform>,
-    /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`,
-    /// ADR-0013). Drives the Lazy Start hook and the yield decision.
-    pub server_start: crate::config::ServerStartPolicy,
-    /// Preferred port from `[opencode] url`, a tiebreaker among servers of the
-    /// same class in `pick_server` (ADR-0013).
-    pub preferred_port: Option<u16>,
-    /// `[opencode] generation`: how the reconnect loop's re-attach resolves
-    /// the changed server's generation (spec #364 §2).
-    pub generation: crate::config::GenerationOverride,
-    /// Serializes every server mutation — Lazy Start spawns, the reconnect
-    /// loop's re-attach/yield — so concurrent first messages can't double-spawn
-    /// or race a yield with a reconnect.
-    pub server_lock: Arc<tokio::sync::Mutex<()>>,
     /// session_id → the lock serializing that session's card writes. A card
     /// write is a read-send-record sequence (the flush's build→PATCH→record, a
     /// resolution's mutate→ack/PATCH), and two of them interleaving land out of
@@ -427,10 +414,6 @@ impl SharedCore {
             session_list_cache: Arc::new(Mutex::new(None)),
             client,
             feishu,
-            server_start: cfg.opencode.start_server,
-            preferred_port: cfg.opencode.preferred_port(),
-            generation: cfg.opencode.generation,
-            server_lock: Arc::new(tokio::sync::Mutex::new(())),
             card_write_locks: Arc::new(Mutex::new(HashMap::new())),
             // The preserved-ending view read's bound: the Session Sync pass's
             // own request bound (spec #571 review).
@@ -498,20 +481,6 @@ impl SharedCore {
         }
     }
 
-    /// The poller bundle: the flow handles plus the server-ownership state the
-    /// reconcile loop mutates.
-    pub(crate) fn poll_handles(&self) -> crate::bridge::handles::PollHandles {
-        crate::bridge::handles::PollHandles {
-            flow: self.flow_handles(),
-            server: crate::bridge::handles::ServerHandle {
-                start_policy: self.server_start,
-                preferred_port: self.preferred_port,
-                generation: self.generation,
-                lock: Arc::clone(&self.server_lock),
-            },
-        }
-    }
-
     /// The read-side bundle a Session Snapshot gather needs.
     pub(crate) fn snapshot_handles(&self) -> crate::bridge::handles::SnapshotHandles {
         crate::bridge::handles::SnapshotHandles::from_flow(&self.flow_handles())
@@ -531,7 +500,6 @@ impl SharedCore {
             flow: self.flow_handles(),
             config: self.turn_config(),
             external: Arc::clone(&self.external),
-            preferred_port: self.preferred_port,
             diff_cooldown: Arc::clone(&self.diff_cooldown),
             terminal_runs: Arc::clone(&self.terminal_runs),
             terminal_records: Arc::clone(&self.terminal_records),

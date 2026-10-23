@@ -1,10 +1,8 @@
 pub mod access;
-pub(crate) mod attach;
 pub mod card_handles;
 pub(crate) mod chain;
 pub mod command;
 pub mod core;
-pub mod discovery;
 pub mod display;
 pub mod external;
 pub mod failure_latch;
@@ -33,9 +31,6 @@ pub mod turn;
 pub(crate) mod turn_diff;
 pub(crate) mod viewer;
 pub(crate) mod worktree;
-
-#[cfg(test)]
-mod attach_live;
 
 #[cfg(test)]
 pub(crate) mod test_support;

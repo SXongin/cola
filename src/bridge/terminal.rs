@@ -109,8 +109,8 @@ const KILL_CONFIRM: Duration = Duration::from_secs(2);
 const TERMINAL_PATCH_TIMEOUT_MS: u64 = 10_000;
 
 /// The environment names cola's child must NOT inherit (ADR-0086 §8): the
-/// server credentials cola itself holds. The same three names `discovery`
-/// reads in the other direction; everything else is the Host's own shell.
+/// server credentials cola itself holds. The same three names the adapter's
+/// discovery reads in the other direction; everything else is the Host's own shell.
 #[cfg(unix)]
 const SCRUBBED_ENV: [&str; 3] = [
     "OPENCODE_SERVER_PASSWORD",

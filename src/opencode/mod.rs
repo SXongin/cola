@@ -14,10 +14,15 @@
 //! strategy's private wire decoder; everything else imports the contract from
 //! [`crate::backend`], never from here.
 
+pub(crate) mod attach;
+#[cfg(test)]
+mod attach_live;
 pub mod client;
 #[cfg(test)]
 mod conformance;
+pub(crate) mod discovery;
 pub(crate) mod generation;
+pub(crate) mod lifecycle;
 #[cfg(test)]
 mod live;
 pub(crate) mod strategy;
@@ -244,21 +249,8 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::compact(self, session_id).await
     }
 
-    async fn reconnect(&self, server: Option<&crate::bridge::discovery::ResolvedServer>) -> Result<()> {
-        OpenCodeBackend::reconnect(self, server);
-        Ok(())
-    }
-
     fn base_url(&self) -> String {
         OpenCodeBackend::base_url(self)
-    }
-
-    fn attached_server_pid(&self) -> Option<i32> {
-        OpenCodeBackend::attached_server_pid(self)
-    }
-
-    fn can_self_start_server(&self) -> bool {
-        true
     }
 
     fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn DirectoryBackend> {

@@ -34,7 +34,7 @@ fn body_json(request: &RecordedRequest) -> serde_json::Value {
 fn reconnect_tracks_the_attached_server_pid() {
     let backend = OpenCodeBackend::new(
         None,
-        Some(crate::bridge::discovery::ResolvedServer {
+        Some(crate::opencode::discovery::ResolvedServer {
             url: "http://localhost:4096".to_string(),
             username: "opencode".to_string(),
             password: "secret".to_string(),
@@ -44,7 +44,7 @@ fn reconnect_tracks_the_attached_server_pid() {
     );
     assert_eq!(backend.attached_server_pid(), Some(4242));
 
-    backend.reconnect(Some(&crate::bridge::discovery::ResolvedServer {
+    backend.reconnect(Some(&crate::opencode::discovery::ResolvedServer {
         url: "http://localhost:49374".to_string(),
         username: "opencode".to_string(),
         password: "new-secret".to_string(),

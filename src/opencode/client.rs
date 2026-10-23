@@ -12,7 +12,10 @@ use std::sync::{Arc, RwLock};
 
 use crate::backend::{ChildEvidence, PromptSkill, SessionTranscript, SkillInfo, TaskRuntime};
 use crate::bridge::tasks::TasksHandle;
+use crate::config::OpenCodeConfig;
+use crate::state::StateLayout;
 
+use super::discovery::{DEFAULT_SERVER_USERNAME, ResolvedServer};
 use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use crate::backend::parsing::parse_model;
@@ -61,6 +64,18 @@ pub struct OpenCodeBackend {
     /// handle through [`crate::backend::Backend::tasks`], so the two can never
     /// disagree.
     tasks: TasksHandle,
+    /// This client's OpenCode options (`[opencode]` / `[clients.<id>]`): the
+    /// start policy, the preferred port and the generation override the
+    /// lifecycle obeys.
+    settings: OpenCodeConfig,
+    /// The one owner of the on-disk layout: the Owned Server's pid record and
+    /// the Shared Service's log/registration paths are derived from it
+    /// (ADR-0090 §6).
+    layout: StateLayout,
+    /// Serializes every server mutation — Lazy Start spawns, the reconnect
+    /// loop's re-attach/yield — so concurrent first messages cannot
+    /// double-spawn or race a yield with a reconnect.
+    server_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Clone for OpenCodeBackend {
@@ -72,6 +87,9 @@ impl Clone for OpenCodeBackend {
             strategy: Arc::clone(&self.strategy),
             attached_pid: Arc::clone(&self.attached_pid),
             tasks: self.tasks.clone(),
+            settings: self.settings.clone(),
+            layout: self.layout.clone(),
+            server_lock: Arc::clone(&self.server_lock),
         }
     }
 }
@@ -92,46 +110,48 @@ impl OpenCodeBackend {
     /// Kept for the tests that construct an adapter without threading a handle
     /// (the allow is for the non-test build, where only `with_tasks` is called).
     #[allow(dead_code)]
-    pub fn new(model: Option<&str>, server: Option<crate::bridge::discovery::ResolvedServer>) -> Self {
-        Self::with_tasks(model, server, TasksHandle::new())
+    pub fn new(model: Option<&str>, server: Option<ResolvedServer>) -> Self {
+        let backend = Self::with_tasks_and_generation(
+            model,
+            String::new(),
+            Some(DEFAULT_SERVER_USERNAME),
+            None,
+            Generation::V1,
+            None,
+            TasksHandle::new(),
+            OpenCodeConfig::default(),
+            StateLayout::default(),
+        );
+        backend.reconnect(server.as_ref());
+        backend
     }
 
     /// [`Self::new`] with the process's Background Task State handle threaded in
-    /// at construction (ADR-0079, ticket #682). `src/main.rs` creates the handle
-    /// (it also becomes the Bridge's, through
-    /// [`crate::backend::Backend::tasks`]) and passes it here, so the adapter
-    /// applies the very liveness tier the Bridge records through.
+    /// at construction (ADR-0079, ticket #682), and the lifecycle settings this
+    /// client obeys (start policy, preferred port, generation override) plus the
+    /// state layout its Owned Server record lives under.
+    ///
+    /// The client starts serverless and attaches through
+    /// [`crate::backend::ServerLifecycle::ensure_attached`]; that is the boot
+    /// path `src/main.rs` takes, so there is one attach implementation rather
+    /// than a constructor-shaped second one.
     pub fn with_tasks(
         model: Option<&str>,
-        server: Option<crate::bridge::discovery::ResolvedServer>,
+        settings: &OpenCodeConfig,
+        layout: StateLayout,
         tasks: TasksHandle,
     ) -> Self {
-        match server {
-            Some(crate::bridge::discovery::ResolvedServer {
-                url,
-                username,
-                password,
-                pid,
-                generation,
-            }) => Self::with_tasks_and_generation(
-                model,
-                url,
-                Some(&username),
-                Some(&password),
-                generation,
-                pid,
-                tasks,
-            ),
-            None => Self::with_tasks_and_generation(
-                model,
-                String::new(),
-                Some(crate::bridge::discovery::DEFAULT_SERVER_USERNAME),
-                None,
-                Generation::V1,
-                None,
-                tasks,
-            ),
-        }
+        Self::with_tasks_and_generation(
+            model,
+            String::new(),
+            Some(DEFAULT_SERVER_USERNAME),
+            None,
+            Generation::V1,
+            None,
+            tasks,
+            settings.clone(),
+            layout,
+        )
     }
 
     /// Build a backend against an explicit base URL and credentials, speaking
@@ -173,11 +193,14 @@ impl OpenCodeBackend {
             generation,
             attached_pid,
             TasksHandle::new(),
+            OpenCodeConfig::default(),
+            StateLayout::default(),
         )
     }
 
     /// The one build path: the constructors above differ only in their server
-    /// shape and the Background Task State handle they carry.
+    /// shape, the Background Task State handle they carry, and the lifecycle
+    /// settings/layout the adapter owns.
     #[allow(clippy::too_many_arguments)] // the constructor's flat wiring list
     fn with_tasks_and_generation(
         model: Option<&str>,
@@ -187,6 +210,8 @@ impl OpenCodeBackend {
         generation: Generation,
         attached_pid: Option<i32>,
         tasks: TasksHandle,
+        settings: OpenCodeConfig,
+        layout: StateLayout,
     ) -> Self {
         Self {
             transport: Transport::new(username, password, base_url),
@@ -195,6 +220,9 @@ impl OpenCodeBackend {
             strategy: Arc::new(RwLock::new(generation.strategy())),
             attached_pid: Arc::new(RwLock::new(attached_pid)),
             tasks,
+            settings,
+            layout,
+            server_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -224,7 +252,7 @@ impl OpenCodeBackend {
     ///
     /// Rare; only the reconnect loop (a server restarted/replaced) and Lazy
     /// Start call it.
-    pub fn reconnect(&self, server: Option<&crate::bridge::discovery::ResolvedServer>) {
+    pub fn reconnect(&self, server: Option<&ResolvedServer>) {
         match server {
             Some(server) => {
                 self.transport
@@ -257,6 +285,22 @@ impl OpenCodeBackend {
     /// The current base URL.
     pub fn base_url(&self) -> String {
         self.transport.base_url()
+    }
+
+    /// This client's OpenCode settings — the lifecycle policy it obeys.
+    pub(crate) fn settings(&self) -> &OpenCodeConfig {
+        &self.settings
+    }
+
+    /// The state layout the Owned Server's pid record and the Shared Service's
+    /// files live under.
+    pub(crate) fn layout(&self) -> &StateLayout {
+        &self.layout
+    }
+
+    /// The lock serializing every server mutation on this client.
+    pub(crate) fn server_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.server_lock
     }
 
     /// The configured default model (`[opencode] model`), parsed at startup.

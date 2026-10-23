@@ -15,8 +15,6 @@
 //!
 //! - [`FlowHandles`] — the four per-concern handles plus the backend and the
 //!   platform: the request flow and the external-message flow run on it.
-//! - [`PollHandles`] — [`FlowHandles`] plus the server-ownership state the
-//!   reconcile poller mutates ([`ServerHandle`]).
 //! - [`SnapshotHandles`] — the read-side subset a Session Snapshot gather and
 //!   its claim filter need.
 //! - [`TopicHandles`] — [`FlowHandles`] plus the external flow the topic
@@ -42,7 +40,7 @@ use crate::bridge::request::flow::RequestFlow;
 use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
 use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
 use crate::bridge::turn::{CardSession, CollectReason, Turn};
-use crate::config::{ServerStartPolicy, SessionEntry, ThreadKey};
+use crate::config::{SessionEntry, ThreadKey};
 use crate::feishu;
 
 /// The session map, the session-list cache its write paths invalidate, and the
@@ -1663,36 +1661,6 @@ impl FlowHandles {
     }
 }
 
-/// The OpenCode server-ownership concern (ADR-0013): the start policy, the
-/// preferred port, and the lock serializing every server mutation.
-///
-/// **Locks owned:** `lock`, taken for a whole reconcile pass or a demand
-/// spawn. It is the outermost lock of the bridge: it is never acquired while
-/// holding any handle lock, so no ordering can invert against them. Under it
-/// the reconcile pass reads `waits.inflight` (the only handle lock taken while
-/// it is held) and calls `backend.reconnect`.
-#[derive(Clone)]
-pub(crate) struct ServerHandle {
-    /// When cola may spawn its own `opencode serve` (`auto`/`never`/`eager`).
-    pub(crate) start_policy: ServerStartPolicy,
-    /// Preferred port from `[opencode] url`, a tiebreaker in `pick_server`.
-    pub(crate) preferred_port: Option<u16>,
-    /// `[opencode] generation`: the override the reconnect loop applies when
-    /// it re-probes a changed server (spec #364 §2).
-    pub(crate) generation: crate::config::GenerationOverride,
-    /// Serializes every server mutation — Lazy Start spawns, the reconnect
-    /// loop's re-attach/yield.
-    pub(crate) lock: Arc<Mutex<()>>,
-}
-
-/// The poller bundle: the flow handles plus the server-ownership state the
-/// reconcile loop mutates.
-#[derive(Clone)]
-pub(crate) struct PollHandles {
-    pub(crate) flow: FlowHandles,
-    pub(crate) server: ServerHandle,
-}
-
 /// The read-side bundle a Session Snapshot gather and its claim filter need:
 /// no platform (the card is built as JSON and sent by the caller) and no wait
 /// state (nothing here blocks on a prompt).
@@ -1744,11 +1712,6 @@ pub(crate) struct CommandHandles {
     pub(crate) flow: FlowHandles,
     pub(crate) config: TurnConfig,
     pub(crate) external: Arc<ExternalFlow>,
-    /// Preferred port from `[opencode] url` — the same tiebreaker
-    /// [`crate::bridge::discovery::pick_server`] applies, so
-    /// `/restart-opencode` restarts the canonical server among several of one
-    /// class rather than a lower-port sibling (spec #809, ADR-0085).
-    pub(crate) preferred_port: Option<u16>,
     /// `/diff`'s process-internal cooldown (spec #803): one entry per chat,
     /// claimed before any git/render/upload work. Shared with the rest of the
     /// process through the core, so two `/diff`s in one chat cannot both run

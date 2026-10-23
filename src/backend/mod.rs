@@ -20,10 +20,14 @@
 #[allow(dead_code)]
 pub mod diff_html;
 pub mod file_content;
+pub mod lifecycle;
 pub mod parsing;
 pub mod transcript;
 pub mod turn_diff;
 pub mod types;
+
+pub(crate) use lifecycle::wait_for_server_ready;
+pub use lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, ServerLifecycle};
 
 // The neutral views are re-exported at the contract root: consumers import
 // them from here, never from the decoder's module path.
@@ -153,6 +157,15 @@ impl DirectoryBackend for BackendDirectory {
 /// mock implementations feed scripted transcripts/permissions and verify what
 /// cola renders from them.
 ///
+/// # The lifecycle seam
+///
+/// A client also owns how it is attached to its runtime — discovery, attach,
+/// health and an optional start all live behind [`ServerLifecycle`], which
+/// this trait extends. The bridge's poll loop has one call
+/// ([`ServerLifecycle::ensure_attached`]) and one failure signal
+/// ([`AttachOutcome`]); the OpenCode-specific yield-and-reap policy stays in
+/// the adapter (spec #860, ticket #875, ADR-0090).
+///
 /// # The core, and the surfaces a client may lack
 ///
 /// Some methods describe one runtime's own surface, not a fact every agent
@@ -180,7 +193,7 @@ impl DirectoryBackend for BackendDirectory {
 /// or write genuinely has nothing to report, and reports a failure as an
 /// `Err`. A default must never look like a failed read.
 #[async_trait]
-pub trait Backend: Send + Sync {
+pub trait Backend: ServerLifecycle + Send + Sync {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;
 
     async fn create_session(&self, input: &CreateSessionInput) -> Result<Session>;
@@ -599,33 +612,10 @@ pub trait Backend: Send + Sync {
     /// generation's shape.
     async fn compact(&self, session_id: &str) -> Result<()>;
 
-    /// Re-point the backend at a (re)discovered attachment, selecting that
-    /// attachment's generation strategy (the server was restarted/replaced at
-    /// runtime, or Lazy Start raised one). `None` goes serverless. The caller
-    /// has already resolved the generation (attach detection, spec #364 §2) —
-    /// this never guesses and never probes. No-op for mocks.
-    async fn reconnect(&self, server: Option<&crate::bridge::discovery::ResolvedServer>) -> Result<()>;
-
     /// The base URL this backend currently targets (used by the reconnect loop
     /// to detect a changed server). Empty when serverless (Lazy Start hasn't
     /// attached or spawned yet).
     fn base_url(&self) -> String;
-
-    /// The pid of the server this backend is attached to, when the attach path
-    /// knew it. A neutral identity token: the reconnect loop compares it with
-    /// the discovered candidate's pid so a replacement on the SAME port (a new
-    /// generation or password) is noticed and re-probed (spec #364 §2). `None`
-    /// for mocks and for attachments whose identity was not carried.
-    fn attached_server_pid(&self) -> Option<i32> {
-        None
-    }
-
-    /// Whether this backend can lazily start its own OpenCode server when none
-    /// is running. The real adapter can; test mocks cannot (there is no
-    /// process to spawn), so the Lazy Start hook is a no-op in tests.
-    fn can_self_start_server(&self) -> bool {
-        false
-    }
 
     /// A directory-scoped handle for instance-routed calls (permissions,
     /// questions, session info). The returned handle owns the directory, so no
@@ -652,6 +642,11 @@ mod core_only_client {
     struct CoreClient {
         tasks: crate::bridge::tasks::TasksHandle,
     }
+
+    /// No runtime to discover: the default lifecycle reports "attached,
+    /// nothing to do".
+    #[async_trait]
+    impl ServerLifecycle for CoreClient {}
 
     #[async_trait]
     impl Backend for CoreClient {
@@ -791,10 +786,6 @@ mod core_only_client {
         }
 
         async fn compact(&self, _session_id: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn reconnect(&self, _server: Option<&crate::bridge::discovery::ResolvedServer>) -> Result<()> {
             Ok(())
         }
 

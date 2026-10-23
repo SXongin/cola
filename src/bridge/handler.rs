@@ -1812,7 +1812,7 @@ impl App {
         let perm_handles = self.flow_handles();
         let question_handles = self.flow_handles();
         let external_handles = self.flow_handles();
-        let poll_handles = self.poll_handles();
+        let poll_handles = self.flow_handles();
         let perm_app = Arc::clone(&self);
         let question_app = Arc::clone(&self);
         let external_app = Arc::clone(&self);
@@ -2235,7 +2235,7 @@ impl App {
     /// and [`Self::handle_skill_command`], so `/skill` reports the serverless
     /// state exactly like a prompt.
     async fn ensure_server_for(&self, message_id: &str) -> bool {
-        match crate::bridge::pollers::ensure_server(&self.poll_handles()).await {
+        match crate::bridge::pollers::ensure_server(&self.flow_handles()).await {
             Ok(true) => true,
             Ok(false) => {
                 let _ = self

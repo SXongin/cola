@@ -11,15 +11,10 @@
 //! The allow-list is `src/opencode/` itself — the adapter's own modules may
 //! name each other freely.
 //!
-//! Three item paths are exempt as **batch-local scaffolding**: the adapter's
-//! attach/lifecycle plumbing ([`PENDING_SEAM_MOVE`]) is still driven from the
-//! bridge today, and ticket #875 — in this same batch — moves discovery,
-//! attach and lifecycle behind the client seam. The exemption lets #870 and
-//! #875 land side by side without moving OpenCode-specific types into the
-//! neutral contract before a second adapter earns them (ADR-0090 decision 7).
-//! #875 deletes each entry; the batch is not complete until this list is
-//! **empty**. It is item-scoped, not file-scoped, and must not be extended: an
-//! unrelated `crate::opencode::something` in the same file still fails.
+//! There are **no exemptions**: ticket #875 moved discovery, attach and the
+//! server lifecycle behind the client seam, so the guard is strict. The
+//! adapter's internals — including its generation, strategy, transport and
+//! lifecycle modules — are reachable only from `src/opencode/`.
 //!
 //! Matching runs on a normalised view of each file, not on raw text:
 //!
@@ -59,19 +54,6 @@ pub(crate) const ALLOWED_PREFIXES: &[&str] = &[
     // The adapter owns its own internals: client, strategies, wire decoders,
     // transport and the tests that exercise them.
     "src/opencode/",
-];
-
-/// The adapter plumbing the bridge still names directly, one item path at a
-/// time — batch-local scaffolding that ticket #875 deletes.
-///
-/// Attach and lifecycle are the last OpenCode-shaped work living in the bridge;
-/// #875 moves them behind the client seam. Until then these three item paths
-/// are the *only* escape, and the batch lands no further entry: when #875 is in,
-/// this list is empty and the guard is strict.
-pub(crate) const PENDING_SEAM_MOVE: &[&str] = &[
-    "crate::opencode::generation",
-    "crate::opencode::strategy",
-    "crate::opencode::transport",
 ];
 
 /// The module path the seam forbids outside the adapter.
@@ -204,8 +186,8 @@ impl Normalised {
     ///
     /// Both a plain path (`crate::opencode::types`) and a group that names it
     /// at any depth (`crate::{self, opencode::types}`,
-    /// `crate::{opencode::{types, parsing}}`) count; the exempt item paths do
-    /// not. `roots` are the spellings that reach the crate root from this file
+    /// `crate::{opencode::{types, parsing}}`) count. `roots` are the spellings
+    /// that reach the crate root from this file
     /// ([`roots_for`]): `crate::` everywhere, plus `self::` at the crate root
     /// and `super::` in a depth-1 module.
     fn adapter_mentions(&self, roots: &[&str]) -> Vec<(usize, Leak)> {
@@ -230,9 +212,7 @@ impl Normalised {
                         continue;
                     };
                     mentions.extend(group_mentions(&grouped[..close], search + 1));
-                } else if let Some(suffix) = adapter_suffix(rest)
-                    && !is_exempt(suffix)
-                {
+                } else if adapter_suffix(rest).is_some() {
                     mentions.push((search, Leak::AdapterPath));
                 }
             }
@@ -453,8 +433,7 @@ fn group_mentions(grouped: &str, base: usize) -> Vec<(usize, Leak)> {
     mentions
 }
 
-/// Note one group item if it names the adapter or re-roots the crate, unless it
-/// is an exempt item.
+/// Note one group item if it names the adapter or re-roots the crate.
 fn collect_group_item(item: &str, base: usize, mentions: &mut Vec<(usize, Leak)>) {
     let rooted = item.strip_prefix("self::").unwrap_or(item);
     let offset = base + (item.len() - rooted.len());
@@ -464,9 +443,7 @@ fn collect_group_item(item: &str, base: usize, mentions: &mut Vec<(usize, Leak)>
         mentions.push((offset, Leak::CrateAlias));
         return;
     }
-    if let Some(suffix) = adapter_suffix(rooted)
-        && !is_exempt(suffix)
-    {
+    if adapter_suffix(rooted).is_some() {
         mentions.push((offset, Leak::AdapterPath));
     }
 }
@@ -486,22 +463,6 @@ fn matching_brace(after_open: &str) -> Option<usize> {
         }
     }
     None
-}
-
-/// Whether the path continues with one of the [`PENDING_SEAM_MOVE`] items.
-///
-/// The item name is the whole identifier after `opencode::`: `strategy` is
-/// exempt, `strategy_builder` is not.
-fn is_exempt(suffix: &str) -> bool {
-    let Some(rest) = suffix.strip_prefix("::") else {
-        return false;
-    };
-    let end = rest
-        .find(|ch: char| !is_identifier_continue(ch))
-        .unwrap_or(rest.len());
-    PENDING_SEAM_MOVE
-        .iter()
-        .any(|allowed| allowed.rsplit("::").next() == Some(&rest[..end]))
 }
 
 /// The byte just past `/* … */` at `at`, nested blocks included.
@@ -806,66 +767,39 @@ mod tests {
         assert!(scan_source("src/opencode/tests.rs", planted).is_empty());
     }
 
-    /// Attach and lifecycle are still the bridge's (#875): the three documented
-    /// items are exempt, and only those.
+    /// #875 moved attach and lifecycle behind the seam: there is no escape
+    /// hatch left, so the adapter's generation/strategy/transport paths are
+    /// findings like any other adapter path.
     #[test]
-    fn the_pending_attach_plumbing_is_exempt_for_now() {
-        let planted = "\
-use crate::opencode::generation::{self, ProbeOutcome};
-use crate::opencode::strategy::Generation;
-use crate::opencode::transport::Transport;
-";
-        assert!(findings(planted).is_empty());
-        assert_eq!(
-            PENDING_SEAM_MOVE,
-            [
-                "crate::opencode::generation",
-                "crate::opencode::strategy",
-                "crate::opencode::transport",
-            ]
-        );
-    }
-
-    /// The exemption is a module path, so it survives the normalized forms too.
-    #[test]
-    fn the_pending_exemption_survives_the_normalized_form() {
+    fn the_adapter_plumbing_is_forbidden_outside_the_adapter() {
         for planted in [
+            "use crate::opencode::generation::{self, ProbeOutcome};\n",
+            "use crate::opencode::strategy::Generation;\n",
+            "use crate::opencode::transport::Transport;\n",
             "use crate::{opencode::generation};\n",
             "use crate :: opencode :: strategy :: Generation ;\n",
             "use crate::{\n    opencode::transport::Transport,\n};\n",
-            "use crate::{self::opencode::generation, opencode::strategy};\n",
             "use crate::/*c*/opencode::transport::Transport;\n",
         ] {
-            assert!(findings(planted).is_empty(), "{planted} must stay exempt");
+            assert_eq!(findings(planted).len(), 1, "{planted} must be a finding");
         }
+        // Two adapter paths in one group each report.
+        assert_eq!(
+            findings("use crate::{self::opencode::generation, opencode::strategy};\n").len(),
+            2
+        );
     }
 
-    /// The exemption is per item, not per file, and it stops at an identifier
-    /// boundary: a near-miss name is a finding.
+    /// A finding does not hide its neighbour: two adapter paths on one line or
+    /// in one group each report.
     #[test]
-    fn a_near_miss_on_an_exempt_item_name_is_a_finding() {
-        for planted in [
-            "use crate::opencode::strategy_builder::Plan;\n",
-            "use crate::opencode::types::Session;\n",
-            "use crate::opencode::client::OpenCodeBackend;\n",
-            "use crate::opencode::parsing::parse_model;\n",
-            "use crate::{opencode::strategy_builder};\n",
-            "use crate::opencode as oc;\n",
-        ] {
-            assert_eq!(findings(planted).len(), 1, "{planted} must not be exempt");
-        }
-    }
-
-    /// An exempt item does not shield a forbidden one beside it, on one line or
-    /// inside one group.
-    #[test]
-    fn an_exempt_item_does_not_shield_a_forbidden_one() {
+    fn adjacent_adapter_paths_each_report() {
         for planted in [
             "use crate::opencode::strategy::Generation; use crate::opencode::types::Session;\n",
             "use crate::{opencode::generation, opencode::types::Session};\n",
             "use crate::{\n    opencode::transport,\n    opencode::client::OpenCodeBackend,\n};\n",
         ] {
-            assert_eq!(findings(planted).len(), 1, "{planted} must report one");
+            assert_eq!(findings(planted).len(), 2, "{planted} must report both");
         }
     }
 

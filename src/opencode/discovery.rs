@@ -17,12 +17,16 @@
 //! the official client's discovery contract.
 
 use async_trait::async_trait;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-use crate::bridge::attach;
+use super::attach;
 use crate::config::{GenerationOverride, port_from_url};
 use crate::opencode::strategy::Generation;
 use crate::opencode::transport::Transport;
+use crate::process::{
+    alive as process_alive, cmd as process_cmd, environ as process_environ, force_kill,
+    terminate as terminate_process,
+};
 use crate::state::StateLayout;
 
 /// What a discovered `opencode serve` process is to cola, in selection order.
@@ -162,7 +166,7 @@ fn default_data_home() -> std::path::PathBuf {
 /// lineage, because the generation is not known until the candidate is probed.
 /// It is the effective username **only** on V1: a V2 server ignores
 /// `OPENCODE_SERVER_USERNAME` and always accepts `opencode` (spec #364 §2), so
-/// [`crate::bridge::attach::resolve_probe`] drops an env-derived username once the
+/// [`super::attach::resolve_probe`] drops an env-derived username once the
 /// candidate classifies as V2 — and the probe itself is authenticated with this
 /// value first, which is #763.
 fn username_from_env(env: &[String]) -> String {
@@ -501,11 +505,11 @@ pub fn other_servers<'a>(
 }
 
 /// Whether any default-store server is live in a fresh scan — whoever started
-/// it, cola included. The eager boot uses this to decide "stay serverless"
+/// it, cola included. The boot path uses this to decide "stay serverless"
 /// after a start that did not classify: a V2 Shared Service writes no
-/// `self-opencode.pid` (it is never owned, ADR-0085), so the old
-/// self-pid-based guard would take the bot down at boot whenever a live
-/// service's probe was temporarily inconclusive.
+/// `self-opencode.pid` (it is never owned, ADR-0085), so a self-pid guard
+/// would take the bot down at boot whenever a live service's probe was
+/// temporarily inconclusive.
 pub fn has_live_default_store_server() -> bool {
     scan_processes().iter().any(is_eligible)
 }
@@ -654,126 +658,6 @@ fn is_live_opencode_serve(pid: i32) -> bool {
     process_cmd(pid)
         .map(|args| is_opencode_serve_args(&args))
         .unwrap_or(false)
-}
-
-/// The command-line args of a process, from sysinfo (None if not visible).
-pub fn process_cmd(pid: i32) -> Option<Vec<String>> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
-        false,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
-    );
-    system
-        .process(Pid::from_u32(pid as u32))
-        .map(|p| p.cmd().iter().map(|s| s.to_string_lossy().into_owned()).collect())
-}
-
-/// The executable a process is running, from sysinfo (None if not visible or
-/// the platform does not report it). `cola restart` uses it to re-exec the lock
-/// holder by its own absolute binary path rather than a possibly-relative
-/// argv[0] (ADR-0081).
-pub fn process_exe(pid: i32) -> Option<std::path::PathBuf> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
-        false,
-        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
-    );
-    system
-        .process(Pid::from_u32(pid as u32))
-        .and_then(|p| p.exe().map(|e| e.to_path_buf()))
-}
-
-/// The environment of a process, from sysinfo (`None` if not visible). Used to
-/// tell whether a supervisor owns a running cola (ADR-0021): systemd stamps
-/// `INVOCATION_ID`/`SYSTEMD_EXEC_PID` into every unit process, launchd sets
-/// `XPC_SERVICE_NAME`. Reading another process's env is best-effort — it is
-/// limited to same-user processes on macOS/Windows.
-pub fn process_environ(pid: i32) -> Option<Vec<String>> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
-        false,
-        ProcessRefreshKind::nothing().with_environ(UpdateKind::Always),
-    );
-    system.process(Pid::from_u32(pid as u32)).map(|p| {
-        p.environ()
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect()
-    })
-}
-
-/// The working directory of a process, from sysinfo (`None` if not visible).
-/// `cola restart` re-execs the replacement in the instance's own directory so a
-/// relative `--config` or a `./cola.toml` resolves exactly as it did.
-pub fn process_cwd(pid: i32) -> Option<std::path::PathBuf> {
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]),
-        false,
-        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
-    );
-    system
-        .process(Pid::from_u32(pid as u32))
-        .and_then(|p| p.cwd().map(|c| c.to_path_buf()))
-}
-
-/// Whether a PID refers to a live process (not a zombie, not missing).
-///
-/// Conservative on platforms where sysinfo cannot determine zombie state: a
-/// process that exists but whose status is unknown is treated as alive, so a
-/// lock is never stolen from a process that might still be running.
-pub fn process_alive(pid: i32) -> bool {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid as u32)]), false);
-    match system.process(Pid::from_u32(pid as u32)) {
-        Some(p) => p.status() != sysinfo::ProcessStatus::Zombie,
-        None => false,
-    }
-}
-
-/// Terminate a process. On unix this sends SIGTERM (graceful: the process's
-/// Drop handlers run, releasing the singleton lock and the Feishu WS); the
-/// caller should poll [`process_alive`] and escalate to SIGKILL via
-/// [`force_kill`]. On Windows there is no POSIX signal and the graceful
-/// `taskkill /PID` first stage is a no-op for a windowless CLI, so we go
-/// straight to `taskkill /F`.
-pub fn terminate_process(pid: i32) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        let status = std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!("taskkill /F failed for pid {}", pid)
-        }
-    }
-}
-
-/// Force-kill a process (SIGKILL on unix). No-op on Windows, where
-/// [`terminate_process`] already force-terminated.
-pub fn force_kill(pid: i32) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        let _ = std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status();
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        let _ = pid;
-        Ok(())
-    }
 }
 
 /// Spawn an `opencode serve` on the default store (same semantics as main's
