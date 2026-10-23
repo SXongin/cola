@@ -188,6 +188,23 @@ impl OpenCodeConfig {
     }
 }
 
+/// A `kind = "codex"` Agent Client's options (ADR-0090 decision 3, spec #860).
+///
+/// Deliberately the same [`ServerStartPolicy`] the `opencode` kind reads rather
+/// than a new enum: the policy is "may cola start the runtime, and when", and a
+/// second spelling of it would drift. What differs is the consequence — Codex's
+/// daemon is a shared background server cola may start but **never owns or
+/// reaps** (no pid record, no yield, no signal), so `eager` and `auto` differ
+/// only in *when* the same start is allowed, never in ownership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct CodexConfig {
+    /// When cola may start the app-server daemon: `auto` (lazy, the default),
+    /// `never` (attach-only), `eager` (start at boot). `never` is enforced for
+    /// every path; the other two only decide when a start is attempted.
+    #[serde(default)]
+    pub start_server: ServerStartPolicy,
+}
+
 /// The explicit port of an endpoint URL (`http://localhost:4096`,
 /// `http://127.0.0.1:49374/`), `None` when it carries none. The one parser for
 /// the config's `[opencode] url` tiebreaker, the V2 registration URL discovery
@@ -301,8 +318,10 @@ fn default_client_id() -> String {
 pub enum ClientKind {
     /// The peer OpenCode adapter — the only kind this build constructs.
     Opencode,
-    /// Codex over `app-server` (ADR-0090 decision 2); its adapter is spec #860
-    /// Phase 3, so this build resolves the client but refuses to start it.
+    /// Codex over `app-server` (ADR-0090 decision 2). Discovery, attach and the
+    /// `start_server` policy landed with spec #860 ticket #877; the `Backend`
+    /// implementation that would let this build serve a Codex Session is a
+    /// later ticket, so resolution succeeds and boot still refuses.
     Codex,
 }
 
@@ -339,6 +358,17 @@ impl std::fmt::Display for ClientKind {
 /// with `OpenCodeConfig`'s fields.
 const OPENCODE_CLIENT_KEYS: &[&str] = &["url", "model", "start_server", "generation"];
 
+/// The option keys a `kind = "codex"` Agent Client accepts (spec #860 ticket
+/// #877). `start_server` is the same key and the same [`ServerStartPolicy`] the
+/// `opencode` kind reads; a shared key is legal on both kinds and is checked
+/// against the kind's own list, never rejected as "another kind's".
+const CODEX_CLIENT_KEYS: &[&str] = &["start_server"];
+
+/// Every option key any kind accepts. The table is parsed before `kind` is
+/// validated, so this union is what must be kept out of `unknown`; resolution
+/// then rejects a key the selected kind does not own.
+const CLIENT_OPTION_KEYS: &[&str] = &["url", "model", "start_server", "generation"];
+
 /// One `[clients.<id>]` table: a `kind` plus that kind's options (ADR-0090
 /// decision 5).
 ///
@@ -356,6 +386,9 @@ pub struct ClientEntry {
     /// Read only for `kind = "opencode"`; a named Agent Client never inherits
     /// `[opencode]`.
     pub opencode: OpenCodeConfig,
+    /// This Agent Client's Codex options. Read only for `kind = "codex"`; the
+    /// same rule as `opencode` — a named Agent Client inherits nothing.
+    pub codex: CodexConfig,
     /// Which option keys the table actually spelled. The parsed settings
     /// cannot answer that (`start_server`/`generation` carry defaults), but a
     /// key written on the wrong kind must be named, so presence is recorded
@@ -388,16 +421,19 @@ impl<'de> Deserialize<'de> for ClientEntry {
         };
         let mut options = toml::Table::new();
         let mut present = std::collections::BTreeSet::new();
-        for key in OPENCODE_CLIENT_KEYS {
+        for key in CLIENT_OPTION_KEYS {
             if let Some(value) = table.remove(*key) {
                 present.insert((*key).to_string());
                 options.insert((*key).to_string(), value);
             }
         }
-        let opencode = OpenCodeConfig::deserialize(toml::Value::Table(options)).map_err(D::Error::custom)?;
+        let opencode =
+            OpenCodeConfig::deserialize(toml::Value::Table(options.clone())).map_err(D::Error::custom)?;
+        let codex = CodexConfig::deserialize(toml::Value::Table(options)).map_err(D::Error::custom)?;
         Ok(Self {
             kind,
             opencode,
+            codex,
             present,
             unknown: table.into_iter().collect(),
         })
@@ -421,17 +457,26 @@ impl Serialize for ClientEntry {
         }
         let is_opencode = self.kind.as_deref() == Some(ClientKind::Opencode.as_str());
         if is_opencode || !self.present.is_empty() {
-            let options = toml::Value::try_from(&self.opencode)
-                .map_err(|error| serde::ser::Error::custom(error.to_string()))?;
-            if let toml::Value::Table(options) = options {
-                for (key, value) in options {
-                    // An `opencode` client prints its whole option set (like
-                    // `[opencode]` itself); any other kind prints only the keys
-                    // the file actually spelled, so `config show` neither
-                    // invents options nor hides a rejected one.
-                    if is_opencode || self.present.contains(&key) {
-                        map.serialize_entry(&key, &value)?;
-                    }
+            // An `opencode` client prints its whole option set (like
+            // `[opencode]` itself); any other kind prints only the keys the
+            // file actually spelled, so `config show` neither invents options
+            // nor hides a rejected one. Both kinds' tables are merged for the
+            // selection: a `codex` client's own key prints, and so does an
+            // `opencode` key it misspelled — resolution rejects that key, but
+            // the file must stay visible.
+            let mut options = toml::Table::new();
+            for table in [
+                toml::Value::try_from(&self.opencode),
+                toml::Value::try_from(&self.codex),
+            ] {
+                let table = table.map_err(|error| serde::ser::Error::custom(error.to_string()))?;
+                if let toml::Value::Table(table) = table {
+                    options.extend(table);
+                }
+            }
+            for (key, value) in options {
+                if is_opencode || self.present.contains(&key) {
+                    map.serialize_entry(&key, &value)?;
                 }
             }
         }
@@ -467,15 +512,16 @@ impl ClientEntry {
         }
     }
 
-    /// Reject an OpenCode option written on a client of another kind: the
-    /// running client would ignore it, which is the same silent-settings-change
-    /// class as an unknown key. `BTreeSet` order makes the reported key
-    /// deterministic.
+    /// Reject an option written on a client of another kind: the running
+    /// client would ignore it, which is the same silent-settings-change class
+    /// as an unknown key. A key both kinds accept (`start_server`) is legal on
+    /// either. `BTreeSet` order makes the reported key deterministic.
     fn options_for_kind(&self, id: &str, kind: ClientKind) -> Result<(), ClientConfigError> {
-        if kind == ClientKind::Opencode {
-            return Ok(());
-        }
-        match self.present.iter().next() {
+        let accepted = match kind {
+            ClientKind::Opencode => OPENCODE_CLIENT_KEYS,
+            ClientKind::Codex => CODEX_CLIENT_KEYS,
+        };
+        match self.present.iter().find(|key| !accepted.contains(&key.as_str())) {
             Some(key) => Err(ClientConfigError::OptionForAnotherKind {
                 id: id.to_string(),
                 key: key.clone(),
@@ -503,13 +549,22 @@ pub struct ActiveClient {
 }
 
 impl ActiveClient {
-    /// This client's OpenCode options when it is an `opencode` client — the
-    /// only kind with options modelled so far (ADR-0090 decision 7: the second
-    /// kind's settings are earned by its adapter, not designed ahead).
+    /// This client's OpenCode options when it is an `opencode` client.
     pub fn opencode(&self) -> Option<&OpenCodeConfig> {
         match &self.settings {
             ClientSettings::Opencode(settings) => Some(settings),
-            ClientSettings::Codex => None,
+            ClientSettings::Codex(_) => None,
+        }
+    }
+
+    /// This client's Codex options when it is a `codex` client (spec #860
+    /// ticket #877: daemon discovery and the `start_server` policy). No
+    /// production caller until the adapter's composition root lands (#879).
+    #[allow(dead_code)]
+    pub fn codex(&self) -> Option<&CodexConfig> {
+        match &self.settings {
+            ClientSettings::Opencode(_) => None,
+            ClientSettings::Codex(settings) => Some(settings),
         }
     }
 }
@@ -518,9 +573,9 @@ impl ActiveClient {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientSettings {
     Opencode(OpenCodeConfig),
-    /// Codex has no configurable options yet; #877 adds daemon discovery
-    /// settings with the adapter that reads them.
-    Codex,
+    /// Codex's options (spec #860 ticket #877): the daemon is discovered under
+    /// `$CODEX_HOME`, and `start_server` decides whether cola may start it.
+    Codex(CodexConfig),
 }
 
 /// Why a config cannot resolve its active client. Every message names the
@@ -544,14 +599,14 @@ pub enum ClientConfigError {
     /// `[clients.<id>]` carries a key no option list defines.
     #[error(
         "`clients.{id}.{key}` is not a recognised Agent Client setting; `[clients.{id}]` takes `kind` \
-         plus that kind's option keys (`url`, `model`, `start_server`, `generation` for `opencode`), \
-         never a nested table"
+         plus that kind's option keys (`url`, `model`, `start_server`, `generation` for `opencode`; \
+         `start_server` for `codex`), never a nested table"
     )]
     UnknownSetting { id: String, key: String },
-    /// `[clients.<id>]` carries an `opencode` option but selects another kind.
+    /// `[clients.<id>]` carries an option another kind owns.
     #[error(
-        "`clients.{id}.{key}` is an `opencode` option, but `clients.{id}.kind = \"{kind}\"`; a setting \
-         that kind ignores is rejected rather than accepted and dropped"
+        "`clients.{id}.{key}` is not an option of `clients.{id}.kind = \"{kind}\"`; a setting that \
+         kind ignores is rejected rather than accepted and dropped"
     )]
     OptionForAnotherKind { id: String, key: String, kind: String },
     /// `[bridge] default_client` names no configured table.
@@ -606,7 +661,7 @@ impl Config {
         let kind = entry.kind_for(id)?;
         let settings = match kind {
             ClientKind::Opencode => ClientSettings::Opencode(entry.opencode.clone()),
-            ClientKind::Codex => ClientSettings::Codex,
+            ClientKind::Codex => ClientSettings::Codex(entry.codex.clone()),
         };
         Ok(ActiveClient {
             id: id.to_string(),
@@ -1209,7 +1264,8 @@ mod tests {
         let active = cfg.active_client().unwrap();
         assert_eq!(active.id, "ada");
         assert_eq!(active.kind, ClientKind::Codex);
-        assert_eq!(active.settings, ClientSettings::Codex);
+        assert_eq!(active.settings, ClientSettings::Codex(CodexConfig::default()));
+        assert_eq!(active.codex(), Some(&CodexConfig::default()));
         assert_eq!(
             active.opencode(),
             None,
@@ -1452,6 +1508,71 @@ mod tests {
         assert_eq!(
             declared, fields,
             "OPENCODE_CLIENT_KEYS must list every OpenCodeConfig field"
+        );
+    }
+
+    /// The same rule for the second kind: every `CodexConfig` field is an
+    /// accepted client key, and every key any kind accepts is parsed out of the
+    /// raw table (`CLIENT_OPTION_KEYS` must cover the union).
+    #[test]
+    fn the_key_lists_match_the_codex_config_and_cover_every_kind() {
+        use std::collections::BTreeSet;
+
+        let full = CodexConfig {
+            start_server: ServerStartPolicy::Never,
+        };
+        let toml::Value::Table(serialised) = toml::Value::try_from(&full).unwrap() else {
+            panic!("a config struct serialises to a table");
+        };
+        let declared: BTreeSet<&str> = CODEX_CLIENT_KEYS.iter().copied().collect();
+        let fields: BTreeSet<&str> = serialised.keys().map(String::as_str).collect();
+        assert_eq!(
+            declared, fields,
+            "CODEX_CLIENT_KEYS must list every CodexConfig field"
+        );
+
+        let union: BTreeSet<&str> = OPENCODE_CLIENT_KEYS
+            .iter()
+            .chain(CODEX_CLIENT_KEYS)
+            .copied()
+            .collect();
+        let parsed: BTreeSet<&str> = CLIENT_OPTION_KEYS.iter().copied().collect();
+        assert_eq!(
+            parsed, union,
+            "CLIENT_OPTION_KEYS must cover both kinds, or a shared key becomes an unknown setting"
+        );
+    }
+
+    /// A `codex` Agent Client reads the same `start_server` key and policy the
+    /// `opencode` kind does (spec #860 ticket #877), and `config show` prints
+    /// the key the file spelled.
+    #[test]
+    fn a_codex_client_reads_the_shared_start_server_policy() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             start_server = \"never\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let active = cfg.active_client().unwrap();
+        assert_eq!(active.codex().unwrap().start_server, ServerStartPolicy::Never);
+        assert_eq!(active.opencode(), None);
+
+        let dumped = masked_config_toml(&cfg).unwrap();
+        assert!(
+            dumped.contains("start_server = \"never\""),
+            "the codex option the file spelled must print: {dumped}"
+        );
+
+        // Unset is the same lazy default the opencode kind has.
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n",
+            minimal()
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.active_client().unwrap().codex().unwrap().start_server,
+            ServerStartPolicy::Auto
         );
     }
 

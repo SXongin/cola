@@ -445,7 +445,9 @@ mod tests {
                 ClientKind::Opencode => {
                     crate::config::ClientSettings::Opencode(crate::config::OpenCodeConfig::default())
                 }
-                ClientKind::Codex => crate::config::ClientSettings::Codex,
+                ClientKind::Codex => {
+                    crate::config::ClientSettings::Codex(crate::config::CodexConfig::default())
+                }
             },
         }
     }
