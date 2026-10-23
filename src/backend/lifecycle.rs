@@ -152,9 +152,12 @@ pub trait ServerLifecycle: Send + Sync {
 /// forever — the Lazy Start flow's first request always landed there, hanging
 /// the turn silently (the Lazy Start silent-hang incident). Each probe is
 /// short-bounded so a wedged attempt is abandoned and retried on a fresh
-/// connection. ANY HTTP response — success or error — counts as ready: the
+/// connection. An **HTTP response** — success or error — counts as ready: the
 /// failure mode being dodged is a swallowed request (no response at all), and a
-/// responding server is past the window even when it answers with an error.
+/// responding server is past the window even when it answers with an error. A
+/// **transport** failure (connect/send/timeout) is not a response and keeps
+/// retrying: a connection reset between the generation probe and this probe
+/// must not be read as readiness.
 pub(crate) async fn wait_for_server_ready<T>(
     backend: &T,
     timeout: Duration,
@@ -165,8 +168,9 @@ where
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match tokio::time::timeout(Duration::from_millis(1500), backend.list_sessions()).await {
-            Ok(Ok(_)) | Ok(Err(_)) => return Ok(()),
-            Err(_) => {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(error)) if answered(&error) => return Ok(()),
+            Ok(Err(_)) | Err(_) => {
                 if tokio::time::Instant::now() >= deadline {
                     // The adapter owns the runtime's error vocabulary; this
                     // helper only reports the neutral evidence.
@@ -175,5 +179,50 @@ where
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
+    }
+}
+
+/// Whether an error proves the server answered, as opposed to a transport
+/// failure before any response.
+///
+/// `BridgeError::Http` carries the reqwest error, so a status / decode / body
+/// failure is a response; connect, keep-alive and send failures are not. Every
+/// other variant comes from code that ran after a response was read.
+fn answered(error: &crate::error::BridgeError) -> bool {
+    match error {
+        crate::error::BridgeError::Http(error) => {
+            !(error.is_connect() || error.is_timeout() || error.is_request())
+        }
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_connection_failure_is_not_readiness() {
+        // `no_proxy`: an environment proxy would answer for the refused port
+        // and turn this into a response, hiding the case under test.
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get("http://127.0.0.1:1/")
+            .send()
+            .await
+            .expect_err("port 1 must refuse the connection");
+        assert!(
+            !answered(&crate::error::BridgeError::Http(error)),
+            "a connect/send failure is not an HTTP response"
+        );
+    }
+
+    #[test]
+    fn an_application_error_after_a_response_is_readiness() {
+        assert!(answered(&crate::error::BridgeError::OpenCode(
+            "request failed: 401 Unauthorized".into()
+        )));
     }
 }
