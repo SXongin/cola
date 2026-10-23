@@ -37,6 +37,10 @@ renaming a client id is a state migration, not a config edit.
   conversation; it does not move when the agent client changes. `access.json`
   names the Host and `pinned_chats.json` names Chat/Topics, so neither gains a
   client id — but, like every durable file, both gain a format version.
+- **"Every durable file" means the state sidecars, not every file under
+  `~/.cola`.** `restart-notify.json` is a one-shot announcement the successor
+  consumes and deletes; the lock and pid files are coordination, not state.
+  Neither is read as history, so neither carries a version.
 
 ## Decision
 
