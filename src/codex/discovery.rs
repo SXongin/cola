@@ -208,6 +208,8 @@ pub(crate) struct Daemon {
     /// The binary the daemon actually runs, for the schema probe.
     pub(crate) managed_binary: PathBuf,
     /// The management CLI's report, when it could produce one.
+    // Read by `cola doctor` (#883); discovery keeps it decoded today.
+    #[allow(dead_code)]
     pub(crate) info: Option<DaemonInfo>,
 }
 
@@ -220,6 +222,8 @@ pub(crate) enum DaemonState {
     /// No daemon: no socket at the path, or the path is not dialable. The
     /// evidence is for the log and `cola doctor`.
     Absent {
+        // Read by `cola doctor` (#883).
+        #[allow(dead_code)]
         evidence: String,
     },
 }

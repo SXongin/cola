@@ -12,6 +12,9 @@ use thiserror::Error;
 
 pub(crate) type Result<T> = std::result::Result<T, CodexError>;
 
+// `Endpoint` and `UnsupportedPlatform` are the parse/transport arms a `ws://`
+// or a non-unix build reaches; the daemon path never constructs them here.
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum CodexError {
     /// The listen URL is not one this client speaks. Codex also supports

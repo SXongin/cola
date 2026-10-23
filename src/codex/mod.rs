@@ -1,8 +1,9 @@
-//! A client for `codex app-server` (spec #860, tickets #876/#877/#878).
+//! A client for `codex app-server` (spec #860, tickets #876/#877/#878/#879).
 //!
 //! This is the adapter's first slices: transport, handshake and the pinned
-//! schema contract; daemon discovery and the lifecycle; and thread discovery,
-//! adoption and subscription. The bridge never names this module — it reaches
+//! schema contract; daemon discovery and the lifecycle; thread discovery,
+//! adoption and subscription; and the neutral read model served from the
+//! adapter-owned subscription. The bridge never names this module — it reaches
 //! the active client through `SharedCore::client` and the `crate::backend`
 //! contract (ADR-0090); `cargo xtask check-client-seam` keeps the OpenCode
 //! adapter's module path out of everything beside it.
@@ -17,21 +18,16 @@
 //! probe-and-degrade consequence, the shape ADR-0055 gave generation
 //! detection).
 
-// Nothing in the binary constructs the Codex adapter yet: #877 landed daemon
-// discovery and the lifecycle, but the composition root and the `Backend`
-// implementation are #879's, and `main`'s capability gate still refuses a
-// `codex` client. Until that root exists nothing here is reachable from
-// `main`, and dead-code analysis (a bin crate's) would flag the whole slice —
-// including the paths #877 *did* give real callers inside the slice
-// (`CodexLifecycle::ensure_attached` reaches discovery, the handshake, the
-// managed-binary probe and the neutral error). The silence is removed by the
-// ticket that constructs the adapter, not item by item.
-#![allow(dead_code)]
+// The composition root constructs this adapter by `ActiveClient.kind`, so the
+// slice is reachable from `main`; the remaining test-only helpers are marked
+// where they live rather than silencing the whole module.
 
+pub(crate) mod backend;
 pub(crate) mod client;
 pub(crate) mod discovery;
 pub(crate) mod error;
 pub(crate) mod lifecycle;
+pub(crate) mod read_model;
 pub(crate) mod schema;
 pub(crate) mod threads;
 pub(crate) mod transport;
