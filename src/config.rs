@@ -323,31 +323,78 @@ impl std::fmt::Display for ClientKind {
     }
 }
 
+/// The option keys an `opencode` Agent Client accepts: letter for letter what
+/// `[opencode]` accepts.
+///
+/// Kept as an explicit list, not derived from the struct, because the parser
+/// must tell a known option from a nested table (`[clients.ada.opencode]`) or a
+/// typo — `serde(flatten)` would swallow both silently.
+/// `the_option_key_list_matches_the_opencode_config` keeps the list in step
+/// with `OpenCodeConfig`'s fields.
+const OPENCODE_CLIENT_KEYS: &[&str] = &["url", "model", "start_server", "generation"];
+
 /// One `[clients.<id>]` table: a `kind` plus that kind's options (ADR-0090
 /// decision 5).
 ///
-/// `kind` stays raw text here so a missing or misspelled value is reported by
-/// [`Config::active_client`] with the table it came from
-/// (`clients.<id>.kind`) — serde's own "missing field `kind`" would name neither
-/// the table nor the key path.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Deserialised by hand from the raw table so every key is accounted for:
+/// `kind`, the `opencode` option keys above, and — instead of being silently
+/// dropped by a `flatten` — whatever is left, which [`Config::active_client`]
+/// then rejects naming the table (`clients.<id>.<key>`). `kind` stays raw text
+/// so a missing or misspelled value is reported with that same path.
+#[derive(Debug, Clone, Default)]
 pub struct ClientEntry {
     /// The adapter selector, `opencode` or `codex`. Required; validated on
     /// resolution.
-    #[serde(default)]
     pub kind: Option<String>,
-    /// This client's OpenCode options, flattened into the same table — the
-    /// keys `[opencode]` accepts (`url`, `start_server`, `generation`,
-    /// `model`). Read only for `kind = "opencode"`; a named client never
-    /// inherits `[opencode]`.
-    #[serde(flatten)]
+    /// This Agent Client's OpenCode options — the keys `[opencode]` accepts.
+    /// Read only for `kind = "opencode"`; a named Agent Client never inherits
+    /// `[opencode]`.
     pub opencode: OpenCodeConfig,
+    /// Keys no option list defines (a nested `[clients.<id>.opencode]` table, a
+    /// typo such as `model_typo`, a future setting this build predates). Kept
+    /// so resolution can fail loudly instead of running different settings
+    /// than the file spells.
+    unknown: std::collections::BTreeMap<String, toml::Value>,
+}
+
+impl<'de> Deserialize<'de> for ClientEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let mut table = toml::Table::deserialize(deserializer)?;
+        let kind = match table.remove("kind") {
+            None => None,
+            Some(toml::Value::String(kind)) => Some(kind),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "`kind` must be a string (`opencode` or `codex`), got {}",
+                    other.type_str()
+                )));
+            }
+        };
+        let mut options = toml::Table::new();
+        for key in OPENCODE_CLIENT_KEYS {
+            if let Some(value) = table.remove(*key) {
+                options.insert((*key).to_string(), value);
+            }
+        }
+        let opencode = OpenCodeConfig::deserialize(toml::Value::Table(options)).map_err(D::Error::custom)?;
+        Ok(Self {
+            kind,
+            opencode,
+            unknown: table.into_iter().collect(),
+        })
+    }
 }
 
 /// `[clients.<id>]` is one table: `kind` plus that kind's options. Only an
-/// `opencode` client has options today, so its keys are serialised only then —
-/// a `codex` table must not grow `start_server`/`generation` rows it ignores in
-/// `cola config show`.
+/// `opencode` Agent Client has options today, so its keys are serialised only
+/// then — a `codex` table must not grow `start_server`/`generation` rows it
+/// ignores in `cola config show`. Keys resolution rejects are still printed:
+/// `config show` must not hide what the file says.
 impl Serialize for ClientEntry {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -368,6 +415,9 @@ impl Serialize for ClientEntry {
                 }
             }
         }
+        for (key, value) in &self.unknown {
+            map.serialize_entry(key, value)?;
+        }
         map.end()
     }
 }
@@ -382,6 +432,19 @@ impl ClientEntry {
             id: id.to_string(),
             kind: raw.to_string(),
         })
+    }
+
+    /// Reject any key the table carried that no option list claims, naming the
+    /// client and the setting (`clients.ada.opencode` for a nested table).
+    /// `BTreeMap` order makes the reported key deterministic.
+    fn unknown_setting(&self, id: &str) -> Result<(), ClientConfigError> {
+        match self.unknown.iter().next() {
+            Some((key, _)) => Err(ClientConfigError::UnknownSetting {
+                id: id.to_string(),
+                key: key.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -440,6 +503,13 @@ pub enum ClientConfigError {
     /// `[clients.<id>] kind = "<unknown>"`.
     #[error("`clients.{id}.kind = \"{kind}\"` is not a known client kind; expected `opencode` or `codex`")]
     UnknownKind { id: String, kind: String },
+    /// `[clients.<id>]` carries a key no option list defines.
+    #[error(
+        "`clients.{id}.{key}` is not a recognised Agent Client setting; `[clients.{id}]` takes `kind` \
+         plus that kind's option keys (`url`, `model`, `start_server`, `generation` for `opencode`), \
+         never a nested table"
+    )]
+    UnknownSetting { id: String, key: String },
     /// `[bridge] default_client` names no configured table.
     #[error("`bridge.default_client = \"{id}\"` names no configured client (configured: {available})")]
     UnknownDefaultClient { id: String, available: String },
@@ -462,11 +532,13 @@ impl Config {
             return Err(ClientConfigError::DuplicateDefaultClient);
         }
         // Every declared table is read the same way, active or not: a missing
-        // or misspelled `kind` is a config typo, and reporting it while the table
-        // is inert would leave it to break a later switch. `BTreeMap` order
-        // makes which one is reported first deterministic.
+        // or misspelled `kind`, or a key no option list claims, is a config
+        // error — reporting it while the table is inert would leave it to break
+        // a later switch. `BTreeMap` order makes which one is reported first
+        // deterministic.
         for (entry_id, entry) in &self.clients {
             entry.kind_for(entry_id)?;
+            entry.unknown_setting(entry_id)?;
         }
         let id = self.bridge.default_client.as_deref().unwrap_or(DEFAULT_CLIENT_ID);
         if id == DEFAULT_CLIENT_ID {
@@ -686,9 +758,11 @@ pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
         }
         ConfigAction::Validate => {
             let path = path.ok_or_else(|| anyhow::anyhow!("未找到配置文件"))?;
-            // `load` is the same parser the daemon uses, so a valid result here
-            // is exactly what `cola` would accept at boot — including the
-            // active-client resolution over `[clients.<id>]` (ADR-0090 §5).
+            // `load` is the same parser the daemon uses, and the active Agent
+            // Client must resolve — but this command answers "is the config
+            // resolvable", not "can this build attach to it": an active
+            // `codex` client is valid config and startup's capability gate is
+            // what refuses it until its adapter lands (ADR-0090 §5).
             let cfg = load(&path)?;
             cfg.active_client()?;
             println!("配置有效: {}", path.display());
@@ -1222,6 +1296,90 @@ mod tests {
         assert!(message.contains("acp"), "{message}");
     }
 
+    /// `[clients.ada.opencode]` is a nested table, not an option: it must fail
+    /// naming the key rather than being swallowed by a flatten and leaving
+    /// resolution on defaults (review finding on #872).
+    #[test]
+    fn a_nested_client_options_table_is_rejected() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"opencode\"\n\
+             \n[clients.ada.opencode]\nmodel = \"provider/model\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(
+            err,
+            ClientConfigError::UnknownSetting {
+                id: "ada".into(),
+                key: "opencode".into(),
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("clients.ada.opencode"), "{message}");
+    }
+
+    /// An unknown scalar is rejected too, naming the setting and the client.
+    #[test]
+    fn an_unknown_client_setting_is_rejected() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"opencode\"\n\
+             model_typo = \"x\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(
+            err,
+            ClientConfigError::UnknownSetting {
+                id: "ada".into(),
+                key: "model_typo".into(),
+            }
+        );
+        assert!(err.to_string().contains("clients.ada.model_typo"), "{err}");
+    }
+
+    /// Every `[opencode]` option key is accepted inside a client table, and
+    /// lands in that Agent Client's settings.
+    #[test]
+    fn every_opencode_option_key_is_accepted_in_a_client_table() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"opencode\"\n\
+             url = \"http://localhost:4222\"\nmodel = \"provider/model\"\n\
+             start_server = \"never\"\ngeneration = \"v2\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let settings = cfg.active_client().unwrap().opencode().cloned().unwrap();
+        assert_eq!(settings.url.as_deref(), Some("http://localhost:4222"));
+        assert_eq!(settings.model.as_deref(), Some("provider/model"));
+        assert_eq!(settings.start_server, ServerStartPolicy::Never);
+        assert_eq!(settings.generation, GenerationOverride::V2);
+    }
+
+    /// The hand-written key list must match `OpenCodeConfig`'s fields, so a new
+    /// option cannot become an "unknown setting" the day it is added.
+    #[test]
+    fn the_option_key_list_matches_the_opencode_config() {
+        use std::collections::BTreeSet;
+
+        let full = OpenCodeConfig {
+            url: Some("http://localhost:4222".into()),
+            model: Some("provider/model".into()),
+            start_server: ServerStartPolicy::Never,
+            generation: GenerationOverride::V2,
+        };
+        let toml::Value::Table(serialised) = toml::Value::try_from(&full).unwrap() else {
+            panic!("a config struct serialises to a table");
+        };
+        let declared: BTreeSet<&str> = OPENCODE_CLIENT_KEYS.iter().copied().collect();
+        let fields: BTreeSet<&str> = serialised.keys().map(String::as_str).collect();
+        assert_eq!(
+            declared, fields,
+            "OPENCODE_CLIENT_KEYS must list every OpenCodeConfig field"
+        );
+    }
+
     /// Reading resolves but never writes: neither `load` nor resolution may
     /// rewrite the user's hand-maintained file.
     #[test]
@@ -1291,5 +1449,18 @@ mod tests {
         .unwrap();
         let dumped = masked_config_toml(&opencode).unwrap();
         assert!(dumped.contains("model = \"opencode/work\""), "{dumped}");
+
+        // A setting resolution rejects is still printed: `config show` must not
+        // be the quiet half of the silent-drop bug.
+        let nested: Config = toml::from_str(&format!(
+            "{}\n[clients.ada]\nkind = \"opencode\"\n\n[clients.ada.opencode]\nmodel = \"p/m\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let dumped = masked_config_toml(&nested).unwrap();
+        assert!(
+            dumped.contains("[clients.ada.opencode]"),
+            "unknown settings stay visible: {dumped}"
+        );
     }
 }
