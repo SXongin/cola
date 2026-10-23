@@ -740,7 +740,7 @@ mod tests {
             &config_path,
             format!(
                 "[feishu]\napp_id = \"a\"\napp_secret = \"b\"\n\n[bridge]\naccess_file = \"{}\"\n",
-                access_path.display()
+                access_path.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();
