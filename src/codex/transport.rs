@@ -38,14 +38,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -150,6 +150,25 @@ struct Pending {
     reply: oneshot::Sender<std::result::Result<Value, RpcFailure>>,
 }
 
+/// Removes one request's pending entry on **every** exit path — including a
+/// caller cancelling the future while the send is blocked on a full queue or
+/// while the response is awaited. Without it the map would grow with every
+/// cancelled call even though the frame queue is bounded.
+struct PendingEntry {
+    inner: Arc<ConnectionInner>,
+    id: u64,
+}
+
+impl Drop for PendingEntry {
+    fn drop(&mut self) {
+        self.inner
+            .pending
+            .lock()
+            .expect("pending requests")
+            .remove(&self.id);
+    }
+}
+
 struct ConnectionInner {
     outgoing: mpsc::Sender<Message>,
     next_id: AtomicU64,
@@ -159,6 +178,10 @@ struct ConnectionInner {
     /// this fails immediately instead of waiting on a response that cannot
     /// come.
     closed: std::sync::atomic::AtomicBool,
+    /// Ends the writer when the connection closes. A watch (state-bearing, not
+    /// a one-shot notify) so a close that races the writer's select cannot be
+    /// missed: the writer sees the value even when it checks after the send.
+    closing: watch::Sender<bool>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
@@ -246,6 +269,7 @@ impl RpcConnection {
         let (sink, stream) = socket.split();
         let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
+        let (closing, closing_rx) = watch::channel(false);
 
         let inner = Arc::new(ConnectionInner {
             outgoing,
@@ -253,10 +277,11 @@ impl RpcConnection {
             pending: Mutex::new(HashMap::new()),
             inbound,
             closed: std::sync::atomic::AtomicBool::new(false),
+            closing,
             tasks: Mutex::new(Vec::new()),
         });
 
-        let writer = tokio::spawn(write_loop(sink, outgoing_rx, Arc::downgrade(&inner)));
+        let writer = tokio::spawn(write_loop(sink, outgoing_rx, closing_rx, Arc::downgrade(&inner)));
         let reader = tokio::spawn(read_loop(stream, Arc::downgrade(&inner)));
         inner
             .tasks
@@ -281,6 +306,12 @@ impl RpcConnection {
             .lock()
             .expect("pending requests")
             .insert(id, Pending { reply });
+        // Armed immediately: cancellation anywhere below (blocked on a full
+        // queue, waiting for the response) must not leave this entry behind.
+        let _pending = PendingEntry {
+            inner: Arc::clone(&self.inner),
+            id,
+        };
 
         let frame = json!({
             "jsonrpc": "2.0",
@@ -288,15 +319,11 @@ impl RpcConnection {
             "method": method,
             "params": params,
         });
-        if let Err(error) = self.send(&frame).await {
-            self.inner.pending.lock().expect("pending requests").remove(&id);
-            return Err(error);
-        }
+        self.send(&frame).await?;
         // The connection may have ended between the check above and the send;
-        // the close drains whatever is pending at that moment, so remove this
-        // waiter ourselves rather than wait forever.
+        // the close drains whatever is pending at that moment, and `_pending`
+        // covers the remaining window.
         if self.closed() {
-            self.inner.pending.lock().expect("pending requests").remove(&id);
             return Err(CodexError::NoResponse(method.to_string()));
         }
 
@@ -333,6 +360,31 @@ impl RpcConnection {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
+    /// A connection with no socket and no writer task: the caller owns the
+    /// frame receiver, so it can hold the queue full and observe blocked
+    /// senders. Test-only.
+    #[cfg(test)]
+    fn test_connection(capacity: usize) -> (Self, mpsc::Receiver<Message>, watch::Receiver<bool>) {
+        let (outgoing, outgoing_rx) = mpsc::channel(capacity);
+        let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
+        let (closing, closing_rx) = watch::channel(false);
+        let inner = Arc::new(ConnectionInner {
+            outgoing,
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            inbound,
+            closed: std::sync::atomic::AtomicBool::new(false),
+            closing,
+            tasks: Mutex::new(Vec::new()),
+        });
+        (Self { inner }, outgoing_rx, closing_rx)
+    }
+
+    #[cfg(test)]
+    fn pending_len(&self) -> usize {
+        self.inner.pending.lock().expect("pending requests").len()
+    }
+
     async fn send(&self, message: &Value) -> Result<()> {
         let text = serde_json::to_string(message).map_err(|error| CodexError::Transport {
             context: "encode a JSON-RPC frame".to_string(),
@@ -347,19 +399,50 @@ impl RpcConnection {
 }
 
 /// Serialise every outgoing frame; the sink is the only writer.
-async fn write_loop(
-    mut sink: SplitSink<Socket, Message>,
+///
+/// Selects on the connection's close signal in both states — waiting for a
+/// frame and sending one — so a close ends the writer even while it is wedged
+/// on a peer that stopped reading. Dropping the receiver before returning is
+/// what wakes callers blocked in `send()` on the bounded queue: they see a
+/// send error and fail their request instead of waiting for a writer that no
+/// longer exists.
+async fn write_loop<S>(
+    mut sink: S,
     mut outgoing: mpsc::Receiver<Message>,
+    mut closing: watch::Receiver<bool>,
     inner: Weak<ConnectionInner>,
-) {
-    while let Some(message) = outgoing.recv().await {
-        if sink.send(message).await.is_err() {
-            break;
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Debug,
+{
+    let mut close_while_sending = closing.clone();
+    loop {
+        tokio::select! {
+            biased;
+            _ = closing.changed() => break,
+            message = outgoing.recv() => {
+                let Some(message) = message else { break };
+                tokio::select! {
+                    biased;
+                    _ = close_while_sending.changed() => break,
+                    result = sink.send(message) => {
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
-    // Dropping the sink completes the WebSocket close handshake as far as this
-    // half can; the reader sees the peer's close (or its own error) next.
-    let _ = sink.close().await;
+    // Wake every caller blocked on the queue's capacity *before* the graceful
+    // close: on a teardown a partial frame does not matter, and a caller must
+    // never wait for a writer that is exiting.
+    drop(outgoing);
+    if !*closing.borrow() {
+        // Dropping the sink completes the WebSocket close handshake as far as
+        // this half can; the reader sees the peer's close next.
+        let _ = sink.close().await;
+    }
     if let Some(inner) = inner.upgrade() {
         close(&inner);
     }
@@ -382,7 +465,7 @@ async fn read_loop(mut stream: SplitStream<Socket>, inner: Weak<ConnectionInner>
                     // stream with unknown gaps cannot be trusted — so the
                     // connection is closed and every waiter fails by name.
                     tracing::warn!(
-                        "codex app-server sent a non-JSON text frame; closing the connection:                          {error}"
+                        "codex app-server sent a non-JSON text frame; closing the connection: {error}"
                     );
                     close(&inner);
                     break;
@@ -415,6 +498,9 @@ fn close(inner: &ConnectionInner) {
     if inner.closed.swap(true, Ordering::SeqCst) {
         return;
     }
+    // End the writer first: it drops the frame receiver, which wakes callers
+    // blocked on the bounded queue (their send fails instead of hanging).
+    let _ = inner.closing.send(true);
     let pending = std::mem::take(&mut *inner.pending.lock().expect("pending requests"));
     for (_, pending) in pending {
         let _ = pending.reply.send(Err(RpcFailure::Closed));
@@ -475,6 +561,7 @@ fn dispatch(inner: &Arc<ConnectionInner>, value: Value) {
 mod tests {
     use std::time::Duration;
 
+    use futures_util::Sink;
     use serde_json::json;
 
     use super::*;
@@ -607,6 +694,129 @@ mod tests {
     /// A frame that is not JSON cannot be correlated: the connection closes and
     /// the pending waiter fails by name instead of hanging forever (thread
     /// calls carry no per-call timeout).
+    /// A caller cancelled while its frame waits on the bounded queue must not
+    /// leave a pending entry behind; otherwise the map grows without bound even
+    /// though the queue does not.
+    #[tokio::test]
+    async fn a_cancelled_request_removes_its_pending_entry() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        connection
+            .inner
+            .outgoing
+            .try_send(Message::Text("filler".into()))
+            .expect("fill the queue");
+        let request = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.request("thread/list", json!({})).await }
+        });
+
+        // Let the request register its id and block on the full queue.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(connection.pending_len(), 1);
+        assert!(!request.is_finished(), "the send is blocked on the full queue");
+
+        request.abort();
+        let _ = request.await;
+        assert_eq!(
+            connection.pending_len(),
+            0,
+            "cancellation must remove the pending entry"
+        );
+    }
+
+    /// A close must end the writer and drop the frame receiver, waking a
+    /// caller whose `send()` is blocked on a full queue. The stalled sink is
+    /// the "peer stopped reading" case.
+    #[tokio::test]
+    async fn close_releases_a_sender_blocked_on_a_full_queue() {
+        let (connection, frames, closing) = RpcConnection::test_connection(1);
+        connection
+            .inner
+            .outgoing
+            .try_send(Message::Text("first".into()))
+            .expect("fill the queue");
+
+        let started = Arc::new(tokio::sync::Notify::new());
+        let writer = tokio::spawn(write_loop(
+            StalledSink {
+                started: Arc::clone(&started),
+            },
+            frames,
+            closing,
+            Arc::downgrade(&connection.inner),
+        ));
+        // The writer took the first frame and is now wedged in `send`.
+        started.notified().await;
+        connection
+            .inner
+            .outgoing
+            .try_send(Message::Text("second".into()))
+            .expect("fill the queue again");
+
+        let request = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.request("thread/list", json!({})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(connection.pending_len(), 1);
+        assert!(
+            !request.is_finished(),
+            "the send is blocked while the writer is stalled"
+        );
+
+        close(&connection.inner);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("close releases the blocked sender")
+            .expect("the request task did not panic");
+        assert!(result.is_err(), "a closed writer fails the send: {result:?}");
+        assert_eq!(connection.pending_len(), 0);
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("the writer exits on close")
+            .expect("the writer task did not panic");
+    }
+
+    /// A sink that accepts no frame: its first `poll_ready` says it started and
+    /// then stays pending, exactly a peer that stopped reading.
+    struct StalledSink {
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl Sink<Message> for StalledSink {
+        type Error = ();
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            self.started.notify_one();
+            std::task::Poll::Pending
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            _message: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
     #[tokio::test]
     async fn a_malformed_frame_fails_the_pending_request() {
         let (_, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
