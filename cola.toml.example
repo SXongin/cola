@@ -67,6 +67,10 @@ app_secret = "your-app-secret"
 # instant_reminder = true
 # How many days of rotated daily logs to keep (default 14).
 # log_days = 14
+# The id of the active agent client. Unset means `default`, the implicit
+# client [opencode] above declares. Exactly one client is active per process;
+# switching is this key plus a restart (ADR-0090).
+# default_client = "default"
 
 # Repository review (`/diff`). Optional.
 # The base ref /diff compares the working tree against. Leave it commented to
@@ -83,3 +87,11 @@ app_secret = "your-app-secret"
 # directory, or the main checkout will read dirty.
 # [worktree]
 # root = ".worktrees"
+
+# A second agent client (ADR-0090). `[opencode]` above is the implicit client
+# `default`; declare any other by id, pick the active one with
+# `[bridge] default_client`, and give it its own options. `opencode` is the
+# only kind this release can attach to; `codex` is reserved for its adapter.
+# [clients.ada]
+# kind = "codex"                   # required: opencode | codex
+# (an opencode client also accepts url / start_server / generation / model)

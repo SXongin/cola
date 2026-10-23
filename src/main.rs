@@ -941,7 +941,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Config first: `[bridge] log_days` feeds the daily-rotating log writer.
     let config_path = resolve_config_or_exit(&cli.config);
-    let cfg = config::load(&config_path)?;
+    let mut cfg = config::load(&config_path)?;
+    // ADR-0090 decision 5: one client is active per process. Resolve it once,
+    // here — the resolved id is durable state (ticket #874), and folding its
+    // OpenCode options into the effective config keeps every later reader on
+    // one set of settings rather than re-interpreting `[clients.*]`.
+    let active = cfg.resolve_active_client()?;
+    if active.opencode().is_none() {
+        anyhow::bail!(
+            "the active client `{}` has kind `{}`; this build can only attach to `opencode` clients",
+            active.id,
+            active.kind
+        );
+    }
     // The one owner of the on-disk layout (ADR-0090 §6): every path below —
     // the log, the singleton lock, the Owned Server's pid record, the Session
     // sidecars — is derived from it rather than from a hand-joined `.cola`.
@@ -1006,7 +1018,9 @@ async fn main() -> anyhow::Result<()> {
     let server = resolve_opencode_server(&cfg.opencode, &layout).await?;
 
     tracing::info!(
-        "cola starting — OpenCode: {}, Feishu app: {}",
+        "cola starting — client: {} ({}), OpenCode: {}, Feishu app: {}",
+        active.id,
+        active.kind,
         server
             .as_ref()
             .map(|s| s.url.as_str())

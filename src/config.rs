@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub fn load(path: &Path) -> anyhow::Result<Config> {
@@ -34,6 +35,10 @@ pub fn resolve_config_path(explicit: Option<&str>, cwd: &Path, home: &Path) -> O
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// The default OpenCode client's options (ADR-0090 decision 5). This table
+    /// is also the implicit `[clients.default] kind = "opencode"`: it is never
+    /// renamed, and [`Config::active_client`] resolves it when
+    /// `[bridge] default_client` names no other client.
     #[serde(default)]
     pub opencode: OpenCodeConfig,
     pub feishu: FeishuConfig,
@@ -43,6 +48,14 @@ pub struct Config {
     pub review: ReviewConfig,
     #[serde(default)]
     pub worktree: WorktreeConfig,
+    /// Every declared agent client by id (ADR-0090 decision 5). The map does
+    /// not contain the implicit `default` client — that one is `[opencode]` —
+    /// so seeing `default` here is a duplicate and fails to resolve.
+    ///
+    /// `BTreeMap` rather than a hash map: the configured ids are reported in a
+    /// resolution error, and that report must be deterministic.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub clients: BTreeMap<String, ClientEntry>,
 }
 
 /// Repository review settings (spec #803, ticket #804): what `/diff` compares
@@ -130,7 +143,7 @@ impl std::fmt::Display for GenerationOverride {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenCodeConfig {
     /// Preferred/fallback port. Optional: discovery rewrites the effective
     /// endpoint to whatever server it finds on the shared store, so an absent
@@ -230,6 +243,11 @@ pub struct BridgeConfig {
     /// `cola-YYYY-MM-DD.log` files are swept on startup and at each rotation.
     #[serde(default = "default_log_days")]
     pub log_days: u32,
+    /// The id of the active agent client (ADR-0090 decision 5). Unset means
+    /// [`DEFAULT_CLIENT_ID`], the implicit `[opencode]` client. Exactly one
+    /// client is active per cola process; switching is this key plus a restart.
+    #[serde(default)]
+    pub default_client: Option<String>,
 }
 
 impl Default for BridgeConfig {
@@ -243,6 +261,7 @@ impl Default for BridgeConfig {
             long_task_notice: false,
             instant_reminder: false,
             log_days: default_log_days(),
+            default_client: None,
         }
     }
 }
@@ -261,6 +280,239 @@ fn default_session_file() -> PathBuf {
 
 fn default_access_file() -> PathBuf {
     crate::state::StateLayout::default().access_file()
+}
+
+/// The id of the implicit client `[opencode]` declares (ADR-0090 decision 5).
+///
+/// This spelling is **durable contract**, not display text: the state ticket
+/// records the active client's id beside every Session, so `default` is what a
+/// legacy file upgrades to. [`Config::active_client`] falls back to it whenever
+/// `[bridge] default_client` is unset.
+pub const DEFAULT_CLIENT_ID: &str = "default";
+
+/// The adapter a configured agent client selects (ADR-0090 decision 1/2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientKind {
+    /// The peer OpenCode adapter — the only kind this build constructs.
+    Opencode,
+    /// Codex over `app-server` (ADR-0090 decision 2); its adapter is spec #860
+    /// Phase 3, so this build resolves the client but refuses to start it.
+    Codex,
+}
+
+impl ClientKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Opencode => "opencode",
+            Self::Codex => "codex",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "opencode" => Some(Self::Opencode),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ClientKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One `[clients.<id>]` table: a `kind` plus that kind's options (ADR-0090
+/// decision 5).
+///
+/// `kind` stays raw text here so a missing or misspelled value is reported by
+/// [`Config::active_client`] with the table it came from
+/// (`clients.<id>.kind`) — serde's own "missing field `kind`" would name neither
+/// the table nor the key path.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientEntry {
+    /// The adapter selector, `opencode` or `codex`. Required; validated on
+    /// resolution.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// This client's OpenCode options, flattened into the same table — the
+    /// keys `[opencode]` accepts (`url`, `start_server`, `generation`,
+    /// `model`). Read only for `kind = "opencode"`; a named client never
+    /// inherits `[opencode]`.
+    #[serde(flatten)]
+    pub opencode: OpenCodeConfig,
+}
+
+/// `[clients.<id>]` is one table: `kind` plus that kind's options. Only an
+/// `opencode` client has options today, so its keys are serialised only then —
+/// a `codex` table must not grow `start_server`/`generation` rows it ignores in
+/// `cola config show`.
+impl Serialize for ClientEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(kind) = &self.kind {
+            map.serialize_entry("kind", kind)?;
+        }
+        if self.kind.as_deref() == Some(ClientKind::Opencode.as_str()) {
+            let options = toml::Value::try_from(&self.opencode)
+                .map_err(|error| serde::ser::Error::custom(error.to_string()))?;
+            if let toml::Value::Table(options) = options {
+                for (key, value) in options {
+                    map.serialize_entry(&key, &value)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+impl ClientEntry {
+    fn kind_for(&self, id: &str) -> Result<ClientKind, ClientConfigError> {
+        let raw = self
+            .kind
+            .as_deref()
+            .ok_or_else(|| ClientConfigError::MissingKind { id: id.to_string() })?;
+        ClientKind::parse(raw).ok_or_else(|| ClientConfigError::UnknownKind {
+            id: id.to_string(),
+            kind: raw.to_string(),
+        })
+    }
+}
+
+/// The one active agent client, resolved from config (ADR-0090 decision 5).
+///
+/// Produced exactly once per process by [`Config::active_client`] /
+/// [`Config::resolve_active_client`]; the `id` is the value durable state
+/// records, so renaming it is a state migration, not a config edit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveClient {
+    /// The configured id: [`DEFAULT_CLIENT_ID`] for the implicit `[opencode]`
+    /// client, otherwise the `[clients.<id>]` table's key.
+    pub id: String,
+    /// The adapter this client selects.
+    pub kind: ClientKind,
+    /// That kind's settings. `settings` always matches `kind`.
+    pub settings: ClientSettings,
+}
+
+impl ActiveClient {
+    /// This client's OpenCode options when it is an `opencode` client — the
+    /// only kind with options modelled so far (ADR-0090 decision 7: the second
+    /// kind's settings are earned by its adapter, not designed ahead).
+    pub fn opencode(&self) -> Option<&OpenCodeConfig> {
+        match &self.settings {
+            ClientSettings::Opencode(settings) => Some(settings),
+            ClientSettings::Codex => None,
+        }
+    }
+}
+
+/// A resolved client's kind-specific options.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClientSettings {
+    Opencode(OpenCodeConfig),
+    /// Codex has no configurable options yet; #877 adds daemon discovery
+    /// settings with the adapter that reads them.
+    Codex,
+}
+
+/// Why a config cannot resolve its active client. Every message names the
+/// exact key to fix, because a client id is durable state and may not be
+/// guessed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ClientConfigError {
+    /// `[opencode]` already declares the implicit `default` client, so an
+    /// explicit table under that id would be a second one.
+    #[error(
+        "`[clients.default]` duplicates the implicit client `[opencode]` declares (ADR-0090); \
+         give the table another id, or move its options into `[opencode]`"
+    )]
+    DuplicateDefaultClient,
+    /// `[clients.<id>]` exists but carries no `kind`.
+    #[error("`clients.{id}.kind` is required; set it to `opencode` or `codex`")]
+    MissingKind { id: String },
+    /// `[clients.<id>] kind = "<unknown>"`.
+    #[error("`clients.{id}.kind = \"{kind}\"` is not a known client kind; expected `opencode` or `codex`")]
+    UnknownKind { id: String, kind: String },
+    /// `[bridge] default_client` names no configured table.
+    #[error("`bridge.default_client = \"{id}\"` names no configured client (configured: {available})")]
+    UnknownDefaultClient { id: String, available: String },
+}
+
+impl Config {
+    /// Resolve the one active agent client — pure, no I/O and no duplicated
+    /// meaning (ADR-0090 decision 5).
+    ///
+    /// The implicit `default`/`opencode` client is always available:
+    /// `[opencode]`'s options, all defaults when the table is absent. A
+    /// `[clients.default]` table is rejected because that id is already taken.
+    /// An unset `[bridge] default_client` means [`DEFAULT_CLIENT_ID`]; a set one
+    /// must name a declared table, whose `kind` must be present and known.
+    pub fn active_client(&self) -> Result<ActiveClient, ClientConfigError> {
+        // `[opencode]` IS `clients.default`, whether or not the table is
+        // written. A second table under that id is a collision, never a
+        // precedence question.
+        if self.clients.contains_key(DEFAULT_CLIENT_ID) {
+            return Err(ClientConfigError::DuplicateDefaultClient);
+        }
+        // Every declared table is read the same way, active or not: a missing
+        // or misspelled `kind` is a config typo, and reporting it while the table
+        // is inert would leave it to break a later switch. `BTreeMap` order
+        // makes which one is reported first deterministic.
+        for (entry_id, entry) in &self.clients {
+            entry.kind_for(entry_id)?;
+        }
+        let id = self.bridge.default_client.as_deref().unwrap_or(DEFAULT_CLIENT_ID);
+        if id == DEFAULT_CLIENT_ID {
+            return Ok(ActiveClient {
+                id: DEFAULT_CLIENT_ID.to_string(),
+                kind: ClientKind::Opencode,
+                settings: ClientSettings::Opencode(self.opencode.clone()),
+            });
+        }
+        let entry = self
+            .clients
+            .get(id)
+            .ok_or_else(|| ClientConfigError::UnknownDefaultClient {
+                id: id.to_string(),
+                available: std::iter::once(DEFAULT_CLIENT_ID)
+                    .chain(self.clients.keys().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })?;
+        let kind = entry.kind_for(id)?;
+        let settings = match kind {
+            ClientKind::Opencode => ClientSettings::Opencode(entry.opencode.clone()),
+            ClientKind::Codex => ClientSettings::Codex,
+        };
+        Ok(ActiveClient {
+            id: id.to_string(),
+            kind,
+            settings,
+        })
+    }
+
+    /// Resolve the active client and fold its OpenCode options into
+    /// [`Config::opencode`], the field every existing call site already reads.
+    ///
+    /// This is a process-local **effective view**, never a write to the user's
+    /// file: a named `kind = "opencode"` client's `url`/`model`/`start_server`/
+    /// `generation` take effect without every caller learning about
+    /// `[clients.*]`. The resolved id is returned for the state layer, which
+    /// records it (spec #860 phase 1, ticket #874).
+    pub fn resolve_active_client(&mut self) -> Result<ActiveClient, ClientConfigError> {
+        let active = self.active_client()?;
+        if let ClientSettings::Opencode(settings) = &active.settings {
+            self.opencode = settings.clone();
+        }
+        Ok(active)
+    }
 }
 
 /// A key that uniquely identifies a session context on the Feishu side.
@@ -435,8 +687,10 @@ pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
         ConfigAction::Validate => {
             let path = path.ok_or_else(|| anyhow::anyhow!("未找到配置文件"))?;
             // `load` is the same parser the daemon uses, so a valid result here
-            // is exactly what `cola` would accept at boot.
-            load(&path)?;
+            // is exactly what `cola` would accept at boot — including the
+            // active-client resolution over `[clients.<id>]` (ADR-0090 §5).
+            let cfg = load(&path)?;
+            cfg.active_client()?;
             println!("配置有效: {}", path.display());
             Ok(())
         }
@@ -513,6 +767,7 @@ mod tests {
             bridge: BridgeConfig::default(),
             review: ReviewConfig::default(),
             worktree: WorktreeConfig::default(),
+            clients: Default::default(),
         };
         let dumped = masked_config_toml(&cfg).unwrap();
         assert!(dumped.contains("cli_abc"), "the app id is shown: {dumped}");
@@ -769,5 +1024,272 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
         assert_eq!(resolve_config_path(None, cwd.path(), home.path()), None);
+    }
+
+    // ---- Agent clients (ADR-0090 decision 5) ----
+
+    fn minimal() -> &'static str {
+        "[feishu]\napp_id = \"cli_test\"\napp_secret = \"secret\"\n"
+    }
+
+    /// The additive rule: `[opencode]` alone is one client named `default`,
+    /// kind `opencode`, carrying exactly today's settings.
+    #[test]
+    fn opencode_only_resolves_to_the_default_opencode_client() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[opencode]\nurl = \"http://localhost:4111\"\nmodel = \"opencode/x\"\n\
+             start_server = \"never\"\ngeneration = \"v2\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let active = cfg.active_client().unwrap();
+        assert_eq!(active.id, DEFAULT_CLIENT_ID);
+        assert_eq!(active.id, "default");
+        assert_eq!(active.kind, ClientKind::Opencode);
+        assert_eq!(active.settings, ClientSettings::Opencode(cfg.opencode.clone()));
+        assert_eq!(active.opencode(), Some(&cfg.opencode));
+        assert_eq!(active.opencode().unwrap().preferred_port(), Some(4111));
+    }
+
+    /// No `[opencode]` table at all: the implicit client still exists, with the
+    /// default settings — exactly what cola does today.
+    #[test]
+    fn a_config_without_opencode_still_has_the_default_client() {
+        let cfg: Config = toml::from_str(minimal()).unwrap();
+        let active = cfg.active_client().unwrap();
+        assert_eq!(active.id, "default");
+        assert_eq!(active.kind, ClientKind::Opencode);
+        assert_eq!(active.opencode(), Some(&OpenCodeConfig::default()));
+    }
+
+    #[test]
+    fn an_explicit_default_client_resolves_to_the_implicit_client() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"default\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let active = cfg.active_client().unwrap();
+        assert_eq!(active.id, DEFAULT_CLIENT_ID);
+        assert_eq!(active.kind, ClientKind::Opencode);
+    }
+
+    #[test]
+    fn default_client_selects_a_named_codex_client() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let active = cfg.active_client().unwrap();
+        assert_eq!(active.id, "ada");
+        assert_eq!(active.kind, ClientKind::Codex);
+        assert_eq!(active.settings, ClientSettings::Codex);
+        assert_eq!(
+            active.opencode(),
+            None,
+            "a codex client carries no opencode settings"
+        );
+    }
+
+    /// A named `opencode` client has its own options; it never inherits
+    /// `[opencode]`. Resolving folds them into the process's effective view.
+    #[test]
+    fn a_named_opencode_client_carries_its_own_options() {
+        let mut cfg: Config = toml::from_str(&format!(
+            "{}\n[opencode]\nmodel = \"opencode/default\"\n\n[bridge]\n\
+             default_client = \"work\"\n\n[clients.work]\nkind = \"opencode\"\n\
+             model = \"opencode/work\"\nstart_server = \"never\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let active = cfg.active_client().unwrap();
+        assert_eq!(active.id, "work");
+        assert_eq!(active.kind, ClientKind::Opencode);
+        let settings = active.opencode().unwrap();
+        assert_eq!(settings.model.as_deref(), Some("opencode/work"));
+        assert_eq!(settings.start_server, ServerStartPolicy::Never);
+
+        let resolved = cfg.resolve_active_client().unwrap();
+        assert_eq!(resolved, active);
+        assert_eq!(
+            cfg.opencode.model.as_deref(),
+            Some("opencode/work"),
+            "the effective view follows the active client"
+        );
+    }
+
+    /// `[opencode]` is the implicit `default`, so an explicit table under that
+    /// id is a duplicate — deterministically an error, never precedence.
+    #[test]
+    fn clients_default_is_a_duplicate_of_the_implicit_client() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[opencode]\nmodel = \"opencode/x\"\n\n[clients.default]\nkind = \"opencode\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(err, ClientConfigError::DuplicateDefaultClient);
+        let message = err.to_string();
+        assert!(message.contains("clients.default"), "{message}");
+        assert!(message.contains("[opencode]"), "{message}");
+
+        // The collision is about the id namespace, not about which client is
+        // active: naming another client does not make it resolvable.
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.default]\nkind = \"opencode\"\n\
+             \n[clients.ada]\nkind = \"codex\"\n",
+            minimal()
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.active_client().unwrap_err(),
+            ClientConfigError::DuplicateDefaultClient
+        );
+    }
+
+    #[test]
+    fn an_unknown_default_client_names_the_key() {
+        let cfg: Config =
+            toml::from_str(&format!("{}\n[bridge]\ndefault_client = \"ada\"\n", minimal())).unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(
+            err,
+            ClientConfigError::UnknownDefaultClient {
+                id: "ada".into(),
+                available: "default".into(),
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("bridge.default_client"), "{message}");
+        assert!(message.contains("ada"), "{message}");
+    }
+
+    #[test]
+    fn a_client_without_a_kind_names_the_key() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nmodel = \"opencode/x\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(err, ClientConfigError::MissingKind { id: "ada".into() });
+        assert!(
+            err.to_string().contains("clients.ada.kind"),
+            "the error names the key: {err}"
+        );
+    }
+
+    /// A table the active client does not name is still validated: an invalid
+    /// client would otherwise only fail on the day it is switched to.
+    #[test]
+    fn an_inert_client_table_is_still_validated() {
+        let missing: Config =
+            toml::from_str(&format!("{}\n[clients.ada]\nmodel = \"opencode/x\"\n", minimal())).unwrap();
+        assert_eq!(
+            missing.active_client().unwrap_err(),
+            ClientConfigError::MissingKind { id: "ada".into() }
+        );
+
+        let unknown: Config =
+            toml::from_str(&format!("{}\n[clients.ada]\nkind = \"acp\"\n", minimal())).unwrap();
+        assert_eq!(
+            unknown.active_client().unwrap_err(),
+            ClientConfigError::UnknownKind {
+                id: "ada".into(),
+                kind: "acp".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_client_kind_names_the_key() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"acp\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(
+            err,
+            ClientConfigError::UnknownKind {
+                id: "ada".into(),
+                kind: "acp".into(),
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("clients.ada.kind"), "{message}");
+        assert!(message.contains("acp"), "{message}");
+    }
+
+    /// Reading resolves but never writes: neither `load` nor resolution may
+    /// rewrite the user's hand-maintained file.
+    #[test]
+    fn reading_a_config_never_rewrites_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        let original = format!(
+            "{}\n[opencode]\nmodel = \"opencode/x\"\n\n[bridge]\ndefault_client = \"ada\"\n\
+             \n[clients.ada]\nkind = \"codex\"\n",
+            minimal()
+        );
+        std::fs::write(&path, &original).unwrap();
+
+        let mut cfg = load(&path).unwrap();
+        cfg.resolve_active_client().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "reading must leave the file byte-identical"
+        );
+    }
+
+    /// `cola config validate` parses AND resolves, so a broken client table is
+    /// caught by the same command that check-parses the file.
+    #[test]
+    fn config_run_validate_checks_the_active_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            format!("{}\n[bridge]\ndefault_client = \"nope\"\n", minimal()),
+        )
+        .unwrap();
+        let err = run(ConfigAction::Validate, path.to_str()).unwrap_err();
+        assert!(
+            err.to_string().contains("bridge.default_client"),
+            "expected the resolution error, got: {err}"
+        );
+    }
+
+    /// `cola config show` renders declared clients (they are not dropped), and
+    /// an empty map adds no `[clients]` table to the output.
+    #[test]
+    fn masked_config_toml_renders_declared_clients() {
+        let bare: Config = toml::from_str(minimal()).unwrap();
+        let dumped = masked_config_toml(&bare).unwrap();
+        assert!(!dumped.contains("[clients"), "no empty table: {dumped}");
+
+        let cfg: Config =
+            toml::from_str(&format!("{}\n[clients.ada]\nkind = \"codex\"\n", minimal())).unwrap();
+        let dumped = masked_config_toml(&cfg).unwrap();
+        let clients = dumped
+            .split("[clients.ada]")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no clients table: {dumped}"));
+        assert!(clients.contains("kind = \"codex\""), "{dumped}");
+        assert!(
+            !clients.contains("start_server") && !clients.contains("generation"),
+            "a codex client has no opencode options to print: {dumped}"
+        );
+
+        let opencode: Config = toml::from_str(&format!(
+            "{}\n[clients.work]\nkind = \"opencode\"\nmodel = \"opencode/work\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let dumped = masked_config_toml(&opencode).unwrap();
+        assert!(dumped.contains("model = \"opencode/work\""), "{dumped}");
     }
 }

@@ -207,6 +207,35 @@ start_server = "auto"            # auto (default) | never | eager
   attaches to (usually `opencode/...`). Per-session overrides are set with
   `/model`.
 
+### `[clients.<id>]` — optional, for a second agent client
+
+```toml
+# `[opencode]` is already the implicit client `default` — leave its name alone.
+[clients.ada]
+kind = "codex"                   # required: opencode | codex
+
+[bridge]
+default_client = "ada"           # which client is active (default: "default")
+```
+
+- **`kind`** — required, and it selects the adapter. `opencode` is the only
+  kind this build can attach to; `codex` (the `app-server` adapter, ADR-0090)
+  is reserved for the next phase, so a config that makes it active parses and
+  resolves but cola refuses to start until that adapter ships.
+- **Options live in the same table as `kind`.** An `opencode` client accepts
+  `url`, `start_server`, `generation` and `model`, exactly as `[opencode]`
+  does. A named client does not inherit `[opencode]`'s values.
+- **`default_client`** — the id of the active client. Unset means `default`
+  (`[opencode]`). Exactly one client is active per cola process (ADR-0090);
+  switching clients is this key plus a restart.
+- **`[opencode]` stays valid forever.** cola reads it as the implicit
+  `clients.default` / `kind = "opencode"` and never rewrites your file — no
+  `[clients.*]` table is generated and no key is renamed. An explicit
+  `[clients.default]` is rejected as a duplicate of that implicit client:
+  give the table another id, or move its options into `[opencode]`.
+- **A client id is durable state.** cola records the active id beside each
+  Session, so renaming an id is a state migration, not a config edit.
+
 ### `[bridge]` — all optional
 
 ```toml
@@ -219,6 +248,7 @@ start_server = "auto"            # auto (default) | never | eager
 # long_task_notice = true
 # instant_reminder = true
 # log_days = 14
+# default_client = "default"
 ```
 
 - **`session_file`** — where the thread↔session mapping is persisted.
@@ -264,6 +294,8 @@ start_server = "auto"            # auto (default) | never | eager
   task's end is easy to miss; a short turn stays silent. Group chats already
   notify on every turn via `group_completion_notice`.
 - **`log_days`** — how many days of rotated daily logs to keep (default 14).
+- **`default_client`** — the id of the active agent client; see
+  `[clients.<id>]` above. Unset means `default` (`[opencode]`).
 
 ### `[review]` — all optional
 
