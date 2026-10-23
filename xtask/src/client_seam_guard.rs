@@ -37,11 +37,12 @@
 //!
 //! A crate re-root is itself a finding — `use crate as <ident>`,
 //! `use crate::{self as <ident>}` and `extern crate self as <ident>` — because
-//! renaming the crate root renames the adapter path everywhere in the file. At
-//! a crate-root file (`src/main.rs`, `src/lib.rs`, `src/<name>.rs`) the path may
-//! also be rooted at `self::`, so `use self::opencode as oc;` is the same leak;
-//! inside a submodule `self::` names a sibling module, not the crate, and is
-//! not reported.
+//! renaming the crate root renames the adapter path everywhere in the file. The
+//! root spelling follows Rust's module tree: at the crate root
+//! (`src/main.rs`, `src/lib.rs`) `self::opencode` is the adapter; in a depth-1
+//! module (`src/status.rs`) `self::opencode` is that module's own child and
+//! `super::opencode` is the adapter; deeper in the tree only `crate::` reaches
+//! it.
 //!
 //! This is a **textual** guard, the same class as `generation_guard`, and it
 //! accepts the limits that come with that: it does not follow `include!` of
@@ -139,7 +140,7 @@ pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
     }
     let source = Normalised::new(content);
     let lines: Vec<&str> = content.lines().collect();
-    let mut leaks = source.adapter_mentions(is_crate_root(path));
+    let mut leaks = source.adapter_mentions(roots_for(path));
     leaks.extend(source.crate_alias_mentions());
     leaks.sort_by_key(|&(offset, _)| offset);
     leaks
@@ -156,12 +157,24 @@ pub(crate) fn scan_source(path: &str, content: &str) -> Vec<Finding> {
         .collect()
 }
 
-/// Whether this scanned path is a crate-root file, where `self::` is the crate
-/// root: `src/main.rs`, `src/lib.rs` or `src/<name>.rs`. In a submodule
-/// (`src/bridge/foo.rs`) `self::` names a sibling module instead.
-fn is_crate_root(path: &str) -> bool {
-    path.strip_prefix("src/")
-        .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+/// The path roots that reach the crate's adapter module from this file.
+///
+/// - the crate root itself (`src/main.rs`, `src/lib.rs`): `crate::` and
+///   `self::`;
+/// - a depth-1 module (`src/status.rs`, `src/error.rs`): `crate::` and
+///   `super::` — its `self` is that module, and `super` is the crate root;
+/// - anything deeper (`src/bridge/foo.rs`): `crate::` only.
+fn roots_for(path: &str) -> &'static [&'static str] {
+    let Some(rest) = path.strip_prefix("src/") else {
+        return &["crate::"];
+    };
+    if rest.contains('/') {
+        return &["crate::"];
+    }
+    match rest {
+        "main.rs" | "lib.rs" => &["crate::", "self::"],
+        _ => &["crate::", "super::"],
+    }
 }
 
 /// The token stream of one file, normalised for path matching.
@@ -192,30 +205,35 @@ impl Normalised {
     /// Both a plain path (`crate::opencode::types`) and a group that names it
     /// at any depth (`crate::{self, opencode::types}`,
     /// `crate::{opencode::{types, parsing}}`) count; the exempt item paths do
-    /// not. `self::opencode` is the same path only in a crate-root file, where
-    /// `self` is the crate; a submodule's `self` names a sibling.
-    fn adapter_mentions(&self, crate_root: bool) -> Vec<(usize, Leak)> {
-        let roots: &[&str] = if crate_root {
-            &["crate::", "self::"]
-        } else {
-            &["crate::"]
-        };
+    /// not. `roots` are the spellings that reach the crate root from this file
+    /// ([`roots_for`]): `crate::` everywhere, plus `self::` at the crate root
+    /// and `super::` in a depth-1 module.
+    fn adapter_mentions(&self, roots: &[&str]) -> Vec<(usize, Leak)> {
         let mut mentions = Vec::new();
         for root in roots {
             let mut search = 0;
             while let Some(offset) = self.text[search..].find(root) {
-                let start = search + offset + root.len();
-                search = start;
-                let rest = &self.text[start..];
+                let rooted_at = search + offset;
+                search = rooted_at + root.len();
+                // The root must be a whole token: `mycrate::opencode` and
+                // `myself::opencode` are other names, not this root.
+                if self.text[..rooted_at]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_identifier_continue)
+                {
+                    continue;
+                }
+                let rest = &self.text[search..];
                 if let Some(grouped) = rest.strip_prefix('{') {
                     let Some(close) = matching_brace(grouped) else {
                         continue;
                     };
-                    mentions.extend(group_mentions(&grouped[..close], start + 1));
+                    mentions.extend(group_mentions(&grouped[..close], search + 1));
                 } else if let Some(suffix) = adapter_suffix(rest)
                     && !is_exempt(suffix)
                 {
-                    mentions.push((start, Leak::AdapterPath));
+                    mentions.push((search, Leak::AdapterPath));
                 }
             }
         }
@@ -668,30 +686,40 @@ mod tests {
         }
     }
 
-    /// `self::` is the crate root only in a crate-root file; in a submodule it
-    /// names a sibling module.
+    /// The root spelling follows the module tree: the crate root uses
+    /// `self::`, a depth-1 module uses `super::`, and deeper files reach the
+    /// adapter only through `crate::`.
     #[test]
-    fn a_crate_root_self_path_is_a_finding_only_at_the_root() {
+    fn the_root_spelling_follows_the_module_tree() {
         for (path, planted) in [
             ("src/main.rs", "use self::opencode as oc;\n"),
             ("src/lib.rs", "use self::opencode::types::Session;\n"),
-            ("src/status.rs", "use self::{opencode};\n"),
+            ("src/main.rs", "use self::{opencode};\n"),
+            ("src/status.rs", "use super::opencode as oc;\n"),
+            ("src/error.rs", "use super::{opencode};\n"),
+            ("src/status.rs", "use crate::opencode as oc;\n"),
         ] {
             assert_eq!(scan_source(path, planted).len(), 1, "{path}: {planted}");
         }
-        for path in [
-            "src/bridge/foo.rs",
-            "src/bridge/handler.rs",
-            "src/opencode/v2/wire.rs",
+        for (path, planted) in [
+            // In a depth-1 module `self::` is that module, not the crate.
+            ("src/status.rs", "use self::opencode as oc;\n"),
+            // Below depth 1 neither `self::` nor `super::` is the crate root.
+            ("src/bridge/foo.rs", "use self::opencode as oc;\n"),
+            ("src/bridge/foo.rs", "use super::opencode as oc;\n"),
         ] {
-            if path.starts_with("src/opencode/") {
-                continue;
-            }
-            assert!(
-                scan_source(path, "use self::opencode as oc;\n").is_empty(),
-                "{path} must not treat self:: as the crate root"
-            );
+            assert!(scan_source(path, planted).is_empty(), "{path}: {planted}");
         }
+    }
+
+    /// The root must be a whole token: a longer identifier ending in it is a
+    /// different name.
+    #[test]
+    fn a_longer_identifier_ending_in_the_root_is_not_the_root() {
+        assert!(findings("use mycrate::opencode::types::Session;\n").is_empty());
+        assert!(scan_source("src/main.rs", "use myself::opencode;\n").is_empty());
+        assert!(scan_source("src/status.rs", "use mysuper::opencode;\n").is_empty());
+        assert_eq!(findings("use crate::opencode::types::Session;\n").len(), 1);
     }
 
     /// A raw identifier is the identifier it spells.
