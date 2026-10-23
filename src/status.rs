@@ -30,6 +30,10 @@ pub struct Status {
     /// inspected (no config).
     pub claimed: Option<bool>,
     pub host: Option<String>,
+    /// The access file's declared version when this build refused it. Reported
+    /// instead of "unclaimed": the file may still name a Host, and the process
+    /// must not write over it.
+    pub access_unsupported: Option<String>,
     pub config_path: Option<PathBuf>,
     /// Whether the resolved config file parsed. `false` with a path present is
     /// a broken config; `false` with no path is "no config found".
@@ -141,12 +145,15 @@ pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Ba
         active: crate::autostart::supervisor_is_active(),
         binary: crate::autostart::supervisor_binary_path(),
     };
-    let (claimed, host) = match cfg {
+    let (claimed, host, access_unsupported) = match cfg {
         Some(cfg) => {
             let list = crate::bridge::access::AccessList::load_read_only(&cfg.bridge.access_file);
-            (Some(list.is_claimed()), list.host().map(str::to_string))
+            match list.unsupported_version() {
+                Some(declared) => (None, None, Some(declared.to_string())),
+                None => (Some(list.is_claimed()), list.host().map(str::to_string), None),
+            }
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     let server = probe_server(client).await;
     let generation_override = effective_generation_override(state);
@@ -158,6 +165,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Ba
         autostart,
         claimed,
         host,
+        access_unsupported,
         config_path: state.path.clone(),
         config_ok: state.ok(),
         log_path: log_path.to_path_buf(),
@@ -241,6 +249,9 @@ fn autostart_line(a: &AutostartStatus) -> String {
 }
 
 fn claimed_line(s: &Status) -> String {
+    if let Some(version) = &s.access_unsupported {
+        return format!("⚠ 不支持的状态文件版本 {version}（access.json 未读取，且不会写入）");
+    }
     match s.claimed {
         Some(true) => match &s.host {
             Some(h) => format!("✅ 机主 = {h}"),
@@ -299,6 +310,7 @@ pub fn render_json(s: &Status) -> serde_json::Value {
         },
         "claimed": s.claimed,
         "host": s.host,
+        "access_unsupported_version": s.access_unsupported,
         "config_path": s.config_path.as_ref().map(|p| p.display().to_string()),
         "config_ok": s.config_ok,
         "log_path": s.log_path.display().to_string(),
@@ -666,6 +678,7 @@ mod tests {
             },
             claimed: Some(true),
             host: Some("ou_abc".into()),
+            access_unsupported: None,
             config_path: Some(PathBuf::from("/home/u/cola.toml")),
             config_ok: true,
             log_path: PathBuf::from("/home/u/.cola/cola.log"),
@@ -715,6 +728,46 @@ mod tests {
         assert!(text.contains("✗ 未认领"));
         assert!(text.contains("未找到"));
         assert!(text.contains("未发现共享服务器"));
+    }
+
+    #[tokio::test]
+    async fn gather_surfaces_an_unsupported_access_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let access_path = dir.path().join("access.json");
+        std::fs::write(&access_path, r#"{"version":3,"host":"ou_host"}"#).unwrap();
+        let config_path = dir.path().join("cola.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[feishu]\napp_id = \"a\"\napp_secret = \"b\"\n\n[bridge]\naccess_file = \"{}\"\n",
+                access_path.display()
+            ),
+        )
+        .unwrap();
+        let state = ConfigState::from_env(config_path.to_str());
+        let status = gather(&state, &dir.path().join("cola.log"), None).await;
+        assert_eq!(status.access_unsupported.as_deref(), Some("3"));
+        assert_eq!(status.claimed, None, "not silently unclaimed");
+        assert_eq!(status.host, None);
+    }
+
+    #[test]
+    fn render_surfaces_an_unsupported_access_file() {
+        let s = Status {
+            claimed: None,
+            host: None,
+            access_unsupported: Some("3".into()),
+            ..sample_status()
+        };
+        let text = render(&s);
+        assert!(
+            text.contains("不支持的状态文件版本 3"),
+            "the report names the unsupported version: {text}"
+        );
+        assert!(!text.contains("✗ 未认领"), "not silently unclaimed: {text}");
+        let v = render_json(&s);
+        assert_eq!(v["access_unsupported_version"], "3");
+        assert!(v["claimed"].is_null());
     }
 
     #[test]

@@ -248,7 +248,7 @@ fn migrate_record_dir(
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
             continue;
         };
-        match sidecar::classify_version(value.get("version")) {
+        match sidecar::classify_raw_version(&String::from_utf8_lossy(&raw), &value) {
             sidecar::DeclaredVersion::Unsupported(declared) => {
                 anyhow::bail!(
                     "{} declares unsupported format version {declared} (this build writes {}); \
@@ -415,7 +415,7 @@ impl TerminalRunRecords {
             return None;
         };
         if let sidecar::DeclaredVersion::Unsupported(declared) =
-            sidecar::classify_version(value.get("version"))
+            sidecar::classify_raw_version(&String::from_utf8_lossy(&raw), &value)
         {
             tracing::error!(
                 "terminal record: {} declares unsupported format version {declared} \
@@ -881,7 +881,7 @@ impl TerminalOwedSettlements {
                 continue;
             };
             if let sidecar::DeclaredVersion::Unsupported(declared) =
-                sidecar::classify_version(value.get("version"))
+                sidecar::classify_raw_version(&String::from_utf8_lossy(&raw), &value)
             {
                 tracing::error!(
                     "terminal owed: {} declares unsupported format version {declared} \
@@ -1457,6 +1457,30 @@ mod tests {
                 "the refusal names the raw value {declared}: {error}"
             );
         }
+    }
+
+    /// A duplicate top-level `version` key must be refused before serde keeps
+    /// the last one; a nested record body's `version` field must not trip it.
+    #[test]
+    fn a_duplicate_version_key_is_refused() {
+        let current = crate::state::STATE_FORMAT_VERSION;
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("terminal-runs");
+        std::fs::create_dir_all(&runs).unwrap();
+        let path = runs.join("record.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{},"version":{current},"run_id":"run","chat_id":"c","thread_id":"c","log_path":"/tmp/x","command":"ls","cwd":"/tmp","timeout_ms":1,"state":"running"}}"#,
+                current + 1
+            ),
+        )
+        .unwrap();
+        assert!(TerminalRunRecords::load_file(&path).is_none());
+        let error = TerminalRunRecords::open(runs, crate::config::DEFAULT_CLIENT_ID)
+            .err()
+            .expect("a duplicate version key is refused");
+        assert!(error.to_string().contains("duplicate"), "{error}");
     }
 
     /// The owed journal is part of the same tree and refuses a malformed header

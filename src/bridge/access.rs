@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 pub struct AccessList {
     path: PathBuf,
     host: Option<String>,
+    /// The declared version this build refused to interpret, if any. It is
+    /// sticky for the process: a claim must never write over the file.
+    unsupported: Option<String>,
 }
 
 /// The on-disk shape. ADR-0091: version 1. It is deliberately **not**
@@ -45,13 +48,16 @@ impl AccessList {
     }
 
     fn read(path: &Path, migrate: bool) -> Self {
-        let value = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+        let raw = std::fs::read_to_string(path).ok();
+        let value = raw
+            .as_deref()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok());
         let mut legacy = false;
+        let mut unsupported = None;
         let host = match value.as_ref() {
             Some(value) => {
-                let declared = crate::bridge::sidecar::classify_version(value.get("version"));
+                let declared =
+                    crate::bridge::sidecar::classify_raw_version(raw.as_deref().unwrap_or_default(), value);
                 match &declared {
                     crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) => {
                         tracing::error!(
@@ -60,6 +66,7 @@ impl AccessList {
                             path.display(),
                             crate::state::STATE_FORMAT_VERSION
                         );
+                        unsupported = Some(declared.clone());
                         None
                     }
                     crate::bridge::sidecar::DeclaredVersion::Legacy
@@ -79,6 +86,7 @@ impl AccessList {
         let list = Self {
             path: path.to_path_buf(),
             host,
+            unsupported,
         };
         if legacy && migrate {
             // The one eager rewrite (ADR-0091), atomic so a crash cannot
@@ -100,11 +108,23 @@ impl AccessList {
         self.host.is_some()
     }
 
+    /// The declared version this build refused to interpret, if any. Callers
+    /// that could write the file must treat this as sticky.
+    pub(crate) fn unsupported_version(&self) -> Option<&str> {
+        self.unsupported.as_deref()
+    }
+
     /// Claim the bot for `open_id` and persist. One-time: returns `false` and
     /// changes nothing when a Host is already recorded. The record is written
     /// before the in-memory state flips, so a failed write leaves the list
     /// unclaimed rather than in-memory-claimed with nothing on disk.
     pub fn claim(&mut self, open_id: &str) -> crate::error::Result<bool> {
+        if let Some(declared) = self.unsupported.as_deref() {
+            return Err(crate::error::BridgeError::State(format!(
+                "{} declares unsupported format version {declared}; refusing to overwrite it with a claim",
+                self.path.display()
+            )));
+        }
         if self.host.is_some() {
             return Ok(false);
         }
@@ -167,7 +187,14 @@ impl Access {
     /// ever shown.
     pub fn new(path: PathBuf) -> Self {
         let list = AccessList::load(&path);
-        let claim_code = (!list.is_claimed()).then(generate_claim_code);
+        if let Some(declared) = list.unsupported_version() {
+            tracing::error!(
+                "refusing to offer a claim code: {} declares unsupported format version {declared}",
+                path.display()
+            );
+        }
+        let claim_code =
+            (!list.is_claimed() && list.unsupported_version().is_none()).then(generate_claim_code);
         let access = Self { list, claim_code };
         if let Some(code) = access.claim_code() {
             tracing::warn!("cola 尚未认领 —— 认领码: {code}（在飞书私聊中发送 /claim {code} 成为机主）");
@@ -321,5 +348,34 @@ mod tests {
         assert_eq!(claim_code_of("/claim"), Some(""));
         assert_eq!(claim_code_of("/claimx abc"), None);
         assert_eq!(claim_code_of("hello"), None);
+    }
+
+    /// ADR-0091: an unsupported declared version is sticky. The process offers
+    /// no claim code, a claim refuses, and the file's bytes are never replaced.
+    #[test]
+    fn an_unsupported_version_is_never_overwritten_by_a_claim() {
+        for raw in [
+            r#"{"version":3,"host":null}"#,
+            r#"{"version":2,"version":1,"host":null}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("access.json");
+            std::fs::write(&path, raw).unwrap();
+
+            let mut access = Access::new(path.clone());
+            assert!(access.claim_code().is_none(), "no claim code for {raw}");
+            let error = access
+                .claim("ou_alice")
+                .expect_err("a claim must refuse the unsupported file");
+            assert!(
+                error.to_string().contains("unsupported"),
+                "the refusal names the reason: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                raw,
+                "the refused file is untouched"
+            );
+        }
     }
 }

@@ -53,6 +53,76 @@ pub(crate) fn classify_version(value: Option<&serde_json::Value>) -> DeclaredVer
     DeclaredVersion::Unsupported(value.to_string())
 }
 
+/// Classify a parsed header's `version`, **and** reject a duplicate top-level
+/// `version` key. `serde_json::Value` keeps only the last duplicate, so without
+/// this the text `{"version":2,"version":1}` would look current. The scan is
+/// depth-aware and skips strings, so a nested record body's `version` field and
+/// a `"version"` string value never trip it.
+pub(crate) fn classify_raw_version(raw: &str, value: &serde_json::Value) -> DeclaredVersion {
+    if duplicate_top_level_version_keys(raw) {
+        return DeclaredVersion::Unsupported("duplicate \"version\" keys".to_string());
+    }
+    classify_version(value.get("version"))
+}
+
+/// Whether the top-level object spells a `version` key more than once.
+fn duplicate_top_level_version_keys(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'{') {
+        return false;
+    }
+    let mut depth = 0usize;
+    let mut keys = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                let start = index;
+                index = skip_string(bytes, index);
+                if depth == 1
+                    && let Ok(key) = serde_json::from_str::<String>(&raw[start..index])
+                    && key == "version"
+                {
+                    let mut next = index;
+                    while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                        next += 1;
+                    }
+                    if bytes.get(next) == Some(&b':') {
+                        keys += 1;
+                    }
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    keys > 1
+}
+
+/// The index just past the string that starts at `start` (a quote), honouring
+/// JSON's backslash escapes.
+fn skip_string(bytes: &[u8], start: usize) -> usize {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 2,
+            b'"' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    bytes.len()
+}
+
 /// What a durable file's format header says (ADR-0091). A file with no
 /// `version` field — or a pre-ADR-0041 bare JSON array — is [`Self::Legacy`]:
 /// version 0, read as the shape the release before ADR-0091 wrote. A declared
@@ -101,7 +171,7 @@ pub(crate) fn read_versioned(path: &Path, what: &str) -> VersionedRead {
             return VersionedRead::Corrupt;
         }
     };
-    match classify_version(value.get("version")) {
+    match classify_raw_version(&raw, &value) {
         DeclaredVersion::Legacy => VersionedRead::Legacy(raw),
         DeclaredVersion::Current => VersionedRead::Current(raw),
         DeclaredVersion::Unsupported(declared) => VersionedRead::Unsupported(declared),
@@ -388,5 +458,47 @@ mod tests {
                 _ => panic!("{declared} must be unsupported, not corrupt or version 0"),
             }
         }
+    }
+
+    /// A duplicate top-level `version` key is a refusal, not "the last value
+    /// wins"; a nested record body or a string value that spells the word must
+    /// not trip the scan.
+    #[test]
+    fn a_duplicate_top_level_version_key_is_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        let current = crate::state::STATE_FORMAT_VERSION;
+
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{},"version":{current}}}"#, current + 1),
+        )
+        .unwrap();
+        match read_versioned(&path, "test record") {
+            VersionedRead::Unsupported(raw) => {
+                assert!(raw.contains("duplicate"), "the reason names duplicates: {raw}")
+            }
+            _ => panic!("a duplicate version key must be unsupported"),
+        }
+
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{current},"body":{{"version":{}}}}}"#, current + 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_versioned(&path, "test record"),
+            VersionedRead::Current(_)
+        ));
+
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{current},"note":"\"version\": {}"}}"#, current + 1),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_versioned(&path, "test record"),
+            VersionedRead::Current(_)
+        ));
     }
 }
