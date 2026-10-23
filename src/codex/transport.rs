@@ -66,6 +66,9 @@ const INBOUND_CAPACITY: usize = 1024;
 const OUTGOING_CAPACITY: usize = 64;
 
 /// How to reach an app-server.
+// `ws://` endpoints are how a TUI's own listener is addressed (and how every
+// hermetic test dials the fake server); the daemon path uses `Unix`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
     /// `ws://HOST:PORT` — the loopback listener Codex starts for a TUI.
@@ -79,6 +82,9 @@ pub(crate) enum Endpoint {
 impl Endpoint {
     /// Parse the form `codex app-server --listen` prints. `stdio://` is
     /// rejected with the endpoint named so a misconfiguration is obvious.
+    // Used by the live suite and every test endpoint; the daemon builds `Unix`
+    // directly.
+    #[allow(dead_code)]
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         if let Some(path) = raw.strip_prefix("unix://") {
             if path.is_empty() {
@@ -90,6 +96,15 @@ impl Endpoint {
             return Ok(Self::WebSocket(raw.to_string()));
         }
         Err(CodexError::Endpoint(raw.to_string()))
+    }
+
+    /// The neutral base-URL spelling of this endpoint (`unix://PATH` or
+    /// `ws://…`), for `Backend::base_url`.
+    pub(crate) fn display_url(&self) -> String {
+        match self {
+            Self::WebSocket(url) => url.clone(),
+            Self::Unix(path) => format!("unix://{}", path.display()),
+        }
     }
 }
 

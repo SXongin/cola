@@ -162,26 +162,16 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
 
 /// The active Agent Client this build can actually construct (ADR-0090 §5).
 ///
-/// OpenCode is the only adapter whose `Backend` this build has, so a resolved
-/// `codex` client is refused loudly here rather than booting with the legacy
-/// OpenCode settings the config did not ask for. This is the *capability* gate;
-/// resolution itself stays pure and `cola config validate` still calls such a
-/// config valid.
-///
-/// Spec #860 ticket #877 landed the Codex daemon's discovery, probe and attach,
-/// but the `Backend` implementation that serves a Codex Session is #878–#882;
-/// boot therefore keeps refusing, so a client cola cannot serve never looks
-/// attached. Relax this in the ticket that constructs the adapter and stores it
-/// in `SharedCore.client` — not when discovery alone exists.
+/// Both known kinds have a `Backend` in this build: OpenCode's is the legacy
+/// adapter, Codex's landed with ticket #879 (thread discovery, the adapter-owned
+/// subscription and the neutral read model). The gate stays explicit — a future
+/// `kind` with no adapter must be refused here rather than booting with the
+/// legacy OpenCode settings the config did not ask for. Resolution itself stays
+/// pure and `cola config validate` still calls such a config valid.
 fn require_supported_client(active: &config::ActiveClient) -> anyhow::Result<()> {
-    if active.opencode().is_none() {
-        anyhow::bail!(
-            "the active Agent Client `{}` has kind `{}`; this build can only attach to `opencode` clients",
-            active.id,
-            active.kind
-        );
+    match active.kind {
+        config::ClientKind::Opencode | config::ClientKind::Codex => Ok(()),
     }
-    Ok(())
 }
 
 /// Attach at boot through the active client's lifecycle (spec #860, ticket
@@ -193,30 +183,18 @@ fn require_supported_client(active: &config::ActiveClient) -> anyhow::Result<()>
 /// otherwise stay serverless (Lazy Start is the demand path). An inconclusive
 /// generation probe is not fatal at boot: cola starts serverless and the
 /// reconnect loop attaches once the probe classifies.
-async fn attach_at_boot(
-    client: &opencode::client::OpenCodeBackend,
-    cfg: &config::Config,
-) -> anyhow::Result<String> {
+async fn attach_at_boot(client: &dyn backend::Backend, allow_spawn: bool) -> anyhow::Result<String> {
     // Boot has no turn to protect: the daemon has not started serving yet.
     let never_busy = || false;
     let request = backend::EnsureAttached {
-        allow_spawn: cfg.opencode.start_server == config::ServerStartPolicy::Eager,
+        allow_spawn,
         heal_when_busy: false,
         busy: &never_busy,
         boot: true,
     };
     match backend::ServerLifecycle::ensure_attached(client, request).await {
         Ok(backend::AttachOutcome::Attached) => Ok(client.base_url()),
-        Ok(backend::AttachOutcome::Serverless) => {
-            tracing::info!(
-                "No shared OpenCode server running; {}",
-                match cfg.opencode.start_server {
-                    config::ServerStartPolicy::Never => "attach-only mode (`start_server = \"never\"`)",
-                    _ => "lazy start — attach to a server or spawn an Owned Server at the first prompt",
-                }
-            );
-            Ok(String::new())
-        }
+        Ok(backend::AttachOutcome::Serverless) => Ok(String::new()),
         Ok(backend::AttachOutcome::Inconclusive { url, evidence }) => {
             tracing::warn!("generation probe inconclusive at {url}; staying serverless: {evidence}");
             Ok(String::new())
@@ -1035,17 +1013,46 @@ async fn main() -> anyhow::Result<()> {
 
     let feishu_client = feishu::client::Client::new(cfg.feishu.clone());
 
-    let opencode_client = opencode::client::OpenCodeBackend::with_tasks(
-        cfg.opencode.model.as_deref(),
-        &cfg.opencode,
-        layout.clone(),
-        bridge::tasks::TasksHandle::new(),
-    );
-    // The client owns discovery and attach; the daemon asks once at boot.
-    let server_url = attach_at_boot(&opencode_client, &cfg).await?;
+    // One client is active per process (ADR-0090 §5), selected by `kind`. Each
+    // arm constructs its adapter through the same neutral seam; the bridge
+    // below only ever sees `Arc<dyn Backend>`.
+    let (backend, server_url): (Arc<dyn backend::Backend>, String) = match active.kind {
+        config::ClientKind::Opencode => {
+            let client = opencode::client::OpenCodeBackend::with_tasks(
+                cfg.opencode.model.as_deref(),
+                &cfg.opencode,
+                layout.clone(),
+                bridge::tasks::TasksHandle::new(),
+            );
+            let eager = cfg.opencode.start_server == config::ServerStartPolicy::Eager;
+            let url = attach_at_boot(&client, eager).await?;
+            if url.is_empty() {
+                tracing::info!(
+                    "No shared OpenCode server running; {}",
+                    match cfg.opencode.start_server {
+                        config::ServerStartPolicy::Never => "attach-only mode (`start_server = \"never\"`)",
+                        _ => "lazy start — attach to a server or spawn an Owned Server at the first prompt",
+                    }
+                );
+            }
+            (Arc::new(client), url)
+        }
+        config::ClientKind::Codex => {
+            let settings = match &active.settings {
+                config::ClientSettings::Codex(settings) => settings.clone(),
+                config::ClientSettings::Opencode(_) => unreachable!("the arm selects codex settings"),
+            };
+            let environment = codex::discovery::Environment::from_env()?;
+            let client =
+                codex::CodexLifecycle::new(settings.clone(), environment, Box::new(codex::ManagedProbe));
+            let eager = settings.start_server == config::ServerStartPolicy::Eager;
+            let url = attach_at_boot(&client, eager).await?;
+            (Arc::new(client), url)
+        }
+    };
 
     tracing::info!(
-        "cola starting — client: {} ({}), OpenCode: {}, Feishu app: {}",
+        "cola starting — client: {} ({}), endpoint: {}, Feishu app: {}",
         active.id,
         active.kind,
         if server_url.is_empty() {
@@ -1059,7 +1066,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(bridge::App::with_layout(
         cfg.clone(),
         layout,
-        Arc::new(opencode_client),
+        backend,
         Arc::new(feishu_client),
     )?);
 
@@ -1897,12 +1904,11 @@ kind = "codex"
         let _ = child.wait();
     }
 
-    /// ADR-0090 §5: resolution accepts a `codex` Agent Client, but this build
-    /// cannot attach to it — startup must refuse rather than run the legacy
-    /// OpenCode settings the config did not choose. Deleting the gate turns
-    /// this test red.
+    /// ADR-0090 §5: resolution accepts a `codex` Agent Client, and ticket #879
+    /// gives this build a Codex `Backend`, so startup accepts it instead of
+    /// pretending the legacy OpenCode settings were chosen.
     #[test]
-    fn an_active_codex_client_is_refused_at_startup() {
+    fn an_active_codex_client_passes_the_startup_gate() {
         let mut cfg: config::Config = toml::from_str(
             "[feishu]\napp_id = \"cli_test\"\napp_secret = \"secret\"\n\
              [bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n",
@@ -1911,9 +1917,7 @@ kind = "codex"
         let active = cfg.resolve_active_client().unwrap();
         assert_eq!(active.kind, config::ClientKind::Codex);
 
-        let error = require_supported_client(&active).unwrap_err().to_string();
-        assert!(error.contains("`ada`"), "names the Agent Client: {error}");
-        assert!(error.contains("codex"), "names the kind: {error}");
+        require_supported_client(&active).expect("the codex adapter is constructed by this build");
     }
 
     #[test]

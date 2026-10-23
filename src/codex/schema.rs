@@ -203,6 +203,7 @@ pub(crate) trait SurfaceProbe: Send + Sync {
 /// Accept the pinned surface for the pinned version and refuse every other
 /// version loudly. This is the probe for a hermetic construction (tests) and
 /// for a caller that has not wired the binary probe yet.
+#[allow(dead_code)]
 pub(crate) struct PinnedProbe;
 
 #[async_trait]

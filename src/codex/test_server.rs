@@ -522,6 +522,21 @@ impl FakeServer {
             .find(|thread| thread.id == thread_id)
             .and_then(|thread| thread.name.clone())
     }
+
+    /// Give a never-run thread a rollout, as the user's own client's first turn
+    /// would. The next `thread/resume` then succeeds.
+    pub(crate) fn mark_history(&self, thread_id: &str) {
+        if let Some(thread) = self
+            .state
+            .threads
+            .lock()
+            .expect("scripted threads")
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        {
+            thread.has_history = true;
+        }
+    }
 }
 
 /// Count one accepted connection and serve it on its own task. The accept loop

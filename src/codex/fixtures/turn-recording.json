@@ -1,0 +1,443 @@
+[
+  {
+    "method": "turn/started",
+    "params": {
+      "threadId": "thread-1",
+      "turn": {
+        "id": "turn-1",
+        "status": "inProgress",
+        "startedAt": 1700000000,
+        "completedAt": null,
+        "error": null,
+        "items": []
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000000000,
+      "item": {
+        "type": "userMessage",
+        "id": "item-user",
+        "clientId": null,
+        "content": [
+          { "type": "text", "text": "Fix the build", "textElements": [] }
+        ]
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000000010,
+      "item": {
+        "type": "userMessage",
+        "id": "item-user",
+        "clientId": null,
+        "content": [
+          { "type": "text", "text": "Fix the build", "textElements": [] }
+        ]
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000000100,
+      "item": {
+        "type": "reasoning",
+        "id": "item-reasoning",
+        "summary": [],
+        "content": []
+      }
+    }
+  },
+  {
+    "method": "item/reasoning/summaryTextDelta",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-reasoning",
+      "delta": "Check the failing test.",
+      "summaryIndex": 0
+    }
+  },
+  {
+    "method": "item/reasoning/textDelta",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-reasoning",
+      "delta": "The test harness changed.",
+      "contentIndex": 0
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000000200,
+      "item": {
+        "type": "reasoning",
+        "id": "item-reasoning",
+        "summary": ["Check the failing test."],
+        "content": ["The test harness changed."]
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000000300,
+      "item": {
+        "type": "agentMessage",
+        "id": "item-agent",
+        "text": ""
+      }
+    }
+  },
+  {
+    "method": "item/agentMessage/delta",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-agent",
+      "delta": "The"
+    }
+  },
+  {
+    "method": "item/agentMessage/delta",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-agent",
+      "delta": " fix"
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000000400,
+      "item": {
+        "type": "agentMessage",
+        "id": "item-agent",
+        "text": "The fix"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000000500,
+      "item": {
+        "type": "commandExecution",
+        "id": "item-command",
+        "command": "cargo test",
+        "cwd": "/work/cola",
+        "processId": null,
+        "source": "agent",
+        "status": "inProgress",
+        "commandActions": [],
+        "aggregatedOutput": null,
+        "exitCode": null,
+        "durationMs": null
+      }
+    }
+  },
+  {
+    "method": "item/commandExecution/outputDelta",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-command",
+      "delta": "Compiling cola v0.14.2\n"
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000000700,
+      "item": {
+        "type": "commandExecution",
+        "id": "item-command",
+        "command": "cargo test",
+        "cwd": "/work/cola",
+        "processId": null,
+        "source": "agent",
+        "status": "failed",
+        "commandActions": [],
+        "aggregatedOutput": "Compiling cola v0.14.2\nerror[E0425]: cannot find value `x`\n",
+        "exitCode": 1,
+        "durationMs": 200
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000000800,
+      "item": {
+        "type": "fileChange",
+        "id": "item-file",
+        "changes": [],
+        "status": "inProgress"
+      }
+    }
+  },
+  {
+    "method": "item/fileChange/patchUpdated",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-file",
+      "changes": [
+        {
+          "path": "src/lib.rs",
+          "kind": { "type": "update", "movePath": null },
+          "diff": "@@ -1 +1 @@\n-old\n+new"
+        }
+      ]
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000000900,
+      "item": {
+        "type": "fileChange",
+        "id": "item-file",
+        "changes": [
+          {
+            "path": "src/lib.rs",
+            "kind": { "type": "update", "movePath": null },
+            "diff": "@@ -1 +1 @@\n-old\n+new"
+          }
+        ],
+        "status": "completed"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000001000,
+      "item": {
+        "type": "mcpToolCall",
+        "id": "item-mcp",
+        "server": "docs",
+        "tool": "search",
+        "status": "inProgress",
+        "arguments": { "q": "tool panel" },
+        "result": null,
+        "error": null
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000001100,
+      "item": {
+        "type": "mcpToolCall",
+        "id": "item-mcp",
+        "server": "docs",
+        "tool": "search",
+        "status": "completed",
+        "arguments": { "q": "tool panel" },
+        "result": {
+          "content": [{ "type": "text", "text": "the tool panel is documented" }]
+        },
+        "error": null
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000001200,
+      "item": {
+        "type": "webSearch",
+        "id": "item-web",
+        "query": "codex app-server",
+        "action": { "type": "search", "query": "codex app-server", "queries": null },
+        "results": null
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000001300,
+      "item": {
+        "type": "webSearch",
+        "id": "item-web",
+        "query": "codex app-server",
+        "action": { "type": "search", "query": "codex app-server", "queries": null },
+        "results": [
+          { "title": "app-server protocol", "url": "https://example.test/app-server" }
+        ]
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000001400,
+      "item": {
+        "type": "imageView",
+        "id": "item-image",
+        "path": "/work/cola/shot.png"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000001500,
+      "item": {
+        "type": "imageView",
+        "id": "item-image",
+        "path": "/work/cola/shot.png"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000001600,
+      "item": {
+        "type": "plan",
+        "id": "item-plan",
+        "text": ""
+      }
+    }
+  },
+  {
+    "method": "item/plan/delta",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "itemId": "item-plan",
+      "delta": "1. Reproduce the failure"
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000001700,
+      "item": {
+        "type": "plan",
+        "id": "item-plan",
+        "text": "1. Reproduce the failure\n2. Fix it"
+      }
+    }
+  },
+  {
+    "method": "item/started",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "startedAtMs": 1700000001800,
+      "item": {
+        "type": "contextCompaction",
+        "id": "item-compaction"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "completedAtMs": 1700000001900,
+      "item": {
+        "type": "contextCompaction",
+        "id": "item-compaction"
+      }
+    }
+  },
+  {
+    "method": "turn/diff/updated",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "diff": "diff --git a/src/lib.rs b/src/lib.rs\nindex 1111111..2222222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+    }
+  },
+  {
+    "method": "thread/tokenUsage/updated",
+    "params": {
+      "threadId": "thread-1",
+      "turnId": "turn-1",
+      "tokenUsage": {
+        "total": {
+          "totalTokens": 24690,
+          "inputTokens": 16000,
+          "cachedInputTokens": 8000,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 690,
+          "reasoningOutputTokens": 100
+        },
+        "last": {
+          "totalTokens": 12345,
+          "inputTokens": 4000,
+          "cachedInputTokens": 8000,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 900,
+          "reasoningOutputTokens": 100
+        },
+        "modelContextWindow": 128000
+      }
+    }
+  },
+  {
+    "method": "turn/completed",
+    "params": {
+      "threadId": "thread-1",
+      "turn": {
+        "id": "turn-1",
+        "status": "completed",
+        "startedAt": 1700000000,
+        "completedAt": 1700000002,
+        "error": null,
+        "items": []
+      }
+    }
+  }
+]

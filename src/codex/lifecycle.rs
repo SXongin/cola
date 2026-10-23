@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use async_trait::async_trait;
 
 use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, ServerLifecycle};
+use crate::bridge::tasks::TasksHandle;
 use crate::config::CodexConfig;
 use crate::error::BridgeError;
 
@@ -144,6 +145,9 @@ pub(crate) struct CodexLifecycle {
     settings: CodexConfig,
     environment: Environment,
     probes: Box<dyn ProbeSource>,
+    /// The Background Task State handle the attached clients share with the
+    /// bridge (ADR-0079); one per active client, not per connection.
+    pub(crate) tasks: TasksHandle,
     /// The current connection. A `tokio` mutex because the attach pass holds it
     /// across the handshake's await.
     attached: tokio::sync::Mutex<Option<Attachment>>,
@@ -168,12 +172,29 @@ impl CodexLifecycle {
             settings,
             environment,
             probes,
+            tasks: TasksHandle::new(),
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
             #[cfg(test)]
             dial_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The attached client the `Backend` surface reads through, if the last
+    /// attach pass left one installed.
+    pub(crate) async fn attached_client(&self) -> Option<CodexClient> {
+        self.attached
+            .lock()
+            .await
+            .as_ref()
+            .map(|attachment| attachment.client.clone())
+    }
+
+    /// The control socket the lifecycle targets, rendered as the neutral base
+    /// URL. Stable while serverless too: a replacement daemon keeps the path.
+    pub(crate) fn environment_socket(&self) -> std::path::PathBuf {
+        self.environment.socket()
     }
 
     /// Test-only: install the one-shot hook that fires after a connection
@@ -235,7 +256,8 @@ impl CodexLifecycle {
                 continue;
             }
             let probe = self.probes.probe(&current.daemon);
-            let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()));
+            let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()))
+                .with_tasks(self.tasks.clone());
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
             // and the identity re-read right below. The hook opens exactly that

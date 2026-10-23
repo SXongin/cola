@@ -12,12 +12,15 @@
 //! contract fails **here**, at construction, not at the first prompt.
 
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::bridge::tasks::TasksHandle;
 use crate::config::{ActiveClient, ClientKind};
 
+use super::backend::Projections;
 use super::error::{CodexError, Result};
 use super::schema::{PINNED_VERSION, SurfaceProbe};
 use super::threads::Threads;
@@ -32,6 +35,11 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct CodexOptions {
     pub(crate) endpoint: Endpoint,
     pub(crate) timeout: Duration,
+    /// The Background Task State handle shared with the bridge. One per active
+    /// client: the lifecycle creates it and hands the same instance to every
+    /// client it attaches, so the Bridge records through the handle its reads
+    /// go through (ADR-0079).
+    pub(crate) tasks: TasksHandle,
 }
 
 impl CodexOptions {
@@ -39,7 +47,14 @@ impl CodexOptions {
         Self {
             endpoint,
             timeout: HANDSHAKE_TIMEOUT,
+            tasks: TasksHandle::new(),
         }
+    }
+
+    /// Carry the active client's own task handle into the attached client.
+    pub(crate) fn with_tasks(mut self, tasks: TasksHandle) -> Self {
+        self.tasks = tasks;
+        self
     }
 }
 
@@ -105,6 +120,9 @@ impl fmt::Display for ServerVersion {
 
 /// What the server told the adapter about itself, recorded on the client for
 /// `cola status`/`doctor` (later tickets) and the attach log.
+// The identity fields are read by the `cola status`/`doctor` rows (#883) and by
+// tests; keeping them decoded is the point of recording `initialize`.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct ServerInfo {
     /// The raw `initialize` `userAgent`.
@@ -120,7 +138,12 @@ pub(crate) struct ServerInfo {
 }
 
 /// One attached app-server. Construction is the whole contract check; the
-/// thread surface (#878) and the Backend implementation (#879) build on it.
+/// thread surface (#878) and the `Backend` implementation (#879) build on it.
+///
+/// Cloning shares the one connection, the thread registry, the read-model cache
+/// and the task handle: a subscription is connection-scoped, so a clone must
+/// address the same socket the handshake opened.
+#[derive(Clone)]
 pub(crate) struct CodexClient {
     /// Owned so a second connection is independent and the socket lives as long
     /// as the client does. Cloning the handle shares this one connection — the
@@ -130,6 +153,13 @@ pub(crate) struct CodexClient {
     /// Discovery and subscriptions over `connection`, with its own dispatcher
     /// for the push traffic a resumed thread produces.
     threads: Threads,
+    /// The endpoint this connection dialled, for the neutral base-URL read.
+    pub(crate) endpoint: Endpoint,
+    /// The adapter-internal transcript cache (#879): subscriptions fold into
+    /// it, and `Backend::transcript` reads it without waiting.
+    pub(crate) projections: Arc<Projections>,
+    /// The Background Task State handle, shared with the bridge.
+    pub(crate) tasks: TasksHandle,
     server: ServerInfo,
 }
 
@@ -199,6 +229,9 @@ impl CodexClient {
         Ok(Self {
             threads: Threads::new(connection.clone()),
             connection,
+            endpoint: options.endpoint.clone(),
+            projections: Arc::new(Projections::default()),
+            tasks: options.tasks.clone(),
             server: ServerInfo {
                 user_agent,
                 version,
@@ -243,6 +276,10 @@ fn platform(initialize: &Value) -> String {
 /// The id is deliberately not consulted: a `[clients.<id>]` rename is a state
 /// migration, not a new adapter (ADR-0090 decision 5/6). `Ok(None)` means the
 /// active client is not a Codex client and the caller keeps its own adapter.
+// A pure selection helper kept beside the construction it documents (and its
+// own test): the composition root now matches on `kind` and builds the
+// lifecycle, so this pre-lifecycle entry point has no production caller.
+#[allow(dead_code)]
 pub(crate) async fn connect_for_active_client(
     active: &ActiveClient,
     options: &CodexOptions,

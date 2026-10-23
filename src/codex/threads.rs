@@ -22,10 +22,10 @@
 //! thread loaded for another subscriber (and for its 30-minute grace), and this
 //! module never unsubscribes a thread another local handle still holds.
 //!
-//! The poll-shaped `Backend` (#879) will serve `transcript` from what these
-//! subscriptions accumulate; this ticket deliberately exposes the event stream
-//! rather than caching it, so the read model is designed once, with its
-//! consumer.
+//! The poll-shaped `Backend` (#879) serves `transcript` from what these
+//! subscriptions accumulate: the read model lives in [`super::read_model`] and
+//! the subscription/cache wiring in [`super::backend`]. This module stays the
+//! fan-out surface — it does not interpret item payloads itself.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -59,6 +59,10 @@ const NO_ROLLOUT: &str = "no rollout found for thread id ";
 /// One app-server thread, as `thread/list`, `thread/read` and `thread/resume`
 /// return it. Only the fields cola reads today are decoded; turns and status
 /// are the read model's (#879).
+// `session_id` is the tree root the attach path (#881) reads from the wire;
+// `source` and `status` feed `cola doctor` (#883). They are decoded here so the
+// contract is exercised, not guessed from the thread id.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Thread {
@@ -153,6 +157,9 @@ pub(crate) enum Adoption {
 
 /// `thread/unsubscribe`'s answer. `NotSubscribed` is the server's reply for a
 /// connection that holds no subscription to the thread.
+// The release path's answer (#881); kept decoded so
+// `thread/unsubscribe`'s states are the server's own.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum UnsubscribeStatus {
@@ -183,7 +190,11 @@ pub(crate) enum ThreadEvent {
 pub(crate) struct ThreadSubscription {
     thread: Thread,
     events: broadcast::Receiver<ThreadEvent>,
+    // Held for their `Drop`/release semantics: the guard releases this local
+    // holder, and the connection sends the acknowledged unsubscribe.
+    #[allow(dead_code)]
     guard: ReleaseGuard,
+    #[allow(dead_code)]
     connection: RpcConnection,
 }
 
@@ -223,6 +234,8 @@ impl ThreadSubscription {
     /// holds it (no `thread/unsubscribe` is sent: the server must keep
     /// streaming to that handle). This is the **only** unsubscribe path, so a
     /// caller cannot stop a stream another handle is reading.
+    // The bridge's release path is #881; the tests exercise it today.
+    #[allow(dead_code)]
     pub(crate) async fn release(mut self) -> Result<Option<UnsubscribeStatus>> {
         // Claim the local release atomically: two handles releasing at once
         // cannot both decide they are the last (and neither can both skip).
@@ -238,12 +251,14 @@ impl ThreadSubscription {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct UnsubscribeResponse {
     status: UnsubscribeStatus,
 }
 
 /// The thread surface over one attached connection.
+#[derive(Clone)]
 pub(crate) struct Threads {
     connection: RpcConnection,
     /// Outlives every subscription it handed out: the dispatcher is owned here,
@@ -269,16 +284,33 @@ impl Threads {
     /// List threads whose session cwd is exactly `cwd`, newest-page first as
     /// the server orders them. Pass the returned cursor back for the next
     /// page; [`Self::list_all`] does that until the end.
+    // The directory-scoped reads are used by #881's discovery, not the neutral
+    // `list_sessions` (which lists every thread).
+    #[allow(dead_code)]
     pub(crate) async fn list(
         &self,
         cwd: &str,
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<ThreadPage> {
+        self.list_page(Some(cwd), cursor, limit).await
+    }
+
+    /// One page of the server's thread list. `cwd` is the discovery scopes'
+    /// filter; `None` asks for every thread (the neutral `list_sessions` read,
+    /// which has no directory axis).
+    async fn list_page(
+        &self,
+        cwd: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<ThreadPage> {
         let mut params = json!({
-            "cwd": cwd,
             "sourceKinds": INTERACTIVE_SOURCE_KINDS,
         });
+        if let Some(cwd) = cwd {
+            params["cwd"] = json!(cwd);
+        }
         if let Some(cursor) = cursor {
             params["cursor"] = json!(cursor);
         }
@@ -297,12 +329,24 @@ impl Threads {
     /// Every thread for `cwd`, following `nextCursor` until the end. A server
     /// that repeats a cursor would otherwise loop forever, so that is a named
     /// protocol failure instead.
+    #[allow(dead_code)]
     pub(crate) async fn list_all(&self, cwd: &str) -> Result<Vec<SessionListInfo>> {
+        self.list_all_page(Some(cwd)).await
+    }
+
+    /// Every thread the server lists, with no cwd filter. The neutral
+    /// `Backend::list_sessions` read has no directory argument; a Codex thread
+    /// carries its cwd on the row for the caller to filter.
+    pub(crate) async fn list_all_any(&self) -> Result<Vec<SessionListInfo>> {
+        self.list_all_page(None).await
+    }
+
+    async fn list_all_page(&self, cwd: Option<&str>) -> Result<Vec<SessionListInfo>> {
         let mut sessions = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
         loop {
-            let page = self.list(cwd, cursor.as_deref(), None).await?;
+            let page = self.list_page(cwd, cursor.as_deref(), None).await?;
             sessions.extend(page.sessions);
             match page.next_cursor {
                 None => return Ok(sessions),
@@ -331,6 +375,19 @@ impl Threads {
             )
             .await?;
         let response: ReadResponse = decode("thread/read", result)?;
+        Ok(response.thread)
+    }
+
+    /// Start a new thread (`thread/start`). The server assigns the thread id;
+    /// `cwd` scopes it to the session's directory when the caller has one.
+    /// The response is the same [`Thread`] `thread/read` returns.
+    pub(crate) async fn start(&self, cwd: Option<&str>) -> Result<Thread> {
+        let mut params = json!({});
+        if let Some(cwd) = cwd {
+            params["cwd"] = json!(cwd);
+        }
+        let result = self.connection.request("thread/start", params).await?;
+        let response: ReadResponse = decode("thread/start", result)?;
         Ok(response.thread)
     }
 
@@ -542,6 +599,7 @@ struct ReleaseGuard {
 
 impl ReleaseGuard {
     /// Drop this local handle and report whether it was the last one.
+    #[allow(dead_code)]
     fn take(&mut self) -> bool {
         if self.released {
             return false;
