@@ -138,7 +138,7 @@ impl OpenCodeBackend {
     /// (the heal path). When more than one eligible server exists, the pass
     /// also WARNs once naming the canonical and every ignored server, so the
     /// choice is visible without attempting to sync two servers.
-    async fn reconcile(&self, request: EnsureAttached) -> crate::error::Result<AttachOutcome> {
+    async fn reconcile(&self, request: &EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
         let candidates = discovery::scan_processes();
         let self_pid = discovery::self_spawned_pid(self.layout());
         let Some(server) = discovery::pick_server(&candidates, self.settings().preferred_port(), self_pid)
@@ -147,7 +147,7 @@ impl OpenCodeBackend {
             // demand (the Shared Service first, else an Owned `serve --port`);
             // otherwise stay serverless (the caller replies that OpenCode is
             // unavailable).
-            let want_spawn = want_to_spawn(request.allow_spawn, request.heal_when_busy, request.busy);
+            let want_spawn = want_to_spawn(request.allow_spawn, request.heal_when_busy, (request.busy)());
             if want_spawn && self.settings().start_server.spawns_when_needed() {
                 let spawned = match discovery::spawn_own_server(
                     self.layout(),
@@ -177,8 +177,11 @@ impl OpenCodeBackend {
                 // silently. Boot skips this: `spawn_own_server` already
                 // resolved the generation against the live server.
                 if !request.boot
-                    && let Err(e) = wait_for_server_ready(self, Duration::from_secs(20)).await
+                    && let Err(evidence) = wait_for_server_ready(self, Duration::from_secs(20)).await
                 {
+                    // The helper reports neutral evidence; the adapter owns
+                    // the runtime-specific error text and its existing wording.
+                    let e = BridgeError::OpenCode(format!("own OpenCode server {evidence}"));
                     tracing::warn!("own OpenCode server never served a request: {}", e);
                     // Reap the wedged server and go serverless, so the NEXT
                     // message re-runs this reconcile and spawns a fresh one —
@@ -259,7 +262,7 @@ impl OpenCodeBackend {
         let pick_is_owned = self_pid == Some(server.pid);
 
         if needs_reattach(&current, attached_pid, server) {
-            if current_is_alive(&candidates, &current, attached_pid) && request.busy {
+            if current_is_alive(&candidates, &current, attached_pid) && (request.busy)() {
                 // Defer ANY migration while a turn streams on a server that is
                 // still alive — not only the Owned-Server yield. A Shared
                 // Service appearing while cola is attached to OpenChamber (or a
@@ -297,7 +300,7 @@ impl OpenCodeBackend {
         // (Shared Service or Coexistent), reap a leftover Owned Server (the
         // yield) — but never while a turn is in flight.
         if !pick_is_owned {
-            if request.busy {
+            if (request.busy)() {
                 return Ok(AttachOutcome::Attached);
             }
             reap_owned_server(self.layout(), &candidates, self_pid).await;
@@ -308,7 +311,7 @@ impl OpenCodeBackend {
 
 #[async_trait]
 impl ServerLifecycle for OpenCodeBackend {
-    async fn ensure_attached(&self, request: EnsureAttached) -> crate::error::Result<AttachOutcome> {
+    async fn ensure_attached(&self, request: EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
         let _guard = self.server_lock().lock().await;
         // The demand path's fast paths (the regex of the old `ensure_server`
         // hook): before rescanning the process table on every message, honour
@@ -326,7 +329,7 @@ impl ServerLifecycle for OpenCodeBackend {
                 return Ok(AttachOutcome::Attached);
             }
         }
-        self.reconcile(request).await
+        self.reconcile(&request).await
     }
 
     async fn attachment_status(&self) -> Option<AttachmentStatus> {
@@ -445,6 +448,93 @@ mod tests {
         assert!(
             needs_reattach("http://localhost:4096", None, &picked),
             "an unknown identity re-resolves rather than trust the URL"
+        );
+    }
+
+    fn serverless_backend(settings: crate::config::OpenCodeConfig) -> OpenCodeBackend {
+        OpenCodeBackend::with_tasks(
+            None,
+            &settings,
+            crate::state::StateLayout::default(),
+            crate::bridge::tasks::TasksHandle::new(),
+        )
+    }
+
+    /// The demand path's real decision, not an extracted helper: with
+    /// `start_server = "never"`, a serverless cola reports serverless (the
+    /// caller replies NoServer) and an attached one reports attached.
+    #[tokio::test]
+    async fn the_demand_path_honours_the_attach_only_policy() {
+        let settings = crate::config::OpenCodeConfig {
+            start_server: ServerStartPolicy::Never,
+            ..Default::default()
+        };
+        let backend = serverless_backend(settings);
+        let never_busy = || false;
+        let request = || EnsureAttached {
+            allow_spawn: true,
+            heal_when_busy: true,
+            busy: &never_busy,
+            boot: false,
+        };
+
+        assert_eq!(
+            backend.ensure_attached(request()).await.unwrap(),
+            AttachOutcome::Serverless,
+            "attach-only with no server is the NoServer state"
+        );
+
+        backend.reconnect(Some(&crate::opencode::discovery::ResolvedServer {
+            url: "http://localhost:4096".into(),
+            username: "opencode".into(),
+            password: "pw".into(),
+            pid: Some(4242),
+            generation: crate::opencode::strategy::Generation::V1,
+        }));
+        assert_eq!(
+            backend.ensure_attached(request()).await.unwrap(),
+            AttachOutcome::Attached,
+            "attach-only with a live server stays attached"
+        );
+    }
+
+    /// The lifecycle lock is what makes a busy sample meaningful: the probe
+    /// must not run until this pass owns the lock, or a turn that starts while
+    /// the pass waits would be read as idle.
+    #[tokio::test]
+    async fn the_busy_probe_is_read_only_after_the_lifecycle_lock() {
+        let backend = serverless_backend(crate::config::OpenCodeConfig::default());
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&called);
+        let busy = move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            false
+        };
+        let request = EnsureAttached {
+            allow_spawn: false,
+            heal_when_busy: false,
+            busy: &busy,
+            boot: false,
+        };
+
+        let guard = backend.server_lock().lock().await;
+        let mut pass = Box::pin(backend.ensure_attached(request));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut pass)
+                .await
+                .is_err(),
+            "the pass must wait on the lifecycle lock"
+        );
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "the probe must not be read before the lock is acquired"
+        );
+
+        drop(guard);
+        pass.await.expect("the pass completes once the lock is free");
+        assert!(
+            called.load(std::sync::atomic::Ordering::SeqCst),
+            "the probe is read under the lock"
         );
     }
 

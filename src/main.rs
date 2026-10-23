@@ -189,10 +189,12 @@ async fn attach_at_boot(
     client: &opencode::client::OpenCodeBackend,
     cfg: &config::Config,
 ) -> anyhow::Result<String> {
+    // Boot has no turn to protect: the daemon has not started serving yet.
+    let never_busy = || false;
     let request = backend::EnsureAttached {
         allow_spawn: cfg.opencode.start_server == config::ServerStartPolicy::Eager,
         heal_when_busy: false,
-        busy: false,
+        busy: &never_busy,
         boot: true,
     };
     match backend::ServerLifecycle::ensure_attached(client, request).await {

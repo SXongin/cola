@@ -643,10 +643,14 @@ mod core_only_client {
         tasks: crate::bridge::tasks::TasksHandle,
     }
 
-    /// No runtime to discover: the default lifecycle reports "attached,
-    /// nothing to do".
+    /// No runtime to discover: the explicit "attached, nothing to do" body
+    /// every no-lifecycle client owes the required method.
     #[async_trait]
-    impl ServerLifecycle for CoreClient {}
+    impl ServerLifecycle for CoreClient {
+        async fn ensure_attached(&self, _request: EnsureAttached<'_>) -> Result<AttachOutcome> {
+            Ok(AttachOutcome::Attached)
+        }
+    }
 
     #[async_trait]
     impl Backend for CoreClient {
