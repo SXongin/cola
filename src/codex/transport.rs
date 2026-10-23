@@ -20,7 +20,9 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
@@ -33,7 +35,8 @@ pub(crate) enum Endpoint {
     /// `ws://HOST:PORT` — the loopback listener Codex starts for a TUI.
     WebSocket(String),
     /// `unix://PATH` — a filesystem socket, usually the daemon control socket
-    /// (a symlink; followed by the OS, not by string canonicalisation).
+    /// (a symlink; followed by the OS, not by string canonicalisation). The
+    /// variant parses on every platform; connecting to it is unix-only.
     Unix(PathBuf),
 }
 
@@ -52,14 +55,6 @@ impl Endpoint {
         }
         Err(CodexError::Endpoint(raw.to_string()))
     }
-
-    /// Human-readable form for errors and logs.
-    pub(crate) fn describe(&self) -> String {
-        match self {
-            Self::WebSocket(url) => url.clone(),
-            Self::Unix(path) => format!("unix://{}", path.display()),
-        }
-    }
 }
 
 /// The one byte stream a `WebSocketStream` is built over.
@@ -71,6 +66,7 @@ type BoxedStream = Box<dyn ByteStream>;
 /// The HTTP request line the WebSocket handshake uses over a unix socket: the
 /// daemon serves one endpoint and ignores the host, but the handshake still
 /// needs a valid request target.
+#[cfg(unix)]
 const UNIX_HANDSHAKE_URL: &str = "ws://localhost/";
 
 /// One live app-server connection. The handshake and the contract check are
@@ -94,14 +90,26 @@ impl RpcConnection {
     async fn open_inner(endpoint: &Endpoint) -> Result<Self> {
         match endpoint {
             Endpoint::Unix(path) => {
-                let stream = UnixStream::connect(path)
-                    .await
-                    .map_err(|error| CodexError::Transport {
-                        context: format!("connect to unix socket {}", path.display()),
-                        detail: error.to_string(),
-                    })?;
-                let socket = Self::handshake(UNIX_HANDSHAKE_URL, Box::new(stream)).await?;
-                Ok(Self { socket, next_id: 1 })
+                #[cfg(unix)]
+                {
+                    let stream = UnixStream::connect(path)
+                        .await
+                        .map_err(|error| CodexError::Transport {
+                            context: format!("connect to unix socket {}", path.display()),
+                            detail: error.to_string(),
+                        })?;
+                    let socket = Self::handshake(UNIX_HANDSHAKE_URL, Box::new(stream)).await?;
+                    Ok(Self { socket, next_id: 1 })
+                }
+                // A unix-domain socket is not part of this platform's socket
+                // support. Say so by name; the caller can still use `ws://`.
+                #[cfg(not(unix))]
+                {
+                    Err(CodexError::UnsupportedPlatform {
+                        path: path.display().to_string(),
+                        platform: std::env::consts::OS,
+                    })
+                }
             }
             Endpoint::WebSocket(raw) => {
                 let url = Url::parse(raw).map_err(|error| CodexError::Transport {
@@ -262,6 +270,7 @@ mod tests {
     /// The shipped control socket is a symlink (ADR-0090 amendment, question
     /// 4). A real symlink to a real unix-socket server must connect: the path
     /// is handed to the OS, never canonicalised first.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_unix_transport_follows_a_symlinked_socket() {
         let dir = tempfile::tempdir().expect("tempdir");

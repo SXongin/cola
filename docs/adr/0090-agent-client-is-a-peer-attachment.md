@@ -341,3 +341,11 @@ reported version is refused, so a local `0.163.0` CLI can never vouch for a
 fails construction with its name, and an older server is refused outright. The
 live daemon at `~/.codex/app-server-control/app-server-control.sock` (a symlink
 into `/tmp/codex-daemon-0/<hash>`) passes both connections under that rule.
+
+The construction check is **method-name level by design**: the generated method
+lists are the stable part of the surface, while payload shapes are consumed by
+the adapter's typed decoders in the read-model and approval tickets (#879,
+#882), where a changed field fails as a named decode error on the read that
+uses it — never silently. The measured shape diff above (additive only across
+the pin-to-running delta) is what makes probing at that level honest rather
+than a guess.

@@ -351,6 +351,58 @@ mod tests {
         }
     }
 
+    /// End to end through the real probe: a newer server whose *generated*
+    /// surface lacks a required method fails at construction, naming it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_generated_surface_missing_a_method_fails_at_construction() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::codex::schema::{
+            AutoProbe, REQUIRED_CLIENT_METHODS, REQUIRED_NOTIFICATIONS, REQUIRED_SERVER_REQUESTS,
+            write_generated_surface,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let fixture = directory.path().join("schema");
+        std::fs::create_dir(&fixture).expect("schema fixture dir");
+        let client_methods: Vec<&str> = REQUIRED_CLIENT_METHODS
+            .iter()
+            .copied()
+            .filter(|method| *method != "turn/steer")
+            .collect();
+        write_generated_surface(
+            &fixture,
+            &client_methods,
+            REQUIRED_NOTIFICATIONS,
+            REQUIRED_SERVER_REQUESTS,
+        )
+        .expect("write schema fixture");
+
+        let binary = directory.path().join("codex");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.164.0\"; exit 0; fi\ncp '{}'/*.json \"$4\"/\n",
+                fixture.display()
+            ),
+        )
+        .expect("write fake codex");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake codex executable");
+
+        let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
+        let error = CodexClient::connect(&CodexOptions::new(endpoint), &AutoProbe::new(&binary))
+            .await
+            .expect_err("a missing generated method fails construction");
+        match error {
+            CodexError::MissingContract { missing, .. } => {
+                assert!(missing.contains("turn/steer"), "{missing}");
+            }
+            other => panic!("expected a missing contract, got {other}"),
+        }
+    }
+
     /// The adapter is selected by `kind`, never by the configured id.
     #[tokio::test]
     async fn the_adapter_is_selected_by_kind_not_id() {
