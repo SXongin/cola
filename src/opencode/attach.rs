@@ -81,8 +81,8 @@ fn resolve_probe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::discovery::ServerClass;
     use crate::bridge::test_support::{assert_line_level, capture_logs, level_count};
+    use crate::opencode::discovery::ServerClass;
     use crate::opencode::strategy::Generation;
     use crate::test_http::TestHttpServer;
 

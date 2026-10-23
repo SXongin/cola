@@ -10,6 +10,7 @@ mod feishu;
 mod git;
 mod logging;
 mod opencode;
+mod process;
 mod review;
 mod state;
 mod status;
@@ -175,77 +176,43 @@ fn require_supported_client(active: &config::ActiveClient) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Resolve which OpenCode server cola attaches to, honoring the `start_server`
-/// policy (ADR-0013).
+/// Attach at boot through the active client's lifecycle (spec #860, ticket
+/// #875).
 ///
-/// The invariant is the STORE: sessions are shared only when cola, OpenChamber
-/// and the CLI read the same data directory (`~/.local/share/opencode`). So
-/// cola attaches to whatever `opencode serve` is already running on the default
-/// store (OpenChamber's, a manual one — whoever started it), a Shared Service
-/// winning, then a Coexistent Server over cola's Owned (ADR-0085). `eager`
-/// additionally spawns
-/// cola's own server at boot when none exists. `auto` (lazy) and `never`
-/// return `None` when nothing runs — `auto` spawns on first demand (Lazy
-/// Start), `never` stays attach-only. Returns the resolved endpoint +
-/// credentials (discovery always supplies both username and password).
-async fn resolve_opencode_server(
-    cfg: &config::OpenCodeConfig,
-    layout: &state::StateLayout,
-) -> anyhow::Result<Option<bridge::discovery::ResolvedServer>> {
-    let candidates = bridge::discovery::scan_processes();
-    let self_pid = bridge::discovery::self_spawned_pid(layout);
-    if let Some(server) = bridge::discovery::pick_server(&candidates, cfg.preferred_port(), self_pid) {
-        // Attach-time generation detection (spec #364 §2): probe the server
-        // with the credentials discovery resolved and log the positive
-        // evidence. An inconclusive probe is never guessed — cola stays
-        // serverless and Lazy Start / the reconnect scan retries. It also
-        // never falls through to the eager spawn below: a server IS running,
-        // so raising a second one against the same store is exactly the
-        // hazard ADR-0013 exists to prevent.
-        return match bridge::attach::resolve_candidate(server, cfg.generation).await {
-            Ok(resolved) => Ok(Some(resolved)),
-            Err(evidence) => {
-                tracing::warn!("generation probe inconclusive; staying serverless: {evidence}");
-                Ok(None)
-            }
-        };
-    }
-
-    if cfg.start_server == config::ServerStartPolicy::Eager {
-        match bridge::discovery::spawn_own_server(layout, cfg.preferred_port(), cfg.generation).await {
-            Ok(spawned) => {
-                tracing::info!(
-                    "Started cola's OpenCode server at {} — generation={} (Shared Service when one could be raised, else self-started `opencode serve`)",
-                    spawned.url,
-                    spawned.generation.as_str()
-                );
-                return Ok(Some(spawned));
-            }
-            // A live server whose generation has not resolved yet (e.g. a V2
-            // store migration answering 503, or a Shared Service whose probe is
-            // momentarily inconclusive) is treated exactly like an inconclusive
-            // attach: stay serverless and let the reconnect loop attach once the
-            // probe classifies, instead of taking the bot down at boot. The test
-            // is "any default-store server is alive in the scan", not "our own
-            // child is alive": a Shared Service is never owned and writes no
-            // `self-opencode.pid` (ADR-0085). A spawn that never came up (no
-            // live default-store server at all) stays loud.
-            Err(e) if bridge::discovery::has_live_default_store_server() => {
-                tracing::warn!("eager start could not resolve a generation yet; staying serverless: {e}");
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
+/// The client owns discovery, the generation probe and the optional start; the
+/// daemon supplies only the policy-derived spawn allowance. `eager` is the one
+/// boot mode that may spawn; `auto` and `never` attach if a server exists and
+/// otherwise stay serverless (Lazy Start is the demand path). An inconclusive
+/// generation probe is not fatal at boot: cola starts serverless and the
+/// reconnect loop attaches once the probe classifies.
+async fn attach_at_boot(
+    client: &opencode::client::OpenCodeBackend,
+    cfg: &config::Config,
+) -> anyhow::Result<String> {
+    let request = backend::EnsureAttached {
+        allow_spawn: cfg.opencode.start_server == config::ServerStartPolicy::Eager,
+        heal_when_busy: false,
+        busy: false,
+        boot: true,
+    };
+    match backend::ServerLifecycle::ensure_attached(client, request).await {
+        Ok(backend::AttachOutcome::Attached) => Ok(client.base_url()),
+        Ok(backend::AttachOutcome::Serverless) => {
+            tracing::info!(
+                "No shared OpenCode server running; {}",
+                match cfg.opencode.start_server {
+                    config::ServerStartPolicy::Never => "attach-only mode (`start_server = \"never\"`)",
+                    _ => "lazy start — attach to a server or spawn an Owned Server at the first prompt",
+                }
+            );
+            Ok(String::new())
         }
-    }
-
-    tracing::info!(
-        "No shared OpenCode server running; {}",
-        match cfg.start_server {
-            config::ServerStartPolicy::Never => "attach-only mode (`start_server = \"never\"`)",
-            _ => "lazy start — attach to a server or spawn an Owned Server at the first prompt",
+        Ok(backend::AttachOutcome::Inconclusive { url, evidence }) => {
+            tracing::warn!("generation probe inconclusive at {url}; staying serverless: {evidence}");
+            Ok(String::new())
         }
-    );
-    Ok(None)
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Path of the singleton lock file — created atomically at startup so a second
@@ -314,7 +281,7 @@ fn is_cola_process(pid: i32) -> bool {
 /// whose zombie state cannot be determined is treated as alive (conservative —
 /// never steal a lock we can't verify is dead).
 fn pid_alive(pid: i32) -> bool {
-    bridge::discovery::process_alive(pid)
+    process::alive(pid)
 }
 
 /// Whether a lock owner is still capable of processing events: a live
@@ -433,7 +400,7 @@ fn replace_instance(pid: i32) -> anyhow::Result<()> {
             pid
         );
     }
-    bridge::discovery::terminate_process(pid)?;
+    process::terminate(pid)?;
     for _ in 0..50 {
         if !pid_alive(pid) {
             return Ok(());
@@ -441,7 +408,7 @@ fn replace_instance(pid: i32) -> anyhow::Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     tracing::warn!("PID {} did not exit on SIGTERM; sending SIGKILL", pid);
-    bridge::discovery::force_kill(pid)?;
+    process::force_kill(pid)?;
     for _ in 0..50 {
         if !pid_alive(pid) {
             return Ok(());
@@ -675,9 +642,9 @@ fn restart_cli(assume_yes: bool) -> anyhow::Result<()> {
     // Read the instance's identity BEFORE stopping it: without a supervisor its
     // command line, executable and working directory are the only record of how
     // it was started.
-    let argv = bridge::discovery::process_cmd(pid);
-    let exe = bridge::discovery::process_exe(pid);
-    let cwd = bridge::discovery::process_cwd(pid);
+    let argv = process::cmd(pid);
+    let exe = process::exe(pid);
+    let cwd = process::cwd(pid);
     // Supervisor first — but ONLY when the supervisor actually owns the running
     // process (ADR-0021): restarting the unit while an unrelated manual instance
     // holds the lock starts a process that cannot acquire it, which
@@ -864,6 +831,23 @@ fn wait_for_new_daemon(old_pid: Option<i32>) -> bool {
     }
 }
 
+/// Build the active client for a read-only introspection command. The
+/// composition root is the one place allowed to name the adapter; the report
+/// only sees its [`backend::ServerLifecycle`].
+fn status_client(state: &status::ConfigState) -> Option<Arc<dyn backend::Backend>> {
+    let cfg = state.cfg()?;
+    // Only an OpenCode client has a server lifecycle to report today. A
+    // configured kind this build cannot construct reports no server rather
+    // than an error — `cola status` must survive a broken/unsupported config.
+    cfg.active_client().ok()?.opencode()?;
+    Some(Arc::new(opencode::client::OpenCodeBackend::with_tasks(
+        cfg.opencode.model.as_deref(),
+        &cfg.opencode,
+        state::StateLayout::from_config(cfg),
+        bridge::tasks::TasksHandle::new(),
+    )))
+}
+
 /// `cola status` (ADR-0081): resolve the config leniently, gather the snapshot,
 /// and print it as text or JSON. A missing or broken config narrows the report
 /// instead of failing.
@@ -873,7 +857,8 @@ async fn status_cli(
     log_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let state = status::ConfigState::from_env(explicit_config);
-    let snapshot = status::gather(&state, log_path).await;
+    let client = status_client(&state);
+    let snapshot = status::gather(&state, log_path, client.as_deref()).await;
     if json {
         println!(
             "{}",
@@ -950,7 +935,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(Subcommand::Doctor) = cli.subcommand {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
-        if !status::run_doctor(cli.config.as_deref(), &log_path).await? {
+        let state = status::ConfigState::from_env(cli.config.as_deref());
+        let client = status_client(&state);
+        if !status::run_doctor(&state, &log_path, client.as_deref()).await? {
             std::process::exit(1);
         }
         return Ok(());
@@ -1026,26 +1013,29 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let server = resolve_opencode_server(&cfg.opencode, &layout).await?;
+    let feishu_client = feishu::client::Client::new(cfg.feishu.clone());
+
+    let opencode_client = opencode::client::OpenCodeBackend::with_tasks(
+        cfg.opencode.model.as_deref(),
+        &cfg.opencode,
+        layout.clone(),
+        bridge::tasks::TasksHandle::new(),
+    );
+    // The client owns discovery and attach; the daemon asks once at boot.
+    let server_url = attach_at_boot(&opencode_client, &cfg).await?;
 
     tracing::info!(
         "cola starting — client: {} ({}), OpenCode: {}, Feishu app: {}",
         active.id,
         active.kind,
-        server
-            .as_ref()
-            .map(|s| s.url.as_str())
-            .unwrap_or("<lazy — attach or spawn at the first prompt>"),
+        if server_url.is_empty() {
+            "<lazy — attach or spawn at the first prompt>"
+        } else {
+            server_url.as_str()
+        },
         cfg.feishu.app_id
     );
 
-    let feishu_client = feishu::client::Client::new(cfg.feishu.clone());
-
-    let opencode_client = opencode::client::OpenCodeBackend::with_tasks(
-        cfg.opencode.model.as_deref(),
-        server,
-        bridge::tasks::TasksHandle::new(),
-    );
     let app = Arc::new(bridge::App::with_layout(
         cfg.clone(),
         layout,

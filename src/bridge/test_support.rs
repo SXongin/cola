@@ -1657,10 +1657,14 @@ pub struct MockBackend {
     /// order — the location a session's skill read must carry.
     pub list_skills_directories: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// Simulate a real adapter BEFORE Lazy Start: serverless (an empty
-    /// `base_url`, so a read against it yields nothing) but able to spawn its
-    /// own server. Lets a test drive the Lazy Start / NoServer path that the
-    /// default mock (attached, `can_self_start_server = false`) never reaches.
+    /// `base_url`, so a read against it yields nothing) and reporting
+    /// [`crate::backend::AttachOutcome::Serverless`]. Lets a test drive the
+    /// attach-only / NoServer path that the default mock (attached, and
+    /// therefore "nothing to do") never reaches.
     pub serverless: bool,
+    /// The attachment `attachment_status` reports (`cola status`/`doctor`'s
+    /// read). `None` means "nothing to report", the default.
+    pub attachment: Option<crate::backend::lifecycle::AttachmentStatus>,
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
     pub provider_models: Vec<crate::backend::types::ProviderModels>,
@@ -1912,6 +1916,7 @@ impl MockBackend {
             list_skills_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             list_skills_directories: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             serverless: false,
+            attachment: None,
             provider_models: Vec::new(),
             default_model: None,
             context_window: Some(100_000),
@@ -3390,12 +3395,6 @@ impl crate::backend::Backend for MockBackend {
         self.compact_calls.lock().await.push(_s.to_string());
         Ok(())
     }
-    async fn reconnect(
-        &self,
-        _server: Option<&crate::bridge::discovery::ResolvedServer>,
-    ) -> crate::error::Result<()> {
-        Ok(())
-    }
     fn base_url(&self) -> String {
         if self.serverless {
             String::new()
@@ -3404,15 +3403,30 @@ impl crate::backend::Backend for MockBackend {
         }
     }
 
-    /// A serverless mock simulates the real adapter before Lazy Start: it can
-    /// spawn its own server. An attached mock (the default) cannot, so
-    /// `ensure_server` is a no-op for it.
-    fn can_self_start_server(&self) -> bool {
-        self.serverless
-    }
-
     fn for_directory(self: Arc<Self>, directory: &str) -> Arc<dyn crate::backend::DirectoryBackend> {
         Arc::new(crate::backend::BackendDirectory::new(self, directory.to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::backend::ServerLifecycle for MockBackend {
+    /// The mock has no runtime to discover: it reports the state a test set.
+    /// An attached mock (the default) is "attached, nothing to do"; a
+    /// serverless one reports serverless, so the Lazy Start / NoServer paths
+    /// are reachable (the real adapter would start a server instead).
+    async fn ensure_attached(
+        &self,
+        _request: crate::backend::EnsureAttached,
+    ) -> crate::error::Result<crate::backend::AttachOutcome> {
+        Ok(if self.serverless {
+            crate::backend::AttachOutcome::Serverless
+        } else {
+            crate::backend::AttachOutcome::Attached
+        })
+    }
+
+    async fn attachment_status(&self) -> Option<crate::backend::lifecycle::AttachmentStatus> {
+        self.attachment.clone()
     }
 }
 

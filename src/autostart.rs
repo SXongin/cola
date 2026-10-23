@@ -229,7 +229,7 @@ mod linux {
     /// process it starts, and `SYSTEMD_EXEC_PID` names the main one. Both must
     /// hold, the same pair `update::supervisor_restart_code` checks for itself.
     pub(super) fn supervisor_owns(pid: i32) -> bool {
-        let Some(env) = crate::bridge::discovery::process_environ(pid) else {
+        let Some(env) = crate::process::environ(pid) else {
             return false;
         };
         let mut invocation = false;
@@ -485,7 +485,7 @@ mod macos {
     /// Whether launchd owns `pid`: a job process carries its label in
     /// `XPC_SERVICE_NAME`.
     pub(super) fn supervisor_owns(pid: i32) -> bool {
-        crate::bridge::discovery::process_environ(pid)
+        crate::process::environ(pid)
             .is_some_and(|env| env.iter().any(|kv| kv == &format!("XPC_SERVICE_NAME={LABEL}")))
     }
 

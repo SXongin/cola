@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bridge::discovery::{self, ServerCandidate};
+use crate::backend::lifecycle::{AttachOutcome, EnsureAttached};
 use crate::bridge::handler::CardActionResult;
-use crate::bridge::handles::{CardsHandle, PollHandles, SessionsHandle, WaitsHandle};
+use crate::bridge::handles::{CardsHandle, FlowHandles, SessionsHandle, WaitsHandle};
 use crate::bridge::request::flow::SentCard;
 use crate::bridge::turn::Turn;
-use crate::config::ServerStartPolicy;
 
 /// How often the server-reconcile loop rescans for a changed or newly-appeared
 /// server (the same cadence the old reconnect loop used).
@@ -19,303 +18,40 @@ const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 /// an Owned Server never truncates a mid-stream generation (ADR-0013) — and
 /// since the follow holds the guard, a followed Session is never read as idle
 /// here.
+///
+/// This is the one bridge fact the client's lifecycle needs: the client owns
+/// every other part of the decision (spec #860, ticket #875).
 async fn busy(waits: &WaitsHandle) -> bool {
     !waits.inflight.lock().await.is_empty()
 }
 
-/// Whether the server cola is currently attached to is still present in this
-/// scan — the same process (pid, when the attach path carried one) on the same
-/// port, still on the default store.
+/// One pass of the client-owned "ensure attached" entry point.
 ///
-/// This is the guard that separates "the canonical pick moved to another live
-/// server" (defer while a turn is in flight — the server being left behind is
-/// still serving) from "the attached server is gone" (reattach immediately,
-/// even busy: the endpoint is dead). A replacement on the same port is NOT the
-/// attached server — its pid differs, so the old endpoint is gone and the pass
-/// must re-resolve now.
-fn current_is_alive(candidates: &[ServerCandidate], current: &str, attached_pid: Option<i32>) -> bool {
-    let Some(port) = crate::config::port_from_url(current) else {
-        return false;
-    };
-    candidates.iter().any(|c| {
-        c.uses_default_store && c.port != 0 && c.port == port && attached_pid.is_none_or(|pid| c.pid == pid)
-    })
-}
-
-/// Whether this reconcile pass must re-resolve the attachment: the picked
-/// server is not the one currently attached.
-///
-/// Identity, not just the URL, decides: a server replaced on the SAME port —
-/// a new pid — may be the other generation or carry a new password, and
-/// `auto` re-probes on every attach/reconnect (spec #364 §2). Comparing only
-/// the URL would keep a stale strategy (and stale credentials) for that
-/// replacement. A `None` attached pid means the attach path did not carry an
-/// identity, so the pass re-resolves.
-fn needs_reattach(current_url: &str, attached_pid: Option<i32>, picked: &ServerCandidate) -> bool {
-    current_url != picked.url() || attached_pid != Some(picked.pid)
-}
-
-/// Terminate cola's Owned Server (verified by pid against the live candidates)
-/// and forget it, so the Shared Store returns to one server once cola attached
-/// to a Coexistent one. The yield (ADR-0013). The pid file is cleared only
-/// after the process is confirmed dead (SIGTERM, escalating to SIGKILL) — a
-/// lingering process cola lost the record of could never be reaped.
-async fn reap_owned_server(
-    layout: &crate::state::StateLayout,
-    candidates: &[ServerCandidate],
-    self_pid: Option<i32>,
-) {
-    let Some(self_pid) = self_pid else { return };
-    if !candidates.iter().any(|c| c.pid == self_pid) {
-        return;
-    }
-    tracing::info!("yielding: terminating own OpenCode server (pid {})", self_pid);
-    if let Err(e) = discovery::terminate_process(self_pid) {
-        tracing::warn!("yield: failed to terminate Owned Server {}: {}", self_pid, e);
-        return;
-    }
-    if wait_dead(self_pid, 5000).await {
-        discovery::clear_self_spawned(layout);
-        return;
-    }
-    tracing::warn!(
-        "yield: Owned Server {} did not exit on SIGTERM; sending SIGKILL",
-        self_pid
-    );
-    let _ = discovery::force_kill(self_pid);
-    if wait_dead(self_pid, 5000).await {
-        discovery::clear_self_spawned(layout);
-    } else {
-        tracing::warn!(
-            "yield: Owned Server {} did not exit after SIGKILL; keeping its pid record",
-            self_pid
-        );
-    }
-}
-
-/// Poll until a process is dead (not alive / not a zombie), within `timeout_ms`.
-async fn wait_dead(pid: i32, timeout_ms: u64) -> bool {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-    loop {
-        if !discovery::process_alive(pid) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-}
-
-/// Whether a demand-time spawn is wanted for this reconcile pass.
-///
-/// `allow_spawn` is the message-path demand (Lazy Start). `heal_when_busy` is
-/// the poll-path heal: also spawn when a turn is in flight and the server is
-/// gone, so a mid-stream generation's next poll finds a live server instead of
-/// 502ing forever. `Never` policy is enforced separately by
-/// `ServerStartPolicy::spawns_when_needed`.
-fn want_to_spawn(allow_spawn: bool, heal_when_busy: bool, busy: bool) -> bool {
-    allow_spawn || (heal_when_busy && busy)
-}
-
-/// Wait until the freshly spawned server actually serves requests, within
-/// `timeout`. `opencode serve` accepts TCP before its HTTP dispatch is fully
-/// wired up; requests landing in that startup window (~1s) are swallowed
-/// silently and hang forever — the Lazy Start flow's first request
-/// (session_subtitle) always landed there, hanging the turn silently (the
-/// Lazy Start silent-hang incident). Each probe is short-bounded so a wedged
-/// attempt is abandoned and retried on a fresh connection. ANY HTTP response
-/// — success or error — counts as ready: the failure mode being dodged is a
-/// swallowed request (no response at all), and a responding server is past
-/// the window even when it answers with an error.
-pub(crate) async fn wait_for_server_ready(
-    backend: &Arc<dyn crate::backend::Backend>,
-    timeout: std::time::Duration,
-) -> crate::error::Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        match tokio::time::timeout(std::time::Duration::from_millis(1500), backend.list_sessions()).await {
-            Ok(Ok(_)) | Ok(Err(_)) => return Ok(()),
-            Err(_) => {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(crate::error::BridgeError::OpenCode(
-                        "own OpenCode server accepted connections but never served a request".into(),
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-    }
-}
-
-/// One pass of the server-ownership reconcile (ADR-0013, ADR-0085): attach to
-/// the canonical default-store server (Shared Service first, then a Coexistent
-/// Server over cola's Owned), lazily start a server when `allow_spawn` and none
-/// exists (the machine-wide Shared Service first, else an Owned
-/// `serve --port`), and reap a leftover Owned Server once another server is
-/// the pick. A migration — the yield included — is deferred while a turn is in
-/// flight AND the attached server is still alive, so an appearing Service (or
-/// a preferred sibling) never truncates a streaming generation; a dead
-/// attached server reattaches immediately (the heal path). When more than one
-/// eligible server exists, the pass also WARNs once naming the canonical and
-/// every ignored server, so the choice is visible without attempting to sync
-/// two servers. The reconnect loop runs this with `allow_spawn=false` on a
-/// cadence; the Lazy Start hook runs it with `allow_spawn=true` at the moment a
-/// server is needed.
+/// The whole discover / attach / health / optionally-start policy lives behind
+/// [`crate::backend::ServerLifecycle::ensure_attached`]; the bridge supplies
+/// only the three facts the client cannot know (is a message waiting, may a
+/// poll heal a dead server, is a turn streaming) and maps the outcome to
+/// attached/serverless, or to the one failure signal the latch reports.
 ///
 /// Returns whether a server is attached (or was just started).
-///
-/// `heal_when_busy` lets a poll (not a new message) start a server when a turn
-/// is already in flight and the attached server died — the mid-stream
-/// generation's next poll should find a live server instead of 502ing forever.
-/// Spawns only if `allow_spawn` OR (`heal_when_busy` and a turn is busy), and
-/// only when the policy allows it (`Never` never spawns).
 async fn reconcile(
-    handles: &PollHandles,
+    handles: &FlowHandles,
     allow_spawn: bool,
     heal_when_busy: bool,
 ) -> crate::error::Result<bool> {
-    let candidates = discovery::scan_processes();
-    let self_pid = discovery::self_spawned_pid(&handles.flow.layout);
-    let Some(server) = discovery::pick_server(&candidates, handles.server.preferred_port, self_pid) else {
-        // No default-store server at all. Lazy Start: start a server on demand
-        // (the Shared Service first, else an Owned `serve --port`); otherwise
-        // stay serverless (the caller replies that OpenCode is unavailable).
-        let want_spawn = want_to_spawn(allow_spawn, heal_when_busy, busy(&handles.flow.waits).await);
-        if want_spawn && handles.server.start_policy.spawns_when_needed() {
-            let spawned = discovery::spawn_own_server(
-                &handles.flow.layout,
-                handles.server.preferred_port,
-                handles.server.generation,
-            )
-            .await
-            .map_err(|e| crate::error::BridgeError::OpenCode(format!("lazy start failed: {e}")))?;
-            handles.flow.backend.reconnect(Some(&spawned)).await?;
-            // The spawned server only serves requests after a short startup
-            // window (requests landing in it are swallowed forever). Wait until
-            // it actually responds, so the message flow's first request lands
-            // on a live server instead of hanging the turn silently.
-            if let Err(e) =
-                wait_for_server_ready(&handles.flow.backend, std::time::Duration::from_secs(20)).await
-            {
-                tracing::warn!("own OpenCode server never served a request: {}", e);
-                // Reap the wedged server and go serverless, so the NEXT message
-                // re-runs this reconcile and spawns a fresh one — leaving the
-                // record in place would re-attach a scan-found wedged server
-                // (its requests are swallowed, hanging the turn again).
-                if let Some(pid) = discovery::self_spawned_pid(&handles.flow.layout) {
-                    if discovery::terminate_process(pid).is_ok() && wait_dead(pid, 5000).await {
-                        discovery::clear_self_spawned(&handles.flow.layout);
-                    } else {
-                        let _ = discovery::force_kill(pid);
-                        if wait_dead(pid, 5000).await {
-                            discovery::clear_self_spawned(&handles.flow.layout);
-                        }
-                    }
-                }
-                let _ = handles.flow.backend.reconnect(None).await;
-                return Err(e);
-            }
-            if allow_spawn {
-                tracing::info!(
-                    "lazily started an OpenCode server at {} (generation={})",
-                    spawned.url,
-                    spawned.generation.as_str()
-                );
-            } else {
-                tracing::warn!(
-                    "attached server died mid-turn; started an OpenCode server at {} (generation={})",
-                    spawned.url,
-                    spawned.generation.as_str()
-                );
-            }
-            return Ok(true);
-        }
-        // The attached server, if any, is gone — go serverless so a later
-        // message re-attaches or lazily spawns instead of 502ing against the
-        // dead endpoint forever.
-        if !handles.flow.backend.base_url().is_empty() {
-            tracing::warn!("attached OpenCode server is gone; going serverless");
-            handles.flow.backend.reconnect(None).await?;
-        }
-        return Ok(false);
+    let request = EnsureAttached {
+        allow_spawn,
+        heal_when_busy,
+        busy: busy(&handles.waits).await,
+        boot: false,
     };
-    let url = server.url();
-    let ignored = discovery::other_servers(&candidates, server);
-    if !ignored.is_empty() {
-        // One server is the premise of real-time sync (ADR-0085). cola cannot
-        // aggregate two servers, so make the choice and the ignored servers
-        // visible every pass instead of silently flapping.
-        tracing::warn!(
-            "multiple default-store OpenCode servers; canonical {} (pid {}); ignoring {}",
-            url,
-            server.pid,
-            ignored
-                .iter()
-                .map(|c| format!(
-                    "{} (pid {}, {})",
-                    c.url(),
-                    c.pid,
-                    if c.is_service() {
-                        "service"
-                    } else {
-                        "not a service"
-                    }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    match handles.backend.ensure_attached(request).await? {
+        AttachOutcome::Attached => Ok(true),
+        AttachOutcome::Serverless => Ok(false),
+        AttachOutcome::Inconclusive { url, evidence } => Err(crate::error::BridgeError::OpenCode(format!(
+            "generation probe inconclusive at {url}; staying serverless: {evidence}"
+        ))),
     }
-    let current = handles.flow.backend.base_url();
-    let attached_pid = handles.flow.backend.attached_server_pid();
-    let pick_is_owned = self_pid == Some(server.pid);
-
-    if needs_reattach(&current, attached_pid, server) {
-        if current_is_alive(&candidates, &current, attached_pid) && busy(&handles.flow.waits).await {
-            // Defer ANY migration while a turn streams on a server that is
-            // still alive — not only the Owned-Server yield. A Shared Service
-            // appearing while cola is attached to OpenChamber (or a preferred
-            // sibling within the same class) is exactly the case the spec asks
-            // to defer, so the in-flight generation is never truncated. A dead
-            // current server is not deferred: the heal path reattaches now.
-            return Ok(true);
-        }
-        tracing::warn!(
-            "OpenCode server changed ({} pid {} -> {} pid {}); reconnecting",
-            current,
-            attached_pid.map_or("?".to_string(), |p| p.to_string()),
-            url,
-            server.pid
-        );
-        // Resolve the new attachment's generation before re-pointing (spec
-        // #364 §2). A probe that cannot classify the server is never guessed
-        // at: cola drops to serverless and the next pass retries — an error
-        // return lets the PollLoop's latch report it once, not every tick.
-        let resolved = match crate::bridge::attach::resolve_candidate(server, handles.server.generation).await
-        {
-            Ok(resolved) => resolved,
-            Err(evidence) => {
-                if !current.is_empty() {
-                    handles.flow.backend.reconnect(None).await?;
-                }
-                return Err(crate::error::BridgeError::OpenCode(format!(
-                    "generation probe inconclusive at {url}; staying serverless: {evidence}"
-                )));
-            }
-        };
-        handles.flow.backend.reconnect(Some(&resolved)).await?;
-    }
-
-    // Attached to the canonical server. If it is not cola's Owned Server
-    // (Shared Service or Coexistent), reap a leftover Owned Server (the yield)
-    // — but never while a turn is in flight.
-    if !pick_is_owned {
-        if busy(&handles.flow.waits).await {
-            return Ok(true);
-        }
-        reap_owned_server(&handles.flow.layout, &candidates, self_pid).await;
-    }
-    Ok(true)
 }
 
 /// Independent poller: the OpenCode server cola attaches to is managed by
@@ -334,13 +70,12 @@ async fn reconcile(
 /// as disappear, so every tick reconciles.
 ///
 /// [`PollLoop`]: crate::bridge::poll::PollLoop
-pub(crate) async fn reconnect_poll_loop(handles: &PollHandles) -> crate::error::Result<()> {
+pub(crate) async fn reconnect_poll_loop(handles: &FlowHandles) -> crate::error::Result<()> {
     let cadence_ms = std::sync::atomic::AtomicU64::new(RECONNECT_POLL_INTERVAL_SECS * 1_000);
     let mut poll = reconnect_loop(&cadence_ms);
     poll.poll(
         || true,
         move || async move {
-            let _guard = handles.server.lock.lock().await;
             reconcile(handles, false, true)
                 .await
                 .map(|_| ())
@@ -352,8 +87,8 @@ pub(crate) async fn reconnect_poll_loop(handles: &PollHandles) -> crate::error::
 
 /// The reconnect loop's [`PollLoop`]: the production condition name, wired to
 /// the injected cadence. Split out so the loop's failure policy is testable at
-/// the seam — a reconcile pass scans the real process table and cannot be
-/// driven with a fake.
+/// the seam — a reconcile pass is client-owned, so a fake client that reports
+/// "attached, nothing to do" drives the loop without any adapter symbols.
 ///
 /// [`PollLoop`]: crate::bridge::poll::PollLoop
 fn reconnect_loop(cadence_ms: &std::sync::atomic::AtomicU64) -> crate::bridge::poll::PollLoop<'_> {
@@ -361,26 +96,10 @@ fn reconnect_loop(cadence_ms: &std::sync::atomic::AtomicU64) -> crate::bridge::p
 }
 
 /// Lazy Start hook (ADR-0013): called at the moment a message needs a server.
-/// Attaches if a default-store server exists, spawns an Owned Server if none
-/// does and the policy allows (`auto`/`eager`), and reports false when
-/// attach-only (`never`) and no server exists. No-op for test mocks (they have
-/// no process to spawn). Returns whether a server is ready.
-pub(crate) async fn ensure_server(handles: &PollHandles) -> crate::error::Result<bool> {
-    if !handles.flow.backend.can_self_start_server() {
-        return Ok(true);
-    }
-    if handles.server.start_policy == ServerStartPolicy::Never {
-        // Attach-only: a non-empty base_url means we're attached to someone
-        // else's server; otherwise stay serverless.
-        return Ok(!handles.flow.backend.base_url().is_empty());
-    }
-    // Already attached — the reconcile loop re-points us within a few seconds
-    // if that server dies or a Coexistent one appears, so don't rescan the
-    // process table on every message.
-    if !handles.flow.backend.base_url().is_empty() {
-        return Ok(true);
-    }
-    let _guard = handles.server.lock.lock().await;
+/// The active client's lifecycle attaches if a server exists, starts one when
+/// its policy allows, and reports serverless for attach-only. Returns whether a
+/// server is ready.
+pub(crate) async fn ensure_server(handles: &FlowHandles) -> crate::error::Result<bool> {
     reconcile(handles, true, true).await
 }
 
@@ -634,95 +353,33 @@ pub(crate) async fn mark_stale_cards(
 mod tests {
     use super::*;
     use crate::bridge::core::SharedCore;
-    use crate::bridge::discovery::ServerClass;
     use crate::bridge::test_support::{MockBackend, RecordingPlatform, test_config};
     use std::sync::Arc;
 
-    fn cand(pid: i32, port: u16) -> ServerCandidate {
-        ServerCandidate {
-            pid,
-            port,
-            username: "opencode".into(),
-            password: "x".into(),
-            uses_default_store: true,
-            class: ServerClass::Coexistent,
-        }
-    }
+    /// The poll loop's seam, driven by a client with no lifecycle of its own:
+    /// it reports "attached, nothing to do", so the pass is a clean success
+    /// and this test names no adapter symbol (spec #860, ticket #875).
+    #[tokio::test]
+    async fn a_fake_client_that_is_attached_drives_the_poll_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let layout = crate::state::StateLayout::from_config(&cfg);
+        let platform = Arc::new(RecordingPlatform::new());
+        let core = Arc::new(
+            SharedCore::new(&cfg, layout, Arc::new(MockBackend::new(Vec::new())), platform).unwrap(),
+        );
 
-    #[test]
-    fn current_is_alive_tracks_identity_not_just_the_port() {
-        let servers = vec![cand(7, 4096)];
-        assert!(current_is_alive(&servers, "http://localhost:4096", Some(7)));
-        // A replacement on the same port is NOT the attached server: its
-        // endpoint is gone, so the pass must reattach immediately.
-        assert!(!current_is_alive(&servers, "http://localhost:4096", Some(8)));
-        // No identity on the attachment: the port is the only thing to compare.
-        assert!(current_is_alive(&servers, "http://localhost:4096", None));
-        assert!(!current_is_alive(&servers, "http://localhost:4097", Some(7)));
-        assert!(!current_is_alive(&servers, "http://mock", Some(7)));
-        assert!(!current_is_alive(&servers, "", Some(7)));
-        // A candidate on a custom store is someone else's data — not the
-        // attached server, even on the same port.
-        let custom = ServerCandidate {
-            uses_default_store: false,
-            ..cand(7, 4096)
-        };
-        assert!(!current_is_alive(&[custom], "http://localhost:4096", Some(7)));
-    }
-
-    /// Same-URL replacements are the reason identity (pid), not just the URL,
-    /// decides: a server swapped on the same port may speak the other
-    /// generation or carry a new password, and `auto` re-probes on every
-    /// attach/reconnect (spec #364 §2).
-    #[test]
-    fn needs_reattach_on_url_or_pid_change() {
-        let picked = cand(7, 4096);
         assert!(
-            !needs_reattach("http://localhost:4096", Some(7), &picked),
-            "the same server stays attached"
+            reconcile(&core.flow_handles(), false, true).await.unwrap(),
+            "a client that reports attached leaves the pass successful"
         );
-        assert!(
-            needs_reattach("http://localhost:4096", Some(8), &picked),
-            "a replacement on the same port must re-resolve"
-        );
-        assert!(
-            needs_reattach("http://localhost:4097", Some(7), &picked),
-            "a server on another port must re-resolve"
-        );
-        assert!(
-            needs_reattach("", None, &picked),
-            "serverless re-attaches at the picked server"
-        );
-        assert!(
-            needs_reattach("http://localhost:4096", None, &picked),
-            "an unknown identity re-resolves rather than trust the URL"
-        );
-    }
-
-    #[test]
-    fn want_to_spawn_message_path_always_spawns() {
-        // Lazy Start (allow_spawn) spawns regardless of busy state.
-        assert!(want_to_spawn(true, false, false));
-        assert!(want_to_spawn(true, false, true));
-        assert!(want_to_spawn(true, true, false));
-        assert!(want_to_spawn(true, true, true));
-    }
-
-    #[test]
-    fn want_to_spawn_poll_path_spawns_only_when_busy() {
-        // Poll path (allow_spawn=false) spawns to heal a dead server only when
-        // a turn is in flight; an idle poll stays serverless (no resource churn).
-        assert!(!want_to_spawn(false, true, false));
-        assert!(want_to_spawn(false, true, true));
-        assert!(!want_to_spawn(false, false, false));
-        assert!(!want_to_spawn(false, false, true));
     }
 
     /// The reconnect loop's failure policy (ADR-0048): a failing reconcile
     /// WARNs once with the cause, the identical repeat is DEBUG at the
     /// production 5 s cadence (injected as 1 ms here) — not a WARN every tick.
-    /// Driven at the seam because `reconcile` scans the real process table and
-    /// cannot be faked.
+    /// Driven at the loop's own seam, with a pass closure standing in for the
+    /// client-owned reconcile.
     #[tokio::test]
     async fn the_reconnect_loop_latches_its_failures() {
         let cadence = std::sync::atomic::AtomicU64::new(1);

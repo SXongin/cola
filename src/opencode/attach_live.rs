@@ -9,10 +9,10 @@
 //! harness (ADR-0057). Deliberately not named `live*` — the CI live filters
 //! (`cargo test -- --ignored live_v1` / `live_v2`) must never pick it up.
 
-use crate::bridge::attach::resolve_candidate;
-use crate::bridge::discovery::{DEFAULT_SERVER_USERNAME, scan_processes};
 use crate::bridge::test_support::{assert_line_level, capture_logs, line_with};
 use crate::config::GenerationOverride;
+use crate::opencode::attach::resolve_candidate;
+use crate::opencode::discovery::{DEFAULT_SERVER_USERNAME, scan_processes};
 use crate::opencode::strategy::Generation;
 
 /// Live check (manual): detect every OpenCode server running on this

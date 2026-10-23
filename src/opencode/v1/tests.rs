@@ -218,7 +218,7 @@ async fn new_binds_the_resolved_server_url_and_credentials() {
     let client = without_env_proxy(
         OpenCodeBackend::new(
             None,
-            Some(crate::bridge::discovery::ResolvedServer {
+            Some(crate::opencode::discovery::ResolvedServer {
                 url: server.base_url(),
                 username: "custom-user".to_string(),
                 password: "custom-pass".to_string(),

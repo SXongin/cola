@@ -13,8 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::bridge::attach;
-use crate::bridge::discovery;
+use crate::backend::Backend;
 use crate::config::{self, Config};
 use crate::update::InstallChannel;
 
@@ -113,7 +112,12 @@ impl ConfigState {
 
 /// Gather the status snapshot. Its absence only narrows what can be reported
 /// (claim state, the generation override), never fails the command.
-pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
+///
+/// `client` is the active client built by the composition root (`src/main.rs`,
+/// which may name the adapter); the report reads its attachment through the
+/// neutral [`ServerLifecycle::attachment_status`] seam, so `cola status` never
+/// spells an adapter type (spec #860, ticket #875).
+pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Backend>) -> Status {
     let cfg = state.cfg();
     let channel = crate::update::current_exe_path()
         .map(|exe| channel_label(crate::update::detect_install_channel(&exe)))
@@ -130,7 +134,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
         }
         None => (None, None),
     };
-    let server = probe_server(cfg).await;
+    let server = probe_server(client).await;
     let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default().to_string();
 
     Status {
@@ -148,47 +152,23 @@ pub async fn gather(state: &ConfigState, log_path: &Path) -> Status {
     }
 }
 
-/// Scan for a shared OpenCode server and probe its generation. `None` when
-/// nothing is running on the shared store; a probe that cannot classify still
-/// returns the candidate with `generation: None` and the evidence.
-async fn probe_server(cfg: Option<&Config>) -> Option<ServerStatus> {
-    let preferred_port = cfg.and_then(|c| c.opencode.preferred_port());
-    let generation_override = cfg.map(|c| c.opencode.generation).unwrap_or_default();
-    let layout = cfg
-        .map(crate::state::StateLayout::from_config)
-        .unwrap_or_default();
-    let candidates = discovery::scan_processes();
-    let candidate =
-        discovery::pick_server(&candidates, preferred_port, discovery::self_spawned_pid(&layout))?;
-    let other_servers: Vec<OtherServer> = discovery::other_servers(&candidates, candidate)
+/// Read the client's attachment for the report. `None` when there is nothing
+/// to report or no client could be built (no config, another kind).
+async fn probe_server(client: Option<&dyn Backend>) -> Option<ServerStatus> {
+    let status = client?.attachment_status().await?;
+    let other_servers = status
+        .other_servers
         .into_iter()
         .map(|c| OtherServer {
-            url: c.url(),
+            url: c.url,
             pid: c.pid,
         })
         .collect();
-    // The probe carries Basic credentials and the endpoint is always loopback,
-    // so it must bypass any env proxy (ADR-0081) — `new_loopback`, not the
-    // production attach transport.
-    let transport = crate::opencode::transport::Transport::new_loopback(
-        Some(&candidate.username),
-        Some(&candidate.password),
-        candidate.url(),
-    );
-    let (url, generation, evidence) =
-        match attach::resolve_candidate_over(&transport, candidate, generation_override).await {
-            Ok(resolved) => (
-                resolved.url,
-                Some(resolved.generation.as_str().to_string()),
-                String::new(),
-            ),
-            Err(evidence) => (candidate.url(), None, evidence),
-        };
     Some(ServerStatus {
-        url,
-        pid: candidate.pid,
-        generation,
-        evidence,
+        url: status.url,
+        pid: status.pid,
+        generation: status.generation,
+        evidence: status.evidence,
         other_servers,
     })
 }
@@ -380,15 +360,18 @@ pub fn render_doctor(checks: &[Check]) -> String {
 
 /// Run `cola doctor`: gather the checks, print the report, and return whether
 /// every check passed.
-pub async fn run_doctor(explicit_config: Option<&str>, log_path: &Path) -> anyhow::Result<bool> {
-    let state = ConfigState::from_env(explicit_config);
-    let checks = doctor_checks(&state, log_path).await;
+pub async fn run_doctor(
+    state: &ConfigState,
+    log_path: &Path,
+    client: Option<&dyn Backend>,
+) -> anyhow::Result<bool> {
+    let checks = doctor_checks(state, log_path, client).await;
     print!("{}", render_doctor(&checks));
     Ok(doctor_ok(&checks))
 }
 
 /// Assemble the doctor checks from the resolved config state.
-async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
+async fn doctor_checks(state: &ConfigState, log_path: &Path, client: Option<&dyn Backend>) -> Vec<Check> {
     let mut checks = Vec::new();
     let cfg = state.cfg();
 
@@ -413,7 +396,7 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path) -> Vec<Check> {
 
     checks.push(opencode_binary_check());
 
-    let server = probe_server(cfg).await;
+    let server = probe_server(client).await;
     match &server {
         Some(s) => match &s.generation {
             Some(g) => checks.push(Check::pass(
@@ -613,6 +596,37 @@ fn lock_check(state: crate::LockState) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cola status` still reports URL, pid, generation and the other servers
+    /// for an OpenCode attachment — read through the neutral lifecycle seam, so
+    /// this module never names the adapter (spec #860, ticket #875).
+    #[tokio::test]
+    async fn probe_reads_the_attachment_through_the_client_seam() {
+        let mut mock = crate::bridge::test_support::MockBackend::new(Vec::new());
+        mock.attachment = Some(crate::backend::lifecycle::AttachmentStatus {
+            url: "http://localhost:49374".into(),
+            pid: 42,
+            generation: Some("v2".into()),
+            evidence: String::new(),
+            other_servers: vec![crate::backend::lifecycle::OtherServer {
+                url: "http://localhost:4096".into(),
+                pid: 7,
+            }],
+        });
+
+        let server = probe_server(Some(&mock)).await.expect("the attachment reports");
+
+        assert_eq!(server.url, "http://localhost:49374");
+        assert_eq!(server.pid, 42);
+        assert_eq!(server.generation.as_deref(), Some("v2"));
+        assert_eq!(
+            server.other_servers,
+            vec![OtherServer {
+                url: "http://localhost:4096".into(),
+                pid: 7,
+            }]
+        );
+    }
 
     fn sample_status() -> Status {
         Status {
