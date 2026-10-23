@@ -24,7 +24,8 @@ All runtime state defaults to `~/.cola/`:
 | `cola.lock` | singleton lock (one cola per machine) | — |
 | `restart-notify.json` | restart announcement bookkeeping | — |
 
-Every state file carries a format `version`. Records keyed by a Session also
+Every durable state sidecar carries a format `version` (the lock, log and
+one-shot restart bookkeeping do not). Records keyed by a Session also
 name the **agent client** that owns them, so two clients' sessions can coexist
 in one file. A file written by an older release reads as version 0 under the
 `default` client and is rewritten once; a file from a **newer** release is
