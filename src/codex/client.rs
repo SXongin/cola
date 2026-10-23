@@ -351,6 +351,15 @@ mod tests {
         }
     }
 
+    /// Quote one value for `sh` with single quotes, escaping an embedded quote
+    /// as `'\''`. Test-only: the fixture path is interpolated into the fake
+    /// binary's script, and a temp path containing an apostrophe must not make
+    /// the test fail for a reason unrelated to the code under test.
+    #[cfg(unix)]
+    fn shell_single_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
     /// End to end through the real probe: a newer server whose *generated*
     /// surface lacks a required method fails at construction, naming it.
     #[cfg(unix)]
@@ -364,7 +373,9 @@ mod tests {
         };
 
         let directory = tempfile::tempdir().expect("tempdir");
-        let fixture = directory.path().join("schema");
+        // The apostrophe is deliberate: it proves the fixture path is quoted
+        // for the shell, not just concatenated between two quote characters.
+        let fixture = directory.path().join("schema's-fixture");
         std::fs::create_dir(&fixture).expect("schema fixture dir");
         let client_methods: Vec<&str> = REQUIRED_CLIENT_METHODS
             .iter()
@@ -383,8 +394,8 @@ mod tests {
         std::fs::write(
             &binary,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.164.0\"; exit 0; fi\ncp '{}'/*.json \"$4\"/\n",
-                fixture.display()
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.164.0\"; exit 0; fi\ncp {}/*.json \"$4\"/\n",
+                shell_single_quote(&fixture.display().to_string())
             ),
         )
         .expect("write fake codex");
@@ -444,8 +455,14 @@ mod tests {
     /// Opt-in like the repository's other live suites: set
     /// `COLA_LIVE_CODEX_SOCKET` (the control socket, symlink allowed) and
     /// `COLA_LIVE_CODEX_BIN` (the binary the daemon runs, for the schema
-    /// probe) and run `cargo test -- --ignored live_codex`. It skips with a
-    /// message when the environment is absent.
+    /// probe) and run `cargo test -- --ignored codex::client::tests::live_`
+    /// (or `--ignored live_initialize`). It skips with a message when the
+    /// environment is absent.
+    ///
+    /// Unix-only like the transport it exercises: on a platform without unix
+    /// domain sockets the endpoint construction is the named unsupported-
+    /// platform error, not a skipped run.
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "live codex app-server: set COLA_LIVE_CODEX_SOCKET and COLA_LIVE_CODEX_BIN"]
     async fn live_initialize_then_initialized_and_a_second_connection() {
