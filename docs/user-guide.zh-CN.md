@@ -14,10 +14,16 @@
 | --- | --- | --- |
 | `cola.toml` | 配置 | `./cola.toml`（当前工作目录）或 `cola --config <path>` |
 | `cola.log` | 日志（追加写入，按日轮转） | `cola --log-file <path>` |
-| `sessions.json` | 飞书话题 ↔ OpenCode 会话映射 | `[bridge] session_file` |
+| `sessions.json` | 飞书话题 ↔ 会话映射 | `[bridge] session_file` |
+| `chain_records.json` | 持久链记录：实时卡片、唤醒水位、任务结束、已送达位置 | 与 `session_file` 同目录 |
+| `interactive_surfaces.json` | 重启后重新接管的权限/问答卡片（ADR-0038） | 与 `session_file` 同目录 |
+| `pinned_chats.json` | 持久化的即时提醒置顶 | 与 `session_file` 同目录 |
+| `terminal-runs/` | 实时/已结束 `/run` 卡片的终端运行记录 | 与 `session_file` 同目录 |
 | `access.json` | 访问名单（机主；ADR-0035） | `[bridge] access_file` |
 | `cola.lock` | 单实例锁（每台机器只能有一个 cola） | — |
 | `restart-notify.json` | 重启通知记账 | — |
+
+每个状态文件都带有格式 `version`。以会话为键的记录还会标明所属的 **agent client**，因此两个客户端的会话可以共存于同一个文件。旧版本写出的文件按版本 0 读取，归入 `default` 客户端，并且只重写一次；来自**更新**版本的文件会被拒绝读取，而不是误读。因此，重命名 `[clients.<id>]` 的 id 属于**状态迁移**而非配置修改：必须把旧 id 下的记录重新键控，否则重命名后的客户端将看不到它们（ADR-0091）。
 
 锁与配置正是 `cola` 在自动启动启动器里不带任何参数的原因：无论工作目录是什么，它都从 `~/.cola` 解析全部信息。
 
