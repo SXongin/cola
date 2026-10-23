@@ -30,6 +30,7 @@ pub(crate) mod reminder;
 pub(crate) mod session_routing;
 pub(crate) mod skill;
 pub(crate) mod snapshot_follow;
+pub(crate) mod state;
 pub(crate) mod subtask;
 pub(crate) mod supplement;
 pub(crate) mod surfaces;

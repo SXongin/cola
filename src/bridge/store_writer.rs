@@ -53,10 +53,12 @@ impl StoreSnapshot {
     pub(crate) fn to_bytes(&self) -> io::Result<Vec<u8>> {
         #[derive(Serialize)]
         struct StoreFile<'a> {
+            version: u32,
             entries: &'a [SessionEntry],
             pending: &'a [PendingEntry],
         }
         let data = serde_json::to_string_pretty(&StoreFile {
+            version: crate::state::STATE_FORMAT_VERSION,
             entries: &self.entries,
             pending: &self.pending,
         })

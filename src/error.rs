@@ -35,6 +35,13 @@ pub enum BridgeError {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// A durable state file this build cannot safely interpret — today only a
+    /// format version newer than this build writes (ADR-0091). Refusing is
+    /// deliberate: reading it as version 0 and rewriting would destroy a newer
+    /// process's state.
+    #[error("state error: {0}")]
+    State(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

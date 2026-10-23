@@ -19,9 +19,123 @@
 //! or [`Default`] for the config-less CLI paths) and thread it to whoever needs
 //! a path.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::Config;
+
+/// The format version this build writes into every durable state file
+/// (ADR-0091). A file without a `version` field reads as version 0: the shape
+/// the release before ADR-0091 wrote.
+pub(crate) const STATE_FORMAT_VERSION: u32 = 1;
+
+/// A durable section keyed by Agent Client *and* Session (ADR-0091): the
+/// on-disk shape is `{ "<client id>": { "<session id>": value } }`, so one bare
+/// Session id can exist under two clients without either copy overwriting the
+/// other. The in-memory methods take the two halves separately; the nesting is
+/// the file's, not the caller's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct ClientScoped<T> {
+    clients: HashMap<String, HashMap<String, T>>,
+}
+
+impl<T> Default for ClientScoped<T> {
+    fn default() -> Self {
+        Self {
+            clients: HashMap::new(),
+        }
+    }
+}
+
+impl<T> ClientScoped<T> {
+    /// The record for `session` under `client`, when it exists.
+    pub(crate) fn get(&self, client: &str, session: &str) -> Option<&T> {
+        self.clients
+            .get(client)
+            .and_then(|sessions| sessions.get(session))
+    }
+
+    /// [`Self::get`] as a mutable reference.
+    pub(crate) fn get_mut(&mut self, client: &str, session: &str) -> Option<&mut T> {
+        self.clients
+            .get_mut(client)
+            .and_then(|sessions| sessions.get_mut(session))
+    }
+
+    /// Insert `value` for `session` under `client`, returning what it replaced.
+    pub(crate) fn insert(&mut self, client: &str, session: &str, value: T) -> Option<T> {
+        self.clients
+            .entry(client.to_string())
+            .or_default()
+            .insert(session.to_string(), value)
+    }
+
+    /// Remove `session`'s record under `client`.
+    pub(crate) fn remove(&mut self, client: &str, session: &str) -> Option<T> {
+        let removed = self
+            .clients
+            .get_mut(client)
+            .and_then(|sessions| sessions.remove(session));
+        self.prune_client(client);
+        removed
+    }
+
+    /// Whether `session` has a record under `client`.
+    pub(crate) fn contains(&self, client: &str, session: &str) -> bool {
+        self.get(client, session).is_some()
+    }
+
+    /// Every record under `client`, in the map's own (unordered) order.
+    pub(crate) fn iter_client(&self, client: &str) -> impl Iterator<Item = (&String, &T)> {
+        self.clients
+            .get(client)
+            .into_iter()
+            .flat_map(|sessions| sessions.iter())
+    }
+
+    /// Every client's section, for a migration that must fill a per-record
+    /// field from the scope it was read under.
+    pub(crate) fn clients_mut(&mut self) -> impl Iterator<Item = (&String, &mut HashMap<String, T>)> {
+        self.clients.iter_mut()
+    }
+
+    /// Whether no client holds any record.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clients.values().all(HashMap::is_empty)
+    }
+
+    /// The version-0 shape, read under `client` (ADR-0091).
+    pub(crate) fn from_flat(client: &str, flat: HashMap<String, T>) -> Self {
+        let mut scoped = Self::default();
+        if !flat.is_empty() {
+            scoped.clients.insert(client.to_string(), flat);
+        }
+        scoped
+    }
+
+    /// Drop a client's now-empty section, so a written file never carries an
+    /// empty map for a client whose last record was removed.
+    fn prune_client(&mut self, client: &str) {
+        if self.clients.get(client).is_some_and(HashMap::is_empty) {
+            self.clients.remove(client);
+        }
+    }
+}
+
+impl<T> ClientScoped<Vec<T>> {
+    /// The mutable record list for `session` under `client`, created empty when
+    /// absent — the `entry().or_default()` the run-record writers need.
+    pub(crate) fn entry_mut(&mut self, client: &str, session: &str) -> &mut Vec<T> {
+        self.clients
+            .entry(client.to_string())
+            .or_default()
+            .entry(session.to_string())
+            .or_default()
+    }
+}
 
 /// The single owner of cola's on-disk paths: the Session-keyed sidecars beside
 /// `[bridge] session_file` plus the process-owned files under the home state

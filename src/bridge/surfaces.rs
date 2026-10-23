@@ -28,11 +28,15 @@ use serde::{Deserialize, Serialize};
 use crate::bridge::card_handles::BlockSpan;
 use crate::bridge::sidecar;
 use crate::bridge::snapshot_claims::ClaimKind;
+use crate::state::ClientScoped;
 
 /// One live interaction block and the card that renders it — the persisted
 /// half of the card-handle registry's block entries (ADR-0038, rule 2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InlineSurface {
+    /// The Agent Client that minted the request/session (ADR-0091).
+    #[serde(default)]
+    pub client_id: String,
     pub message_id: String,
     pub kind: ClaimKind,
     pub session_id: String,
@@ -54,6 +58,9 @@ pub struct CachedSurface {
 /// `sent_cards` (ADR-0038, rule 6).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StandaloneSurface {
+    /// The Agent Client that minted the request/session (ADR-0091).
+    #[serde(default)]
+    pub client_id: String,
     pub kind: ClaimKind,
     pub message_id: String,
     pub summary: String,
@@ -65,57 +72,204 @@ pub struct StandaloneSurface {
     pub session_id: String,
 }
 
-/// The whole persisted record. Every map defaults, so a file written by an
-/// older build (or a truncated one) still loads what it can.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// One active client's view of the persisted record — what the startup
+/// hydration reads. The file itself is [`SurfaceFile`], scoped by client.
+#[derive(Debug, Default, Clone)]
 pub struct SurfaceState {
     /// request_id → the card rendering its live block.
-    #[serde(default)]
     pub inline: HashMap<String, InlineSurface>,
     /// message_id → the card JSON and the live blocks it renders.
-    #[serde(default)]
     pub cards: HashMap<String, CachedSurface>,
     /// request_id → the standalone card sent for it.
-    #[serde(default)]
     pub standalone: HashMap<String, StandaloneSurface>,
 }
 
 impl SurfaceState {
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.inline.is_empty() && self.cards.is_empty() && self.standalone.is_empty()
     }
+}
+
+/// The version-1 file (ADR-0091): every map is scoped by Agent Client first,
+/// because request and message ids are minted per client and two clients could
+/// otherwise collide on one key.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SurfaceFile {
+    version: u32,
+    #[serde(default)]
+    inline: ClientScoped<InlineSurface>,
+    #[serde(default)]
+    cards: ClientScoped<CachedSurface>,
+    #[serde(default)]
+    standalone: ClientScoped<StandaloneSurface>,
+}
+
+impl SurfaceFile {
+    fn is_empty(&self) -> bool {
+        self.inline.is_empty() && self.cards.is_empty() && self.standalone.is_empty()
+    }
+
+    /// This client's maps, flattened for the startup hydration.
+    fn view(&self, client: &str) -> SurfaceState {
+        SurfaceState {
+            inline: self
+                .inline
+                .iter_client(client)
+                .map(|(id, surface)| (id.clone(), surface.clone()))
+                .collect(),
+            cards: self
+                .cards
+                .iter_client(client)
+                .map(|(id, card)| (id.clone(), card.clone()))
+                .collect(),
+            standalone: self
+                .standalone
+                .iter_client(client)
+                .map(|(id, surface)| (id.clone(), surface.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// The version-0 shape (ADR-0091): one flat map per section, read as the
+/// default client's.
+#[derive(Debug, Default, Deserialize)]
+struct SurfaceFileV0 {
+    #[serde(default)]
+    inline: HashMap<String, InlineSurface>,
+    #[serde(default)]
+    cards: HashMap<String, CachedSurface>,
+    #[serde(default)]
+    standalone: HashMap<String, StandaloneSurface>,
 }
 
 /// The write-through mirror of the interactive-surface state, persisted beside
 /// `sessions.json` (`interactive_surfaces.json`).
 pub struct Surfaces {
     path: PathBuf,
-    state: Mutex<SurfaceState>,
+    /// The Agent Client this process is attached to (ADR-0091).
+    client_id: String,
+    state: Mutex<SurfaceFile>,
 }
 
 impl Surfaces {
+    /// The test convenience: the implicit `default` client.
+    #[cfg(test)]
+    pub fn load(path: PathBuf) -> Self {
+        Self::open(path, crate::config::DEFAULT_CLIENT_ID).unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// Load the persisted record, or an empty one when the file is missing or
     /// unreadable. A corrupt file is logged and replaced on the next write —
     /// never an error: the mirror only feeds the next restart's re-adoption.
-    pub fn load(path: PathBuf) -> Self {
-        let state: SurfaceState = sidecar::load(&path, "surface record");
-        Self {
+    ///
+    /// ADR-0091: a version-0 file is read as the **default** client's and
+    /// rewritten once in the current form; a newer version is refused.
+    pub(crate) fn open(path: PathBuf, client_id: &str) -> anyhow::Result<Self> {
+        let mut rewrite = false;
+        let state = match sidecar::read_versioned(&path, "surface record") {
+            sidecar::VersionedRead::Missing
+            | sidecar::VersionedRead::Unreadable
+            | sidecar::VersionedRead::Corrupt => SurfaceFile {
+                version: crate::state::STATE_FORMAT_VERSION,
+                ..SurfaceFile::default()
+            },
+            sidecar::VersionedRead::Unsupported(version) => {
+                anyhow::bail!(
+                    "{} declares unsupported format version {version} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    crate::state::STATE_FORMAT_VERSION
+                );
+            }
+            sidecar::VersionedRead::Legacy(raw) => match serde_json::from_str::<SurfaceFileV0>(&raw) {
+                Ok(file) => {
+                    let mut inline = file.inline;
+                    for surface in inline.values_mut() {
+                        surface.client_id = crate::config::DEFAULT_CLIENT_ID.to_string();
+                    }
+                    let mut standalone = file.standalone;
+                    for surface in standalone.values_mut() {
+                        surface.client_id = crate::config::DEFAULT_CLIENT_ID.to_string();
+                    }
+                    rewrite = true;
+                    SurfaceFile {
+                        version: crate::state::STATE_FORMAT_VERSION,
+                        inline: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, inline),
+                        cards: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, file.cards),
+                        standalone: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, standalone),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "could not parse {} ({error}); starting with an empty surface record",
+                        path.display()
+                    );
+                    SurfaceFile {
+                        version: crate::state::STATE_FORMAT_VERSION,
+                        ..SurfaceFile::default()
+                    }
+                }
+            },
+            sidecar::VersionedRead::Current(raw) => match serde_json::from_str::<SurfaceFile>(&raw) {
+                Ok(mut file) => {
+                    // A record written by an intermediate build may carry the
+                    // client in the scope but not in the surface itself; keep
+                    // the two spellings agreeing.
+                    for (client, surfaces) in file.inline.clients_mut() {
+                        for surface in surfaces.values_mut() {
+                            if surface.client_id.is_empty() {
+                                surface.client_id = client.clone();
+                            }
+                        }
+                    }
+                    for (client, surfaces) in file.standalone.clients_mut() {
+                        for surface in surfaces.values_mut() {
+                            if surface.client_id.is_empty() {
+                                surface.client_id = client.clone();
+                            }
+                        }
+                    }
+                    file
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "could not parse {} ({error}); starting with an empty surface record",
+                        path.display()
+                    );
+                    SurfaceFile {
+                        version: crate::state::STATE_FORMAT_VERSION,
+                        ..SurfaceFile::default()
+                    }
+                }
+            },
+        };
+        let surfaces = Self {
             path,
+            client_id: client_id.to_string(),
             state: Mutex::new(state),
+        };
+        if rewrite {
+            let state = surfaces.lock();
+            surfaces.persist(&state);
         }
+        Ok(surfaces)
     }
 
-    /// The persisted record, cloned for startup hydration.
+    /// The persisted record for this process's client, cloned for startup
+    /// hydration.
     pub fn snapshot(&self) -> SurfaceState {
-        self.lock().clone()
+        self.lock().view(&self.client_id)
     }
 
     /// Record (or refresh) the card rendering `request_id`'s live block.
-    pub fn set_inline(&self, request_id: &str, surface: InlineSurface) {
+    pub fn set_inline(&self, request_id: &str, mut surface: InlineSurface) {
+        surface.client_id = self.client_id.clone();
         self.mutate(|state| {
-            let changed = state.inline.get(request_id) != Some(&surface);
+            let changed = state.inline.get(&self.client_id, request_id) != Some(&surface);
             if changed {
-                state.inline.insert(request_id.to_string(), surface);
+                state.inline.insert(&self.client_id, request_id, surface);
             }
             changed
         });
@@ -123,7 +277,7 @@ impl Surfaces {
 
     /// Forget a block's registry entry — it resolved.
     pub fn remove_inline(&self, request_id: &str) {
-        self.mutate(|state| state.inline.remove(request_id).is_some());
+        self.mutate(|state| state.inline.remove(&self.client_id, request_id).is_some());
     }
 
     /// Cache a card's last-rendered JSON and its live blocks' element ranges.
@@ -134,13 +288,14 @@ impl Surfaces {
         self.mutate(|state| {
             if state
                 .cards
-                .get(message_id)
+                .get(&self.client_id, message_id)
                 .is_some_and(|cached| cached.spans == spans)
             {
                 return false;
             }
             state.cards.insert(
-                message_id.to_string(),
+                &self.client_id,
+                message_id,
                 CachedSurface {
                     card: card.clone(),
                     spans: spans.to_vec(),
@@ -152,15 +307,16 @@ impl Surfaces {
 
     /// Release a card's cache — it no longer renders a live block.
     pub fn remove_card(&self, message_id: &str) {
-        self.mutate(|state| state.cards.remove(message_id).is_some());
+        self.mutate(|state| state.cards.remove(&self.client_id, message_id).is_some());
     }
 
     /// Record the standalone card cola sent for `request_id`.
-    pub fn set_standalone(&self, request_id: &str, surface: StandaloneSurface) {
+    pub fn set_standalone(&self, request_id: &str, mut surface: StandaloneSurface) {
+        surface.client_id = self.client_id.clone();
         self.mutate(|state| {
-            let changed = state.standalone.get(request_id) != Some(&surface);
+            let changed = state.standalone.get(&self.client_id, request_id) != Some(&surface);
             if changed {
-                state.standalone.insert(request_id.to_string(), surface);
+                state.standalone.insert(&self.client_id, request_id, surface);
             }
             changed
         });
@@ -168,20 +324,24 @@ impl Surfaces {
 
     /// Forget a standalone card's record — it resolved or was marked stale.
     pub fn remove_standalone(&self, request_id: &str) {
-        self.mutate(|state| state.standalone.remove(request_id).is_some());
+        self.mutate(|state| state.standalone.remove(&self.client_id, request_id).is_some());
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, SurfaceState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SurfaceFile> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Apply `f` under the lock and persist only when it reports a change.
-    fn mutate(&self, f: impl FnOnce(&mut SurfaceState) -> bool) {
+    fn mutate(&self, f: impl FnOnce(&mut SurfaceFile) -> bool) {
         let mut state = self.lock();
         if !f(&mut state) {
             return;
         }
-        sidecar::store(&self.path, "surface record", &*state, state.is_empty());
+        self.persist(&state);
+    }
+
+    fn persist(&self, state: &SurfaceFile) {
+        sidecar::store(&self.path, "surface record", state, state.is_empty());
     }
 }
 
@@ -199,6 +359,7 @@ mod tests {
 
     fn inline(message_id: &str) -> InlineSurface {
         InlineSurface {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             message_id: message_id.into(),
             kind: ClaimKind::Permission,
             session_id: "ses_1".into(),
@@ -222,6 +383,7 @@ mod tests {
             surfaces.set_standalone(
                 "per_2",
                 StandaloneSurface {
+                    client_id: crate::config::DEFAULT_CLIENT_ID.into(),
                     kind: ClaimKind::Permission,
                     message_id: "om_2".into(),
                     summary: "ls".into(),

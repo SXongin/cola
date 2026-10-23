@@ -60,6 +60,7 @@ use crate::backend::{MessageId, TurnAnchor};
 use crate::bridge::handles::CardsHandle;
 use crate::bridge::sidecar;
 use crate::bridge::tasks::model::TaskRunId;
+use crate::state::ClientScoped;
 
 /// The orphan gap a restart must still deliver (spec #561, review #569): the
 /// message-first takeover's undelivered tail, recorded durably because the
@@ -615,27 +616,41 @@ impl EndingFacts {
 }
 
 /// The persisted Chain Record; a wrapper so the on-disk shape can grow.
-#[derive(Debug, Default, Serialize, Deserialize)]
+///
+/// ADR-0091: version 1. Every section is keyed by Agent Client first, then
+/// Session, so one bare Session id can hold two clients' facts without either
+/// overwriting the other.
+#[derive(Debug, Serialize, Deserialize)]
 struct ChainRecordFile {
+    version: u32,
     #[serde(default)]
-    records: HashMap<String, ChainRecord>,
+    records: ClientScoped<ChainRecord>,
     #[serde(default)]
-    announcements: HashMap<String, WakeMark>,
-    /// The pre-ADR-0080 `rendered` section (ADR-0073's amendment, issue #671):
-    /// the synthetic announce keys a delivered card write carried. **Migration
-    /// input only** — [`ChainRecords::load`] translates it into `endings`
-    /// through [`translate_legacy_rendered`], it is never held in [`State`], and
-    /// `skip_serializing` keeps it off disk so a write after the migration
-    /// drops the section for good.
-    #[serde(default, skip_serializing)]
-    rendered: HashMap<String, Vec<String>>,
+    announcements: ClientScoped<WakeMark>,
     /// session_id → the Session's run records, oldest first (ADR-0080).
     #[serde(default)]
-    endings: HashMap<String, Vec<TaskRunRecord>>,
+    endings: ClientScoped<Vec<TaskRunRecord>>,
     /// session_id → the Session's **delivered position** (ADR-0082 §3): the
     /// newest content a confirmed card write surfaced for it, kept past the
     /// release of the chain's record. An older sidecar has no such section and
     /// reads as "nothing delivered", exactly as it read before.
+    #[serde(default)]
+    delivered: ClientScoped<MessageId>,
+}
+
+/// The pre-ADR-0091 shape (version 0): one flat map per section, keyed by bare
+/// Session id and read as the default client's. The `rendered` section is
+/// migration input only (ADR-0073's amendment, issue #671).
+#[derive(Debug, Default, Deserialize)]
+struct ChainRecordFileV0 {
+    #[serde(default)]
+    records: HashMap<String, ChainRecord>,
+    #[serde(default)]
+    announcements: HashMap<String, WakeMark>,
+    #[serde(default)]
+    rendered: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    endings: HashMap<String, Vec<TaskRunRecord>>,
     #[serde(default)]
     delivered: HashMap<String, MessageId>,
 }
@@ -679,15 +694,15 @@ fn resolved_reply_to(previous: Option<&ChainRecord>, update: ReplyToUpdate<'_>) 
 /// capping the depth — a Session recreated repeatedly keeps forwarding past any
 /// fixed limit.
 fn resolved_session(state: &State, session_id: &str) -> String {
-    let mut current = session_id;
+    let mut current = session_id.to_string();
     let mut seen = std::collections::HashSet::new();
-    while seen.insert(current) {
-        match state.renamed.get(current) {
-            Some(next) => current = next,
+    while seen.insert(current.clone()) {
+        match state.renamed.get(&state.client_id, &current) {
+            Some(next) => current = next.clone(),
             None => break,
         }
     }
-    current.to_string()
+    current
 }
 
 /// Record the Session's **delivered position** (ADR-0082 §3) as a released
@@ -705,7 +720,9 @@ fn note_delivered(state: &mut State, session_id: &str, cursor: Option<&RenderedC
     // release that ran with the id captured before a recreate must still land on
     // the recreated Session.
     let session_id = resolved_session(state, session_id);
-    state.delivered.insert(session_id, frontier.message_id.clone());
+    state
+        .delivered
+        .insert(&state.client_id, &session_id, frontier.message_id.clone());
 }
 
 /// Flip the delivered body's endings to SHOWN (ADR-0080) — the Rendered Cursor's
@@ -724,7 +741,7 @@ fn push_shown(state: &mut State, session_id: &str, shown: &[EndingKey]) -> bool 
     // before a recreate must still land on the recreated Session, never the dead
     // one.
     let session_id = resolved_session(state, session_id);
-    let Some(records) = state.endings.get_mut(&session_id) else {
+    let Some(records) = state.endings.get_mut(&state.client_id, &session_id) else {
         return false;
     };
     mark_shown(records, shown)
@@ -993,8 +1010,12 @@ impl<T> Default for LegacySessions<T> {
 /// happens and persists under it, so the two sections can never be observed
 /// half-written against each other.
 struct State {
-    records: HashMap<String, ChainRecord>,
-    announcements: HashMap<String, WakeMark>,
+    /// The Agent Client this process is attached to (ADR-0091): every lookup
+    /// and write is scoped to it, while the other clients' sections stay in the
+    /// maps untouched so a switch cannot overwrite them.
+    client_id: String,
+    records: ClientScoped<ChainRecord>,
+    announcements: ClientScoped<WakeMark>,
     /// session_id → the **delivered position** — the newest content a CONFIRMED
     /// card write has surfaced for this Session (ADR-0082 §3). Session-scoped,
     /// exactly like the announcements and the run records: [`Self::release`]
@@ -1003,7 +1024,7 @@ struct State {
     /// must not replay across Turns — a **Compaction** row — loses its bound at
     /// every Turn boundary. Written only from a record's own confirmed cursor as
     /// that record is released, never by a refused or merely owed write.
-    delivered: HashMap<String, MessageId>,
+    delivered: ClientScoped<MessageId>,
     /// card_message_id → the endings a recoverably-failed body still owes the
     /// durable Record, waiting on the Pending Card Update payload at
     /// [`OwedRendered::seq`] (ADR-0080). In-memory only, and held here rather
@@ -1016,15 +1037,17 @@ struct State {
     /// A recreated Session's OLD id → its new one (issue #671, ticket #672):
     /// in-memory forwarding so a concurrent writer that captured the id before
     /// [`ChainRecords::rename`] still lands under the recreated Session, never
-    /// the dead one. Not persisted — the rename moved the durable facts, and no
-    /// writer outlives the process.
-    renamed: HashMap<String, String>,
+    /// the dead one. Client-scoped like every other Session fact (ADR-0091), so
+    /// a rename under one client cannot redirect another's writes. Not
+    /// persisted — the rename moved the durable facts, and no writer outlives
+    /// the process.
+    renamed: ClientScoped<String>,
     /// session_id → the Session's run records, oldest first (ADR-0080): one
     /// record per [`TaskRunId`], each carrying at most one ending per class.
     /// Insertion order is what the bound evicts from — the OLDEST record with no
     /// owed ending first. Session-scoped like the announcements: `release`
     /// drops only the chain's record.
-    endings: HashMap<String, Vec<TaskRunRecord>>,
+    endings: ClientScoped<Vec<TaskRunRecord>>,
 }
 
 /// The most run records one Session retains (ADR-0080) — the shared bound the
@@ -1062,58 +1085,129 @@ pub(crate) struct ChainRecords {
 }
 
 impl ChainRecords {
+    /// The test/default construction: the implicit `default` client.
+    #[cfg(test)]
+    pub(crate) fn load(path: PathBuf) -> Self {
+        Self::load_for(path, crate::config::DEFAULT_CLIENT_ID).unwrap_or_else(|error| panic!("{error}"))
+    }
+
     /// Load the Chain Record — from `chain_records.json` when it exists, else
     /// by folding the legacy `live_cards.json` / `wake_watermarks.json` beside
     /// it (ADR-0069's one-time migration). A missing or corrupt file is an
     /// empty record, never an error: a lost record only means a restart reaps
     /// nothing and a Fresh path may re-announce once.
-    pub(crate) fn load(path: PathBuf) -> Self {
-        let folded = !path.exists();
-        let state = if folded {
-            let (legacy_live_cards, legacy_wake_watermarks) =
-                crate::state::StateLayout::legacy_chain_sidecars(&path);
-            let records =
-                sidecar::load::<LegacySessions<ChainRecord>>(&legacy_live_cards, "live-card record").sessions;
-            let announcements =
-                sidecar::load::<LegacySessions<WakeMark>>(&legacy_wake_watermarks, "Wake watermark").sessions;
-            State {
-                records,
-                announcements,
-                delivered: HashMap::new(),
-                owed: HashMap::new(),
-                renamed: HashMap::new(),
-                endings: HashMap::new(),
-            }
-        } else {
-            let file = sidecar::load::<ChainRecordFile>(&path, "Chain Record");
-            // The legacy `rendered` marks are the OLDER shape, so they are
-            // translated first and the file's own `endings` merge into them
-            // (ADR-0080): the section keeps its oldest-first order, a run the
-            // marks already name resolves instead of being minted a second time,
-            // and a class both shapes carry stays the derivation the marks
-            // already recorded. The translated section is never carried into
-            // [`State`]: this read is the migration's only consumer.
-            let mut endings = translate_legacy_rendered(&file.rendered);
-            for (session_id, records) in file.endings {
-                if records.is_empty() {
-                    continue;
+    ///
+    /// ADR-0091: version 1 scopes every section by Agent Client first. A
+    /// version-0 file is read as the **default** client's and rewritten once in
+    /// the current form (exactly like the fold's marker write); a newer version
+    /// is refused rather than read as 0.
+    pub(crate) fn load_for(path: PathBuf, client_id: &str) -> anyhow::Result<Self> {
+        let mut rewrite = false;
+        let state = match sidecar::read_versioned(&path, "Chain Record") {
+            sidecar::VersionedRead::Missing => {
+                // ADR-0069: presence of the file is the fold's marker, so only
+                // an absent file folds, and the fold materializes the file.
+                rewrite = true;
+                let (legacy_live_cards, legacy_wake_watermarks) =
+                    crate::state::StateLayout::legacy_chain_sidecars(&path);
+                let records =
+                    sidecar::load::<LegacySessions<ChainRecord>>(&legacy_live_cards, "live-card record")
+                        .sessions;
+                let announcements =
+                    sidecar::load::<LegacySessions<WakeMark>>(&legacy_wake_watermarks, "Wake watermark")
+                        .sessions;
+                State {
+                    client_id: client_id.to_string(),
+                    records: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, records),
+                    announcements: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, announcements),
+                    delivered: ClientScoped::default(),
+                    owed: HashMap::new(),
+                    renamed: ClientScoped::default(),
+                    endings: ClientScoped::default(),
                 }
-                let kept = endings.entry(session_id.clone()).or_default();
-                for record in records {
-                    for ending in record.endings {
-                        insert_ending(kept, &record.run, ending);
+            }
+            sidecar::VersionedRead::Unreadable | sidecar::VersionedRead::Corrupt => {
+                Self::empty_state(client_id)
+            }
+            sidecar::VersionedRead::Unsupported(version) => {
+                anyhow::bail!(
+                    "{} declares unsupported format version {version} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    crate::state::STATE_FORMAT_VERSION
+                );
+            }
+            sidecar::VersionedRead::Legacy(raw) => {
+                // The `rendered` marks are the OLDER shape, so they are
+                // translated first and the file's own `endings` merge into them
+                // (ADR-0080): the section keeps its oldest-first order, a run the
+                // marks already name resolves instead of being minted a second
+                // time, and a class both shapes carry stays the derivation the
+                // marks already recorded. The translated section is never
+                // carried into [`State`]: this read is the migration's only
+                // consumer.
+                match serde_json::from_str::<ChainRecordFileV0>(&raw) {
+                    Ok(file) => {
+                        let mut endings = translate_legacy_rendered(&file.rendered);
+                        for (session_id, records) in file.endings {
+                            if records.is_empty() {
+                                continue;
+                            }
+                            let kept = endings.entry(session_id.clone()).or_default();
+                            for record in records {
+                                for ending in record.endings {
+                                    insert_ending(kept, &record.run, ending);
+                                }
+                                bound_run_records(&session_id, kept);
+                            }
+                        }
+                        rewrite = true;
+                        State {
+                            client_id: client_id.to_string(),
+                            records: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, file.records),
+                            announcements: ClientScoped::from_flat(
+                                crate::config::DEFAULT_CLIENT_ID,
+                                file.announcements,
+                            ),
+                            delivered: ClientScoped::from_flat(
+                                crate::config::DEFAULT_CLIENT_ID,
+                                file.delivered,
+                            ),
+                            endings: ClientScoped::from_flat(crate::config::DEFAULT_CLIENT_ID, endings),
+                            owed: HashMap::new(),
+                            renamed: ClientScoped::default(),
+                        }
+                    }
+                    Err(error) => {
+                        // A file with a version header but a body this build
+                        // cannot read is corrupt, and a corrupt file fails open
+                        // as it always has — untouched, so nothing is lost.
+                        tracing::warn!(
+                            "could not parse {} ({error}); starting with an empty Chain Record",
+                            path.display()
+                        );
+                        Self::empty_state(client_id)
                     }
                 }
-                bound_run_records(&session_id, kept);
             }
-            State {
-                records: file.records,
-                announcements: file.announcements,
-                delivered: file.delivered,
-                endings,
-                owed: HashMap::new(),
-                renamed: HashMap::new(),
-            }
+            sidecar::VersionedRead::Current(raw) => match serde_json::from_str::<ChainRecordFile>(&raw) {
+                Ok(file) => State {
+                    client_id: client_id.to_string(),
+                    records: file.records,
+                    announcements: file.announcements,
+                    delivered: file.delivered,
+                    endings: file.endings,
+                    owed: HashMap::new(),
+                    renamed: ClientScoped::default(),
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        "could not parse {} ({error}); starting with an empty Chain Record",
+                        path.display()
+                    );
+                    Self::empty_state(client_id)
+                }
+            },
         };
         let store = Self {
             path,
@@ -1121,14 +1215,27 @@ impl ChainRecords {
             #[cfg(test)]
             writes: std::sync::atomic::AtomicUsize::new(0),
         };
-        if folded {
-            // Materialize the marker now: the folded state is what the legacy
-            // files held, and the first load is what settles the migration, not
-            // the first later mutation. The subsequent loads never look back.
+        if rewrite {
+            // Materialize the new form now: the folded state is what the legacy
+            // files held, or what the version-0 file meant under the default
+            // client. A later process reads version 1 and does not write again.
             let state = store.lock();
             store.write(&state);
         }
-        store
+        Ok(store)
+    }
+
+    /// The fail-open state: no facts, but the right client.
+    fn empty_state(client_id: &str) -> State {
+        State {
+            client_id: client_id.to_string(),
+            records: ClientScoped::default(),
+            announcements: ClientScoped::default(),
+            delivered: ClientScoped::default(),
+            owed: HashMap::new(),
+            renamed: ClientScoped::default(),
+            endings: ClientScoped::default(),
+        }
     }
 
     /// The session's record, when its card is (believed to be) live. The test
@@ -1136,15 +1243,19 @@ impl ChainRecords {
     /// reap's pass) or the previous value [`Self::track`] returns.
     #[cfg(test)]
     pub(crate) fn get(&self, session_id: &str) -> Option<ChainRecord> {
-        self.lock().records.get(session_id).cloned()
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state.records.get(&client, session_id).cloned()
     }
 
     /// Every record, as one snapshot — Session Sync's reap iterates this so a
     /// record whose session is no longer mapped is still reconciled.
     pub(crate) fn entries(&self) -> Vec<(String, ChainRecord)> {
-        self.lock()
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state
             .records
-            .iter()
+            .iter_client(&client)
             .map(|(session_id, card)| (session_id.clone(), card.clone()))
             .collect()
     }
@@ -1156,9 +1267,11 @@ impl ChainRecords {
     /// it. A released chain has no version left, and no writer of it remains;
     /// zero is what a fresh chain starts at.
     pub(crate) fn generation(&self, session_id: &str) -> u64 {
-        self.lock()
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state
             .records
-            .get(session_id)
+            .get(&client, session_id)
             .map_or(0, |record| record.generation)
     }
 
@@ -1267,11 +1380,12 @@ impl ChainRecords {
         shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         // A re-point within the chain carries the Rendered Cursor (spec #561):
         // a split continuation or a new Turn on the same chain must not clear
         // the chain's frontier — only a genuinely new chain (no previous
         // record) starts cursorless.
-        let previous = state.records.get(session_id).cloned();
+        let previous = state.records.get(&client, session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
@@ -1292,7 +1406,7 @@ impl ChainRecords {
             // explicit clear on the loser's late-card collect).
             record.projection_intent = previous.projection_intent;
         }
-        state.records.insert(session_id.to_string(), record);
+        state.records.insert(&client, session_id, record);
         // The delivered body's endings ride this SAME write (ADR-0080): a crash
         // must never leave a shown bit apart from the re-point that confirmed
         // it.
@@ -1323,7 +1437,8 @@ impl ChainRecords {
         reply_to: Option<&str>,
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
-        let previous = state.records.get(session_id).cloned();
+        let client = state.client_id.clone();
+        let previous = state.records.get(&client, session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id.clone(), created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
@@ -1339,7 +1454,7 @@ impl ChainRecords {
             });
             record.projection_intent = previous.projection_intent;
         }
-        state.records.insert(session_id.to_string(), record);
+        state.records.insert(&client, session_id, record);
         self.write(&state);
         previous
     }
@@ -1352,7 +1467,8 @@ impl ChainRecords {
     /// again.
     pub(crate) fn clear_projection_intent_any(&self, session_id: &str) -> bool {
         let mut state = self.lock();
-        let Some(card) = state.records.get_mut(session_id) else {
+        let client = state.client_id.clone();
+        let Some(card) = state.records.get_mut(&client, session_id) else {
             return false;
         };
         if !card.projection_intent {
@@ -1442,7 +1558,8 @@ impl ChainRecords {
         shown: &[EndingKey],
     ) -> Option<ChainRecord> {
         let mut state = self.lock();
-        let previous = state.records.get(session_id).cloned();
+        let client = state.client_id.clone();
+        let previous = state.records.get(&client, session_id).cloned();
         let mut record = ChainRecord::new(card_message_id, message_id, created_ms)
             .with_directory(directory.map(str::to_string));
         record.generation = chain_generation(previous.as_ref(), &record.card_message_id);
@@ -1466,7 +1583,7 @@ impl ChainRecords {
             }
             _ => {}
         }
-        state.records.insert(session_id.to_string(), record);
+        state.records.insert(&client, session_id, record);
         // The entries this landed body carried leave their shown bits in the
         // SAME write as the re-point (ADR-0080): a crash between two writes
         // could drop the bit and let the entry replay on a later card.
@@ -1485,7 +1602,8 @@ impl ChainRecords {
     /// write never advanced it, so it still re-renders.
     pub(crate) fn release(&self, session_id: &str) {
         let mut state = self.lock();
-        let Some(record) = state.records.remove(session_id) else {
+        let client = state.client_id.clone();
+        let Some(record) = state.records.remove(&client, session_id) else {
             return;
         };
         note_delivered(&mut state, session_id, record.cursor.as_ref());
@@ -1500,14 +1618,15 @@ impl ChainRecords {
     /// exactly as [`Self::release`] keeps it.
     pub(crate) fn release_if_card(&self, session_id: &str, card_message_id: &str) -> bool {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         if state
             .records
-            .get(session_id)
+            .get(&client, session_id)
             .is_none_or(|record| record.card_message_id != card_message_id)
         {
             return false;
         }
-        let record = state.records.remove(session_id);
+        let record = state.records.remove(&client, session_id);
         note_delivered(
             &mut state,
             session_id,
@@ -1526,39 +1645,40 @@ impl ChainRecords {
     /// retirement it already showed must not replay under the new one.
     pub(crate) fn rename(&self, from: &str, to: &str) {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         // Forward the old id so a concurrent writer that captured it before this
         // rename still lands under the recreated Session (issue #671, ticket
         // #672). Also re-point the owed mirrors' Session.
-        state.renamed.insert(from.to_string(), to.to_string());
+        state.renamed.insert(&client, from, to.to_string());
         for owed in state.owed.values_mut() {
             if owed.session_id == from {
                 owed.session_id = to.to_string();
             }
         }
-        let record = state.records.remove(from);
-        let announcement = state.announcements.remove(from);
+        let record = state.records.remove(&client, from);
+        let announcement = state.announcements.remove(&client, from);
         // The run records move with the logical Session too (ADR-0080): the
         // recreated id names the same Session, so an ending (and its shown bit)
         // must not replay under it.
-        let endings = state.endings.remove(from);
+        let endings = state.endings.remove(&client, from);
         // The delivered position moves with the logical Session too (ADR-0082
         // §3): the recreated id names the same Session, so content a card
         // already surfaced must not be surfaced again under it.
-        let delivered = state.delivered.remove(from);
+        let delivered = state.delivered.remove(&client, from);
         if record.is_none() && announcement.is_none() && endings.is_none() && delivered.is_none() {
             return;
         }
         if let Some(record) = record {
-            state.records.insert(to.to_string(), record);
+            state.records.insert(&client, to, record);
         }
         if let Some(announcement) = announcement {
-            state.announcements.insert(to.to_string(), announcement);
+            state.announcements.insert(&client, to, announcement);
         }
         if let Some(endings) = endings {
-            state.endings.insert(to.to_string(), endings);
+            state.endings.insert(&client, to, endings);
         }
         if let Some(delivered) = delivered {
-            state.delivered.insert(to.to_string(), delivered);
+            state.delivered.insert(&client, to, delivered);
         }
         self.write(&state);
     }
@@ -1570,7 +1690,8 @@ impl ChainRecords {
     /// frequent render polls do not rewrite the file.
     pub(crate) fn set_anchor(&self, session_id: &str, card_message_id: &str, anchor: &TurnAnchor) {
         let mut state = self.lock();
-        let Some(card) = state.records.get_mut(session_id) else {
+        let client = state.client_id.clone();
+        let Some(card) = state.records.get_mut(&client, session_id) else {
             return;
         };
         if card.card_message_id != card_message_id
@@ -1589,9 +1710,11 @@ impl ChainRecords {
     /// it at apply time (ticket #563): the record snapshot the reap took
     /// before its server reads can be older than a concurrent confirmed write.
     pub(crate) fn cursor(&self, session_id: &str) -> Option<RenderedCursor> {
-        self.lock()
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state
             .records
-            .get(session_id)
+            .get(&client, session_id)
             .and_then(|record| record.cursor.clone())
     }
 
@@ -1607,7 +1730,9 @@ impl ChainRecords {
     /// confirmed write moves it: a body whose write was refused or is still owed
     /// advanced nothing.
     pub(crate) fn delivered(&self, session_id: &str) -> Option<MessageId> {
-        self.lock().delivered.get(session_id).cloned()
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state.delivered.get(&client, session_id).cloned()
     }
 
     /// Whether the session has a durable Chain Record at all — the Fresh
@@ -1615,7 +1740,9 @@ impl ChainRecords {
     /// belongs to the projection (or, cursorless, to the reap's fallback),
     /// so only a recordless post uses the Wake Watermark's announcement rule.
     pub(crate) fn recorded(&self, session_id: &str) -> bool {
-        self.lock().records.contains_key(session_id)
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state.records.contains(&client, session_id)
     }
 
     /// Advance the Rendered Cursor of the record naming `card_message_id`
@@ -1644,8 +1771,9 @@ impl ChainRecords {
         shown: &[EndingKey],
     ) {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         let mut cursor_change = false;
-        match state.records.get_mut(session_id) {
+        match state.records.get_mut(&client, session_id) {
             Some(card) if card.card_message_id == card_message_id => {
                 let cursor_current = card.cursor.as_ref() == Some(cursor);
                 let gap_change = match (card.pending_gap.as_mut(), gap) {
@@ -1729,7 +1857,8 @@ impl ChainRecords {
     /// Returns whether the record was the named one.
     fn set_projection_intent(&self, session_id: &str, card_message_id: &str, intent: bool) -> bool {
         let mut state = self.lock();
-        match state.records.get_mut(session_id) {
+        let client = state.client_id.clone();
+        match state.records.get_mut(&client, session_id) {
             Some(card) if card.card_message_id == card_message_id => {
                 if card.projection_intent != intent {
                     card.projection_intent = intent;
@@ -1747,7 +1876,8 @@ impl ChainRecords {
     /// exactly the gap and nothing the old cards already showed.
     pub(crate) fn note_pending_gap(&self, session_id: &str, card_message_id: &str, gap: &PendingGap) -> bool {
         let mut state = self.lock();
-        match state.records.get_mut(session_id) {
+        let client = state.client_id.clone();
+        match state.records.get_mut(&client, session_id) {
             Some(card) if card.card_message_id == card_message_id => {
                 if card.pending_gap.as_ref() != Some(gap) {
                     card.pending_gap = Some(gap.clone());
@@ -1775,7 +1905,8 @@ impl ChainRecords {
         complete: bool,
     ) -> bool {
         let mut state = self.lock();
-        match state.records.get_mut(session_id) {
+        let client = state.client_id.clone();
+        match state.records.get_mut(&client, session_id) {
             Some(card) if card.card_message_id == card_message_id => {
                 let Some(gap) = card.pending_gap.as_mut() else {
                     return false;
@@ -1803,7 +1934,8 @@ impl ChainRecords {
         flag: impl FnOnce(&mut ChainRecord),
     ) -> bool {
         let mut state = self.lock();
-        match state.records.get_mut(session_id) {
+        let client = state.client_id.clone();
+        match state.records.get_mut(&client, session_id) {
             Some(card) if card.card_message_id == card_message_id => {
                 flag(card);
                 true
@@ -1815,7 +1947,9 @@ impl ChainRecords {
     /// The session's mark, when one exists — the Fresh path's gate: a Wake at
     /// or below it was already announced.
     pub(crate) fn announced(&self, session_id: &str) -> Option<WakeMark> {
-        self.lock().announcements.get(session_id).cloned()
+        let state = self.lock();
+        let client = state.client_id.clone();
+        state.announcements.get(&client, session_id).cloned()
     }
 
     /// Advance the session's mark to `(wake_id, created_ms)` and persist, when
@@ -1825,15 +1959,17 @@ impl ChainRecords {
     /// same duplicate-over-loss trade the drain itself makes.
     pub(crate) fn advance(&self, session_id: &str, wake_id: &str, created_ms: i64) {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         if state
             .announcements
-            .get(session_id)
+            .get(&client, session_id)
             .is_some_and(|mark| mark.created_ms >= created_ms)
         {
             return;
         }
         state.announcements.insert(
-            session_id.to_string(),
+            &client,
+            session_id,
             WakeMark {
                 wake_id: wake_id.to_string(),
                 created_ms,
@@ -1872,8 +2008,9 @@ impl ChainRecords {
     /// whether the section changed.
     pub(crate) fn record_ending(&self, session_id: &str, run: &TaskRunId, ending: TaskEnding) -> bool {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         let session_id = resolved_session(&state, session_id);
-        let records = state.endings.entry(session_id.clone()).or_default();
+        let records = state.endings.entry_mut(&client, &session_id);
         let changed = insert_ending(records, run, ending) | bound_run_records(&session_id, records);
         if changed {
             self.write(&state);
@@ -1893,9 +2030,10 @@ impl ChainRecords {
     /// when an id was actually learned.
     pub(crate) fn observe_run(&self, session_id: &str, held: &TaskRunId) -> bool {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         let session_id = resolved_session(&state, session_id);
         let (resolved, learned) = {
-            let Some(records) = state.endings.get_mut(&session_id) else {
+            let Some(records) = state.endings.get_mut(&client, &session_id) else {
                 return false;
             };
             match resolve_run(records, held) {
@@ -1923,8 +2061,9 @@ impl ChainRecords {
         shown: &[(TaskRunId, TaskEndingClass)],
     ) -> bool {
         let mut state = self.lock();
+        let client = state.client_id.clone();
         let session_id = resolved_session(&state, session_id);
-        let Some(records) = state.endings.get_mut(&session_id) else {
+        let Some(records) = state.endings.get_mut(&client, &session_id) else {
             return false;
         };
         if !mark_shown(records, shown) {
@@ -1939,8 +2078,13 @@ impl ChainRecords {
     /// empty.
     pub(crate) fn endings(&self, session_id: &str) -> Vec<TaskRunRecord> {
         let state = self.lock();
+        let client = state.client_id.clone();
         let session_id = resolved_session(&state, session_id);
-        state.endings.get(&session_id).cloned().unwrap_or_default()
+        state
+            .endings
+            .get(&client, &session_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Whether the run's ending of `class` was SHOWN by a confirmed card write
@@ -1952,8 +2096,9 @@ impl ChainRecords {
     #[allow(dead_code)]
     pub(crate) fn ending_shown(&self, session_id: &str, run: &TaskRunId, class: TaskEndingClass) -> bool {
         let state = self.lock();
+        let client = state.client_id.clone();
         let session_id = resolved_session(&state, session_id);
-        let Some(records) = state.endings.get(&session_id) else {
+        let Some(records) = state.endings.get(&client, &session_id) else {
             return false;
         };
         let Some(record) = resolve_run(records, run).map(|index| &records[index]) else {
@@ -2012,8 +2157,9 @@ impl ChainRecords {
         session_id: &str,
     ) -> (Vec<TaskRunRecord>, Vec<(String, OwedRendered)>) {
         let state = self.lock();
+        let client = state.client_id.clone();
         let session = resolved_session(&state, session_id);
-        let records = state.endings.get(&session).cloned().unwrap_or_default();
+        let records = state.endings.get(&client, &session).cloned().unwrap_or_default();
         let owed = state
             .owed
             .iter()
@@ -2074,9 +2220,9 @@ impl ChainRecords {
             &self.path,
             "Chain Record",
             &ChainRecordFile {
+                version: crate::state::STATE_FORMAT_VERSION,
                 records: state.records.clone(),
                 announcements: state.announcements.clone(),
-                rendered: HashMap::new(),
                 endings: state.endings.clone(),
                 delivered: state.delivered.clone(),
             },
@@ -4807,6 +4953,203 @@ mod tests {
             chains.writes() - writes,
             0,
             "every id is already on the record, so the observation writes nothing"
+        );
+    }
+
+    /// ADR-0069's "file presence is the migration marker" survives ADR-0091:
+    /// a version-0 file is the marker (the legacy sidecars are not folded in),
+    /// the migration rewrites it as version 1, and the next load still does not
+    /// fold.
+    #[test]
+    fn a_version_0_file_is_the_fold_marker_and_version_1_never_refolds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let (live_cards, wake_watermarks) = crate::state::StateLayout::legacy_chain_sidecars(&path);
+        std::fs::write(
+            &live_cards,
+            r#"{"sessions":{"ses_legacy":{"card_message_id":"om_legacy","message_id":"msg_legacy"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &wake_watermarks,
+            r#"{"sessions":{"ses_legacy":{"wake_id":"wake_legacy","created_ms":1}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &path,
+            r#"{"records":{"ses_file":{"card_message_id":"om_file","message_id":"msg_file"}}}"#,
+        )
+        .unwrap();
+
+        let chains = ChainRecords::load_for(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
+        assert_eq!(
+            chains.entries().into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec!["ses_file".to_string()],
+            "the version-0 file is the marker: the legacy sidecars are not folded"
+        );
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 1, "the marker file was rewritten in the new form");
+
+        // A second load reads version 1 and never looks at the legacy files,
+        // even if something writes them again.
+        std::fs::write(
+            &live_cards,
+            r#"{"sessions":{"ses_other":{"card_message_id":"om_other","message_id":"msg_other"}}}"#,
+        )
+        .unwrap();
+        let chains = ChainRecords::load_for(path, crate::config::DEFAULT_CLIENT_ID).unwrap();
+        assert_eq!(
+            chains.entries().into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            vec!["ses_file".to_string()],
+            "version 1 is still the marker"
+        );
+    }
+
+    /// ADR-0091: one bare Session id can hold two clients' Chain Records,
+    /// endings and delivered positions without either replacing the other. The
+    /// file is written by two sequential stores and then read back per client.
+    #[test]
+    fn two_clients_hold_the_same_session_id_without_overwriting_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+
+        let default = ChainRecords::load_for(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
+        default.track(
+            "ses_shared",
+            "om_default",
+            MessageId::new("msg_default"),
+            Some(1_000),
+            Some("/work/default"),
+            None,
+        );
+        default.advance("ses_shared", "wake_default", 10);
+        let default_run = TaskRunId {
+            key: "call_default".into(),
+            call_id: Some("call_default".into()),
+            shell_id: None,
+            child_id: None,
+            job_id: None,
+            wake_id: None,
+        };
+        default.record_ending(
+            "ses_shared",
+            &default_run,
+            TaskEnding::owed(TaskEndingClass::Evidence, identity("default")),
+        );
+        {
+            let mut state = default.lock();
+            note_delivered(
+                &mut state,
+                "ses_shared",
+                Some(&RenderedCursor {
+                    frontier: Some(CursorFrontier {
+                        message_id: MessageId::new("msg_default"),
+                        part_index: 0,
+                        kind: CursorPartKind::Text,
+                        started_at: None,
+                        delivered_chars: 1,
+                        prefix_digest: None,
+                    }),
+                    live_calls: Default::default(),
+                }),
+            );
+            default.write(&state);
+        }
+
+        let codex = ChainRecords::load_for(path.clone(), "codex").unwrap();
+        assert!(
+            codex.entries().is_empty(),
+            "the codex client does not read the default client's live records"
+        );
+        assert_eq!(codex.delivered("ses_shared"), None);
+        codex.track(
+            "ses_shared",
+            "om_codex",
+            MessageId::new("msg_codex"),
+            Some(2_000),
+            Some("/work/codex"),
+            None,
+        );
+        codex.advance("ses_shared", "wake_codex", 20);
+        let codex_run = TaskRunId {
+            key: "call_codex".into(),
+            call_id: Some("call_codex".into()),
+            shell_id: None,
+            child_id: None,
+            job_id: None,
+            wake_id: None,
+        };
+        codex.record_ending(
+            "ses_shared",
+            &codex_run,
+            TaskEnding::owed(TaskEndingClass::Wake, identity("codex")),
+        );
+        {
+            let mut state = codex.lock();
+            note_delivered(
+                &mut state,
+                "ses_shared",
+                Some(&RenderedCursor {
+                    frontier: Some(CursorFrontier {
+                        message_id: MessageId::new("msg_codex"),
+                        part_index: 0,
+                        kind: CursorPartKind::Text,
+                        started_at: None,
+                        delivered_chars: 1,
+                        prefix_digest: None,
+                    }),
+                    live_calls: Default::default(),
+                }),
+            );
+            codex.write(&state);
+        }
+
+        // Every section survives per client in one file.
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], 1);
+        assert_eq!(
+            raw["records"]["default"]["ses_shared"]["card_message_id"],
+            "om_default"
+        );
+        assert_eq!(
+            raw["records"]["codex"]["ses_shared"]["card_message_id"],
+            "om_codex"
+        );
+        assert_eq!(
+            raw["announcements"]["default"]["ses_shared"]["wake_id"],
+            "wake_default"
+        );
+        assert_eq!(
+            raw["announcements"]["codex"]["ses_shared"]["wake_id"],
+            "wake_codex"
+        );
+        assert_eq!(
+            raw["endings"]["default"]["ses_shared"][0]["run"]["key"],
+            "call_default"
+        );
+        assert_eq!(
+            raw["endings"]["codex"]["ses_shared"][0]["run"]["key"],
+            "call_codex"
+        );
+        assert_eq!(raw["delivered"]["default"]["ses_shared"], "msg_default");
+        assert_eq!(raw["delivered"]["codex"]["ses_shared"], "msg_codex");
+
+        let default_again = ChainRecords::load_for(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
+        assert_eq!(
+            default_again.get("ses_shared").unwrap().card_message_id,
+            "om_default"
+        );
+        assert_eq!(
+            default_again.delivered("ses_shared"),
+            Some(MessageId::new("msg_default"))
+        );
+        assert_eq!(default_again.endings("ses_shared")[0].run.key, "call_default");
+        let codex_again = ChainRecords::load_for(path, "codex").unwrap();
+        assert_eq!(codex_again.get("ses_shared").unwrap().card_message_id, "om_codex");
+        assert_eq!(codex_again.endings("ses_shared")[0].run.key, "call_codex");
+        assert_eq!(
+            codex_again.delivered("ses_shared"),
+            Some(MessageId::new("msg_codex"))
         );
     }
 }

@@ -550,6 +550,7 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: topic_key.clone(),
             session_id: "ses_t1".into(),
             directory: "/work/t".into(),
@@ -898,6 +899,7 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
             seed_entry(
                 &app,
                 crate::config::SessionEntry {
+                    client_id: crate::config::DEFAULT_CLIENT_ID.into(),
                     thread_key: topic_key.clone(),
                     session_id: "ses_owned".into(),
                     directory: "/work/topic".into(),
@@ -969,6 +971,7 @@ async fn cat_directory_pick_is_rejected_in_a_bound_topic() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: topic_key.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/topic".into(),
@@ -1041,6 +1044,7 @@ async fn topic_gate_rejects_the_unparseable_topic_shape() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: topic_key.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/topic".into(),
@@ -1232,6 +1236,7 @@ async fn topic_adopt_rejects_owned_session_without_force() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1275,6 +1280,7 @@ async fn topic_adopt_force_steals_mapping() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1411,6 +1417,7 @@ async fn switch_card_topic_adopt_occupied_offers_force_confirm() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1481,6 +1488,7 @@ async fn switch_card_force_topic_adopt_steals_owned_session() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: other.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1546,6 +1554,7 @@ async fn switch_card_force_topic_adopt_failure_keeps_old_owner() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: other.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -1773,6 +1782,7 @@ async fn topic_plain_reply_skips_own_root_and_seed_injection() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_topic".into(),
             directory: "/work/topic".into(),
@@ -1831,6 +1841,7 @@ async fn topic_explicit_quote_of_real_message_still_injects() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_topic".into(),
             directory: "/work/topic".into(),
@@ -1888,6 +1899,7 @@ async fn manual_topic_plain_reply_injects_user_root() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_topic".into(),
             directory: "/work/topic".into(),

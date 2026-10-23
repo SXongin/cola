@@ -7168,6 +7168,7 @@ Index: /x/src/main.rs
         seed_entry(
             &app,
             crate::config::SessionEntry {
+                client_id: crate::config::DEFAULT_CLIENT_ID.into(),
                 thread_key: key.clone(),
                 session_id: sid.into(),
                 directory: proj.path().to_string_lossy().to_string(),
@@ -7342,6 +7343,7 @@ Index: /x/src/main.rs
         seed_entry(
             &app,
             crate::config::SessionEntry {
+                client_id: crate::config::DEFAULT_CLIENT_ID.into(),
                 thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
                 session_id: sid.into(),
                 directory: "/tmp/x".into(),
@@ -9284,6 +9286,7 @@ Index: /x/src/main.rs
         seed_entry(
             &app,
             crate::config::SessionEntry {
+                client_id: crate::config::DEFAULT_CLIENT_ID.into(),
                 thread_key: key.clone(),
                 session_id: "ses_test".into(),
                 directory: "/tmp/x".into(),
@@ -9370,6 +9373,7 @@ Index: /x/src/main.rs
         seed_entry(
             &app,
             crate::config::SessionEntry {
+                client_id: crate::config::DEFAULT_CLIENT_ID.into(),
                 thread_key: key.clone(),
                 session_id: "ses_test".into(),
                 directory: "/tmp/x".into(),

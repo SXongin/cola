@@ -16,6 +16,7 @@ async fn switch_card_is_cached_within_ttl_and_invalidated_on_rename() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_alpha01".into(),
             directory: "/work/a".into(),
@@ -140,6 +141,7 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_foreign123abc".into(),
             directory: "/work/foreign".into(),
@@ -179,6 +181,7 @@ async fn attach_force_steals_mapping_from_other_thread() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_foreign123abc".into(),
             directory: "/work/foreign".into(),
@@ -213,6 +216,7 @@ async fn forget_unmaps_thread_keeping_server_session() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -456,6 +460,7 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -540,6 +545,7 @@ async fn switch_prefers_threads_own_sessions() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -555,6 +561,7 @@ async fn switch_prefers_threads_own_sessions() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_other_own".into(),
             directory: "/work/other".into(),
@@ -635,6 +642,7 @@ async fn switch_card_defaults_to_current_directory_scope() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_beta02".into(),
             directory: "/work/cola".into(),
@@ -689,6 +697,7 @@ async fn switch_card_scope_toggle_shows_whole_store() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_beta02".into(),
             directory: "/work/cola".into(),
@@ -829,6 +838,7 @@ async fn switch_card_adopt_occupied_offers_force_confirm() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("oc_group_other".into(), "oc_group_other".into()),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -893,6 +903,7 @@ async fn switch_card_force_adopt_steals_owned_session() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: other.clone(),
             session_id: "ses_owned".into(),
             directory: "/work/auth".into(),
@@ -972,6 +983,7 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -987,6 +999,7 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_active".into(),
             directory: "/work/active".into(),
@@ -1053,6 +1066,7 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_own1".into(),
             directory: "/work/cola".into(),
@@ -1068,6 +1082,7 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_active".into(),
             directory: "/work/active".into(),
@@ -1171,6 +1186,7 @@ async fn switch_card_new_action_declares_pending_in_current_project() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_old".into(),
             directory: "/work/proj".into(),

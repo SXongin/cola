@@ -2319,6 +2319,7 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
             directory: "/tmp/x".into(),
@@ -2361,6 +2362,7 @@ async fn subtitle_degrades_when_session_info_hangs() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_01ba0ed03ffeRvYNWua6mg8d9c".into(),
             directory: "/tmp/x".into(),
@@ -2429,6 +2431,7 @@ async fn subtitle_ignores_server_default_title() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_00ea4e77cffez1fo4wrNuJyHF0".into(),
             directory: "/tmp/y".into(),
@@ -2463,6 +2466,7 @@ async fn subtitle_prefers_server_title() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/x".into(),

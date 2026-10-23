@@ -963,6 +963,7 @@ async fn auto_accept_session_answers_permission_without_card() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1040,6 +1041,7 @@ async fn autoaccept_on_approves_already_pending_permission() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1097,6 +1099,7 @@ async fn autoaccept_on_approves_child_session_permission() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1290,6 +1293,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_topic_1".into()),
             session_id: "ses_topic".into(),
             directory: "/tmp/topic".into(),

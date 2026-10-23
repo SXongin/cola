@@ -126,6 +126,7 @@ impl CardHandles {
             surfaces.set_inline(
                 &span.request_id,
                 InlineSurface {
+                    client_id: String::new(),
                     message_id: message_id.to_string(),
                     kind: handle.kind,
                     session_id: handle.session_id.clone(),

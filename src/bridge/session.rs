@@ -128,6 +128,11 @@ impl LoadedStore {
 /// unless the thread has a Pending Session.
 pub struct SessionStore {
     path: PathBuf,
+    /// The Agent Client this process is attached to (ADR-0090 decision 5): the
+    /// id stamped on every mapping it activates, and the half that scopes the
+    /// store's lookups when one bare Session id exists under two clients
+    /// (ADR-0091).
+    client_id: String,
     /// The two halves are refcounted so a snapshot (what the writer serializes)
     /// is O(1) to take under the store lock — the callback never renders JSON
     /// (ADR-0089). A mutation copies the vector only when a snapshot is
@@ -142,24 +147,48 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
+    /// The test/default construction: the implicit `default` client.
+    #[cfg(test)]
     pub fn new(path: PathBuf) -> crate::error::Result<Self> {
-        let (entries, pending) = if path.exists() {
-            let data = std::fs::read_to_string(&path)?;
-            match serde_json::from_str::<LoadedStore>(&data) {
-                Ok(loaded) => loaded.into_parts(),
-                Err(err) => {
-                    tracing::warn!(
-                        "could not parse {} ({err}); starting with an empty mapping",
-                        path.display()
-                    );
-                    (Vec::new(), Vec::new())
+        Self::for_client(path, crate::config::DEFAULT_CLIENT_ID)
+    }
+
+    /// The production construction: `client_id` is the active Agent Client's id
+    /// (ADR-0090 decision 5). A version-0 file reads as the **default** client's
+    /// (ADR-0091), then is rewritten once in the current form; a newer format
+    /// version is refused rather than silently read as version 0.
+    pub fn for_client(path: PathBuf, client_id: &str) -> crate::error::Result<Self> {
+        let (entries, pending, legacy) = match sidecar::read_versioned(&path, "session mapping") {
+            sidecar::VersionedRead::Missing => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
+                (Vec::new(), Vec::new(), false)
             }
-        } else {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+            sidecar::VersionedRead::Unreadable | sidecar::VersionedRead::Corrupt => {
+                (Vec::new(), Vec::new(), false)
             }
-            (Vec::new(), Vec::new())
+            sidecar::VersionedRead::Unsupported(version) => {
+                return Err(crate::error::BridgeError::State(format!(
+                    "{} declares unsupported format version {version} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    crate::state::STATE_FORMAT_VERSION
+                )));
+            }
+            sidecar::VersionedRead::Legacy(raw) => {
+                let (mut entries, pending) = parse_store(&raw, &path);
+                // ADR-0091: a version-0 file belongs to the default client,
+                // whatever client this process happens to run.
+                for entry in &mut entries {
+                    entry.client_id = crate::config::DEFAULT_CLIENT_ID.to_string();
+                }
+                (entries, pending, true)
+            }
+            sidecar::VersionedRead::Current(raw) => {
+                let (entries, pending) = parse_store(&raw, &path);
+                (entries, pending, false)
+            }
         };
         let writer = match crate::bridge::store_writer::StoreWriter::start(path.clone()) {
             Ok(writer) => Some(writer),
@@ -168,12 +197,19 @@ impl SessionStore {
                 None
             }
         };
-        Ok(Self {
+        let store = Self {
             path,
+            client_id: client_id.to_string(),
             entries: Arc::new(entries),
             pending: Arc::new(pending),
             writer,
-        })
+        };
+        if legacy {
+            // ADR-0091: the one eager rewrite. A later process reads version 1
+            // and therefore does not write again at load.
+            store.write_to_disk()?;
+        }
+        Ok(store)
     }
 
     /// The two halves as mutable vectors. `Arc::make_mut` copies only when a
@@ -196,7 +232,9 @@ impl SessionStore {
         if self.pending_for(key).is_some() {
             return None;
         }
-        self.entries.iter().find(|e| &e.thread_key == key)
+        self.entries
+            .iter()
+            .find(|e| e.client_id == self.client_id && &e.thread_key == key)
     }
 
     /// The conversation's Pending Session, if it declared one (ADR-0041).
@@ -232,6 +270,9 @@ impl SessionStore {
     /// a thread cannot have both (ADR-0041). Centralised here so no activation
     /// path can leave a pending behind to supersede the session it activated.
     fn promote(&mut self, mut entry: SessionEntry) {
+        // The store owns which client the mapping belongs to: a caller builds
+        // an entry without knowing the process's active client.
+        entry.client_id = self.client_id.clone();
         self.pending_mut().retain(|p| p.thread_key != entry.thread_key);
         // Replace any existing mapping of this session. ADR-0041 keeps the
         // per-session overrides on the session: an adoption flow rebuilds the
@@ -244,7 +285,11 @@ impl SessionStore {
         // written through the settings path (`update`), never activation.
         // Everything the flow owns — thread key, directory, agent, topic
         // anchors — stays as the new entry set it.
-        if let Some(pos) = self.entries.iter().position(|e| e.session_id == entry.session_id) {
+        if let Some(pos) = self
+            .entries
+            .iter()
+            .position(|e| e.client_id == entry.client_id && e.session_id == entry.session_id)
+        {
             let previous = self.entries_mut().remove(pos);
             if entry.model.is_none() {
                 entry.model = previous.model;
@@ -283,7 +328,12 @@ impl SessionStore {
     where
         F: FnOnce(&mut SessionEntry),
     {
-        let Some(entry) = self.entries_mut().iter_mut().find(|e| e.session_id == session_id) else {
+        let client_id = self.client_id.clone();
+        let Some(entry) = self
+            .entries_mut()
+            .iter_mut()
+            .find(|e| e.client_id == client_id && e.session_id == session_id)
+        else {
             return Ok(None);
         };
         f(entry);
@@ -311,8 +361,12 @@ impl SessionStore {
             .iter()
             .map(|(session_id, directory)| (session_id.as_str(), directory.as_str()))
             .collect();
+        let client_id = self.client_id.clone();
         let mut moved = Vec::new();
         for entry in self.entries_mut().iter_mut() {
+            if entry.client_id != client_id {
+                continue;
+            }
             let Some(directory) = listed.get(entry.session_id.as_str()) else {
                 continue;
             };
@@ -374,6 +428,7 @@ impl SessionStore {
     /// before this write lands on the new active entry — the settings still
     /// configure the conversation (ADR-0041). `false` when the target is gone.
     pub fn set_settings(&mut self, key: &ThreadKey, settings: SessionSettings) -> crate::error::Result<bool> {
+        let client_id = self.client_id.clone();
         let overrides = (
             settings.agent.clone(),
             settings.model.clone(),
@@ -381,7 +436,11 @@ impl SessionStore {
             settings.auto_accept,
         );
         let applied = if let Some(id) = settings.session_id.as_deref() {
-            match self.entries_mut().iter_mut().find(|e| e.session_id == id) {
+            match self
+                .entries_mut()
+                .iter_mut()
+                .find(|e| e.client_id == client_id && e.session_id == id)
+            {
                 Some(e) => {
                     (e.agent, e.model, e.variant, e.auto_accept) = overrides.clone();
                     true
@@ -391,7 +450,11 @@ impl SessionStore {
         } else if let Some(p) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
             (p.agent, p.model, p.variant, p.auto_accept) = overrides;
             true
-        } else if let Some(e) = self.entries_mut().iter_mut().find(|e| &e.thread_key == key) {
+        } else if let Some(e) = self
+            .entries_mut()
+            .iter_mut()
+            .find(|e| e.client_id == client_id && &e.thread_key == key)
+        {
             // The pending materialised between the read and this write: the
             // overrides belong on the session it created.
             (e.agent, e.model, e.variant, e.auto_accept) = overrides;
@@ -407,7 +470,10 @@ impl SessionStore {
 
     /// Remove a session entry by session ID.
     fn remove(&mut self, session_id: &str) -> Option<SessionEntry> {
-        let pos = self.entries.iter().position(|e| e.session_id == session_id)?;
+        let pos = self
+            .entries
+            .iter()
+            .position(|e| e.client_id == self.client_id && e.session_id == session_id)?;
         Some(self.entries_mut().remove(pos))
     }
 
@@ -421,14 +487,16 @@ impl SessionStore {
     /// Remove every session entry mapped to a thread, together with any
     /// Pending Session (ADR-0041: forget clears both in the same write).
     fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
+        let client_id = self.client_id.clone();
         self.pending_mut().retain(|p| &p.thread_key != key);
         let removed: Vec<SessionEntry> = self
             .entries
             .iter()
-            .filter(|e| &e.thread_key == key)
+            .filter(|e| e.client_id == client_id && &e.thread_key == key)
             .cloned()
             .collect();
-        self.entries_mut().retain(|e| &e.thread_key != key);
+        self.entries_mut()
+            .retain(|e| e.client_id != client_id || &e.thread_key != key);
         removed
     }
 
@@ -444,14 +512,16 @@ impl SessionStore {
     pub fn thread_for_session(&self, session_id: &str) -> Option<ThreadKey> {
         self.entries
             .iter()
-            .find(|e| e.session_id == session_id)
+            .find(|e| e.client_id == self.client_id && e.session_id == session_id)
             .map(|e| e.thread_key.clone())
     }
 
     /// Find the entry for a session ID (regardless of thread). Used to check
     /// per-session flags like `auto_accept` from the permission poller.
     pub fn entry_for_session(&self, session_id: &str) -> Option<&SessionEntry> {
-        self.entries.iter().find(|e| e.session_id == session_id)
+        self.entries
+            .iter()
+            .find(|e| e.client_id == self.client_id && e.session_id == session_id)
     }
 
     /// Directory for a session ID (used to route permission requests to the
@@ -459,7 +529,7 @@ impl SessionStore {
     pub fn directory_for_session(&self, session_id: &str) -> Option<String> {
         self.entries
             .iter()
-            .find(|e| e.session_id == session_id)
+            .find(|e| e.client_id == self.client_id && e.session_id == session_id)
             .map(|e| e.directory.clone())
     }
 
@@ -467,7 +537,7 @@ impl SessionStore {
     /// instance the bot has created sessions in.
     pub fn directories(&self) -> Vec<String> {
         let mut dirs: Vec<String> = Vec::new();
-        for e in self.entries.iter() {
+        for e in self.entries.iter().filter(|e| e.client_id == self.client_id) {
             if !dirs.contains(&e.directory) {
                 dirs.push(e.directory.clone());
             }
@@ -477,12 +547,18 @@ impl SessionStore {
 
     /// List all sessions in a thread.
     pub fn list_thread(&self, key: &ThreadKey) -> Vec<&SessionEntry> {
-        self.entries.iter().filter(|e| &e.thread_key == key).collect()
+        self.entries
+            .iter()
+            .filter(|e| e.client_id == self.client_id && &e.thread_key == key)
+            .collect()
     }
 
     /// All known sessions (used by the external-message poller).
     pub fn all_entries(&self) -> Vec<&SessionEntry> {
-        self.entries.iter().collect()
+        self.entries
+            .iter()
+            .filter(|e| e.client_id == self.client_id)
+            .collect()
     }
 
     fn write_to_disk(&self) -> crate::error::Result<()> {
@@ -591,6 +667,22 @@ impl SessionStore {
     }
 }
 
+/// Parse either historical shape: the pre-ADR-0041 bare array, or the object
+/// with `entries`/`pending`. A corrupt body fails open with a warning, exactly
+/// as the store did before ADR-0091.
+fn parse_store(raw: &str, path: &std::path::Path) -> (Vec<SessionEntry>, Vec<PendingEntry>) {
+    match serde_json::from_str::<LoadedStore>(raw) {
+        Ok(loaded) => loaded.into_parts(),
+        Err(err) => {
+            tracing::warn!(
+                "could not parse {} ({err}); starting with an empty mapping",
+                path.display()
+            );
+            (Vec::new(), Vec::new())
+        }
+    }
+}
+
 /// Whether two directory spellings name the same path, without touching the
 /// filesystem: an exact match, or the same path components (a trailing slash,
 /// doubled separators). A spelling-only difference must not report a move —
@@ -612,6 +704,7 @@ mod tests {
 
     fn make_entry(chat_id: &str, root_id: &str, session_id: &str, dir: &str) -> SessionEntry {
         SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: ThreadKey::new(chat_id.into(), root_id.into()),
             session_id: session_id.into(),
             directory: dir.into(),

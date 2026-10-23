@@ -246,6 +246,7 @@ async fn dir_card_pick_current_directory_toasts_only() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_a".into(),
             directory: "/work/a".into(),
@@ -393,6 +394,7 @@ async fn dir_card_topic_on_current_directory_opens_topic() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: lobby_key.clone(),
             session_id: "ses_a".into(),
             directory: "/work/a".into(),
@@ -837,6 +839,7 @@ async fn dir_card_pick_current_directory_preserves_the_filter() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key,
             session_id: "ses_p2".into(),
             directory: "/work/proj2".into(),
@@ -1022,6 +1025,7 @@ fn browse_project() -> tempfile::TempDir {
 /// A seeded active SessionEntry rooted at `directory`.
 fn seeded_entry(key: &crate::config::ThreadKey, directory: &str) -> crate::config::SessionEntry {
     crate::config::SessionEntry {
+        client_id: crate::config::DEFAULT_CLIENT_ID.into(),
         thread_key: key.clone(),
         session_id: "ses_seed".into(),
         directory: directory.to_string(),

@@ -192,12 +192,29 @@ pub(crate) fn now_epoch_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// The version-1 file wrapper (ADR-0091): every durable record file names the
+/// format it is in and the Agent Client the run was issued under. The record
+/// itself is flattened, so a version-0 file (bare record) still parses as 0
+/// under the default client.
+#[derive(Debug, Serialize, Deserialize)]
+struct TerminalRecordFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    client_id: String,
+    #[serde(flatten)]
+    record: TerminalRunRecord,
+}
+
 /// The record directory: one file per **Chat**/**Topic**, beside the session
 /// mapping (`~/.cola/terminal-runs` in production, `<dir>` of
 /// `[bridge] session_file`). One file per conversation is deliberate — a write
 /// touches only its own chat, so two chats' runs never rewrite each other.
 pub(crate) struct TerminalRunRecords {
     dir: PathBuf,
+    /// The Agent Client this process is attached to (ADR-0091), stamped on
+    /// every record it writes.
+    client_id: String,
     /// One lock per Chat/Topic, taken by every write of that chat's record. The
     /// record is replaced whole, so a read-modify-write (the 「问 AI」 marker)
     /// that interleaved with the chat's next run could install a stale snapshot
@@ -218,15 +235,100 @@ pub(crate) struct TerminalRunRecords {
 }
 
 impl TerminalRunRecords {
+    /// The test/default construction: the implicit `default` client.
+    #[cfg(test)]
     pub(crate) fn new(dir: PathBuf) -> Self {
+        Self::for_client(dir, crate::config::DEFAULT_CLIENT_ID)
+    }
+
+    /// The production construction (ADR-0090 §5): `client_id` is stamped on
+    /// every record this process writes. ADR-0091: version-0 record files are
+    /// rewritten once in the current form under the default client; a newer
+    /// version is refused rather than read as 0.
+    pub(crate) fn open(dir: PathBuf, client_id: &str) -> anyhow::Result<Self> {
+        let records = Self::for_client(dir, client_id);
+        records.migrate_version_0()?;
+        Ok(records)
+    }
+
+    fn for_client(dir: PathBuf, client_id: &str) -> Self {
         Self {
             dir,
+            client_id: client_id.to_string(),
             locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             writes_allowed: std::sync::atomic::AtomicUsize::new(usize::MAX),
             #[cfg(test)]
             merge_pause: Mutex::new(None),
         }
+    }
+
+    /// Rewrite every version-0 record file once (ADR-0091), preserving the
+    /// record's facts and assigning it to the default client. A corrupt or
+    /// misplaced file is left untouched: it fails open on read, exactly as
+    /// before.
+    fn migrate_version_0(&self) -> anyhow::Result<()> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    "terminal record: could not read the record directory {} for migration: {error}",
+                    self.dir.display()
+                );
+                return Ok(());
+            }
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(raw) = read_bounded(&path) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let version = value
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|version| u32::try_from(version).ok())
+                .unwrap_or(0);
+            if version > crate::state::STATE_FORMAT_VERSION {
+                anyhow::bail!(
+                    "{} declares unsupported format version {version} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    crate::state::STATE_FORMAT_VERSION
+                );
+            }
+            if version == crate::state::STATE_FORMAT_VERSION {
+                continue;
+            }
+            let Ok(record) = serde_json::from_slice::<TerminalRecordFile>(&raw) else {
+                continue;
+            };
+            if self.path(&record.record.key()) != path {
+                continue;
+            }
+            let migrated = TerminalRecordFile {
+                version: crate::state::STATE_FORMAT_VERSION,
+                client_id: crate::config::DEFAULT_CLIENT_ID.to_string(),
+                record: record.record,
+            };
+            let data = serde_json::to_vec(&migrated).map_err(std::io::Error::other)?;
+            if let Err(error) = sidecar::write_atomic(&path, &data) {
+                tracing::warn!(
+                    "terminal record: could not migrate {} to the current format: {error}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     /// The directory the records live in. The log sweep asks whether it exists
@@ -279,8 +381,18 @@ impl TerminalRunRecords {
     /// not grow with whatever sits at the path.
     fn load_file(path: &Path) -> Option<TerminalRunRecord> {
         let raw = read_bounded(path)?;
-        match serde_json::from_slice(&raw) {
-            Ok(record) => Some(record),
+        match serde_json::from_slice::<TerminalRecordFile>(&raw) {
+            Ok(file) if file.version > crate::state::STATE_FORMAT_VERSION => {
+                tracing::error!(
+                    "terminal record: {} declares unsupported format version {} (this build writes {}); \
+                     refusing to read it as version 0",
+                    path.display(),
+                    file.version,
+                    crate::state::STATE_FORMAT_VERSION
+                );
+                None
+            }
+            Ok(file) => Some(file.record),
             Err(e) => {
                 tracing::warn!("terminal record: could not parse {}: {e}", path.display());
                 None
@@ -325,7 +437,12 @@ impl TerminalRunRecords {
                 "simulated record write failure (test seam)",
             ));
         }
-        let data = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        let data = serde_json::to_vec(&TerminalRecordFile {
+            version: crate::state::STATE_FORMAT_VERSION,
+            client_id: self.client_id.clone(),
+            record: record.clone(),
+        })
+        .map_err(std::io::Error::other)?;
         sidecar::write_atomic(&self.path(&record.key()), &data)
     }
 
@@ -499,7 +616,10 @@ impl TerminalRunRecords {
     /// only place an ending can be recorded, or the card could never be told the
     /// run ended at all.
     pub(crate) fn owed(&self) -> TerminalOwedSettlements {
-        TerminalOwedSettlements::new(crate::state::StateLayout::terminal_owed_beside(&self.dir))
+        TerminalOwedSettlements::new(
+            crate::state::StateLayout::terminal_owed_beside(&self.dir),
+            &self.client_id,
+        )
     }
 
     /// Test-only: park the next 「问 AI」 merge after its re-read and before its
@@ -619,11 +739,17 @@ impl TerminalRunRecords {
 /// ending is still owed.
 pub(crate) struct TerminalOwedSettlements {
     dir: PathBuf,
+    /// The Agent Client this process is attached to, stamped on every
+    /// obligation it writes (ADR-0091).
+    client_id: String,
 }
 
 impl TerminalOwedSettlements {
-    fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    fn new(dir: PathBuf, client_id: &str) -> Self {
+        Self {
+            dir,
+            client_id: client_id.to_string(),
+        }
     }
 
     /// The directory the obligations live in. Its absence means "nothing owed";
@@ -642,7 +768,12 @@ impl TerminalOwedSettlements {
     /// **checked**: the card may only be told a run ended once this landed,
     /// otherwise no restart could repeat the write.
     pub(crate) fn add(&self, record: &TerminalRunRecord) -> std::io::Result<()> {
-        let data = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+        let data = serde_json::to_vec(&TerminalRecordFile {
+            version: crate::state::STATE_FORMAT_VERSION,
+            client_id: self.client_id.clone(),
+            record: record.clone(),
+        })
+        .map_err(std::io::Error::other)?;
         sidecar::write_atomic(&self.path(&record.run_id), &data)
     }
 
@@ -696,11 +827,22 @@ impl TerminalOwedSettlements {
                 complete = false;
                 continue;
             };
-            match serde_json::from_slice::<TerminalRunRecord>(&raw) {
+            match serde_json::from_slice::<TerminalRecordFile>(&raw) {
                 // An obligation only means something at the path its OWN run id
                 // names: anything else is unreadable, whether misplaced or
-                // crafted.
-                Ok(record) if self.path(&record.run_id) == path => owed.push(record),
+                // crafted. A version this build does not know is not knowing
+                // either — never read as version 0 (ADR-0091).
+                Ok(file) if file.version > crate::state::STATE_FORMAT_VERSION => {
+                    tracing::error!(
+                        "terminal owed: {} declares unsupported format version {} (this build writes {}); \
+                         refusing to read it as version 0",
+                        path.display(),
+                        file.version,
+                        crate::state::STATE_FORMAT_VERSION
+                    );
+                    complete = false;
+                }
+                Ok(file) if self.path(&file.record.run_id) == path => owed.push(file.record),
                 Ok(_) => complete = false,
                 Err(e) => {
                     tracing::warn!("terminal owed: could not parse {}: {e}", path.display());

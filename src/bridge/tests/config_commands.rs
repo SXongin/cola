@@ -22,6 +22,7 @@ async fn model_no_arg_sends_picker_card() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -95,6 +96,7 @@ async fn model_card_falls_back_to_the_configured_default_model() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -153,6 +155,7 @@ async fn model_card_falls_back_to_the_server_recorded_model() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -211,6 +214,7 @@ async fn model_card_button_records_override() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -280,6 +284,7 @@ async fn model_picker_back_button_returns_to_providers() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -349,6 +354,7 @@ async fn agent_card_picker_and_button() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -452,6 +458,7 @@ async fn agent_text_reset_flag_clears_override() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -517,6 +524,7 @@ async fn autoaccept_card_toggles_flag() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -585,6 +593,7 @@ async fn name_patches_server_title() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -622,6 +631,7 @@ async fn name_patches_cover_card_in_cover_rooted_topic() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -689,6 +699,7 @@ async fn default_server_title_does_not_patch_cover_card() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -748,6 +759,7 @@ async fn cover_title_retry_ladder_catches_late_auto_title() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "omt_t_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -818,6 +830,7 @@ async fn model_command_records_override_used_on_next_prompt() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -873,6 +886,7 @@ async fn think_command_records_variant_used_on_next_prompt() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -936,6 +950,7 @@ async fn think_command_rejects_undeclared_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -991,6 +1006,7 @@ async fn think_reset_flag_clears_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1042,6 +1058,7 @@ async fn think_bare_default_undeclared_is_rejected() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1092,6 +1109,7 @@ async fn think_bare_default_declared_is_stored() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1142,6 +1160,7 @@ async fn think_no_arg_sends_variant_card() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1208,6 +1227,7 @@ async fn think_card_button_records_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1298,6 +1318,7 @@ async fn model_switch_clears_undeclared_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1369,6 +1390,7 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1413,6 +1435,7 @@ async fn model_command_rejects_malformed_value() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1455,6 +1478,7 @@ async fn model_override_flows_through_supplement_path() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1508,6 +1532,7 @@ async fn agent_command_records_override_used_on_next_prompt() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1562,6 +1587,7 @@ async fn agent_override_flows_through_supplement_path() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1604,6 +1630,7 @@ async fn model_override_persists_across_store_reload() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1665,6 +1692,7 @@ async fn model_pick_switches_the_session_and_carries_the_servers_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1754,6 +1782,7 @@ async fn think_pick_rewrites_the_model_ref_with_the_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1841,6 +1870,7 @@ async fn think_card_falls_back_to_the_last_run_model_on_v2() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1919,6 +1949,7 @@ async fn think_pick_uses_the_last_run_model_on_v2() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -1974,6 +2005,7 @@ async fn think_card_degrades_when_the_last_run_read_fails() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2034,6 +2066,7 @@ async fn agent_pick_switches_the_session_and_reset_switches_the_default() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2115,6 +2148,7 @@ async fn agent_reset_refuses_when_no_default_agent_resolves() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2172,6 +2206,7 @@ async fn a_failed_session_switch_leaves_the_mirror_untouched() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2247,6 +2282,7 @@ async fn the_ladder_reads_the_servers_selection_over_the_local_mirror() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2346,6 +2382,7 @@ async fn a_failed_durable_read_never_confirms_a_think_pick() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2429,6 +2466,7 @@ async fn a_failed_durable_read_hides_the_mirror_and_drops_an_unknown_variant() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
@@ -2527,6 +2565,7 @@ async fn picker_buttons_switch_the_session_on_a_durable_generation() {
     seed_entry(
         &app,
         crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
             thread_key: key.clone(),
             session_id: "ses_test".into(),
             directory: "/tmp/aa".into(),
