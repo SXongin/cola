@@ -20,31 +20,65 @@ use std::path::Path;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+/// The format a JSON header declares (ADR-0091). Only the exact integer `0`
+/// (or an absent header) is version 0, only the exact integer this build writes
+/// is current, and **every** other value is unsupported — `2.0`, `"2"`,
+/// `"2-beta"`, `-1`, `null`. Those are never downgraded to "corrupt and read as
+/// empty": that would let a later write replace state this build cannot
+/// understand.
+pub(crate) enum DeclaredVersion {
+    /// Version 0, or no `version` field at all.
+    Legacy,
+    /// The version this build writes.
+    Current,
+    /// Any other declared value, carrying its raw JSON spelling for the message.
+    Unsupported(String),
+}
+
+/// Classify a parsed header's `version` value.
+pub(crate) fn classify_version(value: Option<&serde_json::Value>) -> DeclaredVersion {
+    let Some(value) = value else {
+        return DeclaredVersion::Legacy;
+    };
+    if let serde_json::Value::Number(number) = value
+        && let Some(integer) = number.as_u64()
+    {
+        if integer == 0 {
+            return DeclaredVersion::Legacy;
+        }
+        if integer == u64::from(crate::state::STATE_FORMAT_VERSION) {
+            return DeclaredVersion::Current;
+        }
+    }
+    DeclaredVersion::Unsupported(value.to_string())
+}
+
 /// What a durable file's format header says (ADR-0091). A file with no
 /// `version` field — or a pre-ADR-0041 bare JSON array — is [`Self::Legacy`]:
-/// version 0, read as the shape the release before ADR-0091 wrote. A version
-/// newer than this build is [`Self::Unsupported`], never silently read as 0.
+/// version 0, read as the shape the release before ADR-0091 wrote. A declared
+/// value that is not exactly 0 or the current version is [`Self::Unsupported`],
+/// never silently read as 0.
 pub(crate) enum VersionedRead {
     /// No file at the path.
     Missing,
     /// The file exists but could not be read.
     Unreadable,
-    /// The file is not valid JSON, or its `version` is not a number.
+    /// The file is not valid JSON.
     Corrupt,
     /// Version 0, or no `version` field at all.
     Legacy(String),
     /// The version this build writes.
     Current(String),
-    /// A version newer than this build knows.
-    Unsupported(u32),
+    /// Any other version, with its raw value.
+    Unsupported(String),
 }
 
 /// Read `path` and classify its format header without parsing the body.
 ///
 /// The classification fails open (a missing, unreadable or corrupt file is
-/// reported, never an error) except for a future version, which the caller
-/// must refuse rather than rewrite as its own older shape. `what` names the
-/// record in the warning lines ("Wake watermark", "Chain Record", ...).
+/// reported, never an error) except for an unsupported version, which the
+/// caller must refuse rather than rewrite as its own older shape. `what` names
+/// the record in the warning lines ("Wake watermark", "Chain Record", ...).
 pub(crate) fn read_versioned(path: &Path, what: &str) -> VersionedRead {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -67,22 +101,10 @@ pub(crate) fn read_versioned(path: &Path, what: &str) -> VersionedRead {
             return VersionedRead::Corrupt;
         }
     };
-    // A non-object is a version-0 shape (the pre-ADR-0041 bare session array);
-    // a body the concrete record cannot parse still fails open in its loader.
-    let Some(version) = value.get("version") else {
-        return VersionedRead::Legacy(raw);
-    };
-    let Some(version) = version.as_u64().and_then(|version| u32::try_from(version).ok()) else {
-        tracing::warn!(
-            "could not parse {} (version is not a number); starting with an empty {what}",
-            path.display()
-        );
-        return VersionedRead::Corrupt;
-    };
-    match version {
-        0 => VersionedRead::Legacy(raw),
-        version if version == crate::state::STATE_FORMAT_VERSION => VersionedRead::Current(raw),
-        version => VersionedRead::Unsupported(version),
+    match classify_version(value.get("version")) {
+        DeclaredVersion::Legacy => VersionedRead::Legacy(raw),
+        DeclaredVersion::Current => VersionedRead::Current(raw),
+        DeclaredVersion::Unsupported(declared) => VersionedRead::Unsupported(declared),
     }
 }
 
@@ -316,5 +338,55 @@ mod tests {
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
         assert!(ensure_parent(&file.join("child/record.json")).is_err());
+    }
+
+    /// ADR-0091: only the exact integer 0 (or no `version`) is legacy, and only
+    /// the exact current integer is current. Every other declared value —
+    /// float, string, suffixed string, negative, null — is unsupported with its
+    /// raw spelling, never "corrupt and empty".
+    #[test]
+    fn only_integer_zero_and_the_current_version_are_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+
+        std::fs::write(&path, "{}").unwrap();
+        assert!(matches!(
+            read_versioned(&path, "test record"),
+            VersionedRead::Legacy(_)
+        ));
+
+        std::fs::write(&path, r#"{"version":0}"#).unwrap();
+        assert!(matches!(
+            read_versioned(&path, "test record"),
+            VersionedRead::Legacy(_)
+        ));
+
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":{}}}"#, crate::state::STATE_FORMAT_VERSION),
+        )
+        .unwrap();
+        assert!(matches!(
+            read_versioned(&path, "test record"),
+            VersionedRead::Current(_)
+        ));
+
+        let current = crate::state::STATE_FORMAT_VERSION;
+        for declared in [
+            (current + 1).to_string(),
+            format!("{}.0", current + 1),
+            format!("\"{}\"", current + 1),
+            format!("\"{}-beta\"", current + 1),
+            "-1".to_string(),
+            "null".to_string(),
+        ] {
+            std::fs::write(&path, format!(r#"{{"version":{declared}}}"#)).unwrap();
+            match read_versioned(&path, "test record") {
+                VersionedRead::Unsupported(raw) => {
+                    assert_eq!(raw, declared, "the refusal carries the raw declared value")
+                }
+                _ => panic!("{declared} must be unsupported, not corrupt or version 0"),
+            }
+        }
     }
 }

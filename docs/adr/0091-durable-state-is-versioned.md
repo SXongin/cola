@@ -105,7 +105,9 @@ way: a rename under one client must not redirect another client's writes.
 Request and message ids are minted per client, so the maps are scoped too — two
 clients could otherwise mint the same `per_…`/`om_…` key. `InlineSurface` and
 `StandaloneSurface` additionally carry `client_id` beside their existing
-`session_id`, so a record read out of its map still says whose it is.
+`session_id`, so a record read out of its map still says whose it is. A current
+file whose embedded id is empty is repaired from its scope once and written
+back, not repaired in memory on every load.
 
 `terminal-runs/<chat-or-topic>.json` is one record per file and therefore one
 version per file; the version and the client are siblings of the record's own
@@ -115,8 +117,12 @@ fields:
 { "version": 1, "client_id": "default", "run_id": "…", "chat_id": "…", … }
 ```
 
-The owed-settlement journal beside it (`terminal-runs-owed/`) uses the same
-envelope, so an obligation written before this ADR reads as version 0 too.
+A run record is read only by the client it names; a version-0 record — or a
+current one with an empty id — belongs to the default client. Another client's
+run is therefore not adopted as this process's current run. The owed-settlement
+journal beside it (`terminal-runs-owed/`) uses the same envelope and the same
+ownership rule, so an obligation written before this ADR reads as version 0 and
+migrates with the run records.
 
 `access.json` and `pinned_chats.json` carry `"version": 1` and no client id:
 the Host is not a Session, and a pin is a Chat/Topic fact. The Chat/Topic key
@@ -136,19 +142,25 @@ and for the same reason: the migration is settled at the first load, not left
 for a mutation that may never come. A second process reads `"version": 1` and
 writes nothing. The stale legacy sections (`rendered`, the pre-0041 bare array)
 are dropped by that rewrite. `TerminalRunRecords::open` performs the same
-one-time rewrite for old run files; `access.json` is rewritten by the daemon's
-startup path (`Access::new`, never by a read-only `cola status`);
-`pinned_chats.json` is rewritten by its next write (the startup orphan sweep).
+one-time rewrite for old run files **and** the owed-settlement journal beside
+them; `access.json` is rewritten when the Access List is loaded by the daemon,
+while the read-only `cola status` uses the non-migrating read
+(`load_read_only`); `pinned_chats.json` is rewritten when the reminder state is
+constructed at startup. Every rewrite goes through the
+atomic temp-file-plus-rename writer, so a crash cannot truncate the old file
+before the new bytes are durable.
 
 **5. The failure modes are split deliberately.**
 
 - A **missing**, **unreadable** or **corrupt** file still fails open exactly as
   today: an empty record and a warning. The bytes are left untouched, so a human
   can inspect them.
-- An **unknown future version** is refused: the startup stores return an error
-  naming the path, the found version and the version this build writes; the
-  bot does not start rather than rewrite state it cannot understand. A store
-  loaded outside startup (the Access List) logs the refusal and behaves
+- **Any declared version that is not exactly the integer `0` or the current
+  integer is refused** — a future number, a float (`2.0`), a string (`"2"`), a
+  suffixed string (`"2-beta"`), a negative, `null`. The startup stores return
+  an error naming the path, the raw declared value and the version this build
+  writes; the bot does not start rather than rewrite state it cannot understand.
+  A store loaded outside startup (the Access List) logs the refusal and behaves
   unclaimed/fails closed.
 - A version-0 file whose body still will not parse fails open and is **not**
   rewritten; only a body that parsed as version 0 is migrated.

@@ -14,9 +14,6 @@ use std::path::{Path, PathBuf};
 pub struct AccessList {
     path: PathBuf,
     host: Option<String>,
-    /// The file read as version 0 — [`Self::migrate`] may rewrite it. A future
-    /// version is never rewritten.
-    legacy: bool,
 }
 
 /// The on-disk shape. ADR-0091: version 1. It is deliberately **not**
@@ -31,50 +28,66 @@ struct AccessFile {
 }
 
 impl AccessList {
-    /// Load the list from `path`. An absent, unreadable, or malformed file is
-    /// an unclaimed list — never an error: a broken store must fail closed.
-    /// A version-0 file is read as such and rewritten once in the current form
-    /// (ADR-0091); a newer version is refused loudly and left untouched.
+    /// Load the list from `path`, migrating a version-0 file once in the
+    /// current form (ADR-0091). An absent, unreadable, or malformed file is an
+    /// unclaimed list — never an error: a broken store must fail closed. A
+    /// declared value that is not exactly 0 or the current integer is refused
+    /// loudly and left untouched.
     pub fn load(path: &Path) -> Self {
-        let file = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|data| serde_json::from_str::<AccessFile>(&data).ok());
-        let (host, legacy) = match &file {
-            Some(file) if file.version > crate::state::STATE_FORMAT_VERSION => {
-                tracing::error!(
-                    "{} declares unsupported format version {} (this build writes {}); \
-                     refusing to read it as version 0",
-                    path.display(),
-                    file.version,
-                    crate::state::STATE_FORMAT_VERSION
-                );
-                (None, false)
-            }
-            Some(file) => (
-                file.host.clone(),
-                file.version < crate::state::STATE_FORMAT_VERSION,
-            ),
-            None => (None, false),
-        };
-        Self {
-            path: path.to_path_buf(),
-            host,
-            legacy,
-        }
+        Self::read(path, true)
     }
 
-    /// Rewrite a version-0 file once in the current form (ADR-0091). Called by
-    /// the daemon's startup path ([`Access::new`]), never by a read-only CLI
-    /// such as `cola status`. Best effort: a failed write logs and leaves the
-    /// version-0 file for the next start.
-    pub(crate) fn migrate(&mut self) {
-        if !self.legacy {
-            return;
+    /// [`Self::load`] without the one-time migration, for read-only callers
+    /// such as `cola status` (ADR-0081: a read-only command does not write
+    /// state). A version-0 file still reads as version 0.
+    pub(crate) fn load_read_only(path: &Path) -> Self {
+        Self::read(path, false)
+    }
+
+    fn read(path: &Path, migrate: bool) -> Self {
+        let value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok());
+        let mut legacy = false;
+        let host = match value.as_ref() {
+            Some(value) => {
+                let declared = crate::bridge::sidecar::classify_version(value.get("version"));
+                match &declared {
+                    crate::bridge::sidecar::DeclaredVersion::Unsupported(declared) => {
+                        tracing::error!(
+                            "{} declares unsupported format version {declared} (this build writes {}); \
+                             refusing to read it as version 0",
+                            path.display(),
+                            crate::state::STATE_FORMAT_VERSION
+                        );
+                        None
+                    }
+                    crate::bridge::sidecar::DeclaredVersion::Legacy
+                    | crate::bridge::sidecar::DeclaredVersion::Current => {
+                        match serde_json::from_value::<AccessFile>(value.clone()) {
+                            Ok(file) => {
+                                legacy = matches!(&declared, crate::bridge::sidecar::DeclaredVersion::Legacy);
+                                file.host
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+        let list = Self {
+            path: path.to_path_buf(),
+            host,
+        };
+        if legacy && migrate {
+            // The one eager rewrite (ADR-0091), atomic so a crash cannot
+            // truncate the Host entry to an unclaimed file.
+            if let Err(error) = write_access_file(&list.path, list.host.as_deref()) {
+                tracing::warn!("access list: could not migrate {}: {error}", list.path.display());
+            }
         }
-        match write_access_file(&self.path, self.host.as_deref()) {
-            Ok(()) => self.legacy = false,
-            Err(error) => tracing::warn!("access list: could not migrate {}: {error}", self.path.display()),
-        }
+        list
     }
 
     /// The Host's `open_id`, when claimed.
@@ -109,14 +122,13 @@ impl AccessList {
 /// Write the current on-disk shape (ADR-0091), atomically enough for a
 /// best-effort store.
 fn write_access_file(path: &Path, host: Option<&str>) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let data = serde_json::to_string_pretty(&AccessFile {
         version: crate::state::STATE_FORMAT_VERSION,
         host: host.map(str::to_string),
     })?;
-    std::fs::write(path, data)
+    // Atomic (temp file + rename): a crash must never truncate the Host entry
+    // to an unclaimed file (ADR-0091).
+    crate::bridge::sidecar::write_atomic(path, data.as_bytes())
 }
 
 /// The runtime gate state: the Access List plus the startup Claim Code.
@@ -154,8 +166,7 @@ impl Access {
     /// The code is logged once here — the startup log is the only place it is
     /// ever shown.
     pub fn new(path: PathBuf) -> Self {
-        let mut list = AccessList::load(&path);
-        list.migrate();
+        let list = AccessList::load(&path);
         let claim_code = (!list.is_claimed()).then(generate_claim_code);
         let access = Self { list, claim_code };
         if let Some(code) = access.claim_code() {

@@ -168,6 +168,10 @@ impl Surfaces {
     /// rewritten once in the current form; a newer version is refused.
     pub(crate) fn open(path: PathBuf, client_id: &str) -> anyhow::Result<Self> {
         let mut rewrite = false;
+        // A current-version file may carry an empty embedded client id (written
+        // by an intermediate build). Repair it once and persist the repair, so
+        // the next load does not repeat it.
+        let mut repaired = false;
         let state = match sidecar::read_versioned(&path, "surface record") {
             sidecar::VersionedRead::Missing
             | sidecar::VersionedRead::Unreadable
@@ -221,6 +225,7 @@ impl Surfaces {
                         for surface in surfaces.values_mut() {
                             if surface.client_id.is_empty() {
                                 surface.client_id = client.clone();
+                                repaired = true;
                             }
                         }
                     }
@@ -228,6 +233,7 @@ impl Surfaces {
                         for surface in surfaces.values_mut() {
                             if surface.client_id.is_empty() {
                                 surface.client_id = client.clone();
+                                repaired = true;
                             }
                         }
                     }
@@ -250,9 +256,11 @@ impl Surfaces {
             client_id: client_id.to_string(),
             state: Mutex::new(state),
         };
-        if rewrite {
+        if rewrite || repaired {
             let state = surfaces.lock();
-            surfaces.persist(&state);
+            // A migration must land the version even when the record is empty;
+            // the normal empty-record removal applies only to later mutations.
+            sidecar::store(&surfaces.path, "surface record", &*state, false);
         }
         Ok(surfaces)
     }
@@ -440,5 +448,49 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         let surfaces = Surfaces::load(path);
         assert!(surfaces.snapshot().is_empty());
+    }
+
+    /// A version-0 file is rewritten in the current form even when it is
+    /// empty: the migration marker is the version, not a non-empty record.
+    #[test]
+    fn an_empty_version_0_file_is_rewritten_versioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        std::fs::write(&path, "{}").unwrap();
+        let _ = Surfaces::open(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], crate::state::STATE_FORMAT_VERSION);
+    }
+
+    /// ADR-0091: a current-version file whose embedded client id is empty is
+    /// repaired once and written back, not repaired in memory on every load.
+    #[test]
+    fn an_empty_embedded_client_is_repaired_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interactive_surfaces.json");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{},"inline":{{"default":{{"per_1":{{"client_id":"","message_id":"om_1","kind":"Permission","session_id":"ses_1","directory":"/work","target":"ls"}}}}}},"cards":{{}},"standalone":{{}}}}"#,
+                crate::state::STATE_FORMAT_VERSION
+            ),
+        )
+        .unwrap();
+
+        let surfaces = Surfaces::open(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
+        assert_eq!(
+            surfaces.snapshot().inline.get("per_1").unwrap().client_id,
+            crate::config::DEFAULT_CLIENT_ID
+        );
+        let raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            raw["inline"]["default"]["per_1"]["client_id"],
+            crate::config::DEFAULT_CLIENT_ID,
+            "the repair is on disk"
+        );
+
+        let before = std::fs::read(&path).unwrap();
+        let _ = Surfaces::open(path.clone(), crate::config::DEFAULT_CLIENT_ID).unwrap();
+        assert_eq!(before, std::fs::read(&path).unwrap(), "the repair lands once");
     }
 }
