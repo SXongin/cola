@@ -158,6 +158,23 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
     }
 }
 
+/// The active Agent Client this build can actually construct (ADR-0090 §5).
+///
+/// OpenCode is the only adapter today, so a resolved `codex` client is refused
+/// loudly here rather than booting with the legacy OpenCode settings the config
+/// did not ask for. This is the *capability* gate; resolution itself stays pure
+/// and `cola config validate` still calls such a config valid.
+fn require_supported_client(active: &config::ActiveClient) -> anyhow::Result<()> {
+    if active.opencode().is_none() {
+        anyhow::bail!(
+            "the active Agent Client `{}` has kind `{}`; this build can only attach to `opencode` clients",
+            active.id,
+            active.kind
+        );
+    }
+    Ok(())
+}
+
 /// Resolve which OpenCode server cola attaches to, honoring the `start_server`
 /// policy (ADR-0013).
 ///
@@ -947,13 +964,7 @@ async fn main() -> anyhow::Result<()> {
     // OpenCode options into the effective config keeps every later reader on
     // one set of settings rather than re-interpreting `[clients.*]`.
     let active = cfg.resolve_active_client()?;
-    if active.opencode().is_none() {
-        anyhow::bail!(
-            "the active client `{}` has kind `{}`; this build can only attach to `opencode` clients",
-            active.id,
-            active.kind
-        );
-    }
+    require_supported_client(&active)?;
     // The one owner of the on-disk layout (ADR-0090 §6): every path below —
     // the log, the singleton lock, the Owned Server's pid record, the Session
     // sidecars — is derived from it rather than from a hand-joined `.cola`.
@@ -1785,5 +1796,32 @@ mod tests {
         assert!(pid_alive(pid), "a non-cola PID must be left alone");
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// ADR-0090 §5: resolution accepts a `codex` Agent Client, but this build
+    /// cannot attach to it — startup must refuse rather than run the legacy
+    /// OpenCode settings the config did not choose. Deleting the gate turns
+    /// this test red.
+    #[test]
+    fn an_active_codex_client_is_refused_at_startup() {
+        let mut cfg: config::Config = toml::from_str(
+            "[feishu]\napp_id = \"cli_test\"\napp_secret = \"secret\"\n\
+             [bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n",
+        )
+        .unwrap();
+        let active = cfg.resolve_active_client().unwrap();
+        assert_eq!(active.kind, config::ClientKind::Codex);
+
+        let error = require_supported_client(&active).unwrap_err().to_string();
+        assert!(error.contains("`ada`"), "names the Agent Client: {error}");
+        assert!(error.contains("codex"), "names the kind: {error}");
+    }
+
+    #[test]
+    fn the_default_opencode_client_passes_the_startup_gate() {
+        let mut cfg: config::Config =
+            toml::from_str("[feishu]\napp_id = \"cli_test\"\napp_secret = \"secret\"\n").unwrap();
+        let active = cfg.resolve_active_client().unwrap();
+        require_supported_client(&active).unwrap();
     }
 }

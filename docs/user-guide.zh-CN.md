@@ -150,29 +150,33 @@ start_server = "auto"            # auto (default) | never | eager
 ### `[clients.<id>]` —— 可选，用于第二个 Agent Client
 
 ```toml
-# `[opencode]` 已经是隐式客户端 `default`——不要改名。
+# `[opencode]` 已经是隐式 Agent Client `default`——不要改名。
 [clients.ada]
 kind = "codex"                   # 必填：opencode | codex
 
 [bridge]
-default_client = "ada"           # 哪个客户端处于活动状态（默认 "default"）
+default_client = "ada"           # 哪个 Agent Client 处于活动状态（默认 "default"）
 ```
 
 - **`kind`** —— 必填，用于选择适配器。`opencode` 是本版本唯一能附加的 kind；
   `codex`（`app-server` 适配器，ADR-0090）留给下一阶段，因此把它设为活动
-  客户端的配置能解析成功，但在该适配器落地前 cola 会拒绝启动。
-- **选项与 `kind` 写在同一个表里。** `opencode` 客户端接受 `url`、
+  Agent Client 的配置能解析成功，但在该适配器落地前 cola 会拒绝启动。
+- **选项与 `kind` 写在同一个表里。** `opencode` 的 Agent Client 接受 `url`、
   `start_server`、`generation` 与 `model`，和 `[opencode]` 完全一样；
-  具名客户端不会继承 `[opencode]` 的取值。
-- **`default_client`** —— 活动客户端的 id。不设置时是 `default`（即
-  `[opencode]`）。每个 cola 进程只有一个活动客户端（ADR-0090）；切换客户端
-  就是改这个键并重启。
+  具名的 Agent Client 不会继承 `[opencode]` 的取值。
+- **只接受这些键。** 其他任何键——例如拼错的 `model_typo`，或嵌套的
+  `[clients.ada.opencode]` 表——都是配置错误，并会指出
+  `clients.<id>.<key>`，绝不会被静默忽略。
+- **`default_client`** —— 活动 Agent Client 的 id。不设置时是 `default`
+  （即 `[opencode]`）。每个 cola 进程只有一个活动的 Agent Client（ADR-0090）；
+  切换 Agent Client 就是改这个键并重启。
 - **`[opencode]` 永远有效。** cola 把它当作隐式的 `clients.default` /
   `kind = "opencode"` 读取，并且从不改写你的文件——不会生成任何
   `[clients.*]` 表，也不会重命名任何键。显式的 `[clients.default]` 会作为
-  隐式客户端的重复被拒绝：请给表换一个 id，或把它的选项移进 `[opencode]`。
-- **客户端 id 是持久状态。** cola 会把活动 id 记录在每个会话旁，因此重命名
-  id 是一次状态迁移，而不是一次配置修改。
+  该隐式 Agent Client 的重复被拒绝：请给表换一个 id，或把它的选项移进
+  `[opencode]`。
+- **Agent Client id 是持久状态。** cola 会把活动 id 记录在每个会话旁，因此
+  重命名 id 是一次状态迁移，而不是一次配置修改。
 
 ### `[bridge]` —— 全部可选
 
