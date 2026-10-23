@@ -20,6 +20,117 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 use tokio_tungstenite::tungstenite::Message;
 
+/// Quote one value for `sh` with single quotes, escaping an embedded quote as
+/// `'\''`. Test-only: a fixture path is interpolated into a fake binary's
+/// script, and a temp path containing an apostrophe must not make a test fail
+/// for a reason unrelated to the code under test.
+#[cfg(unix)]
+pub(crate) fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// A scripted `codex` CLI for discovery and lifecycle tests.
+///
+/// It answers the two management commands those paths use, logs every
+/// invocation together with the `CODEX_HOME` it was given, and its
+/// `app-server daemon start` links the control socket to a socket the test
+/// already serves. That keeps a test's "daemon" a real WebSocket server on a
+/// real unix socket while no real Codex state is touched.
+#[cfg(unix)]
+pub(crate) struct FakeCodex {
+    pub(crate) binary: std::path::PathBuf,
+    pub(crate) log: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeCodex {
+    /// Write the fake CLI into `directory`. `real_socket` is what `daemon
+    /// start` links the control socket to (`None`: a launcher that reports
+    /// success but leaves no socket, the failure this path must name).
+    pub(crate) fn write(
+        directory: &Path,
+        control_socket: &Path,
+        real_socket: Option<&Path>,
+        managed_binary: &Path,
+    ) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        let binary = directory.join("codex");
+        let log = directory.join("fake-codex.log");
+        let report = json!({
+            "status": "running",
+            "backend": "pid",
+            "managedCodexPath": managed_binary,
+            "managedCodexVersion": "0.163.0",
+            "socketPath": control_socket,
+            "cliVersion": "0.163.0",
+            "appServerVersion": "0.163.0",
+        })
+        .to_string();
+        let start = match real_socket {
+            Some(real_socket) => format!(
+                "mkdir -p {}\nln -sfn {} {}\nprintf '%s\\n' '{{\"status\":\"started\"}}'\n",
+                shell_single_quote(
+                    &control_socket
+                        .parent()
+                        .expect("control dir")
+                        .display()
+                        .to_string()
+                ),
+                shell_single_quote(&real_socket.display().to_string()),
+                shell_single_quote(&control_socket.display().to_string()),
+            ),
+            None => "printf '%s\\n' '{\"status\":\"started\"}'\n".to_string(),
+        };
+        let script = format!(
+            "#!/bin/sh\n\
+             printf 'CODEX_HOME=%s ARGS=%s\\n' \"$CODEX_HOME\" \"$*\" >> {log}\n\
+             case \"$*\" in\n\
+             \"app-server daemon version\")\n\
+             \x20 if [ -e {socket} ]; then\n\
+             \x20   printf '%s\\n' {report}\n\
+             \x20   exit 0\n\
+             \x20 fi\n\
+             \x20 echo \"Error: failed to connect to {socket}\" >&2\n\
+             \x20 exit 1\n\
+             \x20 ;;\n\
+             \"app-server daemon start\")\n\
+             {start}\
+             \x20 exit 0\n\
+             \x20 ;;\n\
+             *)\n\
+             \x20 echo \"fake codex: unexpected command: $*\" >&2\n\
+             \x20 exit 64\n\
+             \x20 ;;\n\
+             esac\n",
+            log = shell_single_quote(&log.display().to_string()),
+            socket = shell_single_quote(&control_socket.display().to_string()),
+            report = shell_single_quote(&report),
+        );
+        std::fs::write(&binary, script).expect("write the fake codex CLI");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make the fake codex CLI executable");
+        Self { binary, log }
+    }
+
+    /// Every invocation, one `CODEX_HOME=… ARGS=…` line each.
+    pub(crate) fn invocations(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// How many times `app-server daemon start` was run.
+    pub(crate) fn starts(&self) -> usize {
+        self.invocations()
+            .iter()
+            .filter(|line| line.ends_with("ARGS=app-server daemon start"))
+            .count()
+    }
+}
+
 /// The state one fake server exposes to its test.
 #[derive(Default)]
 struct State {

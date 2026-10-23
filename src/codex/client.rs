@@ -351,15 +351,6 @@ mod tests {
         }
     }
 
-    /// Quote one value for `sh` with single quotes, escaping an embedded quote
-    /// as `'\''`. Test-only: the fixture path is interpolated into the fake
-    /// binary's script, and a temp path containing an apostrophe must not make
-    /// the test fail for a reason unrelated to the code under test.
-    #[cfg(unix)]
-    fn shell_single_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-
     /// End to end through the real probe: a newer server whose *generated*
     /// surface lacks a required method fails at construction, naming it.
     #[cfg(unix)]
@@ -371,6 +362,7 @@ mod tests {
             AutoProbe, REQUIRED_CLIENT_METHODS, REQUIRED_NOTIFICATIONS, REQUIRED_SERVER_REQUESTS,
             write_generated_surface,
         };
+        use crate::codex::test_server::shell_single_quote;
 
         let directory = tempfile::tempdir().expect("tempdir");
         // The apostrophe is deliberate: it proves the fixture path is quoted
