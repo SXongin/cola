@@ -837,17 +837,27 @@ fn wait_for_new_daemon(old_pid: Option<i32>) -> bool {
 /// composition root is the one place allowed to name the adapter; the report
 /// only sees its [`backend::ServerLifecycle`].
 fn status_client(state: &status::ConfigState) -> Option<Arc<dyn backend::Backend>> {
+    Some(Arc::new(status_backend(state)?))
+}
+
+/// The concrete backend `status_client` wraps, kept as one construction seam
+/// so a test can assert which settings the probe was built with.
+///
+/// The settings come from [`status::ConfigState::effective_opencode`] — the
+/// active Agent Client's fold, exactly what boot applies — not the raw
+/// `[opencode]` table. A named `kind = "opencode"` client's `url`, generation
+/// and model must be the ones `cola status`/`doctor` probe. Only an OpenCode
+/// client has a server lifecycle to report today; a broken or unsupported
+/// config yields `None` instead of an error.
+fn status_backend(state: &status::ConfigState) -> Option<opencode::client::OpenCodeBackend> {
     let cfg = state.cfg()?;
-    // Only an OpenCode client has a server lifecycle to report today. A
-    // configured kind this build cannot construct reports no server rather
-    // than an error — `cola status` must survive a broken/unsupported config.
-    cfg.active_client().ok()?.opencode()?;
-    Some(Arc::new(opencode::client::OpenCodeBackend::with_tasks(
-        cfg.opencode.model.as_deref(),
-        &cfg.opencode,
+    let settings = state.effective_opencode()?;
+    Some(opencode::client::OpenCodeBackend::with_tasks(
+        settings.model.as_deref(),
+        &settings,
         state::StateLayout::from_config(cfg),
         bridge::tasks::TasksHandle::new(),
-    )))
+    ))
 }
 
 /// `cola status` (ADR-0081): resolve the config leniently, gather the snapshot,
@@ -1085,6 +1095,95 @@ async fn update_cli(check_only: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The named-active-client regression (#872/#875): `cola status`/`doctor`
+    /// must build their probe from the **active** Agent Client's effective
+    /// settings, not the raw `[opencode]` table.
+    #[test]
+    fn status_targets_the_active_named_opencode_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            r#"
+[feishu]
+app_id = "cli_test"
+app_secret = "secret"
+
+[bridge]
+session_file = "sessions.json"
+default_client = "ada"
+
+[opencode]
+url = "http://localhost:1111"
+generation = "v1"
+model = "base/model"
+
+[clients.ada]
+kind = "opencode"
+url = "http://localhost:2222"
+generation = "v2"
+model = "ada/model"
+"#,
+        )
+        .unwrap();
+
+        let state = status::ConfigState::from_env(path.to_str());
+        let backend = status_backend(&state).expect("the active OpenCode client builds");
+        let settings = backend.settings();
+
+        assert_eq!(
+            settings.url.as_deref(),
+            Some("http://localhost:2222"),
+            "the probe must target the active client's url, not [opencode]"
+        );
+        assert_eq!(
+            settings.preferred_port(),
+            Some(2222),
+            "discovery's tiebreaker comes from the active client"
+        );
+        assert_eq!(settings.generation, crate::config::GenerationOverride::V2);
+        assert_eq!(settings.model.as_deref(), Some("ada/model"));
+        assert_eq!(
+            state.effective_opencode().unwrap().generation,
+            crate::config::GenerationOverride::V2,
+            "the report's generation override follows the active client"
+        );
+    }
+
+    /// Introspection stays lenient: a broken config or an unsupported kind
+    /// yields no report, never an error.
+    #[test]
+    fn status_client_is_lenient_on_broken_or_unsupported_configs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "not = valid = toml").unwrap();
+        let state = status::ConfigState::from_env(broken.to_str());
+        assert!(status_backend(&state).is_none());
+
+        let codex = dir.path().join("codex.toml");
+        std::fs::write(
+            &codex,
+            r#"
+[feishu]
+app_id = "cli_test"
+app_secret = "secret"
+
+[bridge]
+default_client = "c"
+
+[clients.c]
+kind = "codex"
+"#,
+        )
+        .unwrap();
+        let state = status::ConfigState::from_env(codex.to_str());
+        assert!(
+            status_backend(&state).is_none(),
+            "a kind with no OpenCode server lifecycle reports nothing"
+        );
+    }
 
     #[test]
     fn pid_alive_sees_own_process_as_alive() {
