@@ -1,0 +1,432 @@
+//! The app-server client: handshake, contract check and construction by the
+//! active client's `kind` (spec #860, ticket #876).
+//!
+//! Construction order is deliberate:
+//!
+//! 1. dial the endpoint (WebSocket over `ws://` or a unix socket);
+//! 2. `initialize`, read the server's identity, send `initialized`;
+//! 3. ask the [`SurfaceProbe`] for that version's method surface;
+//! 4. refuse if a required method is missing, naming it.
+//!
+//! Step 4 is the acceptance criterion: a server that cannot serve the adapter's
+//! contract fails **here**, at construction, not at the first prompt.
+
+use std::fmt;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use crate::config::{ActiveClient, ClientKind};
+
+use super::error::{CodexError, Result};
+use super::schema::{PINNED_VERSION, SurfaceProbe};
+use super::transport::{Endpoint, RpcConnection};
+
+/// How long the handshake (connect + `initialize` + `initialized`) may take.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How to construct the client. The endpoint is supplied by the caller today;
+/// daemon discovery under `$CODEX_HOME` lands with the lifecycle ticket (#877)
+/// and fills the same field.
+pub(crate) struct CodexOptions {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) timeout: Duration,
+}
+
+impl CodexOptions {
+    pub(crate) fn new(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            timeout: HANDSHAKE_TIMEOUT,
+        }
+    }
+}
+
+/// The `codex-*` product version from an `initialize` `userAgent` (or from
+/// `codex --version`'s `codex-cli 0.164.0`).
+///
+/// The user agent looks like
+/// `codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.1.0)`;
+/// only the `codex-*` token is the server's version — the parenthesised client
+/// version is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServerVersion {
+    raw: String,
+    pub(crate) parsed: semver::Version,
+}
+
+impl ServerVersion {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            let (name, inline) = match token.split_once('/') {
+                Some((name, version)) => (name, Some(version)),
+                None => (*token, None),
+            };
+            if !name.starts_with("codex") {
+                continue;
+            }
+            let candidate = inline.or_else(|| tokens.get(index + 1).copied())?;
+            let candidate = candidate.trim_matches(|character: char| {
+                !(character.is_ascii_alphanumeric()
+                    || character == '.'
+                    || character == '-'
+                    || character == '+')
+            });
+            if let Ok(parsed) = semver::Version::parse(candidate) {
+                return Some(Self {
+                    raw: candidate.to_string(),
+                    parsed,
+                });
+            }
+        }
+        None
+    }
+
+    fn pinned() -> semver::Version {
+        semver::Version::parse(PINNED_VERSION).expect("the pinned version is valid semver")
+    }
+
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.parsed == Self::pinned()
+    }
+
+    pub(crate) fn is_older_than_pin(&self) -> bool {
+        self.parsed < Self::pinned()
+    }
+}
+
+impl fmt::Display for ServerVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.raw)
+    }
+}
+
+/// What the server told the adapter about itself, recorded on the client for
+/// `cola status`/`doctor` (later tickets) and the attach log.
+#[derive(Debug, Clone)]
+pub(crate) struct ServerInfo {
+    /// The raw `initialize` `userAgent`.
+    pub(crate) user_agent: String,
+    /// The binary version parsed out of it.
+    pub(crate) version: ServerVersion,
+    /// `initialize`'s `codexHome`, when present.
+    pub(crate) codex_home: Option<String>,
+    /// `initialize`'s `platformFamily`/`platformOs`, joined for display.
+    pub(crate) platform: String,
+    /// Where the verified surface came from (`pinned …` or `generated from …`).
+    pub(crate) surface_source: String,
+}
+
+/// One attached app-server. Construction is the whole contract check; the
+/// subscription and Backend implementation arrive in later tickets.
+pub(crate) struct CodexClient {
+    /// Owned so a second connection is independent and the socket lives as long
+    /// as the client does.
+    connection: RpcConnection,
+    server: ServerInfo,
+}
+
+impl fmt::Debug for CodexClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexClient")
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodexClient {
+    /// Connect, handshake, and verify the server's surface.
+    pub(crate) async fn connect(options: &CodexOptions, probe: &dyn SurfaceProbe) -> Result<Self> {
+        let mut connection = RpcConnection::open(&options.endpoint, options.timeout).await?;
+
+        let initialize = tokio::time::timeout(
+            options.timeout,
+            connection.request(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "cola",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    }
+                }),
+            ),
+        )
+        .await
+        .map_err(|_| CodexError::Timeout(options.timeout))??;
+
+        let user_agent = initialize
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .filter(|user_agent| !user_agent.trim().is_empty())
+            .ok_or(CodexError::MissingUserAgent)?
+            .to_string();
+        let version = ServerVersion::parse(&user_agent)
+            .ok_or_else(|| CodexError::UnparseableUserAgent(user_agent.clone()))?;
+
+        // The protocol acknowledges the result before any further call; do it
+        // even when the contract check below is about to fail, so a rejecting
+        // server sees a well-formed client.
+        connection.notify("initialized", None).await?;
+
+        let surface = probe.surface(&version).await?;
+        let missing = surface.missing_required();
+        if !missing.is_empty() {
+            return Err(CodexError::MissingContract {
+                version: version.to_string(),
+                missing: missing.join(", "),
+                pinned: PINNED_VERSION.to_string(),
+            });
+        }
+        let counts = surface.counts();
+        let surface_source = probe.source();
+        tracing::info!(
+            version = %version,
+            surface = %surface_source,
+            client_requests = counts.0,
+            notifications = counts.1,
+            server_requests = counts.2,
+            "attached to codex app-server"
+        );
+
+        Ok(Self {
+            connection,
+            server: ServerInfo {
+                user_agent,
+                version,
+                codex_home: initialize
+                    .get("codexHome")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                platform: platform(&initialize),
+                surface_source,
+            },
+        })
+    }
+
+    pub(crate) fn server_info(&self) -> &ServerInfo {
+        &self.server
+    }
+
+    /// The live connection, for the subscription loop later tickets add.
+    pub(crate) fn connection(&mut self) -> &mut RpcConnection {
+        &mut self.connection
+    }
+}
+
+fn platform(initialize: &Value) -> String {
+    let field = |name: &str| initialize.get(name).and_then(Value::as_str);
+    match (field("platformFamily"), field("platformOs")) {
+        (Some(family), Some(os)) => format!("{family}/{os}"),
+        (Some(family), None) => family.to_string(),
+        (None, Some(os)) => os.to_string(),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+/// Construct the adapter the active client's `kind` selects.
+///
+/// The id is deliberately not consulted: a `[clients.<id>]` rename is a state
+/// migration, not a new adapter (ADR-0090 decision 5/6). `Ok(None)` means the
+/// active client is not a Codex client and the caller keeps its own adapter.
+pub(crate) async fn connect_for_active_client(
+    active: &ActiveClient,
+    options: &CodexOptions,
+    probe: &dyn SurfaceProbe,
+) -> Result<Option<CodexClient>> {
+    match active.kind {
+        ClientKind::Opencode => Ok(None),
+        ClientKind::Codex => CodexClient::connect(options, probe).await.map(Some),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::codex::schema::{PinnedProbe, Surface};
+    use crate::codex::test_server::FakeServer;
+
+    struct FixedProbe(Surface);
+
+    #[async_trait]
+    impl SurfaceProbe for FixedProbe {
+        async fn surface(&self, _server: &ServerVersion) -> Result<Surface> {
+            Ok(self.0.clone())
+        }
+
+        fn source(&self) -> String {
+            "test fixture".to_string()
+        }
+    }
+
+    async fn server(user_agent: &str) -> (FakeServer, Endpoint) {
+        let (server, url) = FakeServer::tcp(user_agent).await;
+        (server, Endpoint::parse(&url).expect("endpoint"))
+    }
+
+    async fn connect(user_agent: &str, probe: &dyn SurfaceProbe) -> Result<CodexClient> {
+        let (_server, endpoint) = server(user_agent).await;
+        CodexClient::connect(&CodexOptions::new(endpoint), probe).await
+    }
+
+    #[test]
+    fn the_version_comes_from_the_codex_product_not_the_client_parenthesis() {
+        let version = ServerVersion::parse(
+            "codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
+        )
+        .expect("version");
+        assert_eq!(version.to_string(), "0.164.0");
+        assert!(!version.is_pinned());
+        assert!(
+            ServerVersion::parse("codex-cli 0.163.0")
+                .expect("cli")
+                .is_pinned()
+        );
+        assert!(ServerVersion::parse("codex-tui/not-a-version").is_none());
+    }
+
+    /// The acceptance criterion: a server that lacks a required method fails at
+    /// construction with the method named.
+    #[tokio::test]
+    async fn a_missing_required_method_fails_at_construction_naming_it() {
+        let mut surface = Surface::pinned();
+        surface.client_requests.remove("turn/steer");
+        let error = connect("codex-tui/0.163.0 (test)", &FixedProbe(surface))
+            .await
+            .expect_err("construction must fail");
+        let message = error.to_string();
+        assert!(message.contains("turn/steer"), "{message}");
+        assert!(message.contains("0.163.0"), "{message}");
+    }
+
+    /// A newer server passes only after its own surface has been checked — the
+    /// version is recorded, never guessed.
+    #[tokio::test]
+    async fn a_newer_server_passes_with_a_verified_surface() {
+        let client = connect("codex-tui/0.164.0 (test)", &FixedProbe(Surface::pinned()))
+            .await
+            .expect("a verified newer server passes");
+        assert_eq!(client.server_info().version.to_string(), "0.164.0");
+        assert_eq!(client.server_info().surface_source, "test fixture");
+    }
+
+    /// With only the pinned surface known, a newer or older server is refused
+    /// loudly rather than guessed at.
+    #[tokio::test]
+    async fn an_unknown_version_degrades_loudly() {
+        for (user_agent, needle) in [
+            ("codex-tui/0.164.0 (test)", "0.164.0"),
+            ("codex-tui/0.162.0 (test)", "0.162.0"),
+        ] {
+            let error = connect(user_agent, &PinnedProbe).await.expect_err("refused");
+            let message = error.to_string();
+            assert!(message.contains(needle), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_initialize_result_without_a_user_agent_is_rejected() {
+        let error = connect("", &PinnedProbe)
+            .await
+            .expect_err("an unidentified server is refused");
+        assert!(matches!(error, CodexError::MissingUserAgent), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_initialize_error_is_surfaced() {
+        let (_server, url) = FakeServer::tcp_rejecting("not a codex client").await;
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let error = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
+            .await
+            .expect_err("an initialize error fails construction");
+        match error {
+            CodexError::Rpc { method, detail } => {
+                assert_eq!(method, "initialize");
+                assert!(detail.contains("not a codex client"), "{detail}");
+            }
+            other => panic!("expected an RPC error, got {other}"),
+        }
+    }
+
+    /// The adapter is selected by `kind`, never by the configured id.
+    #[tokio::test]
+    async fn the_adapter_is_selected_by_kind_not_id() {
+        let opencode = active("grace", ClientKind::Opencode);
+        let (_server, endpoint) = server("codex-tui/0.163.0 (test)").await;
+        let options = CodexOptions::new(endpoint);
+        assert!(
+            connect_for_active_client(&opencode, &options, &PinnedProbe)
+                .await
+                .expect("an opencode client is simply not this adapter")
+                .is_none()
+        );
+
+        for id in ["ada", "grace"] {
+            let codex = active(id, ClientKind::Codex);
+            let client = connect_for_active_client(&codex, &options, &PinnedProbe)
+                .await
+                .expect("a codex client constructs")
+                .expect("this adapter is selected");
+            assert_eq!(client.server_info().version.to_string(), "0.163.0");
+        }
+    }
+
+    fn active(id: &str, kind: ClientKind) -> ActiveClient {
+        ActiveClient {
+            id: id.to_string(),
+            kind,
+            settings: match kind {
+                ClientKind::Opencode => {
+                    crate::config::ClientSettings::Opencode(crate::config::OpenCodeConfig::default())
+                }
+                ClientKind::Codex => crate::config::ClientSettings::Codex,
+            },
+        }
+    }
+
+    /// Live: `initialize` + `initialized` against a real daemon, twice.
+    ///
+    /// Opt-in like the repository's other live suites: set
+    /// `COLA_LIVE_CODEX_SOCKET` (the control socket, symlink allowed) and
+    /// `COLA_LIVE_CODEX_BIN` (the binary the daemon runs, for the schema
+    /// probe) and run `cargo test -- --ignored live_codex`. It skips with a
+    /// message when the environment is absent.
+    #[tokio::test]
+    #[ignore = "live codex app-server: set COLA_LIVE_CODEX_SOCKET and COLA_LIVE_CODEX_BIN"]
+    async fn live_initialize_then_initialized_and_a_second_connection() {
+        let Some(socket) = std::env::var_os("COLA_LIVE_CODEX_SOCKET") else {
+            eprintln!("skipping live codex test: COLA_LIVE_CODEX_SOCKET is unset");
+            return;
+        };
+        let Some(binary) = std::env::var_os("COLA_LIVE_CODEX_BIN") else {
+            eprintln!("skipping live codex test: COLA_LIVE_CODEX_BIN is unset");
+            return;
+        };
+        let endpoint = Endpoint::parse(&format!("unix://{}", std::path::Path::new(&socket).display()))
+            .expect("endpoint");
+        let probe = crate::codex::schema::AutoProbe::new(binary);
+
+        let mut first = CodexClient::connect(&CodexOptions::new(endpoint.clone()), &probe)
+            .await
+            .expect("first live connection");
+        let second = CodexClient::connect(&CodexOptions::new(endpoint), &probe)
+            .await
+            .expect("second live connection");
+
+        assert_eq!(
+            first.server_info().user_agent,
+            second.server_info().user_agent,
+            "both connections identify the same daemon"
+        );
+        // The connection is live after the handshake: a real call answers.
+        let result = first
+            .connection()
+            .request("thread/loaded/list", json!({}))
+            .await
+            .expect("a call after initialize answers");
+        assert!(result.is_object() || result.is_array(), "unexpected {result}");
+    }
+}

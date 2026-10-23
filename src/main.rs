@@ -3,6 +3,7 @@
 mod autostart;
 mod backend;
 mod bridge;
+mod codex;
 mod completions;
 mod config;
 mod error;
