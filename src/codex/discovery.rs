@@ -268,6 +268,21 @@ pub(crate) struct LocalClients {
     pub(crate) unverified: Vec<UnverifiedClient>,
 }
 
+/// A running daemon together with the control socket identity the **same**
+/// discovery pass read for it.
+///
+/// The two are one fact and must stay paired: the managed binary to probe
+/// belongs to the daemon behind that socket. Probing daemon B's binary while
+/// dialling the socket a *later* read points at (daemon C) checks C's server
+/// against B's schema — `AutoProbe` then refuses a healthy server with a
+/// version mismatch, or worse, vouches for one build with another's surface.
+/// Every pairing here therefore comes from one `discover` pass.
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredDaemon {
+    pub(crate) daemon: Daemon,
+    pub(crate) identity: SocketIdentity,
+}
+
 /// One discovery pass.
 #[derive(Debug, Clone)]
 pub(crate) struct Discovery {
@@ -277,6 +292,28 @@ pub(crate) struct Discovery {
     pub(crate) socket: Option<SocketIdentity>,
     /// Local Codex clients, in pid order.
     pub(crate) clients: LocalClients,
+}
+
+impl Discovery {
+    /// The running daemon and the socket identity this pass observed for it, as
+    /// one pair (see [`DiscoveredDaemon`]).
+    ///
+    /// `None` when no daemon runs. A `Running` state always carries the identity
+    /// that gated it, so the pair cannot be half-built.
+    pub(crate) fn running(&self) -> Option<DiscoveredDaemon> {
+        match &self.daemon {
+            DaemonState::Running(daemon) => self.socket.map(|identity| DiscoveredDaemon {
+                daemon: daemon.clone(),
+                identity,
+            }),
+            DaemonState::Absent { .. } => None,
+        }
+    }
+}
+
+/// One discovery pass, reduced to the running daemon pair.
+pub(crate) async fn discover_daemon(environment: &Environment) -> Result<Option<DiscoveredDaemon>> {
+    Ok(discover(environment).await?.running())
 }
 
 /// Discover the daemon under `environment.home`.
@@ -371,8 +408,8 @@ fn parse_info(stdout: &[u8]) -> Result<DaemonInfo> {
     })
 }
 
-/// Start the daemon through Codex's own management command and wait for a
-/// **new** control socket to appear.
+/// Start the daemon through Codex's own management command and return the
+/// daemon that is serving afterwards, paired with its socket identity.
 ///
 /// This is the only place cola causes a daemon to exist, and it does so by
 /// running the CLI's documented command — never by spawning the server itself,
@@ -380,11 +417,18 @@ fn parse_info(stdout: &[u8]) -> Result<DaemonInfo> {
 /// drops the CLI's child does **not** kill it: cola does not reap what it does
 /// not own.
 ///
-/// The socket must *change*, not merely exist: a daemon that crashed can leave
-/// its Unix socket path behind, and treating that corpse as the new daemon
-/// would report a dead server as started. Codex re-links the path into a fresh
-/// runtime directory, so a successful start always produces a new identity.
-pub(crate) async fn start(environment: &Environment) -> Result<()> {
+/// A cold start is recognised by the control socket's identity *changing*: a
+/// daemon that crashed can leave its Unix socket path behind, and treating that
+/// corpse as the new daemon would report a dead server as started. Codex
+/// re-links the path into a fresh runtime directory, so a successful cold start
+/// always produces a new identity.
+///
+/// The command is idempotent, though, and the identity can change *before* it
+/// runs (a replacement appearing while a failed dial was being decided): then
+/// the command starts nothing and no identity changes. A daemon already serving
+/// is the outcome we asked for, so that case returns the discovered daemon
+/// instead of a timeout — the caller's attach still proves it answers.
+pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon> {
     let socket = environment.socket();
     // A socket path left behind by a crashed daemon is not a fresh one: the
     // launcher must produce a **new** socket (Codex re-links the path into a new
@@ -409,9 +453,19 @@ pub(crate) async fn start(environment: &Environment) -> Result<()> {
         if let Some(identity) = socket_identity(&socket)?
             && Some(identity) != before
         {
-            return Ok(());
+            return discovered_after_start(environment).await;
         }
         if tokio::time::Instant::now() >= deadline {
+            // `daemon start` is **idempotent**: a daemon that appeared between
+            // our snapshot and the command (a replacement racing the failed
+            // dial) makes the command a no-op, so no identity changes. A daemon
+            // already serving is what we asked for — return it rather than a
+            // timeout for a start that had nothing to do. The caller's attach
+            // still proves the daemon answers; a corpse behind a stale path
+            // fails there, never as "attached".
+            if let Some(daemon) = discover_daemon(environment).await? {
+                return Ok(daemon);
+            }
             return Err(CodexError::Daemon(format!(
                 "`{} app-server daemon start` reported success, but {} did not appear (or was \
                  not replaced) within {:?}",
@@ -422,6 +476,18 @@ pub(crate) async fn start(environment: &Environment) -> Result<()> {
         }
         tokio::time::sleep(SOCKET_READY_STEP).await;
     }
+}
+
+/// The daemon a successful start produced (a changed identity), as one pair.
+async fn discovered_after_start(environment: &Environment) -> Result<DiscoveredDaemon> {
+    discover_daemon(environment).await?.ok_or_else(|| {
+        CodexError::Daemon(format!(
+            "`{} app-server daemon start` reported success, but the control socket at {} is not \
+             discoverable",
+            environment.cli.display(),
+            environment.socket().display()
+        ))
+    })
 }
 
 /// Run one management command with `CODEX_HOME` pinned to the environment's
@@ -995,6 +1061,47 @@ mod tests {
         };
         let error = start(&empty).await.expect_err("no socket is a named failure");
         assert!(error.to_string().contains("did not appear"), "{error}");
+    }
+
+    /// `daemon start` is idempotent: a daemon that appeared between the
+    /// snapshot and the command (a replacement racing a failed dial) makes it a
+    /// no-op, so no identity changes. That must return the serving daemon, not
+    /// a timeout for a start that had nothing to do.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idempotent_start_returns_the_daemon_already_serving() {
+        use crate::codex::test_server::FakeCodex;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let environment = test_environment(&root.path().join("codex-home"));
+        let control = environment.socket();
+        std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
+        // A daemon already serves, and the path already names it: the launcher's
+        // `start` is a no-op (the fake CLI written without a link target).
+        let daemon_socket = root.path().join("daemon.sock");
+        std::fs::create_dir_all(daemon_socket.parent().expect("dir")).expect("dir");
+        let _listener =
+            std::os::unix::net::UnixListener::bind(&daemon_socket).expect("bind the daemon socket");
+        std::os::unix::fs::symlink(&daemon_socket, &control).expect("symlink the control socket");
+        let managed = root.path().join("managed-codex");
+        let cli = FakeCodex::write(root.path(), &control, None, None, &managed);
+        let environment = Environment {
+            cli: cli.binary.clone(),
+            socket_ready_timeout: Duration::from_millis(200),
+            ..environment
+        };
+
+        let started = start(&environment)
+            .await
+            .expect("an idempotent start returns the daemon already serving");
+        assert_eq!(started.daemon.socket, control);
+        assert_eq!(started.daemon.managed_binary, managed);
+        assert_eq!(
+            socket_identity(&control).expect("identity"),
+            Some(started.identity),
+            "the returned identity is the one the same pass read"
+        );
+        assert_eq!(cli.starts(), 1, "the launcher was asked exactly once");
     }
 
     #[cfg(unix)]

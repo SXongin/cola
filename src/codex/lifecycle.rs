@@ -40,7 +40,9 @@ use crate::config::CodexConfig;
 use crate::error::BridgeError;
 
 use super::client::{CodexClient, CodexOptions};
-use super::discovery::{self, Daemon, DaemonState, Discovery, Environment, LocalClients, SocketIdentity};
+use super::discovery::{
+    self, Daemon, DaemonState, DiscoveredDaemon, Discovery, Environment, LocalClients, SocketIdentity,
+};
 use super::error::{CodexError, Result};
 use super::schema::{AutoProbe, SurfaceProbe};
 use super::transport::Endpoint;
@@ -174,7 +176,8 @@ impl CodexLifecycle {
         }
     }
 
-    /// Test-only: install the one-shot pre-dial hook.
+    /// Test-only: install the one-shot hook that fires after a connection
+    /// attempt returns and before its identity is re-read.
     #[cfg(test)]
     pub(crate) fn set_dial_hook(&self, hook: std::sync::Arc<dyn Fn() + Send + Sync>) {
         *self.dial_hook.lock().expect("dial hook") = Some(hook);
@@ -201,11 +204,15 @@ impl CodexLifecycle {
     /// check and the dial: it is reported as unattached and retried on the next
     /// pass, never reaped. A daemon that answers and is unusable (a contract or
     /// probe failure) stays loud — retrying cannot fix it.
-    async fn attach(&self, daemon: &Daemon) -> Result<Attempt> {
-        // The daemon of the attempt, not the daemon discovery saw first: a retry
-        // follows a re-pointed path, and the probe must ask the binary *that*
-        // daemon runs (a different build is a different schema).
-        let mut current = daemon.clone();
+    async fn attach(&self, daemon: &Daemon, observed: SocketIdentity) -> Result<Attempt> {
+        // The daemon of the attempt together with the identity discovery read
+        // for it, never one from an earlier pass and one from a later read: a
+        // retry follows a re-pointed path, and the probe must ask the binary
+        // *that* daemon runs (a different build is a different schema).
+        let mut current = DiscoveredDaemon {
+            daemon: daemon.clone(),
+            identity: observed,
+        };
         for attempt in 0..ATTACH_ATTEMPTS {
             if attempt > 0 {
                 current = match self.current_daemon().await? {
@@ -215,11 +222,20 @@ impl CodexLifecycle {
                     None => return Ok(Attempt::Unreachable),
                 };
             }
-            let Some(identity) = discovery::socket_identity(&current.socket)? else {
-                return Ok(Attempt::Unreachable);
-            };
-            let probe = self.probes.probe(&current);
-            let options = CodexOptions::new(Endpoint::Unix(current.socket.clone()));
+            let identity = discovery::socket_identity(&current.daemon.socket)?;
+            if identity != Some(current.identity) {
+                // The path moved after the pass that paired this daemon with
+                // its socket: probing it now would pair one daemon's binary
+                // with another daemon's socket. Re-discover the pair; a second
+                // move in a row ends the pass as a race.
+                tracing::warn!(
+                    "the codex control socket moved between discovery and the dial; \
+                     re-discovering the daemon it names"
+                );
+                continue;
+            }
+            let probe = self.probes.probe(&current.daemon);
+            let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()));
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
             // and the identity re-read right below. The hook opens exactly that
@@ -228,23 +244,26 @@ impl CodexLifecycle {
             self.fire_dial_hook();
             match dialed {
                 Ok(client) => {
-                    if discovery::socket_identity(&current.socket)? != Some(identity) {
+                    if discovery::socket_identity(&current.daemon.socket)? != Some(current.identity) {
                         tracing::warn!(
                             "the codex control socket at {} was replaced during the attach; \
                              discarding a connection of unknown identity",
-                            current.socket.display()
+                            current.daemon.socket.display()
                         );
                         // Dropping `client` closes the connection to the daemon
                         // the path no longer names. Nothing is sent to it.
                         continue;
                     }
                     tracing::info!(
-                        socket = %current.socket.display(),
+                        socket = %current.daemon.socket.display(),
                         version = %client.server_info().version,
                         surface = %client.server_info().surface_source,
                         "attached to the codex app-server daemon"
                     );
-                    *self.attached.lock().await = Some(Attachment { client, identity });
+                    *self.attached.lock().await = Some(Attachment {
+                        client,
+                        identity: current.identity,
+                    });
                     return Ok(Attempt::Attached);
                 }
                 Err(error) if daemon_gone(&error) => {
@@ -252,17 +271,17 @@ impl CodexLifecycle {
                     // the path moved to a healthy B. Reporting `Unreachable`
                     // would let a start run against B, so re-check the identity
                     // and re-dial the daemon the path now names.
-                    if discovery::socket_identity(&current.socket)? != Some(identity) {
+                    if discovery::socket_identity(&current.daemon.socket)? != Some(current.identity) {
                         tracing::warn!(
                             "the codex control socket at {} was replaced while the dial failed; \
                              re-dialling the daemon the path now names",
-                            current.socket.display()
+                            current.daemon.socket.display()
                         );
                         continue;
                     }
                     tracing::warn!(
                         "the codex daemon at {} is gone or unreachable; staying unattached: {}",
-                        current.socket.display(),
+                        current.daemon.socket.display(),
                         error
                     );
                     return Ok(Attempt::Unreachable);
@@ -273,12 +292,10 @@ impl CodexLifecycle {
         Ok(Attempt::Raced)
     }
 
-    /// The daemon the control path names right now, if one is discoverable.
-    async fn current_daemon(&self) -> Result<Option<Daemon>> {
-        Ok(match discovery::discover(&self.environment).await?.daemon {
-            DaemonState::Running(daemon) => Some(daemon),
-            DaemonState::Absent { .. } => None,
-        })
+    /// The daemon the control path names right now and the identity the same
+    /// discovery pass read for it — one pair, never mixed.
+    async fn current_daemon(&self) -> Result<Option<DiscoveredDaemon>> {
+        discovery::discover_daemon(&self.environment).await
     }
 
     /// Test-only: run the dial hook once, after a connection attempt and before
@@ -396,8 +413,12 @@ impl ServerLifecycle for CodexLifecycle {
         // as unreachable (`Serverless`), which is exactly the case the start
         // policy below must get a chance at. A daemon that answers and refuses
         // the contract is a different thing and stays an error.
-        if let DaemonState::Running(daemon) = &discovered.daemon {
-            match self.attach(daemon).await.map_err(client_error)? {
+        if let Some(daemon) = discovered.running() {
+            match self
+                .attach(&daemon.daemon, daemon.identity)
+                .await
+                .map_err(client_error)?
+            {
                 Attempt::Attached => return Ok(AttachOutcome::Attached),
                 // A daemon exists; it just lost a race with its own control
                 // path. Starting another would be wrong, so report unattached
@@ -416,24 +437,21 @@ impl ServerLifecycle for CodexLifecycle {
             return Ok(AttachOutcome::Serverless);
         }
 
-        discovery::start(&self.environment).await.map_err(client_error)?;
-        tracing::info!("started the codex app-server daemon through its own CLI (`app-server daemon start`)");
-        let daemon = match discovery::discover(&self.environment)
-            .await
-            .map_err(client_error)?
-            .daemon
-        {
-            DaemonState::Running(daemon) => daemon,
-            DaemonState::Absent { evidence } => {
-                return Err(client_error(CodexError::Daemon(format!(
-                    "the daemon was started but is not discoverable: {evidence}"
-                ))));
-            }
-        };
-        Ok(match self.attach(&daemon).await.map_err(client_error)? {
-            Attempt::Attached => AttachOutcome::Attached,
-            Attempt::Unreachable | Attempt::Raced => AttachOutcome::Serverless,
-        })
+        // The launcher's result is the daemon **and** the identity the same
+        // pass read for it — a cold start's new socket, or the daemon that was
+        // already serving when the idempotent command did nothing.
+        let started = discovery::start(&self.environment).await.map_err(client_error)?;
+        tracing::info!("the codex app-server daemon is serving after its own `app-server daemon start`");
+        Ok(
+            match self
+                .attach(&started.daemon, started.identity)
+                .await
+                .map_err(client_error)?
+            {
+                Attempt::Attached => AttachOutcome::Attached,
+                Attempt::Unreachable | Attempt::Raced => AttachOutcome::Serverless,
+            },
+        )
     }
 
     /// Restarting is never cola's call: the daemon is not owned or reaped
