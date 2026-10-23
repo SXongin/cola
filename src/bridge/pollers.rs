@@ -12,6 +12,8 @@ use crate::bridge::turn::Turn;
 /// server (the same cadence the old reconnect loop used).
 const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 
+/// The busy probe the client's lifecycle calls **under its own lock**.
+///
 /// Whether any session has a prompt in flight (a turn is streaming), or an
 /// out-of-turn follow still rendering it (ADR-0059: the follow inherits the
 /// inflight guard for its window). The yield is deferred while busy so killing
@@ -19,19 +21,28 @@ const RECONNECT_POLL_INTERVAL_SECS: u64 = 5;
 /// since the follow holds the guard, a followed Session is never read as idle
 /// here.
 ///
-/// This is the one bridge fact the client's lifecycle needs: the client owns
-/// every other part of the decision (spec #860, ticket #875).
-async fn busy(waits: &WaitsHandle) -> bool {
-    !waits.inflight.lock().await.is_empty()
+/// `try_lock`, never `lock`: the probe is called synchronously from inside the
+/// client's serialized pass, so it must not await a handle lock there. A
+/// contended read is **busy** — the conservative answer, because the other
+/// holder is mutating the set, and migrating when the state cannot be read is
+/// exactly the truncation this guard prevents.
+fn busy_probe(waits: &WaitsHandle) -> impl Fn() -> bool + '_ {
+    move || match waits.inflight.try_lock() {
+        Ok(inflight) => !inflight.is_empty(),
+        Err(_) => true,
+    }
 }
 
 /// One pass of the client-owned "ensure attached" entry point.
 ///
 /// The whole discover / attach / health / optionally-start policy lives behind
 /// [`crate::backend::ServerLifecycle::ensure_attached`]; the bridge supplies
-/// only the three facts the client cannot know (is a message waiting, may a
-/// poll heal a dead server, is a turn streaming) and maps the outcome to
-/// attached/serverless, or to the one failure signal the latch reports.
+/// only the facts the client cannot know (is a message waiting, may a poll
+/// heal a dead server, is a turn streaming) and maps the outcome to
+/// attached/serverless, or to the one failure signal the latch reports. The
+/// busy answer travels as a probe, not a value: the client reads it after
+/// acquiring its lifecycle lock, so a turn that starts while this pass waits
+/// behind another one is never missed.
 ///
 /// Returns whether a server is attached (or was just started).
 async fn reconcile(
@@ -39,10 +50,11 @@ async fn reconcile(
     allow_spawn: bool,
     heal_when_busy: bool,
 ) -> crate::error::Result<bool> {
+    let busy = busy_probe(&handles.waits);
     let request = EnsureAttached {
         allow_spawn,
         heal_when_busy,
-        busy: busy(&handles.waits).await,
+        busy: &busy,
         boot: false,
     };
     match handles.backend.ensure_attached(request).await? {
@@ -73,16 +85,16 @@ async fn reconcile(
 pub(crate) async fn reconnect_poll_loop(handles: &FlowHandles) -> crate::error::Result<()> {
     let cadence_ms = std::sync::atomic::AtomicU64::new(RECONNECT_POLL_INTERVAL_SECS * 1_000);
     let mut poll = reconnect_loop(&cadence_ms);
-    poll.poll(
-        || true,
-        move || async move {
-            reconcile(handles, false, true)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        },
-    )
-    .await
+    poll.poll(|| true, move || reconnect_tick(handles)).await
+}
+
+/// One production reconcile tick, extracted so a test can drive it through
+/// [`reconnect_loop`] with a fast cadence — the same pass the real loop runs.
+async fn reconnect_tick(handles: &FlowHandles) -> std::result::Result<(), String> {
+    reconcile(handles, false, true)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// The reconnect loop's [`PollLoop`]: the production condition name, wired to
@@ -372,6 +384,57 @@ mod tests {
         assert!(
             reconcile(&core.flow_handles(), false, true).await.unwrap(),
             "a client that reports attached leaves the pass successful"
+        );
+    }
+
+    /// The busy probe runs inside the client's serialized pass, so it must be
+    /// synchronous and conservative: a set it cannot read means a turn might
+    /// be streaming, which is `busy` (never migrate on an unreadable state).
+    #[tokio::test]
+    async fn the_busy_probe_is_conservative_under_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let layout = crate::state::StateLayout::from_config(&cfg);
+        let platform = Arc::new(RecordingPlatform::new());
+        let core = Arc::new(
+            SharedCore::new(&cfg, layout, Arc::new(MockBackend::new(Vec::new())), platform).unwrap(),
+        );
+        let waits = core.waits_handle();
+        let probe = busy_probe(&waits);
+
+        assert!(!probe(), "an idle, unlocked set is not busy");
+        let guard = waits.inflight.lock().await;
+        assert!(probe(), "a contended read is conservatively busy");
+        drop(guard);
+        waits.inflight.lock().await.insert("ses_busy".into());
+        assert!(probe(), "a set with an in-flight turn is busy");
+    }
+
+    /// The production poll loop — its own `reconnect_loop` seam, a fast
+    /// cadence and the real production tick — drives a client that reports
+    /// "attached, nothing to do", naming no adapter symbol (spec #860,
+    /// ticket #875).
+    #[tokio::test]
+    async fn the_production_poll_loop_drives_an_attached_fake_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let layout = crate::state::StateLayout::from_config(&cfg);
+        let platform = Arc::new(RecordingPlatform::new());
+        let backend = Arc::new(MockBackend::new(Vec::new()));
+        let calls = Arc::clone(&backend.ensure_attached_calls);
+        let core = Arc::new(SharedCore::new(&cfg, layout, backend, platform).unwrap());
+        let handles = core.flow_handles();
+        let cadence = std::sync::atomic::AtomicU64::new(1);
+        let mut poll = reconnect_loop(&cadence);
+        let mut pass = || async { reconnect_tick(&handles).await };
+
+        for _ in 0..2 {
+            assert!(poll.tick(|| true, &mut pass).await, "the production tick ran");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the production pass drove the client's ensure_attached"
         );
     }
 

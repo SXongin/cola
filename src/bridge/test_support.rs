@@ -1665,6 +1665,9 @@ pub struct MockBackend {
     /// The attachment `attachment_status` reports (`cola status`/`doctor`'s
     /// read). `None` means "nothing to report", the default.
     pub attachment: Option<crate::backend::lifecycle::AttachmentStatus>,
+    /// Counts `ensure_attached` passes, so a poll-loop test can prove the
+    /// client-owned pass actually ran.
+    pub ensure_attached_calls: Arc<std::sync::atomic::AtomicUsize>,
     /// Available models grouped by provider, served by `list_models` (for the
     /// `/model` card).
     pub provider_models: Vec<crate::backend::types::ProviderModels>,
@@ -1917,6 +1920,7 @@ impl MockBackend {
             list_skills_directories: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             serverless: false,
             attachment: None,
+            ensure_attached_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_models: Vec::new(),
             default_model: None,
             context_window: Some(100_000),
@@ -3416,8 +3420,10 @@ impl crate::backend::ServerLifecycle for MockBackend {
     /// are reachable (the real adapter would start a server instead).
     async fn ensure_attached(
         &self,
-        _request: crate::backend::EnsureAttached,
+        _request: crate::backend::EnsureAttached<'_>,
     ) -> crate::error::Result<crate::backend::AttachOutcome> {
+        self.ensure_attached_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(if self.serverless {
             crate::backend::AttachOutcome::Serverless
         } else {

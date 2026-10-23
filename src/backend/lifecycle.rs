@@ -22,8 +22,11 @@
 //! - [`AttachmentStatus`] — the read `cola status` and `cola doctor` report;
 //! - [`RestartOutcome`] — `/restart-opencode`'s neutral result.
 //!
-//! A client with no lifecycle of its own (a peer attachment the user manages,
-//! or a test double) gets the defaults: already attached, nothing to do.
+//! [`ServerLifecycle::ensure_attached`] is deliberately **required**: a new
+//! backend cannot silently inherit a healthy-looking "attached" answer while
+//! its runtime is actually unreachable. A client with no lifecycle of its own
+//! (a peer attachment the user manages, or a test double) implements the
+//! explicit "already attached, nothing to do" body instead.
 
 use std::time::Duration;
 
@@ -35,18 +38,20 @@ use super::Backend;
 
 /// One "ensure attached" request from the bridge.
 ///
-/// The bridge only knows these three facts; the client owns the policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EnsureAttached {
+/// The bridge only knows these facts; the client owns the policy.
+pub struct EnsureAttached<'a> {
     /// A start is allowed (the demand path, or an `eager` boot). The client
     /// still enforces its own start policy.
     pub allow_spawn: bool,
     /// The poll path may start one only when a turn is in flight, so a
     /// mid-stream generation's next poll finds a live server instead of 502ing.
     pub heal_when_busy: bool,
-    /// Whether a turn is currently streaming. The client defers a migration
-    /// (and its yield/reap) while busy, so it never truncates a generation.
-    pub busy: bool,
+    /// The busy probe. The client calls it **after it has acquired its
+    /// lifecycle lock**, at the migration/yield decision, so the answer
+    /// describes the serialized pass rather than the moment the bridge built
+    /// the request. A contended read is treated as busy by the bridge (the
+    /// conservative answer: never migrate when the state cannot be read).
+    pub busy: &'a (dyn Fn() -> bool + Sync),
     /// The process-start pass. A start that cannot resolve a generation is
     /// **not** fatal at boot when a default-store server is alive (the next
     /// reconnect pass attaches once it classifies), and boot does not wait on
@@ -83,8 +88,10 @@ pub struct OtherServer {
 pub struct AttachmentStatus {
     pub url: String,
     pub pid: i32,
-    /// The generation the client resolved (`v1`/`v2` for OpenCode), `None`
-    /// when the probe was inconclusive — never guessed.
+    /// The client's own protocol label for display — for an OpenCode
+    /// attachment the resolved generation (`v1`/`v2`), for another client its
+    /// equivalent opaque label. `None` when the client could not classify the
+    /// attachment; never guessed. The seam does not interpret the value.
     pub generation: Option<String>,
     /// The probe's evidence, the detail line when the generation is unknown.
     pub evidence: String,
@@ -108,18 +115,21 @@ pub enum RestartOutcome {
 
 /// The active client's discover / attach / health / optionally-start surface.
 ///
-/// Every method has a default stating **this client has nothing to manage**:
-/// a peer attachment whose daemon the user owns, or a test double. The OpenCode
-/// adapter overrides all three with its Shared-Store policy.
+/// [`Self::ensure_attached`] is required: a client must state its attachment
+/// explicitly, so a disconnected runtime can never look healthy by inheriting
+/// a default. The read-only methods keep defaults stating **this client has
+/// nothing to report** — a peer attachment whose daemon the user owns, or a
+/// test double.
 #[async_trait]
 pub trait ServerLifecycle: Send + Sync {
     /// Ensure the client is attached to its runtime, honoring the request's
-    /// spawn allowance and busy state. This is the poll loop's one entry
+    /// spawn allowance and busy probe. This is the poll loop's one entry
     /// point; it never returns "which server class"; it returns whether the
     /// client is attached and, when resolution failed, why.
-    async fn ensure_attached(&self, _request: EnsureAttached) -> Result<AttachOutcome> {
-        Ok(AttachOutcome::Attached)
-    }
+    ///
+    /// A client with no lifecycle of its own answers
+    /// `Ok(AttachOutcome::Attached)` explicitly.
+    async fn ensure_attached(&self, request: EnsureAttached<'_>) -> Result<AttachOutcome>;
 
     /// The attachment for read-only introspection. `None` when there is
     /// nothing to report (a client whose runtime the user manages elsewhere).
@@ -145,7 +155,10 @@ pub trait ServerLifecycle: Send + Sync {
 /// connection. ANY HTTP response — success or error — counts as ready: the
 /// failure mode being dodged is a swallowed request (no response at all), and a
 /// responding server is past the window even when it answers with an error.
-pub(crate) async fn wait_for_server_ready<T>(backend: &T, timeout: Duration) -> Result<()>
+pub(crate) async fn wait_for_server_ready<T>(
+    backend: &T,
+    timeout: Duration,
+) -> std::result::Result<(), String>
 where
     T: Backend + ?Sized,
 {
@@ -155,9 +168,9 @@ where
             Ok(Ok(_)) | Ok(Err(_)) => return Ok(()),
             Err(_) => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(crate::error::BridgeError::OpenCode(
-                        "own OpenCode server accepted connections but never served a request".into(),
-                    ));
+                    // The adapter owns the runtime's error vocabulary; this
+                    // helper only reports the neutral evidence.
+                    return Err("accepted connections but never served a request".into());
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
