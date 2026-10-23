@@ -162,10 +162,17 @@ fn resolve_config_or_exit(explicit: &Option<String>) -> std::path::PathBuf {
 
 /// The active Agent Client this build can actually construct (ADR-0090 §5).
 ///
-/// OpenCode is the only adapter today, so a resolved `codex` client is refused
-/// loudly here rather than booting with the legacy OpenCode settings the config
-/// did not ask for. This is the *capability* gate; resolution itself stays pure
-/// and `cola config validate` still calls such a config valid.
+/// OpenCode is the only adapter whose `Backend` this build has, so a resolved
+/// `codex` client is refused loudly here rather than booting with the legacy
+/// OpenCode settings the config did not ask for. This is the *capability* gate;
+/// resolution itself stays pure and `cola config validate` still calls such a
+/// config valid.
+///
+/// Spec #860 ticket #877 landed the Codex daemon's discovery, probe and attach,
+/// but the `Backend` implementation that serves a Codex Session is #878–#882;
+/// boot therefore keeps refusing, so a client cola cannot serve never looks
+/// attached. Relax this in the ticket that constructs the adapter and stores it
+/// in `SharedCore.client` — not when discovery alone exists.
 fn require_supported_client(active: &config::ActiveClient) -> anyhow::Result<()> {
     if active.opencode().is_none() {
         anyhow::bail!(
