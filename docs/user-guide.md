@@ -15,10 +15,22 @@ All runtime state defaults to `~/.cola/`:
 | --- | --- | --- |
 | `cola.toml` | configuration | `./cola.toml` (cwd) or `cola --config <path>` |
 | `cola.log` | logs (append, daily rotation) | `cola --log-file <path>` |
-| `sessions.json` | Feishu thread ↔ OpenCode session mapping | `[bridge] session_file` |
+| `sessions.json` | Feishu thread ↔ Session mapping | `[bridge] session_file` |
+| `chain_records.json` | durable Chain Record: live cards, wake watermarks, Task Endings, delivered positions | beside `session_file` |
+| `interactive_surfaces.json` | Permission/Question cards re-adopted after a restart (ADR-0038) | beside `session_file` |
+| `pinned_chats.json` | persisted Instant Reminder pins | beside `session_file` |
+| `terminal-runs/` | Terminal Run Records for live/settled `/run` cards | beside `session_file` |
 | `access.json` | Access List (the Host; ADR-0035) | `[bridge] access_file` |
 | `cola.lock` | singleton lock (one cola per machine) | — |
 | `restart-notify.json` | restart announcement bookkeeping | — |
+
+Every state file carries a format `version`. Records keyed by a Session also
+name the **agent client** that owns them, so two clients' sessions can coexist
+in one file. A file written by an older release reads as version 0 under the
+`default` client and is rewritten once; a file from a **newer** release is
+refused rather than misread. Renaming a `[clients.<id>]` id is therefore a
+**state migration**, not a config edit: the old id's records must be re-keyed,
+or they stay invisible to the renamed client (ADR-0091).
 
 The lock and config are why `cola` has no flags in the autostart launcher: it
 resolves everything from `~/.cola` regardless of the working directory.
