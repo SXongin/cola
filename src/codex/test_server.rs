@@ -202,6 +202,12 @@ pub(crate) struct ScriptedThread {
     /// How many turns a `thread/read`/`thread/resume` response carries. `None`
     /// carries every stored turn.
     pub(crate) read_turn_limit: Option<usize>,
+    /// Answer `thread/turns/list` without the required `data` field, so a
+    /// malformed page is a decode error rather than an empty success.
+    pub(crate) malformed_turns_page: bool,
+    /// Return a repeating `nextCursor` from `thread/turns/list`, so the client
+    /// must refuse to loop and keep the projection incomplete.
+    pub(crate) repeat_turns_cursor: bool,
 }
 
 impl ScriptedThread {
@@ -220,6 +226,8 @@ impl ScriptedThread {
             has_history: true,
             turns: Vec::new(),
             read_turn_limit: None,
+            malformed_turns_page: false,
+            repeat_turns_cursor: false,
         }
     }
 
@@ -715,6 +723,9 @@ where
             let Some(thread) = find_thread(state, thread_id) else {
                 return reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await;
             };
+            if thread.malformed_turns_page {
+                return replying(sink, id, json!({ "nextCursor": null, "backwardsCursor": null })).await;
+            }
             let offset = params
                 .get("cursor")
                 .and_then(Value::as_str)
@@ -728,7 +739,11 @@ where
                 .filter(|limit| *limit > 0)
                 .unwrap_or(2);
             let end = (offset + limit).min(thread.turns.len());
-            let next = (end < thread.turns.len()).then(|| json!(end.to_string()));
+            let next = if thread.repeat_turns_cursor {
+                Some(json!("0"))
+            } else {
+                (end < thread.turns.len()).then(|| json!(end.to_string()))
+            };
             replying(
                 sink,
                 id,
