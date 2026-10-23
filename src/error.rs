@@ -6,6 +6,14 @@ pub enum BridgeError {
     #[error("opencode error: {0}")]
     OpenCode(String),
 
+    /// A failure of the active agent client's own runtime, in the neutral
+    /// vocabulary the seam needs (spec #860, ADR-0090): a second adapter
+    /// reports through here rather than borrowing the first adapter's variant.
+    /// `client` is the adapter kind's label, so the display keeps the shape the
+    /// OpenCode arm has ("codex error: …").
+    #[error("{client} error: {detail}")]
+    Client { client: &'static str, detail: String },
+
     #[error("feishu error: {0}")]
     Feishu(String),
 

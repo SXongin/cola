@@ -273,8 +273,10 @@ pub(crate) async fn discover(environment: &Environment) -> Result<Discovery> {
                 Err(error) => {
                     // The socket is still the evidence that a daemon serves;
                     // the report only names its binary. Degrade to the package
-                    // fallback and keep the reason visible.
-                    tracing::warn!(
+                    // fallback and keep the reason at debug level — the poll
+                    // loop re-runs this every few seconds, and a wrong fallback
+                    // makes the probe refuse loudly rather than silently.
+                    tracing::debug!(
                         "codex daemon control socket {} exists, but its version report failed: {}",
                         socket.display(),
                         error
@@ -794,7 +796,7 @@ mod tests {
         std::os::unix::fs::symlink(&daemon_socket, &control).expect("symlink the control socket");
 
         let managed = root.path().join("managed-codex");
-        let cli = FakeCodex::write(root.path(), &control, Some(&daemon_socket), &managed);
+        let cli = FakeCodex::write(root.path(), &control, Some(&daemon_socket), None, &managed);
         let environment = Environment {
             cli: cli.binary.clone(),
             ..environment
@@ -839,6 +841,7 @@ mod tests {
             root.path(),
             &environment.socket(),
             Some(&root.path().join("unused.sock")),
+            None,
             &root.path().join("managed-codex"),
         );
         let environment = Environment {
@@ -875,6 +878,7 @@ mod tests {
             root.path(),
             &environment.socket(),
             Some(&daemon_socket),
+            None,
             &root.path().join("managed-codex"),
         );
         let environment = Environment {
@@ -897,6 +901,7 @@ mod tests {
         let cli = FakeCodex::write(
             root.path(),
             &empty_socket,
+            None,
             None,
             &root.path().join("managed-codex"),
         );

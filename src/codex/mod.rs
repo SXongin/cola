@@ -16,15 +16,21 @@
 //! probe-and-degrade consequence, the shape ADR-0055 gave generation
 //! detection).
 
-// Nothing above this adapter exists yet: #877 adds daemon discovery and the
-// lifecycle, #878+#879 the Backend implementation and the subscription read
-// model. Until then the binary has no caller, and a bin crate's dead-code lint
-// would flag the whole slice.
+// Nothing in the binary constructs the Codex adapter yet: #877 landed daemon
+// discovery and the lifecycle, but the composition root and the `Backend`
+// implementation are #879's, and `main`'s capability gate still refuses a
+// `codex` client. Until that root exists nothing here is reachable from
+// `main`, and dead-code analysis (a bin crate's) would flag the whole slice —
+// including the paths #877 *did* give real callers inside the slice
+// (`CodexLifecycle::ensure_attached` reaches discovery, the handshake, the
+// managed-binary probe and the neutral error). The silence is removed by the
+// ticket that constructs the adapter, not item by item.
 #![allow(dead_code)]
 
 pub(crate) mod client;
 pub(crate) mod discovery;
 pub(crate) mod error;
+pub(crate) mod lifecycle;
 pub(crate) mod schema;
 pub(crate) mod transport;
 
@@ -35,6 +41,8 @@ pub(crate) mod test_server;
 pub(crate) use client::{CodexClient, CodexOptions, ServerInfo, ServerVersion, connect_for_active_client};
 #[allow(unused_imports)]
 pub(crate) use error::{CodexError, Result};
+#[allow(unused_imports)]
+pub(crate) use lifecycle::{CodexLifecycle, ManagedProbe, ProbeSource};
 #[allow(unused_imports)]
 pub(crate) use schema::{AutoProbe, PinnedProbe, Surface, SurfaceProbe};
 #[allow(unused_imports)]

@@ -51,6 +51,7 @@ impl FakeCodex {
         directory: &Path,
         control_socket: &Path,
         real_socket: Option<&Path>,
+        daemon_pid_record: Option<&Path>,
         managed_binary: &Path,
     ) -> Self {
         use std::os::unix::fs::PermissionsExt;
@@ -81,6 +82,17 @@ impl FakeCodex {
                 shell_single_quote(&control_socket.display().to_string()),
             ),
             None => "printf '%s\\n' '{\"status\":\"started\"}'\n".to_string(),
+        };
+        // The fake daemon is a detached process of its own, with its own pid
+        // record — the shape cola must never adopt as its own. Its stdio is
+        // detached so `output()` does not wait on the pipe it inherits.
+        let start = match daemon_pid_record {
+            Some(record) => format!(
+                "{}sleep 30 >/dev/null 2>&1 &\necho $! > {}\n",
+                start,
+                shell_single_quote(&record.display().to_string())
+            ),
+            None => start,
         };
         let script = format!(
             "#!/bin/sh\n\
