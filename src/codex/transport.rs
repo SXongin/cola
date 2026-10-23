@@ -58,6 +58,13 @@ use super::error::{CodexError, Result};
 /// reports it instead of silently rendering a hole.
 const INBOUND_CAPACITY: usize = 1024;
 
+/// How many outgoing frames may sit between a caller and the writer. Bounded on
+/// purpose: a peer that stops reading must apply backpressure to the callers
+/// (whose own timeouts — the handshake's, the liveness probe's — bound them)
+/// instead of letting an unbounded queue grow. A closed socket fails the send,
+/// which closes the connection and fails every waiter.
+const OUTGOING_CAPACITY: usize = 64;
+
 /// How to reach an app-server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
@@ -144,7 +151,7 @@ struct Pending {
 }
 
 struct ConnectionInner {
-    outgoing: mpsc::UnboundedSender<Message>,
+    outgoing: mpsc::Sender<Message>,
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     inbound: broadcast::Sender<Inbound>,
@@ -237,7 +244,7 @@ impl RpcConnection {
     /// Split the socket and start the writer and reader tasks.
     fn start(socket: Socket) -> Self {
         let (sink, stream) = socket.split();
-        let (outgoing, outgoing_rx) = mpsc::unbounded_channel::<Message>();
+        let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
 
         let inner = Arc::new(ConnectionInner {
@@ -281,7 +288,7 @@ impl RpcConnection {
             "method": method,
             "params": params,
         });
-        if let Err(error) = self.send(&frame) {
+        if let Err(error) = self.send(&frame).await {
             self.inner.pending.lock().expect("pending requests").remove(&id);
             return Err(error);
         }
@@ -313,7 +320,7 @@ impl RpcConnection {
         if let Some(params) = params {
             message["params"] = params;
         }
-        self.send(&message)
+        self.send(&message).await
     }
 
     /// Subscribe to everything the server pushed that was not a response to
@@ -326,7 +333,7 @@ impl RpcConnection {
         self.inner.closed.load(Ordering::SeqCst)
     }
 
-    fn send(&self, message: &Value) -> Result<()> {
+    async fn send(&self, message: &Value) -> Result<()> {
         let text = serde_json::to_string(message).map_err(|error| CodexError::Transport {
             context: "encode a JSON-RPC frame".to_string(),
             detail: error.to_string(),
@@ -334,6 +341,7 @@ impl RpcConnection {
         self.inner
             .outgoing
             .send(Message::Text(text.into()))
+            .await
             .map_err(|_| CodexError::NoResponse("the connection writer".to_string()))
     }
 }
@@ -341,7 +349,7 @@ impl RpcConnection {
 /// Serialise every outgoing frame; the sink is the only writer.
 async fn write_loop(
     mut sink: SplitSink<Socket, Message>,
-    mut outgoing: mpsc::UnboundedReceiver<Message>,
+    mut outgoing: mpsc::Receiver<Message>,
     inner: Weak<ConnectionInner>,
 ) {
     while let Some(message) = outgoing.recv().await {
@@ -368,14 +376,22 @@ async fn read_loop(mut stream: SplitStream<Socket>, inner: Weak<ConnectionInner>
             Ok(Message::Text(text)) => match serde_json::from_str::<Value>(&text) {
                 Ok(value) => dispatch(&inner, value),
                 Err(error) => {
-                    // A frame that is not JSON cannot be correlated or routed;
-                    // dropping it would hide a server bug, so say so and keep
-                    // the connection serving the calls that are well formed.
-                    tracing::warn!("codex app-server sent a non-JSON text frame: {error}");
+                    // A frame that is not JSON cannot be correlated or routed.
+                    // If it was a response, its waiter would otherwise hang
+                    // forever (thread calls carry no per-call timeout), and a
+                    // stream with unknown gaps cannot be trusted — so the
+                    // connection is closed and every waiter fails by name.
+                    tracing::warn!(
+                        "codex app-server sent a non-JSON text frame; closing the connection:                          {error}"
+                    );
+                    close(&inner);
+                    break;
                 }
             },
             Ok(Message::Ping(payload)) => {
-                let _ = inner.outgoing.send(Message::Pong(payload));
+                // A ping answer must not stall the reader behind a busy writer;
+                // the WebSocket layer can retry or the peer can close.
+                let _ = inner.outgoing.try_send(Message::Pong(payload));
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => continue,
@@ -552,15 +568,20 @@ mod tests {
         assert_eq!(server.initialized(), 2);
     }
 
-    /// A broadcast notification that races the response is skipped, not
-    /// mistaken for the reply.
+    /// A broadcast notification that races the response is skipped by the
+    /// correlation loop **and delivered to `inbound()`**. The old synchronous
+    /// loop discarded it, so asserting delivery is what makes this test fail
+    /// without the fan-out (the scripted server emits this notification before
+    /// the `initialize` response).
     #[tokio::test]
-    async fn a_racing_notification_is_skipped() {
+    async fn a_racing_notification_is_delivered_not_mistaken_for_the_reply() {
         let (_, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
         let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
             .await
             .expect("connection");
+        let mut inbound = connection.inbound();
+
         let result = connection
             .request(
                 "initialize",
@@ -569,6 +590,52 @@ mod tests {
             .await
             .expect("initialize");
         assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+            .await
+            .expect("the racing notification is not lost")
+            .expect("inbound stays open");
+        match event {
+            Inbound::Notification { method, params } => {
+                assert_eq!(method, "remoteControl/status/changed");
+                assert_eq!(params["status"], "disabled");
+            }
+            other => panic!("expected the initialize-time broadcast, got {other:?}"),
+        }
+    }
+
+    /// A frame that is not JSON cannot be correlated: the connection closes and
+    /// the pending waiter fails by name instead of hanging forever (thread
+    /// calls carry no per-call timeout).
+    #[tokio::test]
+    async fn a_malformed_frame_fails_the_pending_request() {
+        let (_, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
+            .await
+            .expect("connection");
+
+        let failed = tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.request("test/malformed", json!({})),
+        )
+        .await
+        .expect("the waiter must not hang on an unroutable frame")
+        .expect_err("a malformed frame fails the request");
+        assert!(
+            matches!(failed, CodexError::NoResponse(_) | CodexError::Transport { .. }),
+            "{failed}"
+        );
+
+        // The connection is closed, so a later call fails fast too.
+        let after = tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.request("initialize", json!({})),
+        )
+        .await
+        .expect("a closed connection fails fast")
+        .expect_err("nothing is served after the malformed frame");
+        assert!(matches!(after, CodexError::NoResponse(_)), "{after}");
     }
 
     /// Ticket #878's seam: a notification the server pushes while a request is
