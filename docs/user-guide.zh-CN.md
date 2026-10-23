@@ -164,9 +164,11 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
 - **选项与 `kind` 写在同一个表里。** `opencode` 的 Agent Client 接受 `url`、
   `start_server`、`generation` 与 `model`，和 `[opencode]` 完全一样；
   具名的 Agent Client 不会继承 `[opencode]` 的取值。
-- **只接受这些键。** 其他任何键——例如拼错的 `model_typo`，或嵌套的
-  `[clients.ada.opencode]` 表——都是配置错误，并会指出
-  `clients.<id>.<key>`，绝不会被静默忽略。
+- **只接受这些键，且只用于 `opencode`。** 其他任何键——例如拼错的
+  `model_typo`，或嵌套的 `[clients.ada.opencode]` 表——都是配置错误，并会指出
+  `clients.<id>.<key>`；在非 `opencode` 的 Agent Client 上写 `opencode` 选项
+  （例如 `kind = "codex"` 配 `model`）同样是配置错误，因为运行中的客户端会
+  忽略它。绝不会被静默忽略。
 - **`default_client`** —— 活动 Agent Client 的 id。不设置时是 `default`
   （即 `[opencode]`）。每个 cola 进程只有一个活动的 Agent Client（ADR-0090）；
   切换 Agent Client 就是改这个键并重启。

@@ -350,6 +350,11 @@ pub struct ClientEntry {
     /// Read only for `kind = "opencode"`; a named Agent Client never inherits
     /// `[opencode]`.
     pub opencode: OpenCodeConfig,
+    /// Which option keys the table actually spelled. The parsed settings
+    /// cannot answer that (`start_server`/`generation` carry defaults), but a
+    /// key written on the wrong kind must be named, so presence is recorded
+    /// while the raw table is still in hand.
+    present: std::collections::BTreeSet<String>,
     /// Keys no option list defines (a nested `[clients.<id>.opencode]` table, a
     /// typo such as `model_typo`, a future setting this build predates). Kept
     /// so resolution can fail loudly instead of running different settings
@@ -376,8 +381,10 @@ impl<'de> Deserialize<'de> for ClientEntry {
             }
         };
         let mut options = toml::Table::new();
+        let mut present = std::collections::BTreeSet::new();
         for key in OPENCODE_CLIENT_KEYS {
             if let Some(value) = table.remove(*key) {
+                present.insert((*key).to_string());
                 options.insert((*key).to_string(), value);
             }
         }
@@ -385,16 +392,17 @@ impl<'de> Deserialize<'de> for ClientEntry {
         Ok(Self {
             kind,
             opencode,
+            present,
             unknown: table.into_iter().collect(),
         })
     }
 }
 
-/// `[clients.<id>]` is one table: `kind` plus that kind's options. Only an
-/// `opencode` Agent Client has options today, so its keys are serialised only
-/// then — a `codex` table must not grow `start_server`/`generation` rows it
-/// ignores in `cola config show`. Keys resolution rejects are still printed:
-/// `config show` must not hide what the file says.
+/// `[clients.<id>]` is one table: `kind` plus that kind's options. An
+/// `opencode` Agent Client prints its keys; any other kind prints them only
+/// when the file actually spelled one, so a config `config show` would
+/// otherwise hide — and resolution rejects — stays visible until the error is
+/// read.
 impl Serialize for ClientEntry {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -406,12 +414,19 @@ impl Serialize for ClientEntry {
         if let Some(kind) = &self.kind {
             map.serialize_entry("kind", kind)?;
         }
-        if self.kind.as_deref() == Some(ClientKind::Opencode.as_str()) {
+        let is_opencode = self.kind.as_deref() == Some(ClientKind::Opencode.as_str());
+        if is_opencode || !self.present.is_empty() {
             let options = toml::Value::try_from(&self.opencode)
                 .map_err(|error| serde::ser::Error::custom(error.to_string()))?;
             if let toml::Value::Table(options) = options {
                 for (key, value) in options {
-                    map.serialize_entry(&key, &value)?;
+                    // An `opencode` client prints its whole option set (like
+                    // `[opencode]` itself); any other kind prints only the keys
+                    // the file actually spelled, so `config show` neither
+                    // invents options nor hides a rejected one.
+                    if is_opencode || self.present.contains(&key) {
+                        map.serialize_entry(&key, &value)?;
+                    }
                 }
             }
         }
@@ -442,6 +457,24 @@ impl ClientEntry {
             Some((key, _)) => Err(ClientConfigError::UnknownSetting {
                 id: id.to_string(),
                 key: key.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Reject an OpenCode option written on a client of another kind: the
+    /// running client would ignore it, which is the same silent-settings-change
+    /// class as an unknown key. `BTreeSet` order makes the reported key
+    /// deterministic.
+    fn options_for_kind(&self, id: &str, kind: ClientKind) -> Result<(), ClientConfigError> {
+        if kind == ClientKind::Opencode {
+            return Ok(());
+        }
+        match self.present.iter().next() {
+            Some(key) => Err(ClientConfigError::OptionForAnotherKind {
+                id: id.to_string(),
+                key: key.clone(),
+                kind: kind.as_str().to_string(),
             }),
             None => Ok(()),
         }
@@ -510,6 +543,12 @@ pub enum ClientConfigError {
          never a nested table"
     )]
     UnknownSetting { id: String, key: String },
+    /// `[clients.<id>]` carries an `opencode` option but selects another kind.
+    #[error(
+        "`clients.{id}.{key}` is an `opencode` option, but `clients.{id}.kind = \"{kind}\"`; a setting \
+         that kind ignores is rejected rather than accepted and dropped"
+    )]
+    OptionForAnotherKind { id: String, key: String, kind: String },
     /// `[bridge] default_client` names no configured table.
     #[error("`bridge.default_client = \"{id}\"` names no configured client (configured: {available})")]
     UnknownDefaultClient { id: String, available: String },
@@ -537,8 +576,9 @@ impl Config {
         // a later switch. `BTreeMap` order makes which one is reported first
         // deterministic.
         for (entry_id, entry) in &self.clients {
-            entry.kind_for(entry_id)?;
+            let kind = entry.kind_for(entry_id)?;
             entry.unknown_setting(entry_id)?;
+            entry.options_for_kind(entry_id, kind)?;
         }
         let id = self.bridge.default_client.as_deref().unwrap_or(DEFAULT_CLIENT_ID);
         if id == DEFAULT_CLIENT_ID {
@@ -1339,6 +1379,30 @@ mod tests {
         assert!(err.to_string().contains("clients.ada.model_typo"), "{err}");
     }
 
+    /// An `opencode` option on a `codex` Agent Client would be ignored by the
+    /// running client, so it is rejected — not accepted and dropped.
+    #[test]
+    fn an_opencode_option_on_a_codex_client_is_rejected() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             model = \"provider/model\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(
+            err,
+            ClientConfigError::OptionForAnotherKind {
+                id: "ada".into(),
+                key: "model".into(),
+                kind: "codex".into(),
+            }
+        );
+        let message = err.to_string();
+        assert!(message.contains("clients.ada.model"), "{message}");
+        assert!(message.contains("codex"), "{message}");
+    }
+
     /// Every `[opencode]` option key is accepted inside a client table, and
     /// lands in that Agent Client's settings.
     #[test]
@@ -1421,6 +1485,29 @@ mod tests {
         );
     }
 
+    /// `cola config validate` must fail a `codex` Agent Client carrying an
+    /// `opencode` option, naming the key — not accept it and let `show`/boot
+    /// silently drop the option.
+    #[test]
+    fn config_run_validate_rejects_an_opencode_option_on_a_codex_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+                 model = \"provider/model\"\n",
+                minimal()
+            ),
+        )
+        .unwrap();
+        let err = run(ConfigAction::Validate, path.to_str()).unwrap_err();
+        assert!(
+            err.to_string().contains("clients.ada.model"),
+            "expected the option/kind error, got: {err}"
+        );
+    }
+
     /// `cola config show` renders declared clients (they are not dropped), and
     /// an empty map adds no `[clients]` table to the output.
     #[test]
@@ -1440,6 +1527,19 @@ mod tests {
         assert!(
             !clients.contains("start_server") && !clients.contains("generation"),
             "a codex client has no opencode options to print: {dumped}"
+        );
+
+        // A codex entry that does spell an `opencode` option is rejected on
+        // resolution, but `config show` must still print what the file says.
+        let misapplied: Config = toml::from_str(&format!(
+            "{}\n[clients.ada]\nkind = \"codex\"\nmodel = \"provider/model\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let dumped = masked_config_toml(&misapplied).unwrap();
+        assert!(
+            dumped.contains("model = \"provider/model\""),
+            "an option resolution rejects must not vanish from show: {dumped}"
         );
 
         let opencode: Config = toml::from_str(&format!(
