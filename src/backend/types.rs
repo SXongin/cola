@@ -510,6 +510,12 @@ impl SessionStatus {
     }
 }
 
+/// The character budget for one rendered permission pattern. A request whose
+/// rendered target would exceed it is refused before a card is offered, so the
+/// user approves exactly what the card shows. Neutral presentation contract:
+/// the card renderer and every adapter that can raise an approval share it.
+pub const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
     #[serde(rename = "id")]
