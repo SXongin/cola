@@ -502,7 +502,7 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
 | `/model <p/m>` | 切换模型（下一条消息生效；持久化） |
 | `/think [level]` | 设置/清除思考等级，按模型生效（下一条消息生效） |
 | `#<id> [#<id> …] [text]` | 把 OpenCode 技能加载进本条消息的提示词（如 `#implement-spec 644`）；整段消息原样提交，匹配不到技能的 `#<id>` 原样保留为正文（`#644`、`C#caveman`、`##foreman` 都不是技能记号）。裸 `/skill` 打开技能选择卡片——可按 id/名称/描述搜索、每页 20 个翻页——`/skill <id>` 是别名，用于 `#` 形式打不出的 id（`2fa-helper`、`web_scrape`） |
-| `/autoaccept [on\|off]` | 查看/切换本会话是否自动放行工具权限请求 |
+| `/autoaccept [on\|off]` | 查看/切换本会话是否自动放行工具权限请求。卡片无法完整显示的权限请求（例如过长的命令）仍会被拒绝，绝不批准你看不到的内容 |
 | `/restart` | 重启 cola（保留启动参数与日志重定向） |
 | `/restart-opencode` | 重启 OpenCode 服务器（cola 自有的服务器或 V2 Shared Service） |
 | `/update` | 按安装渠道更新 cola（GitHub Releases 自更新，或 `cargo install`/`cargo binstall` 安装的 cargo 命令） |

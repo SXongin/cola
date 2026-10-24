@@ -23,7 +23,7 @@ use crate::bridge::turn::Turn;
 use super::delivery::{
     Origin, Residue, already_handled_result, denied_receipt, resolve_blocks, vanished_receipt,
 };
-use super::kind::{PendingRequest, RequestKind};
+use super::kind::{PendingRequest, Refusal, RequestKind};
 
 /// One question request's captured reply inputs (spec #364, S6): the request's
 /// fields and the index-aligned per-field answer slots (`answers[i]` is `None`
@@ -127,6 +127,45 @@ pub struct RequestFlow {
     /// from production builds.
     #[cfg(test)]
     pub(crate) wait_checks: Arc<Mutex<Vec<String>>>,
+}
+
+/// Tell the chat why a permission was declined before it could be offered.
+///
+/// The normal first sighting has no card to withdraw, so this is the only
+/// surface the refusal gets: routed exactly like a permission card (the reply
+/// target of the session's prompt, or the chat).
+async fn post_unshowable_notice(
+    handles: &FlowHandles,
+    p: &crate::backend::types::PermissionRequest,
+    directory: &str,
+) {
+    let session_id = p.session_id.as_deref().unwrap_or("");
+    let card = crate::feishu::card::question::build_unshowable_permission_card(p.target_budget());
+    match resolve_card_target(
+        &handles.sessions,
+        &handles.cards,
+        &handles.backend,
+        &handles.platform,
+        session_id,
+        directory,
+    )
+    .await
+    {
+        Some(CardTarget::ReplyTo(message_id)) => {
+            if let Err(e) = handles.platform.reply_card(&message_id, &card).await {
+                tracing::warn!("unshowable permission notice reply failed: {e}");
+            }
+        }
+        Some(CardTarget::Chat(chat_id)) => {
+            if let Err(e) = handles.platform.send_card("chat_id", &chat_id, &card).await {
+                tracing::warn!("unshowable permission notice send failed: {e}");
+            }
+        }
+        None => tracing::warn!(
+            "unshowable permission {} on session {session_id}: no reply target for the notice",
+            p.request_id
+        ),
+    }
 }
 
 impl RequestFlow {
@@ -1004,15 +1043,19 @@ impl RequestFlow {
 
     /// Everything one sweep does with ONE listed request, wrapped by the
     /// caller in that request's session span (ADR-0048): the snapshot-claim
-    /// skip, the re-host for a request already surfaced, the kind's `prepare`
-    /// (auto-accept / remember), and the card delivery — inline on the
-    /// session's live card, else a standalone card. Returns whether `prepare`
-    /// handled the request (an auto-accept), which the sweep must exclude from
+    /// skip, the re-host for a request already surfaced, the kind's `refuse`
+    /// (a request the card cannot show in full — before any surface, the
+    /// restart readoption included), the kind's `prepare` (auto-accept /
+    /// remember), and the card delivery — inline on the session's live card,
+    /// else a standalone card. Returns whether the request was handled without
+    /// a card (a refusal or an auto-accept), which the sweep must exclude from
     /// its reminder/pin reconciliation.
     ///
     /// `seen` records the requests this process has surfaced: a re-host needs
     /// the record (`seen.contains`), a first surfacing inserts it — so the
-    /// poller never surfaces one request twice.
+    /// poller never surfaces one request twice. A refusal inserts it only once
+    /// the server accepted the refusal; a failed one leaves it unmarked so the
+    /// next sweep retries.
     async fn surface(
         &self,
         handles: &FlowHandles,
@@ -1031,6 +1074,24 @@ impl RequestFlow {
             // follow the newest card (ADR-0038, rule 1).
             self.rehost_block(handles, req, dir).await;
             return false;
+        }
+        // Kind-specific refusal BEFORE any surface — the restart readoption
+        // included (whole-branch re-review #883). A request this process must
+        // not offer (a target the card cannot show in full) must never become
+        // interactive, not even on a card an older build persisted, so the
+        // refusal runs before `seen` records the request and before the
+        // recovered card is re-adopted. A refused request is settled on the
+        // server and its stored surface withdrawn in this same pass; a FAILED
+        // refusal leaves it pending and unmarked, so the next sweep retries it
+        // and this pass offers nothing.
+        match self.kind.refuse(self, handles, req, dir).await {
+            Refusal::NotApplicable => {}
+            Refusal::Refused => {
+                seen.insert(req.id().to_string());
+                self.withdraw_refused_surface(handles, req, dir).await;
+                return true;
+            }
+            Refusal::Failed => return false,
         }
         seen.insert(req.id().to_string());
         tracing::info!(
@@ -1202,6 +1263,77 @@ impl RequestFlow {
             && let Err(e) = handles.platform.update_message(&old_message, &card).await
         {
             tracing::warn!("re-host old-card repaint failed on {}: {}", old_message, e);
+        }
+    }
+
+    /// Withdraw whatever surface a previous process persisted for a request the
+    /// kind just refused, or explain the refusal in the chat when there is
+    /// none.
+    ///
+    /// A persisted inline block is replaced on its cached card by the refusal
+    /// receipt and forgotten; a persisted standalone card is repainted as the
+    /// refusal card and its record forgotten. Neither can be clicked again, and
+    /// a refusal never posts a second copy of the same card. With no stored
+    /// surface — the normal first sighting — the chat gets one reason card
+    /// instead.
+    async fn withdraw_refused_surface(&self, handles: &FlowHandles, req: &PendingRequest, dir: &str) {
+        let PendingRequest::Permission(p) = req else {
+            return;
+        };
+        self.recovered.lock().await.remove(req.id());
+        let mut withdrawn = false;
+        // Inline: replace the block on its cached card, then forget the handle.
+        let inline = {
+            let mut registry = handles.cards.card_handles.lock().await;
+            registry
+                .message_of(req.id())
+                .map(str::to_string)
+                .and_then(|message_id| {
+                    let card = registry.resolve_on(
+                        &message_id,
+                        req.id(),
+                        crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT,
+                    );
+                    registry.forget(req.id());
+                    card.map(|card| (message_id, card))
+                })
+        };
+        if let Some((message_id, card)) = inline {
+            withdrawn = true;
+            if let Err(e) = handles.platform.update_message(&message_id, &card).await {
+                tracing::warn!(
+                    "refused {} block withdrawal failed on {}: {}",
+                    req.id(),
+                    message_id,
+                    e
+                );
+            } else {
+                tracing::info!("refused {} inline block withdrawn on {}", req.id(), message_id);
+            }
+        }
+        // Standalone: repaint the card a previous process posted.
+        let standalone = self.sent_cards.lock().await.remove(req.id());
+        if let Some(sent) = standalone {
+            withdrawn = true;
+            self.surfaces.remove_standalone(req.id());
+            let card = crate::feishu::card::question::build_unshowable_permission_card(p.target_budget());
+            if let Err(e) = handles.platform.update_message(&sent.message_id, &card).await {
+                tracing::warn!(
+                    "refused {} card withdrawal failed on {}: {}",
+                    req.id(),
+                    sent.message_id,
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "refused {} standalone card withdrawn on {}",
+                    req.id(),
+                    sent.message_id
+                );
+            }
+        }
+        if !withdrawn {
+            post_unshowable_notice(handles, p, dir).await;
         }
     }
 

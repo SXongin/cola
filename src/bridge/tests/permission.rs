@@ -2219,3 +2219,131 @@ async fn an_over_budget_permission_is_declined_and_never_offered() {
         "the clipped target is never rendered as an approval"
     );
 }
+
+/// Whole-branch re-review #883: an over-budget permission the flow could not
+/// decline (a failed reply) must not be reported as handled. It stays pending
+/// and unmarked, nothing is posted for it, and the next sweep retries — a
+/// decline that never landed would otherwise leave the server waiting with no
+/// actionable card, because `seen` would have retired the request.
+#[tokio::test]
+async fn a_failed_decline_keeps_the_request_retryable_and_posts_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_session(&app, "ses_test", "/work").await;
+
+    // The same `seen` set across both sweeps: a failed refusal that marked the
+    // request seen would never be retried.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the first sweep tries the decline"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.is_empty(),
+        "a failed decline posts no card: it did not happen"
+    );
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "and it is never offered for approval"
+    );
+
+    // The retry succeeds: the reply lands and the reason card is posted.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        replies.lock().await.len(),
+        2,
+        "the second sweep retries the decline"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.iter().any(|card| card_text(card)
+            .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
+        "the successful retry explains the refusal"
+    );
+}
+
+/// Whole-branch re-review #883: `/autoaccept` is a policy about requests cola
+/// can show. An over-budget target is declined even under it — approving text
+/// nobody could review is the one thing the toggle does not buy.
+#[tokio::test]
+async fn auto_accept_declines_an_unshowable_permission_too() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+            session_id: "ses_test".into(),
+            directory: "/work".into(),
+            agent: None,
+            model: None,
+            auto_accept: true,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "an unshowable target is declined, never auto-approved"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards.iter().any(|card| card_text(card)
+            .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
+        "and the refusal is explained"
+    );
+}
