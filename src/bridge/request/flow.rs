@@ -668,7 +668,7 @@ impl RequestFlow {
                         // and skip the request: it is never surfaced, never
                         // pinned, never walked. `pending` still records it, so
                         // unknown is never read as resolved (#130).
-                        if !can_be_a_session_id(req.session_id()) {
+                        if !handles.backend.is_addressable_session_id(req.session_id()) {
                             let first = self
                                 .session_less
                                 .lock()
@@ -1438,14 +1438,6 @@ impl RequestFlow {
         }
         r
     }
-}
-
-/// Whether `id` can name a session at all (#489). Both generations mint
-/// `ses…` ids and V2's session route schema rejects anything else with a 400
-/// (`Expected a string starting with "ses"`), so an id that fails this can
-/// never be read — a structural, terminal condition, not a transient failure.
-fn can_be_a_session_id(id: &str) -> bool {
-    id.starts_with("ses")
 }
 
 /// Whether session `candidate` belongs to `session_id` — the session itself or

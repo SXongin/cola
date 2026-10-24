@@ -251,6 +251,28 @@ impl ScriptedThread {
 /// exactly one subscriber.
 type Stream = (usize, mpsc::UnboundedSender<Message>);
 
+/// One answer a client sent to a server-initiated request, so a test can pair
+/// it with the request the fake server broadcast.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ServerRequestReply {
+    /// The connection that answered (1 is the first accepted).
+    pub(crate) connection: usize,
+    /// The JSON-RPC id, echoed verbatim by the client.
+    pub(crate) id: Value,
+    /// The `result` member, when the client answered with one.
+    pub(crate) result: Option<Value>,
+    /// The `error` member, when the client refused.
+    pub(crate) error: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerRequest {
+    id: Value,
+    /// The request's thread, from `threadId`/`conversationId`; used to route
+    /// the `serverRequest/resolved` broadcast.
+    thread_id: Option<String>,
+}
+
 /// The state one fake server exposes to its test.
 struct State {
     user_agent: String,
@@ -331,6 +353,12 @@ struct State {
     model_list_calls: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
+    /// Server-initiated requests the fake server broadcast, in send order.
+    server_requests: std::sync::Mutex<Vec<ServerRequest>>,
+    /// Every answer a client sent to one of them.
+    server_request_replies: std::sync::Mutex<Vec<ServerRequestReply>>,
+    /// The next id the server assigns to a request it initiates.
+    next_server_request: AtomicUsize,
 }
 
 impl Default for State {
@@ -375,6 +403,9 @@ impl Default for State {
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             model_list_calls: AtomicUsize::new(0),
             page_size: 2,
+            server_requests: std::sync::Mutex::new(Vec::new()),
+            server_request_replies: std::sync::Mutex::new(Vec::new()),
+            next_server_request: AtomicUsize::new(1000),
         }
     }
 }
@@ -515,6 +546,83 @@ impl FakeServer {
         };
         streams.retain(|(_, stream)| stream.send(message.clone()).is_ok());
         streams.len()
+    }
+
+    /// Send one server-initiated request to the subscribers of `thread_id` —
+    /// the spike's shape: an approval reaches **every** subscriber, not only
+    /// the turn's initiator. Returns the id the server chose.
+    pub(crate) fn request_to_subscribers(&self, thread_id: &str, method: &str, mut params: Value) -> Value {
+        let id = Value::from(self.state.next_server_request.fetch_add(1, Ordering::SeqCst) as u64);
+        if let Value::Object(object) = &mut params
+            && !object.contains_key("threadId")
+        {
+            object.insert("threadId".to_string(), json!(thread_id));
+        }
+        self.state
+            .server_requests
+            .lock()
+            .expect("server requests")
+            .push(ServerRequest {
+                id: id.clone(),
+                thread_id: Some(thread_id.to_string()),
+            });
+        let message = Message::Text(
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+                .to_string()
+                .into(),
+        );
+        if let Some(streams) = self
+            .state
+            .subscribers
+            .lock()
+            .expect("subscribers")
+            .get_mut(thread_id)
+        {
+            streams.retain(|(_, stream)| stream.send(message.clone()).is_ok());
+        }
+        id
+    }
+
+    /// Send one server-initiated request to every live connection, whether it
+    /// subscribed or not (a server-global request, such as an account token
+    /// refresh).
+    pub(crate) fn request_to_all(&self, method: &str, params: Value) -> Value {
+        let id = Value::from(self.state.next_server_request.fetch_add(1, Ordering::SeqCst) as u64);
+        self.state
+            .server_requests
+            .lock()
+            .expect("server requests")
+            .push(ServerRequest {
+                id: id.clone(),
+                thread_id: None,
+            });
+        let message = Message::Text(
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+                .to_string()
+                .into(),
+        );
+        self.state
+            .live
+            .lock()
+            .expect("live connections")
+            .retain(|(_, connection)| connection.send(message.clone()).is_ok());
+        id
+    }
+
+    /// Every answer clients sent to a server-initiated request.
+    pub(crate) fn server_request_replies(&self) -> Vec<ServerRequestReply> {
+        self.state
+            .server_request_replies
+            .lock()
+            .expect("server request replies")
+            .clone()
+    }
+
+    /// Wait until at least `expected` answers arrived; the client's frame is
+    /// asynchronous, so asserting in the same tick races its writer.
+    pub(crate) async fn wait_for_server_request_replies(&self, expected: usize) {
+        let replies = || self.server_request_replies().len();
+        wait_until(replies, expected, "server request replies").await;
     }
 
     /// Push one completed agent-message item to a thread's subscribers.
@@ -895,6 +1003,15 @@ async fn handle_call<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // No method means this is the client's ANSWER to a request the server
+    // initiated (JSON-RPC responses are the only method-less frames a client
+    // sends). Record it, then resolve the request for every subscriber — the
+    // real server's `serverRequest/resolved` shape, which is what withdraws
+    // the card on the other client.
+    if value.get("method").is_none() {
+        handle_server_response(state, connection_id, &value);
+        return true;
+    }
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let params = value.get("params").cloned().unwrap_or(Value::Null);
     match value.get("method").and_then(Value::as_str) {
@@ -1366,6 +1483,63 @@ where
             }
         }
         _ => true,
+    }
+}
+
+/// Record one client answer to a server-initiated request and broadcast the
+/// resolution, modelling the real server's peer behaviour: whichever client
+/// answers, every subscriber sees `serverRequest/resolved`.
+fn handle_server_response(state: &State, connection_id: usize, value: &Value) {
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
+    let result = value.get("result").cloned();
+    let error = value.get("error").cloned();
+    state
+        .server_request_replies
+        .lock()
+        .expect("server request replies")
+        .push(ServerRequestReply {
+            connection: connection_id,
+            id: id.clone(),
+            result,
+            error,
+        });
+
+    let request = state
+        .server_requests
+        .lock()
+        .expect("server requests")
+        .iter()
+        .find(|request| request.id == id)
+        .cloned();
+    let Some(request) = request else {
+        // A response to something this server never asked (a client bug, or a
+        // second answer after the first resolved it). Recorded above; nothing
+        // to broadcast.
+        return;
+    };
+    match request.thread_id {
+        Some(thread_id) => emit(
+            state,
+            &thread_id,
+            "serverRequest/resolved",
+            json!({ "threadId": thread_id, "requestId": id }),
+        ),
+        None => {
+            let message = Message::Text(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "serverRequest/resolved",
+                    "params": { "requestId": id },
+                })
+                .to_string()
+                .into(),
+            );
+            state
+                .live
+                .lock()
+                .expect("live connections")
+                .retain(|(_, connection)| connection.send(message.clone()).is_ok());
+        }
     }
 }
 

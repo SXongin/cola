@@ -180,6 +180,12 @@ impl DirectoryBackend for BackendDirectory {
 /// [`Self::task_runtime`], [`Self::background_tasks_supported`],
 /// [`Self::shell_output`] and [`Self::child_evidence`].
 ///
+/// One more default is structural rather than a missing surface:
+/// [`Self::is_addressable_session_id`] answers the `ses…` id shape both
+/// OpenCode generations mint, and a client whose ids have another shape (Codex
+/// thread UUIDs) overrides it so its requests are not filtered out as
+/// unaddressable.
+///
 /// A future adapter (spec #860) is expected to leave all thirteen defaulted when
 /// the runtime it attaches to publishes no equivalent surface, and to override
 /// the ones it does publish; the rest of the trait — session lifecycle,
@@ -464,6 +470,16 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// List the pending forms/questions for one directory/instance (the same
     /// per-directory read as [`Self::list_permissions`]).
     async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>>;
+
+    /// Whether `id` can name a Session on this client at all. Every OpenCode
+    /// generation mints `ses…` ids, so the default preserves the structural
+    /// filter that keeps a session-less request (`global`, an empty optional
+    /// id) from paying a doomed read every tick. Codex mints UUID thread ids,
+    /// which are just as addressable — the prefix rule must not silently drop
+    /// every Codex approval.
+    fn is_addressable_session_id(&self, id: &str) -> bool {
+        id.starts_with("ses")
+    }
 
     /// Answer a pending form/question with keyed answers (V2's `Form.Answer`);
     /// V1 flattens the values into its positional `answers` arrays.

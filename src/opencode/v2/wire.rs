@@ -416,6 +416,7 @@ impl RawPermission {
             patterns: self.resources,
             metadata: self.metadata,
             always: self.save,
+            always_supported: true,
         }
     }
 }
@@ -443,6 +444,7 @@ impl RawForm {
             session_id: self.session_id,
             title: self.title,
             questions: self.fields.into_iter().map(RawFormField::into_neutral).collect(),
+            uncollectable: None,
         }
     }
 }

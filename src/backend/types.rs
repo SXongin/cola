@@ -443,6 +443,16 @@ fn field_answer(field: &QuestionInfo, values: &[String]) -> Option<FormValue> {
     }
 }
 
+/// Why a question request cannot be collected on a card at all. The neutral
+/// shape carries only the reason; each surface renders its own copy (the
+/// Feishu card owns the user-facing wording).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncollectableReason {
+    /// The answer is secret; a shared card would expose it, and cola has no
+    /// private input channel.
+    SecretInput,
+}
+
 /// A pending question (V1) / form (V2) request: the AI asks the user one or
 /// more typed fields and blocks until answered or cancelled.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -452,6 +462,26 @@ pub struct QuestionRequest {
     /// The form's title (V2 `Form.Info.title`); empty for V1 questions.
     pub title: String,
     pub questions: Vec<QuestionInfo>,
+    /// Set when the request has no answerable fields: the surface must show
+    /// the reason and offer only a decline. The neutral shape carries the
+    /// reason, never the user-facing copy.
+    pub uncollectable: Option<UncollectableReason>,
+}
+
+impl QuestionRequest {
+    /// A request cola cannot safely collect at all — a secret input, which
+    /// would be visible on a shared card. The shape is a request with no
+    /// fields and a named reason, so every surface can show its own copy and
+    /// only a reject control; the reject path declines the request.
+    pub fn uncollectable(session_id: &str) -> Self {
+        Self {
+            id: String::new(),
+            session_id: session_id.to_string(),
+            title: String::new(),
+            questions: Vec::new(),
+            uncollectable: Some(UncollectableReason::SecretInput),
+        }
+    }
 }
 
 /// A session's run state as reported by the server (`GET /session/status`).
@@ -494,6 +524,18 @@ pub struct PermissionRequest {
     pub metadata: Option<serde_json::Value>,
     #[serde(default)]
     pub always: Vec<String>,
+    /// Whether the backend advertised a **session-scoped** "always allow" for
+    /// this request. The card offers the 始终允许 button (and says what the
+    /// scope means) only then. Defaults to `true`: every OpenCode generation
+    /// offers its always rule, and a backend whose protocol advertises the
+    /// decision only for some request kinds sets it per request. The neutral
+    /// model names the decision by its scope, never by a client's wire value.
+    #[serde(default = "always_supported_default")]
+    pub always_supported: bool,
+}
+
+fn always_supported_default() -> bool {
+    true
 }
 
 #[cfg(test)]

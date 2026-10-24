@@ -169,6 +169,11 @@ pub(crate) struct CodexClient {
     /// The adapter-internal transcript cache (#879): subscriptions fold into
     /// it, and `Backend::transcript` reads it without waiting.
     pub(crate) projections: Arc<Projections>,
+    /// The server-initiated approvals and questions this connection received
+    /// (#882). One record per connection: an approval reaches every
+    /// subscriber, and this is where one connection's copy waits for an
+    /// answer.
+    pub(crate) approvals: Arc<super::approvals::Approvals>,
     /// The Background Task State handle, shared with the bridge.
     pub(crate) tasks: TasksHandle,
     /// The turns cola started, so the External Message question is answered
@@ -251,11 +256,18 @@ impl CodexClient {
         let projections = Arc::new(Projections::default());
         projections.watch_thread_status(&connection);
 
+        // Record server-initiated requests before any subscription can produce
+        // one: an approval is answered on this connection's inbound stream, and
+        // a missed request would leave the server waiting.
+        let approvals = Arc::new(super::approvals::Approvals::default());
+        approvals.watch(&connection, &projections);
+
         Ok(Self {
             threads: Threads::new(connection.clone()),
             connection,
             endpoint: options.endpoint.clone(),
             projections,
+            approvals,
             tasks: options.tasks.clone(),
             authored: options.authored.clone(),
             skills: Arc::new(SkillCatalog::default()),

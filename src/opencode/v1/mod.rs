@@ -722,6 +722,7 @@ impl WirePermission {
             patterns: self.patterns,
             metadata: self.metadata,
             always: self.always,
+            always_supported: true,
         }
     }
 }
@@ -791,6 +792,7 @@ impl WireQuestion {
                     url: None,
                 })
                 .collect(),
+            uncollectable: None,
         }
     }
 }

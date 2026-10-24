@@ -14,6 +14,7 @@ async fn permission_poller_sends_card_and_card_action_replies() {
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let (app, _platform) = build_app(cfg, backend).await;
 
@@ -124,6 +125,7 @@ async fn inline_permission_click_carries_the_receipt_in_the_ack() {
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let (app, platform) = build_app(cfg, backend).await;
 
@@ -393,6 +395,7 @@ async fn permission_poller_recovers_when_a_list_call_hangs() {
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     // The first list call hangs forever, like a request in flight when the
     // server was SIGTERM'd; later calls serve normally.
@@ -457,6 +460,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             patterns: vec!["ls -la".into()],
             metadata: None,
             always: Vec::new(),
+            always_supported: true,
         },
         // A second, already-pending request for the same session — the
         // toggle approves it too and must drop its inline section in the
@@ -470,6 +474,7 @@ async fn autoaccept_toggle_on_permission_card_flips_flag_and_approves() {
             patterns: vec!["*.rs".into()],
             metadata: Some(serde_json::json!({ "filepath": "src/main.rs" })),
             always: Vec::new(),
+            always_supported: true,
         },
     ]);
     let perm_calls = backend.reply_permission_calls.clone();
@@ -954,6 +959,7 @@ async fn auto_accept_session_answers_permission_without_card() {
         patterns: vec!["ls".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let perm_calls = mock.reply_permission_calls.clone();
     let reply_sessions = mock.reply_permission_sessions.clone();
@@ -1032,6 +1038,7 @@ async fn autoaccept_on_approves_already_pending_permission() {
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, _platform) = build_app(cfg, mock).await;
@@ -1091,6 +1098,7 @@ async fn autoaccept_on_approves_child_session_permission() {
         patterns: vec!["rm -rf x".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     mock.with_session_parent("ses_child", "ses_test");
     let perm_calls = mock.reply_permission_calls.clone();
@@ -1285,6 +1293,7 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
         patterns: vec!["cargo build".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let (app, platform) = build_app(cfg, backend).await;
 
@@ -1351,6 +1360,7 @@ fn perm_req(id: &str, session: &str, pattern: &str) -> crate::backend::types::Pe
         patterns: vec![pattern.into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }
 }
 

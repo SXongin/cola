@@ -1,5 +1,7 @@
 use serde_json::json;
 
+use crate::backend::types::UncollectableReason;
+
 use super::shell::card_shell;
 
 /// A single-select question with more options than this collapses them all
@@ -13,16 +15,23 @@ const MAX_VISIBLE_OPTIONS: usize = 3;
 /// value keep the raw text.
 const CUSTOM_ANSWER_LABEL_CHARS: usize = 20;
 
-/// The four permission buttons (Allow Once / Allow Always / Deny / Auto-Accept),
-/// as body elements. Shared by the standalone permission card and the inline
-/// section on the streaming card. The fourth turns on the session's Auto-Accept
-/// (cola-side, `/autoaccept`), distinct from "Allow Always" which is a
-/// backend-side per-type rule.
+/// The copy that explains what the session-scoped Always button means. Pinned
+/// here, beside the button, so the card cannot describe a scope it does not
+/// offer — and an adapter never writes UI copy.
+pub(crate) const SESSION_ALWAYS_NOTE: &str = "🔁 始终允许：本会话内后续同类请求将自动批准";
+
+/// The permission controls, as body elements: Allow Once / Allow Always (only
+/// when the backend advertised a session-scoped grant) / Deny / Auto-Accept.
+/// Shared by the standalone permission card and the inline section on the
+/// streaming card. The fourth turns on the session's Auto-Accept (cola-side,
+/// `/autoaccept`), distinct from "Allow Always" which is a backend-side
+/// session rule.
 pub fn permission_buttons(
     session_id: &str,
     request_id: &str,
     body: &str,
     directory: &str,
+    always_supported: bool,
 ) -> Vec<serde_json::Value> {
     let btn_value = |reply: &str, label: &str, color: &str| {
         json!({
@@ -36,12 +45,23 @@ pub fn permission_buttons(
             "perm_body": body,
         })
     };
-    vec![
+    let mut elements = Vec::new();
+    if always_supported {
+        elements.push(json!({ "tag": "markdown", "content": SESSION_ALWAYS_NOTE }));
+    }
+    elements.push(
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许一次" }, "type": "primary", "value": btn_value("once", "✅ 已允许一次", "green") }),
-        json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 始终允许" }, "type": "default", "value": btn_value("always", "✅ 已始终允许", "green") }),
+    );
+    if always_supported {
+        elements.push(
+            json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🔁 始终允许" }, "type": "default", "value": btn_value("always", "✅ 已始终允许", "green") }),
+        );
+    }
+    elements.extend([
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "🚫 拒绝" }, "type": "danger", "value": btn_value("reject", "🚫 已拒绝", "red") }),
         json!({ "tag": "button", "text": { "tag": "plain_text", "content": "⚡ 开启自动授权" }, "type": "primary", "value": btn_value("autoaccept", "✅ 已开启自动授权", "blue") }),
-    ]
+    ]);
+    elements
 }
 
 /// Build the interactive permission card (JSON 2.0). Buttons sit directly in
@@ -54,10 +74,17 @@ pub fn build_permission_card(
     request_id: &str,
     body: &str,
     directory: &str,
+    always_supported: bool,
 ) -> serde_json::Value {
     let body = super::sanitize::CardMarkdown::new().clean(body);
     let mut elements = vec![json!({ "tag": "markdown", "content": body })];
-    elements.extend(permission_buttons(session_id, request_id, &body, directory));
+    elements.extend(permission_buttons(
+        session_id,
+        request_id,
+        &body,
+        directory,
+        always_supported,
+    ));
     card_shell("🔐 权限请求", "orange", elements)
 }
 
@@ -91,6 +118,21 @@ pub fn question_summary(questions: &[crate::backend::types::QuestionInfo]) -> St
     super::sanitize::CardMarkdown::new().clean(&s)
 }
 
+/// The card copy for a question cola cannot collect at all. The neutral model
+/// carries only [`UncollectableReason`]; the user-facing wording lives here,
+/// in the card copy table, and every rendering path (standalone, inline,
+/// snapshot) asks for it.
+pub(crate) fn uncollectable_note(reason: UncollectableReason) -> &'static str {
+    match reason {
+        UncollectableReason::SecretInput => {
+            "该提问需要私密输入，cola 无法在卡片上安全收集；请在这里拒绝，必要时请在原始客户端重新发起该提问。"
+        }
+    }
+}
+
+/// The header of a standalone card whose request cannot be collected at all.
+pub(crate) const UNCOLLECTABLE_HEADER: &str = "❓ 无法在卡片上作答";
+
 /// The body elements of a form prompt (spec #364, S6). Each typed field renders
 /// as its own block — a markdown heading (number, title, description, status)
 /// followed by the controls its kind demands, with a divider between blocks:
@@ -114,7 +156,16 @@ pub fn question_summary(questions: &[crate::backend::types::QuestionInfo]) -> St
 /// remaining); a reject/cancel button sits at the bottom. The card callback
 /// (`action: "question"`) posts the keyed answer back to the session. Shared by
 /// the standalone question card and the inline section on the streaming card.
+///
+/// `title` (an elicitation's message) and `uncollectable` render at the top of
+/// the block: the standalone card passes an empty title because its header
+/// carries it, while inline and snapshot blocks show both here. An
+/// `uncollectable` request renders its reason and a decline control only —
+/// never a field an answer could be typed into.
+#[allow(clippy::too_many_arguments)] // title, reason, routing, fields, display state
 pub fn question_elements(
+    title: &str,
+    uncollectable: Option<UncollectableReason>,
     request_id: &str,
     session_id: &str,
     questions: &[crate::backend::types::QuestionInfo],
@@ -131,192 +182,212 @@ pub fn question_elements(
     // (one budget for the block; a question rarely carries tables).
     let mut md = super::sanitize::CardMarkdown::new();
 
-    for (i, q) in questions.iter().enumerate() {
-        let multi = q.is_multi();
-        let finalized = is_done(i);
+    // The request's own title (an elicitation's message, for example) belongs
+    // on every surface; the standalone card puts it in the header and passes
+    // an empty title here, while inline and snapshot blocks render it here.
+    if !title.is_empty() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": md.clean(&format!("**{}**", title)),
+        }));
+    }
+    if let Some(reason) = uncollectable {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": md.clean(uncollectable_note(reason)),
+        }));
+    }
 
-        // Per-question heading: number + text + status, option bullets while
-        // the question is still open (so the full option list reads together
-        // with the controls right below), and the running selection.
-        let mut heading = String::new();
-        if finalized {
-            // The finished block keeps the full question text (falling back to
-            // the short title when the field has no description).
-            let label = if q.question.is_empty() {
-                q.title()
-            } else {
-                q.question.as_str()
-            };
-            heading.push_str(&format!("✅ **{}. {}**", i + 1, label));
-        } else {
-            heading.push_str(&format!(
-                "**{}. {}{}**",
-                i + 1,
-                q.title(),
-                if multi { "（可多选）" } else { "" }
-            ));
-            if !q.header.is_empty() && q.header != q.question {
-                heading.push_str(&format!("\n{}", q.question));
-            }
-            for opt in &q.options {
-                if opt.description.is_empty() {
-                    heading.push_str(&format!("\n- {}", opt.label));
+    if uncollectable.is_none() {
+        for (i, q) in questions.iter().enumerate() {
+            let multi = q.is_multi();
+            let finalized = is_done(i);
+
+            // Per-question heading: number + text + status, option bullets while
+            // the question is still open (so the full option list reads together
+            // with the controls right below), and the running selection.
+            let mut heading = String::new();
+            if finalized {
+                // The finished block keeps the full question text (falling back to
+                // the short title when the field has no description).
+                let label = if q.question.is_empty() {
+                    q.title()
                 } else {
-                    heading.push_str(&format!("\n- {} ({})", opt.label, opt.description));
+                    q.question.as_str()
+                };
+                heading.push_str(&format!("✅ **{}. {}**", i + 1, label));
+            } else {
+                heading.push_str(&format!(
+                    "**{}. {}{}**",
+                    i + 1,
+                    q.title(),
+                    if multi { "（可多选）" } else { "" }
+                ));
+                if !q.header.is_empty() && q.header != q.question {
+                    heading.push_str(&format!("\n{}", q.question));
+                }
+                for opt in &q.options {
+                    if opt.description.is_empty() {
+                        heading.push_str(&format!("\n- {}", opt.label));
+                    } else {
+                        heading.push_str(&format!("\n- {} ({})", opt.label, opt.description));
+                    }
+                }
+                if let Some(url) = &q.url {
+                    heading.push_str(&format!("\n🔗 {url}"));
                 }
             }
-            if let Some(url) = &q.url {
-                heading.push_str(&format!("\n🔗 {url}"));
+            if let Some(values) = selected(i).filter(|values| !values.is_empty()) {
+                heading.push_str(&format!("\n👉 已选：{}", q.display_values(values).join("、")));
             }
-        }
-        if let Some(values) = selected(i).filter(|values| !values.is_empty()) {
-            heading.push_str(&format!("\n👉 已选：{}", q.display_values(values).join("、")));
-        }
-        let heading = md.clean(&heading);
-        elements.push(json!({ "tag": "markdown", "content": heading }));
+            let heading = md.clean(&heading);
+            elements.push(json!({ "tag": "markdown", "content": heading }));
 
-        if finalized {
-            // Answered / confirmed: no controls, just the 已选 line above.
-        } else {
-            match q.kind {
-                // An external link is not answerable; acknowledging it is the
-                // only valid answer (the form schema requires the `true`).
-                FormFieldKind::External => {
-                    let mut value = question_value(request_id, session_id, directory, i, "answer");
-                    value["answer"] = json!("true");
-                    elements.push(json!({
-                        "tag": "button",
-                        "text": { "tag": "plain_text", "content": "✅ 我已了解" },
-                        "type": "primary",
-                        "value": value,
-                    }));
-                }
-                // A boolean finalizes on one click, like a single-select: the
-                // answer value is the JSON boolean the form schema expects.
-                FormFieldKind::Boolean => {
-                    for (label, answer, button_type) in
-                        [("✅ 是", "true", "primary"), ("否", "false", "default")]
-                    {
+            if finalized {
+                // Answered / confirmed: no controls, just the 已选 line above.
+            } else {
+                match q.kind {
+                    // An external link is not answerable; acknowledging it is the
+                    // only valid answer (the form schema requires the `true`).
+                    FormFieldKind::External => {
                         let mut value = question_value(request_id, session_id, directory, i, "answer");
-                        value["answer"] = json!(answer);
+                        value["answer"] = json!("true");
                         elements.push(json!({
                             "tag": "button",
-                            "text": { "tag": "plain_text", "content": label },
-                            "type": button_type,
+                            "text": { "tag": "plain_text", "content": "✅ 我已了解" },
+                            "type": "primary",
                             "value": value,
                         }));
                     }
-                }
-                // A numeric field has no options: a typed input plus its
-                // submit is its only control, and the text is parsed into the
-                // field's number at reply time.
-                FormFieldKind::Number | FormFieldKind::Integer => {
-                    elements.push(number_answer_form(request_id, session_id, directory, i));
-                }
-                // String / Multiselect: an option picker when the field
-                // declares options (the question tool always does) plus the
-                // custom-answer input; a String with none is just the input.
-                FormFieldKind::String | FormFieldKind::Multiselect => {
-                    if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
-                        let options: Vec<serde_json::Value> = q
-                            .options
-                            .iter()
-                            .map(|opt| {
-                                json!({
-                                    "text": { "tag": "plain_text", "content": opt.label },
-                                    "value": format!("{}|{}", i, opt.answer_value()),
-                                })
-                            })
-                            .collect();
-                        elements.push(json!({
-                            "tag": "overflow",
-                            "width": "fill",
-                            "options": options,
-                            "value": question_value(request_id, session_id, directory, i, "answer"),
-                        }));
-                    } else {
-                        for opt in &q.options {
-                            // Multi-select buttons show their selected state so
-                            // the user can see what's already picked while
-                            // still toggling. Selection matches the submitted
-                            // VALUE; the label is display only.
-                            let is_selected = multi
-                                && selected(i).is_some_and(|values| {
-                                    values.iter().any(|value| value == opt.answer_value())
-                                });
+                    // A boolean finalizes on one click, like a single-select: the
+                    // answer value is the JSON boolean the form schema expects.
+                    FormFieldKind::Boolean => {
+                        for (label, answer, button_type) in
+                            [("✅ 是", "true", "primary"), ("否", "false", "default")]
+                        {
                             let mut value = question_value(request_id, session_id, directory, i, "answer");
-                            value["answer"] = json!(opt.answer_value());
+                            value["answer"] = json!(answer);
                             elements.push(json!({
                                 "tag": "button",
-                                "text": {
-                                    "tag": "plain_text",
-                                    "content": if is_selected {
-                                        format!("✅ {}", opt.label)
-                                    } else {
-                                        opt.label.clone()
-                                    },
-                                },
-                                "type": if is_selected { "primary" } else { "default" },
+                                "text": { "tag": "plain_text", "content": label },
+                                "type": button_type,
                                 "value": value,
                             }));
                         }
                     }
-
-                    // Custom Answers: user-typed entries in the selection,
-                    // rendered as selected buttons exactly like a picked option
-                    // — a click removes the entry through the same toggle path
-                    // (`reply: "answer"`). The button label is display-only
-                    // (whitespace collapsed, long text truncated); the value
-                    // carries the raw answer verbatim.
-                    if multi && let Some(values) = selected(i) {
-                        for value in values {
-                            if q.options.iter().any(|opt| opt.answer_value() == value) {
-                                continue;
+                    // A numeric field has no options: a typed input plus its
+                    // submit is its only control, and the text is parsed into the
+                    // field's number at reply time.
+                    FormFieldKind::Number | FormFieldKind::Integer => {
+                        elements.push(number_answer_form(request_id, session_id, directory, i));
+                    }
+                    // String / Multiselect: an option picker when the field
+                    // declares options (the question tool always does) plus the
+                    // custom-answer input; a String with none is just the input.
+                    FormFieldKind::String | FormFieldKind::Multiselect => {
+                        if !multi && q.options.len() > MAX_VISIBLE_OPTIONS {
+                            let options: Vec<serde_json::Value> = q
+                                .options
+                                .iter()
+                                .map(|opt| {
+                                    json!({
+                                        "text": { "tag": "plain_text", "content": opt.label },
+                                        "value": format!("{}|{}", i, opt.answer_value()),
+                                    })
+                                })
+                                .collect();
+                            elements.push(json!({
+                                "tag": "overflow",
+                                "width": "fill",
+                                "options": options,
+                                "value": question_value(request_id, session_id, directory, i, "answer"),
+                            }));
+                        } else {
+                            for opt in &q.options {
+                                // Multi-select buttons show their selected state so
+                                // the user can see what's already picked while
+                                // still toggling. Selection matches the submitted
+                                // VALUE; the label is display only.
+                                let is_selected = multi
+                                    && selected(i).is_some_and(|values| {
+                                        values.iter().any(|value| value == opt.answer_value())
+                                    });
+                                let mut value =
+                                    question_value(request_id, session_id, directory, i, "answer");
+                                value["answer"] = json!(opt.answer_value());
+                                elements.push(json!({
+                                    "tag": "button",
+                                    "text": {
+                                        "tag": "plain_text",
+                                        "content": if is_selected {
+                                            format!("✅ {}", opt.label)
+                                        } else {
+                                            opt.label.clone()
+                                        },
+                                    },
+                                    "type": if is_selected { "primary" } else { "default" },
+                                    "value": value,
+                                }));
                             }
-                            let mut payload = question_value(request_id, session_id, directory, i, "answer");
-                            payload["answer"] = json!(value);
+                        }
+
+                        // Custom Answers: user-typed entries in the selection,
+                        // rendered as selected buttons exactly like a picked option
+                        // — a click removes the entry through the same toggle path
+                        // (`reply: "answer"`). The button label is display-only
+                        // (whitespace collapsed, long text truncated); the value
+                        // carries the raw answer verbatim.
+                        if multi && let Some(values) = selected(i) {
+                            for value in values {
+                                if q.options.iter().any(|opt| opt.answer_value() == value) {
+                                    continue;
+                                }
+                                let mut payload =
+                                    question_value(request_id, session_id, directory, i, "answer");
+                                payload["answer"] = json!(value);
+                                elements.push(json!({
+                                    "tag": "button",
+                                    "text": {
+                                        "tag": "plain_text",
+                                        "content": format!("✅ {}", custom_answer_label(value)),
+                                    },
+                                    "type": "primary",
+                                    "value": payload,
+                                }));
+                            }
+                        }
+
+                        // Free-text answer (V1 questions allow custom by default).
+                        // The typed text arrives in `action.form_value`; ws.rs
+                        // injects it into the answer payload. Single-select submits
+                        // a replacement (`reply: "answer"`); a multi-select ADDS
+                        // the typed label to the toggled set (`reply: "custom"`),
+                        // so the two never collide. A String field with no options
+                        // always renders it — otherwise the field has no control.
+                        if q.custom_allowed() || (q.kind == FormFieldKind::String && q.options.is_empty()) {
+                            elements.push(custom_answer_form(request_id, session_id, directory, i, multi));
+                        }
+
+                        // Multi-select: the commit action sits right under its own
+                        // options instead of a far-away bottom submit. Clicking
+                        // locks the toggled set (empty allowed — "不选") and
+                        // collapses the question to 已选.
+                        if multi {
                             elements.push(json!({
                                 "tag": "button",
-                                "text": {
-                                    "tag": "plain_text",
-                                    "content": format!("✅ {}", custom_answer_label(value)),
-                                },
+                                "text": { "tag": "plain_text", "content": "✅ 确定该题" },
                                 "type": "primary",
-                                "value": payload,
+                                "value": question_value(request_id, session_id, directory, i, "confirm"),
                             }));
                         }
                     }
-
-                    // Free-text answer (V1 questions allow custom by default).
-                    // The typed text arrives in `action.form_value`; ws.rs
-                    // injects it into the answer payload. Single-select submits
-                    // a replacement (`reply: "answer"`); a multi-select ADDS
-                    // the typed label to the toggled set (`reply: "custom"`),
-                    // so the two never collide. A String field with no options
-                    // always renders it — otherwise the field has no control.
-                    if q.custom_allowed() || (q.kind == FormFieldKind::String && q.options.is_empty()) {
-                        elements.push(custom_answer_form(request_id, session_id, directory, i, multi));
-                    }
-
-                    // Multi-select: the commit action sits right under its own
-                    // options instead of a far-away bottom submit. Clicking
-                    // locks the toggled set (empty allowed — "不选") and
-                    // collapses the question to 已选.
-                    if multi {
-                        elements.push(json!({
-                            "tag": "button",
-                            "text": { "tag": "plain_text", "content": "✅ 确定该题" },
-                            "type": "primary",
-                            "value": question_value(request_id, session_id, directory, i, "confirm"),
-                        }));
-                    }
                 }
             }
-        }
 
-        // A divider separates question blocks so options never mix visually.
-        if i + 1 < questions.len() {
-            elements.push(json!({ "tag": "hr" }));
+            // A divider separates question blocks so options never mix visually.
+            if i + 1 < questions.len() {
+                elements.push(json!({ "tag": "hr" }));
+            }
         }
     }
 
@@ -338,7 +409,15 @@ pub fn question_elements(
             },
         }));
     }
-    elements.push(json!({
+    elements.push(question_reject_button(request_id, session_id, directory));
+
+    elements
+}
+
+/// The reject control every question block carries. One builder, so the
+/// uncollectable block and an ordinary question cannot drift.
+fn question_reject_button(request_id: &str, session_id: &str, directory: &str) -> serde_json::Value {
+    json!({
         "tag": "button",
         "text": { "tag": "plain_text", "content": "🚫 无法回答" },
         "type": "danger",
@@ -349,9 +428,7 @@ pub fn question_elements(
             "session_id": session_id,
             "directory": directory,
         },
-    }));
-
-    elements
+    })
 }
 
 /// The routing payload every per-question control carries: which request, which
@@ -498,13 +575,28 @@ pub fn build_question_card(
     answered: &[Option<Vec<String>>],
     done: &[bool],
 ) -> serde_json::Value {
-    let elements = question_elements(request_id, session_id, questions, directory, answered, done);
+    let elements = question_elements(
+        "", None, request_id, session_id, questions, directory, answered, done,
+    );
     let header = if title.is_empty() {
         "❓ AI 想问你".to_string()
     } else {
         format!("❓ {title}")
     };
     card_shell(&header, "blue", elements)
+}
+
+/// The standalone card for a request cola cannot collect at all: the reason's
+/// copy and the ordinary reject control, never a field the answer could be
+/// typed into.
+pub fn build_uncollectable_card(
+    reason: UncollectableReason,
+    request_id: &str,
+    session_id: &str,
+    directory: &str,
+) -> serde_json::Value {
+    let elements = question_elements("", Some(reason), request_id, session_id, &[], directory, &[], &[]);
+    card_shell(UNCOLLECTABLE_HEADER, "orange", elements)
 }
 
 #[cfg(test)]
@@ -992,8 +1084,60 @@ mod tests {
     }
 
     #[test]
+    fn an_uncollectable_question_renders_its_reason_and_a_decline() {
+        let elements = question_elements(
+            "",
+            Some(UncollectableReason::SecretInput),
+            "req_1",
+            "ses_1",
+            &[],
+            "/w",
+            &[],
+            &[],
+        );
+        let text = serde_json::to_string(&elements).expect("elements serialize");
+        assert!(text.contains("私密输入"), "the reason is shown: {text}");
+        assert!(
+            text.contains("重新发起"),
+            "the copy says how to retry safely: {text}"
+        );
+        assert!(
+            !elements.iter().any(|element| element["tag"] == "input"),
+            "no answer can be typed: {text}"
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|element| element["tag"] == "button" && element["value"]["reply"] == "reject"),
+            "the only control is the decline: {text}"
+        );
+    }
+
+    #[test]
+    fn a_question_title_renders_in_the_block_for_inline_surfaces() {
+        let elements = question_elements("把文件写入工作区？", None, "req_1", "ses_1", &[], "/w", &[], &[]);
+        let text = serde_json::to_string(&elements).expect("elements serialize");
+        assert!(
+            text.contains("把文件写入工作区？"),
+            "an elicitation's message renders inline: {text}"
+        );
+    }
+
+    #[test]
+    fn a_standalone_uncollectable_card_uses_the_copy_table() {
+        let card = build_uncollectable_card(UncollectableReason::SecretInput, "req_1", "ses_1", "/w");
+        assert_eq!(
+            card["header"]["title"]["content"].as_str().unwrap(),
+            UNCOLLECTABLE_HEADER
+        );
+        let text = card.to_string();
+        assert!(text.contains("私密输入"), "{text}");
+        assert!(!text.contains("\"tag\":\"input\""), "{text}");
+    }
+
+    #[test]
     fn permission_card_carries_reply_payload() {
-        let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash", "/tmp/proj/lib");
+        let card = build_permission_card("ses_abc", "per_123", "AI 想要执行 bash", "/tmp/proj/lib", true);
         assert_eq!(
             card["header"]["title"]["content"].as_str().unwrap(),
             "🔐 权限请求"
@@ -1019,10 +1163,44 @@ mod tests {
         assert_eq!(reject["perm_color"], "red");
         let always = values.iter().find(|v| v["reply"] == "always").unwrap();
         assert!(always["perm_label"].as_str().unwrap().contains("始终允许"));
+        // The session-scoped decision says what it means, beside the button.
+        assert!(
+            elements
+                .iter()
+                .any(|element| element["content"] == SESSION_ALWAYS_NOTE),
+            "the session scope copy is on the card"
+        );
         // The Auto-Accept toggle carries the session id so it can flip the flag.
         let autoaccept = values.iter().find(|v| v["reply"] == "autoaccept").unwrap();
         assert_eq!(autoaccept["session_id"], "ses_abc");
         assert_eq!(autoaccept["request_id"], "per_123");
+    }
+
+    /// A request whose backend did not advertise a session-scoped decision
+    /// offers neither the button nor its explanation — no silent
+    /// approximation of a session-scoped decision the wire cannot carry.
+    #[test]
+    fn permission_card_hides_the_session_decision_when_not_advertised() {
+        let card = build_permission_card(
+            "ses_abc",
+            "per_123",
+            "AI 想要申请额外权限",
+            "/tmp/proj/lib",
+            false,
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
+        assert_eq!(buttons.len(), 3);
+        assert!(
+            !buttons.iter().any(|button| button["value"]["reply"] == "always"),
+            "no session-scoped button: {card}"
+        );
+        assert!(
+            !elements
+                .iter()
+                .any(|element| element["content"] == SESSION_ALWAYS_NOTE),
+            "no scope copy without the decision: {card}"
+        );
     }
 
     /// A V2 form's typed fields render as their own controls: a string field's

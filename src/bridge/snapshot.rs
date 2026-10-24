@@ -709,6 +709,7 @@ mod tests {
                 patterns: vec!["ls".into()],
                 metadata: None,
                 always: vec![],
+                always_supported: true,
             },
             PermissionRequest {
                 request_id: "req_other".into(),
@@ -717,6 +718,7 @@ mod tests {
                 patterns: vec!["rm".into()],
                 metadata: None,
                 always: vec![],
+                always_supported: true,
             },
         ]);
         mock.ask_questions(vec![

@@ -33,6 +33,7 @@ async fn configured_default_marks_a_fresh_session_and_answers_permissions() {
         patterns: vec!["ls".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let perm_calls = mock.reply_permission_calls.clone();
     let (app, platform) = build_app(cfg, mock).await;

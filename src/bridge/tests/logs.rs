@@ -320,6 +320,7 @@ async fn a_surfaced_permission_carries_its_session_chat_and_topic() {
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let (app, _platform) = build_app(cfg, backend).await;
     let topic = ThreadKey::new("oc_chat".into(), "omt_topic".into());
