@@ -17,6 +17,7 @@
 | `sessions.json` | 飞书话题 ↔ 会话映射 | `[bridge] session_file` |
 | `chain_records.json` | 持久链记录：实时卡片、唤醒水位、任务结束、已送达位置 | 与 `session_file` 同目录 |
 | `interactive_surfaces.json` | 重启后重新接管的权限/问答卡片（ADR-0038） | 与 `session_file` 同目录 |
+| `authored_turns.json` | cola 自己发起的轮次；让自行分配 id 的客户端也能区分自己的消息与外部消息（ADR-0092） | 与 `session_file` 同目录 |
 | `pinned_chats.json` | 持久化的即时提醒置顶 | 与 `session_file` 同目录 |
 | `terminal-runs/` | 实时/已结束 `/run` 卡片的终端运行记录 | 与 `session_file` 同目录 |
 | `access.json` | 访问名单（机主；ADR-0035） | `[bridge] access_file` |
