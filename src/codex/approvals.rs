@@ -69,6 +69,23 @@ use super::transport::{RpcConnection, ServerEvent};
 /// The JSON-RPC error code for a method this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
 
+/// The JSON-RPC error code for an implementation-defined server error — here,
+/// a request refused because the connection already holds too many unresolved
+/// decisions.
+const TOO_MANY_PENDING: i64 = -32000;
+
+/// How many unresolved server decisions one connection may retain.
+///
+/// The stream that feeds this record is bounded (transport
+/// `SERVER_EVENT_CAPACITY`), but a peer can still leave requests unanswered:
+/// each is retained until the server resolves it, and a peer that never does
+/// would grow this map for the connection's lifetime. A turn blocks on one
+/// decision at a time, so a backlog this size is abuse rather than work. The
+/// **excess is refused by name** and never retained; an already-waiting
+/// decision is never evicted to make room, because that one may still be the
+/// card a user is about to answer.
+const MAX_PENDING: usize = 64;
+
 /// One approval/question request a server is waiting on, keyed by the canonical
 /// spelling of its id.
 struct Pending {
@@ -129,6 +146,10 @@ impl Approvals {
     /// for a request nobody waits on. Those are decisions, not transcript
     /// events a reader can repair from a later read, so they never share the
     /// lossy path.
+    ///
+    /// The close signal is watched beside the stream on purpose: when the
+    /// stream overflowed, the `Closed` frame could not be queued, so this is
+    /// the only edge that still clears the pending set.
     pub(crate) fn watch(self: &Arc<Self>, connection: &RpcConnection, projections: &Arc<Projections>) {
         // One connection installs one approval record (`CodexClient::connect`);
         // a second taker would silently record nothing, so say so loudly.
@@ -136,12 +157,37 @@ impl Approvals {
             tracing::warn!("the codex connection's server-request stream was already taken");
             return;
         };
+        let mut closing = connection.closing();
         let approvals = Arc::downgrade(self);
         let connection = connection.clone();
         let projections = Arc::clone(projections);
         let task = tokio::spawn(async move {
             loop {
-                match server_events.recv().await {
+                // Checked before the select as well: a connection closed
+                // before this task first ran has no pending `changed()` to
+                // wake it.
+                if *closing.borrow() {
+                    if let Some(approvals) = approvals.upgrade() {
+                        approvals.clear();
+                    }
+                    return;
+                }
+                let event = tokio::select! {
+                    event = server_events.recv() => event,
+                    changed = closing.changed() => {
+                        // A dropped sender means no later value can arrive, so
+                        // the connection is gone for good rather than merely
+                        // still-closing.
+                        if changed.is_err() {
+                            if let Some(approvals) = approvals.upgrade() {
+                                approvals.clear();
+                            }
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                match event {
                     Some(ServerEvent::Request { id, method, params }) => {
                         let Some(approvals) = approvals.upgrade() else {
                             return;
@@ -253,6 +299,34 @@ impl Approvals {
         }
         if let Some(question) = &mut decoded.question {
             question.id = key.clone();
+        }
+
+        // A packet the connection cannot answer is one this record cannot
+        // forget until the server resolves it, so the size is bounded here and
+        // the excess is refused by name (never retained, never evicted).
+        let at_capacity = {
+            let pending = self.pending.lock().expect("pending approvals");
+            pending.len() >= MAX_PENDING && !pending.contains_key(&key)
+        };
+        if at_capacity {
+            tracing::error!(
+                "codex server request `{method}` refused: {MAX_PENDING} decisions are already \
+                 unresolved on this connection"
+            );
+            if let Err(error) = connection
+                .respond_error(
+                    &id,
+                    TOO_MANY_PENDING,
+                    &format!(
+                        "cola already holds {MAX_PENDING} unresolved decisions on this connection; \
+                         this request was refused rather than queued"
+                    ),
+                )
+                .await
+            {
+                tracing::warn!("codex server request `{method}` cap refusal failed: {error}");
+            }
+            return;
         }
 
         let pending = Pending {
@@ -1849,5 +1923,69 @@ mod tests {
                 Err(Decode::Unsupported)
             ));
         }
+    }
+
+    /// Whole-branch re-review #883: unresolved decisions are bounded. A peer
+    /// that leaves requests unanswered must not grow the record for the
+    /// connection's lifetime; the excess is refused with a named JSON-RPC error
+    /// and never retained, while the decisions already waiting stay (one of
+    /// them may be the card a user is about to answer).
+    #[tokio::test]
+    async fn the_pending_cap_refuses_the_excess_by_name() {
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (connection, mut frames, _closing) = RpcConnection::test_connection(8);
+        let approvals = Approvals::default();
+        let projections = Arc::new(Projections::default());
+        let params = json!({
+            "threadId": "thread-1",
+            "itemId": "item-1",
+            "command": "ls",
+            "cwd": "/work",
+        });
+        for id in 0..MAX_PENDING {
+            approvals
+                .ingest(
+                    &connection,
+                    &projections,
+                    json!(id),
+                    "item/commandExecution/requestApproval".into(),
+                    params.clone(),
+                )
+                .await;
+        }
+        assert_eq!(approvals.permissions(None).len(), MAX_PENDING);
+
+        approvals
+            .ingest(
+                &connection,
+                &projections,
+                json!(MAX_PENDING),
+                "item/commandExecution/requestApproval".into(),
+                params,
+            )
+            .await;
+        assert_eq!(
+            approvals.permissions(None).len(),
+            MAX_PENDING,
+            "the excess is refused, not retained"
+        );
+
+        let Message::Text(text) = frames.try_recv().expect("the named refusal frame") else {
+            panic!("the refusal is a text frame");
+        };
+        let frame: Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(
+            frame["id"],
+            json!(MAX_PENDING),
+            "the refusal echoes the server's id"
+        );
+        assert_eq!(frame["error"]["code"], json!(TOO_MANY_PENDING));
+        assert!(
+            frame["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("unresolved decisions")),
+            "the reason is named: {frame}"
+        );
     }
 }
