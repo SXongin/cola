@@ -2,7 +2,9 @@ use serde_json::json;
 
 use crate::backend::types::UncollectableReason;
 
+use super::sanitize::CardMarkdown;
 use super::shell::card_shell;
+use super::tool_render::json_escaped_len;
 
 /// A single-select question with more options than this collapses them all
 /// into a folding `overflow` group instead of a tall stack of buttons (the
@@ -112,8 +114,16 @@ fn permission_button_count(always_supported: bool) -> usize {
 /// once as the block's element and once per button. The routing values come
 /// from the caller — a long directory is the common case, and a fixed overhead
 /// would let the streaming card's split underestimate itself past Feishu's
-/// limit. [`json_string_bytes`] charges JSON escaping, so the estimate is an
-/// upper bound on the block rather than a character count.
+/// limit.
+///
+/// The body is estimated **as the card renders it**, not as authored:
+/// [`CardMarkdown::element`] is what both the standalone card and the streaming
+/// body apply, and it expands `<` to `&#60;` (five bytes for one), so a
+/// 150-char reason of `<` would add 600 bytes per copy that a raw-length
+/// estimate missed. The result is then charged at its JSON-escaped length
+/// ([`json_escaped_len`]). The `BUTTON_OVERHEAD` margin also absorbs the
+/// fenced-fallback wrapper (a card whose content Feishu rejected renders the
+/// body verbatim inside one fence instead of cleaning it).
 pub(crate) fn permission_block_estimate(
     body: &str,
     always_supported: bool,
@@ -124,29 +134,18 @@ pub(crate) fn permission_block_estimate(
     // A button's own labels, action, reply, colour and JSON punctuation. CJK
     // labels cost three bytes a character, which is why this is generous.
     const BUTTON_OVERHEAD: usize = 360;
-    let body = json_string_bytes(body);
-    let routing =
-        json_string_bytes(request_id) + json_string_bytes(session_id) + json_string_bytes(directory);
+    // Both copies (the element and every button's `perm_body`) carry the
+    // cleaned body; `perm_body` is the same text `build_permission_card`
+    // passes after cleaning.
+    let body = json_escaped_len(&CardMarkdown::new().element(body));
+    let routing = json_escaped_len(request_id) + json_escaped_len(session_id) + json_escaped_len(directory);
     let buttons = permission_button_count(always_supported);
     let note = if always_supported {
-        json_string_bytes(SESSION_ALWAYS_NOTE) + 60
+        json_escaped_len(&CardMarkdown::new().element(SESSION_ALWAYS_NOTE)) + 60
     } else {
         0
     };
     body + buttons * (body + routing + BUTTON_OVERHEAD) + note
-}
-
-/// The bytes `text` contributes to a serialized JSON string, escaping
-/// included: a quote, backslash or newline doubles, and a control character
-/// costs six bytes.
-fn json_string_bytes(text: &str) -> usize {
-    text.chars()
-        .map(|c| match c {
-            '"' | '\\' | '\n' | '\r' | '\t' => 2,
-            c if (c as u32) < 0x20 => 6,
-            c => c.len_utf8(),
-        })
-        .sum()
 }
 
 /// Compact one-line target for a question's Interaction Receipt: each
@@ -1325,6 +1324,13 @@ mod tests {
     #[test]
     fn the_permission_block_estimate_covers_the_rendered_block() {
         let long_directory = format!("/work/{}", "a-project-directory/".repeat(12));
+        // A 150-character `<` reason: `CardMarkdown::clean` expands each `<` to
+        // `&#60;` (5 bytes), so a raw-length estimate under-counts every copy by
+        // 600 bytes — the case the cleaning step in the estimate exists for.
+        let angle_reason = format!(
+            "⚡ **执行 Shell 命令**\n**原因**: {}\n**对象**:\n- `ls`\n\nAI 想要执行这个操作，是否允许？",
+            "<".repeat(150)
+        );
         for (body, always, directory) in [
             ("⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n", true, "/d"),
             ("⚡ **执行 Shell 命令**\n**对象**:\n- `cargo test`\n", false, "/d"),
@@ -1334,6 +1340,7 @@ mod tests {
                 true,
                 long_directory.as_str(),
             ),
+            (angle_reason.as_str(), true, "/d"),
         ] {
             let card = build_permission_card("ses", "n:1", body, directory, always);
             let elements = card["body"]["elements"].as_array().expect("body elements");
@@ -1351,6 +1358,26 @@ mod tests {
         }
     }
 
+    /// Whole-branch re-review #883: the estimate must charge the **rendered**
+    /// body. `CardMarkdown` expands `<` to `&#60;`, so a reason full of `<` is
+    /// five times its authored length; a raw-byte estimate would let the split
+    /// reserve 600 bytes too little per copy.
+    #[test]
+    fn an_angle_bracket_reason_is_charged_at_its_sanitized_size() {
+        let reason = "<".repeat(150);
+        let body = format!("**原因**: {reason}");
+        let buttons = permission_block_components(true) - 1;
+        let estimate = permission_block_estimate(&body, true, "n:1", "ses", "/d");
+        let raw = permission_block_estimate(&"".repeat(0), true, "n:1", "ses", "/d");
+        let sanitized = crate::feishu::card::sanitize::CardMarkdown::new().element(&body);
+        assert_eq!(sanitized.len(), body.len() - 150 + 150 * "&#60;".len());
+        assert_eq!(
+            estimate - raw,
+            (1 + buttons) * json_escaped_len(&sanitized),
+            "the element and every button carry the cleaned body's bytes"
+        );
+    }
+
     /// Whole-branch re-review #883: a long directory is repeated in every
     /// button's callback value, so the block estimate must grow with it — a
     /// fixed overhead would let the streaming card's split exceed its budget.
@@ -1362,7 +1389,7 @@ mod tests {
         let buttons = permission_block_components(true) - 1;
         assert_eq!(
             long - short,
-            buttons * crate::feishu::card::question::json_string_bytes(&directory).saturating_sub(2),
+            buttons * json_escaped_len(&directory).saturating_sub(2),
             "every button pays for the directory it echoes"
         );
         assert!(long > short, "a longer directory can never estimate less");
