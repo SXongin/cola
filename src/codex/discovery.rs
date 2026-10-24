@@ -247,6 +247,21 @@ pub(crate) struct EmbeddedClient {
     pub(crate) evidence: &'static str,
 }
 
+/// A local Codex TUI that is **proven** to share the daemon: its `--remote`
+/// names the discovered control socket (or the socket the symlink resolves to).
+///
+/// This is the positive half of ADR-0090 decision 3's diagnosis: the user's
+/// own client is attached to the one runtime cola mirrors. A `--remote` that
+/// names another server is not this daemon, so it is not reported here (a
+/// process scan cannot judge someone else's endpoint).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttachedClient {
+    pub(crate) pid: i32,
+    pub(crate) binary: String,
+    /// The endpoint spelling the process was launched with, for the report.
+    pub(crate) endpoint: String,
+}
+
 /// A local Codex TUI that a daemon exists for, but whose argv cannot establish
 /// that it joined that daemon.
 ///
@@ -268,6 +283,8 @@ pub(crate) struct UnverifiedClient {
 pub(crate) struct LocalClients {
     /// Clients proven to run their own app-server.
     pub(crate) embedded: Vec<EmbeddedClient>,
+    /// Clients proven to share the discovered daemon (`--remote` names it).
+    pub(crate) attached: Vec<AttachedClient>,
     /// Clients sharing the daemon cannot be confirmed from argv.
     pub(crate) unverified: Vec<UnverifiedClient>,
 }
@@ -357,11 +374,12 @@ pub(crate) async fn discover(environment: &Environment) -> Result<Discovery> {
             })
         }
     };
-    let running = daemon.daemon().is_some();
+    let running = daemon.daemon();
+    let clients = local_clients(running.map(|daemon| daemon.socket.as_path()));
     Ok(Discovery {
         daemon,
         socket: identity,
-        clients: local_clients(running),
+        clients,
     })
 }
 
@@ -539,7 +557,11 @@ fn first_line(stderr: &[u8]) -> String {
 /// Thin I/O: the decisions are [`observe_client`], unit-tested on their own. The
 /// table is read with sysinfo so this works on every platform (there is no
 /// `/proc` on macOS or Windows).
-pub(crate) fn local_clients(daemon_running: bool) -> LocalClients {
+///
+/// `daemon` is the discovered control socket when a daemon is running. It is
+/// what proves a `--remote` client shares this daemon; `None` means no daemon,
+/// so a TUI with no `--remote` fell back to its own embedded server.
+pub(crate) fn local_clients(daemon: Option<&Path>) -> LocalClients {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -559,9 +581,10 @@ pub(crate) fn local_clients(daemon_running: bool) -> LocalClients {
             process.pid().as_u32() as i32,
             &process.name().to_string_lossy(),
             &arguments,
-            daemon_running,
+            daemon,
         ) {
             Some(Observation::Embedded(client)) => found.embedded.push(client),
+            Some(Observation::Attached(client)) => found.attached.push(client),
             Some(Observation::Unverified(client)) => found.unverified.push(client),
             None => {}
         }
@@ -569,6 +592,7 @@ pub(crate) fn local_clients(daemon_running: bool) -> LocalClients {
     // sysinfo enumerates in a randomized order; a report that changes shape
     // between two identical scans would be noise.
     found.embedded.sort_by_key(|client| client.pid);
+    found.attached.sort_by_key(|client| client.pid);
     found.unverified.sort_by_key(|client| client.pid);
     found
 }
@@ -651,6 +675,7 @@ fn tui_invocation(arguments: &[String]) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
     Embedded(EmbeddedClient),
+    Attached(AttachedClient),
     Unverified(UnverifiedClient),
 }
 
@@ -659,16 +684,18 @@ enum Observation {
 /// `--no-daemon` is the documented, decisive opt-out (`Run without the shared
 /// background server`), and Codex only accepts it on the TUI. A TUI with no
 /// daemon running and no `--remote` endpoint has nowhere else to attach, so it
-/// fell back to its in-process server. With a daemon present, a TUI's argv does
-/// **not** prove it joined it — one started before the daemon appeared stays on
-/// its private server — so it is reported as unverified, never assumed to
-/// share. A `--remote` client names its server, which a process scan cannot
-/// judge, so it is not reported either way.
+/// fell back to its in-process server. A `--remote` TUI names its server, so it
+/// is **attached** exactly when that endpoint is the discovered daemon's
+/// control socket (compared after following symlinks), and not reported when it
+/// names another server. With a daemon present, a TUI's argv without `--remote`
+/// does **not** prove it joined it — one started before the daemon appeared
+/// stays on its private server — so it is reported as unverified, never assumed
+/// to share.
 fn observe_client(
     pid: i32,
     process_name: &str,
     arguments: &[String],
-    daemon_running: bool,
+    daemon: Option<&Path>,
 ) -> Option<Observation> {
     let is_codex_client = arguments
         .first()
@@ -685,13 +712,18 @@ fn observe_client(
             evidence: "runs with `--no-daemon`, so its app-server is in-process",
         }));
     }
-    if arguments
-        .iter()
-        .any(|argument| argument == "--remote" || argument.starts_with("--remote="))
-    {
-        return None;
+    if let Some(endpoint) = remote_endpoint(arguments) {
+        return daemon
+            .filter(|socket| endpoint_matches(&endpoint, socket))
+            .map(|_| {
+                Observation::Attached(AttachedClient {
+                    pid,
+                    binary,
+                    endpoint,
+                })
+            });
     }
-    if !daemon_running {
+    if daemon.is_none() {
         return Some(Observation::Embedded(EmbeddedClient {
             pid,
             binary,
@@ -699,6 +731,59 @@ fn observe_client(
         }));
     }
     Some(Observation::Unverified(UnverifiedClient { pid, binary }))
+}
+
+/// The endpoint a TUI's `--remote` names, in either `--remote <value>` or
+/// `--remote=<value>` form.
+fn remote_endpoint(arguments: &[String]) -> Option<String> {
+    let mut tokens = arguments.iter().skip(1);
+    while let Some(token) = tokens.next() {
+        if token == "--remote" {
+            return tokens.next().cloned();
+        }
+        if let Some(endpoint) = token.strip_prefix("--remote=") {
+            return Some(endpoint.to_string());
+        }
+    }
+    None
+}
+
+/// Whether a `--remote` endpoint names `daemon`. Only a unix endpoint can be
+/// compared with the daemon's control socket; a `ws://` remote is somebody
+/// else's listener as far as a process scan can tell, so it is never claimed.
+fn endpoint_matches(endpoint: &str, daemon: &Path) -> bool {
+    let Some(remote) = endpoint
+        .strip_prefix("unix://")
+        .or_else(|| endpoint.strip_prefix("unix:"))
+        .map(Path::new)
+    else {
+        return false;
+    };
+    match (std::fs::canonicalize(remote), std::fs::canonicalize(daemon)) {
+        (Ok(remote), Ok(daemon)) => remote == daemon,
+        _ => remote == daemon,
+    }
+}
+
+/// Resolve the Codex client binary the way a spawn would: an absolute or
+/// explicit path is checked as given, a bare name is looked up on `PATH`.
+/// Windows resolves executables by extension, so only `codex.exe` counts there.
+pub(crate) fn which_client(cli: &Path) -> Option<PathBuf> {
+    let explicit = cli.components().count() > 1 || cli.is_absolute();
+    if explicit {
+        return crate::update::is_executable_file(cli).then(|| cli.to_path_buf());
+    }
+    let name = cli.to_string_lossy();
+    for directory in std::env::split_paths(&std::env::var_os("PATH")?) {
+        #[cfg(windows)]
+        let candidate = directory.join(format!("{name}.exe"));
+        #[cfg(not(windows))]
+        let candidate = directory.join(name.as_ref());
+        if crate::update::is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -833,8 +918,9 @@ mod tests {
     /// The explicit opt-out is the decisive signal, on a TUI only.
     #[test]
     fn a_no_daemon_tui_is_an_embedded_client() {
+        let daemon = Path::new("/tmp/codex-daemon.sock");
         let Some(Observation::Embedded(client)) =
-            observe_client(42, "codex", &args("codex --no-daemon"), true)
+            observe_client(42, "codex", &args("codex --no-daemon"), Some(daemon))
         else {
             panic!("--no-daemon is embedded even with a daemon running");
         };
@@ -842,16 +928,16 @@ mod tests {
         assert!(client.evidence.contains("--no-daemon"), "{}", client.evidence);
 
         // A prompt is still the TUI.
-        assert!(embedded(7, &args("codex --no-daemon fix the tests"), false));
+        assert!(embedded(7, &args("codex --no-daemon fix the tests"), None));
         // Options before the flag do not hide it.
-        assert!(embedded(7, &args("codex -m gpt-5 --no-daemon"), false));
+        assert!(embedded(7, &args("codex -m gpt-5 --no-daemon"), None));
     }
 
     /// One convenience predicate over [`observe_client`] for the cases whose
     /// outcome is "embedded, or not reported at all".
-    fn embedded(pid: i32, arguments: &[String], daemon_running: bool) -> bool {
+    fn embedded(pid: i32, arguments: &[String], daemon: Option<&Path>) -> bool {
         matches!(
-            observe_client(pid, "codex", arguments, daemon_running),
+            observe_client(pid, "codex", arguments, daemon),
             Some(Observation::Embedded(_))
         )
     }
@@ -868,7 +954,7 @@ mod tests {
             "codex mcp list",
         ] {
             assert!(
-                observe_client(7, "codex", &args(line), false).is_none(),
+                observe_client(7, "codex", &args(line), None).is_none(),
                 "{line} is not a TUI"
             );
         }
@@ -878,13 +964,13 @@ mod tests {
     /// unless it names a remote server.
     #[test]
     fn a_tui_without_a_daemon_fell_back_to_embedded() {
-        let Some(Observation::Embedded(client)) = observe_client(9, "codex", &args("codex"), false) else {
+        let Some(Observation::Embedded(client)) = observe_client(9, "codex", &args("codex"), None) else {
             panic!("no daemon means the TUI fell back to an embedded app-server");
         };
         assert_eq!(client.pid, 9);
         assert!(client.evidence.contains("embedded"), "{}", client.evidence);
         assert!(
-            observe_client(9, "codex", &args("codex --remote ws://host:1"), false).is_none(),
+            observe_client(9, "codex", &args("codex --remote ws://host:1"), None).is_none(),
             "a remote client is not judged by a process scan"
         );
     }
@@ -896,27 +982,71 @@ mod tests {
     /// be the silent assumption ADR-0090 decision 3 rejects.
     #[test]
     fn a_tui_with_a_daemon_is_unverified_not_assumed_sharing() {
-        let Some(Observation::Unverified(client)) = observe_client(9, "codex", &args("codex"), true) else {
+        let daemon = Path::new("/tmp/codex-daemon.sock");
+        let Some(Observation::Unverified(client)) = observe_client(9, "codex", &args("codex"), Some(daemon))
+        else {
             panic!("a daemon-present TUI is recorded, not assumed to share");
         };
         assert_eq!(client.pid, 9);
-        assert!(!embedded(9, &args("codex"), true));
+        assert!(!embedded(9, &args("codex"), Some(daemon)));
 
         // `--no-daemon` stays decisive even with a daemon running, and a
-        // `--remote` client is outside what this scan can judge either way.
-        assert!(embedded(9, &args("codex --no-daemon"), true));
-        assert!(observe_client(9, "codex", &args("codex --remote ws://host:1"), true).is_none());
+        // `--remote` client that names another listener is outside what this
+        // scan can judge either way.
+        assert!(embedded(9, &args("codex --no-daemon"), Some(daemon)));
+        assert!(observe_client(9, "codex", &args("codex --remote ws://host:1"), Some(daemon)).is_none());
+    }
+
+    /// The positive half: a `--remote` TUI that names the discovered control
+    /// socket is **attached**; one naming another socket is not this daemon
+    /// and is not claimed.
+    #[test]
+    fn a_remote_tui_naming_the_daemon_is_attached() {
+        let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
+        let Some(Observation::Attached(client)) = observe_client(
+            11,
+            "codex",
+            &args("codex --remote unix:///tmp/codex-daemon-0/app-server-control.sock"),
+            Some(daemon),
+        ) else {
+            panic!("a --remote endpoint naming the daemon is proof of sharing");
+        };
+        assert_eq!(client.pid, 11);
+        assert_eq!(
+            client.endpoint,
+            "unix:///tmp/codex-daemon-0/app-server-control.sock"
+        );
+        assert!(
+            observe_client(
+                11,
+                "codex",
+                &args("codex --remote unix:///tmp/other/app-server-control.sock"),
+                Some(daemon)
+            )
+            .is_none(),
+            "another server is not claimed as attached to this daemon"
+        );
+        assert!(
+            observe_client(
+                11,
+                "codex",
+                &args("codex --remote=unix:///tmp/codex-daemon-0/app-server-control.sock"),
+                Some(daemon)
+            )
+            .is_some(),
+            "the --remote=<value> spelling names the same endpoint"
+        );
     }
 
     #[test]
     fn a_process_that_is_not_codex_is_never_reported() {
-        assert!(observe_client(9, "node", &args("node server.js --no-daemon"), false).is_none());
+        assert!(observe_client(9, "node", &args("node server.js --no-daemon"), None).is_none());
         assert!(
             observe_client(
                 9,
                 "not-codex",
                 &args("/opt/other/bin/not-codex --no-daemon"),
-                false
+                None
             )
             .is_none()
         );

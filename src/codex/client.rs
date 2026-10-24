@@ -146,6 +146,9 @@ pub(crate) struct ServerInfo {
     pub(crate) platform: String,
     /// Where the verified surface came from (`pinned …` or `generated from …`).
     pub(crate) surface_source: String,
+    /// The three verified method-list sizes (client → server, notifications,
+    /// server → client), for `cola status`/`doctor`.
+    pub(crate) surface_counts: (usize, usize, usize),
 }
 
 /// One attached app-server. Construction is the whole contract check; the
@@ -280,6 +283,7 @@ impl CodexClient {
                     .map(str::to_string),
                 platform: platform(&initialize),
                 surface_source,
+                surface_counts: counts,
             },
         })
     }

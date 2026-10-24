@@ -35,8 +35,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
-use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, ServerLifecycle};
+use crate::backend::lifecycle::{
+    AttachOutcome, Capability, ClientReport, ClientState, EnsureAttached, RestartOutcome, ServerLifecycle,
+    TurnProbe, UserClient, UserClientState,
+};
 use crate::bridge::tasks::TasksHandle;
 use crate::config::CodexConfig;
 use crate::error::BridgeError;
@@ -47,7 +51,7 @@ use super::discovery::{
 };
 use super::error::{CodexError, Result};
 use super::schema::{AutoProbe, SurfaceProbe};
-use super::transport::Endpoint;
+use super::transport::{Endpoint, Inbound};
 
 /// How the lifecycle builds the schema probe for a discovered daemon.
 ///
@@ -96,6 +100,27 @@ const LIVENESS_METHOD: &str = "thread/loaded/list";
 /// under it. Two is enough for the deterministic race; a third race in a row is
 /// reported unattached and retried on the next pass.
 const ATTACH_ATTEMPTS: usize = 2;
+
+/// The budget for `cola doctor --check-turn`'s real turn. A minimal turn still
+/// crosses the configured provider, so this is generous; the point of the
+/// bound is that an unreachable or wedged provider fails with a clear timeout
+/// instead of hanging the command.
+#[cfg(not(test))]
+const TURN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+#[cfg(test)]
+const TURN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A bound on each probe bookkeeping call (`thread/name/set`, `thread/delete`):
+/// a wedged connection must not extend the diagnosis past its own turn budget.
+const TURN_PROBE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The probe thread's name. The thread is a real write on a daemon cola does
+/// not own, so it is named as cola's own diagnostic and deleted afterwards.
+const TURN_PROBE_THREAD_NAME: &str = "cola doctor probe";
+
+/// The smallest prompt that still requires the provider to answer.
+const TURN_PROBE_PROMPT: &str =
+    "Reply with OK. This is a cola doctor probe; the thread is deleted afterwards.";
 
 /// How one dial ended, for the pass's next decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,11 +243,11 @@ impl CodexLifecycle {
         *self.dial_hook.lock().expect("dial hook") = Some(hook);
     }
 
-    /// What discovery last observed — the read `cola doctor` needs for ADR-0090
-    /// decision 3 (daemon presence, the binary it runs, clients proven to be on
-    /// an embedded server and clients whose sharing cannot be established from
-    /// the process table). No caller until #883.
-    #[allow(dead_code)]
+    /// What discovery last observed — the read `cola doctor` and `cola status`
+    /// need for ADR-0090 decision 3 (daemon presence, the binary it runs,
+    /// clients proven to be on an embedded server, clients proven attached to
+    /// the daemon, and clients whose sharing cannot be established from the
+    /// process table).
     pub(crate) async fn diagnosis(&self) -> Result<Discovery> {
         discovery::discover(&self.environment).await
     }
@@ -362,6 +387,14 @@ impl CodexLifecycle {
                 client.evidence
             );
         }
+        for client in &clients.attached {
+            tracing::debug!(
+                "a local Codex client (pid {}, {}) is attached to the shared daemon at {}",
+                client.pid,
+                client.binary,
+                client.endpoint
+            );
+        }
         for client in &clients.unverified {
             tracing::debug!(
                 "a local Codex client (pid {}, {}) names no `--remote`; whether it shares the \
@@ -370,6 +403,132 @@ impl CodexLifecycle {
                 client.binary
             );
         }
+    }
+}
+
+/// The report before any discovery: the endpoint this client targets and the
+/// binary a spawn would use. The rest is filled by [`CodexLifecycle::client_report`].
+fn client_report_shell(environment: &Environment, endpoint: String) -> ClientReport {
+    ClientReport {
+        endpoint,
+        state: ClientState::Absent,
+        detail: String::new(),
+        runtime_binary: None,
+        version: None,
+        platform: None,
+        surface_source: None,
+        capabilities: Vec::new(),
+        user_clients: Vec::new(),
+        client_binary: discovery::which_client(&environment.cli).map(|path| path.display().to_string()),
+    }
+}
+
+/// What discovery proved about each local client, in pid order, for the report.
+fn report_user_clients(clients: &LocalClients) -> Vec<UserClient> {
+    let mut report = Vec::new();
+    for client in &clients.embedded {
+        report.push(UserClient {
+            pid: client.pid,
+            binary: client.binary.clone(),
+            state: UserClientState::Embedded,
+            detail: client.evidence.to_string(),
+        });
+    }
+    for client in &clients.attached {
+        report.push(UserClient {
+            pid: client.pid,
+            binary: client.binary.clone(),
+            state: UserClientState::Attached,
+            detail: format!("shares the daemon through {}", client.endpoint),
+        });
+    }
+    for client in &clients.unverified {
+        report.push(UserClient {
+            pid: client.pid,
+            binary: client.binary.clone(),
+            state: UserClientState::Unverified,
+            detail: "its argv does not name the daemon, so whether it shares the daemon cannot be \
+                     established from the process table"
+                .to_string(),
+        });
+    }
+    report.sort_by_key(|client| client.pid);
+    report
+}
+
+/// The capabilities a verified app-server connection advertises. The method
+/// names are the pinned contract's, which construction refuses to attach
+/// without, so every one of these is a claim the connection was held to — not
+/// a hope. Background Tasks are the one surface Codex does not publish.
+fn codex_capabilities(info: &super::client::ServerInfo) -> Vec<Capability> {
+    let (client_requests, notifications, server_requests) = info.surface_counts;
+    let mut capabilities = vec![
+        Capability {
+            name: "peer_attachment".to_string(),
+            value: "yes".to_string(),
+        },
+        Capability {
+            name: "background_tasks".to_string(),
+            value: "unsupported".to_string(),
+        },
+        Capability {
+            name: "turn_control".to_string(),
+            value: "turn/start, turn/steer, turn/interrupt".to_string(),
+        },
+        Capability {
+            name: "permissions".to_string(),
+            value: "yes".to_string(),
+        },
+        Capability {
+            name: "questions".to_string(),
+            value: "yes".to_string(),
+        },
+        Capability {
+            name: "compaction".to_string(),
+            value: "thread/compact/start".to_string(),
+        },
+        Capability {
+            name: "models".to_string(),
+            value: "model/list".to_string(),
+        },
+        Capability {
+            name: "skills".to_string(),
+            value: "skills/list".to_string(),
+        },
+        Capability {
+            name: "surface".to_string(),
+            value: info.surface_source.clone(),
+        },
+    ];
+    capabilities.push(Capability {
+        name: "client_requests".to_string(),
+        value: client_requests.to_string(),
+    });
+    capabilities.push(Capability {
+        name: "notifications".to_string(),
+        value: notifications.to_string(),
+    });
+    capabilities.push(Capability {
+        name: "server_requests".to_string(),
+        value: server_requests.to_string(),
+    });
+    capabilities
+}
+
+/// Whether an `error` notification names the probe's own turn (some errors are
+/// thread-scoped and carry no turn id: those do apply).
+fn turn_matches(params: &Value, turn_id: &str) -> bool {
+    match params.get("turnId").and_then(Value::as_str) {
+        Some(id) => turn_id.is_empty() || id == turn_id,
+        None => true,
+    }
+}
+
+/// The reason a discovery pass found no daemon, as the report's evidence.
+fn absent_reason(discovery: &Discovery) -> String {
+    match &discovery.daemon {
+        DaemonState::Absent { evidence } => evidence.clone(),
+        DaemonState::Running(_) => "the daemon is running but was not attached".to_string(),
     }
 }
 
@@ -422,7 +581,9 @@ impl ServerLifecycle for CodexLifecycle {
                         discovery::socket_identity(&self.environment.socket()).map_err(client_error)?;
                     if still == Some(identity) {
                         drop(slot);
-                        self.report_clients(&discovery::local_clients(true));
+                        self.report_clients(&discovery::local_clients(Some(
+                            self.environment.socket().as_path(),
+                        )));
                         return Ok(AttachOutcome::Attached);
                     }
                     tracing::warn!(
@@ -502,6 +663,266 @@ impl ServerLifecycle for CodexLifecycle {
             DaemonState::Running(_) => RestartOutcome::NotOwned,
             DaemonState::Absent { .. } => RestartOutcome::NoServer,
         })
+    }
+
+    /// ADR-0090 decision 3's read-only diagnosis: the daemon discovery found,
+    /// the clients it can prove something about, and the capabilities the
+    /// **attached** connection advertised. Attaching here is read-only — the
+    /// spawn allowance is always false, so `cola status`/`doctor` never start a
+    /// daemon.
+    async fn client_report(&self) -> Option<ClientReport> {
+        let mut report = client_report_shell(
+            &self.environment,
+            format!("unix://{}", self.environment.socket().display()),
+        );
+        if let Err(error) = discovery::socket_identity(&self.environment.socket()) {
+            report.state = ClientState::Unattached;
+            report.detail = error.to_string();
+            return Some(report);
+        }
+        let discovered = match self.diagnosis().await {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                report.state = ClientState::Unattached;
+                report.detail = error.to_string();
+                return Some(report);
+            }
+        };
+        let daemon = discovered.daemon.daemon().cloned();
+        report.detail = match &daemon {
+            Some(daemon) => {
+                let version = daemon
+                    .info
+                    .as_ref()
+                    .and_then(|info| info.app_server_version.clone())
+                    .unwrap_or_else(|| "version unknown".to_string());
+                format!("daemon at {} (app-server {version})", daemon.socket.display())
+            }
+            None => absent_reason(&discovered),
+        };
+        report.runtime_binary = daemon
+            .as_ref()
+            .map(|daemon| daemon.managed_binary.display().to_string());
+        report.user_clients = report_user_clients(&discovered.clients);
+        if daemon.is_none() {
+            return Some(report);
+        }
+
+        // Attach to read what the connection advertises. `allow_spawn: false`
+        // and no mid-turn heal keep this a read: a diagnostic must never start
+        // the daemon it is describing.
+        let never_busy = || false;
+        let outcome = self
+            .ensure_attached(EnsureAttached {
+                allow_spawn: false,
+                heal_when_busy: false,
+                busy: &never_busy,
+                boot: true,
+            })
+            .await;
+        match outcome {
+            Ok(AttachOutcome::Attached) => match self.attached_client().await {
+                Some(client) => {
+                    let info = client.server_info();
+                    report.state = ClientState::Attached;
+                    report.detail = format!(
+                        "attached to the app-server daemon (version {}, {})",
+                        info.version, info.platform
+                    );
+                    report.version = Some(info.version.to_string());
+                    report.platform = Some(info.platform.clone());
+                    report.surface_source = Some(info.surface_source.clone());
+                    report.capabilities = codex_capabilities(info);
+                }
+                None => {
+                    report.state = ClientState::Unattached;
+                    report.detail = "the daemon answered but no client was installed".to_string();
+                }
+            },
+            Ok(_) => {
+                report.state = ClientState::Unattached;
+                report.detail = "the daemon is running but cola could not attach to it".to_string();
+            }
+            Err(error) => {
+                report.state = ClientState::Unattached;
+                report.detail = error.to_string();
+            }
+        }
+        Some(report)
+    }
+
+    /// ADR-0090's amendment: a turn with no usable credential is **accepted**
+    /// and then fails as a retryable `error`, so doctor's proof that the
+    /// configured provider works is a real turn. This is a write on a daemon
+    /// cola does not own, which is why the CLI gates it behind
+    /// `cola doctor --check-turn`.
+    ///
+    /// The scratch thread is named as cola's diagnostic and deleted on every
+    /// exit path. A retryable error is read from the raw notification stream:
+    /// the read model deliberately keeps a retrying turn live (it may recover),
+    /// so the probe cannot learn it from the projection.
+    async fn probe_turn(&self) -> TurnProbe {
+        let never_busy = || false;
+        if let Err(error) = self
+            .ensure_attached(EnsureAttached {
+                allow_spawn: false,
+                heal_when_busy: false,
+                busy: &never_busy,
+                boot: true,
+            })
+            .await
+        {
+            return TurnProbe::Failed {
+                detail: format!("could not attach to the codex daemon: {error}"),
+            };
+        }
+        let Some(client) = self.attached_client().await else {
+            return TurnProbe::NotAttempted {
+                detail: "no codex app-server daemon is attached; start the daemon and attach your \
+                         client, then retry"
+                    .to_string(),
+            };
+        };
+        let mut inbound = client.connection().inbound();
+        let scratch: Arc<std::sync::Mutex<Option<(String, Option<String>)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let scratch_for_probe = Arc::clone(&scratch);
+
+        let outcome = tokio::time::timeout(TURN_PROBE_TIMEOUT, async {
+            let thread = client
+                .threads()
+                .start(None)
+                .await
+                .map_err(|error| format!("could not create a probe thread: {error}"))?;
+            let thread_id = thread.id.clone();
+            *scratch_for_probe.lock().expect("probe thread id") = Some((thread_id.clone(), None));
+            // Name it as cola's own diagnostic; a failure here is cosmetic.
+            let _ = tokio::time::timeout(
+                TURN_PROBE_CLEANUP_TIMEOUT,
+                client.connection().request(
+                    "thread/name/set",
+                    json!({ "threadId": thread_id, "name": TURN_PROBE_THREAD_NAME }),
+                ),
+            )
+            .await;
+
+            let started = client
+                .connection()
+                .request(
+                    "turn/start",
+                    json!({
+                        "threadId": thread_id,
+                        "input": [{
+                            "type": "text",
+                            "text": TURN_PROBE_PROMPT,
+                            "text_elements": [],
+                        }],
+                    }),
+                )
+                .await
+                .map_err(|error| format!("the server refused `turn/start`: {error}"))?;
+            let turn_id = started
+                .pointer("/turn/id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !turn_id.is_empty() {
+                *scratch_for_probe.lock().expect("probe thread id") =
+                    Some((thread_id.clone(), Some(turn_id.clone())));
+            }
+
+            loop {
+                match inbound.recv().await {
+                    Ok(Inbound::Notification { method, params, .. }) if method == "error" => {
+                        if params.get("threadId").and_then(Value::as_str) != Some(thread_id.as_str())
+                            || !turn_matches(&params, &turn_id)
+                        {
+                            continue;
+                        }
+                        let message = params
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error");
+                        if params.get("willRetry").and_then(Value::as_bool).unwrap_or(false) {
+                            return Err(format!(
+                                "the configured provider cannot complete a turn (the server will \
+                                 retry): {message}"
+                            ));
+                        }
+                        return Err(format!("the turn failed: {message}"));
+                    }
+                    Ok(Inbound::Notification { method, params, .. }) if method == "turn/completed" => {
+                        if params.get("threadId").and_then(Value::as_str) != Some(thread_id.as_str()) {
+                            continue;
+                        }
+                        let Some(turn) = params.get("turn") else {
+                            continue;
+                        };
+                        let id = turn.get("id").and_then(Value::as_str).unwrap_or_default();
+                        if !id.is_empty() && !turn_id.is_empty() && id != turn_id {
+                            continue;
+                        }
+                        let status = turn.get("status").and_then(Value::as_str).unwrap_or("unknown");
+                        if status == "completed" {
+                            return Ok(format!(
+                                "the configured provider completed a turn (thread {thread_id})"
+                            ));
+                        }
+                        let error = turn
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str);
+                        return Err(match error {
+                            Some(message) => format!("the turn ended as {status}: {message}"),
+                            None => format!("the turn ended as {status}"),
+                        });
+                    }
+                    Ok(Inbound::Closed) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("the connection closed before the turn completed".to_string());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+
+        // Delete the probe thread on every path — a completed turn, a failure,
+        // or the budget expiring. The daemon is not cola's, so a leftover
+        // diagnostic thread would be a write the user did not ask for.
+        let probe = scratch.lock().expect("probe thread id").take();
+        if let Some((thread_id, turn_id)) = probe {
+            // A failed or timed-out probe can leave the turn live (a retryable
+            // error keeps retrying): interrupt it before deleting the thread,
+            // so the diagnostic leaves neither a thread nor a running turn.
+            if !matches!(&outcome, Ok(Ok(_)))
+                && let Some(turn_id) = turn_id
+            {
+                let _ = tokio::time::timeout(
+                    TURN_PROBE_CLEANUP_TIMEOUT,
+                    client.connection().request(
+                        "turn/interrupt",
+                        json!({ "threadId": thread_id, "turnId": turn_id }),
+                    ),
+                )
+                .await;
+            }
+            let _ = tokio::time::timeout(
+                TURN_PROBE_CLEANUP_TIMEOUT,
+                client
+                    .connection()
+                    .request("thread/delete", json!({ "threadId": thread_id })),
+            )
+            .await;
+        }
+
+        match outcome {
+            Ok(Ok(detail)) => TurnProbe::Passed { detail },
+            Ok(Err(detail)) => TurnProbe::Failed { detail },
+            Err(_) => TurnProbe::Failed {
+                detail: format!("the turn did not complete within {TURN_PROBE_TIMEOUT:?}"),
+            },
+        }
     }
 }
 
@@ -641,6 +1062,29 @@ mod tests {
         /// no pid record of its own.
         fn layout(&self) -> crate::state::StateLayout {
             crate::state::StateLayout::for_home(self.root.path())
+        }
+
+        /// Link the control socket at the daemon the fixture serves, exactly as
+        /// `codex app-server daemon start` does.
+        fn link_daemon(&self) {
+            let control = self.environment.socket();
+            std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
+            std::os::unix::fs::symlink(&self.daemon_socket, &control).expect("symlink the daemon");
+        }
+
+        /// Spawn a fake local `codex` TUI: an `sh` symlink named `codex` keeps
+        /// the argv the process scan reads (no interpreter re-exec).
+        fn spawn_tui(&self, extra: &[&str]) -> std::process::Child {
+            let tui_dir = self.root.path().join("tui");
+            std::fs::create_dir_all(&tui_dir).expect("tui dir");
+            let binary = tui_dir.join("codex");
+            if !binary.exists() {
+                std::os::unix::fs::symlink("/bin/sh", &binary).expect("symlink");
+            }
+            let mut command = std::process::Command::new(&binary);
+            command.args(["-c", "sleep 30; :"]);
+            command.args(extra);
+            command.spawn().expect("spawn the fake TUI")
         }
 
         /// The fake daemons' own pid records, once their launcher has run.
@@ -1301,6 +1745,218 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Ticket #883 acceptance 4: `status`/`doctor` learn the active client's
+    /// endpoint, its capabilities and its local clients through the same
+    /// read-only report — never by naming the adapter.
+    #[tokio::test]
+    async fn the_report_names_the_daemon_capabilities_and_an_attached_client() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        let remote = format!("unix://{}", fixture.environment.socket().display());
+        let mut client = fixture.spawn_tui(&["--remote", &remote]);
+        let pid = client.id() as i32;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let report = loop {
+            let report = lifecycle.client_report().await.expect("a report");
+            if report
+                .user_clients
+                .iter()
+                .any(|found| found.pid == pid && found.state == UserClientState::Attached)
+            {
+                break report;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the attached client must be discovered: {:?}",
+                report.user_clients
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = client.kill();
+        let _ = client.wait();
+
+        assert_eq!(
+            report.endpoint,
+            format!("unix://{}", fixture.environment.socket().display())
+        );
+        assert_eq!(report.state, ClientState::Attached);
+        assert_eq!(report.version.as_deref(), Some("0.163.0"));
+        assert_eq!(report.platform.as_deref(), Some("unix/linux"));
+        assert!(
+            report
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "background_tasks" && capability.value == "unsupported"),
+            "the report states the missing Background Task surface: {:?}",
+            report.capabilities
+        );
+        assert!(
+            report
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "surface"),
+            "{:?}",
+            report.capabilities
+        );
+        assert_eq!(
+            report.client_binary.as_deref(),
+            Some(fixture.cli.binary.display().to_string().as_str()),
+            "the absolute client binary is reported as it would be spawned"
+        );
+        assert_eq!(
+            report.runtime_binary.as_deref(),
+            Some(
+                fixture
+                    .root
+                    .path()
+                    .join("managed-codex")
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "the daemon's own managed binary is reported"
+        );
+        assert!(server.connections() >= 1);
+    }
+
+    /// ADR-0090 decision 3: a TUI on an embedded server is a named failure in
+    /// the report, not a healthy-looking attachment.
+    #[tokio::test]
+    async fn the_report_names_an_embedded_client() {
+        let fixture = Fixture::new();
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        let mut client = fixture.spawn_tui(&[]);
+        let pid = client.id() as i32;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let report = loop {
+            let report = lifecycle.client_report().await.expect("a report");
+            if report
+                .user_clients
+                .iter()
+                .any(|found| found.pid == pid && found.state == UserClientState::Embedded)
+            {
+                break report;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the embedded client must be discovered: {:?}",
+                report.user_clients
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = client.kill();
+        let _ = client.wait();
+
+        assert_eq!(
+            report.state,
+            ClientState::Absent,
+            "no daemon means no attachment: {:?}",
+            report.state
+        );
+        let embedded = report
+            .user_clients
+            .iter()
+            .find(|found| found.pid == pid)
+            .expect("the embedded client is named");
+        assert_eq!(embedded.state, UserClientState::Embedded);
+        assert!(embedded.detail.contains("embedded"), "{}", embedded.detail);
+    }
+
+    /// Ticket #883 acceptance 3: a daemon-attached client plus a provider that
+    /// completes a turn passes, and the scratch thread is cleaned up.
+    #[tokio::test]
+    async fn the_turn_probe_passes_and_deletes_its_scratch_thread() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        server.script_turn(
+            "*",
+            vec![json!({
+                "method": "turn/completed",
+                "params": { "turn": { "status": "completed" } },
+            })],
+        );
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+
+        let outcome = lifecycle.probe_turn().await;
+        assert!(matches!(outcome, TurnProbe::Passed { .. }), "{outcome:?}");
+        assert_eq!(server.turn_starts(), 1, "one minimal turn");
+        assert_eq!(
+            server.deleted_threads().len(),
+            1,
+            "the probe thread is deleted: {:?}",
+            server.deleted_threads()
+        );
+        let thread = server.deleted_threads()[0].clone();
+        assert_eq!(server.subscribers(&thread), 0);
+        // The prompt is the doctor's own diagnostic, not a user request.
+        let params = server.turn_params(&thread);
+        assert_eq!(params.len(), 1);
+        assert!(
+            params[0]["input"][0]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("cola doctor probe")),
+            "{:?}",
+            params[0]
+        );
+    }
+
+    /// Ticket #883 acceptance 2: a turn with no usable credential is accepted
+    /// and then fails as a **retryable** `error`. The probe must fail — a
+    /// login-shaped check would pass while every turn died.
+    #[tokio::test]
+    async fn a_retryable_provider_error_fails_the_turn_probe() {
+        let fixture = Fixture::new();
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        _server.script_turn(
+            "*",
+            vec![json!({
+                "method": "error",
+                "params": {
+                    "error": { "message": "401 Unauthorized" },
+                    "willRetry": true,
+                },
+            })],
+        );
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+
+        let outcome = lifecycle.probe_turn().await;
+        match outcome {
+            TurnProbe::Failed { detail } => {
+                assert!(detail.contains("will retry"), "{detail}");
+                assert!(detail.contains("401"), "{detail}");
+            }
+            other => panic!("a retryable error must fail the probe, got {other:?}"),
+        }
+        assert_eq!(
+            _server.deleted_threads().len(),
+            1,
+            "a failed probe still deletes its thread"
+        );
+    }
+
+    /// With no daemon there is nothing to probe; the outcome says so rather
+    /// than claiming a pass.
+    #[tokio::test]
+    async fn the_turn_probe_without_a_daemon_is_not_attempted() {
+        let fixture = Fixture::new();
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        assert!(matches!(
+            lifecycle.probe_turn().await,
+            TurnProbe::NotAttempted { .. }
+        ));
+        assert!(
+            fixture.cli.invocations().is_empty(),
+            "a read-only probe never starts a daemon: {:?}",
+            fixture.cli.invocations()
+        );
     }
 
     /// The production probe asks for the managed binary, so the surface check
