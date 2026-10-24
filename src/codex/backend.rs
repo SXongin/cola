@@ -801,11 +801,13 @@ const MODEL_PROVIDER: &str = "codex";
 /// was read so far, and the truncation is logged.
 const MAX_MODEL_PAGES: usize = 64;
 
-/// The most recent `skills/list` read, keyed by the skill identity the server
-/// advertised. Codex's `skill` prompt part carries a **path** as well as a name,
-/// and the neutral [`crate::backend::PromptSkill`] only carries `{ id, name }`,
-/// so the path is remembered here from the same read the `/skill` command made
-/// immediately before the prompt. The newest path for a name wins; a skill name
+/// The `skills/list` reads, keyed by the skill identity the server advertised.
+/// Codex's `skill` prompt part carries a **path** as well as a name, and the
+/// neutral [`crate::backend::PromptSkill`] only carries `{ id, name }`, so the
+/// path is remembered here from the same read the `/skill` command made
+/// immediately before the prompt. Entries merge rather than replace: a
+/// concurrent read for another project must not empty the catalog between a
+/// `/skill` read and its prompt. The newest path for a name wins; a skill name
 /// present in two projects at once is the one ambiguity the protocol's
 /// name+path pair cannot resolve from a name alone.
 #[derive(Default)]
@@ -814,9 +816,8 @@ pub(crate) struct SkillCatalog {
 }
 
 impl SkillCatalog {
-    fn replace(&self, skills: impl IntoIterator<Item = (String, String)>) {
+    fn remember(&self, skills: impl IntoIterator<Item = (String, String)>) {
         let mut paths = self.paths.lock().expect("codex skill catalog");
-        paths.clear();
         for (name, path) in skills {
             paths.insert(name, path);
         }
@@ -1244,6 +1245,7 @@ impl Backend for CodexClient {
             }
         };
         let mut skills = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let mut catalog = Vec::new();
         for entry in response.data {
             for error in entry.errors {
@@ -1255,6 +1257,9 @@ impl Backend for CodexClient {
             }
             for skill in entry.skills {
                 catalog.push((skill.name.clone(), skill.path.clone()));
+                if !seen.insert(skill.name.clone()) {
+                    continue;
+                }
                 // Codex has no separate skill id: the name is what a prompt's
                 // `skill` input names, so it IS the neutral id (V1's rule).
                 skills.push(SkillInfo {
@@ -1267,7 +1272,7 @@ impl Backend for CodexClient {
                 });
             }
         }
-        self.skills.replace(catalog);
+        self.skills.remember(catalog);
         skills
     }
 

@@ -195,7 +195,9 @@ impl Authorship {
             && let Err(error) = self.persist(&state)
         {
             state.untrusted = true;
-            untrusted(self.path.as_deref().expect("a durable record"), &error);
+            if let Some(path) = &self.path {
+                untrusted(path, &error);
+            }
         }
     }
 
@@ -209,7 +211,9 @@ impl Authorship {
             && let Err(error) = self.persist(&state)
         {
             state.untrusted = true;
-            untrusted(self.path.as_deref().expect("a durable record"), &error);
+            if let Some(path) = &self.path {
+                untrusted(path, &error);
+            }
         }
     }
 
