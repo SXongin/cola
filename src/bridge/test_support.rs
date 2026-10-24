@@ -1668,7 +1668,7 @@ pub struct MockBackend {
     /// The client-scoped diagnosis `client_report` reports (`cola status`/
     /// `doctor`, ticket #883). `None` means "nothing to report", the default.
     pub client_report: Option<crate::backend::lifecycle::ClientReport>,
-    /// The answer `probe_turn` gives (`cola doctor --check-turn`).
+    /// The answer `probe_turn` gives (`cola doctor`'s turn probe).
     pub turn_probe: Option<crate::backend::lifecycle::TurnProbe>,
     /// Counts `ensure_attached` passes, so a poll-loop test can prove the
     /// client-owned pass actually ran.

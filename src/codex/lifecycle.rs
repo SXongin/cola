@@ -31,6 +31,7 @@
 //! The `Backend` implementation that serves Sessions is a later ticket (#879);
 //! this type is the lifecycle half it will build on.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -51,7 +52,7 @@ use super::discovery::{
 };
 use super::error::{CodexError, Result};
 use super::schema::{AutoProbe, SurfaceProbe};
-use super::transport::{Endpoint, Inbound};
+use super::transport::{Endpoint, Inbound, RpcConnection};
 
 /// How the lifecycle builds the schema probe for a discovered daemon.
 ///
@@ -101,7 +102,7 @@ const LIVENESS_METHOD: &str = "thread/loaded/list";
 /// reported unattached and retried on the next pass.
 const ATTACH_ATTEMPTS: usize = 2;
 
-/// The budget for `cola doctor --check-turn`'s real turn. A minimal turn still
+/// The budget for `cola doctor`'s real turn probe. A minimal turn still
 /// crosses the configured provider, so this is generous; the point of the
 /// bound is that an unreachable or wedged provider fails with a clear timeout
 /// instead of hanging the command.
@@ -234,6 +235,20 @@ impl CodexLifecycle {
     /// URL. Stable while serverless too: a replacement daemon keeps the path.
     pub(crate) fn environment_socket(&self) -> std::path::PathBuf {
         self.environment.socket()
+    }
+
+    /// Attach for a **diagnostic**: read-only, never a start, never a mid-turn
+    /// heal. `cola status`/`doctor` and the turn probe all share this one
+    /// setting set so the safety choices cannot drift apart.
+    async fn attach_for_diagnostics(&self) -> crate::error::Result<AttachOutcome> {
+        let never_busy = || false;
+        self.ensure_attached(EnsureAttached {
+            allow_spawn: false,
+            heal_when_busy: false,
+            busy: &never_busy,
+            boot: true,
+        })
+        .await
     }
 
     /// Test-only: install the one-shot hook that fires after a connection
@@ -397,10 +412,19 @@ impl CodexLifecycle {
         }
         for client in &clients.unverified {
             tracing::debug!(
-                "a local Codex client (pid {}, {}) names no `--remote`; whether it shares the \
-                 daemon cannot be established from its argv — `cola doctor` must verify it",
+                "a local Codex client (pid {}, {}) is not proven attached: {}",
                 client.pid,
-                client.binary
+                client.binary,
+                client.detail
+            );
+        }
+        for client in &clients.unreachable {
+            tracing::warn!(
+                "a local Codex client (pid {}, {}) {}; it shares no thread with the daemon cola \
+                 mirrors",
+                client.pid,
+                client.binary,
+                client.detail
             );
         }
     }
@@ -439,7 +463,7 @@ fn report_user_clients(clients: &LocalClients) -> Vec<UserClient> {
             pid: client.pid,
             binary: client.binary.clone(),
             state: UserClientState::Attached,
-            detail: format!("shares the daemon through {}", client.endpoint),
+            detail: client.detail.clone(),
         });
     }
     for client in &clients.unverified {
@@ -447,9 +471,15 @@ fn report_user_clients(clients: &LocalClients) -> Vec<UserClient> {
             pid: client.pid,
             binary: client.binary.clone(),
             state: UserClientState::Unverified,
-            detail: "its argv does not name the daemon, so whether it shares the daemon cannot be \
-                     established from the process table"
-                .to_string(),
+            detail: client.detail.clone(),
+        });
+    }
+    for client in &clients.unreachable {
+        report.push(UserClient {
+            pid: client.pid,
+            binary: client.binary.clone(),
+            state: UserClientState::Unreachable,
+            detail: client.detail.clone(),
         });
     }
     report.sort_by_key(|client| client.pid);
@@ -529,6 +559,210 @@ fn absent_reason(discovery: &Discovery) -> String {
     match &discovery.daemon {
         DaemonState::Absent { evidence } => evidence.clone(),
         DaemonState::Running(_) => "the daemon is running but was not attached".to_string(),
+    }
+}
+
+/// A unique scratch directory for one probe. `thread/start` assigns the thread
+/// id only in its response, so an ambiguous create has no id to delete; the
+/// distinctive cwd is what a recovery `thread/list` finds.
+fn probe_directory() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("cola-doctor-{}-{nanos}", std::process::id()))
+}
+
+/// Owns a probe's scratch thread so cancellation cannot leak it.
+///
+/// The normal path calls [`Self::finish`], which reports a cleanup failure in
+/// the probe result. If the future is dropped first — a cancelled doctor, a
+/// wrapping timeout — `Drop` spawns the same cleanup on the still-live runtime;
+/// the spawned task cannot be awaited, so its failure is logged.
+struct ProbeThread {
+    connection: RpcConnection,
+    directory: std::path::PathBuf,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    finished: bool,
+}
+
+impl ProbeThread {
+    fn new(connection: RpcConnection, directory: std::path::PathBuf) -> Self {
+        Self {
+            connection,
+            directory,
+            thread_id: None,
+            turn_id: None,
+            finished: false,
+        }
+    }
+
+    /// Record the id as soon as `thread/start` returns, before anything can
+    /// fail or be cancelled with the thread already created.
+    fn set_thread(&mut self, thread_id: String) {
+        self.thread_id = Some(thread_id);
+    }
+
+    fn set_turn(&mut self, turn_id: String) {
+        self.turn_id = Some(turn_id);
+    }
+
+    /// Delete the thread, interrupting the turn only when the probe did not
+    /// see it complete, then fall back to a by-directory lookup for an
+    /// ambiguous create. Returns the failure when the probe's write is not
+    /// gone.
+    async fn finish(&mut self, stop_turn: bool) -> Option<String> {
+        let turn_id = if stop_turn { self.turn_id.as_deref() } else { None };
+        let cleanup = clean_probe_thread(
+            &self.connection,
+            self.thread_id.as_deref(),
+            turn_id,
+            &self.directory,
+        )
+        .await
+        .err();
+        self.finished = true;
+        let _ = std::fs::remove_dir_all(&self.directory);
+        cleanup
+    }
+}
+
+impl Drop for ProbeThread {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let connection = self.connection.clone();
+        let directory = self.directory.clone();
+        let thread_id = self.thread_id.clone();
+        let turn_id = self.turn_id.clone();
+        runtime.spawn(async move {
+            if let Err(failure) =
+                clean_probe_thread(&connection, thread_id.as_deref(), turn_id.as_deref(), &directory).await
+            {
+                tracing::warn!("the cancelled codex doctor probe could not clean up: {failure}");
+            }
+            let _ = std::fs::remove_dir_all(&directory);
+        });
+    }
+}
+
+/// Remove the probe's turn and thread. An unknown id is not "nothing to do":
+/// an ambiguous `thread/start` may have created the thread, so the distinctive
+/// directory is looked up and every match deleted.
+async fn clean_probe_thread(
+    connection: &RpcConnection,
+    thread_id: Option<&str>,
+    turn_id: Option<&str>,
+    directory: &Path,
+) -> std::result::Result<(), String> {
+    let mut failures = Vec::new();
+    let mut deleted = false;
+    if let Some(thread_id) = thread_id {
+        if let Some(turn_id) = turn_id {
+            match tokio::time::timeout(
+                TURN_PROBE_CLEANUP_TIMEOUT,
+                connection.request(
+                    "turn/interrupt",
+                    json!({ "threadId": thread_id, "turnId": turn_id }),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => failures.push(format!("turn/interrupt: {error}")),
+                Err(_) => failures.push(format!(
+                    "turn/interrupt timed out after {TURN_PROBE_CLEANUP_TIMEOUT:?}"
+                )),
+            }
+        }
+        match tokio::time::timeout(
+            TURN_PROBE_CLEANUP_TIMEOUT,
+            connection.request("thread/delete", json!({ "threadId": thread_id })),
+        )
+        .await
+        {
+            Ok(Ok(_)) => deleted = true,
+            Ok(Err(error)) => failures.push(format!("thread/delete: {error}")),
+            Err(_) => failures.push(format!(
+                "thread/delete timed out after {TURN_PROBE_CLEANUP_TIMEOUT:?}"
+            )),
+        }
+    }
+    // An unknown id (an ambiguous create) or a failed delete still leaves the
+    // probe's own thread behind: find it by its unique directory.
+    if !deleted {
+        match recover_probe_threads(connection, directory).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!("deleted {count} codex doctor probe thread(s)"),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Delete every thread whose cwd is the probe's unique directory. This is the
+/// only handle on a thread the server created but whose `thread/start` reply
+/// was lost.
+async fn recover_probe_threads(
+    connection: &RpcConnection,
+    directory: &Path,
+) -> std::result::Result<usize, String> {
+    let cwd = directory.to_string_lossy().to_string();
+    let result = tokio::time::timeout(
+        TURN_PROBE_CLEANUP_TIMEOUT,
+        connection.request("thread/list", json!({ "cwd": cwd, "limit": 10 })),
+    )
+    .await
+    .map_err(|_| format!("thread/list timed out after {TURN_PROBE_CLEANUP_TIMEOUT:?}"))?
+    .map_err(|error| format!("thread/list: {error}"))?;
+    let threads = result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut deleted = 0;
+    let mut failures = Vec::new();
+    for thread in threads {
+        let Some(id) = thread.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if thread.get("cwd").and_then(Value::as_str) != Some(cwd.as_str()) {
+            continue;
+        }
+        match tokio::time::timeout(
+            TURN_PROBE_CLEANUP_TIMEOUT,
+            connection.request("thread/delete", json!({ "threadId": id })),
+        )
+        .await
+        {
+            Ok(Ok(_)) => deleted += 1,
+            Ok(Err(error)) => failures.push(format!("thread/delete {id}: {error}")),
+            Err(_) => failures.push(format!(
+                "thread/delete {id} timed out after {TURN_PROBE_CLEANUP_TIMEOUT:?}"
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(deleted)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Append a cleanup failure to a probe detail so it is visible in the result.
+fn with_cleanup(detail: String, cleanup: Option<String>) -> String {
+    match cleanup {
+        Some(cleanup) => format!("{detail}; the probe could not clean up: {cleanup}"),
+        None => detail,
     }
 }
 
@@ -680,7 +914,7 @@ impl ServerLifecycle for CodexLifecycle {
             report.detail = error.to_string();
             return Some(report);
         }
-        let discovered = match self.diagnosis().await {
+        let mut discovered = match self.diagnosis().await {
             Ok(discovered) => discovered,
             Err(error) => {
                 report.state = ClientState::Unattached;
@@ -689,6 +923,11 @@ impl ServerLifecycle for CodexLifecycle {
             }
         };
         let daemon = discovered.daemon.daemon().cloned();
+        if let Some(daemon) = &daemon {
+            // An argv match is not proof; settle it from the clients' open
+            // descriptors where the OS exposes them.
+            discovery::prove_attachments(&mut discovered.clients, &daemon.socket).await;
+        }
         report.detail = match &daemon {
             Some(daemon) => {
                 let version = daemon
@@ -708,18 +947,9 @@ impl ServerLifecycle for CodexLifecycle {
             return Some(report);
         }
 
-        // Attach to read what the connection advertises. `allow_spawn: false`
-        // and no mid-turn heal keep this a read: a diagnostic must never start
-        // the daemon it is describing.
-        let never_busy = || false;
-        let outcome = self
-            .ensure_attached(EnsureAttached {
-                allow_spawn: false,
-                heal_when_busy: false,
-                busy: &never_busy,
-                boot: true,
-            })
-            .await;
+        // Attach to read what the connection advertises. The shared diagnostic
+        // request never starts the daemon it is describing.
+        let outcome = self.attach_for_diagnostics().await;
         match outcome {
             Ok(AttachOutcome::Attached) => match self.attached_client().await {
                 Some(client) => {
@@ -754,24 +984,17 @@ impl ServerLifecycle for CodexLifecycle {
     /// ADR-0090's amendment: a turn with no usable credential is **accepted**
     /// and then fails as a retryable `error`, so doctor's proof that the
     /// configured provider works is a real turn. This is a write on a daemon
-    /// cola does not own, which is why the CLI gates it behind
-    /// `cola doctor --check-turn`.
+    /// cola does not own, so the CLI runs it by default and offers
+    /// `--no-turn-check` as the explicit opt-out.
     ///
-    /// The scratch thread is named as cola's diagnostic and deleted on every
-    /// exit path. A retryable error is read from the raw notification stream:
-    /// the read model deliberately keeps a retrying turn live (it may recover),
-    /// so the probe cannot learn it from the projection.
+    /// The scratch thread is named as cola's diagnostic and cleaned up on
+    /// every exit path, including cancellation: a [`ProbeThread`] guard owns
+    /// the ids and spawns the same cleanup when the future is dropped. A
+    /// retryable error is read from the raw notification stream: the read
+    /// model deliberately keeps a retrying turn live (it may recover), so the
+    /// probe cannot learn it from the projection.
     async fn probe_turn(&self) -> TurnProbe {
-        let never_busy = || false;
-        if let Err(error) = self
-            .ensure_attached(EnsureAttached {
-                allow_spawn: false,
-                heal_when_busy: false,
-                busy: &never_busy,
-                boot: true,
-            })
-            .await
-        {
+        if let Err(error) = self.attach_for_diagnostics().await {
             return TurnProbe::Failed {
                 detail: format!("could not attach to the codex daemon: {error}"),
             };
@@ -783,19 +1006,27 @@ impl ServerLifecycle for CodexLifecycle {
                     .to_string(),
             };
         };
+        let directory = probe_directory();
+        if let Err(error) = std::fs::create_dir_all(&directory) {
+            return TurnProbe::Failed {
+                detail: format!(
+                    "could not create the probe directory {}: {error}",
+                    directory.display()
+                ),
+            };
+        }
+        let mut probe = ProbeThread::new(client.connection().clone(), directory.clone());
         let mut inbound = client.connection().inbound();
-        let scratch: Arc<std::sync::Mutex<Option<(String, Option<String>)>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let scratch_for_probe = Arc::clone(&scratch);
+        let cwd = directory.to_string_lossy().to_string();
 
         let outcome = tokio::time::timeout(TURN_PROBE_TIMEOUT, async {
             let thread = client
                 .threads()
-                .start(None)
+                .start(Some(&cwd))
                 .await
                 .map_err(|error| format!("could not create a probe thread: {error}"))?;
             let thread_id = thread.id.clone();
-            *scratch_for_probe.lock().expect("probe thread id") = Some((thread_id.clone(), None));
+            probe.set_thread(thread_id.clone());
             // Name it as cola's own diagnostic; a failure here is cosmetic.
             let _ = tokio::time::timeout(
                 TURN_PROBE_CLEANUP_TIMEOUT,
@@ -827,8 +1058,7 @@ impl ServerLifecycle for CodexLifecycle {
                 .unwrap_or_default()
                 .to_string();
             if !turn_id.is_empty() {
-                *scratch_for_probe.lock().expect("probe thread id") =
-                    Some((thread_id.clone(), Some(turn_id.clone())));
+                probe.set_turn(turn_id.clone());
             }
 
             loop {
@@ -887,40 +1117,18 @@ impl ServerLifecycle for CodexLifecycle {
         })
         .await;
 
-        // Delete the probe thread on every path — a completed turn, a failure,
-        // or the budget expiring. The daemon is not cola's, so a leftover
-        // diagnostic thread would be a write the user did not ask for.
-        let probe = scratch.lock().expect("probe thread id").take();
-        if let Some((thread_id, turn_id)) = probe {
-            // A failed or timed-out probe can leave the turn live (a retryable
-            // error keeps retrying): interrupt it before deleting the thread,
-            // so the diagnostic leaves neither a thread nor a running turn.
-            if !matches!(&outcome, Ok(Ok(_)))
-                && let Some(turn_id) = turn_id
-            {
-                let _ = tokio::time::timeout(
-                    TURN_PROBE_CLEANUP_TIMEOUT,
-                    client.connection().request(
-                        "turn/interrupt",
-                        json!({ "threadId": thread_id, "turnId": turn_id }),
-                    ),
-                )
-                .await;
-            }
-            let _ = tokio::time::timeout(
-                TURN_PROBE_CLEANUP_TIMEOUT,
-                client
-                    .connection()
-                    .request("thread/delete", json!({ "threadId": thread_id })),
-            )
-            .await;
-        }
-
+        let stop_turn = !matches!(&outcome, Ok(Ok(_)));
+        let cleanup = probe.finish(stop_turn).await;
         match outcome {
-            Ok(Ok(detail)) => TurnProbe::Passed { detail },
-            Ok(Err(detail)) => TurnProbe::Failed { detail },
+            Ok(Ok(detail)) => TurnProbe::Passed { detail, cleanup },
+            Ok(Err(detail)) => TurnProbe::Failed {
+                detail: with_cleanup(detail, cleanup),
+            },
             Err(_) => TurnProbe::Failed {
-                detail: format!("the turn did not complete within {TURN_PROBE_TIMEOUT:?}"),
+                detail: with_cleanup(
+                    format!("the turn did not complete within {TURN_PROBE_TIMEOUT:?}"),
+                    cleanup,
+                ),
             },
         }
     }
@@ -936,7 +1144,7 @@ mod tests {
 
     use super::*;
     use crate::codex::schema::PinnedProbe;
-    use crate::codex::test_server::{FakeCodex, FakeServer};
+    use crate::codex::test_server::{FakeCodex, FakeServer, ScriptedThread};
 
     /// Record which binary each attach asks the probe for, and answer with the
     /// pinned surface (the fake daemon reports the pinned version).
@@ -1085,6 +1293,32 @@ mod tests {
             command.args(["-c", "sleep 30; :"]);
             command.args(extra);
             command.spawn().expect("spawn the fake TUI")
+        }
+
+        /// Spawn a fake `codex` TUI that **actually connects** to `socket` and
+        /// sleeps, so the descriptor proof can be exercised end to end. `None`
+        /// when `python3` is unavailable (the test then skips).
+        fn spawn_connected_tui(&self, socket: &std::path::Path, remote: &str) -> Option<std::process::Child> {
+            let python = ["python3", "/usr/bin/python3", "/usr/sbin/python3"]
+                .into_iter()
+                .find(|program| {
+                    std::process::Command::new(program)
+                        .arg("--version")
+                        .output()
+                        .is_ok()
+                })?;
+            let tui_dir = self.root.path().join("tui-connected");
+            std::fs::create_dir_all(&tui_dir).expect("connected tui dir");
+            let binary = tui_dir.join("codex");
+            if !binary.exists() {
+                std::os::unix::fs::symlink(python, &binary).expect("symlink python");
+            }
+            let script = "import socket,sys,time; s=socket.socket(socket.AF_UNIX); \
+                          s.connect(sys.argv[1]); time.sleep(30)";
+            std::process::Command::new(&binary)
+                .args(["-c", script, &socket.display().to_string(), "--remote", remote])
+                .spawn()
+                .ok()
         }
 
         /// The fake daemons' own pid records, once their launcher has run.
@@ -1749,15 +1983,28 @@ mod tests {
 
     /// Ticket #883 acceptance 4: `status`/`doctor` learn the active client's
     /// endpoint, its capabilities and its local clients through the same
-    /// read-only report — never by naming the adapter.
+    /// read-only report — never by naming the adapter. Linux-only: the
+    /// attached claim comes from the descriptor proof.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_report_names_the_daemon_capabilities_and_an_attached_client() {
+        // The descriptor proof needs `/proc` and `ss`; both are standard on
+        // Linux. The pure proof has its own test in `discovery`, so a hidden
+        // environment degrades this integration test to a skip, not a false
+        // green.
+        if std::process::Command::new("ss").arg("-x").output().is_err() {
+            eprintln!("skipping descriptor proof: `ss` is unavailable");
+            return;
+        }
         let fixture = Fixture::new();
         let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
         fixture.link_daemon();
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
         let remote = format!("unix://{}", fixture.environment.socket().display());
-        let mut client = fixture.spawn_tui(&["--remote", &remote]);
+        let Some(mut client) = fixture.spawn_connected_tui(&fixture.environment.socket(), &remote) else {
+            eprintln!("skipping descriptor proof: `python3` is unavailable");
+            return;
+        };
         let pid = client.id() as i32;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1940,6 +2187,102 @@ mod tests {
             1,
             "a failed probe still deletes its thread"
         );
+    }
+
+    /// Cancellation safety: dropping the probe future while it waits on the
+    /// turn stream still interrupts the turn and deletes the scratch thread
+    /// (the guard's `Drop` spawns the cleanup).
+    #[tokio::test]
+    async fn a_cancelled_turn_probe_still_cleans_up() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        let lifecycle = Arc::new(fixture.lifecycle(crate::config::ServerStartPolicy::Never));
+        let task = tokio::spawn({
+            let lifecycle = Arc::clone(&lifecycle);
+            async move { lifecycle.probe_turn().await }
+        });
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while server.turn_starts() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the probe never started its turn"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while server.deleted_threads().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a cancelled probe leaked its scratch thread"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.interrupt_params().len(),
+            1,
+            "cancellation stops the live probe turn"
+        );
+    }
+
+    /// An ambiguous `thread/start` (the server created the thread, the reply
+    /// was lost) has no id to delete. The cleanup finds it by the probe's
+    /// unique directory and deletes it.
+    #[tokio::test]
+    async fn an_ambiguous_create_is_cleaned_up_by_its_probe_directory() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        let directory = fixture.root.path().join("ambiguous-probe");
+        std::fs::create_dir_all(&directory).expect("probe dir");
+        server.seed_thread(ScriptedThread::never_run(
+            "thread-ambiguous",
+            "session-root",
+            &directory.to_string_lossy(),
+        ));
+        let endpoint = Endpoint::Unix(fixture.environment.socket());
+        let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
+            .await
+            .expect("attach to the scripted daemon");
+
+        let result = clean_probe_thread(client.connection(), None, None, &directory).await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            server.deleted_threads(),
+            vec!["thread-ambiguous".to_string()],
+            "the by-directory lookup deleted the lost-response thread"
+        );
+    }
+
+    /// A passing provider whose cleanup failed is not a clean pass: the
+    /// failure is in the result, and `doctor` turns it into a warning.
+    #[tokio::test]
+    async fn a_failed_cleanup_is_surfaced_in_a_passing_probe() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        server.script_turn(
+            "*",
+            vec![json!({
+                "method": "turn/completed",
+                "params": { "turn": { "status": "completed" } },
+            })],
+        );
+        // Both the direct delete and the by-directory fallback fail.
+        server.reject_thread_deletes(2);
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+
+        match lifecycle.probe_turn().await {
+            TurnProbe::Passed { cleanup, .. } => {
+                let cleanup = cleanup.expect("the cleanup failure is surfaced");
+                assert!(cleanup.contains("delete refused"), "{cleanup}");
+            }
+            other => panic!("the provider passed but the result hid cleanup: {other:?}"),
+        }
     }
 
     /// With no daemon there is nothing to probe; the outcome says so rather

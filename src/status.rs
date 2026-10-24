@@ -13,7 +13,8 @@
 //! kind from the config, and its endpoint, attachment, capabilities and local
 //! clients from the adapter's own [`crate::backend::ServerLifecycle::client_report`].
 //! The one check that writes to a runtime cola does not own — a real turn
-//! proving the configured provider works — is opt-in via `doctor --check-turn`.
+//! proving the configured provider works — runs by default; `--no-turn-check`
+//! is the explicit opt-out.
 //!
 //! Neither command takes the Singleton Lock: they must work while cola runs, and
 //! against a broken install where cola cannot run at all.
@@ -94,7 +95,7 @@ pub struct ClientCapability {
 pub struct ClientProcess {
     pub pid: i32,
     pub binary: String,
-    /// `attached` / `embedded` / `unverified`.
+    /// `attached` / `embedded` / `unverified` / `unreachable`.
     pub state: String,
     pub detail: String,
 }
@@ -304,6 +305,7 @@ fn user_client_state_label(state: UserClientState) -> &'static str {
         UserClientState::Attached => "attached",
         UserClientState::Embedded => "embedded",
         UserClientState::Unverified => "unverified",
+        UserClientState::Unreachable => "unreachable",
     }
 }
 
@@ -412,6 +414,7 @@ fn process_list(clients: &[ClientProcess]) -> String {
             let state = match client.state.as_str() {
                 "attached" => "已连接",
                 "embedded" => "内嵌服务器",
+                "unreachable" => "端点不可达",
                 _ => "未验证",
             };
             format!("{} (PID {}, {state})", client.binary, client.pid)
@@ -609,8 +612,11 @@ pub fn render_doctor(checks: &[Check]) -> String {
 }
 
 /// Run `cola doctor`: gather the checks, print the report, and return whether
-/// every check passed. `check_turn` is the explicit opt-in for the one check
-/// that writes to the user's runtime (ADR-0090 decision 3, ticket #883).
+/// every check passed. `check_turn` is true unless the user passed
+/// `--no-turn-check`: it is the one check that writes to the user's runtime,
+/// and it runs by default because a provider that cannot complete a turn is
+/// exactly the failure a login-shaped check would miss (ADR-0090 decision 3,
+/// ticket #883).
 pub async fn run_doctor(
     state: &ConfigState,
     log_path: &Path,
@@ -679,12 +685,6 @@ async fn doctor_checks(
         // The OpenCode rows are unchanged (ADR-0081): the client-scoped rows
         // are additive, and a broken/unsupported config keeps its old report.
         _ => {
-            if check_turn {
-                checks.push(Check::warn(
-                    "回合检查",
-                    "`--check-turn` 只适用于 Codex 客户端；OpenCode 的服务器探测已覆盖其可用性".to_string(),
-                ));
-            }
             checks.push(opencode_binary_check());
 
             let server = probe_server(client).await;
@@ -820,16 +820,29 @@ fn codex_client_checks(report: Option<&ClientReport>, turn: Option<&TurnProbe>) 
     checks
 }
 
-/// The user's own client: a proven embedded one is a failure; a proven
-/// attached one passes; an unverifiable one is a warning that names the gap.
+/// The user's own client, classified honestly:
+///
+/// - **proven attached** (a live descriptor connection) → PASS;
+/// - **unverified** (neither argv nor descriptors settle it) → WARN, naming
+///   the gap; never a pass, because claiming sharing cola cannot establish is
+///   the silence ADR-0090 decision 3 rejects;
+/// - **embedded** or **unreachable** (proven not to share this daemon) → FAIL;
+/// - **absent** (no local Codex client process) → PASS: a Feishu-only
+///   deployment has no local client to attach, and cola's own connection to the
+///   daemon is covered by the check above.
 fn local_client_check(report: &ClientReport) -> Check {
-    let embedded: Vec<&UserClient> = report
+    let unsupported: Vec<&UserClient> = report
         .user_clients
         .iter()
-        .filter(|client| client.state == UserClientState::Embedded)
+        .filter(|client| {
+            matches!(
+                client.state,
+                UserClientState::Embedded | UserClientState::Unreachable
+            )
+        })
         .collect();
-    if !embedded.is_empty() {
-        let listed = embedded
+    if !unsupported.is_empty() {
+        let listed = unsupported
             .iter()
             .map(|client| format!("PID {} ({})：{}", client.pid, client.binary, client.detail))
             .collect::<Vec<_>>()
@@ -837,8 +850,8 @@ fn local_client_check(report: &ClientReport) -> Check {
         return Check::fail(
             "Codex 本地客户端",
             format!(
-                "{listed}。它运行在自己的内嵌服务器上，与共享 daemon 不共享线程；请启动 \
-                 `codex app-server daemon start` 并用 `--remote` 把你的客户端指向该 daemon"
+                "{listed}。它无法与共享 daemon 共享线程；请启动 \
+                 `codex app-server daemon start`，并用 `--remote` 把你的客户端指向该 daemon"
             ),
         );
     }
@@ -850,14 +863,14 @@ fn local_client_check(report: &ClientReport) -> Check {
     if !unverified.is_empty() {
         let listed = unverified
             .iter()
-            .map(|client| format!("PID {} ({})", client.pid, client.binary))
+            .map(|client| format!("PID {} ({})：{}", client.pid, client.binary, client.detail))
             .collect::<Vec<_>>()
             .join("；");
         return Check::warn(
             "Codex 本地客户端",
             format!(
-                "{listed} 未在 argv 中命名 daemon，无法从进程表证明它已连接到共享 daemon；\
-                 用 `codex --remote unix://{}` 启动可被证实",
+                "{listed}。无法证明它已连接到共享 daemon；在有 `/proc` 与 `ss` 的 Linux 上，\
+                 以 `codex --remote unix://{}` 启动可由打开的描述符证实",
                 report
                     .endpoint
                     .strip_prefix("unix://")
@@ -881,25 +894,29 @@ fn local_client_check(report: &ClientReport) -> Check {
             format!("{listed} 已连接到 {}", report.endpoint),
         );
     }
-    Check::warn(
+    Check::pass(
         "Codex 本地客户端",
-        format!(
-            "未发现本地 Codex 客户端；无法确认你的客户端已连接到 {}",
-            report.endpoint
-        ),
+        "未发现本地 Codex 客户端；Feishu-only 部署不需要本地客户端".to_string(),
     )
 }
 
-/// The provider's real turn. Without `--check-turn` the check states the
-/// opt-in rather than guessing, because the probe is a write on a daemon cola
-/// does not own.
+/// The provider's real turn. By default `doctor` runs it; `--no-turn-check` is
+/// the explicit opt-out, and the check then says so rather than passing
+/// silently. A cleanup failure is a warning, not a pass: the provider worked,
+/// but the probe left its own write behind.
 fn turn_check(turn: Option<&TurnProbe>) -> Check {
     match turn {
         None => Check::warn(
             "Codex 回合",
-            "未检查；运行 `cola doctor --check-turn` 验证配置的 provider 能否完成一次真实回合".to_string(),
+            "已按 `--no-turn-check` 跳过；无法确认配置的 provider 能否完成一次真实回合".to_string(),
         ),
-        Some(TurnProbe::Passed { detail }) => Check::pass("Codex 回合", detail.clone()),
+        Some(TurnProbe::Passed { detail, cleanup }) => match cleanup {
+            None => Check::pass("Codex 回合", detail.clone()),
+            Some(cleanup) => Check::warn(
+                "Codex 回合",
+                format!("{detail}；但探针未能清理自己的线程：{cleanup}"),
+            ),
+        },
         Some(TurnProbe::Failed { detail }) => Check::fail("Codex 回合", detail.clone()),
         Some(TurnProbe::NotAttempted { detail }) => Check::warn("Codex 回合", detail.clone()),
     }
@@ -1496,14 +1513,20 @@ kind = "codex"
                 detail: "runs with `--no-daemon`, so its app-server is in-process".into(),
             }],
         );
-        let checks = codex_client_checks(Some(&report), Some(&TurnProbe::Passed { detail: "ok".into() }));
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
         assert!(!doctor_ok(&checks), "{checks:?}");
         let local = checks
             .iter()
             .find(|check| check.label == "Codex 本地客户端")
             .expect("the local-client check");
         assert_eq!(local.status, CheckStatus::Fail);
-        assert!(local.detail.contains("内嵌服务器"), "{}", local.detail);
+        assert!(local.detail.contains("in-process"), "{}", local.detail);
         assert!(local.detail.contains("--remote"), "{}", local.detail);
     }
 
@@ -1520,13 +1543,23 @@ kind = "codex"
                 detail: "names no daemon".into(),
             }],
         );
-        let checks = codex_client_checks(Some(&report), Some(&TurnProbe::Passed { detail: "ok".into() }));
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
         let local = checks
             .iter()
             .find(|check| check.label == "Codex 本地客户端")
             .expect("the local-client check");
         assert_eq!(local.status, CheckStatus::Warn);
-        assert!(local.detail.contains("无法从进程表证明"), "{}", local.detail);
+        assert!(
+            local.detail.contains("无法证明它已连接到共享 daemon"),
+            "{}",
+            local.detail
+        );
     }
 
     /// The acceptance case that a login-shaped check would miss: the provider
@@ -1558,6 +1591,7 @@ kind = "codex"
             Some(&report),
             Some(&TurnProbe::Passed {
                 detail: "the configured provider completed a turn (thread thread-1)".into(),
+                cleanup: None,
             }),
         );
         assert!(doctor_ok(&checks), "{checks:?}");
@@ -1567,8 +1601,10 @@ kind = "codex"
         );
     }
 
+    /// The default is to run the probe; `--no-turn-check` is the opt-out, and
+    /// the check then says so instead of passing silently.
     #[test]
-    fn the_turn_check_states_its_opt_in_when_not_requested() {
+    fn the_turn_check_reports_an_explicit_opt_out() {
         let report = codex_report(ClientState::Attached, vec![attached_user(77)]);
         let checks = codex_client_checks(Some(&report), None);
         let turn = checks
@@ -1576,7 +1612,78 @@ kind = "codex"
             .find(|check| check.label == "Codex 回合")
             .expect("the turn check");
         assert_eq!(turn.status, CheckStatus::Warn);
-        assert!(turn.detail.contains("--check-turn"), "{}", turn.detail);
+        assert!(turn.detail.contains("--no-turn-check"), "{}", turn.detail);
+    }
+
+    /// A client pointed at another endpoint is proven not to share this
+    /// daemon: a named failure, not "embedded" and not a silent pass.
+    #[test]
+    fn an_unreachable_client_fails_doctor() {
+        let report = codex_report(
+            ClientState::Attached,
+            vec![UserClient {
+                pid: 9,
+                binary: "codex".into(),
+                state: UserClientState::Unreachable,
+                detail: "points at `ws://host:1`, not the discovered daemon".into(),
+            }],
+        );
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
+        assert!(!doctor_ok(&checks), "{checks:?}");
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Fail);
+        assert!(local.detail.contains("ws://host:1"), "{}", local.detail);
+    }
+
+    /// No local client is a Feishu-only deployment: nothing to attach, and
+    /// cola's own daemon connection is checked separately. The check passes
+    /// with that reason rather than warning or failing.
+    #[test]
+    fn no_local_client_is_a_feishu_only_pass() {
+        let report = codex_report(ClientState::Attached, Vec::new());
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Pass);
+        assert!(local.detail.contains("Feishu-only"), "{}", local.detail);
+    }
+
+    /// A working provider whose probe could not clean up is not a clean pass:
+    /// the diagnostic says the write was left behind.
+    #[test]
+    fn a_cleanup_failure_is_surfaced_as_a_warning() {
+        let report = codex_report(ClientState::Attached, vec![attached_user(77)]);
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "the provider completed a turn".into(),
+                cleanup: Some("thread/delete timed out after 5s".into()),
+            }),
+        );
+        let turn = checks
+            .iter()
+            .find(|check| check.label == "Codex 回合")
+            .expect("the turn check");
+        assert_eq!(turn.status, CheckStatus::Warn);
+        assert!(turn.detail.contains("未能清理"), "{}", turn.detail);
+        assert!(turn.detail.contains("thread/delete"), "{}", turn.detail);
     }
 
     #[test]

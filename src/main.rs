@@ -92,14 +92,16 @@ enum Subcommand {
     /// Run the environment checks a support request needs (config, Feishu
     /// credentials, OpenCode binary/server, singleton lock, autostart path) and
     /// exit non-zero when a check fails (ADR-0081). For a Codex client it also
-    /// reports the daemon, the user's own client and, with `--check-turn`, that
-    /// the configured provider can complete a real turn (ticket #883).
+    /// reports the daemon, the user's own client and that the configured
+    /// provider can complete a real turn (ticket #883).
     Doctor {
-        /// Prove the configured provider can complete a turn. This starts a
-        /// minimal turn on a scratch thread (deleted afterwards), a real write
-        /// on a daemon cola does not own, so it is opt-in.
+        /// Skip the real-turn provider probe. `doctor` runs it by default
+        /// because a provider that cannot complete a turn is the failure a
+        /// login-shaped check would miss; the probe writes a scratch thread
+        /// (deleted afterwards) on a daemon cola does not own, so opt out when
+        /// that write or spend is unwanted.
         #[arg(long)]
-        check_turn: bool,
+        no_turn_check: bool,
     },
     /// Print the tail of the log file; `-f` follows it (ADR-0081).
     Logs {
@@ -953,11 +955,11 @@ async fn main() -> anyhow::Result<()> {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
         return status_cli(json, cli.config.as_deref(), &log_path).await;
     }
-    if let Some(Subcommand::Doctor { check_turn }) = cli.subcommand {
+    if let Some(Subcommand::Doctor { no_turn_check }) = cli.subcommand {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
         let state = status::ConfigState::from_env(cli.config.as_deref());
         let client = status_client(&state);
-        if !status::run_doctor(&state, &log_path, client.as_deref(), check_turn).await? {
+        if !status::run_doctor(&state, &log_path, client.as_deref(), !no_turn_check).await? {
             std::process::exit(1);
         }
         return Ok(());

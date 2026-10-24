@@ -513,17 +513,20 @@ and the autostart binary path — each with a ✅/⚠️/❌ mark and a summary,
 non-zero when a check fails. For an OpenCode client it probes the shared server
 as before; for a Codex client it reports the app-server daemon, whether your own
 client is attached to it, and whether the runtime advertises the expected
-surface. A Codex TUI running on an embedded server (or with `--no-daemon`) is a
-named failure, and a client whose argv cannot prove it shares the daemon is a
-warning that says so.
+surface. Attachment is proven from the client process's open socket descriptors
+on Linux (`/proc`, `ss`), not from its argv: an argv match that cannot be proven
+is a warning, while a `--no-daemon` client or one pointed at another endpoint is
+a named failure. With no local client at all (a Feishu-only deployment) the
+check passes, because there is nothing to attach.
 
-`cola doctor --check-turn` additionally proves the configured provider can
-complete a real turn: it starts a minimal turn on a scratch thread and observes
-`turn/completed`, failing on a retryable or terminal error or when the turn does
-not finish within its 60-second budget. That is a write on a daemon cola does
-not own, so it is opt-in; the scratch thread is named as a doctor probe and
-deleted afterwards. No check reads a ChatGPT account state — a provider-keyed
-`[model_providers.*]` setup is fully green.
+`cola doctor` proves the configured provider can complete a real turn: it starts
+a minimal turn on a scratch thread and observes `turn/completed`, failing on a
+retryable or terminal error or when the turn does not finish within its
+60-second budget. That is a write on a daemon cola does not own — the scratch
+thread is named as a doctor probe and deleted afterwards, and a cleanup failure
+is reported as a warning — so `--no-turn-check` is the explicit opt-out. No
+check reads a ChatGPT account state: a provider-keyed `[model_providers.*]`
+setup is fully green.
 
 `cola config path|show|validate` prints the resolved config path, the effective
 config with the app secret masked, or a parse check. `cola version` mirrors
