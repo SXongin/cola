@@ -1753,6 +1753,11 @@ pub struct MockBackend {
     /// test that scripts a no-surface client flips it through
     /// [`Self::without_task_surface`].
     pub task_surface: bool,
+    /// Message ids the client answers as cola-authored through the authorship
+    /// seam (ADR-0090): a client that assigns its own ids answers from its own
+    /// record, never from the `msg_cola_` prefix. Empty by default, so the mock
+    /// keeps the neutral prefix rule.
+    pub authored_message_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Records every `task_runtime` call: `(session_id, shells, children)`.
     pub task_runtime_calls: Arc<tokio::sync::Mutex<Vec<TaskRuntimeCall>>>,
     /// Number of initial `task_runtime` calls to fail with a 500 (then later
@@ -1949,6 +1954,7 @@ impl MockBackend {
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
             task_surface: true,
+            authored_message_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_task_runtime: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2076,6 +2082,16 @@ impl MockBackend {
     /// Scenario: `list_models` serves `models`.
     pub(crate) fn with_models(&mut self, models: Vec<crate::backend::types::ProviderModels>) -> &mut Self {
         self.provider_models = models;
+        self
+    }
+
+    /// Scenario: the client answers `id` as cola-authored through the
+    /// authorship seam (a client that assigns its own ids, ADR-0090).
+    pub(crate) fn with_authored_id(&mut self, id: &str) -> &mut Self {
+        self.authored_message_ids
+            .lock()
+            .expect("authored ids")
+            .insert(id.to_string());
         self
     }
 
@@ -3080,6 +3096,14 @@ impl crate::backend::Backend for MockBackend {
 
     async fn list_models(&self) -> Vec<crate::backend::types::ProviderModels> {
         self.provider_models.clone()
+    }
+
+    async fn is_cola_authored(&self, message_id: &str) -> bool {
+        self.authored_message_ids
+            .lock()
+            .expect("authored ids")
+            .contains(message_id)
+            || crate::backend::parsing::is_cola_message_id(message_id)
     }
 
     async fn reply_question(

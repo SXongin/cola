@@ -355,7 +355,7 @@ impl ExternalFlow {
         let Some(turn_anchor) = newest.anchor() else {
             return;
         };
-        let cola_authored = crate::backend::parsing::is_cola_message_id(newest.id.as_str());
+        let cola_authored = handles.backend.is_cola_authored(newest.id.as_str()).await;
         // The Session Sync pass's clock (ADR-0060): the yielded refresh
         // compares the ledger's rendered elapsed at second granularity, and
         // the Wake decision and the yielded refresh of this same read must
@@ -1645,11 +1645,11 @@ async fn external_render_loop(
         // server time wins) because a same-millisecond message cannot be
         // ordered by server time; the armed-renderer guards above use
         // full-anchor identity instead.
-        let newer_turn = transcript
-            .newest_user()
-            .filter(|message| !crate::backend::parsing::is_cola_message_id(message.id.as_str()))
-            .and_then(|message| message.anchor())
-            .is_some_and(|newest| newest.created_ms > anchor.created_ms);
+        let newest_external = match transcript.newest_user() {
+            Some(message) if !handles.backend.is_cola_authored(message.id.as_str()).await => message.anchor(),
+            _ => None,
+        };
+        let newer_turn = newest_external.is_some_and(|newest| newest.created_ms > anchor.created_ms);
         if newer_turn {
             break;
         }

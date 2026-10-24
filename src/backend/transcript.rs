@@ -80,6 +80,13 @@ pub struct SessionTranscript {
     /// carries the read's own outcome for the shells it did spend on. Empty on
     /// V1 and on every path that does not reconcile.
     pub shell_outputs: std::collections::HashMap<String, ShellOutputRead>,
+    /// The message the client actually landed for an id cola submitted
+    /// (ADR-0026): chosen submission id → the transcript message's own id.
+    /// Empty on a generation whose messages carry the id cola chose (every
+    /// OpenCode one). A client that assigns its own message ids — Codex —
+    /// reports the pairing here (ADR-0092), because the Turn's anchor is found
+    /// by the id cola submitted and that id is not the message's.
+    pub submissions: std::collections::HashMap<String, MessageId>,
 }
 
 impl SessionTranscript {
@@ -93,7 +100,16 @@ impl SessionTranscript {
             unconfirmed_tasks: std::collections::HashSet::new(),
             truncated: false,
             shell_outputs: std::collections::HashMap::new(),
+            submissions: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach the client's own record of which message an id cola submitted
+    /// landed as (ADR-0026, ADR-0092). Only a client that assigns its own
+    /// message ids needs it; every OpenCode read leaves the map empty.
+    pub fn with_submissions(mut self, submissions: std::collections::HashMap<String, MessageId>) -> Self {
+        self.submissions = submissions;
+        self
     }
 
     /// Attach the Execution boundaries the backend recorded. The V2 decoder
@@ -398,9 +414,18 @@ impl SessionTranscript {
     /// The one derivation the renderer's anchor capture and the Turn's failure
     /// read both use, so they cannot drift.
     pub fn anchor_of_user(&self, message_id: &str) -> Option<TurnAnchor> {
+        // The anchor is found by the id cola SUBMITTED (ADR-0026, ADR-0092). A client
+        // that assigns its own message ids reports which message that id
+        // landed as ([`Self::submissions`]); on a generation whose messages
+        // carry cola's id the map is empty and the id is the message's.
+        let landed = self
+            .submissions
+            .get(message_id)
+            .map(MessageId::as_str)
+            .unwrap_or(message_id);
         self.messages
             .iter()
-            .find(|message| message.role == MessageRole::User && message.id.as_str() == message_id)
+            .find(|message| message.role == MessageRole::User && message.id.as_str() == landed)
             .and_then(TranscriptMessage::anchor)
     }
 

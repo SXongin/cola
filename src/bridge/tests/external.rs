@@ -172,6 +172,95 @@ async fn external_message_from_shared_store_notifies_feishu() {
     );
 }
 
+/// The client, not the id's spelling, decides authorship (ADR-0090). A client
+/// that assigns its own ids answers through the seam; a message it reports as
+/// cola's never notifies — while a genuinely external one still does, so the
+/// assertion is not vacuous.
+#[tokio::test]
+async fn a_client_authored_message_never_notifies_the_chat() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut mock = MockBackend::new(realistic_parts());
+    let now = now_ms();
+    mock.given_transcript(
+        "ses_own",
+        vec![SessionTranscript::new(vec![user(
+            "item_from_codex",
+            now,
+            "cola 自己的一轮（服务端分配的 id）",
+        )])],
+    );
+    mock.given_transcript(
+        "ses_ext",
+        vec![SessionTranscript::new(vec![user(
+            "msg_ext_user",
+            now,
+            "OpenChamber 里发的消息",
+        )])],
+    );
+    // The client vouches for its own item — the id carries no `msg_cola_`.
+    mock.with_authored_id("item_from_codex");
+    let (app, platform) = build_app(cfg, mock).await;
+
+    for (chat, session) in [("oc_own", "ses_own"), ("oc_ext", "ses_ext")] {
+        seed_entry(
+            &app,
+            crate::config::SessionEntry {
+                client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+                thread_key: crate::config::ThreadKey::new(chat.into(), chat.into()),
+                session_id: session.into(),
+                directory: "/tmp/ext".into(),
+                agent: None,
+                model: None,
+                auto_accept: false,
+                topic_anchor: None,
+                topic_root: None,
+                variant: None,
+            },
+        )
+        .await;
+        app.external
+            .last_user_msg_epoch
+            .lock()
+            .await
+            .insert(session.into(), now - 60_000);
+    }
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+    let notifications: Vec<serde_json::Value> = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::SendCard { card, receive_id } if card_text(card).contains("有新消息") => {
+                if receive_id == "oc_own" {
+                    panic!("cola's own message was notified as external: {card}");
+                }
+                Some(card.clone())
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        notifications.len(),
+        1,
+        "exactly the genuine external message notifies"
+    );
+    assert!(card_text(&notifications[0]).contains("OpenChamber 里发的消息"));
+}
+
 /// A V1 compaction carrier is not a user message (ADR-0082, ticket #724): a
 /// session whose NEWEST message is a compaction pair still routes its External
 /// Message to the real user message the pair follows, never to the carrier —
