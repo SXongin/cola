@@ -653,6 +653,13 @@ impl GenerationStrategy for V2Strategy {
         Ok(runtime)
     }
 
+    /// V2 publishes the live shell/subagent runtime, the shell records and the
+    /// child sessions the Background Task Ledger renders, so its task surface
+    /// is present.
+    fn background_tasks_supported(&self) -> bool {
+        true
+    }
+
     /// The evidence one child session's newest assistant message carries (#591,
     /// issue #464): ONE page, newest assistant first — the same minimal wire
     /// shape as the retry read, so it never decodes the child transcript. A

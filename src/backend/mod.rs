@@ -172,15 +172,15 @@ impl DirectoryBackend for BackendDirectory {
 /// client has. They carry a default body stating **this client has no such
 /// surface**, in the vocabulary the trait already uses: `Ok(None)`, `false`,
 /// the no-op `Ok(())`, `Ok(TaskRuntime::default())`,
-/// `Ok(ChildEvidence::Unfinished)`. The twelve are
+/// `Ok(ChildEvidence::Unfinished)`. The thirteen are
 /// [`Self::session_selection`], [`Self::session_last_run_model`],
 /// [`Self::switch_session_model`], [`Self::switch_session_agent`],
 /// [`Self::keeps_session_selection`], [`Self::reuse_continues_an_admitted_turn`],
 /// [`Self::resume_supported`], [`Self::resume`], [`Self::session_diff`],
-/// [`Self::task_runtime`], [`Self::shell_output`] and
-/// [`Self::child_evidence`].
+/// [`Self::task_runtime`], [`Self::background_tasks_supported`],
+/// [`Self::shell_output`] and [`Self::child_evidence`].
 ///
-/// A future adapter (spec #860) is expected to leave all twelve defaulted when
+/// A future adapter (spec #860) is expected to leave all thirteen defaulted when
 /// the runtime it attaches to publishes no equivalent surface, and to override
 /// the ones it does publish; the rest of the trait — session lifecycle,
 /// [`Self::prompt`], [`Self::transcript`], permissions/questions,
@@ -504,6 +504,22 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         _children: &[String],
     ) -> Result<TaskRuntime> {
         Ok(TaskRuntime::default())
+    }
+
+    /// Whether this client publishes a **Background Task surface** at all: the
+    /// live shells, subagent children and shell output records the Background
+    /// Task Ledger renders, and the runtime verdicts that retire them. It is a
+    /// capability, not a read: it says whether asking the questions is
+    /// meaningful on this client.
+    ///
+    /// The default answers `false`: a client with no such surface renders **no
+    /// ledger** — not an empty section, and never a `⚠️ 状态待确认` row — and the
+    /// Bridge spends no runtime verdict, child-evidence or shell-output read on
+    /// it. `false` is **not applicable to this client**, never a failed read; a
+    /// client that has the surface overrides this, and each of its reads still
+    /// reports its own failure as that read's `Err`.
+    fn background_tasks_supported(&self) -> bool {
+        false
     }
 
     /// The Background Task State module's handle (ADR-0079, tickets #681/#682)
@@ -843,6 +859,10 @@ mod core_only_client {
         client.switch_session_model("ses_core", &model).await.unwrap();
         client.switch_session_agent("ses_core", "build").await.unwrap();
         assert!(client.shell_output("sh_1", None).await.unwrap().is_none());
+        assert!(
+            !client.background_tasks_supported(),
+            "a client with no Background Task surface says so, and renders no ledger"
+        );
 
         let runtime = client
             .task_runtime("ses_core", None, &["sh_1".into()], &["ses_child".into()])

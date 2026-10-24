@@ -197,6 +197,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::task_runtime(self, session_id, directory, shells, children).await
     }
 
+    fn background_tasks_supported(&self) -> bool {
+        OpenCodeBackend::background_tasks_supported(self)
+    }
+
     async fn shell_output(
         &self,
         shell_id: &str,

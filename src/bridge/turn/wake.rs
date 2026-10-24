@@ -339,6 +339,7 @@ impl Turn {
             state::LedgerCadence::Minute,
             endings,
             plans,
+            backend.background_tasks_supported(),
         );
         match ending {
             Some(ending) => acc.apply_ending(ending),

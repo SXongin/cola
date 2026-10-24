@@ -1067,6 +1067,7 @@ impl Turn {
                         render::rendered_bound(&handles.cards, &self.session_id, transcript),
                         render::Endings::of(&handles.cards, &self.session_id),
                         plans,
+                        handles.backend.background_tasks_supported(),
                     );
                 }
                 // Capture the answering model + token usage from the LATEST
@@ -2779,6 +2780,7 @@ impl Turn {
                     state::LedgerCadence::Minute,
                     render::Endings::of(cards, session_id),
                     plans,
+                    backend.background_tasks_supported(),
                 );
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
@@ -2872,6 +2874,7 @@ impl Turn {
                 state::LedgerCadence::Second,
                 render::Endings::of(cards, session_id),
                 plans,
+                backend.background_tasks_supported(),
             );
             // The chain has taken this completion's work over, when there is
             // one. Its entry may already be on the card (a yielded ledger
@@ -3118,6 +3121,7 @@ impl Turn {
                 state::LedgerCadence::Second,
                 render::Endings::of(cards, session_id),
                 plans,
+                backend.background_tasks_supported(),
             );
             // The read's own settle decision judges the true end (ADR-0059):
             // only a read whose Wakes are answered and that retired the last

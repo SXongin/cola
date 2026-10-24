@@ -1748,6 +1748,11 @@ pub struct MockBackend {
     /// script a shell the runtime reports ended/missing, or a child session it
     /// reports inactive. Empty by default — no evidence, exactly like V1.
     pub task_runtime: Arc<std::sync::Mutex<crate::backend::TaskRuntime>>,
+    /// Whether this client publishes a Background Task surface (spec #860,
+    /// #880). True by default — the V2-shaped mock every ledger test drives; a
+    /// test that scripts a no-surface client flips it through
+    /// [`Self::without_task_surface`].
+    pub task_surface: bool,
     /// Records every `task_runtime` call: `(session_id, shells, children)`.
     pub task_runtime_calls: Arc<tokio::sync::Mutex<Vec<TaskRuntimeCall>>>,
     /// Number of initial `task_runtime` calls to fail with a 500 (then later
@@ -1943,6 +1948,7 @@ impl MockBackend {
             session_statuses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             session_status_reads: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             task_runtime: Arc::new(std::sync::Mutex::new(crate::backend::TaskRuntime::default())),
+            task_surface: true,
             task_runtime_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_task_runtime_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_task_runtime: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2373,6 +2379,14 @@ impl MockBackend {
             .lock()
             .await
             .insert(session_id.to_string(), status);
+    }
+
+    /// Scenario: a client with no Background Task surface (spec #860, #880):
+    /// the card renders no ledger and the Bridge spends no runtime read, even
+    /// when a scripted transcript carries task facts.
+    pub(crate) fn without_task_surface(&mut self) -> &mut Self {
+        self.task_surface = false;
+        self
     }
 
     /// Scenario: the server's title for `session_id` (the render poll's
@@ -3257,6 +3271,12 @@ impl crate::backend::Backend for MockBackend {
             Some(status) => *status,
             None => Some(crate::backend::types::SessionStatus::Idle),
         })
+    }
+
+    /// Whether this mock publishes a Background Task surface (spec #860,
+    /// #880): the scripted `task_surface` flag.
+    fn background_tasks_supported(&self) -> bool {
+        self.task_surface
     }
 
     /// The scripted runtime verdict (issue #454). Empty by default, so a test
