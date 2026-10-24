@@ -1017,7 +1017,7 @@ pub(crate) fn file_tracking_estimate(tool: &ToolPanel) -> usize {
 /// without the surrounding quotes. `serde_json::to_string` on a `&str` cannot
 /// fail, so the raw-length fallback is unreachable; it only keeps the estimate
 /// finite if it ever were.
-fn json_escaped_len(text: &str) -> usize {
+pub(crate) fn json_escaped_len(text: &str) -> usize {
     serde_json::to_string(text)
         .map(|quoted| quoted.len().saturating_sub(2))
         .unwrap_or(text.len())
