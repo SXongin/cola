@@ -63,6 +63,18 @@ use super::error::{CodexError, Result};
 /// protocol is not subject to this bound — see [`ServerEvent`].
 const INBOUND_CAPACITY: usize = 1024;
 
+/// How many server decisions may wait between the reader loop and the approval
+/// record.
+///
+/// This is a **memory** bound, not a rate limit: a peer is free to send more
+/// requests than it should, and the queue must not grow without limit. One
+/// tool call blocks on one decision at a time, so a backlog this size means the
+/// decision pipeline is not running — not that the peer is busy. Overflow is
+/// therefore treated as loss of trust: the connection is closed, every pending
+/// decision fails loudly, and the server clears its own pending set because the
+/// peer it waited on is gone. A decision is never dropped to make room.
+const SERVER_EVENT_CAPACITY: usize = 64;
+
 /// How many outgoing frames may sit between a caller and the writer. Bounded on
 /// purpose: a peer that stops reading must apply backpressure to the callers
 /// (whose own timeouts — the handshake's, the liveness probe's — bound them)
@@ -147,9 +159,11 @@ pub(crate) enum Inbound {
 /// broadcast. Both directions are decisions a server is blocked on, so a lost
 /// frame is a hang rather than a gap: a dropped request leaves the server
 /// waiting forever with no card, and a dropped resolution leaves a card
-/// clickable for a request nobody waits on any more. The stream is unbounded
-/// because the volume is one frame per tool call — a bounded queue would only
-/// turn a slow consumer into the same silence.
+/// clickable for a request nobody waits on any more. "Lossless" means no frame
+/// is discarded *silently*: the stream is bounded by
+/// [`SERVER_EVENT_CAPACITY`] for memory safety, and overflowing it closes the
+/// connection (a loud failure every waiter sees) instead of dropping a
+/// decision.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ServerEvent {
     /// A request the server initiated; answer it with
@@ -233,11 +247,14 @@ struct ConnectionInner {
     /// The lossless server-request stream's sender. Requests and their
     /// resolutions are sent here from the reader loop; the receiver is handed
     /// to the approval consumer once, by [`RpcConnection::take_server_events`].
-    /// A connection whose caller never takes it (doctor's attach, a liveness
-    /// probe) buffers what little arrives and drops it with the connection —
-    /// server requests are one frame per tool call, never a flood.
-    server_events: mpsc::UnboundedSender<ServerEvent>,
-    server_events_rx: Mutex<Option<mpsc::UnboundedReceiver<ServerEvent>>>,
+    ///
+    /// **Bounded** ([`SERVER_EVENT_CAPACITY`]): "one frame per tool call" is a
+    /// shape, not a rate a peer must honour, and an unbounded queue would let a
+    /// flood of server requests grow cola's memory until OOM. A connection
+    /// whose caller never takes the stream (doctor's attach, a liveness probe)
+    /// buffers at most that many and drops them with the connection.
+    server_events: mpsc::Sender<ServerEvent>,
+    server_events_rx: Mutex<Option<mpsc::Receiver<ServerEvent>>>,
     /// The receipt order of inbound notifications. Assigned in the reader loop
     /// (before fan-out), so every consumer sees one order even when two tasks
     /// process the same broadcast at different speeds.
@@ -337,7 +354,7 @@ impl RpcConnection {
         let (sink, stream) = socket.split();
         let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
-        let (server_events, server_events_rx) = mpsc::unbounded_channel();
+        let (server_events, server_events_rx) = mpsc::channel(SERVER_EVENT_CAPACITY);
         let (closing, closing_rx) = watch::channel(false);
 
         let inner = Arc::new(ConnectionInner {
@@ -466,12 +483,22 @@ impl RpcConnection {
     /// Take the connection's one lossless server-request stream.
     ///
     /// Only one consumer may own it (the approval record), so it is taken once
-    /// and `None` afterwards. Unlike [`Self::inbound`] nothing here is dropped
-    /// on lag: an approval request or its resolution is a decision a server (or
-    /// a card) is blocked on, not a notification whose loss a reader can
-    /// repair from a later read.
-    pub(crate) fn take_server_events(&self) -> Option<mpsc::UnboundedReceiver<ServerEvent>> {
+    /// and `None` afterwards. Unlike [`Self::inbound`] no frame here is dropped
+    /// silently: an approval request or its resolution is a decision a server
+    /// (or a card) is blocked on, not a notification whose loss a reader can
+    /// repair from a later read. The stream is bounded for memory safety, so
+    /// overflow closes the connection instead (see [`SERVER_EVENT_CAPACITY`]).
+    pub(crate) fn take_server_events(&self) -> Option<mpsc::Receiver<ServerEvent>> {
         self.inner.server_events_rx.lock().expect("server events").take()
+    }
+
+    /// The connection's close signal.
+    ///
+    /// A consumer of [`Self::take_server_events`] must watch this beside its
+    /// stream: when the stream is *full*, the `Closed` frame cannot be queued,
+    /// so the close signal is the only edge that wakes it to clear its state.
+    pub(crate) fn closing(&self) -> watch::Receiver<bool> {
+        self.inner.closing.subscribe()
     }
 
     /// The receipt sequence of the newest inbound notification fanned out by
@@ -488,12 +515,13 @@ impl RpcConnection {
 
     /// A connection with no socket and no writer task: the caller owns the
     /// frame receiver, so it can hold the queue full and observe blocked
-    /// senders. Test-only.
+    /// senders. Test-only; the approval tests also build one to exercise the
+    /// decision stream's bound without a socket.
     #[cfg(test)]
-    fn test_connection(capacity: usize) -> (Self, mpsc::Receiver<Message>, watch::Receiver<bool>) {
+    pub(crate) fn test_connection(capacity: usize) -> (Self, mpsc::Receiver<Message>, watch::Receiver<bool>) {
         let (outgoing, outgoing_rx) = mpsc::channel(capacity);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
-        let (server_events, server_events_rx) = mpsc::unbounded_channel();
+        let (server_events, server_events_rx) = mpsc::channel(SERVER_EVENT_CAPACITY);
         let (closing, closing_rx) = watch::channel(false);
         let inner = Arc::new(ConnectionInner {
             outgoing,
@@ -636,9 +664,34 @@ fn close(inner: &ConnectionInner) {
         let _ = pending.reply.send(Err(RpcFailure::Closed));
     }
     // The server-request stream ends too: the approval record clears its
-    // pending set on this frame, because no answer can reach the server.
-    let _ = inner.server_events.send(ServerEvent::Closed);
+    // pending set on this frame, because no answer can reach the server. The
+    // queue may be full (that is one way to get here), in which case the frame
+    // cannot be queued — the approval record's watch on `closing` is the edge
+    // that wakes it.
+    let _ = inner.server_events.try_send(ServerEvent::Closed);
     let _ = inner.inbound.send(Inbound::Closed);
+}
+
+/// Put one server decision on the lossless stream, or take the connection down.
+///
+/// A full queue means nothing is draining the decision pipeline, so the
+/// connection's decisions can no longer be honoured. Closing is the loud
+/// failure the peer and every waiter see; dropping the event would leave a
+/// server waiting forever (the exact failure this stream exists to prevent).
+fn send_server_event(inner: &Arc<ConnectionInner>, event: ServerEvent) {
+    match inner.server_events.try_send(event) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::error!(
+                "the codex connection's server-request stream is full \
+                 ({SERVER_EVENT_CAPACITY} decisions unread); closing the connection rather than \
+                 dropping a decision"
+            );
+            close(inner);
+        }
+        // The receiver is gone: the connection is closing anyway.
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
 }
 
 /// Route one inbound value.
@@ -650,18 +703,21 @@ fn dispatch(inner: &Arc<ConnectionInner>, value: Value) {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
             // A server request is a server blocked on an answer: it rides the
             // lossless stream, never the notification broadcast.
-            let _ = inner.server_events.send(ServerEvent::Request {
-                id,
-                method: method.to_string(),
-                params,
-            });
+            send_server_event(
+                inner,
+                ServerEvent::Request {
+                    id,
+                    method: method.to_string(),
+                    params,
+                },
+            );
         }
         (Some(method), None) => {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
             if method == SERVER_REQUEST_RESOLVED {
                 // The end of a server request belongs to the same lossless
                 // stream: losing it strands a clickable card.
-                let _ = inner.server_events.send(ServerEvent::Resolved { params });
+                send_server_event(inner, ServerEvent::Resolved { params });
                 return;
             }
             let seq = inner.inbound_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -997,6 +1053,51 @@ mod tests {
         assert_eq!(events.recv().await, Some(ServerEvent::Closed));
         drop(connection);
         assert_eq!(events.recv().await, None, "the stream ends with the connection");
+    }
+
+    /// The decision stream is bounded for memory safety, and overflow is loss of
+    /// trust rather than a dropped decision: the connection closes, every
+    /// waiter fails loudly, and the peer sees the socket go (so it clears its
+    /// pending set). The already-queued decisions stay readable, and the close
+    /// signal is set even though the `Closed` frame no longer fits.
+    #[tokio::test]
+    async fn a_full_server_event_queue_closes_the_connection() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        let mut events = connection.take_server_events().expect("the stream");
+
+        for id in 0..=SERVER_EVENT_CAPACITY {
+            dispatch(
+                &connection.inner,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "test/approval",
+                    "params": {},
+                }),
+            );
+        }
+
+        assert!(connection.closed(), "overflow closes the connection");
+        assert!(
+            *connection.closing().borrow(),
+            "the consumer's wake edge is set even though `Closed` could not be queued"
+        );
+
+        // Every queued decision is still readable — the overflow request is the
+        // one refused, no earlier frame is lost — and the stream then stalls on
+        // the live sender, which is why the close signal exists.
+        let mut drained = 0;
+        while let Ok(Some(event)) = tokio::time::timeout(Duration::from_millis(50), events.recv()).await {
+            assert!(
+                matches!(event, ServerEvent::Request { .. }),
+                "only decisions precede the close: {event:?}"
+            );
+            drained += 1;
+        }
+        assert_eq!(
+            drained, SERVER_EVENT_CAPACITY,
+            "the queue held exactly its capacity; the overflow frame closed instead of growing it"
+        );
     }
 
     /// A close must end the writer and drop the frame receiver, waking a
