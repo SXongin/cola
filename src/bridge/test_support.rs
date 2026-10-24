@@ -1665,6 +1665,11 @@ pub struct MockBackend {
     /// The attachment `attachment_status` reports (`cola status`/`doctor`'s
     /// read). `None` means "nothing to report", the default.
     pub attachment: Option<crate::backend::lifecycle::AttachmentStatus>,
+    /// The client-scoped diagnosis `client_report` reports (`cola status`/
+    /// `doctor`, ticket #883). `None` means "nothing to report", the default.
+    pub client_report: Option<crate::backend::lifecycle::ClientReport>,
+    /// The answer `probe_turn` gives (`cola doctor --check-turn`).
+    pub turn_probe: Option<crate::backend::lifecycle::TurnProbe>,
     /// Counts `ensure_attached` passes, so a poll-loop test can prove the
     /// client-owned pass actually ran.
     pub ensure_attached_calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -1930,6 +1935,8 @@ impl MockBackend {
             list_skills_directories: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             serverless: false,
             attachment: None,
+            client_report: None,
+            turn_probe: None,
             ensure_attached_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_models: Vec::new(),
             default_model: None,
@@ -3477,6 +3484,18 @@ impl crate::backend::ServerLifecycle for MockBackend {
 
     async fn attachment_status(&self) -> Option<crate::backend::lifecycle::AttachmentStatus> {
         self.attachment.clone()
+    }
+
+    async fn client_report(&self) -> Option<crate::backend::lifecycle::ClientReport> {
+        self.client_report.clone()
+    }
+
+    async fn probe_turn(&self) -> crate::backend::lifecycle::TurnProbe {
+        self.turn_probe
+            .clone()
+            .unwrap_or(crate::backend::lifecycle::TurnProbe::NotAttempted {
+                detail: "the mock has no turn probe".to_string(),
+            })
     }
 }
 

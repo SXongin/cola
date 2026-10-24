@@ -5,8 +5,15 @@
 //! session control. `status` is a fast, config-light snapshot — it resolves what
 //! it can and reports the rest as absent instead of failing — while `doctor`
 //! runs the environment checks a support request needs (config, Feishu
-//! credentials, the OpenCode binary and server, the singleton lock, the
+//! credentials, the client binary and runtime, the singleton lock, the
 //! autostart binary path) and exits non-zero when a check fails.
+//!
+//! Both report the **active Agent Client** through the neutral
+//! [`crate::backend::ServerLifecycle`] seam (ADR-0090 decisions 3/5): its id and
+//! kind from the config, and its endpoint, attachment, capabilities and local
+//! clients from the adapter's own [`crate::backend::ServerLifecycle::client_report`].
+//! The one check that writes to a runtime cola does not own — a real turn
+//! proving the configured provider works — is opt-in via `doctor --check-turn`.
 //!
 //! Neither command takes the Singleton Lock: they must work while cola runs, and
 //! against a broken install where cola cannot run at all.
@@ -14,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backend::Backend;
+use crate::backend::lifecycle::{ClientReport, ClientState, TurnProbe, UserClient, UserClientState};
 use crate::config::{self, Config};
 use crate::update::InstallChannel;
 
@@ -42,7 +50,53 @@ pub struct Status {
     /// The `[opencode] generation` override spelling (`auto`/`v1`/`v2`),
     /// reported even when no server is running so a script can read it.
     pub generation_override: String,
+    /// The active Agent Client (ADR-0090 decision 5): its configured id and
+    /// kind, plus what this process could diagnose about it. `None` only when
+    /// the config cannot resolve an active client.
+    pub client: Option<ClientStatus>,
     pub server: Option<ServerStatus>,
+}
+
+/// The client-scoped rows `cola status` reports (ADR-0090 decision 3, ticket
+/// #883): which client is active, which attachment was found, and what the
+/// connection advertised. Neutral — no adapter type is named here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientStatus {
+    /// The configured id (`default` for the implicit `[opencode]` client).
+    pub id: String,
+    /// The adapter `kind` (`opencode` / `codex`).
+    pub kind: String,
+    /// The endpoint the client targets, even when it is absent.
+    pub endpoint: String,
+    /// `attached` / `unattached` / `absent` / `unknown`, for scripts.
+    pub state: String,
+    /// The evidence for `state` — a daemon's report, or why it is absent.
+    pub detail: String,
+    /// The binary the runtime runs, when it can be learned.
+    pub runtime_binary: Option<String>,
+    /// The client binary a spawn would use, when it can be found.
+    pub client_binary: Option<String>,
+    pub version: Option<String>,
+    pub platform: Option<String>,
+    pub surface_source: Option<String>,
+    pub capabilities: Vec<ClientCapability>,
+    pub user_clients: Vec<ClientProcess>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientCapability {
+    pub name: String,
+    pub value: String,
+}
+
+/// One local process using the active client, and what is proven about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientProcess {
+    pub pid: i32,
+    pub binary: String,
+    /// `attached` / `embedded` / `unverified`.
+    pub state: String,
+    pub detail: String,
 }
 
 /// The registered boot-time launcher, as far as it can be read.
@@ -108,6 +162,13 @@ impl ConfigState {
         self.loaded.as_ref().and_then(|r| r.as_ref().ok())
     }
 
+    /// The active Agent Client, resolved leniently: `None` when the config
+    /// cannot resolve one (broken table, unknown kind). The report narrows in
+    /// that case; it never fails the command.
+    pub fn active_client(&self) -> Option<config::ActiveClient> {
+        self.cfg()?.active_client().ok()
+    }
+
     /// The active Agent Client's effective OpenCode settings — the same fold
     /// [`Config::resolve_active_client`] applies at boot.
     ///
@@ -118,8 +179,7 @@ impl ConfigState {
     /// `kind = "opencode"` client is active: its `url`/`generation` are the
     /// ones boot would use (spec #860, ticket #872/#875).
     pub fn effective_opencode(&self) -> Option<config::OpenCodeConfig> {
-        let mut cfg = self.cfg()?.clone();
-        cfg.resolve_active_client().ok()?.opencode().cloned()
+        self.active_client()?.opencode().cloned()
     }
 
     /// Whether a config file was found AND parsed.
@@ -157,6 +217,7 @@ pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Ba
     };
     let server = probe_server(client).await;
     let generation_override = effective_generation_override(state);
+    let active_client = gather_client(state, client).await;
 
     Status {
         version: crate::version::display_version(),
@@ -170,7 +231,88 @@ pub async fn gather(state: &ConfigState, log_path: &Path, client: Option<&dyn Ba
         config_ok: state.ok(),
         log_path: log_path.to_path_buf(),
         generation_override,
+        client: active_client,
         server,
+    }
+}
+
+/// The active client's row, from the config id/kind plus whatever the neutral
+/// [`Backend::client_report`] could diagnose. No client built (a broken config,
+/// or a kind this build cannot construct) still reports the id and kind the
+/// config resolved, with the endpoint as `unknown` — the row is the point.
+async fn gather_client(state: &ConfigState, client: Option<&dyn Backend>) -> Option<ClientStatus> {
+    let active = state.active_client()?;
+    let report = match client {
+        Some(client) => client.client_report().await,
+        None => None,
+    };
+    let (endpoint, state_label, detail) = match &report {
+        Some(report) => (
+            report.endpoint.clone(),
+            client_state_label(&report.state).to_string(),
+            report.detail.clone(),
+        ),
+        None => (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            "no report (no client could be built)".to_string(),
+        ),
+    };
+    let capabilities = report
+        .as_ref()
+        .map(|report| {
+            report
+                .capabilities
+                .iter()
+                .map(|capability| ClientCapability {
+                    name: capability.name.clone(),
+                    value: capability.value.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let user_clients = report
+        .as_ref()
+        .map(|report| report.user_clients.iter().map(client_process).collect())
+        .unwrap_or_default();
+    Some(ClientStatus {
+        id: active.id,
+        kind: active.kind.as_str().to_string(),
+        endpoint,
+        state: state_label,
+        detail,
+        runtime_binary: report.as_ref().and_then(|report| report.runtime_binary.clone()),
+        client_binary: report.as_ref().and_then(|report| report.client_binary.clone()),
+        version: report.as_ref().and_then(|report| report.version.clone()),
+        platform: report.as_ref().and_then(|report| report.platform.clone()),
+        surface_source: report.as_ref().and_then(|report| report.surface_source.clone()),
+        capabilities,
+        user_clients,
+    })
+}
+
+fn client_state_label(state: &ClientState) -> &'static str {
+    match state {
+        ClientState::Attached => "attached",
+        ClientState::Unattached => "unattached",
+        ClientState::Absent => "absent",
+    }
+}
+
+fn user_client_state_label(state: UserClientState) -> &'static str {
+    match state {
+        UserClientState::Attached => "attached",
+        UserClientState::Embedded => "embedded",
+        UserClientState::Unverified => "unverified",
+    }
+}
+
+fn client_process(client: &UserClient) -> ClientProcess {
+    ClientProcess {
+        pid: client.pid,
+        binary: client.binary.clone(),
+        state: user_client_state_label(client.state).to_string(),
+        detail: client.detail.clone(),
     }
 }
 
@@ -223,11 +365,59 @@ pub fn render(s: &Status) -> String {
         }
     ));
     out.push_str(&format!("日志: {}\n", s.log_path.display()));
-    out.push_str(&format!(
-        "OpenCode: {}\n",
-        server_line(s.server.as_ref(), &s.generation_override)
-    ));
+    if let Some(client) = &s.client {
+        out.push_str(&format!("客户端: {}\n", client_line(client)));
+        if !client.capabilities.is_empty() {
+            out.push_str(&format!("能力: {}\n", capability_line(&client.capabilities)));
+        }
+        if !client.user_clients.is_empty() {
+            out.push_str(&format!("本地客户端: {}\n", process_list(&client.user_clients)));
+        }
+    }
+    // The OpenCode row predates the client-scoped rows; keep it exactly as it
+    // was for an OpenCode install, and omit it when another client is active
+    // (printing "no shared OpenCode server" for a Codex client would be noise).
+    if s.client.as_ref().is_none_or(|client| client.kind == "opencode") {
+        out.push_str(&format!(
+            "OpenCode: {}\n",
+            server_line(s.server.as_ref(), &s.generation_override)
+        ));
+    }
     out
+}
+
+/// The client row: id, kind, endpoint and state.
+fn client_line(client: &ClientStatus) -> String {
+    let state = match client.state.as_str() {
+        "attached" => "已连接",
+        "unattached" => "未连接",
+        "absent" => "未运行",
+        _ => "未知",
+    };
+    format!("{} ({}) → {} [{state}]", client.id, client.kind, client.endpoint)
+}
+
+fn capability_line(capabilities: &[ClientCapability]) -> String {
+    capabilities
+        .iter()
+        .map(|capability| format!("{}={}", capability.name, capability.value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn process_list(clients: &[ClientProcess]) -> String {
+    clients
+        .iter()
+        .map(|client| {
+            let state = match client.state.as_str() {
+                "attached" => "已连接",
+                "embedded" => "内嵌服务器",
+                _ => "未验证",
+            };
+            format!("{} (PID {}, {state})", client.binary, client.pid)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn running_line(s: &Status) -> String {
@@ -315,6 +505,28 @@ pub fn render_json(s: &Status) -> serde_json::Value {
         "config_ok": s.config_ok,
         "log_path": s.log_path.display().to_string(),
         "generation_override": s.generation_override,
+        "client": s.client.as_ref().map(|client| serde_json::json!({
+            "id": client.id,
+            "kind": client.kind,
+            "endpoint": client.endpoint,
+            "state": client.state,
+            "detail": client.detail,
+            "runtime_binary": client.runtime_binary,
+            "client_binary": client.client_binary,
+            "version": client.version,
+            "platform": client.platform,
+            "surface_source": client.surface_source,
+            "capabilities": client.capabilities.iter().map(|capability| serde_json::json!({
+                "name": capability.name,
+                "value": capability.value,
+            })).collect::<Vec<_>>(),
+            "user_clients": client.user_clients.iter().map(|user| serde_json::json!({
+                "pid": user.pid,
+                "binary": user.binary,
+                "state": user.state,
+                "detail": user.detail,
+            })).collect::<Vec<_>>(),
+        })),
         "opencode": s.server.as_ref().map(|s| serde_json::json!({
             "url": s.url,
             "pid": s.pid,
@@ -397,19 +609,26 @@ pub fn render_doctor(checks: &[Check]) -> String {
 }
 
 /// Run `cola doctor`: gather the checks, print the report, and return whether
-/// every check passed.
+/// every check passed. `check_turn` is the explicit opt-in for the one check
+/// that writes to the user's runtime (ADR-0090 decision 3, ticket #883).
 pub async fn run_doctor(
     state: &ConfigState,
     log_path: &Path,
     client: Option<&dyn Backend>,
+    check_turn: bool,
 ) -> anyhow::Result<bool> {
-    let checks = doctor_checks(state, log_path, client).await;
+    let checks = doctor_checks(state, log_path, client, check_turn).await;
     print!("{}", render_doctor(&checks));
     Ok(doctor_ok(&checks))
 }
 
 /// Assemble the doctor checks from the resolved config state.
-async fn doctor_checks(state: &ConfigState, log_path: &Path, client: Option<&dyn Backend>) -> Vec<Check> {
+async fn doctor_checks(
+    state: &ConfigState,
+    log_path: &Path,
+    client: Option<&dyn Backend>,
+    check_turn: bool,
+) -> Vec<Check> {
     let mut checks = Vec::new();
     let cfg = state.cfg();
 
@@ -432,26 +651,62 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path, client: Option<&dyn
         None => checks.push(Check::fail("飞书凭证", "无配置，无法检查".to_string())),
     }
 
-    checks.push(opencode_binary_check());
-
-    let server = probe_server(client).await;
-    match &server {
-        Some(s) => match &s.generation {
-            Some(g) => checks.push(Check::pass(
-                "共享 OpenCode 服务器",
-                format!("{} (世代 {g})", s.url),
-            )),
-            None => checks.push(Check::warn(
-                "共享 OpenCode 服务器",
-                format!("{} 世代未知：{}", s.url, s.evidence),
-            )),
-        },
-        None => checks.push(Check::warn(
-            "共享 OpenCode 服务器",
-            "未发现（federated 服务器未运行；LAZY 启动或 attach-only）".to_string(),
-        )),
+    let active = state.active_client();
+    if let Some(active) = &active {
+        checks.push(Check::pass(
+            "Agent 客户端",
+            format!("{} (kind = {})", active.id, active.kind.as_str()),
+        ));
     }
-    checks.push(multiple_servers_check(server.as_ref()));
+    match active.as_ref().map(|active| active.kind) {
+        Some(config::ClientKind::Codex) => {
+            let report = match client {
+                Some(client) => client.client_report().await,
+                None => None,
+            };
+            let turn = if check_turn {
+                match client {
+                    Some(client) => Some(client.probe_turn().await),
+                    None => Some(TurnProbe::NotAttempted {
+                        detail: "no client could be built".to_string(),
+                    }),
+                }
+            } else {
+                None
+            };
+            checks.extend(codex_client_checks(report.as_ref(), turn.as_ref()));
+        }
+        // The OpenCode rows are unchanged (ADR-0081): the client-scoped rows
+        // are additive, and a broken/unsupported config keeps its old report.
+        _ => {
+            if check_turn {
+                checks.push(Check::warn(
+                    "回合检查",
+                    "`--check-turn` 只适用于 Codex 客户端；OpenCode 的服务器探测已覆盖其可用性".to_string(),
+                ));
+            }
+            checks.push(opencode_binary_check());
+
+            let server = probe_server(client).await;
+            match &server {
+                Some(s) => match &s.generation {
+                    Some(g) => checks.push(Check::pass(
+                        "共享 OpenCode 服务器",
+                        format!("{} (世代 {g})", s.url),
+                    )),
+                    None => checks.push(Check::warn(
+                        "共享 OpenCode 服务器",
+                        format!("{} 世代未知：{}", s.url, s.evidence),
+                    )),
+                },
+                None => checks.push(Check::warn(
+                    "共享 OpenCode 服务器",
+                    "未发现（federated 服务器未运行；LAZY 启动或 attach-only）".to_string(),
+                )),
+            }
+            checks.push(multiple_servers_check(server.as_ref()));
+        }
+    }
 
     checks.push(lock_check(crate::lock_state()));
     checks.push(log_check(log_path));
@@ -488,6 +743,166 @@ async fn doctor_checks(state: &ConfigState, log_path: &Path, client: Option<&dyn
     }
 
     checks
+}
+
+/// The Codex client's checks (ADR-0090 decision 3, ticket #883): the client
+/// binary exists, a daemon was found, this process is attached, the user's own
+/// client is attached to it, and — only when explicitly requested — the
+/// configured provider can complete a turn.
+///
+/// A proven embedded client is a **named failure**; an unverified sharing state
+/// is a warning that says exactly what could not be established, never a pass.
+fn codex_client_checks(report: Option<&ClientReport>, turn: Option<&TurnProbe>) -> Vec<Check> {
+    let mut checks = Vec::new();
+    let Some(report) = report else {
+        checks.push(Check::warn(
+            "Codex 二进制",
+            "无法构建 Codex 客户端（缺少 CODEX_HOME 或 home 目录）".to_string(),
+        ));
+        checks.push(Check::warn("Codex daemon", "未知：没有客户端报告"));
+        checks.push(Check::warn("Codex 连接", "未知：没有客户端报告"));
+        checks.push(Check::warn("Codex 本地客户端", "未知：没有客户端报告"));
+        checks.push(turn_check(turn));
+        return checks;
+    };
+
+    match &report.client_binary {
+        Some(binary) => checks.push(Check::pass("Codex 二进制", binary.clone())),
+        None => checks.push(Check::warn(
+            "Codex 二进制",
+            "PATH 中未找到 `codex`（attach 到已有 daemon 不受影响；启动 daemon 或本地 TUI 需要它）"
+                .to_string(),
+        )),
+    }
+
+    let daemon_running = match &report.state {
+        ClientState::Attached | ClientState::Unattached => true,
+        ClientState::Absent => false,
+    };
+    let daemon_detail = match report.runtime_binary.as_deref() {
+        Some(binary) => format!("{}；运行时二进制 {binary}", report.detail),
+        None => report.detail.clone(),
+    };
+    checks.push(if daemon_running {
+        Check::pass("Codex daemon", daemon_detail)
+    } else {
+        Check::warn(
+            "Codex daemon",
+            format!("未发现（LAZY 启动或 attach-only）：{}", report.detail),
+        )
+    });
+
+    match &report.state {
+        ClientState::Attached => checks.push(Check::pass(
+            "Codex 连接",
+            format!(
+                "{}；{}",
+                report
+                    .version
+                    .as_deref()
+                    .map(|version| format!("app-server {version}"))
+                    .unwrap_or_else(|| "版本未知".to_string()),
+                report.surface_source.as_deref().unwrap_or("surface 未报告")
+            ),
+        )),
+        ClientState::Unattached => checks.push(Check::fail(
+            "Codex 连接",
+            format!("daemon 存在但无法连接：{}", report.detail),
+        )),
+        ClientState::Absent => checks.push(Check::warn(
+            "Codex 连接",
+            format!("无 daemon 可连接：{}", report.detail),
+        )),
+    }
+
+    checks.push(local_client_check(report));
+    checks.push(turn_check(turn));
+    checks
+}
+
+/// The user's own client: a proven embedded one is a failure; a proven
+/// attached one passes; an unverifiable one is a warning that names the gap.
+fn local_client_check(report: &ClientReport) -> Check {
+    let embedded: Vec<&UserClient> = report
+        .user_clients
+        .iter()
+        .filter(|client| client.state == UserClientState::Embedded)
+        .collect();
+    if !embedded.is_empty() {
+        let listed = embedded
+            .iter()
+            .map(|client| format!("PID {} ({})：{}", client.pid, client.binary, client.detail))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Check::fail(
+            "Codex 本地客户端",
+            format!(
+                "{listed}。它运行在自己的内嵌服务器上，与共享 daemon 不共享线程；请启动 \
+                 `codex app-server daemon start` 并用 `--remote` 把你的客户端指向该 daemon"
+            ),
+        );
+    }
+    let unverified: Vec<&UserClient> = report
+        .user_clients
+        .iter()
+        .filter(|client| client.state == UserClientState::Unverified)
+        .collect();
+    if !unverified.is_empty() {
+        let listed = unverified
+            .iter()
+            .map(|client| format!("PID {} ({})", client.pid, client.binary))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Check::warn(
+            "Codex 本地客户端",
+            format!(
+                "{listed} 未在 argv 中命名 daemon，无法从进程表证明它已连接到共享 daemon；\
+                 用 `codex --remote unix://{}` 启动可被证实",
+                report
+                    .endpoint
+                    .strip_prefix("unix://")
+                    .unwrap_or(&report.endpoint)
+            ),
+        );
+    }
+    let attached: Vec<&UserClient> = report
+        .user_clients
+        .iter()
+        .filter(|client| client.state == UserClientState::Attached)
+        .collect();
+    if !attached.is_empty() {
+        let listed = attached
+            .iter()
+            .map(|client| format!("PID {} ({})", client.pid, client.binary))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Check::pass(
+            "Codex 本地客户端",
+            format!("{listed} 已连接到 {}", report.endpoint),
+        );
+    }
+    Check::warn(
+        "Codex 本地客户端",
+        format!(
+            "未发现本地 Codex 客户端；无法确认你的客户端已连接到 {}",
+            report.endpoint
+        ),
+    )
+}
+
+/// The provider's real turn. Without `--check-turn` the check states the
+/// opt-in rather than guessing, because the probe is a write on a daemon cola
+/// does not own.
+fn turn_check(turn: Option<&TurnProbe>) -> Check {
+    match turn {
+        None => Check::warn(
+            "Codex 回合",
+            "未检查；运行 `cola doctor --check-turn` 验证配置的 provider 能否完成一次真实回合".to_string(),
+        ),
+        Some(TurnProbe::Passed { detail }) => Check::pass("Codex 回合", detail.clone()),
+        Some(TurnProbe::Failed { detail }) => Check::fail("Codex 回合", detail.clone()),
+        Some(TurnProbe::NotAttempted { detail }) => Check::warn("Codex 回合", detail.clone()),
+    }
 }
 
 /// Whether two binary paths resolve to the same file (symlinks followed).
@@ -683,6 +1098,23 @@ mod tests {
             config_ok: true,
             log_path: PathBuf::from("/home/u/.cola/cola.log"),
             generation_override: "auto".into(),
+            client: Some(ClientStatus {
+                id: "default".into(),
+                kind: "opencode".into(),
+                endpoint: "http://localhost:4096".into(),
+                state: "attached".into(),
+                detail: "attached (generation v2)".into(),
+                runtime_binary: None,
+                client_binary: None,
+                version: None,
+                platform: None,
+                surface_source: None,
+                capabilities: vec![ClientCapability {
+                    name: "generation".into(),
+                    value: "v2".into(),
+                }],
+                user_clients: Vec::new(),
+            }),
             server: Some(ServerStatus {
                 url: "http://localhost:4096".into(),
                 pid: 99,
@@ -869,6 +1301,282 @@ mod tests {
         // One server is still the normal case: an empty list, not a missing key.
         let one = render_json(&sample_status());
         assert_eq!(one["opencode"]["other_servers"], serde_json::json!([]));
+    }
+
+    /// The client-scoped rows (ticket #883) name the active client, its
+    /// endpoint and the capabilities the connection advertised.
+    fn codex_client_status() -> ClientStatus {
+        ClientStatus {
+            id: "ada".into(),
+            kind: "codex".into(),
+            endpoint: "unix:///home/u/.codex/app-server-control/app-server-control.sock".into(),
+            state: "attached".into(),
+            detail: "attached to the app-server daemon (version 0.163.0, unix/linux)".into(),
+            runtime_binary: Some("/home/u/.codex/packages/app-server-daemon/current/bin/codex".into()),
+            client_binary: Some("/usr/local/bin/codex".into()),
+            version: Some("0.163.0".into()),
+            platform: Some("unix/linux".into()),
+            surface_source: Some("pinned 0.163.0".into()),
+            capabilities: vec![
+                ClientCapability {
+                    name: "background_tasks".into(),
+                    value: "unsupported".into(),
+                },
+                ClientCapability {
+                    name: "surface".into(),
+                    value: "pinned 0.163.0".into(),
+                },
+            ],
+            user_clients: vec![ClientProcess {
+                pid: 77,
+                binary: "codex".into(),
+                state: "attached".into(),
+                detail: "shares the daemon".into(),
+            }],
+        }
+    }
+
+    /// A full `ClientReport` for the doctor checks, with one local client.
+    fn codex_report(state: ClientState, user_clients: Vec<UserClient>) -> ClientReport {
+        ClientReport {
+            endpoint: "unix:///tmp/codex-home/app-server-control/app-server-control.sock".into(),
+            state,
+            detail: "daemon at /tmp/codex-home/app-server-control/app-server-control.sock".into(),
+            runtime_binary: Some("/managed/bin/codex".into()),
+            version: Some("0.163.0".into()),
+            platform: Some("unix/linux".into()),
+            surface_source: Some("pinned 0.163.0".into()),
+            capabilities: Vec::new(),
+            user_clients,
+            client_binary: Some("/usr/bin/codex".into()),
+        }
+    }
+
+    fn attached_user(pid: i32) -> UserClient {
+        UserClient {
+            pid,
+            binary: "codex".into(),
+            state: UserClientState::Attached,
+            detail: "shares the daemon through unix:///tmp/codex-home/app-server-control.sock".into(),
+        }
+    }
+
+    #[test]
+    fn render_reports_the_active_client_and_its_capabilities() {
+        let s = Status {
+            client: Some(codex_client_status()),
+            server: None,
+            ..sample_status()
+        };
+        let text = render(&s);
+        assert!(
+            text.contains(
+                "客户端: ada (codex) → unix:///home/u/.codex/app-server-control/app-server-control.sock [已连接]"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("能力: background_tasks=unsupported"), "{text}");
+        assert!(text.contains("本地客户端: codex (PID 77, 已连接)"), "{text}");
+        assert!(
+            !text.contains("OpenCode:"),
+            "a Codex client does not print the OpenCode row: {text}"
+        );
+    }
+
+    /// The OpenCode rows stay exactly as they were: the client row is additive.
+    #[test]
+    fn render_keeps_the_opencode_row_for_an_opencode_client() {
+        let text = render(&sample_status());
+        assert!(text.contains("客户端: default (opencode)"), "{text}");
+        assert!(text.contains("OpenCode: http://localhost:4096"), "{text}");
+    }
+
+    #[test]
+    fn render_json_names_the_active_client_kind_endpoint_and_capabilities() {
+        let s = Status {
+            client: Some(codex_client_status()),
+            server: None,
+            ..sample_status()
+        };
+        let v = render_json(&s);
+        assert_eq!(v["client"]["id"], "ada");
+        assert_eq!(v["client"]["kind"], "codex");
+        assert_eq!(
+            v["client"]["endpoint"],
+            "unix:///home/u/.codex/app-server-control/app-server-control.sock"
+        );
+        assert_eq!(v["client"]["state"], "attached");
+        assert_eq!(v["client"]["version"], "0.163.0");
+        assert_eq!(v["client"]["surface_source"], "pinned 0.163.0");
+        assert_eq!(v["client"]["capabilities"][0]["name"], "background_tasks");
+        assert_eq!(v["client"]["capabilities"][0]["value"], "unsupported");
+        assert_eq!(v["client"]["user_clients"][0]["state"], "attached");
+        assert!(v["opencode"].is_null(), "the absent OpenCode row is intact");
+    }
+
+    #[tokio::test]
+    async fn gather_names_the_active_client_without_a_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            r#"
+[feishu]
+app_id = "a"
+app_secret = "b"
+
+[bridge]
+default_client = "ada"
+
+[clients.ada]
+kind = "codex"
+"#,
+        )
+        .unwrap();
+        let state = ConfigState::from_env(path.to_str());
+        let status = gather(&state, &dir.path().join("cola.log"), None).await;
+        let client = status
+            .client
+            .as_ref()
+            .expect("the config's active client is named");
+        assert_eq!(client.id, "ada");
+        assert_eq!(client.kind, "codex");
+        assert_eq!(client.endpoint, "unknown");
+        assert_eq!(client.state, "unknown");
+        let v = render_json(&status);
+        assert_eq!(v["client"]["id"], "ada");
+        assert_eq!(v["client"]["kind"], "codex");
+    }
+
+    #[tokio::test]
+    async fn gather_reads_the_client_report_through_the_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            r#"
+[feishu]
+app_id = "a"
+app_secret = "b"
+
+[bridge]
+default_client = "ada"
+
+[clients.ada]
+kind = "codex"
+"#,
+        )
+        .unwrap();
+        let state = ConfigState::from_env(path.to_str());
+        let mut mock = crate::bridge::test_support::MockBackend::new(Vec::new());
+        mock.client_report = Some(codex_report(ClientState::Attached, vec![attached_user(77)]));
+        let status = gather(&state, &dir.path().join("cola.log"), Some(&mock)).await;
+        let client = status.client.expect("the seam's report is used");
+        assert_eq!(client.id, "ada");
+        assert_eq!(client.kind, "codex");
+        assert_eq!(
+            client.endpoint,
+            "unix:///tmp/codex-home/app-server-control/app-server-control.sock"
+        );
+        assert_eq!(client.state, "attached");
+        assert_eq!(client.version.as_deref(), Some("0.163.0"));
+        assert_eq!(client.user_clients[0].state, "attached");
+    }
+
+    /// A proven embedded client is a named FAIL (ADR-0090 decision 3): the
+    /// user's TUI shares nothing, so cola would silently mirror nothing.
+    #[test]
+    fn an_embedded_codex_client_fails_doctor() {
+        let report = codex_report(
+            ClientState::Attached,
+            vec![UserClient {
+                pid: 9,
+                binary: "codex".into(),
+                state: UserClientState::Embedded,
+                detail: "runs with `--no-daemon`, so its app-server is in-process".into(),
+            }],
+        );
+        let checks = codex_client_checks(Some(&report), Some(&TurnProbe::Passed { detail: "ok".into() }));
+        assert!(!doctor_ok(&checks), "{checks:?}");
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Fail);
+        assert!(local.detail.contains("内嵌服务器"), "{}", local.detail);
+        assert!(local.detail.contains("--remote"), "{}", local.detail);
+    }
+
+    /// An unverified sharing state is never a pass: it says exactly what the
+    /// process table could not establish.
+    #[test]
+    fn an_unverified_codex_client_is_a_warning() {
+        let report = codex_report(
+            ClientState::Attached,
+            vec![UserClient {
+                pid: 9,
+                binary: "codex".into(),
+                state: UserClientState::Unverified,
+                detail: "names no daemon".into(),
+            }],
+        );
+        let checks = codex_client_checks(Some(&report), Some(&TurnProbe::Passed { detail: "ok".into() }));
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Warn);
+        assert!(local.detail.contains("无法从进程表证明"), "{}", local.detail);
+    }
+
+    /// The acceptance case that a login-shaped check would miss: the provider
+    /// fails every turn as a retryable `error`, so doctor must fail.
+    #[test]
+    fn a_retryable_provider_error_fails_doctor() {
+        let report = codex_report(ClientState::Attached, vec![attached_user(77)]);
+        let failed = TurnProbe::Failed {
+            detail: "the configured provider cannot complete a turn (the server will retry): 401 \
+                     Unauthorized"
+                .into(),
+        };
+        let checks = codex_client_checks(Some(&report), Some(&failed));
+        assert!(!doctor_ok(&checks), "{checks:?}");
+        let turn = checks
+            .iter()
+            .find(|check| check.label == "Codex 回合")
+            .expect("the turn check");
+        assert_eq!(turn.status, CheckStatus::Fail);
+        assert!(turn.detail.contains("will retry"), "{}", turn.detail);
+    }
+
+    /// The passing path: a daemon-attached client and a working provider are
+    /// fully green, with no ChatGPT account state read anywhere.
+    #[test]
+    fn a_daemon_attached_client_with_a_working_provider_passes() {
+        let report = codex_report(ClientState::Attached, vec![attached_user(77)]);
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "the configured provider completed a turn (thread thread-1)".into(),
+            }),
+        );
+        assert!(doctor_ok(&checks), "{checks:?}");
+        assert!(
+            checks.iter().all(|check| check.status == CheckStatus::Pass),
+            "every Codex check passes: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn the_turn_check_states_its_opt_in_when_not_requested() {
+        let report = codex_report(ClientState::Attached, vec![attached_user(77)]);
+        let checks = codex_client_checks(Some(&report), None);
+        let turn = checks
+            .iter()
+            .find(|check| check.label == "Codex 回合")
+            .expect("the turn check");
+        assert_eq!(turn.status, CheckStatus::Warn);
+        assert!(turn.detail.contains("--check-turn"), "{}", turn.detail);
     }
 
     #[test]

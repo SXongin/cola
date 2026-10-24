@@ -91,8 +91,16 @@ enum Subcommand {
     },
     /// Run the environment checks a support request needs (config, Feishu
     /// credentials, OpenCode binary/server, singleton lock, autostart path) and
-    /// exit non-zero when a check fails (ADR-0081).
-    Doctor,
+    /// exit non-zero when a check fails (ADR-0081). For a Codex client it also
+    /// reports the daemon, the user's own client and, with `--check-turn`, that
+    /// the configured provider can complete a real turn (ticket #883).
+    Doctor {
+        /// Prove the configured provider can complete a turn. This starts a
+        /// minimal turn on a scratch thread (deleted afterwards), a real write
+        /// on a daemon cola does not own, so it is opt-in.
+        #[arg(long)]
+        check_turn: bool,
+    },
     /// Print the tail of the log file; `-f` follows it (ADR-0081).
     Logs {
         /// Stream new lines as they are appended (blocks; Ctrl-C to stop).
@@ -823,7 +831,21 @@ fn wait_for_new_daemon(old_pid: Option<i32>) -> bool {
 /// composition root is the one place allowed to name the adapter; the report
 /// only sees its [`backend::ServerLifecycle`].
 fn status_client(state: &status::ConfigState) -> Option<Arc<dyn backend::Backend>> {
-    Some(Arc::new(status_backend(state)?))
+    let active = state.active_client()?;
+    match active.kind {
+        config::ClientKind::Opencode => Some(Arc::new(status_backend(state)?)),
+        config::ClientKind::Codex => {
+            // Discovery reads `$CODEX_HOME`/`~/.codex`; without a home there is
+            // no endpoint to report, and status stays lenient (the row still
+            // names the active id and kind from the config).
+            let environment = codex::discovery::Environment::from_env().ok()?;
+            Some(Arc::new(codex::lifecycle::CodexLifecycle::new(
+                active.codex()?.clone(),
+                environment,
+                Box::new(codex::lifecycle::ManagedProbe),
+            )))
+        }
+    }
 }
 
 /// The concrete backend `status_client` wraps, kept as one construction seam
@@ -931,11 +953,11 @@ async fn main() -> anyhow::Result<()> {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
         return status_cli(json, cli.config.as_deref(), &log_path).await;
     }
-    if let Some(Subcommand::Doctor) = cli.subcommand {
+    if let Some(Subcommand::Doctor { check_turn }) = cli.subcommand {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
         let state = status::ConfigState::from_env(cli.config.as_deref());
         let client = status_client(&state);
-        if !status::run_doctor(&state, &log_path, client.as_deref()).await? {
+        if !status::run_doctor(&state, &log_path, client.as_deref(), check_turn).await? {
             std::process::exit(1);
         }
         return Ok(());
@@ -1203,6 +1225,36 @@ kind = "codex"
         assert!(
             status_backend(&state).is_none(),
             "a kind with no OpenCode server lifecycle reports nothing"
+        );
+    }
+
+    /// A Codex Agent Client is constructible for introspection (ticket #883):
+    /// `status`/`doctor` build the active adapter's lifecycle from its own
+    /// settings, so the client-scoped rows are real rather than a config echo.
+    #[test]
+    fn status_client_builds_the_active_codex_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cola.toml");
+        std::fs::write(
+            &path,
+            r#"
+[feishu]
+app_id = "cli_test"
+app_secret = "secret"
+
+[bridge]
+default_client = "c"
+
+[clients.c]
+kind = "codex"
+start_server = "never"
+"#,
+        )
+        .unwrap();
+        let state = status::ConfigState::from_env(path.to_str());
+        assert!(
+            status_client(&state).is_some(),
+            "the active Codex client builds a lifecycle for the report"
         );
     }
 
