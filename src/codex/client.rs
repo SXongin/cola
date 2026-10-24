@@ -130,7 +130,7 @@ impl fmt::Display for ServerVersion {
 }
 
 /// What the server told the adapter about itself, recorded on the client for
-/// `cola status`/`doctor` (later tickets) and the attach log.
+/// `cola status`/`doctor` (#883) and the attach log.
 // The identity fields are read by the `cola status`/`doctor` rows (#883) and by
 // tests; keeping them decoded is the point of recording `initialize`.
 #[allow(dead_code)]

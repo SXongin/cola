@@ -316,12 +316,14 @@ fn default_client_id() -> String {
 /// The adapter a configured agent client selects (ADR-0090 decision 1/2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientKind {
-    /// The peer OpenCode adapter — the only kind this build constructs.
+    /// The peer OpenCode adapter.
     Opencode,
-    /// Codex over `app-server` (ADR-0090 decision 2). Discovery, attach and the
-    /// `start_server` policy landed with spec #860 ticket #877; the `Backend`
-    /// implementation that would let this build serve a Codex Session is a
-    /// later ticket, so resolution succeeds and boot still refuses.
+    /// Codex over `app-server` (ADR-0090 decision 2): discovery, attach, the
+    /// `start_server` policy (spec #860 ticket #877) and the [`Backend`] that
+    /// serves its Sessions (ticket #879) all landed, so an active `codex`
+    /// client boots and serves a chat like an `opencode` one.
+    ///
+    /// [`Backend`]: crate::backend::Backend
     Codex,
 }
 
@@ -562,9 +564,7 @@ impl ActiveClient {
     }
 
     /// This client's Codex options when it is a `codex` client (spec #860
-    /// ticket #877: daemon discovery and the `start_server` policy). No
-    /// production caller until the adapter's composition root lands (#879).
-    #[allow(dead_code)]
+    /// ticket #877: daemon discovery and the `start_server` policy).
     pub fn codex(&self) -> Option<&CodexConfig> {
         match &self.settings {
             ClientSettings::Opencode(_) => None,
@@ -871,8 +871,8 @@ pub fn run(action: ConfigAction, explicit: Option<&str>) -> anyhow::Result<()> {
             // `load` is the same parser the daemon uses, and the active Agent
             // Client must resolve — but this command answers "is the config
             // resolvable", not "can this build attach to it": an active
-            // `codex` client is valid config and startup's capability gate is
-            // what refuses it until its adapter lands (ADR-0090 §5).
+            // `codex` client is valid config whether or not its daemon is
+            // running today, and `cola doctor` is what diagnoses that.
             let cfg = load(&path)?;
             cfg.active_client()?;
             println!("配置有效: {}", path.display());
