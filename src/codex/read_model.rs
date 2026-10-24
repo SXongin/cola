@@ -233,6 +233,14 @@ impl ThreadProjection {
         for item in &mut self.items {
             item.set_pending_from(previous.get(&item.id));
         }
+        // The replayed history is the authority on the turns it carries: a live
+        // turn outranks a stale `idle` set before the gap, and with no live turn
+        // a cached `active` can only be the ending the gap dropped.
+        self.status = match (self.live_turn.is_some(), self.status) {
+            (true, _) => Some(ThreadStatus::Active),
+            (false, Some(ThreadStatus::Active)) => Some(ThreadStatus::Idle),
+            (false, status) => status,
+        };
         self.incomplete = false;
     }
 
@@ -2508,8 +2516,16 @@ mod tests {
                 { "type": "agentMessage", "id": "item-agent", "text": "Done." }
             ]
         }]);
+        // The gap may have dropped the ending while a stale `active` stayed
+        // cached; the replayed history proves the turn is over.
+        projection.set_observed_status(Some(ThreadStatus::Active));
         projection.resync(history.as_array().unwrap());
         assert!(!projection.transcript().truncated, "a resync clears the gap");
+        assert_eq!(
+            projection.observed_status(),
+            Some(ThreadStatus::Idle),
+            "the rebuilt history settles a stale active status"
+        );
 
         let transcript = projection.transcript();
         assert_eq!(
