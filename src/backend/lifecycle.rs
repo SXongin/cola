@@ -99,6 +99,99 @@ pub struct AttachmentStatus {
     pub other_servers: Vec<OtherServer>,
 }
 
+/// One capability the attached runtime advertised, rendered neutrally for
+/// `cola status`/`cola doctor` (ADR-0090 decision 3, ticket #883).
+///
+/// A capability is a **claim the connection can be held to**, not a feature
+/// this build merely hopes for: the Codex adapter lists what its verified
+/// `initialize` surface covers, and its counts. The seam never interprets the
+/// pair — a caller prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Capability {
+    pub name: String,
+    pub value: String,
+}
+
+/// What is proven about one local process using this client's runtime
+/// (ADR-0090 decision 3's diagnosis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserClientState {
+    /// The process names the discovered runtime as its endpoint, so it shares
+    /// that runtime's sessions (the supported configuration).
+    Attached,
+    /// The process runs its own embedded runtime and shares nothing.
+    Embedded,
+    /// The process may share the runtime, but its argv cannot prove it.
+    Unverified,
+}
+
+/// One local client process the active adapter observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserClient {
+    pub pid: i32,
+    pub binary: String,
+    pub state: UserClientState,
+    /// Why the state was concluded, for the report and the log.
+    pub detail: String,
+}
+
+/// The runtime's state as the active client reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientState {
+    /// Attached and answering.
+    Attached,
+    /// A runtime was found but this process could not attach to it.
+    Unattached,
+    /// No runtime was found.
+    Absent,
+}
+
+/// The read-only diagnosis `cola status` and `cola doctor` report for the
+/// **active** client (ADR-0090 decision 3, ticket #883).
+///
+/// Deliberately neutral: the id and kind come from the config, and everything
+/// an adapter knows about its own runtime — endpoint, capabilities, the local
+/// clients it can prove something about — arrives here. The CLI never spells a
+/// runtime-specific type, so a second adapter reports through the same shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientReport {
+    /// The endpoint this client targets, even when no runtime is serving it
+    /// (a unix socket path or a `ws://` URL).
+    pub endpoint: String,
+    pub state: ClientState,
+    /// The evidence for `state` — the daemon's own report, or why it is
+    /// absent.
+    pub detail: String,
+    /// The binary the runtime executes, when it can be learned (Codex's
+    /// managed daemon binary is not the CLI on `PATH`).
+    pub runtime_binary: Option<String>,
+    /// The connected server's version, platform and verified surface.
+    pub version: Option<String>,
+    pub platform: Option<String>,
+    pub surface_source: Option<String>,
+    /// What the connected server's verified surface covers.
+    pub capabilities: Vec<Capability>,
+    /// Local processes using this client, in pid order.
+    pub user_clients: Vec<UserClient>,
+    /// The client binary this install would run, resolved where the adapter
+    /// would spawn it.
+    pub client_binary: Option<String>,
+}
+
+/// The `cola doctor --check-turn` outcome (ADR-0090's amendment: a turn with no
+/// usable credential is accepted and then fails as a retryable `error`, so a
+/// login-shaped check would pass while every turn died).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnProbe {
+    /// The configured provider completed a minimal turn.
+    Passed { detail: String },
+    /// The turn failed — a retryable or terminal error, a refusal, a closed
+    /// connection, or the budget expiry.
+    Failed { detail: String },
+    /// The probe could not run (no runtime attached).
+    NotAttempted { detail: String },
+}
+
 /// `/restart-opencode`'s neutral outcome (ADR-0085: only a server cola started
 /// may be restarted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +228,29 @@ pub trait ServerLifecycle: Send + Sync {
     /// nothing to report (a client whose runtime the user manages elsewhere).
     async fn attachment_status(&self) -> Option<AttachmentStatus> {
         None
+    }
+
+    /// The client-scoped diagnosis `cola status`/`cola doctor` report
+    /// (ADR-0090 decision 3): which runtime was found, whether the local
+    /// client(s) share it, and what the connection advertised. `None` when the
+    /// client has no runtime to diagnose.
+    ///
+    /// Read-only: a client may dial/attach to learn the capabilities, but it
+    /// must not start or write to the runtime. The one write a diagnostic may
+    /// need is [`Self::probe_turn`], which the CLI gates explicitly.
+    async fn client_report(&self) -> Option<ClientReport> {
+        None
+    }
+
+    /// Establish that the configured provider can actually complete a turn
+    /// (ADR-0090's amendment, ticket #883). This is a **real turn** on a
+    /// scratch thread — a side effect on a runtime cola does not own — so the
+    /// CLI only calls it for `cola doctor --check-turn`, never for a plain
+    /// `status` or `doctor`.
+    async fn probe_turn(&self) -> TurnProbe {
+        TurnProbe::NotAttempted {
+            detail: "this client has no turn probe".to_string(),
+        }
     }
 
     /// Restart the runtime **only when this client owns it**. Default: no

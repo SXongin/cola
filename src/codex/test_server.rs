@@ -322,6 +322,11 @@ struct State {
     /// The next turn/item id the server assigns, as the real server does.
     next_turn: AtomicUsize,
     next_item: AtomicUsize,
+    /// The next thread id `thread/start` assigns.
+    next_thread: AtomicUsize,
+    /// Threads deleted through `thread/delete`, in call order — the doctor
+    /// probe's cleanup assertion.
+    deleted_threads: std::sync::Mutex<Vec<String>>,
     /// Threads whose `turn/start` (and steer) echoes the request's own input as
     /// a server-generated `userMessage` item, so a test reads the prompt off the
     /// stream instead of hand-writing it.
@@ -391,6 +396,8 @@ impl Default for State {
             live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_turn: AtomicUsize::new(1),
             next_item: AtomicUsize::new(1),
+            next_thread: AtomicUsize::new(1),
+            deleted_threads: std::sync::Mutex::new(Vec::new()),
             echo_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             models: std::sync::Mutex::new(Vec::new()),
             model_page_size: AtomicUsize::new(50),
@@ -775,10 +782,23 @@ impl FakeServer {
         self.state.fail_turns_pages.store(count, Ordering::SeqCst);
     }
 
+    /// Threads deleted through `thread/delete`, in call order.
+    pub(crate) fn deleted_threads(&self) -> Vec<String> {
+        self.state
+            .deleted_threads
+            .lock()
+            .expect("deleted threads")
+            .clone()
+    }
+
     /// Script the notifications a `turn/start` on `thread_id` emits to that
     /// thread's subscribers. The request itself is the origin: a test starts
     /// the turn from another connection, and the fake server — not the test —
     /// pushes the stream.
+    ///
+    /// `thread_id` of `"*"` applies to any thread whose own script is unset,
+    /// so a test can script a turn for a thread the server has not created yet
+    /// (`thread/start` assigns its id).
     pub(crate) fn script_turn(&self, thread_id: &str, events: Vec<Value>) {
         let events = events
             .into_iter()
@@ -1053,6 +1073,36 @@ where
                 .push(params.clone());
             replying(sink, id, list_threads(state, &params)).await
         }
+        Some("thread/start") => {
+            let cwd = params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("/tmp")
+                .to_string();
+            let thread_id = format!("thread-{}", state.next_thread.fetch_add(1, Ordering::SeqCst));
+            let thread = ScriptedThread::never_run(&thread_id, &thread_id, &cwd);
+            state
+                .threads
+                .lock()
+                .expect("scripted threads")
+                .push(thread.clone());
+            reply(sink, id, json!({ "thread": thread_json(&thread) })).await
+        }
+        Some("thread/delete") => {
+            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            state
+                .threads
+                .lock()
+                .expect("scripted threads")
+                .retain(|thread| thread.id != thread_id);
+            state.subscribers.lock().expect("subscribers").remove(thread_id);
+            state
+                .deleted_threads
+                .lock()
+                .expect("deleted threads")
+                .push(thread_id.to_string());
+            reply(sink, id, json!({})).await
+        }
         Some("thread/read") => {
             if state.silent_thread_read.swap(false, Ordering::SeqCst) {
                 return true;
@@ -1196,6 +1246,16 @@ where
                 .lock()
                 .expect("live turns")
                 .insert(thread_id.to_string(), turn_id.clone());
+            // The initiating connection is a subscriber of its own turn (the
+            // spike's A received the stream without an explicit resume), so
+            // `turn/*`, `item/*` and `error` reach it.
+            {
+                let mut subscribers = state.subscribers.lock().expect("subscribers");
+                let streams = subscribers.entry(thread_id.to_string()).or_default();
+                if !streams.iter().any(|(id, _)| *id == connection_id) {
+                    streams.push((connection_id, outgoing.clone()));
+                }
+            }
             let started_at = now_secs();
             let result = json!({
                 "turn": { "id": turn_id, "status": "inProgress", "startedAt": started_at, "items": [] }
@@ -1217,15 +1277,22 @@ where
             }
             // The server, not the test, emits the stream: a turn started on
             // this connection fans out to every subscriber of the thread.
-            let scripted = state
-                .scripted_turns
-                .lock()
-                .expect("scripted turns")
-                .get(thread_id)
-                .cloned()
-                .unwrap_or_default();
+            let scripted = {
+                let turns = state.scripted_turns.lock().expect("scripted turns");
+                turns
+                    .get(thread_id)
+                    .or_else(|| turns.get("*"))
+                    .cloned()
+                    .unwrap_or_default()
+            };
             for (method, params) in &scripted {
-                emit(state, thread_id, method, params.clone());
+                // A real turn notification names its thread; a test script need
+                // not repeat the id `thread/start` assigned.
+                let mut params = params.clone();
+                if let Some(object) = params.as_object_mut() {
+                    object.entry("threadId").or_insert_with(|| json!(thread_id));
+                }
+                emit(state, thread_id, method, params);
                 if method == "turn/completed" {
                     state.live_turns.lock().expect("live turns").remove(thread_id);
                 }

@@ -20,7 +20,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::backend::lifecycle::{
-    AttachOutcome, AttachmentStatus, EnsureAttached, OtherServer, RestartOutcome, ServerLifecycle,
+    AttachOutcome, AttachmentStatus, Capability, ClientReport, ClientState, EnsureAttached, OtherServer,
+    RestartOutcome, ServerLifecycle,
 };
 use crate::backend::wait_for_server_ready;
 use crate::config::{ServerStartPolicy, port_from_url};
@@ -369,6 +370,70 @@ impl ServerLifecycle for OpenCodeBackend {
             generation,
             evidence,
             other_servers,
+        })
+    }
+
+    /// The client-scoped diagnosis (ticket #883). OpenCode's runtime is the
+    /// shared server the attach probe already resolves, so this reuses
+    /// [`Self::attachment_status`] rather than inventing a second probe; the
+    /// only capability the attachment itself proves is the generation, and the
+    /// Background Task surface is this adapter's own answer.
+    async fn client_report(&self) -> Option<ClientReport> {
+        let settings = self.settings();
+        let configured = settings
+            .url
+            .clone()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| "http://localhost:4096".to_string());
+        let attachment = self.attachment_status().await;
+        let endpoint = attachment
+            .as_ref()
+            .map(|status| status.url.clone())
+            .unwrap_or(configured);
+        let capabilities = attachment
+            .as_ref()
+            .map(|status| {
+                let generation = status.generation.clone().unwrap_or_else(|| "unknown".to_string());
+                vec![
+                    Capability {
+                        name: "generation".to_string(),
+                        value: generation,
+                    },
+                    Capability {
+                        name: "background_tasks".to_string(),
+                        value: if self.background_tasks_supported() {
+                            "yes".to_string()
+                        } else {
+                            "unsupported".to_string()
+                        },
+                    },
+                ]
+            })
+            .unwrap_or_default();
+        let (state, detail) = match attachment {
+            Some(status) => (
+                ClientState::Attached,
+                match status.generation {
+                    Some(generation) => format!("attached (generation {generation})"),
+                    None => format!("attached, generation unknown: {}", status.evidence),
+                },
+            ),
+            None => (
+                ClientState::Absent,
+                "no shared OpenCode server was found; LAZY start or attach-only".to_string(),
+            ),
+        };
+        Some(ClientReport {
+            endpoint,
+            state,
+            detail,
+            runtime_binary: None,
+            version: None,
+            platform: None,
+            surface_source: None,
+            capabilities,
+            user_clients: Vec::new(),
+            client_binary: None,
         })
     }
 
