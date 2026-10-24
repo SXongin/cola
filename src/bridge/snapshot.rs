@@ -241,10 +241,14 @@ pub(crate) async fn gather_snapshot(
     };
     // Only the adopted session's own requests belong on the snapshot — never a
     // sibling session's in the same directory, and never a sub-task child's
-    // (ADR-0028 keeps child-session pendings on today's standalone flow).
+    // (ADR-0028 keeps child-session pendings on today's standalone flow). A
+    // permission whose target the card cannot show in full is left out too:
+    // embedding it would bypass the permission flow's decline guard (a claimed
+    // request is never surfaced again), and the poll sweep declines it with the
+    // reason card.
     let pending: Vec<crate::bridge::request::kind::PendingRequest> = permissions
         .into_iter()
-        .filter(|p| p.session_id.as_deref() == Some(session_id))
+        .filter(|p| p.session_id.as_deref() == Some(session_id) && p.targets_are_fully_shown())
         .map(crate::bridge::request::kind::PendingRequest::Permission)
         .chain(
             questions
@@ -480,6 +484,51 @@ mod tests {
     async fn gather_from_typed_backend(mock: MockBackend) -> SnapshotData {
         let backend: Arc<dyn crate::backend::Backend> = Arc::new(mock);
         gather_snapshot(&backend, "ses_adopted", "/work/proj").await
+    }
+
+    /// Whole-branch re-review #883: a permission whose target the card cannot
+    /// render in full is never embedded on a snapshot card. The snapshot claims
+    /// embedded pendings, and a claimed request is never surfaced by the
+    /// permission flow again — so embedding it would bypass the flow's decline
+    /// guard and offer a clipped command. The in-budget request still rides.
+    #[tokio::test]
+    async fn an_unshowable_permission_is_never_embedded_on_a_snapshot() {
+        let mut backend = typed_backend(vec![
+            user("msg_u1", 1_000, &["帮我改一下"]),
+            assistant("msg_a1", 2_000, &["好的"]),
+        ]);
+        let too_long = format!(
+            "echo {}",
+            "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        );
+        backend.ask_permissions(vec![
+            crate::backend::types::PermissionRequest {
+                request_id: "per_ok".into(),
+                session_id: Some("ses_adopted".into()),
+                permission: Some("bash".into()),
+                patterns: vec!["ls".into()],
+                metadata: None,
+                always: Vec::new(),
+                always_supported: true,
+            },
+            crate::backend::types::PermissionRequest {
+                request_id: "per_long".into(),
+                session_id: Some("ses_adopted".into()),
+                permission: Some("bash".into()),
+                patterns: vec![too_long],
+                metadata: None,
+                always: Vec::new(),
+                always_supported: true,
+            },
+        ]);
+
+        let data = gather_from_typed_backend(backend).await;
+        let ids: Vec<&str> = data.embedded_pending().iter().map(|req| req.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["per_ok"],
+            "only the fully showable pending may be claimed by the snapshot"
+        );
     }
 
     /// The overflow fact is what keeps a cardless-but-waiting session honest

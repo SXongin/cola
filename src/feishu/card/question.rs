@@ -191,6 +191,32 @@ pub(crate) fn uncollectable_note(reason: UncollectableReason) -> &'static str {
     }
 }
 
+/// The header of the card that records a permission cola auto-declined because
+/// its target cannot be rendered in full. Pinned beside the note below, so the
+/// decision and its explanation cannot diverge.
+pub(crate) const UNSHOWABLE_PERMISSION_HEADER: &str = "🔐 权限请求已自动拒绝";
+
+/// Why such a request is declined, and what the user can do. The permission
+/// flow declines the request on the server and asks this function for the copy;
+/// the card below renders the same text, so the two never disagree.
+pub(crate) fn unshowable_permission_note(budget: usize) -> String {
+    format!(
+        "该权限请求的目标超过 **{budget}** 字符，卡片无法完整显示。为了不让你批准只看到一部分的内容，\
+         cola 已自动拒绝；请在原始客户端中确认后重试。"
+    )
+}
+
+/// The card that explains an auto-declined, unshowable permission. It carries
+/// no controls: the decision is already made, and the point is to say so rather
+/// than to offer a partial target.
+pub(crate) fn build_unshowable_permission_card(budget: usize) -> serde_json::Value {
+    card_shell(
+        UNSHOWABLE_PERMISSION_HEADER,
+        "grey",
+        vec![json!({ "tag": "markdown", "content": unshowable_permission_note(budget) })],
+    )
+}
+
 /// The header of a standalone card whose request cannot be collected at all.
 pub(crate) const UNCOLLECTABLE_HEADER: &str = "❓ 无法在卡片上作答";
 
@@ -1316,6 +1342,23 @@ mod tests {
                 "the component count is exactly what the block renders"
             );
         }
+    }
+
+    /// Whole-branch re-review #883: a long directory is repeated in every
+    /// button's callback value, so the block estimate must grow with it — a
+    /// fixed overhead would let the streaming card's split exceed its budget.
+    #[test]
+    fn a_long_directory_is_charged_in_the_permission_block_estimate() {
+        let short = permission_block_estimate("body", true, "n:1", "ses", "/d");
+        let directory = format!("/work/{}", "a-project-directory/".repeat(12));
+        let long = permission_block_estimate("body", true, "n:1", "ses", &directory);
+        let buttons = permission_block_components(true) - 1;
+        assert_eq!(
+            long - short,
+            buttons * crate::feishu::card::question::json_string_bytes(&directory).saturating_sub(2),
+            "every button pays for the directory it echoes"
+        );
+        assert!(long > short, "a longer directory can never estimate less");
     }
 
     /// A V2 form's typed fields render as their own controls: a string field's
