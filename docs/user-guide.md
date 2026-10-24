@@ -18,6 +18,7 @@ All runtime state defaults to `~/.cola/`:
 | `sessions.json` | Feishu thread ↔ Session mapping | `[bridge] session_file` |
 | `chain_records.json` | durable Chain Record: live cards, wake watermarks, Task Endings, delivered positions | beside `session_file` |
 | `interactive_surfaces.json` | Permission/Question cards re-adopted after a restart (ADR-0038) | beside `session_file` |
+| `authored_turns.json` | turns cola started, so a client that assigns its own ids still tells its own messages from external ones (ADR-0092) | beside `session_file` |
 | `pinned_chats.json` | persisted Instant Reminder pins | beside `session_file` |
 | `terminal-runs/` | Terminal Run Records for live/settled `/run` cards | beside `session_file` |
 | `access.json` | Access List (the Host; ADR-0035) | `[bridge] access_file` |

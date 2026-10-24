@@ -195,7 +195,7 @@ _UI label_: 已压缩上下文
 _Avoid_: Checkpoint (V2's implementation mechanism for the same act, not the domain term), summarization, pruning (removed in V2), context reset/clear (it is a lossy rewrite, not a discard)
 
 **Cola-Authored Message**:
-A user message cola itself submitted to the Backend on behalf of a Feishu Chat/Topic, as opposed to an External Message. Self-identifying: cola chooses the message's id (`msg_cola_…`) at send time and the Backend persists that id, so authorship survives a server crash/replacement and even a cola restart without any cola-side ledger. Recognised by the `msg_cola_` id prefix.
+A user message cola itself submitted to the Backend on behalf of a Feishu Chat/Topic, as opposed to an External Message. Its authorship is answered by the attached **Agent Client** through one seam (`Backend::is_cola_authored`, ADR-0092): on OpenCode the message carries the `msg_cola_…` id cola chose at send time, while a client that assigns its own ids — Codex — reports the turns cola started from a durable, client-scoped record that survives a cola restart. The bridge never decides authorship from the id's shape.
 _Avoid_: Outbound message, own prompt (a prompt is the send action, not the stored message)
 
 **External Message**:
