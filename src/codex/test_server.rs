@@ -578,6 +578,20 @@ impl FakeServer {
         }
     }
 
+    /// Replace a thread's persisted turns, as a later server write would.
+    pub(crate) fn set_turns(&self, thread_id: &str, turns: Vec<Value>) {
+        if let Some(thread) = self
+            .state
+            .threads
+            .lock()
+            .expect("scripted threads")
+            .iter_mut()
+            .find(|thread| thread.id == thread_id)
+        {
+            thread.turns = turns;
+        }
+    }
+
     /// Fail the next `count` `thread/turns/list` calls with a malformed page,
     /// so a retry path can be exercised.
     pub(crate) fn fail_turns_pages(&self, count: usize) {
