@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::backend::Backend;
 use crate::bridge::App;
 use crate::bridge::test_support::{
-    CardUpdates, PlatformCall, RecordingPlatform, card_header, card_text, seed_entry, test_config,
-    wait_for_card_update,
+    CardUpdates, HostCardAction, PlatformCall, RecordingPlatform, card_header, card_text, incoming,
+    seed_entry, send_command_in, test_config, wait_for_card_update,
 };
 use crate::bridge::turn::Turn;
 use crate::config::SessionEntry;
@@ -45,7 +45,31 @@ async fn build_bridge(
     session_file: &Path,
     watermark: i64,
 ) -> (Arc<App>, Arc<RecordingPlatform>, CodexClient) {
-    let client = connect(url).await;
+    build_bridge_authored(
+        url,
+        session_file,
+        watermark,
+        super::authorship::Authorship::in_memory(),
+    )
+    .await
+}
+
+/// [`build_bridge`] with the turns-cola-started record the client answers
+/// authorship from (ADR-0090). A restart test passes the same durable record
+/// a second process would load.
+async fn build_bridge_authored(
+    url: &str,
+    session_file: &Path,
+    watermark: i64,
+    authored: Arc<super::authorship::Authorship>,
+) -> (Arc<App>, Arc<RecordingPlatform>, CodexClient) {
+    let endpoint = Endpoint::parse(url).expect("endpoint");
+    let client = CodexClient::connect(
+        &CodexOptions::new(endpoint).with_authorship(authored),
+        &PinnedProbe,
+    )
+    .await
+    .expect("attach to the scripted app-server");
     let platform = Arc::new(RecordingPlatform::new());
     let backend: Arc<dyn Backend> = Arc::new(client.clone());
     let app =
@@ -768,4 +792,649 @@ fn persisted_turn(turn_id: &str, user_item: &str, started_ms: i64, answer: &str)
             }
         ]
     })
+}
+
+/// One plain Feishu message from the test Host, addressed to the mapped chat.
+fn prompt_message(text: &str, message_id: &str) -> crate::bridge::IncomingMessage {
+    incoming(
+        message_id.to_string(),
+        CHAT.to_string(),
+        "p2p".to_string(),
+        None,
+        text.to_string(),
+        None,
+    )
+}
+
+/// Wait until the server holds a live turn for the thread (the bridge's Turn
+/// took its guard before submitting, so a supplement or `/stop` sent after this
+/// is racing nothing).
+async fn wait_for_live_turn(server: &FakeServer) -> String {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(turn) = server.live_turn(THREAD) {
+            return turn;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the bridge never started its turn"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait until `turn/start` has arrived for the thread (the bridge submits on
+/// its own task, so a synchronous assertion would race it).
+async fn wait_for_turn_start(server: &FakeServer) -> Value {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(params) = server.turn_params(THREAD).last().cloned() {
+            return params;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the bridge never submitted its prompt"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Ticket #881 acceptance 1: a Feishu prompt reaches the thread as the server's
+/// own user message (the request's content, persisted as a turn) and the turn
+/// completes on the card.
+#[tokio::test]
+async fn a_feishu_prompt_becomes_a_user_message_and_completes() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let now = chrono::Utc::now().timestamp();
+    server.script_turn(
+        THREAD,
+        vec![
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turnId": "turn-1",
+                    "completedAtMs": now * 1000,
+                    "item": { "type": "agentMessage", "id": "agent-1", "text": "the codex answer" },
+                },
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turn": { "id": "turn-1", "status": "completed", "startedAt": now, "completedAt": now + 1 },
+                },
+            }),
+        ],
+    );
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("please help", "om_prompt"))
+                .await
+        }
+    });
+    wait_for_card_update(&platform, "the answer", CardUpdates::Any, |card| {
+        card_text(card).contains("the codex answer")
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+        .await
+        .expect("the prompt must finish")
+        .expect("the handler joins");
+
+    let card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the settled card");
+    assert!(
+        card_header(&card).contains("完成"),
+        "the turn completes: {}",
+        card_header(&card)
+    );
+    assert!(
+        card_text(&card).contains("the codex answer"),
+        "the answer renders on the card: {card}"
+    );
+
+    // The prompt is the thread's own user message (the Feishu message the user
+    // sent is the card's other face, not re-rendered on it), exactly once.
+    let transcript = client.transcript(THREAD).await.expect("the thread's read");
+    let user: Vec<_> = transcript
+        .messages
+        .iter()
+        .filter(|message| message.role == crate::backend::MessageRole::User)
+        .collect();
+    assert_eq!(user.len(), 1, "one user message for one prompt");
+    assert_eq!(user[0].text(), "please help");
+}
+
+/// Ticket #881 acceptance 3 through the bridge: a second message while cola owns
+/// the live run is a Supplement → `turn/steer`, never a second `turn/start`, and
+/// its text renders once on the split continuation.
+#[tokio::test]
+async fn a_supplement_steers_the_live_turn_and_renders_once() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("first message", "om_first"))
+                .await
+        }
+    });
+    let live = wait_for_live_turn(&server).await;
+
+    // The supplement: cola holds the live execution, so it steers.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        app.handle_message(prompt_message("extra context", "om_supplement")),
+    )
+    .await
+    .expect("the supplement returns promptly");
+
+    assert_eq!(
+        server.turn_starts(),
+        1,
+        "a Supplement must not start a second turn"
+    );
+    let steers = server.steer_params();
+    assert_eq!(steers.len(), 1, "the supplement used turn/steer");
+    assert_eq!(steers[0]["expectedTurnId"].as_str(), Some(live.as_str()));
+    assert_eq!(steers[0]["input"][0]["text"], "extra context");
+
+    // The turn ends after the steer: the answer and the completion.
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "item/completed",
+        json!({
+            "threadId": THREAD,
+            "turnId": live,
+            "completedAtMs": now * 1000,
+            "item": { "type": "agentMessage", "id": "agent-after-steer", "text": "the steered answer" },
+        }),
+    );
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), first)
+        .await
+        .expect("the turn must finish")
+        .expect("the handler joins");
+
+    // The message settled as a Supplement: its own continuation carries the
+    // receipt, and the steered run's answer renders on a card.
+    let continuation = crate::bridge::test_support::supplement_continuation(&platform, "om_supplement").await;
+    assert!(
+        card_text(&continuation).contains("📨 已收到补充"),
+        "the supplement's continuation carries the receipt"
+    );
+    let cards: Vec<Value> = platform
+        .updated_cards()
+        .await
+        .into_iter()
+        .chain(platform.replied_cards().await)
+        .collect();
+    assert!(
+        cards
+            .iter()
+            .any(|card| card_text(card).contains("the steered answer")),
+        "the steered run's answer renders: {cards:?}"
+    );
+    // The text itself appears once in the transcript (the card does not repeat
+    // the user's own message).
+    let transcript = _client.transcript(THREAD).await.expect("the thread's read");
+    assert_eq!(
+        transcript
+            .messages
+            .iter()
+            .filter(|message| message.text().contains("extra context"))
+            .count(),
+        1,
+        "the steered text lands exactly once"
+    );
+}
+
+/// Ticket #881 acceptance 2: `/stop` interrupts the running turn and the card
+/// settles as stopped — not an error, not a hang.
+#[tokio::test]
+async fn stop_interrupts_the_turn_and_settles_the_card_as_stopped() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    let turn = tokio::spawn({
+        let app = app.clone();
+        async move { app.handle_message(prompt_message("a long run", "om_stop")).await }
+    });
+    let live = wait_for_live_turn(&server).await;
+
+    send_command_in(
+        &app,
+        "/stop",
+        crate::config::ThreadKey::new(CHAT.into(), CHAT.into()),
+        "om_stop_command",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+        .await
+        .expect("the stopped turn must settle, not hang")
+        .expect("the handler joins");
+
+    let interrupts = server.interrupt_params();
+    assert_eq!(interrupts.len(), 1, "one turn/interrupt");
+    assert_eq!(
+        interrupts[0]["turnId"].as_str(),
+        Some(live.as_str()),
+        "the interrupt names the running turn"
+    );
+    let card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the settled card");
+    assert!(
+        card_header(&card).contains("已停止"),
+        "a stopped turn settles as stopped, not error or spinner: {}",
+        card_header(&card)
+    );
+}
+
+/// Ticket #881 acceptance 5: `/model` lists the server's catalog, and the pick
+/// (with a `/think` effort) reaches the next `turn/start`.
+#[tokio::test]
+async fn a_model_pick_reaches_the_next_turn() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.set_models(vec![json!({
+        "id": "gpt-5.1-codex",
+        "displayName": "GPT-5.1 Codex",
+        "hidden": false,
+        "supportedReasoningEfforts": [
+            { "reasoningEffort": "low", "description": "fast" },
+            { "reasoningEffort": "high", "description": "careful" }
+        ],
+        "defaultReasoningEffort": "high"
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+
+    // `/model` → the provider card → the model card.
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let step = app
+        .host_action(json!({
+            "action": "model",
+            "level": "provider",
+            "chat_id": CHAT,
+            "thread_id": CHAT,
+            "value": "codex",
+        }))
+        .await
+        .expect("the provider pick");
+    let picker = step.card.expect("the model picker");
+    assert!(
+        card_text(&picker).contains("gpt-5.1-codex"),
+        "the picker lists the server's model: {picker}"
+    );
+    app.host_action(json!({
+        "action": "model",
+        "level": "model",
+        "chat_id": CHAT,
+        "thread_id": CHAT,
+        "value": "codex/gpt-5.1-codex",
+    }))
+    .await
+    .expect("the model pick");
+
+    // The effort rides the model entry: `/think high` is accepted for it.
+    send_command_in(
+        &app,
+        "/think high",
+        key.clone(),
+        "om_think",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("use the new model", "om_after_pick"))
+                .await
+        }
+    });
+    let params = wait_for_turn_start(&server).await;
+    assert_eq!(params["model"], "gpt-5.1-codex");
+    assert_eq!(params["effort"], "high");
+
+    // End the turn so the spawned turn stops cleanly.
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+        .await
+        .expect("the turn must finish")
+        .expect("the handler joins");
+}
+
+/// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves
+/// against `skills/list` and the pick reaches `turn/start` as the protocol's
+/// `skill` input.
+#[tokio::test]
+async fn a_skill_pick_reaches_the_next_turn() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    server.set_skills(vec![json!({
+        "name": "caveman",
+        "description": "Ultra-compressed communication mode.",
+        "path": "/home/u/.codex/skills/caveman/SKILL.md",
+        "scope": "user",
+        "enabled": true,
+        "pluginId": null,
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("/skill caveman explain this", "om_skill"))
+                .await
+        }
+    });
+    let params = wait_for_turn_start(&server).await;
+    assert_eq!(
+        params["input"][1],
+        json!({
+            "type": "skill",
+            "name": "caveman",
+            "path": "/home/u/.codex/skills/caveman/SKILL.md",
+        }),
+        "the skill rides the prompt with the path the server advertised"
+    );
+
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+        .await
+        .expect("the turn must finish")
+        .expect("the handler joins");
+}
+
+/// Ticket #881 acceptance 4 through the bridge: `/compact` runs, and the
+/// compaction it caused renders through the existing path — once — on the next
+/// turn's card.
+#[tokio::test]
+async fn compact_renders_through_the_existing_compaction_path_once() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let now = chrono::Utc::now().timestamp();
+    server.script_turn(
+        THREAD,
+        vec![
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turnId": "turn-2",
+                    "completedAtMs": now * 1000,
+                    "item": { "type": "agentMessage", "id": "agent-after-compact", "text": "after the compaction" },
+                },
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turn": { "id": "turn-2", "status": "completed", "startedAt": now, "completedAt": now + 1 },
+                },
+            }),
+        ],
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    send_command_in(
+        &app,
+        "/compact",
+        crate::config::ThreadKey::new(CHAT.into(), CHAT.into()),
+        "om_compact",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    assert_eq!(
+        server.compact_params(),
+        vec![json!({ "threadId": THREAD })],
+        "thread/compact/start names the thread"
+    );
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("after compact", "om_post_compact"))
+                .await
+        }
+    });
+    wait_for_card_update(&platform, "the compaction row", CardUpdates::Any, |card| {
+        card_text(card).contains("已压缩上下文（手动）")
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+        .await
+        .expect("the turn must finish")
+        .expect("the handler joins");
+
+    let card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the settled card");
+    assert_eq!(
+        card_text(&card).matches("已压缩上下文（手动）").count(),
+        1,
+        "the manual compaction renders exactly once: {card}"
+    );
+    assert!(
+        card_text(&card).contains("after the compaction"),
+        "and the turn's own answer rides the same card: {card}"
+    );
+}
+
+/// Ticket #881 acceptance 6 through the bridge: a turn cola started is never an
+/// External Message — including after a restart, which reads the durable record
+/// rather than an in-memory one. A genuinely external turn still notifies.
+#[tokio::test]
+async fn a_cola_turn_is_never_an_external_message_after_a_restart() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let now = chrono::Utc::now().timestamp();
+    server.script_turn(
+        THREAD,
+        vec![
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turnId": "turn-1",
+                    "completedAtMs": now * 1000,
+                    "item": { "type": "agentMessage", "id": "agent-1", "text": "cola's answer" },
+                },
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turn": { "id": "turn-1", "status": "completed", "startedAt": now, "completedAt": now + 1 },
+                },
+            }),
+        ],
+    );
+    let directory = tempfile::tempdir().expect("tempdir");
+    let session_file = directory.path().join("sessions.json");
+    let record_path = directory.path().join("authored_turns.json");
+
+    // The first cola process prompts; its turn is recorded durably.
+    let (first, first_platform, first_client) = build_bridge_authored(
+        &url,
+        &session_file,
+        now * 1000 - 60_000,
+        super::authorship::Authorship::open(record_path.clone(), crate::config::DEFAULT_CLIENT_ID)
+            .expect("the record opens"),
+    )
+    .await;
+    let handler = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .handle_message(prompt_message("cola's own turn", "om_own"))
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+        .await
+        .expect("the first turn must finish")
+        .expect("the handler joins");
+    drop(first);
+    drop(first_client);
+    drop(first_platform);
+    wait_for_all_unsubscribed(&server).await;
+    let record: Value =
+        serde_json::from_str(&std::fs::read_to_string(&record_path).expect("the durable record"))
+            .expect("json");
+    assert_eq!(
+        record["turns"][crate::config::DEFAULT_CLIENT_ID][THREAD],
+        json!(["turn-1"]),
+        "the turn cola started is on disk: {record}"
+    );
+
+    // The restart: a new process reads the record and starts Session Sync.
+    let (second, second_platform, second_client) = build_bridge_authored(
+        &url,
+        &session_file,
+        now * 1000 - 60_000,
+        super::authorship::Authorship::open(record_path, crate::config::DEFAULT_CLIENT_ID)
+            .expect("the record reloads"),
+    )
+    .await;
+    let sync = spawn_sync(&second);
+    server.wait_for_subscribers(THREAD, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !second_platform
+            .sent_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("有新消息")),
+        "a restart must not report cola's own turn as an external message"
+    );
+
+    // The non-vacuous half: a turn the user's own client starts does notify.
+    let tui = connect(&url).await;
+    tui.transcript(THREAD).await.expect("the TUI's subscription");
+    tui.prompt(THREAD, "from OpenChamber", &[], &[], None, None, None, None)
+        .await
+        .expect("the TUI's prompt");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if second_platform
+            .sent_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("有新消息") && card_text(card).contains("from OpenChamber"))
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a genuinely external turn must still notify after the restart"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    sync.abort();
+    drop(second_client);
 }
