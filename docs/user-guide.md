@@ -502,13 +502,28 @@ reopening the fresh file across a midnight rotation.
 ## Inspect (status / doctor / config)
 
 `cola status` prints a one-shot snapshot: run state, autostart, claim, the
-resolved config and log paths, and the attached OpenCode server with its
-generation. `--json` emits the same facts for scripts.
+resolved config and log paths, the active agent client (its id, kind, endpoint,
+attachment and advertised capabilities), and the attached OpenCode server with
+its generation. `--json` emits the same facts for scripts; the new `client`
+object carries the client-scoped rows and the existing keys are unchanged.
 
 `cola doctor` runs the checks a support request needs — config parse, Feishu
-credentials, `opencode` on `PATH`, the shared server probe, the singleton lock,
-the log path, and the autostart binary path — each with a ✅/⚠️/❌ mark and a
-summary, and exits non-zero when a check fails.
+credentials, the client binary and runtime, the singleton lock, the log path,
+and the autostart binary path — each with a ✅/⚠️/❌ mark and a summary, and exits
+non-zero when a check fails. For an OpenCode client it probes the shared server
+as before; for a Codex client it reports the app-server daemon, whether your own
+client is attached to it, and whether the runtime advertises the expected
+surface. A Codex TUI running on an embedded server (or with `--no-daemon`) is a
+named failure, and a client whose argv cannot prove it shares the daemon is a
+warning that says so.
+
+`cola doctor --check-turn` additionally proves the configured provider can
+complete a real turn: it starts a minimal turn on a scratch thread and observes
+`turn/completed`, failing on a retryable or terminal error or when the turn does
+not finish within its 60-second budget. That is a write on a daemon cola does
+not own, so it is opt-in; the scratch thread is named as a doctor probe and
+deleted afterwards. No check reads a ChatGPT account state — a provider-keyed
+`[model_providers.*]` setup is fully green.
 
 `cola config path|show|validate` prints the resolved config path, the effective
 config with the app secret masked, or a parse check. `cola version` mirrors

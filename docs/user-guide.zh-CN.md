@@ -402,12 +402,24 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 ## 检查（status / doctor / config）
 
 `cola status` 打印一次性快照：运行状态、自启动、认领、解析到的配置与日志
-路径，以及所连接的 OpenCode 服务器及其世代。`--json` 以相同事实输出，供脚本
-使用。
+路径、当前 Agent 客户端（id、kind、端点、连接状态与所公布的能力），以及所
+连接的 OpenCode 服务器及其世代。`--json` 以相同事实输出，供脚本使用；新增的
+`client` 对象承载客户端相关行，既有键保持不变。
 
-`cola doctor` 运行支持排查所需的检查——配置解析、飞书凭证、`PATH` 上的
-`opencode`、共享服务器探测、单实例锁、日志路径、自启动二进制路径——每项带
-✅/⚠️/❌ 标记并给出汇总，任一检查失败时以非零码退出。
+`cola doctor` 运行支持排查所需的检查——配置解析、飞书凭证、客户端二进制与
+运行时、单实例锁、日志路径、自启动二进制路径——每项带 ✅/⚠️/❌ 标记并给出
+汇总，任一检查失败时以非零码退出。OpenCode 客户端仍探测共享服务器；Codex
+客户端则报告 app-server daemon、你自己的客户端是否连接到它，以及运行时是否
+公布了预期的能力。运行在内嵌服务器上（或带 `--no-daemon`）的 Codex TUI 会
+被明确判为失败；仅凭 argv 无法证明已连接共享 daemon 的客户端会给出警告并说明
+原因。
+
+`cola doctor --check-turn` 还会验证配置的 provider 能否完成一次真实回合：
+它在一个临时线程上发起最小回合并等待 `turn/completed`，遇到可重试或终止性
+错误、或回合超出 60 秒预算未完成时判定失败。由于这会在并非 cola 所有的 daemon 上
+产生真实写入，该检查需要显式开启；临时线程会以 doctor 探针命名，并在结束后
+删除。所有检查都不读取 ChatGPT 账号状态——使用 provider key 的
+`[model_providers.*]` 配置可以全绿。
 
 `cola config path|show|validate` 分别打印解析到的配置路径、脱敏后的生效配置、
 或做一次解析校验。`cola version` 等价于 `--version`。`cola completions <shell>`
