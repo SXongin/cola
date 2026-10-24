@@ -576,6 +576,9 @@ impl CodexClient {
     /// path for a lost `turn/start` response (ADR-0092 decision 2), and it runs
     /// on the read the bridge is about to make, before it asks authorship.
     fn reconcile_submissions(&self, thread_id: &str, transcript: &SessionTranscript) {
+        // Prune first: the safety valve must be able to stop an aged id from
+        // vouching on the very read that would otherwise bind it.
+        self.authored.expire(thread_id);
         for (submission, message) in &transcript.submissions {
             // Only an id this record actually saw may vouch. A peer chooses its
             // own `clientUserMessageId`, so the id's shape proves nothing: an
@@ -591,10 +594,6 @@ impl CodexClient {
             }
             self.authored.bind_submission(thread_id, submission, &turn);
         }
-        // A marker whose request never reached the server has no item to bind;
-        // its window is bounded, and this read is where the expired entry
-        // leaves the file.
-        self.authored.expire(thread_id);
     }
 
     /// The `turn/start` params for one prompt. Model and effort ride the turn
@@ -916,6 +915,15 @@ const STOP_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(test)]
 const STOP_LOOKUP_INTERVAL: Duration = Duration::from_millis(10);
 
+/// The bound on the thread metadata read a skill prompt takes when this client
+/// has not learned the session's directory yet. A half-open connection must not
+/// hang the prompt before submission; on expiry the prompt fails by name, since
+/// a skill cannot be resolved without its directory.
+#[cfg(not(test))]
+const SKILL_CWD_READ_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const SKILL_CWD_READ_TIMEOUT: Duration = Duration::from_millis(60);
+
 /// The provider bucket the `/model` picker shows for Codex. `model/list` names
 /// no provider: a Codex model is whatever the attached app-server resolves
 /// through its own `[model_providers.*]`, and the picker's `provider/model`
@@ -936,10 +944,9 @@ const MAX_MODEL_PAGES: usize = 64;
 ///
 /// Each read **replaces its own scope**: a skill deleted between two lists must
 /// stop resolving (the prompt then fails by name, never sending a stale path),
-/// while a read for another project cannot erase this one's entries. Resolution
-/// prefers the session's own directory (the thread's `cwd`); without it, a name
-/// is used only when every scope agrees on one path, so a concurrent read for
-/// another project can never substitute a same-named skill.
+/// while a read for another project cannot erase this one's entries. A prompt
+/// resolves **only** in the session's own directory: a same-named skill from
+/// another project is a different file and must never be substituted.
 #[derive(Default)]
 pub(crate) struct SkillCatalog {
     /// Directory key (`""` for the server default) → (skill name → path).
@@ -1190,12 +1197,26 @@ impl Backend for CodexClient {
         // before its first read). A failed read leaves the directory unknown,
         // and a skill is then refused rather than taken from another project.
         if !skills.is_empty() && self.projections.cwd(session_id).is_none() {
-            match self.threads().read(session_id, false).await {
-                Ok(thread) => self.projections.set_cwd(&thread.id, &thread.cwd),
-                Err(error) => tracing::warn!(
-                    thread = %session_id,
-                    "could not read the thread's cwd before a skill prompt: {error}"
-                ),
+            match tokio::time::timeout(SKILL_CWD_READ_TIMEOUT, self.threads().read(session_id, false)).await {
+                Ok(Ok(thread)) => self.projections.set_cwd(&thread.id, &thread.cwd),
+                Ok(Err(error)) => {
+                    return Err(BridgeError::Client {
+                        client: "codex",
+                        detail: format!(
+                            "could not read the thread's directory before a skill prompt: {error}"
+                        ),
+                    });
+                }
+                Err(_) => {
+                    return Err(BridgeError::Client {
+                        client: "codex",
+                        detail: format!(
+                            "the codex thread metadata read did not answer within \
+                             {SKILL_CWD_READ_TIMEOUT:?}; refusing to submit a skill prompt \
+                             without the session's directory"
+                        ),
+                    });
+                }
             }
         }
         // `turn/start` is the write half of this ticket's read model; a failed
@@ -3901,6 +3922,128 @@ mod tests {
             server.interrupt_params().is_empty(),
             "the idle thread had nothing to interrupt"
         );
+    }
+
+    /// Finding 1 (aged id): the precise match is bounded by the recorded life,
+    /// and the read prunes before it binds. After the thread sat unread past the
+    /// safety valve, its very first history read sees a foreign item reusing the
+    /// aged id — and must not bind it. The foreign item is in the persisted
+    /// history, so this is the first-read case the finding names.
+    #[tokio::test]
+    async fn an_aged_recorded_id_cannot_bind_a_foreign_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        // A peer starts a turn whose chosen id reuses an aged recorded one.
+        let tui = connect(&url).await;
+        tui.prompt(
+            "thread-1",
+            "reusing an aged id",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some("msg_cola_aged"),
+        )
+        .await
+        .expect("the peer's prompt");
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+        let aged = chrono::Utc::now().timestamp_millis() - crate::codex::authorship::PENDING_ID_TTL_MS - 1;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"turns":{{}},"pending":{{"codex":{{"thread-1":[{{"id":"msg_cola_aged","at_ms":{aged}}}]}}}}}}"#
+            ),
+        )
+        .expect("write an aged record");
+        let record = crate::codex::Authorship::open(path.clone(), "codex").expect("the record opens");
+        let cola = connect_with(&url, record.clone()).await;
+
+        // cola's FIRST read of the thread pages the peer's persisted turn.
+        let transcript = cola.transcript("thread-1").await.expect("the first read");
+        let mut transcript = transcript;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !transcript
+            .messages
+            .iter()
+            .any(|message| message.text() == "reusing an aged id")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer's persisted prompt never reached the read"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            transcript = cola.transcript("thread-1").await.expect("the retried read");
+        }
+        let item = transcript
+            .messages
+            .iter()
+            .find(|message| message.text() == "reusing an aged id")
+            .expect("the peer's user message");
+        assert!(
+            !cola.is_cola_authored(item.id.as_str()).await,
+            "an aged recorded id must not vouch for a foreign item that reuses it"
+        );
+        assert!(
+            !cola.authored.is_authored("thread-1", Some("turn-1")),
+            "the read must not have bound the foreign turn"
+        );
+        assert!(
+            !record.is_pending_submission("thread-1", "msg_cola_aged"),
+            "the aged entry is out of its recorded life"
+        );
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the file")).expect("json");
+        assert!(
+            file["pending"].get("codex").is_none(),
+            "the read pruned the aged entry before reconciling: {file}"
+        );
+    }
+
+    /// Finding 2: a stalled metadata read on the skill path fails the prompt by
+    /// name instead of hanging before submission.
+    #[tokio::test]
+    async fn a_stalled_cwd_read_fails_the_skill_prompt_by_name() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        // No adoption: the client has not learned the thread's cwd.
+        let client = connect(&url).await;
+        server.silence_next_thread_read();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.prompt(
+                "thread-1",
+                "be brief",
+                &[],
+                &[PromptSkill {
+                    id: "caveman".into(),
+                    name: "caveman".into(),
+                }],
+                None,
+                None,
+                None,
+                Some("msg_cola_skill"),
+            ),
+        )
+        .await
+        .expect("a stalled metadata read must not hang the prompt")
+        .expect_err("the read timed out");
+        assert!(error.to_string().contains("did not answer within"), "{error}");
+        assert_eq!(server.turn_starts(), 0, "nothing was sent");
+        assert!(!client.authored.is_pending("thread-1"));
     }
 
     /// Finding 1: a peer chooses its own `clientUserMessageId`, so the id's

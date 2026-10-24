@@ -112,9 +112,9 @@ pub(crate) const PENDING_FALLBACK_TTL_MS: i64 = 50;
 /// the record cannot keep it forever; an hour is far longer than any accepted
 /// turn takes to surface, and the per-thread cap refuses new prompts until then.
 #[cfg(not(test))]
-const PENDING_ID_TTL_MS: i64 = 60 * 60 * 1000;
+pub(crate) const PENDING_ID_TTL_MS: i64 = 60 * 60 * 1000;
 #[cfg(test)]
-const PENDING_ID_TTL_MS: i64 = 500;
+pub(crate) const PENDING_ID_TTL_MS: i64 = 500;
 
 /// The version-1 (ADR-0091) file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -450,17 +450,24 @@ impl Authorship {
             || state.anonymous.get(thread).copied().unwrap_or(0) > 0
     }
 
-    /// Whether `submission` is a **recorded** unresolved chosen id. This is the
-    /// precise provenance answer: the item carries exactly the id cola sent, so
-    /// no other client's message can match it, and it is never inferred from
-    /// the id's shape. Only the safety valve ([`PENDING_ID_TTL_MS`]) removes it.
+    /// Whether `submission` is a **recorded, unaged** unresolved chosen id.
+    /// This is the precise provenance answer: the item carries exactly the id
+    /// cola sent, so no other client's message can match it, and it is never
+    /// inferred from the id's shape. The safety valve
+    /// ([`PENDING_ID_TTL_MS`]) also bounds the answer, so an id that outlived
+    /// its recorded life cannot vouch even before the next read prunes it.
     pub(crate) fn is_pending_submission(&self, thread: &str, submission: &str) -> bool {
+        let now = now_ms();
         self.state
             .lock()
             .expect("authorship record")
             .pending
             .get(&self.client_id, thread)
-            .is_some_and(|pending| pending.iter().any(|known| known.id == submission))
+            .is_some_and(|pending| {
+                pending
+                    .iter()
+                    .any(|known| known.id == submission && still_recorded(known, now))
+            })
     }
 
     /// Whether a message in `thread`'s turn `turn` is cola's own.
