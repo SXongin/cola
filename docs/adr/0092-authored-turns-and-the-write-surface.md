@@ -81,11 +81,21 @@ evicting an unresolved id is the same loss.
 Two windows bound the record. The **id-less, thread-wide fallback** stops
 vouching after five minutes (shorter in tests): a request that never reached the
 server must not make a later foreign turn with no client id look cola's. The
-**precise recorded id** is not bounded by that window — a lost response that
-surfaces late still binds, however long it took. What bounds the pending set
-when resolution never arrives is the safety valve: a recorded id that never
-resolves is pruned after an hour (shorter in tests), and until then the
-per-thread cap refuses new prompts rather than forgetting an outstanding id.
+**precise recorded id** outlives that fallback — a lost response that surfaces
+later than five minutes still binds — but it too has a recorded life: an entry
+older than **one hour** (shorter in tests) no longer vouches, and the history
+read **prunes before it reconciles**, so an aged id cannot bind an item even on
+the first read after the thread sat idle. The one-hour valve is also what bounds
+the pending set when resolution never arrives; until it fires, the per-thread
+cap refuses new prompts rather than forgetting an outstanding id.
+
+The trade-off is deliberate. Within the hour, a recorded id is authoritative.
+Past it, the entry is pruned and a genuinely lost response that surfaced after an
+hour would be read as an External Message — one unnecessary notification about
+cola's own message. The alternative is worse: keeping an aged, peer-reusable id
+would let a peer suppress its own turn indefinitely by reusing it. The server
+persists an accepted turn promptly, so an hour is far longer than any real
+response needs.
 
 Only an id **this record saw** may vouch. A peer chooses its own
 `clientUserMessageId`, so the id's spelling proves nothing: an unfamiliar id —
@@ -142,6 +152,13 @@ skill advertised for another project is never substituted, because its path and
 even its content may differ. Codex has no separate skill id, so the name is the
 neutral id (V1's rule).
 
+**8b. The skill prompt's metadata read is bounded.** When the adapter has not
+learned the thread's `cwd` before a skill prompt, the `thread/read` that
+supplies it runs under its own timeout (two seconds; shorter in tests). A
+half-open connection must not hold the prompt before submission; an expired or
+failed read is a named error, and no skill prompt is sent without the
+directory.
+
 **9. `/stop` and `/compact` use the protocol's own verbs.** `turn/interrupt`
 names the live turn; when the cache has not observed it — the subscription
 began after `turn/started`, or the start is still in flight — the adapter reads
@@ -188,7 +205,9 @@ durable shape for a label.
   response can surface later than five minutes, and the precise id cannot
   collide with anything a peer sent unless that peer deliberately reuses the
   recorded id (which is cola's claim, not the peer's). A separate one-hour
-  safety valve bounds the set; the cap refuses new prompts before then.
+  safety valve bounds the set, and the precise answer is age-checked so the
+  valve protects the very first read after an idle period; the cap refuses new
+  prompts before then.
 - **Evict the oldest unresolved submission at the cap.** Rejected: an
   unresolved id may still be owed, and dropping it is exactly the provenance
   loss the record exists to prevent. The next prompt is refused instead.
