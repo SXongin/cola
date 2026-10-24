@@ -707,9 +707,9 @@ impl Drop for ReleaseGuard {
 }
 
 /// Route notifications by `params.threadId` to the subscriber of that thread.
-/// Broadcasts without a thread (`thread/started`, `remoteControl/…`) and
-/// server requests (the approval surface, #882) are not a subscription's
-/// traffic.
+/// Broadcasts without a thread (`thread/started`, `remoteControl/…`) are not a
+/// subscription's traffic, and server requests ride their own lossless stream
+/// (the approval surface, #882) instead of this broadcast.
 async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Registry>) {
     loop {
         let event = inbound.recv().await;
@@ -730,7 +730,6 @@ async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Regi
                     let _ = sender.send(ThreadEvent::Notification { seq, method, params });
                 }
             }
-            Ok(Inbound::Request { .. }) => continue,
             Ok(Inbound::Closed) => {
                 registry.close_all();
                 return;

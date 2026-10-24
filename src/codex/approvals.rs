@@ -64,12 +64,7 @@ use crate::error::{BridgeError, Result};
 
 use super::backend::Projections;
 use super::error::CodexError;
-use super::transport::{Inbound, RpcConnection};
-
-/// The notification the server sends when a request is answered (by any
-/// client) or otherwise leaves the pending set. It carries the same
-/// `requestId` the request frame did.
-const RESOLVED: &str = "serverRequest/resolved";
+use super::transport::{RpcConnection, ServerEvent};
 
 /// The JSON-RPC error code for a method this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -124,18 +119,30 @@ impl Drop for Approvals {
 }
 
 impl Approvals {
-    /// Start consuming this connection's inbound requests and resolutions. The
-    /// task holds a weak reference, so the record's own `Drop` is the
-    /// lifetime edge (the same shape the projections' subscribers use).
+    /// Start consuming this connection's server requests and resolutions. The
+    /// task holds a weak reference, so the record's own `Drop` is the lifetime
+    /// edge (the same shape the projections' subscribers use).
+    ///
+    /// The stream is the connection's **lossless** one, not the notification
+    /// broadcast: a request dropped by a lagged fan-out leaves a server waiting
+    /// forever with no card, and a dropped resolution leaves a card clickable
+    /// for a request nobody waits on. Those are decisions, not transcript
+    /// events a reader can repair from a later read, so they never share the
+    /// lossy path.
     pub(crate) fn watch(self: &Arc<Self>, connection: &RpcConnection, projections: &Arc<Projections>) {
-        let mut inbound = connection.inbound();
+        // One connection installs one approval record (`CodexClient::connect`);
+        // a second taker would silently record nothing, so say so loudly.
+        let Some(mut server_events) = connection.take_server_events() else {
+            tracing::warn!("the codex connection's server-request stream was already taken");
+            return;
+        };
         let approvals = Arc::downgrade(self);
         let connection = connection.clone();
         let projections = Arc::clone(projections);
         let task = tokio::spawn(async move {
             loop {
-                match inbound.recv().await {
-                    Ok(Inbound::Request { id, method, params }) => {
+                match server_events.recv().await {
+                    Some(ServerEvent::Request { id, method, params }) => {
                         let Some(approvals) = approvals.upgrade() else {
                             return;
                         };
@@ -143,34 +150,17 @@ impl Approvals {
                             .ingest(&connection, &projections, id, method, params)
                             .await;
                     }
-                    Ok(Inbound::Notification { method, params, .. }) if method == RESOLVED => {
+                    Some(ServerEvent::Resolved { params }) => {
                         let Some(approvals) = approvals.upgrade() else {
                             return;
                         };
                         approvals.resolve(&params);
                     }
                     // The socket is gone: no answer can reach the server, so
-                    // every pending request must stop being listed. The
-                    // watcher holds a connection clone, so the broadcast's
-                    // own channel would otherwise outlive the socket.
-                    Ok(Inbound::Closed) => {
-                        if let Some(approvals) = approvals.upgrade() {
-                            approvals.clear();
-                        }
-                        return;
-                    }
-                    // Not this consumer's traffic; the thread dispatcher and
-                    // the status watcher read the same broadcast.
-                    Ok(_) => continue,
-                    // A lagged broadcast may have dropped a request the server
-                    // is waiting on. Nothing can answer it now, so report the
-                    // hole rather than pretending the set is complete.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            "codex approvals fell behind by {skipped} event(s); a server request may be unanswered"
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    // every pending request must stop being listed and no card
+                    // may stay clickable. The watcher holds a connection clone,
+                    // so it is this frame — not the drop — that ends the loop.
+                    Some(ServerEvent::Closed) | None => {
                         if let Some(approvals) = approvals.upgrade() {
                             approvals.clear();
                         }
