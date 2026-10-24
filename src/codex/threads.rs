@@ -229,6 +229,26 @@ impl ThreadSubscription {
         }
     }
 
+    /// Try the next already-queued event without awaiting. `Ok(None)` means the
+    /// queue is empty right now; a lag is the same named error as
+    /// [`Self::next_event`]'s.
+    pub(crate) fn try_next_event(&mut self) -> Result<Option<ThreadEvent>> {
+        match self.events.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => Ok(None),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                Err(CodexError::SubscriptionLagged {
+                    thread_id: self.thread.id.clone(),
+                    skipped,
+                })
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => Err(CodexError::NoResponse(format!(
+                "thread subscription {}",
+                self.thread.id
+            ))),
+        }
+    }
+
     /// Leave the subscription. Returns the server's answer when this was the
     /// last local handle for the thread, or `None` when another handle still
     /// holds it (no `thread/unsubscribe` is sent: the server must keep

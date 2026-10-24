@@ -273,6 +273,8 @@ struct State {
     /// Answer `thread/resume` without a response, so a test can cancel a
     /// pending adopt.
     silent_resume: std::sync::atomic::AtomicBool,
+    /// Fail this many `thread/turns/list` calls before answering normally.
+    fail_turns_pages: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
 }
@@ -297,6 +299,7 @@ impl Default for State {
             turns_params: std::sync::Mutex::new(Vec::new()),
             unsubscribe_calls: AtomicUsize::new(0),
             silent_resume: std::sync::atomic::AtomicBool::new(false),
+            fail_turns_pages: AtomicUsize::new(0),
             page_size: 2,
         }
     }
@@ -569,6 +572,12 @@ impl FakeServer {
             thread.has_history = true;
         }
     }
+
+    /// Fail the next `count` `thread/turns/list` calls with a malformed page,
+    /// so a retry path can be exercised.
+    pub(crate) fn fail_turns_pages(&self, count: usize) {
+        self.state.fail_turns_pages.store(count, Ordering::SeqCst);
+    }
 }
 
 /// Count one accepted connection and serve it on its own task. The accept loop
@@ -724,6 +733,11 @@ where
                 return reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await;
             };
             if thread.malformed_turns_page {
+                return replying(sink, id, json!({ "nextCursor": null, "backwardsCursor": null })).await;
+            }
+            let remaining = state.fail_turns_pages.load(Ordering::SeqCst);
+            if remaining > 0 {
+                state.fail_turns_pages.fetch_sub(1, Ordering::SeqCst);
                 return replying(sink, id, json!({ "nextCursor": null, "backwardsCursor": null })).await;
             }
             let offset = params

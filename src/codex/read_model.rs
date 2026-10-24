@@ -229,14 +229,48 @@ impl ThreadProjection {
         }
         if let Some(items) = turn.get("items").and_then(Value::as_array) {
             for item in items {
-                self.item_completed(ItemCompleted {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: id.to_string(),
-                    item: item.clone(),
-                    completed_at_ms: completed,
-                });
+                if status == "inProgress" {
+                    // Only a completed turn's items are authoritative. An
+                    // in-progress turn's persisted item is the state at the
+                    // resume point; its queued item/started, deltas and
+                    // item/completed still refine it. Seeding it as completed
+                    // would freeze a statusless tool as finished and make the
+                    // later start a no-op.
+                    self.seed_live_item(id, item, started);
+                } else {
+                    self.item_completed(ItemCompleted {
+                        thread_id: self.thread_id.clone(),
+                        turn_id: id.to_string(),
+                        item: item.clone(),
+                        completed_at_ms: completed,
+                    });
+                }
             }
         }
+    }
+
+    /// Seed one item from an in-progress turn. Its content is the persisted
+    /// snapshot (so the first read is useful), but it is not completed and its
+    /// start has not been observed, so the queued lifecycle refines it in place.
+    fn seed_live_item(&mut self, turn_id: &str, item: &Value, started_ms: Option<i64>) {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        if self.index.contains_key(id) {
+            return;
+        }
+        let id = id.to_string();
+        let index = self.items.len();
+        self.items.push(Item {
+            id: id.clone(),
+            turn_id: turn_id.to_string(),
+            kind: ItemKind::from_wire(item),
+            started_at_ms: started_ms,
+            completed_at_ms: None,
+            completed: false,
+            started_seen: false,
+        });
+        self.index.insert(id, index);
     }
 
     /// The neutral read. A pure fold over the cached items: no lock is held
