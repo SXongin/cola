@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
-use crate::bridge::pollers::{CardTarget, resolve_card_target, result_card};
+use crate::bridge::pollers::result_card;
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::turn::Turn;
@@ -110,6 +110,11 @@ impl PendingRequest {
 /// Everything else — the poll sweep, the double-click and claim guards, and
 /// the card-delivery helpers — lives once in the flow engine and the delivery
 /// module.
+///
+/// [`RequestKind::refuse`] runs **before any surface**, the restart readoption
+/// included, so a request this process must not offer is never made
+/// interactive; [`RequestKind::prepare`] then runs only for the requests that
+/// survived that refusal.
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)] // the action context is the trait's whole point
 pub trait RequestKind: Send + Sync {
@@ -134,10 +139,31 @@ pub trait RequestKind: Send + Sync {
         req: &PendingRequest,
     ) -> crate::error::Result<()>;
 
-    /// Runs once per newly-seen request before it becomes a card. Permissions
-    /// answer `/autoaccept` sessions here and return true (no card); questions
-    /// remember the full request (via the flow) for later card rebuilds and
-    /// return false.
+    /// Decide whether this request must be refused **before any surface is
+    /// made**, including the restart re-adoption of a card a previous process
+    /// persisted. A request the card cannot show in full must never become —
+    /// or stay — interactive, because its buttons would approve text the user
+    /// never saw.
+    ///
+    /// `Refused` means the request is settled on the server; the flow then
+    /// withdraws any persisted surface and offers nothing. `Failed` means the
+    /// refusal did not apply: the request stays pending, the flow marks it as
+    /// neither surfaced nor handled, and the next sweep retries — never
+    /// offering a card in the meantime. The default refuses nothing.
+    async fn refuse(
+        &self,
+        _flow: &RequestFlow,
+        _handles: &FlowHandles,
+        _req: &PendingRequest,
+        _dir: &str,
+    ) -> Refusal {
+        Refusal::NotApplicable
+    }
+
+    /// Runs once per newly-seen, not-refused request before it becomes a card.
+    /// Permissions answer `/autoaccept` sessions here and return true (no
+    /// card); questions remember the full request (via the flow) for later card
+    /// rebuilds and return false.
     async fn prepare(
         &self,
         flow: &RequestFlow,
@@ -262,6 +288,19 @@ pub trait RequestKind: Send + Sync {
     ) -> Option<CardActionResult>;
 }
 
+/// What [`RequestKind::refuse`] decided for one listed request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Nothing to refuse: surface the request normally.
+    NotApplicable,
+    /// Refused on the server. The request must not be surfaced, and any
+    /// surface a previous process persisted for it is withdrawn.
+    Refused,
+    /// The refusal could not be applied. The request is still pending, so it
+    /// is retried on the next sweep — unmarked, and never surfaced meanwhile.
+    Failed,
+}
+
 /// The permission kind: `/autoaccept` sessions are answered automatically, and
 /// the card carries a friendly description of what the AI wants to do.
 pub struct PermissionKind;
@@ -296,6 +335,22 @@ impl RequestKind for PermissionKind {
             .await
     }
 
+    async fn refuse(
+        &self,
+        _flow: &RequestFlow,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        dir: &str,
+    ) -> Refusal {
+        let PendingRequest::Permission(p) = req else {
+            return Refusal::NotApplicable;
+        };
+        if p.targets_are_fully_shown() {
+            return Refusal::NotApplicable;
+        }
+        decline_unshowable(handles, p, dir).await
+    }
+
     async fn prepare(
         &self,
         _flow: &RequestFlow,
@@ -310,19 +365,15 @@ impl RequestKind for PermissionKind {
         // `/autoaccept` sessions: answer the request automatically instead of
         // showing a card (mirrors OpenChamber's toggle). Resolves sub-task child
         // sessions up their parent chain so they inherit the parent's flag.
+        //
+        // Auto-Accept is a policy about *showable* requests: `refuse` above has
+        // already declined a target the card cannot show in full, so a session
+        // that opted into approving without a card still never approves text
+        // nobody could review. That is deliberate (whole-branch re-review
+        // #883): the exception is named in the `/autoaccept` help and the user
+        // guide, so the toggle cannot silently cover an unseen target.
         let auto = should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await;
         if !auto {
-            // The card is the decision surface, and its buttons approve what it
-            // shows. A target the card would have to clip must therefore never
-            // be offered: decline it on the server and say why in the chat, so
-            // the turn is freed and the user is never asked to approve a suffix
-            // they cannot see. This lives here, on the neutral kind, rather than
-            // in an adapter, so every client (OpenCode V1/V2, Codex) is covered
-            // by the same proof (whole-branch re-review #883).
-            if !p.targets_are_fully_shown() {
-                decline_unshowable(handles, p, &sid, dir).await;
-                return true;
-            }
             return false;
         }
         match handles
@@ -467,7 +518,11 @@ impl RequestKind for PermissionKind {
                     approved.len()
                 );
             }
-            let mut r = result_card("✅ 已开启自动授权", "blue", "该会话后续权限请求将自动批准。");
+            let mut r = result_card(
+                "✅ 已开启自动授权",
+                "blue",
+                "该会话后续权限请求将自动批准；卡片无法完整显示的仍会拒绝。",
+            );
             r.toast = Some("已开启自动授权".to_string());
             settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
             // Re-served verbatim to a losing double-click.
@@ -638,19 +693,21 @@ pub(crate) async fn set_auto_accept(
     approved
 }
 
-/// Decline a permission whose target the card cannot render in full, then post
-/// the reason.
+/// Decline a permission whose target the card cannot render in full.
 ///
-/// The server answer comes first: the turn is blocked on the decision, and the
-/// notice card is only the explanation. Both the refusal and the copy are
-/// neutral — the card table owns the wording, so no adapter writes UI copy and
-/// every client gets the same behaviour.
+/// Only the server answer happens here: the turn is blocked on it, so it must
+/// land first, and whether the user gets the reason card or their persisted
+/// card is withdrawn is the flow's decision (`withdraw_refused_surface`).
+/// **A failed reply is not a refusal**: it returns [`Refusal::Failed`] so the
+/// flow keeps the request retryable instead of reporting it settled. A request
+/// the server no longer lists (another sweep or client settled it first) is
+/// already refused.
 async fn decline_unshowable(
     handles: &FlowHandles,
     p: &crate::backend::types::PermissionRequest,
-    session_id: &str,
     directory: &str,
-) {
+) -> Refusal {
+    let session_id = p.session_id.clone().unwrap_or_default();
     let budget = p.target_budget();
     let longest = p
         .patterns
@@ -662,47 +719,28 @@ async fn decline_unshowable(
         .backend
         .clone()
         .for_directory(directory)
-        .reply_permission(session_id, &p.request_id, "reject")
+        .reply_permission(&session_id, &p.request_id, "reject")
         .await
     {
-        Ok(()) => tracing::warn!(
-            "declined permission {} on session {}: its target is {longest} characters, past the \
-             card's {budget} character budget",
-            p.request_id,
-            session_id
-        ),
-        Err(e) => tracing::warn!(
-            "declining unshowable permission {} on session {} failed: {e}; the card is still not \
-             offered",
-            p.request_id,
-            session_id
-        ),
-    }
-    let card = crate::feishu::card::question::build_unshowable_permission_card(budget);
-    match resolve_card_target(
-        &handles.sessions,
-        &handles.cards,
-        &handles.backend,
-        &handles.platform,
-        session_id,
-        directory,
-    )
-    .await
-    {
-        Some(CardTarget::ReplyTo(message_id)) => {
-            if let Err(e) = handles.platform.reply_card(&message_id, &card).await {
-                tracing::warn!("unshowable permission notice reply failed: {e}");
-            }
+        Ok(()) => {
+            tracing::warn!(
+                "declined permission {} on session {session_id}: its target is {longest} \
+                 characters, past the card's {budget} character budget",
+                p.request_id
+            );
+            Refusal::Refused
         }
-        Some(CardTarget::Chat(chat_id)) => {
-            if let Err(e) = handles.platform.send_card("chat_id", &chat_id, &card).await {
-                tracing::warn!("unshowable permission notice send failed: {e}");
-            }
+        // Another sweep (or another client) already settled it: there is
+        // nothing left to surface and nothing to retry.
+        Err(crate::error::BridgeError::NotFound(_)) => Refusal::Refused,
+        Err(e) => {
+            tracing::warn!(
+                "declining unshowable permission {} on session {session_id} failed: {e}; it will \
+                 be retried on the next sweep and is never offered in the meantime",
+                p.request_id
+            );
+            Refusal::Failed
         }
-        None => tracing::warn!(
-            "unshowable permission {} on session {session_id}: no reply target for the notice",
-            p.request_id
-        ),
     }
 }
 
@@ -733,6 +771,29 @@ pub(crate) async fn approve_pending_for_session(
         // Match the session itself or a sub-task child (its parent chain).
         let sid = p.session_id.clone().unwrap_or_default();
         if !session_belongs_to(sessions, backend, &sid, session_id, directory).await {
+            continue;
+        }
+        // The completeness proof comes first, like the sweep's `refuse`: a
+        // target the card cannot show in full is **declined**, never
+        // auto-approved unseen — `/autoaccept` is a policy about requests cola
+        // can show (whole-branch re-review #883).
+        if !p.targets_are_fully_shown() {
+            match backend
+                .clone()
+                .for_directory(directory)
+                .reply_permission(&sid, &p.request_id, "reject")
+                .await
+            {
+                Ok(()) => tracing::warn!(
+                    "auto-accept declined unshowable permission {} on session {sid}",
+                    p.request_id
+                ),
+                Err(crate::error::BridgeError::NotFound(_)) => {}
+                Err(e) => tracing::warn!(
+                    "auto-accept declining unshowable permission {} on session {sid} failed: {e}",
+                    p.request_id
+                ),
+            }
             continue;
         }
         // Take the settlement claim BEFORE the reply lands: the request
@@ -778,8 +839,11 @@ pub(crate) async fn approve_pending_for_session(
 /// requests it resolved — naming a command made the line read as "only this
 /// command is now auto-approved". One per toggle, however many pending blocks
 /// it swallowed (the blocks are dismissed without lines of their own). Shared
-/// by the card button and the `/autoaccept on` command.
-pub(crate) const AUTOACCEPT_RECEIPT: &str = "🔄 已开启自动授权：后续权限请求将自动批准";
+/// by the card button and the `/autoaccept on` command. It names the one
+/// exception: a permission whose target the card cannot show in full is
+/// declined, never auto-approved unseen.
+pub(crate) const AUTOACCEPT_RECEIPT: &str =
+    "🔄 已开启自动授权：后续权限请求将自动批准（卡片无法完整显示的仍会拒绝）";
 
 /// The Interaction Receipt for a Session Snapshot's claimed block resolved by
 /// another client (#175, ADR-0038 rule 4): the same neutral line an inline

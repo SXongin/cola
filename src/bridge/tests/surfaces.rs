@@ -739,3 +739,185 @@ async fn sweep_records_pending_sessions_for_liveness() {
         "a complete sweep with no pending request clears the record"
     );
 }
+
+/// The over-budget request an older build could have surfaced: its command is
+/// past the card's display budget, so the current process must decline it
+/// rather than re-adopt the persisted card.
+fn over_budget_perm(request_id: &str, session_id: &str) -> crate::backend::types::PermissionRequest {
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    perm_request(request_id, session_id, &command)
+}
+
+/// The persisted surface an older build left for `over_budget_perm` — the file
+/// is written directly because this build refuses such a request before any
+/// card exists, so it can no longer produce one. `inline` picks the shape: an
+/// inline block on a streaming card, or a standalone request card.
+fn seed_stale_surface(session_file: &std::path::Path, request_id: &str, inline: bool, message_id: &str) {
+    use crate::bridge::snapshot_claims::ClaimKind;
+    use crate::bridge::surfaces::{InlineSurface, StandaloneSurface, Surfaces};
+
+    let surfaces = Surfaces::load(crate::state::StateLayout::beside(
+        session_file,
+        "interactive_surfaces.json",
+    ));
+    if inline {
+        let card = serde_json::json!({
+            "schema": "2.0",
+            "body": { "elements": [
+                { "tag": "markdown", "content": "🔐 **权限请求**\n⚡ **执行 Shell 命令**\n**对象**:\n- `echo …`" },
+                { "tag": "button", "text": { "tag": "plain_text", "content": "✅ 允许一次" }, "value": { "action": "perm", "reply": "once" } },
+            ]}
+        });
+        surfaces.set_card(
+            message_id,
+            &card,
+            &[crate::bridge::card_handles::BlockSpan {
+                request_id: request_id.into(),
+                start: 0,
+                end: 2,
+            }],
+        );
+        surfaces.set_inline(
+            request_id,
+            InlineSurface {
+                client_id: String::new(),
+                message_id: message_id.into(),
+                kind: ClaimKind::Permission,
+                session_id: "ses_1".into(),
+                directory: "/work".into(),
+                target: "per_long".into(),
+            },
+        );
+    } else {
+        surfaces.set_standalone(
+            request_id,
+            StandaloneSurface {
+                client_id: String::new(),
+                kind: ClaimKind::Permission,
+                message_id: message_id.into(),
+                summary: "⚡ **执行 Shell 命令**\n**对象**:\n- `echo …`".into(),
+                directory: "/work".into(),
+                session_id: "ses_1".into(),
+            },
+        );
+    }
+}
+
+/// Whole-branch re-review #883: an over-budget permission whose card an older
+/// build persisted is **declined before readoption**, not re-adopted. The
+/// persisted card is repainted to a non-interactive receipt in the same sweep,
+/// no second card is posted, and the request is settled on the server.
+#[tokio::test]
+async fn restart_declines_an_over_budget_inline_permission_instead_of_readopting_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    // The session mapping a pre-restart process persisted.
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    // The card the older build left for the over-budget request.
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the recovered request is declined, not offered"
+    );
+    let withdrawn = last_update_of(&platform, "om_card")
+        .await
+        .expect("the persisted card is withdrawn in the same sweep");
+    let text = card_text(&withdrawn);
+    assert!(
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT),
+        "the block becomes the refusal receipt: {text}"
+    );
+    assert!(
+        !text.contains("允许一次") && !text.contains("始终允许"),
+        "no control survives on the withdrawn card: {text}"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "no second card may be posted for the request"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_none(),
+        "the block handle is forgotten, so nothing re-adopts it later"
+    );
+    assert!(
+        !persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "the persisted surface is gone"
+    );
+    assert!(
+        !app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "and no standalone record was invented for it"
+    );
+}
+
+/// The standalone half of the same rule: a request card an older build posted
+/// for an over-budget request is repainted as the refusal card, forgotten, and
+/// never clicked.
+#[tokio::test]
+async fn restart_declines_an_over_budget_standalone_permission_instead_of_readopting_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", false, "om_standalone");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the recovered request is declined, not offered"
+    );
+    let withdrawn = last_update_of(&platform, "om_standalone")
+        .await
+        .expect("the persisted standalone card is repainted");
+    let text = card_text(&withdrawn);
+    assert!(
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER),
+        "the card carries the refusal copy: {text}"
+    );
+    assert!(
+        !text.contains("允许一次"),
+        "no control survives on the withdrawn card: {text}"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "no second card may be posted for the request"
+    );
+    assert!(
+        !app.permission.sent_cards.lock().await.contains_key("per_long"),
+        "the standalone record is forgotten"
+    );
+    assert!(
+        !persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "the persisted surface is gone"
+    );
+}

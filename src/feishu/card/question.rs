@@ -217,6 +217,13 @@ pub(crate) fn build_unshowable_permission_card(budget: usize) -> serde_json::Val
     )
 }
 
+/// The receipt line an inline permission block collapses to when cola refused
+/// it before it could be offered — its target is too long for the card to show
+/// in full, so approving it would approve unseen text. Pinned with the refusal
+/// header/note above, so the block, the standalone card and the chat notice
+/// cannot drift.
+pub(crate) const UNSHOWABLE_PERMISSION_RECEIPT: &str = "🚫 已自动拒绝：目标过长，卡片无法完整显示";
+
 /// The header of a standalone card whose request cannot be collected at all.
 pub(crate) const UNCOLLECTABLE_HEADER: &str = "❓ 无法在卡片上作答";
 
