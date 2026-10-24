@@ -68,11 +68,11 @@ pub(crate) struct Projections {
     /// first adoption. Entries are weak, so a thread that is never adopted
     /// again costs no retained lock.
     adopting: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-    /// One apply lock per thread: the subscriber's notification fold and every
-    /// paging resync take it, so a page that was read before an event cannot
-    /// replace the projection after that event was applied. Weak entries for
-    /// the same reason as `adopting`.
-    applying: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// One wake-up per thread: a read that finds a due paging retry signals
+    /// the subscriber, which is the only task allowed to page or apply. Weak
+    /// entries: the subscriber holds the strong handle, and a finished thread
+    /// keeps no signal.
+    resync: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Notify>>>,
     /// The subscriber tasks this cache owns. Aborted when the last client
     /// holding the cache is dropped, so a replaced attachment stops folding
     /// into a cache nothing reads.
@@ -111,8 +111,38 @@ impl Projections {
         shared_lock(&self.adopting, thread_id)
     }
 
-    fn apply_lock(&self, thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        shared_lock(&self.applying, thread_id)
+    fn resync_signal(&self, thread_id: &str) -> Arc<tokio::sync::Notify> {
+        let mut signals = self.resync.lock().expect("codex resync signals");
+        signals.retain(|_, signal| signal.strong_count() > 0);
+        if let Some(signal) = signals.get(thread_id).and_then(std::sync::Weak::upgrade) {
+            return signal;
+        }
+        let signal = Arc::new(tokio::sync::Notify::new());
+        signals.insert(thread_id.to_string(), Arc::downgrade(&signal));
+        signal
+    }
+
+    /// Ask the subscriber to re-page a truncated history. Returns whether a
+    /// request was actually made: only a due `PagingIncomplete` is signalled,
+    /// and the retry deadline is pushed forward so repeated reads coalesce.
+    fn request_resync(&self, thread_id: &str) -> bool {
+        let mut states = self.states.lock().expect("codex subscription states");
+        let due = matches!(
+            states.get(thread_id),
+            Some(SubscriptionState::PagingIncomplete { retry_at }) if Instant::now() >= *retry_at
+        );
+        if !due {
+            return false;
+        }
+        states.insert(
+            thread_id.to_string(),
+            SubscriptionState::PagingIncomplete {
+                retry_at: Instant::now() + PAGING_RETRY,
+            },
+        );
+        drop(states);
+        self.resync_signal(thread_id).notify_one();
+        true
     }
 
     /// Whether this thread's run state has a live subscription AND a paged
@@ -287,36 +317,6 @@ fn shared_lock(
 }
 
 impl CodexClient {
-    /// Retry a failed history page on the live subscription. The subscription
-    /// is not re-adopted: this only pages `thread/turns/list` again.
-    async fn retry_paging(&self, thread_id: &str) -> CodexResult<()> {
-        // The subscriber cannot apply an event while this page is read, so an
-        // event delivered after the page cannot be erased by the resync that
-        // follows it.
-        let apply = self.projections.apply_lock(thread_id);
-        let _guard = apply.lock().await;
-        match self.threads().all_turns(thread_id).await {
-            Ok(turns) => {
-                self.projections.resync(thread_id, &turns);
-                self.projections.set_state(thread_id, SubscriptionState::Live);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    thread = %thread_id,
-                    "could not retry the codex thread history page; staying truncated: {error}"
-                );
-                self.projections.mark_incomplete(thread_id);
-                self.projections.set_state(
-                    thread_id,
-                    SubscriptionState::PagingIncomplete {
-                        retry_at: Instant::now() + PAGING_RETRY,
-                    },
-                );
-            }
-        }
-        Ok(())
-    }
-
     /// The endpoint this connection dialled, for the neutral base-URL read.
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
@@ -328,21 +328,21 @@ impl CodexClient {
     pub(crate) async fn ensure_subscription(&self, thread_id: &str) -> CodexResult<()> {
         match self.projections.state(thread_id) {
             Some(SubscriptionState::Live) => return Ok(()),
-            Some(SubscriptionState::PagingIncomplete { retry_at }) if Instant::now() < retry_at => {
+            Some(SubscriptionState::PagingIncomplete { .. }) => {
+                // A read never pages. It signals the subscriber, which is the
+                // only consumer, so no event can be held across a page.
+                self.projections.request_resync(thread_id);
                 return Ok(());
             }
-            Some(SubscriptionState::PagingIncomplete { .. }) => {}
             None => {}
         }
         let adoption = self.projections.adoption_lock(thread_id);
         let _adopting = adoption.lock().await;
         match self.projections.state(thread_id) {
             Some(SubscriptionState::Live) => return Ok(()),
-            Some(SubscriptionState::PagingIncomplete { retry_at }) if Instant::now() < retry_at => {
-                return Ok(());
-            }
             Some(SubscriptionState::PagingIncomplete { .. }) => {
-                return self.retry_paging(thread_id).await;
+                self.projections.request_resync(thread_id);
+                return Ok(());
             }
             None => {}
         }
@@ -436,6 +436,7 @@ impl CodexClient {
                     subscription,
                     self.threads().clone(),
                     Arc::downgrade(&self.projections),
+                    self.projections.resync_signal(thread_id),
                 ));
                 self.projections.track(task);
                 Ok(())
@@ -458,52 +459,59 @@ async fn consume(
     mut subscription: ThreadSubscription,
     threads: Threads,
     projections: std::sync::Weak<Projections>,
+    signal: Arc<tokio::sync::Notify>,
 ) {
     let thread_id = subscription.thread().id.clone();
     loop {
-        // Hold no strong reference across the await: the cache's `Drop`
-        // aborts this task when the last client is gone, so a replaced
-        // attachment cannot keep folding into an unread cache.
-        let event = subscription.next_event().await;
-        match event {
-            Ok(ThreadEvent::Notification { method, params }) => {
-                let apply = {
+        // The subscriber is the only consumer, so an event is either dequeued
+        // and applied immediately or left queued while this task pages. It can
+        // never be in hand across a page and applied twice.
+        tokio::select! {
+            biased;
+            _ = signal.notified() => {
+                let due = projections.upgrade().is_some_and(|projections| {
+                    matches!(
+                        projections.state(&thread_id),
+                        Some(SubscriptionState::PagingIncomplete { .. })
+                    )
+                });
+                if due {
+                    resync(&threads, &projections, &thread_id).await;
+                }
+            }
+            event = subscription.next_event() => match event {
+                Ok(ThreadEvent::Notification { method, params }) => {
                     let Some(projections) = projections.upgrade() else {
                         return;
                     };
-                    projections.apply_lock(&thread_id)
-                };
-                let _guard = apply.lock().await;
-                let Some(projections) = projections.upgrade() else {
-                    return;
-                };
-                projections.apply(&thread_id, &method, &params);
-            }
-            Ok(ThreadEvent::Lagged { skipped }) => {
-                tracing::warn!(
-                    thread = %thread_id,
-                    skipped,
-                    "the codex push stream dropped events; resyncing the projection from paged turns"
-                );
-                resync(&threads, &projections, &thread_id).await;
-            }
-            Err(CodexError::SubscriptionLagged { skipped, .. }) => {
-                tracing::warn!(
-                    thread = %thread_id,
-                    skipped,
-                    "the codex subscription fell behind; resyncing the projection from paged turns"
-                );
-                resync(&threads, &projections, &thread_id).await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    thread = %thread_id,
-                    "the codex thread subscription ended: {error}"
-                );
-                if let Some(projections) = projections.upgrade() {
-                    projections.forget(&thread_id);
+                    projections.apply(&thread_id, &method, &params);
                 }
-                return;
+                Ok(ThreadEvent::Lagged { skipped }) => {
+                    tracing::warn!(
+                        thread = %thread_id,
+                        skipped,
+                        "the codex push stream dropped events; resyncing the projection from paged turns"
+                    );
+                    resync(&threads, &projections, &thread_id).await;
+                }
+                Err(CodexError::SubscriptionLagged { skipped, .. }) => {
+                    tracing::warn!(
+                        thread = %thread_id,
+                        skipped,
+                        "the codex subscription fell behind; resyncing the projection from paged turns"
+                    );
+                    resync(&threads, &projections, &thread_id).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        thread = %thread_id,
+                        "the codex thread subscription ended: {error}"
+                    );
+                    if let Some(projections) = projections.upgrade() {
+                        projections.forget(&thread_id);
+                    }
+                    return;
+                }
             }
         }
     }
@@ -517,15 +525,6 @@ async fn consume(
 /// each step rather than held across the network await: a replaced attachment
 /// can still drop the cache (and abort this task) while a request is in flight.
 async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, thread_id: &str) {
-    // Hold the apply lock across the page so a notification cannot apply
-    // between the read and the replace. Only the lock is held, never the cache.
-    let apply = {
-        let Some(projections) = projections.upgrade() else {
-            return;
-        };
-        projections.apply_lock(thread_id)
-    };
-    let _guard = apply.lock().await;
     if let Some(projections) = projections.upgrade() {
         projections.mark_incomplete(thread_id);
     }
@@ -538,10 +537,21 @@ async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, t
                 projections.set_state(thread_id, SubscriptionState::Live);
             }
         }
-        Err(error) => tracing::warn!(
-            thread = %thread_id,
-            "could not resync the codex projection from thread/turns/list: {error}"
-        ),
+        Err(error) => {
+            tracing::warn!(
+                thread = %thread_id,
+                "could not resync the codex projection from thread/turns/list: {error}"
+            );
+            if let Some(projections) = projections.upgrade() {
+                projections.mark_incomplete(thread_id);
+                projections.set_state(
+                    thread_id,
+                    SubscriptionState::PagingIncomplete {
+                        retry_at: Instant::now() + PAGING_RETRY,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1374,6 +1384,120 @@ mod tests {
             server.turns_calls() >= 2,
             "the repeat is only detected after a second page"
         );
+    }
+
+    /// The discriminating case: an event the retry page ALSO contains must not
+    /// be applied a second time. The client has "Hello"; the page snapshot is
+    /// "Hello world" and the same " world" delta is delivered while the page is
+    /// in flight, so the final text must be "Hello world", not doubled.
+    #[tokio::test]
+    async fn an_event_already_in_the_page_is_applied_once() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a live thread");
+        thread.turns = vec![json!({
+            "id": "turn-live",
+            "status": "inProgress",
+            "startedAt": 1_700_000_000,
+            "completedAt": null,
+            "error": null,
+            "items": [{ "type": "agentMessage", "id": "item-live", "text": "Hello" }],
+        })];
+        thread.read_turn_limit = Some(1);
+        thread.turns_page_delay_ms = 150;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        server.fail_turns_pages(1);
+
+        let first = client.transcript("thread-1").await.expect("first read");
+        assert!(first.truncated, "the first page failed");
+        let bounded = first
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-live")
+            .map(|message| message.text())
+            .unwrap_or_default();
+        assert_eq!(bounded, "Hello", "the fallback carries the pre-delta text");
+
+        // The page snapshot now includes the delta's effect.
+        server.set_turns(
+            "thread-1",
+            vec![json!({
+                "id": "turn-live",
+                "status": "inProgress",
+                "startedAt": 1_700_000_000,
+                "completedAt": null,
+                "error": null,
+                "items": [{ "type": "agentMessage", "id": "item-live", "text": "Hello world" }],
+            })],
+        );
+        tokio::time::sleep(PAGING_RETRY + Duration::from_millis(20)).await;
+
+        // Trigger the retry and inject the delta while its page reply is
+        // delayed. Under the old ordering the in-hand delta is applied after
+        // the page that already contains it.
+        let retry = tokio::spawn({
+            let client = client.clone();
+            async move { client.transcript("thread-1").await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.turns_calls() < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "no paging retry started");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        server.push_to_thread(
+            "thread-1",
+            "item/agentMessage/delta",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-live",
+                "itemId": "item-live",
+                "delta": " world"
+            }),
+        );
+        retry.await.expect("retry joined").expect("the retry read");
+
+        // A terminal sentinel after the delta proves the delta was folded
+        // before this assertion even though the retry itself is complete.
+        server.push_to_thread(
+            "thread-1",
+            "thread/tokenUsage/updated",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-live",
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 77777,
+                        "inputTokens": 1,
+                        "cachedInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 1,
+                        "reasoningOutputTokens": 0
+                    },
+                    "last": {
+                        "totalTokens": 77777,
+                        "inputTokens": 1,
+                        "cachedInputTokens": 0,
+                        "cacheWriteInputTokens": 0,
+                        "outputTokens": 1,
+                        "reasoningOutputTokens": 0
+                    },
+                    "modelContextWindow": 128000
+                }
+            }),
+        );
+        let transcript = wait_for_tokens(&client, "thread-1", 77_777).await;
+        let text = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-live")
+            .map(|message| message.text())
+            .unwrap_or_default();
+        assert_eq!(
+            text, "Hello world",
+            "an event already contained in the page was applied twice"
+        );
+        assert!(!transcript.truncated, "the retry completed");
     }
 
     /// A paging retry must not erase an event the subscriber applied while the

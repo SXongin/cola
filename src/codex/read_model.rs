@@ -177,13 +177,17 @@ impl ThreadProjection {
     /// (the `Lagged` recovery path). Diff and token-usage facts survive: they
     /// are per-turn notifications that history does not carry.
     pub(crate) fn resync(&mut self, turns: &[Value]) {
-        self.items.clear();
+        let previous: HashMap<String, Item> =
+            self.items.drain(..).map(|item| (item.id.clone(), item)).collect();
         self.index.clear();
         self.turns.clear();
         self.turn_order.clear();
         self.live_turn = None;
         for turn in turns {
             self.seed_turn(turn);
+        }
+        for item in &mut self.items {
+            item.set_pending_from(previous.get(&item.id));
         }
         self.incomplete = false;
     }
@@ -192,8 +196,17 @@ impl ThreadProjection {
     /// [`Self::resync`], this never clears existing items: it runs before the
     /// subscriber's first event on a fresh projection.
     pub(crate) fn seed(&mut self, turns: &[Value]) {
+        let previous: std::collections::HashSet<String> =
+            self.items.iter().map(|item| item.id.clone()).collect();
         for turn in turns {
             self.seed_turn(turn);
+        }
+        // The bounded fallback page is a snapshot too: queued deltas it already
+        // contains must be consumed rather than appended.
+        for item in &mut self.items {
+            if !previous.contains(&item.id) {
+                item.set_pending_from(None);
+            }
         }
     }
 
@@ -269,6 +282,7 @@ impl ThreadProjection {
             completed_at_ms: None,
             completed: false,
             started_seen: false,
+            pending: None,
         });
         self.index.insert(id, index);
     }
@@ -385,6 +399,7 @@ impl ThreadProjection {
             completed_at_ms: None,
             completed: false,
             started_seen: false,
+            pending: None,
         });
         self.index.insert(id.to_string(), index);
         index
@@ -517,6 +532,7 @@ impl ThreadProjection {
                     completed_at_ms: None,
                     completed: false,
                     started_seen: true,
+                    pending: None,
                 };
             } else {
                 // Deltas created this item before its start. The start is
@@ -538,6 +554,7 @@ impl ThreadProjection {
             completed_at_ms: None,
             completed: false,
             started_seen: true,
+            pending: None,
         });
         self.index.insert(id, index);
     }
@@ -566,6 +583,7 @@ impl ThreadProjection {
             completed_at_ms: completed,
             completed: true,
             started_seen: true,
+            pending: None,
         });
         self.index.insert(id, index);
     }
@@ -576,37 +594,27 @@ impl ThreadProjection {
             &delta.turn_id,
             ItemKind::AgentMessage { text: String::new() },
         );
-        if let ItemKind::AgentMessage { text } = &mut self.items[index].kind {
-            text.push_str(&delta.delta);
-        }
+        self.items[index].push_agent_delta(&delta.delta);
     }
 
     fn reasoning_summary_delta(&mut self, delta: Delta) {
         let index = self.item_index(&delta.item_id, &delta.turn_id, ItemKind::reasoning());
-        if let ItemKind::Reasoning { summary, .. } = &mut self.items[index].kind {
-            summary.push_str(&delta.delta);
-        }
+        self.items[index].push_reasoning_summary_delta(&delta.delta);
     }
 
     fn reasoning_text_delta(&mut self, delta: Delta) {
         let index = self.item_index(&delta.item_id, &delta.turn_id, ItemKind::reasoning());
-        if let ItemKind::Reasoning { text, .. } = &mut self.items[index].kind {
-            text.push_str(&delta.delta);
-        }
+        self.items[index].push_reasoning_text_delta(&delta.delta);
     }
 
     fn command_output_delta(&mut self, delta: Delta) {
         let index = self.item_index(&delta.item_id, &delta.turn_id, ItemKind::command());
-        if let ItemKind::Command { output, .. } = &mut self.items[index].kind {
-            output.push_str(&delta.delta);
-        }
+        self.items[index].push_command_output_delta(&delta.delta);
     }
 
     fn file_change_output_delta(&mut self, delta: Delta) {
         let index = self.item_index(&delta.item_id, &delta.turn_id, ItemKind::file_change());
-        if let ItemKind::FileChange { output, .. } = &mut self.items[index].kind {
-            output.push_str(&delta.delta);
-        }
+        self.items[index].push_file_output_delta(&delta.delta);
     }
 
     fn file_change_updated(&mut self, notification: PatchUpdated) {
@@ -622,9 +630,7 @@ impl ThreadProjection {
 
     fn mcp_progress(&mut self, delta: Delta) {
         let index = self.item_index(&delta.item_id, &delta.turn_id, ItemKind::mcp());
-        if let ItemKind::Mcp { output, .. } = &mut self.items[index].kind {
-            output.push_str(&delta.delta);
-        }
+        self.items[index].push_mcp_output_delta(&delta.delta);
     }
 
     fn plan_delta(&mut self, delta: Delta) {
@@ -633,9 +639,55 @@ impl ThreadProjection {
             &delta.turn_id,
             ItemKind::Plan { text: String::new() },
         );
-        if let ItemKind::Plan { text } = &mut self.items[index].kind {
-            text.push_str(&delta.delta);
-        }
+        self.items[index].push_plan_delta(&delta.delta);
+    }
+}
+
+/// Delta text a page snapshot already contains beyond what the client had
+/// applied before the resync. Each field is consumed in order by the queued
+/// delta events, so an event the page already reflects is not applied twice.
+#[derive(Debug, Clone, Default)]
+struct PendingDeltas {
+    agent: String,
+    reasoning_summary: String,
+    reasoning_text: String,
+    command_output: String,
+    file_output: String,
+    mcp_output: String,
+    plan: String,
+}
+
+impl PendingDeltas {
+    fn is_empty(&self) -> bool {
+        self.agent.is_empty()
+            && self.reasoning_summary.is_empty()
+            && self.reasoning_text.is_empty()
+            && self.command_output.is_empty()
+            && self.file_output.is_empty()
+            && self.mcp_output.is_empty()
+            && self.plan.is_empty()
+    }
+
+    fn agent_slot(&mut self) -> &mut String {
+        &mut self.agent
+    }
+    fn reasoning_summary_slot(&mut self) -> &mut String {
+        &mut self.reasoning_summary
+    }
+    fn reasoning_text_slot(&mut self) -> &mut String {
+        &mut self.reasoning_text
+    }
+    fn command_output_slot(&mut self) -> &mut String {
+        &mut self.command_output
+    }
+    fn file_output_slot(&mut self) -> &mut String {
+        &mut self.file_output
+    }
+    fn mcp_output_slot(&mut self) -> &mut String {
+        &mut self.mcp_output
+    }
+    fn plan_slot(&mut self) -> &mut String {
+        &mut self.plan
     }
 }
 
@@ -657,9 +709,140 @@ struct Item {
     /// first start must merge into the accumulated deltas; a *replayed* start
     /// resets the item so replaying the same sequence cannot double its text.
     started_seen: bool,
+    /// Content the page snapshot already contains beyond what the client had
+    /// applied before the resync. Queued delta events that match this suffix
+    /// are consumed without appending, so an event the page already reflects
+    /// is applied exactly once.
+    pending: Option<Box<PendingDeltas>>,
 }
 
 impl Item {
+    /// Record the page's content beyond what the previous projection had
+    /// applied. A delta whose text matches the start of one of these suffixes
+    /// is already in the page and must be consumed instead of appended.
+    fn set_pending_from(&mut self, old: Option<&Item>) {
+        let old_agent = old.map_or("", old_agent_text);
+        let old_summary = old.map_or("", old_reasoning_summary);
+        let old_reasoning = old.map_or("", old_reasoning_text);
+        let old_command = old.map_or("", old_command_output);
+        let old_file = old.map_or("", old_file_output);
+        let old_mcp = old.map_or("", old_mcp_output);
+        let old_plan = old.map_or("", old_plan_text);
+        let mut pending = PendingDeltas::default();
+        match &mut self.kind {
+            ItemKind::AgentMessage { text } => {
+                pending.agent = text_suffix(text, old_agent);
+            }
+            ItemKind::Reasoning { summary, text } => {
+                pending.reasoning_summary = text_suffix(summary, old_summary);
+                pending.reasoning_text = text_suffix(text, old_reasoning);
+            }
+            ItemKind::Command { output, .. } => {
+                pending.command_output = text_suffix(output, old_command);
+            }
+            ItemKind::FileChange { output, .. } => {
+                pending.file_output = text_suffix(output, old_file);
+            }
+            ItemKind::Mcp { output, .. } => {
+                pending.mcp_output = text_suffix(output, old_mcp);
+            }
+            ItemKind::Plan { text } => {
+                pending.plan = text_suffix(text, old_plan);
+            }
+            _ => {}
+        }
+        if !pending.is_empty() {
+            self.pending = Some(Box::new(pending));
+        }
+    }
+
+    /// Consume `delta` from one pending suffix, returning whether the page
+    /// already contained it. A mismatch means the queued delta is new content;
+    /// the page suffix it did not match is dropped (it is already in the text).
+    fn consume_pending(&mut self, field: fn(&mut PendingDeltas) -> &mut String, delta: &str) -> bool {
+        let Some(pending) = self.pending.as_mut() else {
+            return false;
+        };
+        let slot = field(pending);
+        if slot.is_empty() {
+            return false;
+        }
+        let matched = slot.starts_with(delta);
+        if matched {
+            slot.drain(..delta.len());
+        } else {
+            slot.clear();
+        }
+        let empty = pending.is_empty();
+        if empty {
+            self.pending = None;
+        }
+        matched
+    }
+
+    fn push_agent_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::agent_slot, delta) {
+            return;
+        }
+        if let ItemKind::AgentMessage { text } = &mut self.kind {
+            text.push_str(delta);
+        }
+    }
+
+    fn push_reasoning_summary_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::reasoning_summary_slot, delta) {
+            return;
+        }
+        if let ItemKind::Reasoning { summary, .. } = &mut self.kind {
+            summary.push_str(delta);
+        }
+    }
+
+    fn push_reasoning_text_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::reasoning_text_slot, delta) {
+            return;
+        }
+        if let ItemKind::Reasoning { text, .. } = &mut self.kind {
+            text.push_str(delta);
+        }
+    }
+
+    fn push_command_output_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::command_output_slot, delta) {
+            return;
+        }
+        if let ItemKind::Command { output, .. } = &mut self.kind {
+            output.push_str(delta);
+        }
+    }
+
+    fn push_file_output_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::file_output_slot, delta) {
+            return;
+        }
+        if let ItemKind::FileChange { output, .. } = &mut self.kind {
+            output.push_str(delta);
+        }
+    }
+
+    fn push_mcp_output_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::mcp_output_slot, delta) {
+            return;
+        }
+        if let ItemKind::Mcp { output, .. } = &mut self.kind {
+            output.push_str(delta);
+        }
+    }
+
+    fn push_plan_delta(&mut self, delta: &str) {
+        if self.consume_pending(PendingDeltas::plan_slot, delta) {
+            return;
+        }
+        if let ItemKind::Plan { text } = &mut self.kind {
+            text.push_str(delta);
+        }
+    }
+
     fn is_assistant(&self) -> bool {
         !matches!(self.kind, ItemKind::UserMessage { .. })
     }
@@ -892,6 +1075,7 @@ impl Item {
         self.completed_at_ms = completed_at_ms.or(self.completed_at_ms);
         self.completed = true;
         self.started_seen = true;
+        self.pending = None;
         self.kind.apply_completed(item);
     }
 }
@@ -1321,6 +1505,63 @@ fn decode_changes(value: &Value) -> Vec<FileUpdate> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn text_suffix(new: &str, old: &str) -> String {
+    if !old.is_empty() && new.starts_with(old) {
+        new[old.len()..].to_string()
+    } else {
+        new.to_string()
+    }
+}
+
+fn old_agent_text(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::AgentMessage { text } => text,
+        _ => "",
+    }
+}
+
+fn old_reasoning_summary(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::Reasoning { summary, .. } => summary,
+        _ => "",
+    }
+}
+
+fn old_reasoning_text(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::Reasoning { text, .. } => text,
+        _ => "",
+    }
+}
+
+fn old_command_output(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::Command { output, .. } => output,
+        _ => "",
+    }
+}
+
+fn old_file_output(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::FileChange { output, .. } => output,
+        _ => "",
+    }
+}
+
+fn old_mcp_output(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::Mcp { output, .. } => output,
+        _ => "",
+    }
+}
+
+fn old_plan_text(item: &Item) -> &str {
+    match &item.kind {
+        ItemKind::Plan { text } => text,
+        _ => "",
+    }
 }
 
 fn string_array(value: Option<&Value>) -> String {
