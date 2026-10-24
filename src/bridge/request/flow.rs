@@ -64,6 +64,12 @@ pub struct RequestFlow {
     /// hung call cannot freeze the poller forever. Defaults to 30 s; tests
     /// store a small value so the timeout branch runs without sleeping.
     pub list_timeout_ms: std::sync::atomic::AtomicU64,
+    /// How long (milliseconds) one withdrawal card PATCH may take before the
+    /// sweep gives up on it and retries next tick. Bounds a hung Feishu PATCH
+    /// so it cannot wedge the permission poller (and leave an old Allow card
+    /// clickable behind a stalled sweep). Defaults to 5 s; tests store a small
+    /// value.
+    pub withdrawal_timeout_ms: std::sync::atomic::AtomicU64,
     /// request_id → the card cola sent (used to mark a card stale when the
     /// request is resolved by ANOTHER client).
     pub sent_cards: Arc<Mutex<HashMap<String, SentCard>>>,
@@ -214,6 +220,21 @@ enum Withdrawal {
     Retrying,
 }
 
+/// The budget for one withdrawal card PATCH. A hung Feishu call must not wedge
+/// the permission sweep — the retry map exists precisely to finish a
+/// neutralization later, so a timeout is a retry, not a failure to record.
+const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
+
+/// How many decided-but-undelivered withdrawals one flow retains.
+///
+/// Each entry carries its rendered replacement card, so an unbounded map would
+/// retain payloads for as long as a card can stay unpatched (e.g. a permanently
+/// refused PATCH). A backlog this size is already pathological; past it the new
+/// entry is dropped rather than retained, and the vanished-surface pass still
+/// neutralizes the card with its neutral receipt (only the precise copy is
+/// lost).
+const MAX_PENDING_WITHDRAWALS: usize = 32;
+
 impl RequestFlow {
     pub fn new(kind: Box<dyn RequestKind>, surfaces: Arc<Surfaces>) -> Self {
         // Hydrate this kind's half of the persisted record: the standalone
@@ -254,6 +275,7 @@ impl RequestFlow {
             kind,
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
+            withdrawal_timeout_ms: std::sync::atomic::AtomicU64::new(WITHDRAWAL_PATCH_TIMEOUT_MS),
             sent_cards: Arc::new(Mutex::new(sent_cards)),
             listed_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             question_state: Arc::new(Mutex::new(HashMap::new())),
@@ -1421,11 +1443,20 @@ impl RequestFlow {
         if outcome == WithdrawalOutcome::Failed {
             // The handle/record are still there (apply only mutates after a
             // landed PATCH), so both the listed path and the sweep-level retry
-            // can deliver this later.
-            self.pending_withdrawals
-                .lock()
-                .await
-                .insert(req.id().to_string(), withdrawal);
+            // can deliver this later. The map is bounded: past the cap the new
+            // entry is dropped rather than retaining its card forever, and the
+            // vanished-surface pass still neutralizes the card with its neutral
+            // receipt.
+            let mut pending = self.pending_withdrawals.lock().await;
+            if pending.contains_key(req.id()) || pending.len() < MAX_PENDING_WITHDRAWALS {
+                pending.insert(req.id().to_string(), withdrawal);
+            } else {
+                tracing::error!(
+                    "withdrawal backlog is full ({MAX_PENDING_WITHDRAWALS}); not retaining {} — \
+                     the vanished-surface pass will still neutralize its card",
+                    req.id()
+                );
+            }
         }
         outcome
     }
@@ -1445,6 +1476,9 @@ impl RequestFlow {
     ) -> WithdrawalOutcome {
         let mut attempted = false;
         let mut failed = false;
+        let timeout_ms = self
+            .withdrawal_timeout_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         // Inline: preview the block's replacement on the cached card, PATCH,
         // then commit the edit and drop the handle.
         let inline = {
@@ -1460,22 +1494,51 @@ impl RequestFlow {
         };
         if let Some((message_id, card)) = inline {
             attempted = true;
-            match handles.platform.update_message(&message_id, &card).await {
-                Ok(()) => {
+            let patched = crate::bridge::bounded_call(
+                &format!("withdraw {} block on {}", id, message_id),
+                timeout_ms,
+                handles.platform.update_message(&message_id, &card),
+            )
+            .await;
+            match patched {
+                Some(Ok(())) => {
                     let mut registry = handles.cards.card_handles.lock().await;
                     registry.resolve_on(&message_id, id, &withdrawal.receipt);
                     registry.forget(id);
                     tracing::info!("withdrew {} inline block on {}", id, message_id);
                 }
-                Err(e) => {
-                    failed = true;
-                    tracing::warn!(
-                        "withdrawing {} inline block on {} failed: {}; the handle is kept so the \
-                         withdrawal can be retried",
+                Some(Err(e)) if e.is_message_gone() => {
+                    // The message no longer exists: nothing is clickable, so
+                    // the handle — and the dead card's cached JSON — have
+                    // nothing left to neutralize.
+                    let mut registry = handles.cards.card_handles.lock().await;
+                    registry.forget(id);
+                    registry.release_cache(&message_id);
+                    tracing::info!(
+                        "withdrew {} inline block: message {} is gone ({})",
                         id,
                         message_id,
                         e
                     );
+                }
+                other => {
+                    failed = true;
+                    match other {
+                        Some(Err(e)) => tracing::warn!(
+                            "withdrawing {} inline block on {} failed: {}; the handle is kept so \
+                             the withdrawal can be retried",
+                            id,
+                            message_id,
+                            e
+                        ),
+                        _ => tracing::warn!(
+                            "withdrawing {} inline block on {} timed out after {}ms; the handle is \
+                             kept so the withdrawal can be retried",
+                            id,
+                            message_id,
+                            timeout_ms
+                        ),
+                    }
                 }
             }
         } else {
@@ -1490,25 +1553,48 @@ impl RequestFlow {
         let standalone = self.sent_cards.lock().await.get(id).cloned();
         if let Some(sent) = standalone {
             attempted = true;
-            match handles
-                .platform
-                .update_message(&sent.message_id, &withdrawal.card)
-                .await
-            {
-                Ok(()) => {
+            let patched = crate::bridge::bounded_call(
+                &format!("withdraw {} card on {}", id, sent.message_id),
+                timeout_ms,
+                handles
+                    .platform
+                    .update_message(&sent.message_id, &withdrawal.card),
+            )
+            .await;
+            match patched {
+                Some(Ok(())) => {
                     self.sent_cards.lock().await.remove(id);
                     self.surfaces.remove_standalone(id);
                     tracing::info!("withdrew {} standalone card on {}", id, sent.message_id);
                 }
-                Err(e) => {
-                    failed = true;
-                    tracing::warn!(
-                        "withdrawing {} standalone card on {} failed: {}; the record is kept so \
-                         the withdrawal can be retried",
+                Some(Err(e)) if e.is_message_gone() => {
+                    self.sent_cards.lock().await.remove(id);
+                    self.surfaces.remove_standalone(id);
+                    tracing::info!(
+                        "withdrew {} standalone card: message {} is gone ({})",
                         id,
                         sent.message_id,
                         e
                     );
+                }
+                other => {
+                    failed = true;
+                    match other {
+                        Some(Err(e)) => tracing::warn!(
+                            "withdrawing {} standalone card on {} failed: {}; the record is kept \
+                             so the withdrawal can be retried",
+                            id,
+                            sent.message_id,
+                            e
+                        ),
+                        _ => tracing::warn!(
+                            "withdrawing {} standalone card on {} timed out after {}ms; the record \
+                             is kept so the withdrawal can be retried",
+                            id,
+                            sent.message_id,
+                            timeout_ms
+                        ),
+                    }
                 }
             }
         }
@@ -1519,6 +1605,12 @@ impl RequestFlow {
         } else {
             WithdrawalOutcome::None
         }
+    }
+
+    /// Test-only: how many decided-but-undelivered withdrawals are retained.
+    #[cfg(test)]
+    pub(crate) async fn pending_withdrawal_count(&self) -> usize {
+        self.pending_withdrawals.lock().await.len()
     }
 
     /// Retry every decided-but-undelivered withdrawal. The request may already

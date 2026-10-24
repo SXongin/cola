@@ -90,6 +90,29 @@ impl BridgeError {
         }
     }
 
+    /// True when a failed card/message write means the addressed **message is
+    /// gone** (deleted, or the platform reports code `230002`): nothing can be
+    /// clicked on a message that no longer exists, so a caller neutralizing it
+    /// may stop instead of retrying forever.
+    ///
+    /// Feishu reports this inside a 2xx body as an API code
+    /// ([`BridgeError::Feishu`]'s `update error 230002: message not found`), not
+    /// as an HTTP status — hence the display-text check. A 404 or
+    /// [`BridgeError::NotFound`] is the same fact from a different transport.
+    pub(crate) fn is_message_gone(&self) -> bool {
+        match self {
+            BridgeError::NotFound(_) => true,
+            BridgeError::FeishuHttp { status, .. } => *status == 404,
+            BridgeError::Feishu(detail) => {
+                let detail = detail.to_ascii_lowercase();
+                detail.contains("230002")
+                    || detail.contains("message not found")
+                    || detail.contains("消息不存在")
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a failed card write may succeed on a retry (ADR-0067): transport
     /// errors, timeouts, 5xx, 429 and 408 are recoverable; a content rejection
     /// or any other refusal is permanent. `Feishu(String)` covers API-level
