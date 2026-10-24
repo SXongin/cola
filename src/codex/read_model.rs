@@ -557,8 +557,13 @@ impl ThreadProjection {
         }
         if self.live_turn.as_deref() == Some(turn_id.as_str()) {
             self.live_turn = None;
+            self.status = Some(ThreadStatus::Idle);
+        } else if self.live_turn.is_none() {
+            // The error names a turn this projection never saw start: the
+            // thread is still idle, unless another turn is live (then its own
+            // status stands).
+            self.status = Some(ThreadStatus::Idle);
         }
-        self.status = Some(ThreadStatus::Idle);
     }
 
     fn turn_diff(&mut self, notification: TurnDiffUpdated) {
