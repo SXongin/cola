@@ -310,6 +310,21 @@ struct State {
     model_page_size: AtomicUsize,
     /// The skills `skills/list` advertises.
     skills: std::sync::Mutex<Vec<Value>>,
+    /// One-shot: answer the next `turn/start` with this JSON-RPC error.
+    reject_turn_start: std::sync::Mutex<Option<String>>,
+    /// One-shot: accept the next `turn/start` (persist and emit its stream) but
+    /// close the connection without answering — an accepted request whose
+    /// response was lost.
+    drop_on_turn_start: std::sync::atomic::AtomicBool,
+    /// One-shot: answer the next `thread/compact/start` with a JSON-RPC error.
+    reject_compact: std::sync::atomic::AtomicBool,
+    /// One-shot: accept the next `thread/compact/start` (persist and emit the
+    /// item) but close the connection without answering.
+    drop_on_compact: std::sync::atomic::AtomicBool,
+    /// How many `thread/read` calls still hide a thread's in-progress turns, so
+    /// a `/stop` can be exercised in the window before the server persists the
+    /// turn.
+    hide_live_turns: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// `model/list` calls received, so a paged catalog is proved by its pages.
     model_list_calls: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
@@ -350,6 +365,11 @@ impl Default for State {
             models: std::sync::Mutex::new(Vec::new()),
             model_page_size: AtomicUsize::new(50),
             skills: std::sync::Mutex::new(Vec::new()),
+            reject_turn_start: std::sync::Mutex::new(None),
+            drop_on_turn_start: std::sync::atomic::AtomicBool::new(false),
+            reject_compact: std::sync::atomic::AtomicBool::new(false),
+            drop_on_compact: std::sync::atomic::AtomicBool::new(false),
+            hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             model_list_calls: AtomicUsize::new(0),
             page_size: 2,
         }
@@ -734,6 +754,40 @@ impl FakeServer {
         self.state.model_list_calls.load(Ordering::SeqCst)
     }
 
+    /// Answer the next `turn/start` with `message` as a JSON-RPC error: a
+    /// definite refusal.
+    pub(crate) fn reject_next_turn_start(&self, message: &str) {
+        *self.state.reject_turn_start.lock().expect("reject turn start") = Some(message.to_string());
+    }
+
+    /// Accept the next `turn/start` (persisting and emitting its stream) but
+    /// close the connection without answering: the request landed, its response
+    /// was lost.
+    pub(crate) fn drop_next_turn_start_response(&self) {
+        self.state.drop_on_turn_start.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer the next `thread/compact/start` with a JSON-RPC error.
+    pub(crate) fn reject_next_compact(&self) {
+        self.state.reject_compact.store(true, Ordering::SeqCst);
+    }
+
+    /// Accept the next `thread/compact/start` (persisting and emitting the
+    /// compaction item) but close the connection without answering.
+    pub(crate) fn drop_next_compact_response(&self) {
+        self.state.drop_on_compact.store(true, Ordering::SeqCst);
+    }
+
+    /// Hide a thread's in-progress turns from the next `reads` `thread/read`
+    /// answers, modelling `/stop` landing before the server persisted the turn.
+    pub(crate) fn hide_live_turn_for(&self, thread_id: &str, reads: usize) {
+        self.state
+            .hide_live_turns
+            .lock()
+            .expect("hidden live turns")
+            .insert(thread_id.to_string(), reads);
+    }
+
     /// The skills `skills/list` serves.
     pub(crate) fn set_skills(&self, skills: Vec<Value>) {
         *self.state.skills.lock().expect("skills") = skills;
@@ -876,8 +930,27 @@ where
         }
         Some("thread/read") => {
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            let hide_live = {
+                let mut hidden = state.hide_live_turns.lock().expect("hidden live turns");
+                match hidden.get_mut(thread_id) {
+                    Some(remaining) if *remaining > 0 => {
+                        *remaining -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            };
             match find_thread(state, thread_id) {
-                Some(thread) => replying(sink, id, json!({ "thread": thread_json(&thread) })).await,
+                Some(mut thread) => {
+                    if hide_live {
+                        for turn in &mut thread.turns {
+                            if turn.get("status").and_then(Value::as_str) == Some("inProgress") {
+                                turn["status"] = json!("completed");
+                            }
+                        }
+                    }
+                    replying(sink, id, json!({ "thread": thread_json(&thread) })).await
+                }
                 None => reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await,
             }
         }
@@ -955,6 +1028,11 @@ where
                 .entry(thread_id.to_string())
                 .or_default()
                 .push(params.clone());
+            let rejected = state.reject_turn_start.lock().expect("reject turn start").take();
+            if let Some(message) = rejected {
+                return reply_error(sink, id, -32000, &message).await;
+            }
+            let drop_response = state.drop_on_turn_start.swap(false, Ordering::SeqCst);
             let echo = state
                 .echo_prompts
                 .lock()
@@ -969,19 +1047,20 @@ where
                 .get(thread_id)
                 .cloned();
             if let Some(live) = folded {
-                if !reply(
-                    sink,
-                    id,
-                    json!({ "turn": { "id": live, "status": "inProgress" } }),
-                )
-                .await
+                if !drop_response
+                    && !reply(
+                        sink,
+                        id,
+                        json!({ "turn": { "id": live, "status": "inProgress" } }),
+                    )
+                    .await
                 {
                     return false;
                 }
                 if echo {
                     emit_user_message(state, thread_id, &live, &params, false);
                 }
-                return true;
+                return !drop_response;
             }
             let turn_id = format!("turn-{}", state.next_turn.fetch_add(1, Ordering::SeqCst));
             state
@@ -993,7 +1072,7 @@ where
             let result = json!({
                 "turn": { "id": turn_id, "status": "inProgress", "startedAt": started_at, "items": [] }
             });
-            if !reply(sink, id, result).await {
+            if !drop_response && !reply(sink, id, result).await {
                 return false;
             }
             emit(
@@ -1023,7 +1102,7 @@ where
                     state.live_turns.lock().expect("live turns").remove(thread_id);
                 }
             }
-            true
+            !drop_response
         }
         Some("turn/steer") => {
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
@@ -1097,7 +1176,11 @@ where
                 .lock()
                 .expect("compact params")
                 .push(params.clone());
-            if !reply(sink, id, json!({})).await {
+            if state.reject_compact.swap(false, Ordering::SeqCst) {
+                return reply_error(sink, id, -32000, "compaction refused").await;
+            }
+            let drop_response = state.drop_on_compact.swap(false, Ordering::SeqCst);
+            if !drop_response && !reply(sink, id, json!({})).await {
                 return false;
             }
             // Codex reports the compaction as a `contextCompaction` item inside
@@ -1154,7 +1237,7 @@ where
                     }),
                 );
             }
-            true
+            !drop_response
         }
         Some("model/list") => {
             state.model_list_calls.fetch_add(1, Ordering::SeqCst);
