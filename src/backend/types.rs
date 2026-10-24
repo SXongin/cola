@@ -516,6 +516,48 @@ impl SessionStatus {
 /// the card renderer and every adapter that can raise an approval share it.
 pub const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
 
+/// The character budget for one rendered **command** target.
+///
+/// A command approval's target is the command itself, not a short path, so the
+/// pattern budget above would truncate ordinary invocations (`cargo test
+/// --workspace --all-targets` is already over half of it) — and a target the
+/// card clips is a target the user approves without seeing. The budget is
+/// therefore larger, and still small enough that the card's own limits hold:
+/// the permission body is rendered once and copied into every button's
+/// callback value, so it appears six times in the card's JSON (one markdown
+/// element plus five buttons); 1,000 characters of the worst case (CJK, three
+/// bytes each) is 18 KB of a 25 KB body budget. See
+/// `permission_target_budget` for the one place that maps an action to it, and
+/// the card tests that pin the rendered card inside
+/// [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
+///
+/// An adapter that cannot show a command within it must **refuse** the request
+/// by name rather than offer a card that hides part of what it approves.
+pub const PERMISSION_COMMAND_MAX_CHARS: usize = 1000;
+
+/// Whether `action` names a shell command, i.e. a target whose text IS the
+/// decision rather than a short path or grant name. The spellings are the
+/// neutral surface's own: both OpenCode generations' shell tool and Codex's
+/// `command` approval.
+pub fn is_command_action(action: &str) -> bool {
+    matches!(action, "bash" | "shell" | "command")
+}
+
+/// The character budget for one rendered target of `action`: the command budget
+/// where the target is a command ([`is_command_action`]), the pattern budget
+/// everywhere else.
+///
+/// One definition, shared by the renderer (which clips) and by an adapter's
+/// completeness proof (which refuses what the renderer would clip), so the two
+/// can never disagree about what "shown in full" means.
+pub fn permission_target_budget(action: &str) -> usize {
+    if is_command_action(action) {
+        PERMISSION_COMMAND_MAX_CHARS
+    } else {
+        PERMISSION_PATTERN_MAX_CHARS
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PermissionRequest {
     #[serde(rename = "id")]

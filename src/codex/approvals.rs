@@ -60,6 +60,7 @@ use crate::backend::PERMISSION_PATTERN_MAX_CHARS;
 use crate::backend::types::{
     FormAnswer, FormFieldKind, FormValue, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
 };
+use crate::backend::{is_command_action, permission_target_budget};
 use crate::error::{BridgeError, Result};
 
 use super::backend::Projections;
@@ -437,74 +438,81 @@ fn decode_request(
     params: &Value,
     projections: &Projections,
 ) -> std::result::Result<Decoded, Decode> {
-    match method {
+    let decoded = match method {
         "item/commandExecution/requestApproval" => {
             let approval: CommandApproval = decode(method, params)?;
-            Ok(Decoded {
+            Decoded {
                 directory: approval.cwd.clone(),
                 permission: Some(permission_from_command(&approval)),
                 question: None,
-            })
+            }
         }
         "execCommandApproval" => {
             let approval: ExecCommandApproval = decode(method, params)?;
-            Ok(Decoded {
+            Decoded {
                 directory: Some(approval.cwd.clone()),
                 permission: Some(permission_from_exec(&approval)),
                 question: None,
-            })
+            }
         }
         "item/fileChange/requestApproval" => {
             let approval: FileChangeApproval = decode(method, params)?;
             let directory = projections.cwd(&approval.thread_id);
-            Ok(Decoded {
+            Decoded {
                 directory,
                 permission: Some(permission_from_file_change(&approval)),
                 question: None,
-            })
+            }
         }
         "applyPatchApproval" => {
             let approval: PatchApproval = decode(method, params)?;
             let directory = projections.cwd(&approval.conversation_id);
-            Ok(Decoded {
+            Decoded {
                 directory,
                 permission: Some(permission_from_patch(&approval)),
                 question: None,
-            })
+            }
         }
         "item/permissions/requestApproval" => {
             let approval: PermissionsApproval = decode(method, params)?;
             // Approving echoes the profile; a field the card cannot show must
             // not be granted behind the user's back.
             expressible_permission_profile(&approval.permissions)?;
-            Ok(Decoded {
+            Decoded {
                 directory: Some(approval.cwd.clone()),
                 permission: Some(permission_from_permissions(&approval)),
                 question: None,
-            })
+            }
         }
         "item/tool/requestUserInput" => {
             let input: ToolInput = decode(method, params)?;
             let directory = projections.cwd(&input.thread_id);
-            Ok(Decoded {
+            Decoded {
                 directory,
                 permission: None,
                 question: Some(question_from_tool_input(&input)?),
-            })
+            }
         }
         "mcpServer/elicitation/request" => {
             let elicitation: Elicitation = decode(method, params)?;
             let question = question_from_elicitation(&elicitation)
                 .ok_or(Decode::CannotExpress("only form-mode elicitations have a card"))?;
             let directory = projections.cwd(&elicitation.thread_id);
-            Ok(Decoded {
+            Decoded {
                 directory,
                 permission: None,
                 question: Some(question),
-            })
+            }
         }
-        _ => Err(Decode::Unsupported),
+        _ => return Err(Decode::Unsupported),
+    };
+    // Every target the card offers to approve must be one it can render in
+    // full: an approval is a decision about the text on the card, so a target
+    // past its budget is declined by name instead of shown clipped.
+    if let Some(permission) = &decoded.permission {
+        expressible_targets(permission)?;
     }
+    Ok(decoded)
 }
 
 fn decode<T: serde::de::DeserializeOwned>(method: &str, params: &Value) -> std::result::Result<T, Decode> {
@@ -830,10 +838,37 @@ const PROFILE_UNEXPRESSIBLE: &str = "the requested permission profile has a gran
 /// A requested path/glob whose rendered form would be truncated by the card.
 const PROFILE_TOO_LONG: &str = "a requested permission path is longer than the card can show";
 
+/// A requested command whose rendered form would be truncated by the card.
+/// The user approves the command text, so a clip here is a decision they did
+/// not make.
+const COMMAND_TOO_LONG: &str = "a requested command is longer than the card can show in full";
+
 /// Whether the card renders this pattern in full (the renderer clips at
 /// [`PERMISSION_PATTERN_MAX_CHARS`] characters).
 fn pattern_fits(rendered: &str) -> bool {
     rendered.chars().count() <= PERMISSION_PATTERN_MAX_CHARS
+}
+
+/// Every target this permission asks for must be one the card shows **in
+/// full** — the same budget the renderer clips at
+/// ([`permission_target_budget`]), so a target past it would be approved
+/// unseen. Such a request is declined by name rather than offered with its
+/// text clipped (whole-branch review #883).
+fn expressible_targets(permission: &PermissionRequest) -> std::result::Result<(), Decode> {
+    let action = permission.permission.as_deref().unwrap_or_default();
+    let budget = permission_target_budget(action);
+    if permission
+        .patterns
+        .iter()
+        .any(|pattern| pattern.chars().count() > budget)
+    {
+        return Err(Decode::CannotExpress(if is_command_action(action) {
+            COMMAND_TOO_LONG
+        } else {
+            PROFILE_TOO_LONG
+        }));
+    }
+    Ok(())
 }
 
 /// Whether the card can render every part of a requested permission profile.
@@ -1376,6 +1411,73 @@ mod tests {
                 .and_then(Value::as_str),
             Some("needs network")
         );
+    }
+
+    /// Whole-branch review #883: a command target is rendered at the neutral
+    /// command budget — in full — and a longer one is refused by name instead
+    /// of being offered with its text clipped. The click must approve exactly
+    /// what the card showed.
+    #[test]
+    fn a_command_past_the_display_budget_is_refused_rather_than_clipped() {
+        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+        let at_budget = "a".repeat(budget);
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": at_budget.clone(),
+            "cwd": "/work/cola",
+        });
+        let Decoded { permission, .. } = decode_request(
+            "item/commandExecution/requestApproval",
+            &params,
+            &Projections::default(),
+        )
+        .expect("a command at the budget decodes");
+        let permission = permission.expect("a permission");
+        let rendered = crate::bridge::request::kind::describe_permission(&permission);
+        assert!(
+            rendered.contains(&at_budget),
+            "the whole command is on the card, not a prefix"
+        );
+
+        let mut too_long = at_budget;
+        too_long.push('a');
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": too_long,
+            "cwd": "/work/cola",
+        });
+        let error = decode_request(
+            "item/commandExecution/requestApproval",
+            &params,
+            &Projections::default(),
+        )
+        .err()
+        .expect("a command past the budget is refused, not clipped");
+        assert!(
+            matches!(error, Decode::CannotExpress(COMMAND_TOO_LONG)),
+            "the refusal names the card's limit"
+        );
+    }
+
+    /// The legacy approval family gets the same proof: its target is the joined
+    /// argv, so a long invocation is refused exactly like the modern one.
+    #[test]
+    fn a_legacy_command_past_the_display_budget_is_refused() {
+        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+        let params = json!({
+            "conversationId": "thread-1",
+            "callId": "call-1",
+            "command": ["a".repeat(budget), "b".to_string()],
+            "cwd": "/work/cola",
+        });
+        let error = decode_request("execCommandApproval", &params, &Projections::default())
+            .err()
+            .expect("the joined command is past the budget");
+        assert!(matches!(error, Decode::CannotExpress(COMMAND_TOO_LONG)));
     }
 
     #[test]

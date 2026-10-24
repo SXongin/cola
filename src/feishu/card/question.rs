@@ -88,6 +88,57 @@ pub fn build_permission_card(
     card_shell("🔐 权限请求", "orange", elements)
 }
 
+/// How many body elements one permission block adds: its description element
+/// plus every element [`permission_buttons`] renders (the scope note when the
+/// session decision is advertised, then the buttons).
+///
+/// The streaming card's split estimate charges this beside the build, so a
+/// near-budget card reserves room for the block instead of appending it past
+/// Feishu's limit.
+pub(crate) fn permission_block_components(always_supported: bool) -> usize {
+    1 + permission_button_count(always_supported)
+}
+
+/// How many elements [`permission_buttons`] renders: `once`, `always` (only
+/// when advertised), `reject` and `autoaccept`, plus the scope note.
+fn permission_button_count(always_supported: bool) -> usize {
+    3 + 2 * usize::from(always_supported)
+}
+
+/// The serialized-JSON size estimate of one permission block.
+///
+/// Every button echoes the body in its `perm_body` callback value, so the body
+/// appears once as the block's element and once per button — the multiplier
+/// that makes a long command expensive even though it is shown only once.
+/// [`json_string_bytes`] charges JSON escaping, so the estimate is a real upper
+/// bound on the block rather than a character count.
+pub(crate) fn permission_block_estimate(body: &str, always_supported: bool) -> usize {
+    // A button's own labels, action, ids, directory and colour. CJK labels
+    // cost three bytes a character, which is why this is generous.
+    const BUTTON_OVERHEAD: usize = 360;
+    let body = json_string_bytes(body);
+    let buttons = permission_button_count(always_supported);
+    let note = if always_supported {
+        json_string_bytes(SESSION_ALWAYS_NOTE) + 60
+    } else {
+        0
+    };
+    body + buttons * (body + BUTTON_OVERHEAD) + note
+}
+
+/// The bytes `text` contributes to a serialized JSON string, escaping
+/// included: a quote, backslash or newline doubles, and a control character
+/// costs six bytes.
+fn json_string_bytes(text: &str) -> usize {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
 /// Compact one-line target for a question's Interaction Receipt: each
 /// question's header (or a clipped question text), joined, clipped to stay a
 /// residue (ADR-0038, rule 4). Shared by the inline block's receipt and the
@@ -1201,6 +1252,53 @@ mod tests {
                 .any(|element| element["content"] == SESSION_ALWAYS_NOTE),
             "no scope copy without the decision: {card}"
         );
+    }
+
+    /// Whole-branch review #883: the command budget is only safe if the card it
+    /// produces is. A permission body is rendered once and echoed into every
+    /// button's `perm_body`, so it appears six times in the card's JSON; this
+    /// pins the worst case — a full-budget CJK command — inside the card's own
+    /// budget. Raising [`crate::backend::types::PERMISSION_COMMAND_MAX_CHARS`]
+    /// fails here, which is the point.
+    #[test]
+    fn a_permission_card_at_the_command_budget_fits_the_card_budget() {
+        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+        let command = "啊".repeat(budget);
+        let body =
+            format!("⚡ **执行 Shell 命令**\n**对象**:\n- `{command}`\n\nAI 想要执行这个操作，是否允许？");
+        let card = build_permission_card("ses_abc", "n:1", &body, "/tmp/proj", true);
+        let len = card.to_string().len();
+        assert!(
+            len <= crate::feishu::card::MAX_CARD_JSON_CHARS,
+            "a full-budget command card is {len} bytes, over the {} budget",
+            crate::feishu::card::MAX_CARD_JSON_CHARS
+        );
+    }
+
+    /// The block estimate the streaming card's split reserves must be an upper
+    /// bound on what the block's elements actually serialize to — otherwise a
+    /// near-full card would still append it past Feishu's limit.
+    #[test]
+    fn the_permission_block_estimate_covers_the_rendered_block() {
+        for (body, always) in [
+            ("⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n", true),
+            ("⚡ **执行 Shell 命令**\n**对象**:\n- `cargo test`\n", false),
+            (&"啊\"\\\n".repeat(250), true),
+        ] {
+            let card = build_permission_card("ses", "n:1", body, "/d", always);
+            let elements = card["body"]["elements"].as_array().expect("body elements");
+            let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
+            let estimate = permission_block_estimate(body, always);
+            assert!(
+                estimate >= rendered,
+                "estimate {estimate} under the block's {rendered} bytes"
+            );
+            assert_eq!(
+                permission_block_components(always),
+                elements.len(),
+                "the component count is exactly what the block renders"
+            );
+        }
     }
 
     /// A V2 form's typed fields render as their own controls: a string field's
