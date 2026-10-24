@@ -1053,3 +1053,103 @@ async fn restart_withdraws_a_persisted_card_neutrally_when_another_client_answer
         "the block handle is forgotten"
     );
 }
+
+/// Whole-branch re-review #883: a withdrawal whose card PATCH fails must keep
+/// the handle and the persisted record — otherwise the old Allow card stays
+/// clickable and cola has thrown away the only state that could neutralize it.
+/// The next sweep redelivers the withdrawal (the request already left the
+/// pending list, so this is the sweep-level retry) without double-posting or
+/// leaving two receipts.
+#[tokio::test]
+async fn restart_retries_a_withdrawal_whose_card_update_failed() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    // The withdrawal's PATCH fails once.
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the decline landed"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_some(),
+        "a failed PATCH keeps the handle, or the withdrawal could never be retried"
+    );
+    assert!(
+        persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "and keeps the persisted record"
+    );
+
+    // The request is no longer listed (it was declined), so only the
+    // sweep-level retry can finish the job.
+    sweep(&app.permission, &app).await;
+
+    let updates: Vec<serde_json::Value> = {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::UpdateMessage { message_id, card } if message_id == "om_card" => {
+                    Some(card.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        updates.len(),
+        2,
+        "one failed attempt and one successful retry, no duplicate deliveries"
+    );
+    let final_card = updates.last().expect("the successful retry");
+    let text = card_text(final_card);
+    assert_eq!(
+        text.matches(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT)
+            .count(),
+        1,
+        "exactly one receipt survives: {text}"
+    );
+    assert!(
+        !text.contains("允许一次") && !text.contains("始终允许"),
+        "the card ends non-interactive: {text}"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_none(),
+        "the handle is forgotten only after the retry landed"
+    );
+    assert!(
+        !persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "and the persisted record is gone"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "no chat card duplicates the receipt on the withdrawn card"
+    );
+}
