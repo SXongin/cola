@@ -13,13 +13,14 @@
 //! kind from the config, and its endpoint, attachment, capabilities and local
 //! clients from the adapter's own [`crate::backend::ServerLifecycle::client_report`].
 //! The one check that writes to a runtime cola does not own — a real turn
-//! proving the configured provider works — runs by default. ADR-0090 decision 3
-//! makes that evidence the support criterion: a doctor that skipped it could
-//! pass while every turn died. The user invoked `doctor` explicitly, so the
-//! probe's write (a scratch thread on the shared daemon, deleted afterwards,
-//! possible provider spend) is part of the diagnostic's contract. The check
-//! text names that side effect; `--no-turn-check` opts out, and `--check-turn`
-//! remains a hidden no-op alias for older scripts.
+//! proving the configured provider works — runs by default, bounded at **60
+//! seconds**. ADR-0090 decision 3 makes that evidence the support criterion: a
+//! doctor that skipped it could pass while every turn died. The user invoked
+//! `doctor` explicitly, so the probe's write (a scratch thread on the shared
+//! daemon, deleted afterwards, possible provider spend) is part of the
+//! diagnostic's contract. The check text names that side effect;
+//! `--no-turn-check` opts out, and `--check-turn` remains a hidden no-op alias
+//! for older scripts.
 //!
 //! Neither command takes the Singleton Lock: they must work while cola runs, and
 //! against a broken install where cola cannot run at all.
