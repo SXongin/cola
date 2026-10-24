@@ -15,8 +15,8 @@ use serde_json::{Value, json};
 use crate::backend::Backend;
 use crate::bridge::App;
 use crate::bridge::test_support::{
-    CardUpdates, HostCardAction, PlatformCall, RecordingPlatform, card_header, card_text, incoming,
-    seed_entry, send_command_in, test_config, wait_for_card_update,
+    CardUpdates, HostCardAction, PlatformCall, RecordingPlatform, card_buttons, card_header, card_text,
+    incoming, seed_entry, send_command_in, test_config, wait_for_card_update,
 };
 use crate::bridge::turn::Turn;
 use crate::config::SessionEntry;
@@ -1440,4 +1440,985 @@ async fn a_cola_turn_is_never_an_external_message_after_a_restart() {
 
     sync.abort();
     drop(second_client);
+}
+
+// ---------------------------------------------------------------------------
+// Ticket #882: approvals and questions in both directions
+// ---------------------------------------------------------------------------
+
+/// Start the permission poller on its own task; the sweep is the path that
+/// turns a pending server request into a Feishu card.
+fn spawn_permission_poll(app: &Arc<App>) -> tokio::task::JoinHandle<()> {
+    app.permission.poll_interval_ms.store(20, Ordering::Relaxed);
+    app.permission.list_timeout_ms.store(500, Ordering::Relaxed);
+    let app = app.clone();
+    tokio::spawn(async move {
+        let _ = app.permission.poll_loop(&app.flow_handles()).await;
+    })
+}
+
+fn spawn_question_poll(app: &Arc<App>) -> tokio::task::JoinHandle<()> {
+    app.question.poll_interval_ms.store(20, Ordering::Relaxed);
+    app.question.list_timeout_ms.store(500, Ordering::Relaxed);
+    let app = app.clone();
+    tokio::spawn(async move {
+        let _ = app.question.poll_loop(&app.flow_handles()).await;
+    })
+}
+
+/// Wait until the app sent a card matching `check`; a standalone permission or
+/// question card is a `SendCard`, not an in-place update.
+async fn wait_for_sent_card(
+    platform: &RecordingPlatform,
+    label: &str,
+    check: impl Fn(&Value) -> bool,
+) -> Value {
+    let wait = async {
+        loop {
+            if let Some(card) = platform.sent_cards().await.into_iter().find(|card| check(card)) {
+                return card;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+        .await
+        .unwrap_or_else(|_| panic!("the card never reached {label}"))
+}
+
+/// Every sent card paired with the chat it went to.
+async fn sent_cards_with_targets(platform: &RecordingPlatform) -> Vec<(String, Value)> {
+    platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::SendCard { receive_id, card } => Some((receive_id.clone(), card.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a card JSON tree carries an element with this `tag` (a button, an
+/// input, a form, …), wherever it nests.
+fn contains_element_tag(value: &Value, tag: &str) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.get("tag").and_then(Value::as_str) == Some(tag)
+                || map.values().any(|value| contains_element_tag(value, tag))
+        }
+        Value::Array(items) => items.iter().any(|value| contains_element_tag(value, tag)),
+        _ => false,
+    }
+}
+
+fn button_value(card: &Value, reply: &str) -> Option<Value> {
+    card_buttons(card)
+        .into_iter()
+        .find(|button| button["value"]["reply"] == reply)
+        .map(|button| button["value"].clone())
+}
+
+/// Ticket #882 acceptance 1: a command approval raised by the user's own
+/// (TUI) turn reaches the Feishu card, and the Feishu answer is the JSON-RPC
+/// response that lets the turn continue.
+#[tokio::test]
+async fn a_tui_command_approval_is_answered_from_the_feishu_card() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    // The user's own client: a second connection subscribed to the thread.
+    let tui = connect(&url).await;
+    tui.transcript(THREAD).await.expect("the TUI's subscription");
+    server.wait_for_subscribers(THREAD, 2).await;
+
+    // The turn was started on the TUI; the server raises the approval to
+    // every subscriber (the spike's cross-connection shape).
+    let request_id = server.request_to_subscribers(
+        THREAD,
+        "item/commandExecution/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-tui",
+            "itemId": "item-tui",
+            "command": "rm -rf build",
+            "cwd": WORK,
+            "reason": "The build directory is stale",
+            "startedAtMs": 1_700_000_000_000_i64,
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+
+    let card = wait_for_sent_card(&platform, "the Feishu permission card", |card| {
+        card_text(card).contains("rm -rf build")
+    })
+    .await;
+    let text = card_text(&card);
+    assert!(
+        text.contains("权限请求"),
+        "the approval is a permission card: {card}"
+    );
+    assert!(
+        text.contains("The build directory is stale"),
+        "the reason renders: {card}"
+    );
+    // The session-scoped button is offered, and the card says what it means.
+    assert!(
+        text.contains("始终允许"),
+        "the advertised decision is offered: {card}"
+    );
+    assert!(
+        text.contains(crate::feishu::card::question::SESSION_ALWAYS_NOTE),
+        "the card explains the session scope: {card}"
+    );
+
+    let once = button_value(&card, "once").expect("the allow-once button");
+    assert_eq!(
+        once["request_id"].as_str(),
+        Some(format!("n:{}", request_id.as_u64().unwrap()).as_str())
+    );
+
+    let result = app.host_action(once).await.expect("the answer card");
+    assert!(
+        result
+            .card
+            .as_ref()
+            .map(card_text)
+            .unwrap_or_default()
+            .contains("已允许一次"),
+        "the click reports its decision"
+    );
+
+    server.wait_for_server_request_replies(1).await;
+    let replies = server.server_request_replies();
+    assert_eq!(replies.len(), 1, "one answer, one response frame");
+    assert_eq!(replies[0].connection, 1, "Feishu answered on cola's connection");
+    assert_eq!(replies[0].result, Some(json!({ "decision": "accept" })));
+    assert_eq!(replies[0].error, None);
+
+    // The server's resolution reaches the TUI too, so the turn it started has
+    // no pending approval left — the answer unblocked it.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !tui
+        .list_permissions(Some(WORK))
+        .await
+        .expect("the TUI's pending list")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the TUI's approval was not resolved by the Feishu answer"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882 acceptance 2 + 3: a cola-started turn's approval is answerable
+/// from the user's own client, and the Feishu card is withdrawn on the
+/// server's `serverRequest/resolved` instead of staying clickable.
+#[tokio::test]
+async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdrawn() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    let tui = connect(&url).await;
+    tui.transcript(THREAD).await.expect("the TUI's subscription");
+    server.wait_for_subscribers(THREAD, 2).await;
+
+    // Cola starts the turn from Feishu.
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("fix the build", "om_task"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while server.turn_starts() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cola turn never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/commandExecution/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-cola",
+            "itemId": "item-cola",
+            "command": "make test",
+            "cwd": WORK,
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+
+    // Both faces see the same pending approval: cola's poll-shaped read and
+    // the TUI's own request record.
+    let request_id = {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(pending) = tui
+                .list_permissions(Some(WORK))
+                .await
+                .expect("the TUI's pending list")
+                .first()
+                .cloned()
+            {
+                break pending.request_id;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the TUI never received the approval"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while client
+        .list_permissions(Some(WORK))
+        .await
+        .expect("cola's pending list")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "cola never received the approval the TUI saw"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The live cola turn carries the inline block.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while Turn::live_permissions(&app.cards_handle(), THREAD)
+        .await
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the permission never became an inline block"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The user's client answers first.
+    tui.reply_permission(THREAD, &request_id, "once", Some(WORK))
+        .await
+        .expect("the TUI's answer");
+    server.wait_for_server_request_replies(1).await;
+    let replies = server.server_request_replies();
+    assert_eq!(replies[0].connection, 2, "the TUI answered, not cola");
+    assert_eq!(replies[0].result, Some(json!({ "decision": "accept" })));
+
+    // `serverRequest/resolved` withdraws cola's copy.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !client
+        .list_permissions(Some(WORK))
+        .await
+        .expect("cola's pending list")
+        .is_empty()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "resolved approval stayed pending on cola"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    let receipt = async {
+        loop {
+            let Some(card) = Turn::rendered_card(&app.cards_handle(), THREAD).await else {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                continue;
+            };
+            if card_text(&card).contains("已由其他客户端处理") {
+                break card;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    let card = tokio::time::timeout(std::time::Duration::from_secs(2), receipt)
+        .await
+        .expect("the withdrawn block leaves a receipt");
+    assert!(
+        !card_text(&card).contains("始终允许"),
+        "the withdrawn card must not stay clickable: {card}"
+    );
+    assert!(
+        !card_text(&card).contains("权限请求"),
+        "the live block is gone: {card}"
+    );
+
+    poll.abort();
+    sync.abort();
+    handler.abort();
+}
+
+/// Ticket #882 acceptance 4: a permission-grant request does not advertise a
+/// session decision, so the card offers neither the button nor its scope copy;
+/// the grant echoes exactly the requested profile and a denial grants nothing.
+#[tokio::test]
+async fn a_permission_grant_offers_only_what_cola_can_express() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/permissions/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "cwd": WORK,
+            "reason": "needs to write the build directory",
+            "permissions": {
+                "fileSystem": { "write": [WORK] },
+                "network": { "enabled": false }
+            },
+            "startedAtMs": 1_700_000_000_000_i64,
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+
+    let card = wait_for_sent_card(&platform, "the permission-grant card", |card| {
+        card_text(card).contains("申请额外权限")
+    })
+    .await;
+    let text = card_text(&card);
+    assert!(text.contains(WORK), "the requested path renders: {card}");
+    assert!(
+        !text.contains("始终允许"),
+        "the session decision was not advertised, so it is not offered: {card}"
+    );
+    assert!(
+        !text.contains(crate::feishu::card::question::SESSION_ALWAYS_NOTE),
+        "no scope copy for a decision the card does not offer: {card}"
+    );
+
+    let once = button_value(&card, "once").expect("the allow-once button");
+    app.host_action(once).await.expect("the answer card");
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({
+            "permissions": {
+                "fileSystem": { "write": [WORK] },
+                "network": { "enabled": false }
+            },
+            "scope": "turn"
+        })),
+        "a grant echoes exactly the requested profile, never a wider one"
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882 acceptance 5: a child-session (subagent) approval resolves its
+/// card target through the parent chain (pitfall `child-session-permissions`).
+#[tokio::test]
+async fn a_child_session_approval_reaches_the_parents_chat() {
+    const CHILD: &str = "thread-child";
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "the parent thread",
+    ));
+    let mut child = ScriptedThread::adopted(CHILD, "session-child", WORK, "a subagent");
+    child.parent_thread_id = Some(THREAD.to_string());
+    server.seed_thread(child);
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    // The server delivers a subagent's approval to the parent turn's
+    // subscribers (the child has no subscription of its own in cola); the
+    // request itself still names the child thread.
+    server.request_to_subscribers(
+        THREAD,
+        "item/commandExecution/requestApproval",
+        json!({
+            "threadId": CHILD,
+            "turnId": "turn-child",
+            "itemId": "item-child",
+            "command": "cargo test",
+            "cwd": WORK,
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some((receive_id, card)) = sent_cards_with_targets(&platform)
+            .await
+            .into_iter()
+            .find(|(_, card)| card_text(card).contains("cargo test"))
+        {
+            assert_eq!(
+                receive_id, CHAT,
+                "the child's card is delivered through the parent's chat mapping"
+            );
+            let button = button_value(&card, "once").expect("the child's button");
+            assert_eq!(
+                button["session_id"], CHILD,
+                "the answer routes to the requesting child session"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the child approval never reached the parent's chat"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882 acceptance 6: two fast clicks produce one JSON-RPC response.
+#[tokio::test]
+async fn two_fast_clicks_send_one_decision() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/commandExecution/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": "ls",
+            "cwd": WORK,
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+    let card = wait_for_sent_card(&platform, "the permission card", |card| {
+        card_text(card).contains("权限请求")
+    })
+    .await;
+    let once = button_value(&card, "once").expect("the allow-once button");
+
+    // Hold the claim guard so both clicks queue on it, then release: the
+    // check-and-claim pair must still let exactly one click reply.
+    let guard = app.answered_requests.lock().await;
+    let a = {
+        let app = app.clone();
+        let value = once.clone();
+        tokio::spawn(async move { app.host_action(value).await })
+    };
+    let b = {
+        let app = app.clone();
+        tokio::spawn(async move { app.host_action(once).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(guard);
+    let (a, b) = tokio::join!(a, b);
+    assert!(a.is_ok() && b.is_ok(), "both clicks are handled");
+
+    server.wait_for_server_request_replies(1).await;
+    // Give a hypothetical second response a chance to arrive before counting.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        server.server_request_replies().len(),
+        1,
+        "two clicks must send one decision: {:?}",
+        server.server_request_replies()
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882: a tool's user-input request is a Question card, and the
+/// Feishu answer maps onto the protocol's keyed `answers` payload.
+#[tokio::test]
+async fn a_user_input_question_is_answered_from_the_feishu_card() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/tool/requestUserInput",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "isBlocking": true,
+            "questions": [{
+                "id": "q1",
+                "header": "确认",
+                "question": "继续执行吗？",
+                "options": [
+                    { "label": "是", "description": "继续" },
+                    { "label": "否", "description": "停止" }
+                ]
+            }]
+        }),
+    );
+    let poll = spawn_question_poll(&app);
+    let card = wait_for_sent_card(&platform, "the question card", |card| {
+        card_text(card).contains("继续执行吗")
+    })
+    .await;
+    let answer = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["reply"] == "answer" && button["value"]["answer"] == "是")
+        .map(|button| button["value"].clone())
+        .expect("the 是 option button");
+
+    app.host_action(answer).await.expect("the answer card");
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({ "answers": { "q1": { "answers": ["是"] } } }))
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882: an MCP form elicitation is a typed Question card, and its
+/// answer is the protocol's `content` object.
+#[tokio::test]
+async fn a_form_elicitation_is_answered_with_typed_content() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "mcpServer/elicitation/request",
+        json!({
+            "serverName": "files",
+            "threadId": THREAD,
+            "message": "把文件写入工作区？",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "confirm": { "type": "boolean", "title": "确认写入" }
+                },
+                "required": ["confirm"]
+            }
+        }),
+    );
+    let poll = spawn_question_poll(&app);
+    let card = wait_for_sent_card(&platform, "the elicitation card", |card| {
+        card_text(card).contains("确认写入")
+    })
+    .await;
+    assert!(
+        card_text(&card).contains("把文件写入工作区？"),
+        "the elicitation's message explains the request even with sparse fields: {card}"
+    );
+    let yes = card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["reply"] == "answer" && button["value"]["answer"] == "true")
+        .map(|button| button["value"].clone())
+        .expect("the 是 button");
+
+    app.host_action(yes).await.expect("the answer card");
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({ "action": "accept", "content": { "confirm": true } }))
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882 residuals: an elicitation's message and a secret refusal are
+/// rendered on the **inline** block too, not only on a standalone card.
+#[tokio::test]
+async fn question_titles_and_refusals_render_inline() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    // A live cola turn owns the streaming card the question blocks join.
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("keep this turn open", "om_task"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while server.turn_starts() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cola turn never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let poll = spawn_question_poll(&app);
+
+    server.request_to_subscribers(
+        THREAD,
+        "mcpServer/elicitation/request",
+        json!({
+            "serverName": "files",
+            "threadId": THREAD,
+            "message": "把文件写入工作区？",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "confirm": { "type": "boolean", "title": "确认写入" } },
+                "required": ["confirm"]
+            }
+        }),
+    );
+    let message = "把文件写入工作区？";
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(card) = Turn::rendered_card(&app.cards_handle(), THREAD).await
+            && card_text(&card).contains(message)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "an elicitation's message never reached the inline card"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/tool/requestUserInput",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "isBlocking": true,
+            "questions": [{
+                "id": "password",
+                "header": "登录",
+                "question": "请输入密码",
+                "isSecret": true
+            }]
+        }),
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(card) = Turn::rendered_card(&app.cards_handle(), THREAD).await
+            && card_text(&card).contains("私密输入")
+        {
+            assert!(
+                !contains_element_tag(&card, "input"),
+                "the inline refusal has no text input: {card}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the secret refusal never reached the inline card"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    poll.abort();
+    sync.abort();
+    handler.abort();
+}
+
+/// Ticket #882: a URL-mode elicitation has no card cola can render, so it is
+/// declined explicitly (never silently ignored, never approximated as a form).
+#[tokio::test]
+async fn a_url_elicitation_is_declined_explicitly() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "mcpServer/elicitation/request",
+        json!({
+            "serverName": "files",
+            "threadId": THREAD,
+            "message": "打开授权页面",
+            "mode": "url",
+            "url": "https://example.test/consent",
+            "elicitationId": "e-1"
+        }),
+    );
+    let poll = spawn_question_poll(&app);
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({ "action": "decline" }))
+    );
+    assert!(
+        platform.sent_cards().await.is_empty(),
+        "a URL elicitation is refused, not shown as a half-form"
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
+/// Ticket #882: a server request cola does not implement is refused by name,
+/// so the server never waits on a client that will not answer.
+#[tokio::test]
+async fn an_unanswered_request_kind_is_refused_by_name() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (_app, _platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+
+    server.request_to_all("account/chatgptAuthTokens/refresh", json!({}));
+    server.wait_for_server_request_replies(1).await;
+    let reply = &server.server_request_replies()[0];
+    assert_eq!(
+        reply
+            .error
+            .as_ref()
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64),
+        Some(-32601),
+        "the refusal names the unsupported method: {reply:?}"
+    );
+    assert!(
+        reply
+            .error
+            .as_ref()
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("account/chatgptAuthTokens/refresh"),
+        "{reply:?}"
+    );
+}
+
+/// A secret question becomes a named refusal card — never a free-text field.
+/// Its only control is the ordinary reject button, and that click is the
+/// protocol's decline to the server.
+#[tokio::test]
+async fn a_secret_question_is_refused_at_the_card_not_collected() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/tool/requestUserInput",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "isBlocking": true,
+            "questions": [{
+                "id": "password",
+                "header": "登录",
+                "question": "请输入密码",
+                "isSecret": true
+            }]
+        }),
+    );
+    let poll = spawn_question_poll(&app);
+    let card = wait_for_sent_card(&platform, "the secret-refusal card", |card| {
+        card_text(card).contains("私密输入")
+    })
+    .await;
+    assert!(
+        !card_text(&card).contains("请输入密码"),
+        "the secret field is never rendered: {card}"
+    );
+    assert!(
+        card_text(&card).contains("重新发起"),
+        "the copy says to re-initiate on the original client: {card}"
+    );
+    assert!(
+        !contains_element_tag(&card, "input") && !contains_element_tag(&card, "form"),
+        "the refusal card has no text input: {card}"
+    );
+
+    let reject = button_value(&card, "reject").expect("the refusal's reject control");
+    app.host_action(reject).await.expect("the refusal card");
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({ "answers": {} })),
+        "rejecting the refusal form declines the request"
+    );
+    assert_eq!(server.server_request_replies()[0].error, None);
+
+    poll.abort();
+    sync.abort();
+}
+
+/// A permission profile with a field the card cannot render is refused: the
+/// reply grants nothing rather than echoing a hidden grant.
+#[tokio::test]
+async fn a_profile_with_a_hidden_grant_is_declined() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.request_to_subscribers(
+        THREAD,
+        "item/permissions/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "cwd": WORK,
+            "permissions": {
+                "fileSystem": {
+                    "write": [WORK],
+                    "globScanMaxDepth": 8
+                }
+            }
+        }),
+    );
+    let poll = spawn_permission_poll(&app);
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({ "permissions": {} })),
+        "a profile the card cannot show is never granted"
+    );
+    // A path longer than the card's pattern budget is the same class: the
+    // suffix would be clipped, so it is declined, not partially shown.
+    server.request_to_subscribers(
+        THREAD,
+        "item/permissions/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-2",
+            "itemId": "item-2",
+            "cwd": WORK,
+            "permissions": {
+                "fileSystem": { "write": ["a".repeat(145)] }
+            }
+        }),
+    );
+    server.wait_for_server_request_replies(2).await;
+    assert_eq!(
+        server.server_request_replies()[1].result,
+        Some(json!({ "permissions": {} })),
+        "an overlong path is never granted"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !platform
+            .sent_cards()
+            .await
+            .iter()
+            .any(|card| card_text(card).contains("申请额外权限")),
+        "no approval card for a grant the user cannot see in full"
+    );
+
+    poll.abort();
+    sync.abort();
 }

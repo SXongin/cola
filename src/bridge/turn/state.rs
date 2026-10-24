@@ -583,6 +583,9 @@ pub(super) struct PendingPermission {
     /// even where the position cannot (ADR-0038).
     pub(super) target: String,
     pub(super) directory: String,
+    /// Whether the backend advertised a session-scoped Always reply for this
+    /// request; the block then offers the button and its scope copy.
+    pub(super) always_supported: bool,
 }
 
 /// A `question` tool request surfaced inline on the streaming card. `answers[i]`
@@ -592,7 +595,13 @@ pub(super) struct PendingPermission {
 pub(super) struct PendingQuestion {
     pub(super) request_id: String,
     pub(super) session_id: String,
+    /// The request's title (an elicitation's message); inline blocks render it
+    /// themselves because the streaming card's header is the turn's.
+    pub(super) title: String,
     pub(super) questions: Vec<crate::backend::types::QuestionInfo>,
+    /// Set when the request has no answerable fields; the block shows the
+    /// reason and only a decline.
+    pub(super) uncollectable: Option<crate::backend::types::UncollectableReason>,
     pub(super) directory: String,
     /// Display selection per question (locked answer, or live multi-select
     /// toggles). Mirrors `question_elements`' `answered` slice.
@@ -4583,12 +4592,15 @@ impl StreamAccumulator {
                             &p.request_id,
                             &p.body,
                             &p.directory,
+                            p.always_supported,
                         ) {
                             builder = builder.with_element(btn);
                         }
                     }
                     InteractionBlock::Question(q) => {
                         for el in crate::feishu::card::question::question_elements(
+                            &q.title,
+                            q.uncollectable,
                             &q.request_id,
                             &q.session_id,
                             &q.questions,
@@ -7350,6 +7362,7 @@ mod tests {
         let question = InteractionBlock::Question(PendingQuestion {
             request_id: "q".into(),
             session_id: "s".into(),
+            title: String::new(),
             questions: vec![crate::backend::types::QuestionInfo {
                 question: "继续?".into(),
                 header: "确认".into(),
@@ -7362,6 +7375,7 @@ mod tests {
                 custom: None,
                 ..Default::default()
             }],
+            uncollectable: None,
             directory: "/w".into(),
             answers: vec![None],
             done: vec![false],
@@ -7380,6 +7394,7 @@ mod tests {
             body: "bash".into(),
             target: "⚡ 执行 Shell 命令 `ls -la`".into(),
             directory: "/w".into(),
+            always_supported: true,
         }));
         assert_eq!(acc.awaiting_action(), AwaitingAction::Both);
         assert!(

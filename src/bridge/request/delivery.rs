@@ -407,6 +407,8 @@ pub(super) async fn refresh_question_block(
     .await;
     let message_id = clicked?;
     let elements = crate::feishu::card::question::question_elements(
+        &request.title,
+        request.uncollectable,
         req_id,
         &request.session_id,
         &request.questions,

@@ -40,6 +40,7 @@ fn permission_without_session(request_id: &str) -> crate::backend::types::Permis
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }
 }
 

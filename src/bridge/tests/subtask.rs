@@ -18,6 +18,7 @@ async fn subtask_permission_routes_to_mapped_parent_and_reply_carries_directory(
         patterns: vec!["git status".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let parent_id = backend.session_id.clone();
     let reply_sessions = backend.reply_permission_sessions.clone();
@@ -138,6 +139,7 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
         patterns: vec!["git status".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let (app, platform) = build_app(cfg, backend).await;
 

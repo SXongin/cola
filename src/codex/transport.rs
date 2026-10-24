@@ -113,7 +113,8 @@ impl Endpoint {
 ///
 /// Both are fanned out here, not dispatched: notifications feed the adapter's
 /// thread subscriptions (#878), and server requests are the approval/question
-/// surface a later ticket answers (#882).
+/// surface the adapter records and answers with [`RpcConnection::respond`]
+/// (#882).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Inbound {
     Notification {
@@ -373,6 +374,39 @@ impl RpcConnection {
             message["params"] = params;
         }
         self.send(&message).await
+    }
+
+    /// Answer one server-initiated request, addressed by the id the server
+    /// chose. This is the response half of [`Inbound::Request`]: approvals and
+    /// questions are not client calls, so they are answered on this same
+    /// serialised writer rather than through [`Self::request`]. A closed
+    /// connection refuses the frame by name, exactly like a call.
+    pub(crate) async fn respond(&self, id: &Value, result: Value) -> Result<()> {
+        if self.closed() {
+            return Err(CodexError::NoResponse(format!("server request {id}")));
+        }
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }))
+        .await
+    }
+
+    /// Refuse one server-initiated request by name. Used where cola cannot
+    /// express an answer at all (a request kind it does not implement): the
+    /// server then sees a refusal instead of waiting forever, and the failure
+    /// is never guessed at.
+    pub(crate) async fn respond_error(&self, id: &Value, code: i64, message: &str) -> Result<()> {
+        if self.closed() {
+            return Err(CodexError::NoResponse(format!("server request {id}")));
+        }
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        }))
+        .await
     }
 
     /// Subscribe to everything the server pushed that was not a response to
@@ -758,6 +792,54 @@ mod tests {
             0,
             "cancellation must remove the pending entry"
         );
+    }
+
+    /// Ticket #882's transport half: a server-initiated request stays a request
+    /// (it is fanned out, never mistaken for a response), and `respond` writes
+    /// the answer with the server's own id — the reader keeps serving other
+    /// traffic in between.
+    #[tokio::test]
+    async fn a_server_request_is_answered_with_the_servers_id() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
+            .await
+            .expect("connection");
+        let mut inbound = connection.inbound();
+
+        let id = server.request_to_all("test/approval", json!({ "threadId": "t" }));
+        let event = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+            .await
+            .expect("the server request arrives")
+            .expect("inbound stays open");
+        match event {
+            Inbound::Request {
+                id: received, method, ..
+            } => {
+                assert_eq!(received, id);
+                assert_eq!(method, "test/approval");
+                connection
+                    .respond(&received, json!({ "decision": "accept" }))
+                    .await
+                    .expect("the answer is written");
+            }
+            other => panic!("expected a server request, got {other:?}"),
+        }
+
+        server.wait_for_server_request_replies(1).await;
+        let replies = server.server_request_replies();
+        assert_eq!(replies[0].id, id);
+        assert_eq!(replies[0].result, Some(json!({ "decision": "accept" })));
+
+        // The connection is still usable after answering a server request.
+        let result = connection
+            .request(
+                "initialize",
+                json!({ "clientInfo": { "name": "cola", "version": "test" } }),
+            )
+            .await
+            .expect("initialize still answers");
+        assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
     }
 
     /// A close must end the writer and drop the frame receiver, waking a

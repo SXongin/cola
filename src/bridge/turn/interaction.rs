@@ -68,6 +68,7 @@ impl Turn {
             body: crate::bridge::request::kind::describe_permission(p),
             target: crate::bridge::request::kind::permission_target(p),
             directory: directory.to_string(),
+            always_supported: p.always_supported,
         });
         match cards.cards.lock().await.get_mut(session_id) {
             Some(card) => card.acc.add_interaction(block),
@@ -89,7 +90,9 @@ impl Turn {
         let block = state::InteractionBlock::Question(state::PendingQuestion {
             request_id: q.id.clone(),
             session_id: q.session_id.clone(),
+            title: q.title.clone(),
             questions: q.questions.clone(),
+            uncollectable: q.uncollectable,
             directory: directory.to_string(),
             answers: answers.to_vec(),
             done: done.to_vec(),

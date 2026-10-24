@@ -1091,6 +1091,13 @@ fn not_attached() -> BridgeError {
     }
 }
 
+/// Whether an id can name a Codex thread. Thread ids are UUIDs, not OpenCode
+/// `ses…` handles; only an empty id (a request that named no thread) is
+/// unaddressable. Shared by the client and the lifecycle's static answer.
+fn codable_thread_id(id: &str) -> bool {
+    !id.trim().is_empty()
+}
+
 fn neutral_session_input(directory: Option<&str>) -> CreateSessionInput {
     CreateSessionInput {
         id: None,
@@ -1351,41 +1358,50 @@ impl Backend for CodexClient {
     async fn reply_permission(
         &self,
         _session_id: &str,
-        _request_id: &str,
-        _reply: &str,
+        request_id: &str,
+        reply: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        // The approval surface (and its neutral DTOs, decision 7) is #882.
-        // Nothing lists a request on this adapter yet, so there is nothing to
-        // reply to.
-        Ok(())
+        // The server request lives on this connection, so the directory is not
+        // a routing axis: a Codex approval is answered where it arrived.
+        self.approvals
+            .reply_permission(self.connection(), request_id, reply)
+            .await
     }
 
-    async fn list_permissions(&self, _directory: Option<&str>) -> Result<Vec<PermissionRequest>> {
-        Ok(Vec::new())
+    async fn list_permissions(&self, directory: Option<&str>) -> Result<Vec<PermissionRequest>> {
+        Ok(self.approvals.permissions(directory))
     }
 
-    async fn list_questions(&self, _directory: Option<&str>) -> Result<Vec<QuestionRequest>> {
-        Ok(Vec::new())
+    async fn list_questions(&self, directory: Option<&str>) -> Result<Vec<QuestionRequest>> {
+        Ok(self.approvals.questions(directory))
     }
 
     async fn reply_question(
         &self,
         _session_id: &str,
-        _request_id: &str,
-        _answers: &[FormAnswer],
+        request_id: &str,
+        answers: &[FormAnswer],
         _directory: Option<&str>,
     ) -> Result<()> {
-        Ok(())
+        self.approvals
+            .reply_question(self.connection(), request_id, answers)
+            .await
     }
 
     async fn reject_question(
         &self,
         _session_id: &str,
-        _request_id: &str,
+        request_id: &str,
         _directory: Option<&str>,
     ) -> Result<()> {
-        Ok(())
+        self.approvals
+            .reject_question(self.connection(), request_id)
+            .await
+    }
+
+    fn is_addressable_session_id(&self, id: &str) -> bool {
+        codable_thread_id(id)
     }
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
@@ -1748,6 +1764,10 @@ impl Backend for CodexLifecycle {
         directory: Option<&str>,
     ) -> Result<()> {
         Backend::reject_question(&self.current().await?, session_id, request_id, directory).await
+    }
+
+    fn is_addressable_session_id(&self, id: &str) -> bool {
+        codable_thread_id(id)
     }
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {

@@ -1226,6 +1226,7 @@ async fn pending_permission_app() -> (
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }]);
     let backend = Arc::new(backend);
     let platform = Arc::new(RecordingPlatform::new());

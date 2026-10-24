@@ -22,6 +22,7 @@
 // slice is reachable from `main`; the remaining test-only helpers are marked
 // where they live rather than silencing the whole module.
 
+pub(crate) mod approvals;
 pub(crate) mod authorship;
 pub(crate) mod backend;
 pub(crate) mod client;

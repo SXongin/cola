@@ -17,6 +17,7 @@ fn permission(request_id: &str, session_id: &str) -> crate::backend::types::Perm
         patterns: vec!["ls -la".into()],
         metadata: None,
         always: Vec::new(),
+        always_supported: true,
     }
 }
 

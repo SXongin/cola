@@ -683,6 +683,7 @@ mod tests {
             patterns: vec!["ls".into()],
             metadata: None,
             always: vec![],
+            always_supported: true,
         }
     }
 

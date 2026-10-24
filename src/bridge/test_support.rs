@@ -4348,6 +4348,7 @@ pub(crate) fn perm_request(
         patterns: vec![pattern.into()],
         metadata: None,
         always: vec![],
+        always_supported: true,
     }
 }
 

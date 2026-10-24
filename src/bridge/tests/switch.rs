@@ -406,6 +406,7 @@ async fn switch_reeswitch_snapshots_on_pending_permission() {
         patterns: vec!["ls".into()],
         metadata: None,
         always: vec![],
+        always_supported: true,
     }]);
     let (app, platform, _dir) = build_reeswitch_app(backend).await;
 
@@ -454,6 +455,7 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
         patterns: vec!["ls".into()],
         metadata: None,
         always: vec![],
+        always_supported: true,
     }]);
     backend.given_sessions(vec![list_session("ses_own1", "本项目会话", "/work/cola", 500)]);
     let (app, platform) = build_app(cfg, backend).await;

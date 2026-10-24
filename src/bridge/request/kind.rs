@@ -79,6 +79,7 @@ impl PendingRequest {
                     &p.request_id,
                     &body,
                     directory,
+                    p.always_supported,
                 ));
                 els
             }
@@ -91,6 +92,8 @@ impl PendingRequest {
                     },
                 );
                 crate::feishu::card::question::question_elements(
+                    &q.title,
+                    q.uncollectable,
                     &q.id,
                     &q.session_id,
                     &q.questions,
@@ -353,6 +356,7 @@ impl RequestKind for PermissionKind {
             &p.request_id,
             &body,
             dir,
+            p.always_supported,
         )
     }
 
@@ -886,6 +890,8 @@ impl RequestKind for QuestionKind {
             .await
             .unwrap_or_else(|| (vec![None; q.questions.len()], vec![false; q.questions.len()]));
         let elements = crate::feishu::card::question::question_elements(
+            &q.title,
+            q.uncollectable,
             &q.id,
             &q.session_id,
             &q.questions,
@@ -952,6 +958,14 @@ impl RequestKind for QuestionKind {
         let PendingRequest::Question(q) = req else {
             return serde_json::json!({});
         };
+        if let Some(reason) = q.uncollectable {
+            return crate::feishu::card::question::build_uncollectable_card(
+                reason,
+                &q.id,
+                &q.session_id,
+                dir,
+            );
+        }
         crate::feishu::card::question::build_question_card(
             &q.title,
             &q.id,
@@ -1504,7 +1518,8 @@ async fn reply_question_scoped(
 /// still renders — as the generic `🔐 执行操作`.
 fn describe_action(action: &str) -> (&'static str, &'static str) {
     match action {
-        "bash" | "shell" => ("⚡", "执行 Shell 命令"),
+        "bash" | "shell" | "command" => ("⚡", "执行 Shell 命令"),
+        "permissions" => ("🔑", "申请额外权限"),
         "subagent" | "task" => ("🤖", "调用子代理"),
         "question" => ("❓", "向你提问"),
         "read" => ("📖", "读取文件"),
@@ -1535,6 +1550,11 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// The character budget one permission pattern is rendered within. The Codex
+/// adapter rejects a grant whose rendered pattern would be clipped, so what the
+/// user approves is exactly what the card shows.
+pub(crate) const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
+
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by the snapshot card's pending block,
 /// ADR-0028 — the adopt-time block must look and behave like today's cards).
@@ -1543,10 +1563,27 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     let (emoji, label) = describe_action(action);
     let mut s = format!("{} **{}**\n", emoji, label);
 
+    // A client-agnostic explanatory line: Codex's approval requests carry a
+    // `reason` (a network rule, extra write access), and showing it is the
+    // difference between "allow something" and knowing what is being allowed.
+    if let Some(reason) = p
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("reason"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        s.push_str(&format!(
+            "**原因**: {}\n",
+            truncate(reason, PERMISSION_PATTERN_MAX_CHARS)
+        ));
+    }
+
     if !p.patterns.is_empty() {
         s.push_str("**对象**:\n");
         for r in &p.patterns {
-            s.push_str(&format!("- `{}`\n", truncate(r, 150)));
+            s.push_str(&format!("- `{}`\n", truncate(r, PERMISSION_PATTERN_MAX_CHARS)));
         }
     }
 
@@ -1645,6 +1682,7 @@ mod tests {
             patterns: vec!["/proj/src/main.rs".into()],
             metadata: Some(metadata),
             always: vec![],
+            always_supported: true,
         }
     }
 
