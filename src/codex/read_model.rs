@@ -126,6 +126,11 @@ pub(crate) struct ThreadProjection {
     /// Set when a subscription gap means the projection may be missing events;
     /// cleared only by a successful `thread/read` resync.
     incomplete: bool,
+    /// A `/compact` this adapter requested, whose `contextCompaction` item has
+    /// not arrived yet. The protocol's item carries no reason, so the request
+    /// is the only evidence a compaction was manual (`/compact`) rather than
+    /// automatic; the next compaction item consumes it.
+    manual_compaction: bool,
 }
 
 impl ThreadProjection {
@@ -149,6 +154,15 @@ impl ThreadProjection {
     /// finished turn would be a stale write.
     pub(crate) fn live_turn(&self) -> Option<&str> {
         self.live_turn.as_deref()
+    }
+
+    /// The turn an item belongs to, for the authorship record: Codex assigns
+    /// item ids itself, so the turn cola started is the finest authorship
+    /// signal the protocol offers.
+    pub(crate) fn turn_of_item(&self, item_id: &str) -> Option<&str> {
+        self.index
+            .get(item_id)
+            .map(|index| self.items[*index].turn_id.as_str())
     }
 
     /// The last explicit run state, if one was observed.
@@ -404,6 +418,8 @@ impl ThreadProjection {
             completed: false,
             started_seen: false,
             pending: None,
+            client_id: item_client_id(item),
+            manual_compaction: false,
         });
         self.index.insert(id, index);
     }
@@ -503,6 +519,21 @@ impl ThreadProjection {
         }
 
         let mut transcript = SessionTranscript::new(messages);
+        // The id cola submitted for a user message is not the item id Codex
+        // assigned; the server echoes it as `userMessage.clientId`. Hand the
+        // pair to the neutral read so the Turn's anchor lookup (by the id cola
+        // chose) still finds the message.
+        let submissions: HashMap<String, MessageId> = self
+            .items
+            .iter()
+            .filter(|item| matches!(item.kind, ItemKind::UserMessage { .. }))
+            .filter_map(|item| {
+                item.client_id
+                    .as_ref()
+                    .map(|client_id| (client_id.clone(), MessageId::new(item.id.clone())))
+            })
+            .collect();
+        transcript = transcript.with_submissions(submissions);
         transcript.truncated = self.incomplete;
         transcript
     }
@@ -572,6 +603,8 @@ impl ThreadProjection {
             completed: false,
             started_seen: false,
             pending: None,
+            client_id: None,
+            manual_compaction: false,
         });
         self.index.insert(id.to_string(), index);
         index
@@ -739,6 +772,8 @@ impl ThreadProjection {
                     completed: false,
                     started_seen: true,
                     pending: None,
+                    client_id: item_client_id(&notification.item),
+                    manual_compaction: false,
                 };
             } else {
                 // Deltas created this item before its start. The start is
@@ -749,6 +784,7 @@ impl ThreadProjection {
                 self.items[index].started_at_ms = started.or(self.items[index].started_at_ms);
                 self.items[index].started_seen = true;
             }
+            self.consume_manual_compaction(index);
             return;
         }
         let index = self.items.len();
@@ -761,8 +797,31 @@ impl ThreadProjection {
             completed: false,
             started_seen: true,
             pending: None,
+            client_id: item_client_id(&notification.item),
+            manual_compaction: false,
         });
         self.index.insert(id, index);
+        self.consume_manual_compaction(index);
+    }
+
+    /// Mark a compaction item as the `/compact` this adapter asked for, and
+    /// consume the request: the protocol's item names no reason, so the request
+    /// is the only evidence (ADR-0092).
+    fn consume_manual_compaction(&mut self, index: usize) {
+        if self.manual_compaction && matches!(self.items[index].kind, ItemKind::Compaction) {
+            self.items[index].manual_compaction = true;
+            self.manual_compaction = false;
+        }
+    }
+
+    /// Record that cola requested a manual compaction for this thread.
+    pub(crate) fn mark_manual_compaction(&mut self) {
+        self.manual_compaction = true;
+    }
+
+    /// Forget a manual-compaction request that never reached the server.
+    pub(crate) fn clear_manual_compaction(&mut self) {
+        self.manual_compaction = false;
     }
 
     fn item_completed(&mut self, notification: ItemCompleted) {
@@ -774,6 +833,10 @@ impl ThreadProjection {
         if let Some(index) = self.index.get(&id) {
             let index = *index;
             self.items[index].complete_with(&notification.item, completed);
+            if let Some(client_id) = item_client_id(&notification.item) {
+                self.items[index].client_id = Some(client_id);
+            }
+            self.consume_manual_compaction(index);
             return;
         }
         let index = self.items.len();
@@ -790,8 +853,11 @@ impl ThreadProjection {
             completed: true,
             started_seen: true,
             pending: None,
+            client_id: item_client_id(&notification.item),
+            manual_compaction: false,
         });
         self.index.insert(id, index);
+        self.consume_manual_compaction(index);
     }
 
     fn agent_delta(&mut self, delta: Delta) {
@@ -897,6 +963,15 @@ impl PendingDeltas {
     }
 }
 
+/// The id cola submitted for an item, when the server echoed it
+/// (`userMessage.clientId`). Any other item type carries none.
+fn item_client_id(item: &Value) -> Option<String> {
+    item.get("clientId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 /// One projected item: the server's identity, its turn, and the typed payload.
 #[derive(Debug, Clone)]
 struct Item {
@@ -920,6 +995,14 @@ struct Item {
     /// are consumed without appending, so an event the page already reflects
     /// is applied exactly once.
     pending: Option<Box<PendingDeltas>>,
+    /// The id cola submitted for this item, when the server echoes it back
+    /// (`userMessage.clientId`). It is the only link from cola's chosen id to
+    /// the id the server assigned, so the Turn's anchor lookup can answer for
+    /// the id cola submitted (ADR-0026, ADR-0092).
+    client_id: Option<String>,
+    /// Whether this compaction was the one cola requested with `/compact`
+    /// (the protocol carries no reason on the item).
+    manual_compaction: bool,
 }
 
 impl Item {
@@ -1263,7 +1346,11 @@ impl Item {
                     } else {
                         CompactionStatus::Running
                     },
-                    reason: CompactionReason::Auto,
+                    reason: if self.manual_compaction {
+                        CompactionReason::Manual
+                    } else {
+                        CompactionReason::Auto
+                    },
                     summary: String::new(),
                     usage: None,
                     error: None,

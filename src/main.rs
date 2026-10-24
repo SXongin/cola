@@ -1043,8 +1043,14 @@ async fn main() -> anyhow::Result<()> {
                 config::ClientSettings::Opencode(_) => unreachable!("the arm selects codex settings"),
             };
             let environment = codex::discovery::Environment::from_env()?;
+            // ADR-0090's authorship consequence: Codex assigns its own turn
+            // ids, so the record of turns cola started is durable and
+            // client-scoped; without it a restart reports cola's own turn as
+            // an External Message.
+            let authored = codex::Authorship::open(layout.authored_turns(), &active.id)?;
             let client =
-                codex::CodexLifecycle::new(settings.clone(), environment, Box::new(codex::ManagedProbe));
+                codex::CodexLifecycle::new(settings.clone(), environment, Box::new(codex::ManagedProbe))
+                    .with_authorship(authored);
             let eager = settings.start_server == config::ServerStartPolicy::Eager;
             let url = attach_at_boot(&client, eager).await?;
             (Arc::new(client), url)
