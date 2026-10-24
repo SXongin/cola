@@ -265,9 +265,10 @@ pub(crate) async fn gather_snapshot(
     // so the snapshot cannot drift from the Turn and external-sync reads.
     let newest_user = transcript.newest_user();
     let newest_user_anchor = newest_user.and_then(|message| message.anchor());
-    let newest_user_is_cola_authored = newest_user
-        .map(|message| crate::backend::parsing::is_cola_message_id(message.id.as_str()))
-        .unwrap_or(false);
+    let newest_user_is_cola_authored = match newest_user {
+        Some(message) => backend.is_cola_authored(message.id.as_str()).await,
+        None => false,
+    };
     let tail = transcript.transcript_tail();
     // The ADR-0059 Waiting fact (#586): the newest user message's Turn is
     // complete (an assistant step finished it) while live Background Tasks

@@ -1738,7 +1738,7 @@ impl Turn {
         if let Some(anchor) = anchor.as_ref()
             && let Some(newest_user) = transcript.newest_user()
             && let Some(created) = newest_user.time.map(|time| time.created)
-            && crate::backend::parsing::is_cola_message_id(newest_user.id.as_str())
+            && handles.backend.is_cola_authored(newest_user.id.as_str()).await
             && created > anchor.created_ms
         {
             // No assistant message after it: either its new Turn has not

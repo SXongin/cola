@@ -268,6 +268,51 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         message_id: Option<&str>,
     ) -> Result<()>;
 
+    /// Submit a **Supplement**: merge this message into the Turn already running
+    /// on `session_id` instead of starting a second one, so the user can append
+    /// context mid-run without `/stop`. The message is persisted and observed
+    /// exactly like a prompt's ([`Self::prompt`]); only the wire differs.
+    ///
+    /// The default delegates to [`Self::prompt`]: on a generation whose server
+    /// steers a prompt into the in-flight run (V1's merge, V2's admitted
+    /// message), a supplement IS a prompt. A client with a dedicated steer verb
+    /// overrides this — Codex's `turn/steer` — so the bridge never has to know
+    /// which shape the attached client speaks.
+    ///
+    /// The remaining arguments carry the same per-turn axes as [`Self::prompt`].
+    #[allow(clippy::too_many_arguments)] // the prompt axes, unchanged
+    async fn steer(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[PromptFile],
+        skills: &[PromptSkill],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<()> {
+        self.prompt(session_id, text, files, skills, model, variant, agent, message_id)
+            .await
+    }
+
+    /// Whether `message_id` names a message **cola itself** wrote into this
+    /// Session (ADR-0026), and must therefore never be reported as an External
+    /// Message or treated as a Turn boundary.
+    ///
+    /// The default answers from the id convention every OpenCode generation
+    /// echoes back: a message cola submitted carries the `msg_cola_` id it chose
+    /// at send time. A client that assigns its own ids — Codex — overrides this
+    /// and answers from its own record of the turns it started (ADR-0090's
+    /// authorship consequence), which is durable across a restart.
+    ///
+    /// A client whose record is unusable must fail **closed** (answer `true`):
+    /// telling the user about cola's own message is the failure this seam
+    /// exists to prevent.
+    async fn is_cola_authored(&self, message_id: &str) -> bool {
+        crate::backend::parsing::is_cola_message_id(message_id)
+    }
+
     /// The session's durable model/agent selection, where the generation keeps
     /// one server-side (V2's session-scoped switches). `None` on a generation
     /// whose selection rides each prompt (V1: cola's own override is

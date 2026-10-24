@@ -2505,7 +2505,7 @@ impl App {
                 let cola_msg_id = crate::backend::parsing::cola_message_id();
                 let submitted = match self
                     .client
-                    .prompt(
+                    .steer(
                         &session_id,
                         &text,
                         &attachments,
