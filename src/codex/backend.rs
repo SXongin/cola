@@ -40,9 +40,9 @@ use crate::error::{BridgeError, Result};
 use super::client::CodexClient;
 use super::error::{CodexError, Result as CodexResult};
 use super::lifecycle::CodexLifecycle;
-use super::read_model::ThreadProjection;
+use super::read_model::{ThreadProjection, ThreadStatus, decode_thread_status};
 use super::threads::{Adoption, ThreadEvent, ThreadSubscription, Threads};
-use super::transport::Endpoint;
+use super::transport::{Endpoint, Inbound, RpcConnection};
 
 /// How long a truncated history waits before the next read retries paging. A
 /// persistently failing server is polled at this cadence, never in a loop; a
@@ -56,6 +56,11 @@ const PAGING_RETRY: Duration = Duration::from_millis(20);
 /// events; draining at most that many means a first read either reflects every
 /// queued event or is explicitly marked incomplete.
 const ADOPTION_DRAIN_LIMIT: usize = 1024;
+
+/// The broadcast notification that carries a thread's run state (ADR-0090's
+/// amendment). Unlike `turn/*` and `item/*` it reaches every connection, so it
+/// feeds [`Projections`] without a subscription.
+const THREAD_STATUS_CHANGED: &str = "thread/status/changed";
 
 /// One thread's projection and the state of its subscription.
 #[derive(Default)]
@@ -220,18 +225,107 @@ impl Projections {
     }
 
     pub(crate) fn status(&self, thread_id: &str) -> Option<SessionStatus> {
-        Some(
-            if self
-                .projection(thread_id)
+        let projection = self.projection(thread_id);
+        let projection = projection.lock().expect("codex projection");
+        Some(match projection.observed_status() {
+            // The broadcast is the server's own run state for this thread,
+            // whether or not this connection subscribed: it wins over the
+            // subscription-derived live flag.
+            Some(ThreadStatus::Active) => SessionStatus::Busy,
+            Some(ThreadStatus::Idle) => SessionStatus::Idle,
+            None => {
+                if projection.is_live() {
+                    SessionStatus::Busy
+                } else {
+                    SessionStatus::Idle
+                }
+            }
+        })
+    }
+
+    /// The last `thread/status/changed` state observed for this thread, if
+    /// any. `None` means the broadcast has not reported one, so the caller may
+    /// have to adopt the thread to learn its run state.
+    pub(crate) fn observed_status(&self, thread_id: &str) -> Option<ThreadStatus> {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .observed_status()
+    }
+
+    /// Fold a `thread/status/changed` broadcast into the cache. This path is
+    /// deliberately independent of a subscription: the server broadcasts the
+    /// notification to every connection, so Session Sync learns a thread's
+    /// busy/idle state without `thread/resume`.
+    fn ingest_status(&self, params: &Value) {
+        let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
+            return;
+        };
+        let decoded = params.get("status").and_then(decode_thread_status);
+        if decoded.is_none() {
+            tracing::warn!(
+                thread = %thread_id,
+                "a codex thread status did not decode; clearing the cached state"
+            );
+        }
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .set_observed_status(decoded);
+    }
+
+    /// Forget every explicit status after the connection's push stream lagged:
+    /// a status notification that was dropped could otherwise leave a session
+    /// busy forever. With no cached state the next read adopts the thread (or
+    /// answers from its subscription-derived live flag).
+    fn clear_statuses(&self) {
+        let projections: Vec<_> = self
+            .threads
+            .lock()
+            .expect("codex projections")
+            .values()
+            .cloned()
+            .collect();
+        for projection in projections {
+            projection
                 .lock()
                 .expect("codex projection")
-                .is_live()
-            {
-                SessionStatus::Busy
-            } else {
-                SessionStatus::Idle
-            },
-        )
+                .set_observed_status(None);
+        }
+    }
+
+    /// Start the status consumer over `connection`'s push stream. The status
+    /// family is server-broadcast (ADR-0090's amendment), so this is a second,
+    /// subscription-free reader of the same broadcast the thread dispatcher
+    /// consumes; it owns no thread and sends no request.
+    pub(crate) fn watch_thread_status(self: &Arc<Self>, connection: &RpcConnection) {
+        let mut inbound = connection.inbound();
+        let projections = Arc::downgrade(self);
+        let task = tokio::spawn(async move {
+            loop {
+                match inbound.recv().await {
+                    Ok(Inbound::Notification { method, params }) if method == THREAD_STATUS_CHANGED => {
+                        let Some(projections) = projections.upgrade() else {
+                            return;
+                        };
+                        projections.ingest_status(&params);
+                    }
+                    Ok(Inbound::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            skipped,
+                            "the codex status stream fell behind; clearing the cached statuses"
+                        );
+                        if let Some(projections) = projections.upgrade() {
+                            projections.clear_statuses();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.track(task);
     }
 
     pub(crate) fn live_turn(&self, thread_id: &str) -> Option<String> {
@@ -753,9 +847,13 @@ impl Backend for CodexClient {
     ) -> Result<Option<SessionStatus>> {
         // The cache is not the server's status service: an unseeded projection
         // answering `Idle` would present "never observed" as an authoritative
-        // idle run. Adopt the thread first (which seeds its live turn from the
-        // resume history); a never-run thread then genuinely has no live run.
-        if !self.projections.is_seeded(session_id) {
+        // idle run. A `thread/status/changed` broadcast is already the server's
+        // own run state for the thread — subscribed or not — so a status it
+        // reported is answered without adopting (Session Sync must not resume a
+        // thread just to read its state). Otherwise adopt the thread first
+        // (which seeds its live turn from the resume history); a never-run
+        // thread then genuinely has no live run.
+        if self.projections.observed_status(session_id).is_none() && !self.projections.is_seeded(session_id) {
             self.ensure_subscription(session_id).await.map_err(client_error)?;
         }
         Ok(self.projections.status(session_id))
@@ -1085,6 +1183,23 @@ mod tests {
         }
     }
 
+    /// Wait until the broadcast status for `thread_id` is `expected` — the
+    /// status consumer is a task of its own, so an assertion on its next tick
+    /// would race it.
+    async fn wait_for_observed_status(client: &CodexClient, thread_id: &str, expected: Option<ThreadStatus>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if client.projections.observed_status(thread_id) == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for status {expected:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Ticket #879: the recorded notification fixture replays through the real
     /// connection, and two reads deliver the same transcript with no duplicate
     /// items.
@@ -1242,6 +1357,61 @@ mod tests {
         );
         assert_eq!(server.resume_calls(), 1);
         server.wait_for_subscribers("thread-1", 1).await;
+    }
+
+    /// Ticket #880 acceptance 2: Session Sync's status read is served by the
+    /// `thread/status/changed` broadcast — which reaches every connection,
+    /// subscribed or not — so a session whose thread cola never resumed still
+    /// reports Busy/Idle. No `thread/resume` may be sent.
+    #[tokio::test]
+    async fn session_status_is_fed_by_the_status_broadcast_without_subscribing() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a thread",
+        ));
+        let client = connect(&url).await;
+
+        server.push_notification(
+            "thread/status/changed",
+            json!({
+                "threadId": "thread-1",
+                "status": { "type": "active", "activeFlags": [] },
+            }),
+        );
+        wait_for_observed_status(&client, "thread-1", Some(ThreadStatus::Active)).await;
+
+        assert_eq!(
+            client
+                .session_status("thread-1", None)
+                .await
+                .expect("status read"),
+            Some(SessionStatus::Busy),
+            "the broadcast's active status reads as busy"
+        );
+        assert_eq!(
+            server.resume_calls(),
+            0,
+            "Session Sync must not subscribe a thread just to read its status"
+        );
+
+        server.push_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-1", "status": { "type": "idle" } }),
+        );
+        wait_for_observed_status(&client, "thread-1", Some(ThreadStatus::Idle)).await;
+
+        assert_eq!(
+            client
+                .session_status("thread-1", None)
+                .await
+                .expect("status read"),
+            Some(SessionStatus::Idle),
+            "a discarded run reads as idle"
+        );
+        assert_eq!(server.resume_calls(), 0);
     }
 
     /// A bounded `thread/resume` page is never presented as the whole history:

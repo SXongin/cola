@@ -226,11 +226,18 @@ impl CodexClient {
             "attached to codex app-server"
         );
 
+        // Start the status consumer before the thread dispatcher can consume the
+        // same broadcast: `thread/status/changed` is server-broadcast, so
+        // Session Sync must read it even for a thread this connection never
+        // resumes.
+        let projections = Arc::new(Projections::default());
+        projections.watch_thread_status(&connection);
+
         Ok(Self {
             threads: Threads::new(connection.clone()),
             connection,
             endpoint: options.endpoint.clone(),
-            projections: Arc::new(Projections::default()),
+            projections,
             tasks: options.tasks.clone(),
             server: ServerInfo {
                 user_agent,

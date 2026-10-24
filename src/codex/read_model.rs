@@ -57,6 +57,35 @@ const TURN_DIFF_UPDATED: &str = "turn/diff/updated";
 const TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
 const ERROR_NOTIFICATION: &str = "error";
 
+/// The live-turn state a `thread/status/changed` broadcast reports. The
+/// neutral [`crate::backend::types::SessionStatus`] is derived from it at the
+/// `Backend` seam; this type keeps the wire's own vocabulary here, where it
+/// belongs (ADR-0053).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadStatus {
+    /// A turn is running on the thread (`{"type":"active", …}`).
+    Active,
+    /// No turn is running: `idle`, a thread the server unloaded
+    /// (`notLoaded`), or one whose last run ended in a system error. All three
+    /// mean "not live" to Session Sync; the run-state detail that matters to
+    /// `cola doctor` is #883's.
+    Idle,
+}
+
+/// Decode one `thread/status/changed` status value, tolerating both the tagged
+/// object and a bare string spelling. An unknown type is no evidence — the
+/// caller clears the cached status rather than guessing.
+pub(crate) fn decode_thread_status(value: &Value) -> Option<ThreadStatus> {
+    let kind = value
+        .as_str()
+        .or_else(|| value.get("type").and_then(Value::as_str))?;
+    match kind {
+        "active" => Some(ThreadStatus::Active),
+        "idle" | "notLoaded" | "systemError" => Some(ThreadStatus::Idle),
+        _ => None,
+    }
+}
+
 /// One thread's folded notifications. Construct with [`Self::new`]; apply
 /// decoded events with [`Self::apply`] and read the neutral view with
 /// [`Self::transcript`].
@@ -79,6 +108,11 @@ pub(crate) struct ThreadProjection {
     context_window: Option<i64>,
     /// The turn between `turn/started` and `turn/completed`, if any.
     live_turn: Option<String>,
+    /// The last explicit run state: a `thread/status/changed` broadcast (which
+    /// arrives on this connection whether the thread is subscribed or not) or
+    /// a turn boundary folded from the subscription. `None` means no status
+    /// has been observed, so the read falls back to [`Self::is_live`].
+    status: Option<ThreadStatus>,
     /// Set when a subscription gap means the projection may be missing events;
     /// cleared only by a successful `thread/read` resync.
     incomplete: bool,
@@ -105,6 +139,16 @@ impl ThreadProjection {
     /// finished turn would be a stale write.
     pub(crate) fn live_turn(&self) -> Option<&str> {
         self.live_turn.as_deref()
+    }
+
+    /// The last explicit run state, if one was observed.
+    pub(crate) fn observed_status(&self) -> Option<ThreadStatus> {
+        self.status
+    }
+
+    /// Record a `thread/status/changed` broadcast for this thread.
+    pub(crate) fn set_observed_status(&mut self, status: Option<ThreadStatus>) {
+        self.status = status;
     }
 
     /// Mark the projection as having missed events. The subscriber then
@@ -420,6 +464,11 @@ impl ThreadProjection {
             .turn
             .completed_at
             .map(|seconds| seconds.saturating_mul(1000));
+        self.status = Some(if status == "inProgress" {
+            ThreadStatus::Active
+        } else {
+            ThreadStatus::Idle
+        });
         {
             let turn = self.ensure_turn(&id);
             turn.started_ms = started.or(turn.started_ms);
@@ -457,6 +506,7 @@ impl ThreadProjection {
             .status
             .clone()
             .unwrap_or_else(|| "completed".to_string());
+        self.status = Some(ThreadStatus::Idle);
         {
             let turn = self.ensure_turn(&id);
             turn.completed_ms = completed.or(turn.completed_ms);
@@ -478,12 +528,29 @@ impl ThreadProjection {
     }
 
     fn turn_error(&mut self, notification: ErrorNotification) {
-        if let Some(turn_id) = notification.turn_id {
-            let message = notification.error.message;
-            if !message.is_empty() {
-                self.ensure_turn(&turn_id).error = Some(message);
-            }
+        let Some(turn_id) = notification.turn_id else {
+            return;
+        };
+        let message = notification.error.message;
+        if !message.is_empty() {
+            self.ensure_turn(&turn_id).error = Some(message);
         }
+        // A retrying error leaves the turn live (the server schedules another
+        // attempt). A terminal one is the turn's ending even when no
+        // `turn/completed` follows: settle it here so the card can take its
+        // error text instead of hanging on a run that has already failed.
+        if notification.will_retry {
+            return;
+        }
+        {
+            let turn = self.ensure_turn(&turn_id);
+            turn.live = false;
+            turn.status = "failed".to_string();
+        }
+        if self.live_turn.as_deref() == Some(turn_id.as_str()) {
+            self.live_turn = None;
+        }
+        self.status = Some(ThreadStatus::Idle);
     }
 
     fn turn_diff(&mut self, notification: TurnDiffUpdated) {
@@ -844,7 +911,9 @@ impl Item {
     }
 
     fn is_assistant(&self) -> bool {
-        !matches!(self.kind, ItemKind::UserMessage { .. })
+        // The neutral role's predicate: a user message and a compaction are
+        // the two non-assistant items (a compaction is a session fact).
+        !matches!(self.kind, ItemKind::UserMessage { .. } | ItemKind::Compaction)
     }
 
     /// The tool state of an item whose wire type carries no status field
@@ -1044,7 +1113,11 @@ impl Item {
                 })],
             ),
             ItemKind::Compaction => (
-                MessageRole::Assistant,
+                // A compaction is a Session-scoped fact, not an assistant
+                // answer (ADR-0082): the neutral role says so, so it neither
+                // answers a Turn nor takes its newest-assistant error/step
+                // finish. The card's compaction walk reads the part itself.
+                MessageRole::Other("compaction".into()),
                 vec![Part::Compaction(Compaction {
                     status: if self.completed {
                         CompactionStatus::Completed
@@ -1885,6 +1958,11 @@ struct ErrorNotification {
     #[serde(default)]
     turn_id: Option<String>,
     error: WireError,
+    /// Whether the server schedules another attempt. A missing field is read
+    /// as terminal (the pinned surface carries it): a malformed error must
+    /// never leave a card hanging on a run the server has abandoned.
+    #[serde(default)]
+    will_retry: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2518,6 +2596,199 @@ mod tests {
         let transcript = projection.transcript();
         assert_eq!(transcript.messages.len(), 1);
         assert_eq!(transcript.messages[0].id.as_str(), "item-a");
+    }
+
+    /// Ticket #880 acceptance 5: a terminal `error` notification is the turn's
+    /// ending even when no `turn/completed` follows. The card reads the failure
+    /// from the transcript's newest assistant message and settles instead of
+    /// hanging on a run the server has abandoned.
+    #[test]
+    fn a_terminal_error_settles_the_live_turn_with_its_text() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            TURN_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000_i64 }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_000_i64,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user",
+                    "content": [{ "type": "text", "text": "go" }]
+                }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_001_000_i64,
+                "item": { "type": "agentMessage", "id": "item-agent", "text": "" }
+            }),
+        );
+        projection.apply(
+            AGENT_DELTA,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-agent",
+                "delta": "partial"
+            }),
+        );
+        assert!(projection.is_live());
+
+        projection.apply(
+            ERROR_NOTIFICATION,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "error": { "message": "401 unauthorized" },
+                "willRetry": false
+            }),
+        );
+
+        assert!(!projection.is_live(), "a terminal error ends the turn");
+        assert_eq!(projection.observed_status(), Some(ThreadStatus::Idle));
+        let transcript = projection.transcript();
+        let anchor = transcript
+            .newest_user()
+            .and_then(|user| user.anchor())
+            .expect("turn anchor");
+        let turn = transcript.turn_for_user(&anchor);
+        assert_eq!(turn.error.as_deref(), Some("401 unauthorized"));
+        assert!(turn.complete, "the failure is a terminal ending");
+        assert_eq!(
+            transcript.settle(Some(&anchor)),
+            crate::backend::TurnSettle::Failed("401 unauthorized".to_string())
+        );
+    }
+
+    /// The retrying shape of the same notification is NOT an ending: the
+    /// server schedules another attempt, so the turn stays live and its card
+    /// keeps streaming.
+    #[test]
+    fn a_retrying_error_keeps_the_turn_live() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            TURN_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000_i64 }
+            }),
+        );
+        projection.apply(
+            ERROR_NOTIFICATION,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "error": { "message": "stream disconnected" },
+                "willRetry": true
+            }),
+        );
+        assert!(projection.is_live(), "a retry keeps the run live");
+        assert_eq!(projection.observed_status(), Some(ThreadStatus::Active));
+    }
+
+    /// The status family is not transcript content: a stray broadcast routed to
+    /// a subscription is ignored rather than folded into the read.
+    #[test]
+    fn a_status_notification_does_not_pollute_the_transcript() {
+        let mut projection = ThreadProjection::new("thread-1");
+        assert!(!projection.apply(
+            "thread/status/changed",
+            &json!({
+                "threadId": "thread-1",
+                "status": { "type": "active", "activeFlags": [] }
+            })
+        ));
+        assert!(projection.transcript().messages.is_empty());
+    }
+
+    /// Ticket #880 acceptance 3: the compaction's message identity and server
+    /// time are what the Rendered Cursor remembers, so the projection must
+    /// rebuild them identically from persisted history after a restart. The
+    /// card then skips the position and the row renders once, on the card that
+    /// owns it.
+    #[test]
+    fn a_compaction_keeps_its_position_across_a_restart_resync() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            TURN_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000_i64 }
+            }),
+        );
+        projection.apply(
+            ITEM_COMPLETED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "completedAtMs": 1_700_000_002_000_i64,
+                "item": { "type": "contextCompaction", "id": "item-compaction" }
+            }),
+        );
+        let before = projection.transcript();
+        let carried = before
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-compaction")
+            .expect("the live projection carries the compaction");
+        assert_eq!(
+            carried.role,
+            MessageRole::Other("compaction".to_string()),
+            "a compaction is a session fact, not an assistant answer"
+        );
+        assert!(matches!(
+            carried.parts.first(),
+            Some(Part::Compaction(fact)) if fact.status == CompactionStatus::Completed
+        ));
+        let created = carried.time.expect("the message's server time").created;
+
+        // The restart path: rebuild from `thread/turns/list`'s persisted turns.
+        projection.resync(&[json!({
+            "id": "turn-1",
+            "status": "completed",
+            "startedAt": 1_700_000_000,
+            "completedAt": 1_700_000_002,
+            "error": null,
+            "items": [{ "type": "contextCompaction", "id": "item-compaction" }]
+        })]);
+
+        let after = projection.transcript();
+        let rebuilt = after
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-compaction")
+            .expect("the resync rebuilds the same compaction identity");
+        assert_eq!(
+            rebuilt.time.expect("the rebuilt message's time").created,
+            created,
+            "the server time the Rendered Cursor keys on is stable"
+        );
+        assert!(matches!(
+            rebuilt.parts.first(),
+            Some(Part::Compaction(fact)) if fact.status == CompactionStatus::Completed
+        ));
+
+        // The compaction is not an answer: the turn's completion and error do
+        // not ride it.
+        let anchor = crate::backend::TurnAnchor {
+            message_id: crate::backend::MessageId::new("item-compaction"),
+            created_ms: created,
+        };
+        assert!(
+            after.turn_for_user(&anchor).messages.is_empty(),
+            "a compaction never joins the Turn's assistant window"
+        );
     }
 
     fn rust_sources(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
