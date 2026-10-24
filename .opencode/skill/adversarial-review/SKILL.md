@@ -5,7 +5,7 @@ description: Repo-local companion to the two-axis `/code-review`. Run the Codex 
 
 # Adversarial review
 
-The binding — its pairing with `/code-review`, which review points, who runs it, how findings route, the re-review bound — is `docs/agents/flow.md`; this skill adds only the pass below.
+The binding — its pairing with `/code-review`, which review points, who runs it, how findings route — is `docs/agents/flow.md`; this skill adds only the pass below.
 
 CI deliberately kept this pass out of `/code-review` (`ADR-0034`, 2026-10-04 amendment), which left the author-side review blind to exactly the class the gate blocks on: a negative path the new test never walks, a test that still passes with the change reverted, an unhandled error/cleanup/ordering path, a lost tail under a size split. Running it locally is the deliberate trade recorded in `ADR-0034`'s 2026-10-09 amendment — fewer review round-trips.
 
@@ -33,7 +33,7 @@ Dispatch a single `code-reviewer` sub-agent **from the orchestrating session** �
 
 ### 3. Re-review round (same scope)
 
-`docs/agents/flow.md` binds when a re-review runs and its two-round bound. Resume the **same** reviewer session with:
+`docs/agents/flow.md` binds when a re-review runs. Resume the **same** reviewer session with:
 
 - the findings **verbatim**;
 - the ref pair `<round-head>..HEAD` for the fix's delta, plus the unchanged full-diff command;
