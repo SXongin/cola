@@ -116,13 +116,17 @@ pub struct Capability {
 /// (ADR-0090 decision 3's diagnosis).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserClientState {
-    /// The process names the discovered runtime as its endpoint, so it shares
-    /// that runtime's sessions (the supported configuration).
+    /// The process holds a live connection to the discovered runtime (proven
+    /// from its open socket file descriptor where the OS exposes it).
     Attached,
     /// The process runs its own embedded runtime and shares nothing.
     Embedded,
-    /// The process may share the runtime, but its argv cannot prove it.
+    /// The process may share the runtime, but neither its argv nor its open
+    /// descriptors settle it.
     Unverified,
+    /// The process points at an endpoint that is not the discovered runtime,
+    /// or at no reachable runtime at all, so it cannot share this one.
+    Unreachable,
 }
 
 /// One local client process the active adapter observed.
@@ -178,17 +182,21 @@ pub struct ClientReport {
     pub client_binary: Option<String>,
 }
 
-/// The `cola doctor --check-turn` outcome (ADR-0090's amendment: a turn with no
+/// The `cola doctor` turn outcome (ADR-0090's amendment: a turn with no
 /// usable credential is accepted and then fails as a retryable `error`, so a
 /// login-shaped check would pass while every turn died).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnProbe {
-    /// The configured provider completed a minimal turn.
-    Passed { detail: String },
+    /// The configured provider completed a minimal turn. `cleanup` names a
+    /// failure to remove the probe's scratch thread (or stop its turn): the
+    /// provider worked, but the diagnostic must not present a clean pass when
+    /// it left its own write behind.
+    Passed { detail: String, cleanup: Option<String> },
     /// The turn failed — a retryable or terminal error, a refusal, a closed
-    /// connection, or the budget expiry.
+    /// connection, or the budget expiry. A cleanup failure is appended to the
+    /// detail.
     Failed { detail: String },
-    /// The probe could not run (no runtime attached).
+    /// The probe could not run (no runtime attached, or the user opted out).
     NotAttempted { detail: String },
 }
 
@@ -244,9 +252,9 @@ pub trait ServerLifecycle: Send + Sync {
 
     /// Establish that the configured provider can actually complete a turn
     /// (ADR-0090's amendment, ticket #883). This is a **real turn** on a
-    /// scratch thread — a side effect on a runtime cola does not own — so the
-    /// CLI only calls it for `cola doctor --check-turn`, never for a plain
-    /// `status` or `doctor`.
+    /// scratch thread — a side effect on a runtime cola does not own — so a
+    /// plain `status` never calls it, and `doctor` calls it by default with
+    /// `--no-turn-check` as the explicit opt-out.
     async fn probe_turn(&self) -> TurnProbe {
         TurnProbe::NotAttempted {
             detail: "this client has no turn probe".to_string(),

@@ -327,6 +327,8 @@ struct State {
     /// Threads deleted through `thread/delete`, in call order — the doctor
     /// probe's cleanup assertion.
     deleted_threads: std::sync::Mutex<Vec<String>>,
+    /// How many upcoming `thread/delete` calls answer with a JSON-RPC error.
+    reject_thread_deletes: AtomicUsize,
     /// Threads whose `turn/start` (and steer) echoes the request's own input as
     /// a server-generated `userMessage` item, so a test reads the prompt off the
     /// stream instead of hand-writing it.
@@ -398,6 +400,7 @@ impl Default for State {
             next_item: AtomicUsize::new(1),
             next_thread: AtomicUsize::new(1),
             deleted_threads: std::sync::Mutex::new(Vec::new()),
+            reject_thread_deletes: AtomicUsize::new(0),
             echo_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             models: std::sync::Mutex::new(Vec::new()),
             model_page_size: AtomicUsize::new(50),
@@ -782,6 +785,11 @@ impl FakeServer {
         self.state.fail_turns_pages.store(count, Ordering::SeqCst);
     }
 
+    /// Fail the next `count` `thread/delete` calls with a JSON-RPC error.
+    pub(crate) fn reject_thread_deletes(&self, count: usize) {
+        self.state.reject_thread_deletes.store(count, Ordering::SeqCst);
+    }
+
     /// Threads deleted through `thread/delete`, in call order.
     pub(crate) fn deleted_threads(&self) -> Vec<String> {
         self.state
@@ -1089,6 +1097,11 @@ where
             reply(sink, id, json!({ "thread": thread_json(&thread) })).await
         }
         Some("thread/delete") => {
+            let remaining = state.reject_thread_deletes.load(Ordering::SeqCst);
+            if remaining > 0 {
+                state.reject_thread_deletes.fetch_sub(1, Ordering::SeqCst);
+                return reply_error(sink, id, -32000, "delete refused").await;
+            }
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             state
                 .threads

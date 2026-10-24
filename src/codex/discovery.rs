@@ -247,35 +247,52 @@ pub(crate) struct EmbeddedClient {
     pub(crate) evidence: &'static str,
 }
 
-/// A local Codex TUI that is **proven** to share the daemon: its `--remote`
-/// names the discovered control socket (or the socket the symlink resolves to).
+/// A local Codex TUI proven to share the daemon: it holds a live unix-socket
+/// connection to the daemon's control socket.
 ///
-/// This is the positive half of ADR-0090 decision 3's diagnosis: the user's
-/// own client is attached to the one runtime cola mirrors. A `--remote` that
-/// names another server is not this daemon, so it is not reported here (a
-/// process scan cannot judge someone else's endpoint).
+/// This is the positive half of ADR-0090 decision 3's diagnosis: the user's own
+/// client is attached to the one runtime cola mirrors. An argv match is not
+/// proof — a TUI started before the control symlink was re-pointed still names
+/// the path while remaining connected to the old daemon — so [`prove_attachments`]
+/// settles it from the process's open descriptors where the OS exposes them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachedClient {
     pub(crate) pid: i32,
     pub(crate) binary: String,
-    /// The endpoint spelling the process was launched with, for the report.
+    /// The endpoint spelling the process was launched with (or the daemon's
+    /// control socket for an implicit attachment), for the report.
     pub(crate) endpoint: String,
+    pub(crate) detail: String,
 }
 
-/// A local Codex TUI that a daemon exists for, but whose argv cannot establish
-/// that it joined that daemon.
+/// A local Codex TUI whose sharing the available evidence cannot settle.
 ///
 /// A TUI launched with neither `--remote` nor `--no-daemon` normally attaches to
 /// the shared daemon — but one started **before** the daemon appeared fell back
-/// to its own embedded server and stays there. The process table cannot tell
-/// the two apart, and claiming sharing cola cannot establish is exactly the
-/// silence ADR-0090 decision 3 rejects. So the state is reported as
-/// **unverified** for `cola doctor` (#883) to settle against the live daemon
-/// (its loaded threads / a turn), never assumed.
+/// to its own embedded server and stays there. The process's argv cannot tell
+/// the two apart. On Linux the open descriptors can, and [`prove_attachments`]
+/// upgrades a live connection to [`AttachedClient`]; where that evidence is
+/// unavailable the state stays **unverified**, never assumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnverifiedClient {
     pub(crate) pid: i32,
     pub(crate) binary: String,
+    /// The `--remote` endpoint the client named, when it named one.
+    pub(crate) endpoint: Option<String>,
+    pub(crate) detail: String,
+}
+
+/// A local Codex TUI pointed at an endpoint that is not the discovered daemon
+/// (or at no reachable daemon at all). It cannot share this daemon's threads.
+///
+/// Deliberately not "embedded": a remote WebSocket is equally unmatched, and
+/// calling it embedded would claim evidence the process table does not have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnreachableClient {
+    pub(crate) pid: i32,
+    pub(crate) binary: String,
+    pub(crate) endpoint: String,
+    pub(crate) detail: String,
 }
 
 /// The local Codex clients one process-table scan observed.
@@ -283,10 +300,12 @@ pub(crate) struct UnverifiedClient {
 pub(crate) struct LocalClients {
     /// Clients proven to run their own app-server.
     pub(crate) embedded: Vec<EmbeddedClient>,
-    /// Clients proven to share the discovered daemon (`--remote` names it).
+    /// Clients proven to hold a live connection to the discovered daemon.
     pub(crate) attached: Vec<AttachedClient>,
-    /// Clients sharing the daemon cannot be confirmed from argv.
+    /// Clients whose sharing the available evidence cannot settle.
     pub(crate) unverified: Vec<UnverifiedClient>,
+    /// Clients pointed at another (or no) endpoint.
+    pub(crate) unreachable: Vec<UnreachableClient>,
 }
 
 /// A running daemon together with the control socket identity the **same**
@@ -584,16 +603,16 @@ pub(crate) fn local_clients(daemon: Option<&Path>) -> LocalClients {
             daemon,
         ) {
             Some(Observation::Embedded(client)) => found.embedded.push(client),
-            Some(Observation::Attached(client)) => found.attached.push(client),
             Some(Observation::Unverified(client)) => found.unverified.push(client),
+            Some(Observation::Unreachable(client)) => found.unreachable.push(client),
             None => {}
         }
     }
     // sysinfo enumerates in a randomized order; a report that changes shape
     // between two identical scans would be noise.
     found.embedded.sort_by_key(|client| client.pid);
-    found.attached.sort_by_key(|client| client.pid);
     found.unverified.sort_by_key(|client| client.pid);
+    found.unreachable.sort_by_key(|client| client.pid);
     found
 }
 
@@ -675,22 +694,22 @@ fn tui_invocation(arguments: &[String]) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
     Embedded(EmbeddedClient),
-    Attached(AttachedClient),
     Unverified(UnverifiedClient),
+    Unreachable(UnreachableClient),
 }
 
 /// Read one process as a local Codex TUI.
 ///
 /// `--no-daemon` is the documented, decisive opt-out (`Run without the shared
-/// background server`), and Codex only accepts it on the TUI. A TUI with no
-/// daemon running and no `--remote` endpoint has nowhere else to attach, so it
-/// fell back to its in-process server. A `--remote` TUI names its server, so it
-/// is **attached** exactly when that endpoint is the discovered daemon's
-/// control socket (compared after following symlinks), and not reported when it
-/// names another server. With a daemon present, a TUI's argv without `--remote`
-/// does **not** prove it joined it — one started before the daemon appeared
-/// stays on its private server — so it is reported as unverified, never assumed
-/// to share.
+/// background server`), and Codex only accepts it on the TUI, so that process
+/// is **embedded**. A TUI with no daemon running and no `--remote` endpoint has
+/// nowhere else to attach and is embedded too. A `--remote` TUI is
+/// **unverified** when its endpoint names the discovered control socket (argv
+/// is intent, not a live connection; [`prove_attachments`] settles it) and
+/// **unreachable** when it names another endpoint or no daemon is running. With
+/// a daemon present, a TUI's argv without `--remote` does **not** prove it
+/// joined it — one started before the daemon appeared stays on its private
+/// server — so it too is reported as unverified, never assumed to share.
 fn observe_client(
     pid: i32,
     process_name: &str,
@@ -713,15 +732,32 @@ fn observe_client(
         }));
     }
     if let Some(endpoint) = remote_endpoint(arguments) {
-        return daemon
-            .filter(|socket| endpoint_matches(&endpoint, socket))
-            .map(|_| {
-                Observation::Attached(AttachedClient {
-                    pid,
-                    binary,
-                    endpoint,
-                })
-            });
+        if daemon.is_some_and(|socket| endpoint_matches(&endpoint, socket)) {
+            // The argv names this daemon, not proof of a live connection: a
+            // TUI started before the control symlink was re-pointed still
+            // names the path while attached to the old daemon.
+            return Some(Observation::Unverified(UnverifiedClient {
+                pid,
+                binary,
+                endpoint: Some(endpoint),
+                detail: "its `--remote` names the daemon, but argv is not proof of a live \
+                         connection"
+                    .to_string(),
+            }));
+        }
+        let detail = match daemon {
+            Some(socket) => format!(
+                "points at `{endpoint}`, not the discovered daemon at {}",
+                socket.display()
+            ),
+            None => format!("points at `{endpoint}`, and no shared daemon is running"),
+        };
+        return Some(Observation::Unreachable(UnreachableClient {
+            pid,
+            binary,
+            endpoint,
+            detail,
+        }));
     }
     if daemon.is_none() {
         return Some(Observation::Embedded(EmbeddedClient {
@@ -730,7 +766,14 @@ fn observe_client(
             evidence: "no daemon is running, so the TUI fell back to an embedded app-server",
         }));
     }
-    Some(Observation::Unverified(UnverifiedClient { pid, binary }))
+    Some(Observation::Unverified(UnverifiedClient {
+        pid,
+        binary,
+        endpoint: None,
+        detail: "names no `--remote`; whether it shares the daemon cannot be established from \
+                 argv"
+            .to_string(),
+    }))
 }
 
 /// The endpoint a TUI's `--remote` names, in either `--remote <value>` or
@@ -763,6 +806,162 @@ fn endpoint_matches(endpoint: &str, daemon: &Path) -> bool {
         (Ok(remote), Ok(daemon)) => remote == daemon,
         _ => remote == daemon,
     }
+}
+
+/// How long `ss` gets to report the kernel's established unix-socket table.
+#[cfg(target_os = "linux")]
+const SS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upgrade local clients to **attached** only when their open descriptors prove
+/// a live connection to `daemon` (ADR-0090 decision 3, ticket #883).
+///
+/// On Linux, `/proc/<pid>/fd/*` exposes each open socket's inode, and
+/// `ss -x -e` pairs a socket with the filesystem inode of the socket at the
+/// other end. Comparing the latter to the daemon control socket's own inode
+/// proves the client is connected to *this* daemon: if the control-socket
+/// symlink is re-pointed after the client connected, the old connection no
+/// longer matches the new path and the client stays unverified. Where `/proc`,
+/// `ss`, or the descriptor table is unavailable, every client stays unverified —
+/// argv is never promoted to proof.
+#[cfg(target_os = "linux")]
+pub(crate) async fn prove_attachments(clients: &mut LocalClients, daemon: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(metadata) = std::fs::metadata(daemon) else {
+        return;
+    };
+    let daemon_inode = metadata.ino();
+    let Some(peers) = established_unix_peers().await else {
+        return;
+    };
+    let mut attached = Vec::new();
+    let mut unverified = Vec::new();
+    for client in std::mem::take(&mut clients.unverified) {
+        let socket_inodes = process_socket_inodes(client.pid);
+        if socket_inodes.is_empty() || !peer_matches(&socket_inodes, &peers, daemon_inode) {
+            unverified.push(client);
+            continue;
+        }
+        attached.push(AttachedClient {
+            pid: client.pid,
+            binary: client.binary,
+            endpoint: client
+                .endpoint
+                .unwrap_or_else(|| format!("unix://{}", daemon.display())),
+            detail: format!(
+                "holds a live unix-socket connection to the daemon at {}",
+                daemon.display()
+            ),
+        });
+    }
+    clients.attached = attached;
+    clients.unverified = unverified;
+    clients.attached.sort_by_key(|client| client.pid);
+}
+
+/// Non-Linux platforms expose no equivalent descriptor evidence here; never
+/// promote argv to proof.
+#[cfg(not(target_os = "linux"))]
+pub(crate) async fn prove_attachments(_clients: &mut LocalClients, _daemon: &Path) {}
+
+/// The kernel's established unix-socket pairs as `(filesystem inode, peer
+/// socket inode)`.
+///
+/// `ss -x -e` is the only portable way to learn a socket's **peer**: the
+/// descriptor target (`socket:[inode]`) and `/proc/net/unix` carry no peer
+/// information. A missing `ss` is not an error — it downgrades the diagnosis to
+/// unverified.
+#[cfg(target_os = "linux")]
+async fn established_unix_peers() -> Option<Vec<(u64, u64)>> {
+    for program in ["ss", "/usr/sbin/ss", "/usr/bin/ss", "/sbin/ss"] {
+        let output = tokio::time::timeout(
+            SS_TIMEOUT,
+            tokio::process::Command::new(program).args(["-x", "-e"]).output(),
+        )
+        .await;
+        if let Ok(Ok(output)) = output
+            && output.status.success()
+        {
+            return Some(parse_established_unix_peers(&String::from_utf8_lossy(
+                &output.stdout,
+            )));
+        }
+    }
+    None
+}
+
+/// Parse the `u_str ESTAB … <-> ino:<fs-inode> dev:<…>` rows of `ss -x -e`.
+///
+/// The `-e` suffix is fixed, so the fields are read from the right: the peer
+/// inode is the last numeric before `<->`, and the local socket's filesystem
+/// inode follows `ino:`. This survives a path containing spaces, which the
+/// space-separated middle of the line does not.
+#[cfg(target_os = "linux")]
+fn parse_established_unix_peers(text: &str) -> Vec<(u64, u64)> {
+    let mut peers = Vec::new();
+    for line in text.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if tokens.len() < 8 || tokens[0] != "u_str" || tokens[1] != "ESTAB" {
+            continue;
+        }
+        let Some(arrow) = tokens.get(tokens.len().saturating_sub(3)) else {
+            continue;
+        };
+        if *arrow != "<->" {
+            continue;
+        }
+        let Some(filesystem_inode) = tokens
+            .get(tokens.len().saturating_sub(2))
+            .and_then(|token| token.strip_prefix("ino:"))
+            .and_then(|inode| inode.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        let Some(peer) = tokens
+            .get(tokens.len().saturating_sub(4))
+            .and_then(|inode| inode.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        peers.push((filesystem_inode, peer));
+    }
+    peers
+}
+
+/// The socket inodes a process holds open, from `/proc/<pid>/fd`.
+#[cfg(target_os = "linux")]
+fn process_socket_inodes(pid: i32) -> Vec<u64> {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    let mut inodes = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Some(target) = target.to_str() else {
+            continue;
+        };
+        let Some(rest) = target.strip_prefix("socket:[") else {
+            continue;
+        };
+        let Some(inode) = rest.strip_suffix(']').and_then(|inode| inode.parse().ok()) else {
+            continue;
+        };
+        inodes.push(inode);
+    }
+    inodes
+}
+
+/// Whether any of the process's sockets is the peer of a socket bound at
+/// `daemon_inode`.
+#[cfg(target_os = "linux")]
+fn peer_matches(socket_inodes: &[u64], peers: &[(u64, u64)], daemon_inode: u64) -> bool {
+    socket_inodes.iter().any(|inode| {
+        peers
+            .iter()
+            .any(|(filesystem_inode, peer)| *filesystem_inode == daemon_inode && peer == inode)
+    })
 }
 
 /// Resolve the Codex client binary the way a spawn would: an absolute or
@@ -969,10 +1168,16 @@ mod tests {
         };
         assert_eq!(client.pid, 9);
         assert!(client.evidence.contains("embedded"), "{}", client.evidence);
-        assert!(
-            observe_client(9, "codex", &args("codex --remote ws://host:1"), None).is_none(),
-            "a remote client is not judged by a process scan"
-        );
+        // A remote endpoint is not embedded: it names a server, even when the
+        // endpoint is not this daemon (a ws listener cannot be compared from
+        // the process table). It is an unreachable remote, not an embedded one.
+        let Some(Observation::Unreachable(remote)) =
+            observe_client(9, "codex", &args("codex --remote ws://host:1"), None)
+        else {
+            panic!("a remote client is not an embedded one");
+        };
+        assert_eq!(remote.endpoint, "ws://host:1");
+        assert!(remote.detail.contains("no shared daemon"), "{}", remote.detail);
     }
 
     /// The transition the scan cannot settle: a daemon exists, and a TUI names
@@ -990,52 +1195,156 @@ mod tests {
         assert_eq!(client.pid, 9);
         assert!(!embedded(9, &args("codex"), Some(daemon)));
 
-        // `--no-daemon` stays decisive even with a daemon running, and a
-        // `--remote` client that names another listener is outside what this
-        // scan can judge either way.
+        // `--no-daemon` stays decisive even with a daemon running. A `--remote`
+        // that names another listener is an unreachable remote, never embedded.
         assert!(embedded(9, &args("codex --no-daemon"), Some(daemon)));
-        assert!(observe_client(9, "codex", &args("codex --remote ws://host:1"), Some(daemon)).is_none());
+        let Some(Observation::Unreachable(remote)) =
+            observe_client(9, "codex", &args("codex --remote ws://host:1"), Some(daemon))
+        else {
+            panic!("a remote naming another listener is not embedded");
+        };
+        assert!(
+            remote.detail.contains("not the discovered daemon"),
+            "{}",
+            remote.detail
+        );
     }
 
-    /// The positive half: a `--remote` TUI that names the discovered control
-    /// socket is **attached**; one naming another socket is not this daemon
-    /// and is not claimed.
+    /// An argv match names the daemon but is **not** proof of a live
+    /// connection (a TUI started before the control symlink moved still names
+    /// the path). It is unverified until [`prove_attachments`] settles it; a
+    /// `--remote` that names another socket is an unreachable remote.
     #[test]
-    fn a_remote_tui_naming_the_daemon_is_attached() {
+    fn a_remote_tui_naming_the_daemon_is_unverified_until_proven() {
         let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
-        let Some(Observation::Attached(client)) = observe_client(
+        let Some(Observation::Unverified(client)) = observe_client(
             11,
             "codex",
             &args("codex --remote unix:///tmp/codex-daemon-0/app-server-control.sock"),
             Some(daemon),
         ) else {
-            panic!("a --remote endpoint naming the daemon is proof of sharing");
+            panic!("an argv match is unverified, not proven attached");
         };
         assert_eq!(client.pid, 11);
         assert_eq!(
-            client.endpoint,
-            "unix:///tmp/codex-daemon-0/app-server-control.sock"
+            client.endpoint.as_deref(),
+            Some("unix:///tmp/codex-daemon-0/app-server-control.sock")
         );
+        assert!(client.detail.contains("not proof"), "{}", client.detail);
+
+        let Some(Observation::Unreachable(other)) = observe_client(
+            11,
+            "codex",
+            &args("codex --remote unix:///tmp/other/app-server-control.sock"),
+            Some(daemon),
+        ) else {
+            panic!("another server is not this daemon");
+        };
         assert!(
-            observe_client(
-                11,
-                "codex",
-                &args("codex --remote unix:///tmp/other/app-server-control.sock"),
-                Some(daemon)
-            )
-            .is_none(),
-            "another server is not claimed as attached to this daemon"
+            other.detail.contains("not the discovered daemon"),
+            "{}",
+            other.detail
         );
+
         assert!(
-            observe_client(
-                11,
-                "codex",
-                &args("codex --remote=unix:///tmp/codex-daemon-0/app-server-control.sock"),
-                Some(daemon)
-            )
-            .is_some(),
+            matches!(
+                observe_client(
+                    11,
+                    "codex",
+                    &args("codex --remote=unix:///tmp/codex-daemon-0/app-server-control.sock"),
+                    Some(daemon)
+                ),
+                Some(Observation::Unverified(_))
+            ),
             "the --remote=<value> spelling names the same endpoint"
         );
+    }
+
+    /// The `ss -x -e` parser reads the fixed suffix from the right, so a path
+    /// containing spaces and the unrelated rows do not confuse it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_unix_peer_parser_reads_the_fixed_suffix() {
+        let text = "\n\
+             u_str ESTAB 0 0 /tmp/a path/daemon.sock 28465257 * 28465256 <-> ino:1077950 dev:0/71\n\
+             u_str LISTEN 0 4096 /tmp/daemon.sock 28465255 * 0 <-> ino:1077950 dev:0/71\n\
+             u_str ESTAB 0 0 * 5944 * 1765 -->\n";
+        assert_eq!(parse_established_unix_peers(text), vec![(1_077_950, 28_465_256)]);
+    }
+
+    /// Replacement: a client connected to the **old** socket is not proven
+    /// attached to the new one, even when argv still names the path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_connection_to_the_old_socket_does_not_prove_the_new_daemon() {
+        let client_sockets = [28_465_256];
+        let old_peers = [(1_077_950, 28_465_256)];
+        assert!(peer_matches(&client_sockets, &old_peers, 1_077_950));
+        assert!(
+            !peer_matches(&client_sockets, &old_peers, 1_077_951),
+            "a re-pointed symlink has a different inode and must not match"
+        );
+    }
+
+    /// End to end over `/proc` and `ss`, where both are available: the test
+    /// process holds a live connection, and the proof upgrades it; pointing at
+    /// a different listener does not.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_live_descriptor_connection_is_proven_and_a_replaced_one_is_not() {
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let old = root.path().join("old.sock");
+        let new = root.path().join("new.sock");
+        let control = root.path().join("app-server-control.sock");
+        let old_listener = UnixListener::bind(&old).expect("bind old");
+        let _new_listener = UnixListener::bind(&new).expect("bind new");
+        std::os::unix::fs::symlink(&old, &control).expect("symlink to old");
+        // The TUI names the control path and connects through it.
+        let _client = std::os::unix::net::UnixStream::connect(&control).expect("connect old");
+        let _accepted = old_listener.accept().expect("accept old");
+
+        let pid = std::process::id() as i32;
+        let endpoint = format!("unix://{}", control.display());
+        let mut clients = LocalClients {
+            unverified: vec![UnverifiedClient {
+                pid,
+                binary: "codex".into(),
+                endpoint: Some(endpoint.clone()),
+                detail: "argv".into(),
+            }],
+            ..LocalClients::default()
+        };
+        // A missing `ss` is the documented degraded path: nothing is promoted.
+        if established_unix_peers().await.is_none() {
+            eprintln!("skipping descriptor proof: `ss` is unavailable");
+            return;
+        }
+        prove_attachments(&mut clients, &control).await;
+        assert_eq!(clients.attached.len(), 1, "the live connection is proven");
+        assert_eq!(clients.attached[0].pid, pid);
+
+        // The operator re-points the control symlink at a new daemon. The TUI's
+        // argv still names the same path, but its live socket belongs to the
+        // old daemon, so it must not be reported attached to the new one.
+        std::fs::remove_file(&control).expect("remove the old link");
+        std::os::unix::fs::symlink(&new, &control).expect("symlink to new");
+        let mut clients = LocalClients {
+            unverified: vec![UnverifiedClient {
+                pid,
+                binary: "codex".into(),
+                endpoint: Some(endpoint),
+                detail: "argv".into(),
+            }],
+            ..LocalClients::default()
+        };
+        prove_attachments(&mut clients, &control).await;
+        assert!(
+            clients.attached.is_empty(),
+            "the old connection is not the replacement daemon"
+        );
+        assert_eq!(clients.unverified.len(), 1);
     }
 
     #[test]
