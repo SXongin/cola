@@ -21,9 +21,10 @@ use crate::bridge::surfaces::{StandaloneSurface, Surfaces};
 use crate::bridge::turn::Turn;
 
 use super::delivery::{
-    Origin, Residue, already_handled_result, denied_receipt, resolve_blocks, vanished_receipt,
+    Origin, Residue, already_handled_result, denied_receipt, handled_elsewhere_receipt, resolve_blocks,
+    vanished_receipt,
 };
-use super::kind::{PendingRequest, Refusal, RequestKind};
+use super::kind::{PendingRequest, Refusal, RequestKind, permission_target};
 
 /// One question request's captured reply inputs (spec #364, S6): the request's
 /// fields and the index-aligned per-field answer slots (`answers[i]` is `None`
@@ -166,6 +167,19 @@ async fn post_unshowable_notice(
             p.request_id
         ),
     }
+}
+
+/// What to leave behind when a stored surface must stop being interactive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Withdrawal {
+    /// cola refused the request: the card carries the auto-reject copy.
+    Refused,
+    /// The server no longer holds it (another client settled it): a neutral
+    /// "handled elsewhere" surface, never a claim that cola rejected it.
+    ResolvedElsewhere,
+    /// cola could not land its refusal and will retry: a "will retry" surface
+    /// that claims nothing.
+    Retrying,
 }
 
 impl RequestFlow {
@@ -1088,10 +1102,30 @@ impl RequestFlow {
             Refusal::NotApplicable => {}
             Refusal::Refused => {
                 seen.insert(req.id().to_string());
-                self.withdraw_refused_surface(handles, req, dir).await;
+                let withdrawn = self
+                    .withdraw_stored_surface(handles, req, Withdrawal::Refused)
+                    .await;
+                if !withdrawn && let PendingRequest::Permission(p) = req {
+                    post_unshowable_notice(handles, p, dir).await;
+                }
                 return true;
             }
-            Refusal::Failed => return false,
+            // Someone else settled it: withdraw a stored card without claiming
+            // cola rejected anything, post nothing, and treat it as handled.
+            Refusal::ResolvedElsewhere => {
+                seen.insert(req.id().to_string());
+                self.withdraw_stored_surface(handles, req, Withdrawal::ResolvedElsewhere)
+                    .await;
+                return true;
+            }
+            // The refusal did not land. The request stays pending and unmarked
+            // so the next sweep retries it, but a stored card must not stay
+            // clickable in the meantime: neutralize it (claiming nothing).
+            Refusal::Failed => {
+                self.withdraw_stored_surface(handles, req, Withdrawal::Retrying)
+                    .await;
+                return false;
+            }
         }
         seen.insert(req.id().to_string());
         tracing::info!(
@@ -1266,21 +1300,31 @@ impl RequestFlow {
         }
     }
 
-    /// Withdraw whatever surface a previous process persisted for a request the
-    /// kind just refused, or explain the refusal in the chat when there is
-    /// none.
+    /// Withdraw whatever surface a previous process persisted for a request
+    /// this flow has just settled or refused.
     ///
-    /// A persisted inline block is replaced on its cached card by the refusal
-    /// receipt and forgotten; a persisted standalone card is repainted as the
-    /// refusal card and its record forgotten. Neither can be clicked again, and
-    /// a refusal never posts a second copy of the same card. With no stored
-    /// surface — the normal first sighting — the chat gets one reason card
-    /// instead.
-    async fn withdraw_refused_surface(&self, handles: &FlowHandles, req: &PendingRequest, dir: &str) {
+    /// A persisted inline block is replaced on its cached card by the receipt
+    /// `how` names and forgotten; a persisted standalone card is repainted as
+    /// `how`'s card and its record forgotten. Neither can be clicked again.
+    /// Returns whether any stored surface was found (the caller posts the chat
+    /// reason card only when there was none).
+    async fn withdraw_stored_surface(
+        &self,
+        handles: &FlowHandles,
+        req: &PendingRequest,
+        how: Withdrawal,
+    ) -> bool {
         let PendingRequest::Permission(p) = req else {
-            return;
+            return false;
         };
         self.recovered.lock().await.remove(req.id());
+        let receipt = match how {
+            Withdrawal::Refused => crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT.to_string(),
+            Withdrawal::ResolvedElsewhere => handled_elsewhere_receipt(&permission_target(p)),
+            Withdrawal::Retrying => {
+                crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT.to_string()
+            }
+        };
         let mut withdrawn = false;
         // Inline: replace the block on its cached card, then forget the handle.
         let inline = {
@@ -1289,11 +1333,7 @@ impl RequestFlow {
                 .message_of(req.id())
                 .map(str::to_string)
                 .and_then(|message_id| {
-                    let card = registry.resolve_on(
-                        &message_id,
-                        req.id(),
-                        crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT,
-                    );
+                    let card = registry.resolve_on(&message_id, req.id(), &receipt);
                     registry.forget(req.id());
                     card.map(|card| (message_id, card))
                 })
@@ -1316,7 +1356,18 @@ impl RequestFlow {
         if let Some(sent) = standalone {
             withdrawn = true;
             self.surfaces.remove_standalone(req.id());
-            let card = crate::feishu::card::question::build_unshowable_permission_card(p.target_budget());
+            let card = match how {
+                Withdrawal::Refused => {
+                    crate::feishu::card::question::build_unshowable_permission_card(p.target_budget())
+                }
+                Withdrawal::ResolvedElsewhere => crate::feishu::card::notify::build_resolved_elsewhere_card(
+                    self.kind.label(),
+                    &sent.summary,
+                ),
+                Withdrawal::Retrying => {
+                    crate::feishu::card::question::build_unshowable_permission_retry_card()
+                }
+            };
             if let Err(e) = handles.platform.update_message(&sent.message_id, &card).await {
                 tracing::warn!(
                     "refused {} card withdrawal failed on {}: {}",
@@ -1332,9 +1383,7 @@ impl RequestFlow {
                 );
             }
         }
-        if !withdrawn {
-            post_unshowable_notice(handles, p, dir).await;
-        }
+        withdrawn
     }
 
     /// Re-adopt the card a previous process surfaced this request on (ADR-0038

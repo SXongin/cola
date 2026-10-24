@@ -296,8 +296,15 @@ pub(crate) enum Refusal {
     /// Refused on the server. The request must not be surfaced, and any
     /// surface a previous process persisted for it is withdrawn.
     Refused,
+    /// The server no longer holds the request: another client (or an earlier
+    /// sweep) settled it. The stored surface is withdrawn **neutrally** — cola
+    /// did not reject anything, so no auto-reject copy may be left behind — and
+    /// nothing is posted.
+    ResolvedElsewhere,
     /// The refusal could not be applied. The request is still pending, so it
     /// is retried on the next sweep — unmarked, and never surfaced meanwhile.
+    /// A stored card is still made non-interactive, but with a "will retry"
+    /// receipt that claims nothing.
     Failed,
 }
 
@@ -730,9 +737,9 @@ async fn decline_unshowable(
             );
             Refusal::Refused
         }
-        // Another sweep (or another client) already settled it: there is
-        // nothing left to surface and nothing to retry.
-        Err(crate::error::BridgeError::NotFound(_)) => Refusal::Refused,
+        // Another client (or an earlier sweep) settled it before us: there is
+        // nothing left to refuse, and nothing cola may claim it rejected.
+        Err(crate::error::BridgeError::NotFound(_)) => Refusal::ResolvedElsewhere,
         Err(e) => {
             tracing::warn!(
                 "declining unshowable permission {} on session {session_id} failed: {e}; it will \

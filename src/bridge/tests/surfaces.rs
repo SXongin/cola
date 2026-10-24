@@ -921,3 +921,135 @@ async fn restart_declines_an_over_budget_standalone_permission_instead_of_readop
         "the persisted surface is gone"
     );
 }
+
+/// Whole-branch re-review #883: a refusal that **fails** must still neutralize
+/// the stored card — an over-budget card from an older build must never keep
+/// its Allow buttons while the request is still pending — but with a "will
+/// retry" receipt that claims nothing, and without marking the request seen so
+/// the next sweep retries the decline and then explains it.
+#[tokio::test]
+async fn restart_neutralizes_a_persisted_card_when_the_refusal_fails_then_retries() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+        b.fail_reply_permission_count
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+    })
+    .await;
+
+    // One persistent `seen`, like the poll loop: a failure must not retire the
+    // request, or the retry below could never happen.
+    let mut seen = std::collections::HashSet::new();
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.len(),
+        1,
+        "the first sweep attempts the decline"
+    );
+    let neutral = last_update_of(&platform, "om_card")
+        .await
+        .expect("the persisted card is neutralized even on failure");
+    let text = card_text(&neutral);
+    assert!(
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT),
+        "the block says it will retry: {text}"
+    );
+    assert!(
+        !text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT),
+        "it must not claim cola rejected it: {text}"
+    );
+    assert!(
+        !text.contains("允许一次") && !text.contains("始终允许"),
+        "no control survives while the refusal is unlanded: {text}"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "nothing is posted before the refusal lands: {text}"
+    );
+
+    // The retry lands; with the handle already forgotten, the reason card is
+    // posted to the chat instead of a second withdrawal.
+    app.permission.sweep(&app.flow_handles(), &mut seen).await;
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.len(),
+        2,
+        "the second sweep retries the decline"
+    );
+    assert!(
+        posted_cards(&platform)
+            .await
+            .iter()
+            .any(|card| card_text(card)
+                .contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
+        "the landed refusal is explained"
+    );
+}
+
+/// Whole-branch re-review #883: `NotFound` on the decline means the server no
+/// longer holds the request — another client settled it. The old card is
+/// withdrawn **neutrally** (handled elsewhere), never with the auto-reject
+/// receipt, and no reason card is posted.
+#[tokio::test]
+async fn restart_withdraws_a_persisted_card_neutrally_when_another_client_answered() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+        b.reply_permission_not_found = true;
+    })
+    .await;
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.len(),
+        1,
+        "cola asked the server to decline"
+    );
+    let withdrawn = last_update_of(&platform, "om_card")
+        .await
+        .expect("the persisted card is withdrawn");
+    let text = card_text(&withdrawn);
+    assert!(
+        text.contains("已由其他客户端处理"),
+        "the neutral handled-elsewhere receipt: {text}"
+    );
+    assert!(
+        !text.contains("自动拒绝"),
+        "cola must not claim it rejected what another client answered: {text}"
+    );
+    assert!(
+        !text.contains("允许一次"),
+        "no control survives on the withdrawn card: {text}"
+    );
+    assert!(
+        posted_cards(&platform).await.is_empty(),
+        "no reason card for a request cola did not refuse"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_none(),
+        "the block handle is forgotten"
+    );
+}
