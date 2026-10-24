@@ -4324,16 +4324,22 @@ impl StreamAccumulator {
                 );
             }
             // The live interaction blocks ride this tail too. A permission's
-            // body is copied into every button's callback value (see
-            // `permission_block_estimate`), so charging only the element would
-            // let a near-budget card append a long command past Feishu's hard
-            // limit. The command budget was raised for exactly those blocks
-            // (whole-branch review #883), which is why they are reserved here.
+            // body and routing triple are copied into every button's callback
+            // value (see `permission_block_estimate`), so charging only the
+            // element would let a near-budget card append a long command or a
+            // long directory past Feishu's hard limit. The command budget was
+            // raised for exactly those blocks (whole-branch review #883), which
+            // is why they are reserved here.
             for block in &self.interactions {
                 if let InteractionBlock::Permission(p) = block {
                     comps += crate::feishu::card::question::permission_block_components(p.always_supported);
-                    size +=
-                        crate::feishu::card::question::permission_block_estimate(&p.body, p.always_supported);
+                    size += crate::feishu::card::question::permission_block_estimate(
+                        &p.body,
+                        p.always_supported,
+                        &p.request_id,
+                        &p.session_id,
+                        &p.directory,
+                    );
                 }
             }
         }

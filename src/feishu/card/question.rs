@@ -107,23 +107,33 @@ fn permission_button_count(always_supported: bool) -> usize {
 
 /// The serialized-JSON size estimate of one permission block.
 ///
-/// Every button echoes the body in its `perm_body` callback value, so the body
-/// appears once as the block's element and once per button — the multiplier
-/// that makes a long command expensive even though it is shown only once.
-/// [`json_string_bytes`] charges JSON escaping, so the estimate is a real upper
-/// bound on the block rather than a character count.
-pub(crate) fn permission_block_estimate(body: &str, always_supported: bool) -> usize {
-    // A button's own labels, action, ids, directory and colour. CJK labels
-    // cost three bytes a character, which is why this is generous.
+/// Every button echoes the body and the whole routing triple (`session_id`,
+/// `request_id`, `directory`) in its callback value, so each of those appears
+/// once as the block's element and once per button. The routing values come
+/// from the caller — a long directory is the common case, and a fixed overhead
+/// would let the streaming card's split underestimate itself past Feishu's
+/// limit. [`json_string_bytes`] charges JSON escaping, so the estimate is an
+/// upper bound on the block rather than a character count.
+pub(crate) fn permission_block_estimate(
+    body: &str,
+    always_supported: bool,
+    request_id: &str,
+    session_id: &str,
+    directory: &str,
+) -> usize {
+    // A button's own labels, action, reply, colour and JSON punctuation. CJK
+    // labels cost three bytes a character, which is why this is generous.
     const BUTTON_OVERHEAD: usize = 360;
     let body = json_string_bytes(body);
+    let routing =
+        json_string_bytes(request_id) + json_string_bytes(session_id) + json_string_bytes(directory);
     let buttons = permission_button_count(always_supported);
     let note = if always_supported {
         json_string_bytes(SESSION_ALWAYS_NOTE) + 60
     } else {
         0
     };
-    body + buttons * (body + BUTTON_OVERHEAD) + note
+    body + buttons * (body + routing + BUTTON_OVERHEAD) + note
 }
 
 /// The bytes `text` contributes to a serialized JSON string, escaping
@@ -1277,21 +1287,28 @@ mod tests {
 
     /// The block estimate the streaming card's split reserves must be an upper
     /// bound on what the block's elements actually serialize to — otherwise a
-    /// near-full card would still append it past Feishu's limit.
+    /// near-full card would still append it past Feishu's limit. The routing
+    /// triple is charged for every button, so a long directory counts too.
     #[test]
     fn the_permission_block_estimate_covers_the_rendered_block() {
-        for (body, always) in [
-            ("⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n", true),
-            ("⚡ **执行 Shell 命令**\n**对象**:\n- `cargo test`\n", false),
-            (&"啊\"\\\n".repeat(250), true),
+        let long_directory = format!("/work/{}", "a-project-directory/".repeat(12));
+        for (body, always, directory) in [
+            ("⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n", true, "/d"),
+            ("⚡ **执行 Shell 命令**\n**对象**:\n- `cargo test`\n", false, "/d"),
+            (&"啊\"\\\n".repeat(250), true, "/d"),
+            (
+                "⚡ **执行 Shell 命令**\n**对象**:\n- `ls`\n",
+                true,
+                long_directory.as_str(),
+            ),
         ] {
-            let card = build_permission_card("ses", "n:1", body, "/d", always);
+            let card = build_permission_card("ses", "n:1", body, directory, always);
             let elements = card["body"]["elements"].as_array().expect("body elements");
             let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
-            let estimate = permission_block_estimate(body, always);
+            let estimate = permission_block_estimate(body, always, "n:1", "ses", directory);
             assert!(
                 estimate >= rendered,
-                "estimate {estimate} under the block's {rendered} bytes"
+                "estimate {estimate} under the block's {rendered} bytes (directory {directory:?})"
             );
             assert_eq!(
                 permission_block_components(always),
