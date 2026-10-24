@@ -83,6 +83,10 @@ pub(crate) struct Projections {
     /// holding the cache is dropped, so a replaced attachment stops folding
     /// into a cache nothing reads.
     subscribers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Each thread's working directory, learned when it is created or adopted.
+    /// The prompt axis carries no directory, so this is where a skill resolves
+    /// against the session's own project first.
+    cwds: Mutex<HashMap<String, String>>,
     /// The adoption backlog drain limit. Zero means the production default;
     /// tests lower it to exercise the truncation-and-retry path.
     drain_limit: Mutex<usize>,
@@ -341,6 +345,11 @@ impl Projections {
     /// protocol's `contextCompaction` item carries no reason, so the request is
     /// the only evidence the existing card path can use to title the row 手动
     /// rather than 自动 (ADR-0082, ADR-0092).
+    ///
+    /// Deliberately in memory: the label is cosmetic (the compaction item is
+    /// the fact, and the card renders it either way). Persisting it would add a
+    /// durable shape for a display hint, and a restart before the item projects
+    /// simply titles that one row 自动.
     pub(crate) fn mark_manual_compaction(&self, thread_id: &str) {
         self.projection(thread_id)
             .lock()
@@ -373,10 +382,26 @@ impl Projections {
             .map(str::to_string)
     }
 
-    /// Which thread and turn an item belongs to. The authorship question is
-    /// asked with a transcript message id (a Codex item id), while the durable
-    /// record is keyed by the turn cola started, so the projection — the only
-    /// owner of the item→turn mapping — answers it.
+    /// Remember a thread's working directory (from `thread/start` or
+    /// `thread/resume`), so a skill resolves against its own project first.
+    pub(crate) fn set_cwd(&self, thread_id: &str, cwd: &str) {
+        if cwd.is_empty() {
+            return;
+        }
+        self.cwds
+            .lock()
+            .expect("codex thread cwds")
+            .insert(thread_id.to_string(), cwd.to_string());
+    }
+
+    pub(crate) fn cwd(&self, thread_id: &str) -> Option<String> {
+        self.cwds
+            .lock()
+            .expect("codex thread cwds")
+            .get(thread_id)
+            .cloned()
+    }
+
     pub(crate) fn submission_of_item(&self, thread_id: &str, item_id: &str) -> Option<String> {
         let projection = self
             .threads
@@ -391,6 +416,10 @@ impl Projections {
             .map(str::to_string)
     }
 
+    /// Which thread and turn an item belongs to. The authorship question is
+    /// asked with a transcript message id (a Codex item id), while the durable
+    /// record is keyed by the turn cola started, so the projection — the only
+    /// owner of the item→turn mapping — answers it.
     pub(crate) fn turn_of_item(&self, item_id: &str) -> Option<(String, String)> {
         let projections: Vec<(String, Arc<Mutex<ThreadProjection>>)> = self
             .threads
@@ -507,26 +536,38 @@ impl CodexClient {
         if let Some(turn) = self.projections.live_turn(session_id) {
             return Ok(Some(turn));
         }
-        for attempt in 0..STOP_LOOKUP_ATTEMPTS {
-            let thread = self
-                .threads()
-                .read(session_id, true)
-                .await
-                .map_err(client_error)?;
-            if let Some(turn) = thread
-                .turns
-                .iter()
-                .rev()
-                .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
-                .and_then(|turn| turn.get("id").and_then(Value::as_str))
+        let deadline = std::time::Instant::now() + STOP_LOOKUP_BOUND;
+        loop {
+            // Each read is bounded: a wedged RPC must not hold `/stop` past its
+            // own look-up window.
+            match tokio::time::timeout(STOP_LOOKUP_READ_TIMEOUT, self.threads().read(session_id, true)).await
             {
-                return Ok(Some(turn.to_string()));
+                Ok(Ok(thread)) => {
+                    if let Some(turn) = thread
+                        .turns
+                        .iter()
+                        .rev()
+                        .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+                        .and_then(|turn| turn.get("id").and_then(Value::as_str))
+                    {
+                        return Ok(Some(turn.to_string()));
+                    }
+                }
+                Ok(Err(error)) => return Err(client_error(error)),
+                Err(_) => {
+                    tracing::warn!(
+                        thread = %session_id,
+                        "the codex thread read did not answer within {STOP_LOOKUP_READ_TIMEOUT:?} \
+                         during a stop; retrying until the lookup bound"
+                    );
+                }
             }
-            if attempt + 1 < STOP_LOOKUP_ATTEMPTS {
-                tokio::time::sleep(STOP_LOOKUP_INTERVAL).await;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
             }
+            tokio::time::sleep(STOP_LOOKUP_INTERVAL.min(deadline - now)).await;
         }
-        Ok(None)
     }
 
     /// Bind every pending submission this read can place: the user item whose
@@ -536,7 +577,13 @@ impl CodexClient {
     /// on the read the bridge is about to make, before it asks authorship.
     fn reconcile_submissions(&self, thread_id: &str, transcript: &SessionTranscript) {
         for (submission, message) in &transcript.submissions {
-            if !self.authored.is_pending_submission(thread_id, submission) {
+            // A pending marker names a submission of ours, and so does cola's
+            // own id convention: the bridge mints every `msg_cola_…` id, so an
+            // item the server echoed one for is cola's even after the marker's
+            // window (a slow item must still bind).
+            if !self.authored.is_pending_submission(thread_id, submission)
+                && !crate::backend::parsing::is_cola_message_id(submission)
+            {
                 continue;
             }
             let Some((owner, turn)) = self.projections.turn_of_item(message.as_str()) else {
@@ -547,6 +594,10 @@ impl CodexClient {
             }
             self.authored.bind_submission(thread_id, submission, &turn);
         }
+        // A marker whose request never reached the server has no item to bind;
+        // its window is bounded, and this read is where the expired entry
+        // leaves the file.
+        self.authored.expire(thread_id);
     }
 
     /// The `turn/start` params for one prompt. Model and effort ride the turn
@@ -566,7 +617,7 @@ impl CodexClient {
     ) -> Result<Value> {
         let mut params = json!({
             "threadId": session_id,
-            "input": self.input_items(text, skills)?,
+            "input": self.input_items(session_id, text, skills)?,
         });
         if let Some(message_id) = message_id {
             params["clientUserMessageId"] = json!(message_id);
@@ -584,12 +635,15 @@ impl CodexClient {
     /// attached skill. Codex's skill input needs the skill's path, so an id the
     /// last `skills/list` did not name is a named error rather than a silently
     /// dropped request (the model would otherwise answer without the skill).
-    fn input_items(&self, text: &str, skills: &[PromptSkill]) -> Result<Value> {
+    /// The session's own directory is tried first, so a same-named skill in
+    /// another project can never be substituted for it.
+    fn input_items(&self, session_id: &str, text: &str, skills: &[PromptSkill]) -> Result<Value> {
         // `text_elements` is the protocol's spelling (`UserInput::Text` keeps
         // it snake_case on 0.163.0, unlike the surrounding camelCase fields).
         let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
+        let directory = self.projections.cwd(session_id);
         for skill in skills {
-            let Some(path) = self.skills.path_of(&skill.id) else {
+            let Some(path) = self.skills.path_of(&skill.id, directory.as_deref()) else {
                 return Err(BridgeError::Client {
                     client: "codex",
                     detail: format!(
@@ -634,6 +688,7 @@ impl CodexClient {
         let boundary = self.threads().inbound_seq();
         match self.threads().adopt(thread_id).await? {
             Adoption::Subscribed(subscription) => {
+                self.projections.set_cwd(thread_id, &subscription.thread().cwd);
                 // `thread/resume` carries only a bounded history page. A first
                 // read must not present that prefix as the whole thread, so
                 // page every turn before the subscriber starts folding. The
@@ -843,11 +898,21 @@ async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, t
     }
 }
 
-/// Bound the `/stop` live-turn lookup: a `turn/start` the server accepts is
-/// persisted within tens of milliseconds, so a stop that lands just before the
-/// turn exists polls this long before it declares the session idle. The
-/// interval is shorter in tests so the suite does not pay the wall clock.
-const STOP_LOOKUP_ATTEMPTS: u32 = 10;
+/// How long `/stop` polls for a turn the server has not persisted yet. A
+/// `turn/start` the server accepts is persisted within tens of milliseconds, so
+/// a stop that lands just before the turn exists retries this long before it
+/// declares the session idle.
+#[cfg(not(test))]
+const STOP_LOOKUP_BOUND: Duration = Duration::from_millis(600);
+#[cfg(test)]
+const STOP_LOOKUP_BOUND: Duration = Duration::from_millis(200);
+
+/// One poll's own deadline: a stalled `thread/read` must not hold `/stop`, so a
+/// slow read is abandoned and the loop either retries or reaches its bound.
+#[cfg(not(test))]
+const STOP_LOOKUP_READ_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const STOP_LOOKUP_READ_TIMEOUT: Duration = Duration::from_millis(60);
 
 #[cfg(not(test))]
 const STOP_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
@@ -874,21 +939,14 @@ const MAX_MODEL_PAGES: usize = 64;
 ///
 /// Each read **replaces its own scope**: a skill deleted between two lists must
 /// stop resolving (the prompt then fails by name, never sending a stale path),
-/// while a read for another project cannot erase this one's entries. A name
-/// present in two scopes resolves to the most recently read scope — the one the
-/// `/skill` command's read just refreshed.
+/// while a read for another project cannot erase this one's entries. Resolution
+/// prefers the session's own directory (the thread's `cwd`); without it, a name
+/// is used only when every scope agrees on one path, so a concurrent read for
+/// another project can never substitute a same-named skill.
 #[derive(Default)]
 pub(crate) struct SkillCatalog {
     /// Directory key (`""` for the server default) → (skill name → path).
-    scopes: Mutex<HashMap<String, ScopeSkills>>,
-    /// Read order, so a name present in several scopes picks the newest one.
-    next_read: std::sync::atomic::AtomicU64,
-}
-
-#[derive(Default)]
-struct ScopeSkills {
-    read_seq: u64,
-    paths: HashMap<String, String>,
+    scopes: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
 impl SkillCatalog {
@@ -897,23 +955,28 @@ impl SkillCatalog {
     /// emptied, so a vanished skill is refused rather than resolved stale.
     fn replace_scope(&self, directory: Option<&str>, skills: impl IntoIterator<Item = (String, String)>) {
         let key = directory.unwrap_or_default().to_string();
-        let seq = self.next_read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let paths: HashMap<String, String> = skills.into_iter().collect();
         let mut scopes = self.scopes.lock().expect("codex skill catalog");
         if paths.is_empty() {
             scopes.remove(&key);
         } else {
-            scopes.insert(key, ScopeSkills { read_seq: seq, paths });
+            scopes.insert(key, paths);
         }
     }
 
-    fn path_of(&self, name: &str) -> Option<String> {
+    /// Resolve `name` for a prompt. The session's own directory is the first
+    /// answer; without it (or when that scope no longer carries the name), the
+    /// name is used only when every remaining scope agrees on one path.
+    fn path_of(&self, name: &str, directory: Option<&str>) -> Option<String> {
         let scopes = self.scopes.lock().expect("codex skill catalog");
-        scopes
-            .values()
-            .filter_map(|scope| scope.paths.get(name).map(|path| (scope.read_seq, path.clone())))
-            .max_by_key(|(seq, _)| *seq)
-            .map(|(_, path)| path)
+        if let Some(directory) = directory
+            && let Some(path) = scopes.get(directory).and_then(|scope| scope.get(name))
+        {
+            return Some(path.clone());
+        }
+        let mut candidates = scopes.values().filter_map(|scope| scope.get(name));
+        let first = candidates.next()?.clone();
+        candidates.all(|path| *path == first).then_some(first)
     }
 }
 
@@ -1059,6 +1122,7 @@ impl Backend for CodexClient {
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
         let thread = self.threads().start(cwd).await.map_err(client_error)?;
+        self.projections.set_cwd(&thread.id, &thread.cwd);
         Ok(Session {
             id: thread.id.clone(),
             project_id: None,
@@ -1127,7 +1191,14 @@ impl Backend for CodexClient {
         // request: the server may emit the turn's user item before this task
         // processes the response, and an accepted request whose response is
         // lost must still be recognisable — by that id — after a restart.
-        self.authored.begin(session_id, message_id);
+        if let Err(detail) = self.authored.begin(session_id, message_id) {
+            // The marker is a precondition: a prompt the record did not learn
+            // about is exactly the turn a restart would report as external.
+            return Err(BridgeError::Client {
+                client: "codex",
+                detail,
+            });
+        }
         let result = match self.connection().request("turn/start", params).await {
             Ok(result) => result,
             Err(error) => {
@@ -1194,7 +1265,7 @@ impl Backend for CodexClient {
                 detail: "prompt attachments are not mapped onto this adapter yet".to_string(),
             });
         }
-        let input = self.input_items(text, skills)?;
+        let input = self.input_items(session_id, text, skills)?;
         let mut params = json!({
             "threadId": session_id,
             "expectedTurnId": turn_id,
@@ -3501,7 +3572,7 @@ mod tests {
 
     /// Finding 4: a skill deleted between two lists must stop resolving, so the
     /// prompt fails by name instead of sending a stale path. A name present in
-    /// two directories resolves to the most recently read scope.
+    /// two directories is ambiguous until the session's own directory answers.
     #[tokio::test]
     async fn a_skill_that_disappears_between_lists_is_refused() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
@@ -3522,7 +3593,6 @@ mod tests {
         let client = connect(&url).await;
         assert_eq!(client.list_skills(Some("/work/cola")).await.len(), 1);
 
-        // A second read for another project refreshes that scope and wins.
         server.set_skills(vec![json!({
             "name": "caveman",
             "description": "Brief mode",
@@ -3532,23 +3602,35 @@ mod tests {
             "pluginId": null,
         })]);
         assert_eq!(client.list_skills(Some("/work/other")).await.len(), 1);
-        let path = client.skills.path_of("caveman").expect("the newest scope");
-        assert_eq!(path, "/work/other/.codex/skills/caveman/SKILL.md");
+        assert_eq!(
+            client.skills.path_of("caveman", Some("/work/cola")).as_deref(),
+            Some("/work/cola/.codex/skills/caveman/SKILL.md"),
+            "the session's own directory answers first"
+        );
+        assert_eq!(
+            client.skills.path_of("caveman", Some("/work/other")).as_deref(),
+            Some("/work/other/.codex/skills/caveman/SKILL.md")
+        );
+        assert!(
+            client.skills.path_of("caveman", None).is_none(),
+            "two distinct paths are ambiguous without a directory"
+        );
 
-        // The skill vanishes from its own directory: a new list replaces that
-        // scope, and the name is gone unless another scope still carries it.
+        // The session's own skill vanishes: the remaining scope is the only
+        // answer, and once that is gone too the name is refused.
         server.set_skills(Vec::new());
         assert!(
             client.list_skills(Some("/work/cola")).await.is_empty(),
             "the vanished scope is replaced"
         );
-        assert!(
-            client.skills.path_of("caveman").is_some(),
-            "the other directory's read still carries it"
+        assert_eq!(
+            client.skills.path_of("caveman", Some("/work/cola")).as_deref(),
+            Some("/work/other/.codex/skills/caveman/SKILL.md"),
+            "the one remaining scope is unambiguous"
         );
         assert!(client.list_skills(Some("/work/other")).await.is_empty());
         assert!(
-            client.skills.path_of("caveman").is_none(),
+            client.skills.path_of("caveman", Some("/work/cola")).is_none(),
             "a vanished skill is not resolved from a stale path"
         );
         let error = client
@@ -3568,6 +3650,233 @@ mod tests {
             .await
             .expect_err("the deleted skill is refused");
         assert!(error.to_string().contains("caveman"), "{error}");
+    }
+
+    /// Finding 5: the prompt resolves a skill in the session's own directory,
+    /// so a same-named skill advertised for another project is never sent.
+    #[tokio::test]
+    async fn a_skill_resolves_in_the_sessions_own_directory() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/other",
+            "a real thread",
+        ));
+        let skill = |path: &str| {
+            json!({
+                "name": "caveman",
+                "description": "Brief mode",
+                "path": path,
+                "scope": "repo",
+                "enabled": true,
+                "pluginId": null,
+            })
+        };
+        let client = connect(&url).await;
+        server.set_skills(vec![skill("/work/cola/.codex/skills/caveman/SKILL.md")]);
+        client.list_skills(Some("/work/cola")).await;
+        server.set_skills(vec![skill("/work/other/.codex/skills/caveman/SKILL.md")]);
+        client.list_skills(Some("/work/other")).await;
+        // Adopting the thread teaches the adapter its cwd.
+        client.transcript("thread-1").await.expect("subscribe");
+
+        client
+            .prompt(
+                "thread-1",
+                "be brief",
+                &[],
+                &[PromptSkill {
+                    id: "caveman".into(),
+                    name: "caveman".into(),
+                }],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the prompt submits");
+        let params = server.turn_params("thread-1");
+        assert_eq!(
+            params[0]["input"][1]["path"], "/work/other/.codex/skills/caveman/SKILL.md",
+            "the session's own project wins over the other read"
+        );
+    }
+
+    /// Finding 3 (suppression): a chosen id whose request never reached the
+    /// server must stop vouching for the thread-wide fallback after its window,
+    /// so a later foreign live turn with no client id is reported external.
+    #[tokio::test]
+    async fn a_never_delivered_marker_does_not_vouch_for_a_later_tui_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+        client
+            .authored
+            .begin("thread-1", Some("msg_cola_never"))
+            .expect("the marker is recorded");
+        tokio::time::sleep(Duration::from_millis(
+            (crate::codex::authorship::PENDING_TTL_MS as u64) + 30,
+        ))
+        .await;
+        assert!(!client.authored.is_pending("thread-1"), "the window expired");
+
+        // A live turn the user's own client starts, with no client id.
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-tui", "status": "inProgress", "startedAt": 5 } }),
+            ),
+            (
+                "item/started",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-tui",
+                    "startedAtMs": 5_000_i64,
+                    "item": {
+                        "type": "userMessage",
+                        "id": "item-tui",
+                        "clientId": null,
+                        "content": [{ "type": "text", "text": "from the TUI", "textElements": [] }],
+                    },
+                }),
+            ),
+        ] {
+            server.push_to_thread("thread-1", method, params);
+        }
+        wait_for_text(&client, "thread-1", "from the TUI").await;
+        assert!(
+            !client.is_cola_authored("item-tui").await,
+            "an unresolved, never-delivered submission must not suppress a foreign turn"
+        );
+    }
+
+    /// Finding 1 (adapter): a marker that cannot be persisted refuses the
+    /// prompt before anything is sent, and leaves the existing record trusted.
+    #[tokio::test]
+    async fn a_prompt_is_refused_when_its_marker_cannot_be_persisted() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+        let record = crate::codex::Authorship::open(path.clone(), "codex").expect("the record opens");
+        // A directory at the writer's temp path makes the atomic replace fail.
+        let blocked = path.with_extension("tmp");
+        std::fs::create_dir(&blocked).expect("block the temp path");
+        let client = connect_with(&url, record.clone()).await;
+
+        let error = client
+            .prompt(
+                "thread-1",
+                "cannot be recorded",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_blocked"),
+            )
+            .await
+            .expect_err("the marker cannot be persisted");
+        assert!(error.to_string().contains("could not be persisted"), "{error}");
+        assert_eq!(
+            server.turn_starts(),
+            0,
+            "nothing may be sent without a durable provenance record"
+        );
+        assert!(record.is_trusted(), "the valid record is still trusted");
+        assert!(!record.is_pending("thread-1"));
+
+        // Once the record can be written again, the next prompt goes out.
+        std::fs::remove_dir(&blocked).expect("unblock");
+        client
+            .prompt(
+                "thread-1",
+                "recordable now",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_ok"),
+            )
+            .await
+            .expect("the retry submits");
+        assert_eq!(server.turn_starts(), 1);
+    }
+
+    /// Finding 2 (adapter): an unresolved marker is never evicted to make room;
+    /// the prompt that would exceed the cap is refused and not sent.
+    #[tokio::test]
+    async fn a_full_authorship_record_refuses_the_next_prompt() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        for index in 0..32 {
+            client
+                .authored
+                .begin("thread-1", Some(&format!("msg_cola_{index}")))
+                .expect("below the cap");
+        }
+        let error = client
+            .prompt(
+                "thread-1",
+                "over capacity",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_over"),
+            )
+            .await
+            .expect_err("at capacity");
+        assert!(error.to_string().contains("unresolved submissions"), "{error}");
+        assert_eq!(server.turn_starts(), 0, "nothing was sent");
+        assert!(
+            client.authored.is_pending_submission("thread-1", "msg_cola_0"),
+            "the oldest unresolved marker is still owed"
+        );
+    }
+
+    /// Finding 4: a stalled `thread/read` cannot hold `/stop`.
+    #[tokio::test]
+    async fn a_stalled_stop_read_is_bounded() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        server.silence_next_thread_read();
+        tokio::time::timeout(Duration::from_secs(1), client.interrupt("thread-1"))
+            .await
+            .expect("a stalled read must not hold the stop")
+            .expect("the stop completes");
+        assert!(
+            server.interrupt_params().is_empty(),
+            "the idle thread had nothing to interrupt"
+        );
     }
 
     /// Finding 3: `/stop` can land after `turn/start` was accepted but before
@@ -3741,7 +4050,10 @@ mod tests {
 
         // cola's prompt is in flight; its turn's stream arrives first, and the
         // item carries no client id (the server dropped it).
-        client.authored.begin("thread-1", None);
+        client
+            .authored
+            .begin("thread-1", None)
+            .expect("the marker is recorded");
         server.push_to_thread(
             "thread-1",
             "turn/started",
@@ -3794,7 +4106,10 @@ mod tests {
         client.transcript("thread-1").await.expect("subscribe");
         server.wait_for_subscribers("thread-1", 1).await;
 
-        client.authored.begin("thread-1", Some("msg_cola_early"));
+        client
+            .authored
+            .begin("thread-1", Some("msg_cola_early"))
+            .expect("the marker is recorded");
         for (method, params) in [
             (
                 "turn/started",
