@@ -165,6 +165,15 @@ impl ThreadProjection {
             .map(|index| self.items[*index].turn_id.as_str())
     }
 
+    /// Whether `submission` was the id cola chose for an item. The chosen id
+    /// rides the server's user item as `clientId`, so it is the precise
+    /// authorship signal before the turn is bound (ADR-0092).
+    pub(crate) fn submission_of_item(&self, item_id: &str) -> Option<&str> {
+        self.index
+            .get(item_id)
+            .and_then(|index| self.items[*index].client_id.as_deref())
+    }
+
     /// The last explicit run state, if one was observed.
     pub(crate) fn observed_status(&self) -> Option<ThreadStatus> {
         self.status
@@ -822,6 +831,13 @@ impl ThreadProjection {
     /// Forget a manual-compaction request that never reached the server.
     pub(crate) fn clear_manual_compaction(&mut self) {
         self.manual_compaction = false;
+    }
+
+    /// Whether a `/compact` request is still waiting for its item (test-only:
+    /// proves an ambiguous failure keeps the marker).
+    #[cfg(test)]
+    pub(crate) fn manual_compaction_pending(&self) -> bool {
+        self.manual_compaction
     }
 
     fn item_completed(&mut self, notification: ItemCompleted) {

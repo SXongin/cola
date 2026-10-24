@@ -348,6 +348,15 @@ impl Projections {
             .mark_manual_compaction();
     }
 
+    /// Whether a `/compact` request is still waiting for its item (test-only).
+    #[cfg(test)]
+    pub(crate) fn manual_compaction_pending(&self, thread_id: &str) -> bool {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .manual_compaction_pending()
+    }
+
     /// Forget a manual-compaction request whose `thread/compact/start` failed.
     pub(crate) fn clear_manual_compaction(&self, thread_id: &str) {
         self.projection(thread_id)
@@ -368,6 +377,20 @@ impl Projections {
     /// asked with a transcript message id (a Codex item id), while the durable
     /// record is keyed by the turn cola started, so the projection — the only
     /// owner of the item→turn mapping — answers it.
+    pub(crate) fn submission_of_item(&self, thread_id: &str, item_id: &str) -> Option<String> {
+        let projection = self
+            .threads
+            .lock()
+            .expect("codex projections")
+            .get(thread_id)
+            .cloned()?;
+        projection
+            .lock()
+            .expect("codex projection")
+            .submission_of_item(item_id)
+            .map(str::to_string)
+    }
+
     pub(crate) fn turn_of_item(&self, item_id: &str) -> Option<(String, String)> {
         let projections: Vec<(String, Arc<Mutex<ThreadProjection>>)> = self
             .threads
@@ -472,27 +495,58 @@ impl CodexClient {
     /// The live turn a `/stop` should interrupt.
     ///
     /// The cache can miss a turn this process started: the subscription may
-    /// begin *after* the server emitted `turn/started`, or the start may still
-    /// be in flight when the user stops. The thread's own persisted record is
-    /// then the authority — `thread/read`'s bounded page carries its newest
-    /// turns, and an `inProgress` one is the run to interrupt. Only when that
-    /// finds none is `/stop` genuinely a no-op.
+    /// begin *after* the server emitted `turn/started`, or — the race that
+    /// matters — `/stop` can arrive after `turn/start` was sent but before the
+    /// server persisted the turn. The thread's own persisted record is then the
+    /// authority (`thread/read`'s bounded page carries its newest turns, and an
+    /// `inProgress` one is the run to interrupt), and the lookup is **polled**
+    /// for a short bound so a stop right after a prompt interrupts the run the
+    /// moment it appears. Only a thread that still has none after the bound is
+    /// genuinely idle.
     async fn live_turn_for_stop(&self, session_id: &str) -> Result<Option<String>> {
         if let Some(turn) = self.projections.live_turn(session_id) {
             return Ok(Some(turn));
         }
-        let thread = self
-            .threads()
-            .read(session_id, true)
-            .await
-            .map_err(client_error)?;
-        Ok(thread
-            .turns
-            .iter()
-            .rev()
-            .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
-            .and_then(|turn| turn.get("id").and_then(Value::as_str))
-            .map(str::to_string))
+        for attempt in 0..STOP_LOOKUP_ATTEMPTS {
+            let thread = self
+                .threads()
+                .read(session_id, true)
+                .await
+                .map_err(client_error)?;
+            if let Some(turn) = thread
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+                .and_then(|turn| turn.get("id").and_then(Value::as_str))
+            {
+                return Ok(Some(turn.to_string()));
+            }
+            if attempt + 1 < STOP_LOOKUP_ATTEMPTS {
+                tokio::time::sleep(STOP_LOOKUP_INTERVAL).await;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Bind every pending submission this read can place: the user item whose
+    /// `clientId` is a pending chosen id tells us which turn cola's accepted
+    /// (but unanswered, or pre-restart) prompt landed in. This is the recovery
+    /// path for a lost `turn/start` response (ADR-0092 decision 2), and it runs
+    /// on the read the bridge is about to make, before it asks authorship.
+    fn reconcile_submissions(&self, thread_id: &str, transcript: &SessionTranscript) {
+        for (submission, message) in &transcript.submissions {
+            if !self.authored.is_pending_submission(thread_id, submission) {
+                continue;
+            }
+            let Some((owner, turn)) = self.projections.turn_of_item(message.as_str()) else {
+                continue;
+            };
+            if owner != thread_id {
+                continue;
+            }
+            self.authored.bind_submission(thread_id, submission, &turn);
+        }
     }
 
     /// The `turn/start` params for one prompt. Model and effort ride the turn
@@ -789,6 +843,17 @@ async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, t
     }
 }
 
+/// Bound the `/stop` live-turn lookup: a `turn/start` the server accepts is
+/// persisted within tens of milliseconds, so a stop that lands just before the
+/// turn exists polls this long before it declares the session idle. The
+/// interval is shorter in tests so the suite does not pay the wall clock.
+const STOP_LOOKUP_ATTEMPTS: u32 = 10;
+
+#[cfg(not(test))]
+const STOP_LOOKUP_INTERVAL: Duration = Duration::from_millis(50);
+#[cfg(test)]
+const STOP_LOOKUP_INTERVAL: Duration = Duration::from_millis(10);
+
 /// The provider bucket the `/model` picker shows for Codex. `model/list` names
 /// no provider: a Codex model is whatever the attached app-server resolves
 /// through its own `[model_providers.*]`, and the picker's `provider/model`
@@ -801,30 +866,54 @@ const MODEL_PROVIDER: &str = "codex";
 /// was read so far, and the truncation is logged.
 const MAX_MODEL_PAGES: usize = 64;
 
-/// The `skills/list` reads, keyed by the skill identity the server advertised.
+/// The `skills/list` reads, scoped by the directory the read was made for.
 /// Codex's `skill` prompt part carries a **path** as well as a name, and the
 /// neutral [`crate::backend::PromptSkill`] only carries `{ id, name }`, so the
 /// path is remembered here from the same read the `/skill` command made
-/// immediately before the prompt. Entries merge rather than replace: a
-/// concurrent read for another project must not empty the catalog between a
-/// `/skill` read and its prompt. The newest path for a name wins; a skill name
-/// present in two projects at once is the one ambiguity the protocol's
-/// name+path pair cannot resolve from a name alone.
+/// immediately before the prompt.
+///
+/// Each read **replaces its own scope**: a skill deleted between two lists must
+/// stop resolving (the prompt then fails by name, never sending a stale path),
+/// while a read for another project cannot erase this one's entries. A name
+/// present in two scopes resolves to the most recently read scope — the one the
+/// `/skill` command's read just refreshed.
 #[derive(Default)]
 pub(crate) struct SkillCatalog {
-    paths: Mutex<HashMap<String, String>>,
+    /// Directory key (`""` for the server default) → (skill name → path).
+    scopes: Mutex<HashMap<String, ScopeSkills>>,
+    /// Read order, so a name present in several scopes picks the newest one.
+    next_read: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct ScopeSkills {
+    read_seq: u64,
+    paths: HashMap<String, String>,
 }
 
 impl SkillCatalog {
-    fn remember(&self, skills: impl IntoIterator<Item = (String, String)>) {
-        let mut paths = self.paths.lock().expect("codex skill catalog");
-        for (name, path) in skills {
-            paths.insert(name, path);
+    /// Replace one directory's scope with what its latest read advertised.
+    /// `skills` empty is a real "this directory has none" answer: the scope is
+    /// emptied, so a vanished skill is refused rather than resolved stale.
+    fn replace_scope(&self, directory: Option<&str>, skills: impl IntoIterator<Item = (String, String)>) {
+        let key = directory.unwrap_or_default().to_string();
+        let seq = self.next_read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let paths: HashMap<String, String> = skills.into_iter().collect();
+        let mut scopes = self.scopes.lock().expect("codex skill catalog");
+        if paths.is_empty() {
+            scopes.remove(&key);
+        } else {
+            scopes.insert(key, ScopeSkills { read_seq: seq, paths });
         }
     }
 
     fn path_of(&self, name: &str) -> Option<String> {
-        self.paths.lock().expect("codex skill catalog").get(name).cloned()
+        let scopes = self.scopes.lock().expect("codex skill catalog");
+        scopes
+            .values()
+            .filter_map(|scope| scope.paths.get(name).map(|path| (scope.read_seq, path.clone())))
+            .max_by_key(|(seq, _)| *seq)
+            .map(|(_, path)| path)
     }
 }
 
@@ -901,6 +990,15 @@ fn decode<T: serde::de::DeserializeOwned>(method: &str, value: Value) -> CodexRe
         method: method.to_string(),
         detail: error.to_string(),
     })
+}
+
+/// Whether the server **definitely refused** a request: it answered with a
+/// JSON-RPC error, so the work did not start. Every other failure — a closed
+/// connection, a timeout, an undecodable result — is ambiguous (the request may
+/// have been accepted and only its answer lost), and an authorship marker for
+/// an ambiguous submission must stay reconcilable (ADR-0092).
+fn definitely_refused(error: &CodexError) -> bool {
+    matches!(error, CodexError::Rpc { .. })
 }
 
 fn client_error(error: CodexError) -> BridgeError {
@@ -1020,37 +1118,50 @@ impl Backend for CodexClient {
         // submit is its own error, while the Turn's outcome is observed from
         // the transcript and session status (ADR-0011).
         //
+        // The params are built BEFORE the pending marker: a pre-send validation
+        // failure (an unknown skill) must not leave a marker behind, or a later
+        // external live turn on this thread could be classified cola's.
+        let params = self.turn_params(session_id, text, skills, model, variant, message_id)?;
         // The turn id is Codex's, so the authorship record is bound from the
-        // response. The pending marker is recorded BEFORE the request: the
-        // server may emit the turn's user item to the subscription before this
-        // task processes the response, and that window must not classify
-        // cola's own message as external.
-        self.authored.begin(session_id);
-        let result = match self
-            .connection()
-            .request(
-                "turn/start",
-                self.turn_params(session_id, text, skills, model, variant, message_id)?,
-            )
-            .await
-        {
+        // response. The chosen submission id is recorded durably BEFORE the
+        // request: the server may emit the turn's user item before this task
+        // processes the response, and an accepted request whose response is
+        // lost must still be recognisable — by that id — after a restart.
+        self.authored.begin(session_id, message_id);
+        let result = match self.connection().request("turn/start", params).await {
             Ok(result) => result,
             Err(error) => {
-                self.authored.abandon(session_id);
+                if definitely_refused(&error) || message_id.is_none() {
+                    // A definite refusal did not start the turn. A submission
+                    // with no chosen id cannot be reconciled by a later read
+                    // either, so its in-memory marker is always cleared when
+                    // the call returns — otherwise it would vouch for a later
+                    // external live turn forever.
+                    self.authored.abandon(session_id, message_id);
+                }
+                // An ambiguous failure (a closed connection, no response) keeps
+                // a chosen id: the server may have accepted the turn, and the
+                // next history read binds it by that id.
                 return Err(client_error(error));
             }
         };
         let turn = match decode::<TurnStartResponse>("turn/start", result) {
             Ok(response) => response.turn,
             Err(error) => {
-                self.authored.abandon(session_id);
+                // The server answered, but the payload did not name the turn:
+                // it may have started one, so a chosen id's pending marker
+                // stays for the next read. An anonymous one cannot be
+                // reconciled, so it does not linger.
+                if message_id.is_none() {
+                    self.authored.abandon(session_id, message_id);
+                }
                 return Err(client_error(error));
             }
         };
         // A prompt whose response names an already-active turn (the spike's
         // fold) binds that turn: it is the turn cola's message landed in, and
         // the card must settle on it. Never a second turn.
-        self.authored.bind(session_id, &turn.id);
+        self.authored.bind(session_id, &turn.id, message_id);
         Ok(())
     }
 
@@ -1103,21 +1214,25 @@ impl Backend for CodexClient {
     }
 
     async fn is_cola_authored(&self, message_id: &str) -> bool {
-        match self.projections.turn_of_item(message_id) {
-            Some((thread, turn)) => {
-                if self.authored.is_authored(&thread, Some(&turn)) {
-                    return true;
-                }
-                // The provenance window: the item's turn was folded before the
-                // `turn/start` response bound its id, so the record cannot name
-                // it yet. A pending prompt on the thread whose turn is the live
-                // one IS that submission (ADR-0092 decision 2).
+        let Some((thread, turn)) = self.projections.turn_of_item(message_id) else {
+            // Not in the cache: nothing cola can vouch for, unless the record
+            // itself is unusable — then everything is cola's (fail closed).
+            return !self.authored.is_trusted();
+        };
+        if self.authored.is_authored(&thread, Some(&turn)) {
+            return true;
+        }
+        // The provenance answer before the turn is bound. An item carrying the
+        // chosen submission id is cola's only if that id is still pending — no
+        // other client's message can match it. An item with no client id falls
+        // back to the in-flight marker, which is only consulted for the
+        // thread's live turn (ADR-0092 decision 2).
+        match self.projections.submission_of_item(&thread, message_id) {
+            Some(submission) => self.authored.is_pending_submission(&thread, &submission),
+            None => {
                 self.authored.is_pending(&thread)
                     && self.projections.live_turn(&thread).as_deref() == Some(turn.as_str())
             }
-            // Not in the cache: nothing cola can vouch for, unless the record
-            // itself is unusable — then everything is cola's (fail closed).
-            None => !self.authored.is_trusted(),
         }
     }
 
@@ -1163,7 +1278,12 @@ impl Backend for CodexClient {
 
     async fn transcript(&self, session_id: &str) -> Result<SessionTranscript> {
         self.ensure_subscription(session_id).await.map_err(client_error)?;
-        Ok(self.projections.transcript(session_id))
+        let transcript = self.projections.transcript(session_id);
+        // The read is where a lost `turn/start` response is reconciled: a
+        // pending chosen id binds to the turn whose user item carries it, so
+        // the authorship answer is exact even before the next prompt.
+        self.reconcile_submissions(session_id, &transcript);
+        Ok(transcript)
     }
 
     async fn session_diff(
@@ -1272,7 +1392,7 @@ impl Backend for CodexClient {
                 });
             }
         }
-        self.skills.remember(catalog);
+        self.skills.replace_scope(directory, catalog);
         skills
     }
 
@@ -1381,9 +1501,15 @@ impl Backend for CodexClient {
             .request("thread/compact/start", json!({ "threadId": session_id }))
             .await
         {
-            // Nothing was requested: do not mislabel a later automatic
-            // compaction as manual.
-            self.projections.clear_manual_compaction(session_id);
+            // Only a definite refusal proves no compaction started, so only it
+            // clears the marker: an ambiguous failure (a lost response after
+            // acceptance) must still title the item 手动. An item that never
+            // arrives leaves the marker for the thread's next compaction; the
+            // next `/compact` overwrites it, so it cannot linger across a
+            // request that failed at the transport.
+            if definitely_refused(&error) {
+                self.projections.clear_manual_compaction(session_id);
+            }
             return Err(client_error(error));
         }
         Ok(())
@@ -3306,7 +3432,7 @@ mod tests {
     /// A skill the last list did not name is a named error, never a silently
     /// dropped request (the model would answer without it).
     #[tokio::test]
-    async fn an_unknown_skill_fails_the_prompt_by_name() {
+    async fn an_unknown_skill_fails_the_prompt_by_name_and_leaves_no_marker() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
@@ -3315,6 +3441,8 @@ mod tests {
             "a real thread",
         ));
         let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
         let error = client
             .prompt(
                 "thread-1",
@@ -3327,11 +3455,197 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
+                Some("msg_cola_never"),
             )
             .await
             .expect_err("an unknown skill is refused");
         assert!(error.to_string().contains("never-listed"), "{error}");
+        // Finding 2: a pre-send validation failure must not leave a marker
+        // that would suppress a later external turn on the thread.
+        assert!(!client.authored.is_pending("thread-1"));
+        assert!(
+            !client
+                .authored
+                .is_pending_submission("thread-1", "msg_cola_never")
+        );
+
+        // A turn the user's own client starts afterwards is external.
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-tui", "status": "inProgress", "startedAt": 5 } }),
+            ),
+            (
+                "item/started",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-tui",
+                    "startedAtMs": 5_000_i64,
+                    "item": {
+                        "type": "userMessage",
+                        "id": "item-tui",
+                        "clientId": null,
+                        "content": [{ "type": "text", "text": "from the TUI", "textElements": [] }],
+                    },
+                }),
+            ),
+        ] {
+            server.push_to_thread("thread-1", method, params);
+        }
+        wait_for_text(&client, "thread-1", "from the TUI").await;
+        assert!(
+            !client.is_cola_authored("item-tui").await,
+            "a failed pre-send validation must not vouch for a later external turn"
+        );
+    }
+
+    /// Finding 4: a skill deleted between two lists must stop resolving, so the
+    /// prompt fails by name instead of sending a stale path. A name present in
+    /// two directories resolves to the most recently read scope.
+    #[tokio::test]
+    async fn a_skill_that_disappears_between_lists_is_refused() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.set_skills(vec![json!({
+            "name": "caveman",
+            "description": "Brief mode",
+            "path": "/work/cola/.codex/skills/caveman/SKILL.md",
+            "scope": "repo",
+            "enabled": true,
+            "pluginId": null,
+        })]);
+        let client = connect(&url).await;
+        assert_eq!(client.list_skills(Some("/work/cola")).await.len(), 1);
+
+        // A second read for another project refreshes that scope and wins.
+        server.set_skills(vec![json!({
+            "name": "caveman",
+            "description": "Brief mode",
+            "path": "/work/other/.codex/skills/caveman/SKILL.md",
+            "scope": "repo",
+            "enabled": true,
+            "pluginId": null,
+        })]);
+        assert_eq!(client.list_skills(Some("/work/other")).await.len(), 1);
+        let path = client.skills.path_of("caveman").expect("the newest scope");
+        assert_eq!(path, "/work/other/.codex/skills/caveman/SKILL.md");
+
+        // The skill vanishes from its own directory: a new list replaces that
+        // scope, and the name is gone unless another scope still carries it.
+        server.set_skills(Vec::new());
+        assert!(
+            client.list_skills(Some("/work/cola")).await.is_empty(),
+            "the vanished scope is replaced"
+        );
+        assert!(
+            client.skills.path_of("caveman").is_some(),
+            "the other directory's read still carries it"
+        );
+        assert!(client.list_skills(Some("/work/other")).await.is_empty());
+        assert!(
+            client.skills.path_of("caveman").is_none(),
+            "a vanished skill is not resolved from a stale path"
+        );
+        let error = client
+            .prompt(
+                "thread-1",
+                "be brief",
+                &[],
+                &[PromptSkill {
+                    id: "caveman".into(),
+                    name: "caveman".into(),
+                }],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("the deleted skill is refused");
+        assert!(error.to_string().contains("caveman"), "{error}");
+    }
+
+    /// Finding 3: `/stop` can land after `turn/start` was accepted but before
+    /// the server persisted the turn. The lookup polls the thread's record, so
+    /// the interrupt fires the moment the turn appears.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_turn_the_server_persists_a_moment_later() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        // The user's own client starts the turn; cola has no subscription, so
+        // its cache cannot see it.
+        let tui = connect(&url).await;
+        tui.transcript("thread-1").await.expect("the TUI's subscription");
+        tui.prompt("thread-1", "a long run", &[], &[], None, None, None, None)
+            .await
+            .expect("the TUI's prompt");
+        let live = server.live_turn("thread-1").expect("the turn is running");
+
+        let cola = connect(&url).await;
+        // The first read still hides the in-progress turn: the stop must retry.
+        server.hide_live_turn_for("thread-1", 1);
+        cola.interrupt("thread-1")
+            .await
+            .expect("the stop waits for the turn");
+
+        let interrupts = server.interrupt_params();
+        assert_eq!(interrupts.len(), 1, "the retry interrupted the run");
+        assert_eq!(interrupts[0]["turnId"].as_str(), Some(live.as_str()));
+        assert_eq!(server.live_turn("thread-1"), None);
+    }
+
+    /// Finding 5: an ambiguous `thread/compact/start` failure (the request was
+    /// accepted, its response lost) keeps the manual marker, so the item is not
+    /// mislabelled automatic; a definite refusal clears it.
+    #[tokio::test]
+    async fn an_ambiguous_compaction_failure_keeps_the_manual_marker() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.drop_next_compact_response();
+        client
+            .compact("thread-1")
+            .await
+            .expect_err("the response was lost");
+        assert!(
+            client.projections.manual_compaction_pending("thread-1"),
+            "an ambiguous failure must not relabel the compaction automatic"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_compaction_clears_the_manual_marker() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.reject_next_compact();
+        let client = connect(&url).await;
+        client.compact("thread-1").await.expect_err("the server refused");
+        assert!(
+            !client.projections.manual_compaction_pending("thread-1"),
+            "a definite refusal did not start a compaction"
+        );
     }
 
     /// A `/model` and `/think` pick ride the next `turn/start`: the model as
@@ -3376,11 +3690,11 @@ mod tests {
     }
 
     /// The provenance window (ADR-0092 decision 2): an item can reach the
-    /// subscription before the `turn/start` response names its turn. While the
-    /// submission is pending, the live turn is cola's — an older, completed
-    /// turn of the thread is not.
+    /// subscription before the `turn/start` response names its turn. With a
+    /// submission in flight, the thread's live turn is cola's — an older,
+    /// completed turn of the same thread is not.
     #[tokio::test]
-    async fn an_item_that_arrives_before_its_turn_is_bound_is_still_colas() {
+    async fn an_item_without_a_client_id_in_the_live_turn_is_colas_while_a_prompt_is_pending() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
@@ -3388,8 +3702,7 @@ mod tests {
             "/work/cola",
             "a real thread",
         ));
-        let authored = crate::codex::Authorship::in_memory();
-        let client = connect_with(&url, authored.clone()).await;
+        let client = connect_with(&url, crate::codex::Authorship::in_memory()).await;
         client.transcript("thread-1").await.expect("subscribe");
         server.wait_for_subscribers("thread-1", 1).await;
 
@@ -3426,8 +3739,9 @@ mod tests {
             "a completed turn cola never touched is external"
         );
 
-        // cola's prompt is in flight; its turn's stream arrives first.
-        client.authored.begin("thread-1");
+        // cola's prompt is in flight; its turn's stream arrives first, and the
+        // item carries no client id (the server dropped it).
+        client.authored.begin("thread-1", None);
         server.push_to_thread(
             "thread-1",
             "turn/started",
@@ -3442,15 +3756,15 @@ mod tests {
                 "startedAtMs": 3_000_i64,
                 "item": {
                     "type": "userMessage",
-                    "id": "item-early",
-                    "clientId": "msg_cola_early",
-                    "content": [{ "type": "text", "text": "cola's early prompt", "textElements": [] }],
+                    "id": "item-live",
+                    "clientId": null,
+                    "content": [{ "type": "text", "text": "cola's live prompt", "textElements": [] }],
                 },
             }),
         );
-        wait_for_text(&client, "thread-1", "cola's early prompt").await;
+        wait_for_text(&client, "thread-1", "cola's live prompt").await;
         assert!(
-            client.is_cola_authored("item-early").await,
+            client.is_cola_authored("item-live").await,
             "the in-flight submission vouches for the live turn before the response names it"
         );
         assert!(
@@ -3459,9 +3773,179 @@ mod tests {
         );
 
         // The response binds the turn: the record answers from here on.
-        client.authored.bind("thread-1", "turn-live");
-        assert!(client.is_cola_authored("item-early").await);
+        client.authored.bind("thread-1", "turn-live", None);
+        assert!(client.is_cola_authored("item-live").await);
         assert!(!client.authored.is_pending("thread-1"));
+    }
+
+    /// A pending **durable** submission binds to the turn its user item landed
+    /// in on the next history read: this is how a lost `turn/start` response is
+    /// recovered (ADR-0092 decision 2).
+    #[tokio::test]
+    async fn an_item_carrying_the_pending_submission_binds_its_turn_on_the_read() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect_with(&url, crate::codex::Authorship::in_memory()).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client.authored.begin("thread-1", Some("msg_cola_early"));
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-early", "status": "inProgress", "startedAt": 3 } }),
+            ),
+            (
+                "item/started",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-early",
+                    "startedAtMs": 3_000_i64,
+                    "item": {
+                        "type": "userMessage",
+                        "id": "item-early",
+                        "clientId": "msg_cola_early",
+                        "content": [{ "type": "text", "text": "cola's early prompt", "textElements": [] }],
+                    },
+                }),
+            ),
+        ] {
+            server.push_to_thread("thread-1", method, params);
+        }
+        // The read is what reconciles: the item's client id names the pending
+        // submission, and its turn is bound.
+        wait_for_text(&client, "thread-1", "cola's early prompt").await;
+        assert!(
+            client.authored.is_authored("thread-1", Some("turn-early")),
+            "the read bound the pending submission's turn"
+        );
+        assert!(
+            !client
+                .authored
+                .is_pending_submission("thread-1", "msg_cola_early"),
+            "the pending marker is resolved by the binding"
+        );
+        assert!(client.is_cola_authored("item-early").await);
+    }
+
+    /// Finding 1: an accepted `turn/start` whose response is lost must not be
+    /// forgotten — not even by a restart. The chosen id is durable before the
+    /// request, and the restarted process reconciles it from persisted history.
+    #[tokio::test]
+    async fn an_accepted_prompt_with_a_lost_response_is_colas_after_a_restart() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+
+        let first = connect_with(
+            &url,
+            crate::codex::Authorship::open(path.clone(), "codex").expect("the record opens"),
+        )
+        .await;
+        first.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.drop_next_turn_start_response();
+        let error = first
+            .prompt(
+                "thread-1",
+                "accepted but unanswered",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_lost"),
+            )
+            .await
+            .expect_err("the response was lost");
+        let _ = error;
+        assert!(
+            first.authored.is_pending_submission("thread-1", "msg_cola_lost"),
+            "an ambiguous failure keeps the chosen id"
+        );
+        drop(first);
+
+        // The restarted process: a fresh connection and the durable record. Its
+        // history read binds the submission to the turn the server persisted.
+        let second = connect_with(
+            &url,
+            crate::codex::Authorship::open(path, "codex").expect("the record reloads"),
+        )
+        .await;
+        let mut transcript = second.transcript("thread-1").await.expect("the read");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !transcript
+            .messages
+            .iter()
+            .any(|message| message.text() == "accepted but unanswered")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the persisted prompt never reached the read"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            transcript = second.transcript("thread-1").await.expect("the retried read");
+        }
+        let user = transcript
+            .messages
+            .iter()
+            .find(|message| message.text() == "accepted but unanswered")
+            .expect("the prompt's user message");
+        assert!(
+            second.is_cola_authored(user.id.as_str()).await,
+            "a restart must not report the accepted, unanswered prompt as external"
+        );
+        assert!(
+            !second.authored.is_pending_submission("thread-1", "msg_cola_lost"),
+            "the history read resolved the pending submission"
+        );
+    }
+
+    /// Finding 1 (the other side): a **definite** refusal clears its marker, so
+    /// a later external turn on the thread is not suppressed.
+    #[tokio::test]
+    async fn a_definitely_refused_prompt_clears_its_pending_marker() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect_with(&url, crate::codex::Authorship::in_memory()).await;
+        server.reject_next_turn_start("model not found");
+        let error = client
+            .prompt(
+                "thread-1",
+                "never sent",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_refused"),
+            )
+            .await
+            .expect_err("the server refused");
+        assert!(error.to_string().contains("model not found"), "{error}");
+        assert!(!client.authored.is_pending("thread-1"));
+        assert!(
+            !client
+                .authored
+                .is_pending_submission("thread-1", "msg_cola_refused")
+        );
     }
 
     /// The adapter is constructed by kind, and an unattached lifecycle is a
