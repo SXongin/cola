@@ -4271,11 +4271,11 @@ impl StreamAccumulator {
     /// hundred bytes — the `MAX_CARD_JSON_CHARS` margin absorbs the rest.
     ///
     /// `reserve_tail` charges the panels the built card will ALSO carry in its
-    /// tail — the todo list, the Background Task Ledger (ADR-0060) and every
-    /// running tool's panel (ADR-0045) — to the same budget, keeping the card
-    /// and its tail together under the cap. Callers pass it only when the
-    /// slice is the final, tail-carrying one — see
-    /// [`Self::build_card_with_info`].
+    /// tail — the todo list, the Background Task Ledger (ADR-0060), every
+    /// running tool's panel (ADR-0045) and the live permission blocks — to the
+    /// same budget, keeping the card and its tail together under the cap.
+    /// Callers pass it only when the slice is the final, tail-carrying one —
+    /// see [`Self::build_card_with_info`].
     fn estimate_split_index(&self, start: usize, reserve_tail: bool) -> usize {
         let mut comps = 0usize;
         let mut size = 0usize;
@@ -4322,6 +4322,19 @@ impl StreamAccumulator {
                     anchor.message_id.as_str(),
                     self.directory.as_deref().unwrap_or_default(),
                 );
+            }
+            // The live interaction blocks ride this tail too. A permission's
+            // body is copied into every button's callback value (see
+            // `permission_block_estimate`), so charging only the element would
+            // let a near-budget card append a long command past Feishu's hard
+            // limit. The command budget was raised for exactly those blocks
+            // (whole-branch review #883), which is why they are reserved here.
+            for block in &self.interactions {
+                if let InteractionBlock::Permission(p) = block {
+                    comps += crate::feishu::card::question::permission_block_components(p.always_supported);
+                    size +=
+                        crate::feishu::card::question::permission_block_estimate(&p.body, p.always_supported);
+                }
             }
         }
         for (i, item) in self.timeline.iter().enumerate().skip(start) {

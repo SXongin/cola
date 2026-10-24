@@ -1628,6 +1628,65 @@ async fn a_tui_command_approval_is_answered_from_the_feishu_card() {
     sync.abort();
 }
 
+/// Whole-branch review #883: server requests are **lossless**. A request
+/// followed by a burst larger than the notification broadcast's capacity still
+/// becomes a card and is still answerable — the approval record no longer reads
+/// the lossy fan-out, where a lagged consumer loses the oldest frames (a server
+/// then waits forever with no card).
+#[tokio::test]
+async fn an_approval_survives_a_notification_burst_larger_than_the_broadcast() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), 1_600_000_000_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    // The request arrives first; the burst then outruns the broadcast's
+    // capacity before the poller has read anything.
+    server.request_to_subscribers(
+        THREAD,
+        "item/commandExecution/requestApproval",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-burst",
+            "itemId": "item-burst",
+            "command": "cargo test --workspace --locked",
+            "cwd": WORK,
+        }),
+    );
+    // More frames than the connection's 1024-entry broadcast holds, so a
+    // consumer on that path is lagged and its oldest entries are gone.
+    for _ in 0..1100 {
+        server.push_notification("remoteControl/status/changed", json!({ "status": "disabled" }));
+    }
+
+    let poll = spawn_permission_poll(&app);
+    let card = wait_for_sent_card(&platform, "the Feishu permission card", |card| {
+        card_text(card).contains("cargo test --workspace --locked")
+    })
+    .await;
+    let once = button_value(&card, "once").expect("the allow-once button");
+    app.host_action(once).await.expect("the answer card");
+
+    server.wait_for_server_request_replies(1).await;
+    assert_eq!(
+        server.server_request_replies()[0].result,
+        Some(json!({ "decision": "accept" })),
+        "the request the burst could have dropped is answered"
+    );
+
+    poll.abort();
+    sync.abort();
+}
+
 /// Ticket #882 acceptance 2 + 3: a cola-started turn's approval is answerable
 /// from the user's own client, and the Feishu card is withdrawn on the
 /// server's `serverRequest/resolved` instead of staying clickable.

@@ -1577,11 +1577,14 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
 
     if !p.patterns.is_empty() {
         s.push_str("**对象**:\n");
+        // A command's target IS the command, so it gets the wider command
+        // budget; every other pattern is a path/grant name and keeps the short
+        // one. An adapter proves its targets fit before offering the card, so
+        // a clip here means "shown in full up to the shared budget", never a
+        // decision the user did not see (see `permission_target_budget`).
+        let budget = crate::backend::permission_target_budget(action);
         for r in &p.patterns {
-            s.push_str(&format!(
-                "- `{}`\n",
-                truncate(r, crate::backend::PERMISSION_PATTERN_MAX_CHARS)
-            ));
+            s.push_str(&format!("- `{}`\n", truncate(r, budget)));
         }
     }
 
@@ -1720,6 +1723,41 @@ Index: /proj/src/main.rs
         );
         // The diff must not leak as escaped raw JSON metadata.
         assert!(!s.contains("\\n"), "no escaped JSON: {}", s);
+    }
+
+    /// Whole-branch review #883: a command's target IS the decision, so it is
+    /// rendered at the command budget in full; a path keeps the short pattern
+    /// budget. The adapter refuses anything past the same budget, so a card
+    /// never offers an approval for text it clipped.
+    #[test]
+    fn describe_permission_renders_a_command_target_at_the_command_budget() {
+        let budget = crate::backend::types::PERMISSION_COMMAND_MAX_CHARS;
+        let command = "x".repeat(budget);
+        let p = crate::backend::types::PermissionRequest {
+            request_id: "n:1".into(),
+            session_id: Some("thread-1".into()),
+            permission: Some("command".into()),
+            patterns: vec![command.clone()],
+            metadata: None,
+            always: vec![],
+            always_supported: true,
+        };
+        let rendered = describe_permission(&p);
+        assert!(
+            rendered.contains(&command),
+            "the whole command is on the card, not a 150-char prefix"
+        );
+        assert!(!rendered.contains('…'), "nothing was clipped: {rendered}");
+
+        // A pattern budget still holds for a non-command target: a path past
+        // 150 characters is clipped, and the adapter proves that before
+        // offering the card.
+        let path = format!("/proj/{}", "d/".repeat(80));
+        let mut p = p;
+        p.permission = Some("write".into());
+        p.patterns = vec![path];
+        let rendered = describe_permission(&p);
+        assert!(rendered.contains('…'), "a long path keeps the short budget");
     }
 
     /// V2's `edit` records `{files: [{file, patch, status, additions,
