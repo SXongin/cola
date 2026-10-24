@@ -122,12 +122,44 @@ pub struct RequestFlow {
     /// failed directory — may still be pending, like every other per-request
     /// registry here.
     session_less: Arc<Mutex<HashMap<String, String>>>,
+    /// request_id → a surface withdrawal this flow decided but could not
+    /// deliver (the card PATCH failed). The payload is rendered at decision
+    /// time and replayed verbatim: re-deciding later could mislabel the card
+    /// (the request may already be settled, or another client may have
+    /// answered), and the retained registry handle is what makes the retry
+    /// possible.
+    pending_withdrawals: Arc<Mutex<HashMap<String, PendingWithdrawal>>>,
     /// Test-only record of the session ids [`Self::is_pending_for`] checked
     /// (spec #501): the per-render shared gather must ask each distinct child's
     /// wait at most once, so a test counts the checks this flow served. Absent
     /// from production builds.
     #[cfg(test)]
     pub(crate) wait_checks: Arc<Mutex<Vec<String>>>,
+}
+
+/// One decided-but-undelivered surface withdrawal: the replacement card for a
+/// standalone surface (built at decision time, from that surface's summary) and
+/// the inline receipt line to replay.
+#[derive(Debug, Clone)]
+struct PendingWithdrawal {
+    /// What was decided, so the retry knows whether success also settles the
+    /// request (`Refused` / `ResolvedElsewhere`) or still needs the decline
+    /// retried (`Retrying`).
+    how: Withdrawal,
+    receipt: String,
+    card: serde_json::Value,
+}
+
+/// How one attempt to neutralize a stored surface ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WithdrawalOutcome {
+    /// There was no stored surface to patch.
+    None,
+    /// Every stored surface was patched (or had nothing to render).
+    Updated,
+    /// A stored surface exists but its PATCH failed: the handle and record are
+    /// **kept**, so the withdrawal can be retried.
+    Failed,
 }
 
 /// Tell the chat why a permission was declined before it could be offered.
@@ -232,6 +264,7 @@ impl RequestFlow {
             surfaces,
             recovered: Arc::new(Mutex::new(recovered)),
             session_less: Arc::new(Mutex::new(HashMap::new())),
+            pending_withdrawals: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             wait_checks: Arc::new(Mutex::new(Vec::new())),
         }
@@ -644,6 +677,11 @@ impl RequestFlow {
     /// attached or spawned yet) lives in [`Self::poll_loop`], so a direct
     /// caller on a serverless app must skip it itself.
     pub(crate) async fn sweep(&self, handles: &FlowHandles, seen: &mut std::collections::HashSet<String>) {
+        // Deliver any withdrawal a previous sweep decided but could not patch.
+        // It cannot ride the per-request loop once the request left the pending
+        // list (a decline that landed before its card PATCH failed), so it runs
+        // before the listing and completes the neutralization first.
+        self.retry_pending_withdrawals(handles).await;
         // Pending requests live in the server instance for the session's
         // directory; `GET /permission` / `GET /question` must be scoped with
         // `?directory=` or they only see the server cwd instance. Check every
@@ -1098,25 +1136,63 @@ impl RequestFlow {
         // server and its stored surface withdrawn in this same pass; a FAILED
         // refusal leaves it pending and unmarked, so the next sweep retries it
         // and this pass offers nothing.
+        // A withdrawal this flow already decided but could not deliver is
+        // replayed with its original payload: re-deciding now could mislabel the
+        // card (the request may already be settled, or another client may have
+        // answered it). A `Refused`/`ResolvedElsewhere` retry that succeeds
+        // settles the request; a `Retrying` one must still fall through to the
+        // refusal it belongs to.
+        let pending = self.pending_withdrawals.lock().await.get(req.id()).cloned();
+        if let Some(withdrawal) = pending {
+            let outcome = self.apply_stored_withdrawal(handles, req.id(), &withdrawal).await;
+            if outcome != WithdrawalOutcome::Failed {
+                self.pending_withdrawals.lock().await.remove(req.id());
+                if withdrawal.how != Withdrawal::Retrying {
+                    seen.insert(req.id().to_string());
+                    return true;
+                }
+            } else if withdrawal.how != Withdrawal::Retrying {
+                // A settled decision whose card still cannot be patched stays
+                // retryable and is never offered.
+                return false;
+            }
+        }
         match self.kind.refuse(self, handles, req, dir).await {
             Refusal::NotApplicable => {}
             Refusal::Refused => {
-                seen.insert(req.id().to_string());
-                let withdrawn = self
+                match self
                     .withdraw_stored_surface(handles, req, Withdrawal::Refused)
-                    .await;
-                if !withdrawn && let PendingRequest::Permission(p) = req {
-                    post_unshowable_notice(handles, p, dir).await;
+                    .await
+                {
+                    // The PATCH failed; the stored surface (and the payload)
+                    // are kept so the next sweep retries the withdrawal.
+                    WithdrawalOutcome::Failed => return false,
+                    WithdrawalOutcome::Updated => {
+                        seen.insert(req.id().to_string());
+                        return true;
+                    }
+                    WithdrawalOutcome::None => {
+                        seen.insert(req.id().to_string());
+                        if let PendingRequest::Permission(p) = req {
+                            post_unshowable_notice(handles, p, dir).await;
+                        }
+                        return true;
+                    }
                 }
-                return true;
             }
             // Someone else settled it: withdraw a stored card without claiming
             // cola rejected anything, post nothing, and treat it as handled.
             Refusal::ResolvedElsewhere => {
-                seen.insert(req.id().to_string());
-                self.withdraw_stored_surface(handles, req, Withdrawal::ResolvedElsewhere)
-                    .await;
-                return true;
+                match self
+                    .withdraw_stored_surface(handles, req, Withdrawal::ResolvedElsewhere)
+                    .await
+                {
+                    WithdrawalOutcome::Failed => return false,
+                    _ => {
+                        seen.insert(req.id().to_string());
+                        return true;
+                    }
+                }
             }
             // The refusal did not land. The request stays pending and unmarked
             // so the next sweep retries it, but a stored card must not stay
@@ -1313,9 +1389,9 @@ impl RequestFlow {
         handles: &FlowHandles,
         req: &PendingRequest,
         how: Withdrawal,
-    ) -> bool {
+    ) -> WithdrawalOutcome {
         let PendingRequest::Permission(p) = req else {
-            return false;
+            return WithdrawalOutcome::None;
         };
         self.recovered.lock().await.remove(req.id());
         let receipt = match how {
@@ -1325,65 +1401,143 @@ impl RequestFlow {
                 crate::feishu::card::question::UNSHOWABLE_PERMISSION_RETRY_RECEIPT.to_string()
             }
         };
-        let mut withdrawn = false;
-        // Inline: replace the block on its cached card, then forget the handle.
+        // Rendered now, from the record that names the card: a retry replays
+        // this exact payload rather than re-deciding what the card should say.
+        let standalone = self.sent_cards.lock().await.get(req.id()).cloned();
+        let card = match (how, &standalone) {
+            (Withdrawal::Refused, _) => {
+                crate::feishu::card::question::build_unshowable_permission_card(p.target_budget())
+            }
+            (Withdrawal::ResolvedElsewhere, Some(sent)) => {
+                crate::feishu::card::notify::build_resolved_elsewhere_card(self.kind.label(), &sent.summary)
+            }
+            (Withdrawal::ResolvedElsewhere, None) => serde_json::Value::Null,
+            (Withdrawal::Retrying, _) => {
+                crate::feishu::card::question::build_unshowable_permission_retry_card()
+            }
+        };
+        let withdrawal = PendingWithdrawal { how, receipt, card };
+        let outcome = self.apply_stored_withdrawal(handles, req.id(), &withdrawal).await;
+        if outcome == WithdrawalOutcome::Failed {
+            // The handle/record are still there (apply only mutates after a
+            // landed PATCH), so both the listed path and the sweep-level retry
+            // can deliver this later.
+            self.pending_withdrawals
+                .lock()
+                .await
+                .insert(req.id().to_string(), withdrawal);
+        }
+        outcome
+    }
+
+    /// Patch every stored surface for `id` with the replacement `withdrawal`
+    /// names, committing the registry/persisted state **only after** the
+    /// PATCH lands.
+    ///
+    /// A failed PATCH changes nothing: the old card is still interactive, so
+    /// forgetting its handle would strand it — the withdrawal could never be
+    /// retried and the request would wait behind a button nobody neutralized.
+    async fn apply_stored_withdrawal(
+        &self,
+        handles: &FlowHandles,
+        id: &str,
+        withdrawal: &PendingWithdrawal,
+    ) -> WithdrawalOutcome {
+        let mut attempted = false;
+        let mut failed = false;
+        // Inline: preview the block's replacement on the cached card, PATCH,
+        // then commit the edit and drop the handle.
         let inline = {
-            let mut registry = handles.cards.card_handles.lock().await;
+            let registry = handles.cards.card_handles.lock().await;
             registry
-                .message_of(req.id())
+                .message_of(id)
                 .map(str::to_string)
                 .and_then(|message_id| {
-                    let card = registry.resolve_on(&message_id, req.id(), &receipt);
-                    registry.forget(req.id());
-                    card.map(|card| (message_id, card))
+                    registry
+                        .resolved_preview(&message_id, id, &withdrawal.receipt)
+                        .map(|card| (message_id, card))
                 })
         };
         if let Some((message_id, card)) = inline {
-            withdrawn = true;
-            if let Err(e) = handles.platform.update_message(&message_id, &card).await {
-                tracing::warn!(
-                    "refused {} block withdrawal failed on {}: {}",
-                    req.id(),
-                    message_id,
-                    e
-                );
-            } else {
-                tracing::info!("refused {} inline block withdrawn on {}", req.id(), message_id);
+            attempted = true;
+            match handles.platform.update_message(&message_id, &card).await {
+                Ok(()) => {
+                    let mut registry = handles.cards.card_handles.lock().await;
+                    registry.resolve_on(&message_id, id, &withdrawal.receipt);
+                    registry.forget(id);
+                    tracing::info!("withdrew {} inline block on {}", id, message_id);
+                }
+                Err(e) => {
+                    failed = true;
+                    tracing::warn!(
+                        "withdrawing {} inline block on {} failed: {}; the handle is kept so the \
+                         withdrawal can be retried",
+                        id,
+                        message_id,
+                        e
+                    );
+                }
+            }
+        } else {
+            // A handle whose cached card no longer renders the block is
+            // unusable, and nothing there can be clicked: drop it.
+            let mut registry = handles.cards.card_handles.lock().await;
+            if registry.message_of(id).is_some() {
+                registry.forget(id);
             }
         }
-        // Standalone: repaint the card a previous process posted.
-        let standalone = self.sent_cards.lock().await.remove(req.id());
+        // Standalone: PATCH the record's card, then forget the record.
+        let standalone = self.sent_cards.lock().await.get(id).cloned();
         if let Some(sent) = standalone {
-            withdrawn = true;
-            self.surfaces.remove_standalone(req.id());
-            let card = match how {
-                Withdrawal::Refused => {
-                    crate::feishu::card::question::build_unshowable_permission_card(p.target_budget())
+            attempted = true;
+            match handles
+                .platform
+                .update_message(&sent.message_id, &withdrawal.card)
+                .await
+            {
+                Ok(()) => {
+                    self.sent_cards.lock().await.remove(id);
+                    self.surfaces.remove_standalone(id);
+                    tracing::info!("withdrew {} standalone card on {}", id, sent.message_id);
                 }
-                Withdrawal::ResolvedElsewhere => crate::feishu::card::notify::build_resolved_elsewhere_card(
-                    self.kind.label(),
-                    &sent.summary,
-                ),
-                Withdrawal::Retrying => {
-                    crate::feishu::card::question::build_unshowable_permission_retry_card()
+                Err(e) => {
+                    failed = true;
+                    tracing::warn!(
+                        "withdrawing {} standalone card on {} failed: {}; the record is kept so \
+                         the withdrawal can be retried",
+                        id,
+                        sent.message_id,
+                        e
+                    );
                 }
-            };
-            if let Err(e) = handles.platform.update_message(&sent.message_id, &card).await {
-                tracing::warn!(
-                    "refused {} card withdrawal failed on {}: {}",
-                    req.id(),
-                    sent.message_id,
-                    e
-                );
-            } else {
-                tracing::info!(
-                    "refused {} standalone card withdrawn on {}",
-                    req.id(),
-                    sent.message_id
-                );
             }
         }
-        withdrawn
+        if failed {
+            WithdrawalOutcome::Failed
+        } else if attempted {
+            WithdrawalOutcome::Updated
+        } else {
+            WithdrawalOutcome::None
+        }
+    }
+
+    /// Retry every decided-but-undelivered withdrawal. The request may already
+    /// have left the pending list (a decline that landed before its card PATCH
+    /// failed), so this cannot wait for the per-request sweep. Success clears
+    /// the entry; a failure keeps it for the next sweep.
+    async fn retry_pending_withdrawals(&self, handles: &FlowHandles) {
+        let pending: Vec<(String, PendingWithdrawal)> = self
+            .pending_withdrawals
+            .lock()
+            .await
+            .iter()
+            .map(|(id, withdrawal)| (id.clone(), withdrawal.clone()))
+            .collect();
+        for (id, withdrawal) in pending {
+            if self.apply_stored_withdrawal(handles, &id, &withdrawal).await != WithdrawalOutcome::Failed {
+                self.pending_withdrawals.lock().await.remove(&id);
+            }
+        }
     }
 
     /// Re-adopt the card a previous process surfaced this request on (ADR-0038

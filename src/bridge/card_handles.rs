@@ -258,6 +258,33 @@ impl CardHandles {
         self.edit_on(message_id, request_id, vec![receipt_element(line)], false)
     }
 
+    /// The JSON [`Self::resolve_on`] would produce for `request_id`'s block on
+    /// `message_id`, **without mutating the registry**.
+    ///
+    /// The caller patches Feishu with this preview first and commits it
+    /// (`resolve_on` + `forget`) only when the patch lands: a failed PATCH must
+    /// leave the handle intact, or the withdrawal it was neutralizing could
+    /// never be retried and the old card would stay clickable. `None` when the
+    /// card does not render the block (or its cached shape is unusable).
+    pub fn resolved_preview(
+        &self,
+        message_id: &str,
+        request_id: &str,
+        line: &str,
+    ) -> Option<serde_json::Value> {
+        let card = self.cards.get(message_id)?;
+        let span = card.spans.iter().find(|span| span.request_id == request_id)?;
+        let elements = card.card["body"]["elements"].as_array()?;
+        if span.start > span.end || span.end > elements.len() {
+            return None;
+        }
+        let mut elements = elements.clone();
+        elements.splice(span.start..span.end, vec![receipt_element(line)]);
+        let mut preview = card.card.clone();
+        preview["body"]["elements"] = serde_json::Value::Array(elements);
+        Some(preview)
+    }
+
     /// Replace a live block's elements on the cached card `message_id` with
     /// freshly built ones (the question block's updated 已选/✅ state). `None`
     /// when that card does not render the block.
