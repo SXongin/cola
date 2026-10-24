@@ -415,12 +415,14 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 `--no-daemon` 或指向其他端点的客户端会被明确判为失败。完全没有本地客户端时
 （纯 Feishu 部署）该检查通过，因为没有需要连接的对象。
 
-`cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在一个临时线程上
-发起最小回合并等待 `turn/completed`，遇到可重试或终止性错误、或回合超出
-60 秒预算未完成时判定失败。由于这会在并非 cola 所有的 daemon 上产生真实写入
-（临时线程以 doctor 探针命名并在结束后删除，清理失败会报告为警告），
-`--no-turn-check` 是显式的跳过开关。所有检查都不读取 ChatGPT 账号状态——使用
-provider key 的 `[model_providers.*]` 配置可以全绿。
+`cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在**共享**
+daemon（并非 cola 所有）上创建一个临时线程并发起最小回合并等待
+`turn/completed`，遇到可重试或终止性错误、或回合超出 60 秒预算未完成时判定
+失败。这会写入共享 daemon，并**可能产生 provider 费用**：doctor 会创建以探针
+命名的临时线程，在回合仍在运行时中断它，然后删除该线程（清理失败会报告为
+警告）。`--no-turn-check` 跳过该检查；`--check-turn` 仍作为旧脚本的无效别名
+被接受。所有检查都不读取 ChatGPT 账号状态——使用 provider key 的
+`[model_providers.*]` 配置可以全绿。
 
 `cola config path|show|validate` 分别打印解析到的配置路径、脱敏后的生效配置、
 或做一次解析校验。`cola version` 等价于 `--version`。`cola completions <shell>`

@@ -28,6 +28,14 @@
 //! whose sharing the process table cannot settle is reported as
 //! **unverified**, never assumed.
 //!
+//! `cola doctor`'s provider-turn probe runs by default: ADR-0090 decision 3
+//! makes "a configured provider that can complete a turn" the support
+//! criterion, and the user invoked the diagnostic explicitly, so its write is
+//! within that contract. The probe reserves an exclusive scratch directory,
+//! starts a named thread and a minimal turn there, then interrupts the turn
+//! while it is live and deletes the thread. `--no-turn-check` is the explicit
+//! opt-out, and the doctor check names the write and possible provider spend.
+//!
 //! The `Backend` implementation that serves Sessions is a later ticket (#879);
 //! this type is the lifecycle half it will build on.
 
@@ -562,15 +570,59 @@ fn absent_reason(discovery: &Discovery) -> String {
     }
 }
 
-/// A unique scratch directory for one probe. `thread/start` assigns the thread
-/// id only in its response, so an ambiguous create has no id to delete; the
-/// distinctive cwd is what a recovery `thread/list` finds.
-fn probe_directory() -> std::path::PathBuf {
+/// How many name suffixes one probe-directory reservation tries before it gives
+/// up. A collision is only possible against another process using the same pid
+/// and clock value, so a handful is generous; exhausting them is a named
+/// failure rather than a silent reuse.
+const PROBE_DIR_ATTEMPTS: u32 = 8;
+
+/// Reserve a scratch directory this run **owns**.
+///
+/// The directory is the only handle on a probe thread whose `thread/start`
+/// reply was lost, so cleanup must never treat a pre-existing directory as its
+/// own: `create_dir` (not `create_dir_all`) fails when the path exists, and the
+/// attempt suffix moves on. Only threads whose cwd is the returned directory
+/// may be deleted by recovery.
+fn create_probe_directory() -> std::io::Result<std::path::PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("cola-doctor-{}-{nanos}", std::process::id()))
+    create_probe_directory_with(&std::env::temp_dir(), std::process::id(), nanos)
+}
+
+/// [`create_probe_directory`] against an explicit root and name seed, so the
+/// exclusive reservation is unit-testable.
+fn create_probe_directory_with(root: &Path, pid: u32, nanos: u128) -> std::io::Result<std::path::PathBuf> {
+    let mut last = None;
+    for attempt in 0..PROBE_DIR_ATTEMPTS {
+        let path = root.join(format!("cola-doctor-{pid}-{}", nanos + u128::from(attempt)));
+        match create_private_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique cola doctor probe directory",
+        )
+    }))
+}
+
+/// Create one directory, unreadable to other users on Unix. The probe thread
+/// runs in it, so its scratch state must not be shared by a second user.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
 }
 
 /// Owns a probe's scratch thread so cancellation cannot leak it.
@@ -1006,15 +1058,14 @@ impl ServerLifecycle for CodexLifecycle {
                     .to_string(),
             };
         };
-        let directory = probe_directory();
-        if let Err(error) = std::fs::create_dir_all(&directory) {
-            return TurnProbe::Failed {
-                detail: format!(
-                    "could not create the probe directory {}: {error}",
-                    directory.display()
-                ),
-            };
-        }
+        let directory = match create_probe_directory() {
+            Ok(directory) => directory,
+            Err(error) => {
+                return TurnProbe::Failed {
+                    detail: format!("could not reserve a probe directory: {error}"),
+                };
+            }
+        };
         let mut probe = ProbeThread::new(client.connection().clone(), directory.clone());
         let mut inbound = client.connection().inbound();
         let cwd = directory.to_string_lossy().to_string();
@@ -2244,6 +2295,12 @@ mod tests {
             "session-root",
             &directory.to_string_lossy(),
         ));
+        // A thread in another project must never be touched by the recovery.
+        server.seed_thread(ScriptedThread::never_run(
+            "thread-user",
+            "session-root",
+            "/tmp/user-project",
+        ));
         let endpoint = Endpoint::Unix(fixture.environment.socket());
         let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
             .await
@@ -2256,6 +2313,39 @@ mod tests {
             vec!["thread-ambiguous".to_string()],
             "the by-directory lookup deleted the lost-response thread"
         );
+    }
+
+    /// The probe directory is reserved exclusively: a colliding name moves to
+    /// the next suffix rather than adopting a pre-existing directory (whose
+    /// threads recovery would otherwise be entitled to delete).
+    #[test]
+    fn the_probe_directory_is_reserved_exclusively() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let pid = std::process::id();
+        let seed = 42u128;
+        let first = create_probe_directory_with(root.path(), pid, seed).expect("reserve");
+        assert!(first.is_dir());
+        let second = create_probe_directory_with(root.path(), pid, seed).expect("next suffix");
+        assert_ne!(first, second);
+        assert!(second.is_dir());
+        // Occupy the next candidate name: the retry must skip it.
+        std::fs::create_dir(root.path().join(format!("cola-doctor-{pid}-{}", seed + 2)))
+            .expect("pre-existing candidate");
+        let third = create_probe_directory_with(root.path(), pid, seed).expect("skips taken names");
+        assert_ne!(third, first);
+        assert_ne!(third, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&third).expect("metadata").permissions().mode() & 0o777,
+                0o700,
+                "the probe directory is private to this user"
+            );
+        }
+        for directory in [first, second, third] {
+            std::fs::remove_dir_all(directory).expect("cleanup");
+        }
     }
 
     /// A passing provider whose cleanup failed is not a clean pass: the

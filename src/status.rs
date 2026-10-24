@@ -13,8 +13,13 @@
 //! kind from the config, and its endpoint, attachment, capabilities and local
 //! clients from the adapter's own [`crate::backend::ServerLifecycle::client_report`].
 //! The one check that writes to a runtime cola does not own — a real turn
-//! proving the configured provider works — runs by default; `--no-turn-check`
-//! is the explicit opt-out.
+//! proving the configured provider works — runs by default. ADR-0090 decision 3
+//! makes that evidence the support criterion: a doctor that skipped it could
+//! pass while every turn died. The user invoked `doctor` explicitly, so the
+//! probe's write (a scratch thread on the shared daemon, deleted afterwards,
+//! possible provider spend) is part of the diagnostic's contract. The check
+//! text names that side effect; `--no-turn-check` opts out, and `--check-turn`
+//! remains a hidden no-op alias for older scripts.
 //!
 //! Neither command takes the Singleton Lock: they must work while cola runs, and
 //! against a broken install where cola cannot run at all.
@@ -900,24 +905,36 @@ fn local_client_check(report: &ClientReport) -> Check {
     )
 }
 
-/// The provider's real turn. By default `doctor` runs it; `--no-turn-check` is
-/// the explicit opt-out, and the check then says so rather than passing
-/// silently. A cleanup failure is a warning, not a pass: the provider worked,
-/// but the probe left its own write behind.
+/// The turn check's explicit side effect: doctor writes to a daemon cola does
+/// not own and may spend the user's provider credit.
+const TURN_CHECK_SIDE_EFFECT: &str =
+    "doctor 在共享 daemon 上创建并删除了一个临时线程，可能产生 provider 费用；`--no-turn-check` 可跳过";
+
+/// The provider's real turn. `doctor` runs it by default (ADR-0090 decision 3:
+/// the provider-turn evidence is the support criterion, and the user invoked
+/// the diagnostic explicitly); `--no-turn-check` is the explicit opt-out, and
+/// the check then says so rather than passing silently. The check always names
+/// the side effect, so a green/red result cannot hide the write. A cleanup
+/// failure is a warning, not a pass: the provider worked, but the probe left
+/// its own write behind.
 fn turn_check(turn: Option<&TurnProbe>) -> Check {
     match turn {
         None => Check::warn(
             "Codex 回合",
-            "已按 `--no-turn-check` 跳过；无法确认配置的 provider 能否完成一次真实回合".to_string(),
+            format!(
+                "已按 `--no-turn-check` 跳过；默认会验证配置的 provider 能否完成一次真实回合（{TURN_CHECK_SIDE_EFFECT}）"
+            ),
         ),
         Some(TurnProbe::Passed { detail, cleanup }) => match cleanup {
-            None => Check::pass("Codex 回合", detail.clone()),
+            None => Check::pass("Codex 回合", format!("{detail}（{TURN_CHECK_SIDE_EFFECT}）")),
             Some(cleanup) => Check::warn(
                 "Codex 回合",
-                format!("{detail}；但探针未能清理自己的线程：{cleanup}"),
+                format!("{detail}；但探针未能清理自己的线程：{cleanup}（{TURN_CHECK_SIDE_EFFECT}）"),
             ),
         },
-        Some(TurnProbe::Failed { detail }) => Check::fail("Codex 回合", detail.clone()),
+        Some(TurnProbe::Failed { detail }) => {
+            Check::fail("Codex 回合", format!("{detail}（{TURN_CHECK_SIDE_EFFECT}）"))
+        }
         Some(TurnProbe::NotAttempted { detail }) => Check::warn("Codex 回合", detail.clone()),
     }
 }
@@ -1580,6 +1597,8 @@ kind = "codex"
             .expect("the turn check");
         assert_eq!(turn.status, CheckStatus::Fail);
         assert!(turn.detail.contains("will retry"), "{}", turn.detail);
+        assert!(turn.detail.contains("临时线程"), "{}", turn.detail);
+        assert!(turn.detail.contains("provider 费用"), "{}", turn.detail);
     }
 
     /// The passing path: a daemon-attached client and a working provider are
@@ -1599,6 +1618,13 @@ kind = "codex"
             checks.iter().all(|check| check.status == CheckStatus::Pass),
             "every Codex check passes: {checks:?}"
         );
+        let turn = checks
+            .iter()
+            .find(|check| check.label == "Codex 回合")
+            .expect("the turn check");
+        assert!(turn.detail.contains("临时线程"), "{}", turn.detail);
+        assert!(turn.detail.contains("provider 费用"), "{}", turn.detail);
+        assert!(turn.detail.contains("--no-turn-check"), "{}", turn.detail);
     }
 
     /// The default is to run the probe; `--no-turn-check` is the opt-out, and

@@ -280,6 +280,12 @@ pub(crate) struct UnverifiedClient {
     /// The `--remote` endpoint the client named, when it named one.
     pub(crate) endpoint: Option<String>,
     pub(crate) detail: String,
+    /// The process's start time from `/proc/<pid>/stat` field 22, captured by
+    /// the same scan that read its argv. The descriptor proof re-checks it
+    /// before and after reading `/proc/<pid>/fd`, so a reused pid cannot lend
+    /// another process's sockets to this client. `None` where the platform
+    /// exposes no equivalent.
+    pub(crate) start_time: Option<u64>,
 }
 
 /// A local Codex TUI pointed at an endpoint that is not the discovered daemon
@@ -596,14 +602,21 @@ pub(crate) fn local_clients(daemon: Option<&Path>) -> LocalClients {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
-        match observe_client(
-            process.pid().as_u32() as i32,
-            &process.name().to_string_lossy(),
-            &arguments,
-            daemon,
-        ) {
+        let pid = process.pid().as_u32() as i32;
+        // Bracket the argv read with the start-time read: if the pid was
+        // reused while sysinfo was reading it, the two reads disagree and the
+        // client stays unverified instead of borrowing the new process's
+        // identity.
+        let before = process_start_time(pid);
+        let observation = observe_client(pid, &process.name().to_string_lossy(), &arguments, daemon);
+        let after = process_start_time(pid);
+        let start_time = if before == after { before } else { None };
+        match observation {
             Some(Observation::Embedded(client)) => found.embedded.push(client),
-            Some(Observation::Unverified(client)) => found.unverified.push(client),
+            Some(Observation::Unverified(mut client)) => {
+                client.start_time = start_time;
+                found.unverified.push(client);
+            }
             Some(Observation::Unreachable(client)) => found.unreachable.push(client),
             None => {}
         }
@@ -743,6 +756,7 @@ fn observe_client(
                 detail: "its `--remote` names the daemon, but argv is not proof of a live \
                          connection"
                     .to_string(),
+                start_time: None,
             }));
         }
         let detail = match daemon {
@@ -773,6 +787,7 @@ fn observe_client(
         detail: "names no `--remote`; whether it shares the daemon cannot be established from \
                  argv"
             .to_string(),
+        start_time: None,
     }))
 }
 
@@ -837,7 +852,17 @@ pub(crate) async fn prove_attachments(clients: &mut LocalClients, daemon: &Path)
     let mut attached = Vec::new();
     let mut unverified = Vec::new();
     for client in std::mem::take(&mut clients.unverified) {
+        // Pin the PID: the scan that read the argv and this proof are two
+        // separate `/proc` reads, and the id may be reused between them.
+        if client.start_time.is_none() || process_start_time(client.pid) != client.start_time {
+            unverified.push(client);
+            continue;
+        }
         let socket_inodes = process_socket_inodes(client.pid);
+        if process_start_time(client.pid) != client.start_time {
+            unverified.push(client);
+            continue;
+        }
         if socket_inodes.is_empty() || !peer_matches(&socket_inodes, &peers, daemon_inode) {
             unverified.push(client);
             continue;
@@ -926,6 +951,25 @@ fn parse_established_unix_peers(text: &str) -> Vec<(u64, u64)> {
         peers.push((filesystem_inode, peer));
     }
     peers
+}
+
+/// The process's start time (`/proc/<pid>/stat` field 22, in clock ticks since
+/// boot), read from the same process table the argv came from.
+///
+/// The `comm` field is parenthesised and may contain spaces, so the fields are
+/// counted after the **last** `)`; `starttime` is field 22, i.e. the 20th
+/// whitespace-separated token after the command name.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: i32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// No portable start-time source outside Linux; the descriptor proof is a
+/// Linux-only path, so this is only reached by the scan's shared struct.
+#[cfg(not(target_os = "linux"))]
+fn process_start_time(_pid: i32) -> Option<u64> {
+    None
 }
 
 /// The socket inodes a process holds open, from `/proc/<pid>/fd`.
@@ -1313,6 +1357,7 @@ mod tests {
                 binary: "codex".into(),
                 endpoint: Some(endpoint.clone()),
                 detail: "argv".into(),
+                start_time: process_start_time(pid),
             }],
             ..LocalClients::default()
         };
@@ -1334,8 +1379,9 @@ mod tests {
             unverified: vec![UnverifiedClient {
                 pid,
                 binary: "codex".into(),
-                endpoint: Some(endpoint),
+                endpoint: Some(endpoint.clone()),
                 detail: "argv".into(),
+                start_time: process_start_time(pid),
             }],
             ..LocalClients::default()
         };
@@ -1345,6 +1391,52 @@ mod tests {
             "the old connection is not the replacement daemon"
         );
         assert_eq!(clients.unverified.len(), 1);
+
+        // A reused PID: the connection is real, but the start time captured
+        // with the argv belongs to the old process, so the descriptors must
+        // not be trusted for this one.
+        let mut clients = LocalClients {
+            unverified: vec![UnverifiedClient {
+                pid,
+                binary: "codex".into(),
+                endpoint: Some(endpoint),
+                detail: "argv".into(),
+                start_time: Some(0),
+            }],
+            ..LocalClients::default()
+        };
+        prove_attachments(&mut clients, &control).await;
+        assert!(
+            clients.attached.is_empty(),
+            "a mismatched start time means the pid may be reused"
+        );
+        assert_eq!(clients.unverified.len(), 1);
+    }
+
+    /// The start-time pin reads a real process and refuses a missing one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_process_start_time_pins_the_pid() {
+        let own = process_start_time(std::process::id() as i32).expect("own start time");
+        assert!(own > 0);
+        assert_eq!(
+            process_start_time(i32::MAX - 1),
+            None,
+            "a missing process has no start time"
+        );
+    }
+
+    /// An unexpected `ss` table (the format is not ours, or the tool changed)
+    /// proves nothing: every client stays unverified rather than guessed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unexpected_ss_output_proves_nothing() {
+        let peers = parse_established_unix_peers(
+            "u_str ESTAB 0 0 not-the-expected-suffix\n\
+             some other tool output entirely\n",
+        );
+        assert!(peers.is_empty(), "{peers:?}");
+        assert!(!peer_matches(&[28_465_256], &peers, 1_077_950));
     }
 
     #[test]

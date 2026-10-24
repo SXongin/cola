@@ -349,3 +349,20 @@ the adapter's typed decoders in the read-model and approval tickets (#879,
 uses it — never silently. The measured shape diff above (additive only across
 the pin-to-running delta) is what makes probing at that level honest rather
 than a guess.
+
+## Amendment (ticket #883): the doctor turn probe is default-on
+
+Decision 3's diagnosis needs the provider-turn evidence, and the amendment above
+records why: a turn with no usable credential is accepted and then fails as a
+retryable `error`, so a login-shaped check would pass while every turn died. A
+plain `cola doctor` therefore runs the real-turn probe for the active Codex
+client by default. The user invoked the diagnostic explicitly, so the probe's
+write is within its contract: it reserves an exclusive scratch directory, starts
+a named thread and a minimal turn on the shared daemon, interrupts the turn
+while it is live, and deletes the thread. That is still a write on a daemon cola
+does not own and may spend the user's provider credit, so the check text names
+the side effect and `--no-turn-check` is the explicit opt-out. `--check-turn`
+remains accepted as a hidden no-op alias for scripts written before the default
+flipped; the single safety setting set for both the report and the probe lives
+in one helper (`attach_for_diagnostics`), so a future change cannot make the
+diagnostic start a daemon.
