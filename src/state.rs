@@ -218,6 +218,13 @@ impl StateLayout {
         self.state_dir.join("terminal-runs")
     }
 
+    /// The turns cola started, per client and thread (ADR-0090's authorship
+    /// consequence): a client that assigns its own ids answers the External
+    /// Message question from this record, and it must survive a restart.
+    pub(crate) fn authored_turns(&self) -> PathBuf {
+        self.state_dir.join("authored_turns.json")
+    }
+
     // ---- Process-owned files: under `~/.cola` ----
 
     /// The default append log (`~/.cola/cola.log`); `--log-file` overrides it.
@@ -338,6 +345,10 @@ mod tests {
         );
         assert_eq!(layout.terminal_runs(), Path::new("/home/u/.cola/terminal-runs"));
         assert_eq!(
+            layout.authored_turns(),
+            Path::new("/home/u/.cola/authored_turns.json")
+        );
+        assert_eq!(
             StateLayout::terminal_owed_beside(&layout.terminal_runs()),
             Path::new("/home/u/.cola/terminal-runs-owed")
         );
@@ -388,6 +399,10 @@ mod tests {
         );
         assert_eq!(layout.pinned_chats(), Path::new("/srv/cola/pinned_chats.json"));
         assert_eq!(layout.terminal_runs(), Path::new("/srv/cola/terminal-runs"));
+        assert_eq!(
+            layout.authored_turns(),
+            Path::new("/srv/cola/authored_turns.json")
+        );
         assert_eq!(
             StateLayout::terminal_owed_beside(&layout.terminal_runs()),
             Path::new("/srv/cola/terminal-runs-owed")

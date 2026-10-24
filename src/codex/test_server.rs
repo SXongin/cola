@@ -286,6 +286,32 @@ struct State {
     /// `turn/start` calls received, so a test can prove which connection
     /// originated the turn.
     turn_starts: AtomicUsize,
+    /// Every `turn/start` params object, per thread, in call order.
+    turn_params: std::sync::Mutex<std::collections::HashMap<String, Vec<Value>>>,
+    /// Every `turn/steer` params object, in call order.
+    steer_params: std::sync::Mutex<Vec<Value>>,
+    /// Every `turn/interrupt` params object, in call order.
+    interrupt_params: std::sync::Mutex<Vec<Value>>,
+    /// Every `thread/compact/start` params object, in call order.
+    compact_params: std::sync::Mutex<Vec<Value>>,
+    /// The live turn per thread: a second `turn/start` while one is running is
+    /// folded into it and returns the same id (the spike's finding).
+    live_turns: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// The next turn/item id the server assigns, as the real server does.
+    next_turn: AtomicUsize,
+    next_item: AtomicUsize,
+    /// Threads whose `turn/start` (and steer) echoes the request's own input as
+    /// a server-generated `userMessage` item, so a test reads the prompt off the
+    /// stream instead of hand-writing it.
+    echo_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The models `model/list` advertises, in server order.
+    models: std::sync::Mutex<Vec<Value>>,
+    /// The page size `model/list` uses when the caller sends no `limit`.
+    model_page_size: AtomicUsize,
+    /// The skills `skills/list` advertises.
+    skills: std::sync::Mutex<Vec<Value>>,
+    /// `model/list` calls received, so a paged catalog is proved by its pages.
+    model_list_calls: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
 }
@@ -313,6 +339,18 @@ impl Default for State {
             fail_turns_pages: AtomicUsize::new(0),
             scripted_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             turn_starts: AtomicUsize::new(0),
+            turn_params: std::sync::Mutex::new(std::collections::HashMap::new()),
+            steer_params: std::sync::Mutex::new(Vec::new()),
+            interrupt_params: std::sync::Mutex::new(Vec::new()),
+            compact_params: std::sync::Mutex::new(Vec::new()),
+            live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_turn: AtomicUsize::new(1),
+            next_item: AtomicUsize::new(1),
+            echo_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
+            models: std::sync::Mutex::new(Vec::new()),
+            model_page_size: AtomicUsize::new(50),
+            skills: std::sync::Mutex::new(Vec::new()),
+            model_list_calls: AtomicUsize::new(0),
             page_size: 2,
         }
     }
@@ -630,6 +668,76 @@ impl FakeServer {
     pub(crate) fn turn_starts(&self) -> usize {
         self.state.turn_starts.load(Ordering::SeqCst)
     }
+
+    /// Every `turn/start` params object sent for `thread_id`, in call order.
+    pub(crate) fn turn_params(&self, thread_id: &str) -> Vec<Value> {
+        self.state
+            .turn_params
+            .lock()
+            .expect("turn params")
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Every `turn/steer` params object, in call order.
+    pub(crate) fn steer_params(&self) -> Vec<Value> {
+        self.state.steer_params.lock().expect("steer params").clone()
+    }
+
+    /// Every `turn/interrupt` params object, in call order.
+    pub(crate) fn interrupt_params(&self) -> Vec<Value> {
+        self.state
+            .interrupt_params
+            .lock()
+            .expect("interrupt params")
+            .clone()
+    }
+
+    /// Every `thread/compact/start` params object, in call order.
+    pub(crate) fn compact_params(&self) -> Vec<Value> {
+        self.state.compact_params.lock().expect("compact params").clone()
+    }
+
+    /// The turn the server still considers live for `thread_id`.
+    pub(crate) fn live_turn(&self, thread_id: &str) -> Option<String> {
+        self.state
+            .live_turns
+            .lock()
+            .expect("live turns")
+            .get(thread_id)
+            .cloned()
+    }
+
+    /// Echo a thread's prompts (and steers) back as server-generated user
+    /// messages: the turn's content then comes from the request itself.
+    pub(crate) fn echo_prompts(&self, thread_id: &str) {
+        self.state
+            .echo_prompts
+            .lock()
+            .expect("echoed prompts")
+            .insert(thread_id.to_string());
+    }
+
+    /// The models `model/list` serves.
+    pub(crate) fn set_models(&self, models: Vec<Value>) {
+        *self.state.models.lock().expect("models") = models;
+    }
+
+    /// The page size `model/list` uses when the caller sends no `limit`.
+    pub(crate) fn set_model_page_size(&self, size: usize) {
+        self.state.model_page_size.store(size, Ordering::SeqCst);
+    }
+
+    /// `model/list` calls received, in order (a paged read proves its pages).
+    pub(crate) fn model_list_calls(&self) -> usize {
+        self.state.model_list_calls.load(Ordering::SeqCst)
+    }
+
+    /// The skills `skills/list` serves.
+    pub(crate) fn set_skills(&self, skills: Vec<Value>) {
+        *self.state.skills.lock().expect("skills") = skills;
+    }
 }
 
 /// Count one accepted connection and serve it on its own task. The accept loop
@@ -840,6 +948,68 @@ where
         Some("turn/start") => {
             state.turn_starts.fetch_add(1, Ordering::SeqCst);
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            state
+                .turn_params
+                .lock()
+                .expect("turn params")
+                .entry(thread_id.to_string())
+                .or_default()
+                .push(params.clone());
+            let echo = state
+                .echo_prompts
+                .lock()
+                .expect("echoed prompts")
+                .contains(thread_id);
+            // The spike's fold: a `turn/start` while a turn is active is
+            // accepted into that turn and returns ITS id, never a second turn.
+            let folded = state
+                .live_turns
+                .lock()
+                .expect("live turns")
+                .get(thread_id)
+                .cloned();
+            if let Some(live) = folded {
+                if !reply(
+                    sink,
+                    id,
+                    json!({ "turn": { "id": live, "status": "inProgress" } }),
+                )
+                .await
+                {
+                    return false;
+                }
+                if echo {
+                    emit_user_message(state, thread_id, &live, &params, false);
+                }
+                return true;
+            }
+            let turn_id = format!("turn-{}", state.next_turn.fetch_add(1, Ordering::SeqCst));
+            state
+                .live_turns
+                .lock()
+                .expect("live turns")
+                .insert(thread_id.to_string(), turn_id.clone());
+            let started_at = now_secs();
+            let result = json!({
+                "turn": { "id": turn_id, "status": "inProgress", "startedAt": started_at, "items": [] }
+            });
+            if !reply(sink, id, result).await {
+                return false;
+            }
+            emit(
+                state,
+                thread_id,
+                "turn/started",
+                json!({
+                    "threadId": thread_id,
+                    "turn": { "id": turn_id, "status": "inProgress", "startedAt": started_at, "items": [] },
+                }),
+            );
+            if echo {
+                emit_user_message(state, thread_id, &turn_id, &params, true);
+            }
+            // The server, not the test, emits the stream: a turn started on
+            // this connection fans out to every subscriber of the thread.
             let scripted = state
                 .scripted_turns
                 .lock()
@@ -847,26 +1017,183 @@ where
                 .get(thread_id)
                 .cloned()
                 .unwrap_or_default();
-            let result = json!({
-                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000, "items": [] }
-            });
-            if !reply(sink, id, result).await {
-                return false;
-            }
-            // The server, not the test, emits the stream: a turn started on
-            // this connection fans out to every subscriber of the thread.
-            let mut subscribers = state.subscribers.lock().expect("subscribers");
-            if let Some(streams) = subscribers.get_mut(thread_id) {
-                for (method, params) in scripted {
-                    let message = Message::Text(
-                        json!({ "jsonrpc": "2.0", "method": method, "params": params })
-                            .to_string()
-                            .into(),
-                    );
-                    streams.retain(|(_, stream)| stream.send(message.clone()).is_ok());
+            for (method, params) in &scripted {
+                emit(state, thread_id, method, params.clone());
+                if method == "turn/completed" {
+                    state.live_turns.lock().expect("live turns").remove(thread_id);
                 }
             }
             true
+        }
+        Some("turn/steer") => {
+            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            state
+                .steer_params
+                .lock()
+                .expect("steer params")
+                .push(params.clone());
+            let live = state
+                .live_turns
+                .lock()
+                .expect("live turns")
+                .get(thread_id)
+                .cloned();
+            let Some(live) = live else {
+                // The protocol's precondition: `expectedTurnId` must name the
+                // active turn, and an idle thread has none.
+                return reply_error(sink, id, -32600, "no active turn to steer").await;
+            };
+            let expected = params.get("expectedTurnId").and_then(Value::as_str);
+            if expected != Some(live.as_str()) {
+                return reply_error(
+                    sink,
+                    id,
+                    -32600,
+                    &format!("expectedTurnId {expected:?} does not match the active turn {live}"),
+                )
+                .await;
+            }
+            if !reply(sink, id, json!({ "turnId": live })).await {
+                return false;
+            }
+            // A steer is a user message inside the active turn: the adapter
+            // renders it through the ordinary item path (ADR-0090's amendment).
+            emit_user_message(state, thread_id, &live, &params, true);
+            true
+        }
+        Some("turn/interrupt") => {
+            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            state
+                .interrupt_params
+                .lock()
+                .expect("interrupt params")
+                .push(params.clone());
+            if !reply(sink, id, json!({})).await {
+                return false;
+            }
+            let live = state.live_turns.lock().expect("live turns").remove(thread_id);
+            if let Some(turn_id) = live {
+                emit(
+                    state,
+                    thread_id,
+                    "turn/completed",
+                    json!({
+                        "threadId": thread_id,
+                        "turn": {
+                            "id": turn_id,
+                            "status": "interrupted",
+                            "startedAt": now_secs(),
+                            "completedAt": now_secs() + 1,
+                        },
+                    }),
+                );
+            }
+            true
+        }
+        Some("thread/compact/start") => {
+            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            state
+                .compact_params
+                .lock()
+                .expect("compact params")
+                .push(params.clone());
+            if !reply(sink, id, json!({})).await {
+                return false;
+            }
+            // Codex reports the compaction as a `contextCompaction` item inside
+            // a turn; when none is running, the compaction turn is its own.
+            let (turn_id, created) = match state
+                .live_turns
+                .lock()
+                .expect("live turns")
+                .get(thread_id)
+                .cloned()
+            {
+                Some(turn_id) => (turn_id, false),
+                None => {
+                    let turn_id = format!("turn-{}", state.next_turn.fetch_add(1, Ordering::SeqCst));
+                    (turn_id, true)
+                }
+            };
+            if created {
+                emit(
+                    state,
+                    thread_id,
+                    "turn/started",
+                    json!({
+                        "threadId": thread_id,
+                        "turn": { "id": turn_id, "status": "inProgress", "startedAt": now_secs() },
+                    }),
+                );
+            }
+            let item_id = format!("item-{}", state.next_item.fetch_add(1, Ordering::SeqCst));
+            emit(
+                state,
+                thread_id,
+                "item/completed",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "completedAtMs": now_ms(),
+                    "item": { "type": "contextCompaction", "id": item_id },
+                }),
+            );
+            if created {
+                emit(
+                    state,
+                    thread_id,
+                    "turn/completed",
+                    json!({
+                        "threadId": thread_id,
+                        "turn": {
+                            "id": turn_id,
+                            "status": "completed",
+                            "startedAt": now_secs(),
+                            "completedAt": now_secs() + 1,
+                        },
+                    }),
+                );
+            }
+            true
+        }
+        Some("model/list") => {
+            state.model_list_calls.fetch_add(1, Ordering::SeqCst);
+            let models = state.models.lock().expect("models").clone();
+            let offset = params
+                .get("cursor")
+                .and_then(Value::as_str)
+                .and_then(|cursor| cursor.parse::<usize>().ok())
+                .unwrap_or(0)
+                .min(models.len());
+            let limit = params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit as usize)
+                .filter(|limit| *limit > 0)
+                .unwrap_or_else(|| state.model_page_size.load(Ordering::SeqCst));
+            let end = (offset + limit).min(models.len());
+            let next = (end < models.len()).then(|| json!(end.to_string()));
+            replying(
+                sink,
+                id,
+                json!({ "data": models[offset..end], "nextCursor": next }),
+            )
+            .await
+        }
+        Some("skills/list") => {
+            let cwd = params
+                .get("cwds")
+                .and_then(Value::as_array)
+                .and_then(|cwds| cwds.first())
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let skills = state.skills.lock().expect("skills").clone();
+            replying(
+                sink,
+                id,
+                json!({ "data": [{ "cwd": cwd, "skills": skills, "errors": [] }] }),
+            )
+            .await
         }
         Some("thread/resume") => {
             state.resume_calls.fetch_add(1, Ordering::SeqCst);
@@ -946,6 +1273,157 @@ where
         }
         _ => true,
     }
+}
+
+/// Send one notification to a thread's subscribers only (the `turn/*` and
+/// `item/*` shape). Never to the whole server: a broadcast would also reach a
+/// connection that never subscribed.
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn emit(state: &State, thread_id: &str, method: &str, params: Value) {
+    record_event(state, thread_id, method, &params);
+    let message = Message::Text(
+        json!({ "jsonrpc": "2.0", "method": method, "params": params })
+            .to_string()
+            .into(),
+    );
+    if let Some(streams) = state.subscribers.lock().expect("subscribers").get_mut(thread_id) {
+        streams.retain(|(_, stream)| stream.send(message.clone()).is_ok());
+    }
+}
+
+/// Fold a server-originated notification into the thread's stored history, as
+/// the real daemon persists a rollout. A later `thread/resume` then carries the
+/// turn even though this connection emitted its stream before anyone
+/// subscribed — and `has_history` flips exactly as the spike observed (a
+/// thread with a completed turn is resumable).
+fn record_event(state: &State, thread_id: &str, method: &str, params: &Value) {
+    let mut threads = state.threads.lock().expect("scripted threads");
+    let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) else {
+        return;
+    };
+    match method {
+        "turn/started" => {
+            let Some(turn) = params.get("turn") else { return };
+            let Some(id) = turn.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            entry(thread, id, turn);
+        }
+        "item/started" | "item/completed" => {
+            let (Some(item), Some(turn_id)) =
+                (params.get("item"), params.get("turnId").and_then(Value::as_str))
+            else {
+                return;
+            };
+            let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            let Some(recorded) = thread
+                .turns
+                .iter_mut()
+                .find(|turn| turn.get("id").and_then(Value::as_str) == Some(turn_id))
+            else {
+                return;
+            };
+            let Some(items) = recorded.get_mut("items").and_then(Value::as_array_mut) else {
+                return;
+            };
+            match items
+                .iter_mut()
+                .find(|existing| existing.get("id").and_then(Value::as_str) == Some(item_id))
+            {
+                Some(existing) => *existing = item.clone(),
+                None => items.push(item.clone()),
+            }
+        }
+        "turn/completed" => {
+            let Some(turn) = params.get("turn") else { return };
+            let Some(id) = turn.get("id").and_then(Value::as_str) else {
+                return;
+            };
+            entry(thread, id, turn);
+        }
+        _ => {}
+    }
+}
+
+/// Insert or update one stored turn. An existing turn keeps its items (a
+/// completion carries only the turn's status and stamps).
+fn entry(thread: &mut ScriptedThread, id: &str, turn: &Value) {
+    thread.has_history = true;
+    if let Some(recorded) = thread
+        .turns
+        .iter_mut()
+        .find(|recorded| recorded.get("id").and_then(Value::as_str) == Some(id))
+    {
+        recorded["status"] = turn.get("status").cloned().unwrap_or(json!("inProgress"));
+        recorded["completedAt"] = turn.get("completedAt").cloned().unwrap_or(Value::Null);
+        recorded["error"] = turn.get("error").cloned().unwrap_or(Value::Null);
+        return;
+    }
+    thread.turns.push(json!({
+        "id": id,
+        "status": turn.get("status").cloned().unwrap_or(json!("inProgress")),
+        "startedAt": turn.get("startedAt").cloned().unwrap_or(Value::Null),
+        "completedAt": turn.get("completedAt").cloned().unwrap_or(Value::Null),
+        "error": turn.get("error").cloned().unwrap_or(Value::Null),
+        "items": turn.get("items").cloned().unwrap_or(json!([])),
+    }));
+}
+
+/// Persist the request's own `input` as a server-generated `userMessage` item:
+/// what cola sent, as the server writes it. `opened` also emits the item's
+/// `item/started`; a steer emits the completed item alone, so the text appears
+/// exactly once in the transcript either way.
+fn emit_user_message(state: &State, thread_id: &str, turn_id: &str, params: &Value, opened: bool) {
+    let Some(text) = params.get("input").and_then(Value::as_array).and_then(|input| {
+        input.iter().find_map(|part| {
+            (part.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| part.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+    }) else {
+        return;
+    };
+    let item_id = format!("item-user-{}", state.next_item.fetch_add(1, Ordering::SeqCst));
+    let client_id = params.get("clientUserMessageId").cloned().unwrap_or(Value::Null);
+    let item = json!({
+        "type": "userMessage",
+        "id": item_id,
+        "clientId": client_id,
+        "content": [{ "type": "text", "text": text, "textElements": [] }],
+    });
+    if opened {
+        emit(
+            state,
+            thread_id,
+            "item/started",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "startedAtMs": now_secs() * 1000,
+                "item": item,
+            }),
+        );
+    }
+    emit(
+        state,
+        thread_id,
+        "item/completed",
+        json!({
+            "threadId": thread_id,
+            "turnId": turn_id,
+            "completedAtMs": now_secs() * 1000 + 1,
+            "item": item,
+        }),
+    );
 }
 
 fn find_thread(state: &State, thread_id: &str) -> Option<ScriptedThread> {

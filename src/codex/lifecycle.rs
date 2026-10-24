@@ -31,6 +31,7 @@
 //! The `Backend` implementation that serves Sessions is a later ticket (#879);
 //! this type is the lifecycle half it will build on.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
@@ -148,6 +149,9 @@ pub(crate) struct CodexLifecycle {
     /// The Background Task State handle the attached clients share with the
     /// bridge (ADR-0079); one per active client, not per connection.
     pub(crate) tasks: TasksHandle,
+    /// The turns cola started (ADR-0090): shared by every connection this
+    /// lifecycle attaches, and durable when the daemon wires the file.
+    authored: Arc<super::authorship::Authorship>,
     /// The current connection. A `tokio` mutex because the attach pass holds it
     /// across the handshake's await.
     attached: tokio::sync::Mutex<Option<Attachment>>,
@@ -173,12 +177,22 @@ impl CodexLifecycle {
             environment,
             probes,
             tasks: TasksHandle::new(),
+            authored: super::authorship::Authorship::in_memory(),
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
             #[cfg(test)]
             dial_hook: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Carry the durable record of turns cola started (ADR-0090). The daemon
+    /// opens it once at startup so a restart still knows which turns are its
+    /// own; a lifecycle left on the in-memory default is correct only for its
+    /// own lifetime.
+    pub(crate) fn with_authorship(mut self, authored: Arc<super::authorship::Authorship>) -> Self {
+        self.authored = authored;
+        self
     }
 
     /// The attached client the `Backend` surface reads through, if the last
@@ -257,7 +271,8 @@ impl CodexLifecycle {
             }
             let probe = self.probes.probe(&current.daemon);
             let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()))
-                .with_tasks(self.tasks.clone());
+                .with_tasks(self.tasks.clone())
+                .with_authorship(self.authored.clone());
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
             // and the identity re-read right below. The hook opens exactly that

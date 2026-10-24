@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::bridge::tasks::TasksHandle;
 use crate::config::{ActiveClient, ClientKind};
 
-use super::backend::Projections;
+use super::backend::{Projections, SkillCatalog};
 use super::error::{CodexError, Result};
 use super::schema::{PINNED_VERSION, SurfaceProbe};
 use super::threads::Threads;
@@ -40,6 +40,10 @@ pub(crate) struct CodexOptions {
     /// client it attaches, so the Bridge records through the handle its reads
     /// go through (ADR-0079).
     pub(crate) tasks: TasksHandle,
+    /// The record of turns cola started (ADR-0090's authorship consequence).
+    /// The daemon hands the durable, client-scoped record; a bare client gets
+    /// an in-memory one, which is still correct for its own lifetime.
+    pub(crate) authored: Arc<super::authorship::Authorship>,
 }
 
 impl CodexOptions {
@@ -48,12 +52,19 @@ impl CodexOptions {
             endpoint,
             timeout: HANDSHAKE_TIMEOUT,
             tasks: TasksHandle::new(),
+            authored: super::authorship::Authorship::in_memory(),
         }
     }
 
     /// Carry the active client's own task handle into the attached client.
     pub(crate) fn with_tasks(mut self, tasks: TasksHandle) -> Self {
         self.tasks = tasks;
+        self
+    }
+
+    /// Carry the durable authorship record into the attached client.
+    pub(crate) fn with_authorship(mut self, authored: Arc<super::authorship::Authorship>) -> Self {
+        self.authored = authored;
         self
     }
 }
@@ -160,6 +171,13 @@ pub(crate) struct CodexClient {
     pub(crate) projections: Arc<Projections>,
     /// The Background Task State handle, shared with the bridge.
     pub(crate) tasks: TasksHandle,
+    /// The turns cola started, so the External Message question is answered
+    /// from cola's own record (ADR-0090).
+    pub(crate) authored: Arc<super::authorship::Authorship>,
+    /// The most recent `skills/list` read, for the `/skill <id>` prompt part:
+    /// Codex's skill input needs the skill's `path`, which the neutral
+    /// [`crate::backend::PromptSkill`] does not carry.
+    pub(crate) skills: Arc<SkillCatalog>,
     server: ServerInfo,
 }
 
@@ -239,6 +257,8 @@ impl CodexClient {
             endpoint: options.endpoint.clone(),
             projections,
             tasks: options.tasks.clone(),
+            authored: options.authored.clone(),
+            skills: Arc::new(SkillCatalog::default()),
             server: ServerInfo {
                 user_agent,
                 version,

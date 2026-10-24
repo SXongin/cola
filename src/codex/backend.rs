@@ -26,12 +26,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, ServerLifecycle};
 use crate::backend::types::{
-    AgentInfo, CreateSessionInput, FormAnswer, Location, ModelInfo, PermissionRequest, PromptFile,
-    ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, PermissionRequest,
+    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
 };
 use crate::backend::{Backend, BackendDirectory, PromptSkill, SessionTranscript, SkillInfo, TurnDiff};
 use crate::bridge::tasks::TasksHandle;
@@ -336,12 +337,56 @@ impl Projections {
         self.track(task);
     }
 
+    /// Record that `/compact` asked for a manual compaction on this thread: the
+    /// protocol's `contextCompaction` item carries no reason, so the request is
+    /// the only evidence the existing card path can use to title the row 手动
+    /// rather than 自动 (ADR-0082, ADR-0092).
+    pub(crate) fn mark_manual_compaction(&self, thread_id: &str) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .mark_manual_compaction();
+    }
+
+    /// Forget a manual-compaction request whose `thread/compact/start` failed.
+    pub(crate) fn clear_manual_compaction(&self, thread_id: &str) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .clear_manual_compaction();
+    }
+
     pub(crate) fn live_turn(&self, thread_id: &str) -> Option<String> {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
             .live_turn()
             .map(str::to_string)
+    }
+
+    /// Which thread and turn an item belongs to. The authorship question is
+    /// asked with a transcript message id (a Codex item id), while the durable
+    /// record is keyed by the turn cola started, so the projection — the only
+    /// owner of the item→turn mapping — answers it.
+    pub(crate) fn turn_of_item(&self, item_id: &str) -> Option<(String, String)> {
+        let projections: Vec<(String, Arc<Mutex<ThreadProjection>>)> = self
+            .threads
+            .lock()
+            .expect("codex projections")
+            .iter()
+            .map(|(thread, projection)| (thread.clone(), projection.clone()))
+            .collect();
+        for (thread, projection) in projections {
+            let turn = projection
+                .lock()
+                .expect("codex projection")
+                .turn_of_item(item_id)
+                .map(str::to_string);
+            if let Some(turn) = turn {
+                return Some((thread, turn));
+            }
+        }
+        None
     }
 
     /// How many adoption-lock slots are retained (test-only; proves a finished
@@ -422,6 +467,87 @@ impl CodexClient {
     /// The endpoint this connection dialled, for the neutral base-URL read.
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// The live turn a `/stop` should interrupt.
+    ///
+    /// The cache can miss a turn this process started: the subscription may
+    /// begin *after* the server emitted `turn/started`, or the start may still
+    /// be in flight when the user stops. The thread's own persisted record is
+    /// then the authority — `thread/read`'s bounded page carries its newest
+    /// turns, and an `inProgress` one is the run to interrupt. Only when that
+    /// finds none is `/stop` genuinely a no-op.
+    async fn live_turn_for_stop(&self, session_id: &str) -> Result<Option<String>> {
+        if let Some(turn) = self.projections.live_turn(session_id) {
+            return Ok(Some(turn));
+        }
+        let thread = self
+            .threads()
+            .read(session_id, true)
+            .await
+            .map_err(client_error)?;
+        Ok(thread
+            .turns
+            .iter()
+            .rev()
+            .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+            .and_then(|turn| turn.get("id").and_then(Value::as_str))
+            .map(str::to_string))
+    }
+
+    /// The `turn/start` params for one prompt. Model and effort ride the turn
+    /// (and the thread's subsequent turns, per the protocol's own field
+    /// documentation) rather than a durable session switch: `turn/start` is
+    /// where Codex accepts them, so a `/model` or `/think` pick reaches the
+    /// next turn through cola's per-session override — the same place V1 puts
+    /// it, and the reason `switch_session_model` stays a no-op on this client.
+    fn turn_params(
+        &self,
+        session_id: &str,
+        text: &str,
+        skills: &[PromptSkill],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<Value> {
+        let mut params = json!({
+            "threadId": session_id,
+            "input": self.input_items(text, skills)?,
+        });
+        if let Some(message_id) = message_id {
+            params["clientUserMessageId"] = json!(message_id);
+        }
+        if let Some(model) = model {
+            params["model"] = json!(model.id);
+        }
+        if let Some(effort) = variant.or_else(|| model.and_then(|model| model.variant.as_deref())) {
+            params["effort"] = json!(effort);
+        }
+        Ok(params)
+    }
+
+    /// The protocol's `input` array: the prompt text, then one `skill` part per
+    /// attached skill. Codex's skill input needs the skill's path, so an id the
+    /// last `skills/list` did not name is a named error rather than a silently
+    /// dropped request (the model would otherwise answer without the skill).
+    fn input_items(&self, text: &str, skills: &[PromptSkill]) -> Result<Value> {
+        // `text_elements` is the protocol's spelling (`UserInput::Text` keeps
+        // it snake_case on 0.163.0, unlike the surrounding camelCase fields).
+        let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
+        for skill in skills {
+            let Some(path) = self.skills.path_of(&skill.id) else {
+                return Err(BridgeError::Client {
+                    client: "codex",
+                    detail: format!(
+                        "skill `{}` is not in the app-server's skill list; send `/skill` to \
+                         reload it",
+                        skill.id
+                    ),
+                });
+            };
+            input.push(json!({ "type": "skill", "name": skill.name, "path": path }));
+        }
+        Ok(Value::Array(input))
     }
 
     /// Subscribe the thread if this connection has not already: `thread/resume`
@@ -663,6 +789,119 @@ async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, t
     }
 }
 
+/// The provider bucket the `/model` picker shows for Codex. `model/list` names
+/// no provider: a Codex model is whatever the attached app-server resolves
+/// through its own `[model_providers.*]`, and the picker's `provider/model`
+/// ref is cola's neutral mirror, so a client-scoped bucket is the honest label
+/// — never a claim that the model is served by OpenAI.
+const MODEL_PROVIDER: &str = "codex";
+
+/// Bound the `/model` catalog read. A server that keeps minting fresh cursors
+/// would otherwise hold the picker forever; past the bound the catalog is what
+/// was read so far, and the truncation is logged.
+const MAX_MODEL_PAGES: usize = 64;
+
+/// The most recent `skills/list` read, keyed by the skill identity the server
+/// advertised. Codex's `skill` prompt part carries a **path** as well as a name,
+/// and the neutral [`crate::backend::PromptSkill`] only carries `{ id, name }`,
+/// so the path is remembered here from the same read the `/skill` command made
+/// immediately before the prompt. The newest path for a name wins; a skill name
+/// present in two projects at once is the one ambiguity the protocol's
+/// name+path pair cannot resolve from a name alone.
+#[derive(Default)]
+pub(crate) struct SkillCatalog {
+    paths: Mutex<HashMap<String, String>>,
+}
+
+impl SkillCatalog {
+    fn replace(&self, skills: impl IntoIterator<Item = (String, String)>) {
+        let mut paths = self.paths.lock().expect("codex skill catalog");
+        paths.clear();
+        for (name, path) in skills {
+            paths.insert(name, path);
+        }
+    }
+
+    fn path_of(&self, name: &str) -> Option<String> {
+        self.paths.lock().expect("codex skill catalog").get(name).cloned()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnStartResponse {
+    turn: TurnRef,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnRef {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelListResponse {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelEntry {
+    id: String,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    supported_reasoning_efforts: Vec<EffortOption>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EffortOption {
+    reasoning_effort: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsListResponse {
+    #[serde(default)]
+    data: Vec<SkillsEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillsEntry {
+    #[serde(default)]
+    skills: Vec<SkillMetadata>,
+    #[serde(default)]
+    errors: Vec<SkillError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillMetadata {
+    name: String,
+    #[serde(default)]
+    description: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillError {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    message: String,
+}
+
+/// Decode one method's result into its typed shape; a changed payload is a
+/// named protocol failure, never a silently empty answer.
+fn decode<T: serde::de::DeserializeOwned>(method: &str, value: Value) -> CodexResult<T> {
+    serde_json::from_value(value).map_err(|error| CodexError::Protocol {
+        method: method.to_string(),
+        detail: error.to_string(),
+    })
+}
+
 fn client_error(error: CodexError) -> BridgeError {
     BridgeError::Client {
         client: "codex",
@@ -753,6 +992,9 @@ impl Backend for CodexClient {
             .await
             .map_err(client_error)?;
         self.projections.forget(session_id);
+        // The thread is gone; its authorship turns cannot be asked about again,
+        // and a recreated id must not inherit them.
+        self.authored.forget(session_id);
         Ok(())
     }
 
@@ -763,7 +1005,7 @@ impl Backend for CodexClient {
         files: &[PromptFile],
         skills: &[PromptSkill],
         model: Option<&ModelInfo>,
-        _variant: Option<&str>,
+        variant: Option<&str>,
         _agent: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<()> {
@@ -773,30 +1015,109 @@ impl Backend for CodexClient {
                 detail: "prompt attachments are not mapped onto this adapter yet".to_string(),
             });
         }
-        if !skills.is_empty() {
+        // `turn/start` is the write half of this ticket's read model; a failed
+        // submit is its own error, while the Turn's outcome is observed from
+        // the transcript and session status (ADR-0011).
+        //
+        // The turn id is Codex's, so the authorship record is bound from the
+        // response. The pending marker is recorded BEFORE the request: the
+        // server may emit the turn's user item to the subscription before this
+        // task processes the response, and that window must not classify
+        // cola's own message as external.
+        self.authored.begin(session_id);
+        let result = match self
+            .connection()
+            .request(
+                "turn/start",
+                self.turn_params(session_id, text, skills, model, variant, message_id)?,
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.authored.abandon(session_id);
+                return Err(client_error(error));
+            }
+        };
+        let turn = match decode::<TurnStartResponse>("turn/start", result) {
+            Ok(response) => response.turn,
+            Err(error) => {
+                self.authored.abandon(session_id);
+                return Err(client_error(error));
+            }
+        };
+        // A prompt whose response names an already-active turn (the spike's
+        // fold) binds that turn: it is the turn cola's message landed in, and
+        // the card must settle on it. Never a second turn.
+        self.authored.bind(session_id, &turn.id);
+        Ok(())
+    }
+
+    /// `turn/steer` merges the message into the active turn. Its protocol
+    /// precondition is the active turn's id; when this adapter has not observed
+    /// one (the `turn/started` notification has not been folded yet, or the
+    /// run already ended), a `turn/start` is the correct fallback — the server
+    /// folds it into the active turn or starts a fresh one, never a second
+    /// competing turn.
+    #[allow(clippy::too_many_arguments)]
+    async fn steer(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[PromptFile],
+        skills: &[PromptSkill],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<()> {
+        let Some(turn_id) = self.projections.live_turn(session_id) else {
+            return self
+                .prompt(session_id, text, files, skills, model, variant, agent, message_id)
+                .await;
+        };
+        if !files.is_empty() {
             return Err(BridgeError::Client {
                 client: "codex",
-                detail: "skill attachments are not mapped onto this adapter yet".to_string(),
+                detail: "prompt attachments are not mapped onto this adapter yet".to_string(),
             });
         }
+        let input = self.input_items(text, skills)?;
         let mut params = json!({
             "threadId": session_id,
-            "input": [{ "type": "text", "text": text, "textElements": [] }],
+            "expectedTurnId": turn_id,
+            "input": input,
         });
         if let Some(message_id) = message_id {
             params["clientUserMessageId"] = json!(message_id);
         }
-        if let Some(model) = model {
-            params["model"] = json!(model.id);
-        }
-        // `turn/start` is the write half of this ticket's read model; a failed
-        // submit is its own error, while the Turn's outcome is observed from
-        // the transcript and session status (ADR-0011).
+        // No `model`/`effort` here: a steer adds input to a turn that already
+        // captured its settings. The turn is cola's — the bridge only steers
+        // while it owns the live execution — so no new provenance is recorded.
         self.connection()
-            .request("turn/start", params)
+            .request("turn/steer", params)
             .await
             .map_err(client_error)?;
         Ok(())
+    }
+
+    async fn is_cola_authored(&self, message_id: &str) -> bool {
+        match self.projections.turn_of_item(message_id) {
+            Some((thread, turn)) => {
+                if self.authored.is_authored(&thread, Some(&turn)) {
+                    return true;
+                }
+                // The provenance window: the item's turn was folded before the
+                // `turn/start` response bound its id, so the record cannot name
+                // it yet. A pending prompt on the thread whose turn is the live
+                // one IS that submission (ADR-0092 decision 2).
+                self.authored.is_pending(&thread)
+                    && self.projections.live_turn(&thread).as_deref() == Some(turn.as_str())
+            }
+            // Not in the cache: nothing cola can vouch for, unless the record
+            // itself is unusable — then everything is cola's (fail closed).
+            None => !self.authored.is_trusted(),
+        }
     }
 
     async fn reply_permission(
@@ -901,12 +1222,117 @@ impl Backend for CodexClient {
         Vec::new()
     }
 
-    async fn list_skills(&self, _directory: Option<&str>) -> Vec<SkillInfo> {
-        Vec::new()
+    async fn list_skills(&self, directory: Option<&str>) -> Vec<SkillInfo> {
+        // A project's skills live under its own cwd, so the read is scoped to
+        // the directory the session runs in; `None` keeps the server default.
+        let mut params = json!({});
+        if let Some(directory) = directory.filter(|directory| !directory.is_empty()) {
+            params["cwds"] = json!([directory]);
+        }
+        let result = match self.connection().request("skills/list", params).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!("codex skills/list failed; the picker degrades to no skills: {error}");
+                return Vec::new();
+            }
+        };
+        let response: SkillsListResponse = match decode("skills/list", result) {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!("codex skills/list did not decode: {error}");
+                return Vec::new();
+            }
+        };
+        let mut skills = Vec::new();
+        let mut catalog = Vec::new();
+        for entry in response.data {
+            for error in entry.errors {
+                tracing::warn!(
+                    path = %error.path,
+                    "codex reported a skill it could not load: {}",
+                    error.message
+                );
+            }
+            for skill in entry.skills {
+                catalog.push((skill.name.clone(), skill.path.clone()));
+                // Codex has no separate skill id: the name is what a prompt's
+                // `skill` input names, so it IS the neutral id (V1's rule).
+                skills.push(SkillInfo {
+                    id: skill.name.clone(),
+                    name: skill.name,
+                    description: (!skill.description.trim().is_empty()).then_some(skill.description),
+                    // The list route carries no body; the loaded-skill card's
+                    // content fold therefore has none to show.
+                    content: None,
+                });
+            }
+        }
+        self.skills.replace(catalog);
+        skills
     }
 
     async fn list_models(&self) -> Vec<ProviderModels> {
-        Vec::new()
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut models = Vec::new();
+        for page in 0..MAX_MODEL_PAGES {
+            let mut params = json!({});
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = json!(cursor);
+            }
+            let result = match self.connection().request("model/list", params).await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!("codex model/list failed; the picker degrades: {error}");
+                    break;
+                }
+            };
+            let response: ModelListResponse = match decode("model/list", result) {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!("codex model/list did not decode: {error}");
+                    break;
+                }
+            };
+            for model in response.data {
+                if model.hidden {
+                    continue;
+                }
+                models.push(ModelOption {
+                    id: model.id,
+                    // The server's own reasoning-effort set rides the model
+                    // entry (ADR-0020: each model declares its own scale).
+                    variants: model
+                        .supported_reasoning_efforts
+                        .into_iter()
+                        .map(|effort| effort.reasoning_effort)
+                        .collect(),
+                });
+            }
+            match response.next_cursor {
+                None => break,
+                Some(next) => {
+                    if !seen.insert(next.clone()) {
+                        tracing::warn!(
+                            "codex model/list repeated pagination cursor `{next}`; \
+                             showing the catalog read so far"
+                        );
+                        break;
+                    }
+                    cursor = Some(next);
+                }
+            }
+            if page + 1 == MAX_MODEL_PAGES {
+                tracing::warn!("codex model/list did not finish in {MAX_MODEL_PAGES} pages");
+            }
+        }
+        if models.is_empty() {
+            return Vec::new();
+        }
+        vec![ProviderModels {
+            provider: MODEL_PROVIDER.to_string(),
+            models,
+        }]
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
@@ -925,9 +1351,10 @@ impl Backend for CodexClient {
     }
 
     async fn interrupt(&self, session_id: &str) -> Result<()> {
-        let Some(turn_id) = self.projections.live_turn(session_id) else {
-            // No turn has been observed: nothing to interrupt. `/stop` on an
-            // idle session is a no-op, exactly as the bridge expects.
+        let Some(turn_id) = self.live_turn_for_stop(session_id).await? else {
+            // No turn has been observed even after adopting the thread:
+            // nothing to interrupt. `/stop` on an idle session is a no-op,
+            // exactly as the bridge expects.
             return Ok(());
         };
         self.connection()
@@ -941,10 +1368,19 @@ impl Backend for CodexClient {
     }
 
     async fn compact(&self, session_id: &str) -> Result<()> {
-        self.connection()
+        // Mark the request before it goes out: the compaction's item can reach
+        // the subscription before this task processes the response.
+        self.projections.mark_manual_compaction(session_id);
+        if let Err(error) = self
+            .connection()
             .request("thread/compact/start", json!({ "threadId": session_id }))
             .await
-            .map_err(client_error)?;
+        {
+            // Nothing was requested: do not mislabel a later automatic
+            // compaction as manual.
+            self.projections.clear_manual_compaction(session_id);
+            return Err(client_error(error));
+        }
         Ok(())
     }
 
@@ -995,6 +1431,32 @@ impl Backend for CodexLifecycle {
         message_id: Option<&str>,
     ) -> Result<()> {
         Backend::prompt(
+            &self.current().await?,
+            session_id,
+            text,
+            files,
+            skills,
+            model,
+            variant,
+            agent,
+            message_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn steer(
+        &self,
+        session_id: &str,
+        text: &str,
+        files: &[PromptFile],
+        skills: &[PromptSkill],
+        model: Option<&ModelInfo>,
+        variant: Option<&str>,
+        agent: Option<&str>,
+        message_id: Option<&str>,
+    ) -> Result<()> {
+        Backend::steer(
             &self.current().await?,
             session_id,
             text,
@@ -1098,7 +1560,20 @@ impl Backend for CodexLifecycle {
     }
 
     async fn list_models(&self) -> Vec<ProviderModels> {
-        Vec::new()
+        match self.attached_client().await {
+            Some(client) => Backend::list_models(&client).await,
+            None => Vec::new(),
+        }
+    }
+
+    async fn is_cola_authored(&self, message_id: &str) -> bool {
+        // The answer needs the item→turn mapping, which only a live
+        // projection has; a call with no attachment cannot name a message this
+        // process was handed, so there is nothing to vouch for.
+        match self.attached_client().await {
+            Some(client) => Backend::is_cola_authored(&client, message_id).await,
+            None => false,
+        }
     }
 
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo> {
@@ -1148,6 +1623,28 @@ mod tests {
         CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
             .await
             .expect("attach to the scripted app-server")
+    }
+
+    async fn connect_with(url: &str, authored: Arc<crate::codex::Authorship>) -> CodexClient {
+        let endpoint = Endpoint::parse(url).expect("endpoint");
+        CodexClient::connect(
+            &CodexOptions::new(endpoint).with_authorship(authored),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach to the scripted app-server")
+    }
+
+    /// Wait until the projection has folded the live turn a prompt started.
+    async fn wait_for_live_turn(client: &CodexClient, thread_id: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while client.projections.live_turn(thread_id).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the prompt's live turn never reached the projection"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     fn recording() -> Vec<Value> {
@@ -2280,6 +2777,686 @@ mod tests {
                 .expect("context window"),
             Some(128_000)
         );
+    }
+
+    /// Ticket #881 acceptance 1: a bridge prompt reaches the thread as a user
+    /// message the server writes, and the turn it started is recorded as cola's
+    /// (ADR-0090's authorship consequence) — never an External Message.
+    #[tokio::test]
+    async fn a_prompt_becomes_the_threads_user_message_and_is_recorded_as_colas() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let authored = crate::codex::Authorship::in_memory();
+        let client = connect_with(&url, authored).await;
+
+        client
+            .prompt(
+                "thread-1",
+                "hello codex",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+            )
+            .await
+            .expect("the prompt submits");
+
+        let params = server.turn_params("thread-1");
+        assert_eq!(params.len(), 1, "one turn/start");
+        assert_eq!(
+            params[0]["input"],
+            json!([{ "type": "text", "text": "hello codex", "text_elements": [] }]),
+            "the prompt is the turn's input, with the protocol's own field spelling"
+        );
+        assert_eq!(
+            params[0]["clientUserMessageId"], "msg_cola_1",
+            "cola's own id rides the submission"
+        );
+
+        // The server persisted the turn: an adoption after the stream still
+        // carries the user message, and the item's turn is in cola's record.
+        let transcript = wait_for_text(&client, "thread-1", "hello codex").await;
+        let user = transcript
+            .messages
+            .iter()
+            .find(|message| message.role == crate::backend::MessageRole::User)
+            .expect("the prompt's user message");
+        assert!(
+            client.is_cola_authored(user.id.as_str()).await,
+            "the turn cola started is cola's"
+        );
+        assert!(
+            !client.is_cola_authored("item-not-ours").await,
+            "a message outside cola's record is external"
+        );
+    }
+
+    /// Ticket #881 acceptance 6: the record survives a restart. A second
+    /// process builds a fresh connection and projection from the same state
+    /// directory and still answers "cola's" for the earlier turn.
+    #[tokio::test]
+    async fn a_turn_cola_started_survives_a_restart() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+
+        let first = connect_with(
+            &url,
+            crate::codex::Authorship::open(path.clone(), "codex").expect("the record opens"),
+        )
+        .await;
+        first
+            .prompt("thread-1", "before the restart", &[], &[], None, None, None, None)
+            .await
+            .expect("the prompt submits");
+        let transcript = wait_for_text(&first, "thread-1", "before the restart").await;
+        let user_id = transcript
+            .messages
+            .iter()
+            .find(|message| message.role == crate::backend::MessageRole::User)
+            .map(|message| message.id.as_str().to_string())
+            .expect("the user message");
+        drop(first);
+
+        // The restarted process: a fresh connection, the record reloaded from
+        // disk, and the projection rebuilt from the server's persisted turns.
+        let second = connect_with(
+            &url,
+            crate::codex::Authorship::open(path, "codex").expect("the record reloads"),
+        )
+        .await;
+        let rebuilt = second.transcript("thread-1").await.expect("the rebuilt read");
+        assert!(
+            rebuilt
+                .messages
+                .iter()
+                .any(|message| message.id.as_str() == user_id),
+            "the restarted projection still carries the turn"
+        );
+        assert!(
+            second.is_cola_authored(&user_id).await,
+            "a restart must not report cola's own turn as external"
+        );
+    }
+
+    /// The record is the only evidence, so an unusable file fails closed: every
+    /// message is treated as cola's and the adapter says so loudly.
+    #[tokio::test]
+    async fn a_corrupt_authorship_record_never_reports_a_message_as_external() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+        std::fs::write(&path, "{not json").expect("write a corrupt record");
+
+        let authored = crate::codex::Authorship::open(path, "codex").expect("a corrupt file loads");
+        let client = connect_with(&url, authored).await;
+        assert!(
+            client.is_cola_authored("item-anything").await,
+            "an unusable record must not point External Message detection at cola's own turns"
+        );
+    }
+
+    /// Ticket #881: a prompt that returns an already-active turn is folded into
+    /// it (the spike's finding) — never a second turn — and the bound turn is
+    /// recorded for the card to settle on.
+    #[tokio::test]
+    async fn a_prompt_that_folds_into_an_active_turn_binds_that_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let authored = crate::codex::Authorship::in_memory();
+        let cola = connect_with(&url, authored).await;
+        cola.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // The user's own client starts the turn.
+        let tui = connect(&url).await;
+        tui.transcript("thread-1").await.expect("the TUI's subscription");
+        tui.prompt("thread-1", "from the TUI", &[], &[], None, None, None, None)
+            .await
+            .expect("the TUI's prompt");
+        wait_for_live_turn(&cola, "thread-1").await;
+        let live = cola.projections.live_turn("thread-1").expect("a live turn");
+
+        // cola's prompt while that turn runs folds into it.
+        cola.prompt(
+            "thread-1",
+            "cola's addition",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some("msg_cola_fold"),
+        )
+        .await
+        .expect("the prompt is accepted");
+
+        assert_eq!(
+            cola.projections.live_turn("thread-1").as_deref(),
+            Some(live.as_str()),
+            "a fold never creates a second turn"
+        );
+        assert_eq!(server.turn_params("thread-1").len(), 2, "both prompts ran");
+        let transcript = wait_for_text(&cola, "thread-1", "cola's addition").await;
+        let tui_message = transcript
+            .messages
+            .iter()
+            .find(|message| message.text().contains("from the TUI"))
+            .expect("the TUI's message is in the same turn");
+        assert_eq!(
+            client_turn(&cola, tui_message.id.as_str()).as_deref(),
+            Some(live.as_str()),
+            "both messages belong to the one active turn"
+        );
+        assert!(
+            cola.is_cola_authored(tui_message.id.as_str()).await,
+            "the turn cola joined is now cola's turn (the protocol has no per-message author)"
+        );
+    }
+
+    /// The turn a message belongs to, from the adapter's own projection.
+    fn client_turn(client: &CodexClient, item_id: &str) -> Option<String> {
+        client.projections.turn_of_item(item_id).map(|(_, turn)| turn)
+    }
+
+    /// Ticket #881 acceptance 3: a Supplement steers the in-flight turn
+    /// (`turn/steer`, with the active turn's id as its precondition) instead of
+    /// starting a new one, and the text appears once in the transcript.
+    #[tokio::test]
+    async fn a_supplement_steers_the_in_flight_turn_once() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .prompt(
+                "thread-1",
+                "first message",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_1"),
+            )
+            .await
+            .expect("the first prompt");
+        wait_for_live_turn(&client, "thread-1").await;
+        let live = client.projections.live_turn("thread-1").expect("live");
+
+        client
+            .steer(
+                "thread-1",
+                "and also this",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_2"),
+            )
+            .await
+            .expect("the supplement steers");
+
+        let steers = server.steer_params();
+        assert_eq!(steers.len(), 1, "turn/steer, not a second turn/start");
+        assert_eq!(steers[0]["expectedTurnId"].as_str(), Some(live.as_str()));
+        assert_eq!(steers[0]["input"][0]["text"], "and also this");
+        assert_eq!(server.turn_starts(), 1, "the supplement never starts a turn");
+
+        let transcript = wait_for_text(&client, "thread-1", "and also this").await;
+        assert_eq!(
+            transcript
+                .messages
+                .iter()
+                .filter(|message| message.text().contains("and also this"))
+                .count(),
+            1,
+            "the steered text appears exactly once"
+        );
+        assert_eq!(
+            client.projections.live_turn("thread-1").as_deref(),
+            Some(live.as_str()),
+            "the steer lands in the same turn"
+        );
+    }
+
+    /// Ticket #881 acceptance 2: `/stop` interrupts the turn the projection
+    /// observed, and the server's `interrupted` ending settles it — not an
+    /// error, not a hang.
+    #[tokio::test]
+    async fn interrupting_sends_the_live_turn_and_settles_interrupted() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+        client
+            .prompt("thread-1", "a long run", &[], &[], None, None, None, None)
+            .await
+            .expect("the prompt");
+        wait_for_live_turn(&client, "thread-1").await;
+        let live = client.projections.live_turn("thread-1").expect("live");
+
+        client.interrupt("thread-1").await.expect("the interrupt");
+
+        let interrupts = server.interrupt_params();
+        assert_eq!(interrupts.len(), 1);
+        assert_eq!(interrupts[0]["threadId"], "thread-1");
+        assert_eq!(
+            interrupts[0]["turnId"].as_str(),
+            Some(live.as_str()),
+            "the interrupt names the observed live turn"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while client.projections.live_turn("thread-1").is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "an interrupted turn must settle, not hang live"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            client.session_status("thread-1", None).await.expect("status"),
+            Some(SessionStatus::Idle),
+            "an interrupted run is idle, never an error or a hang"
+        );
+        assert_eq!(server.live_turn("thread-1"), None);
+    }
+
+    /// An idle `/stop` is a no-op: there is no turn id to interrupt, and no
+    /// request is sent.
+    #[tokio::test]
+    async fn interrupting_an_idle_thread_sends_nothing() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.interrupt("thread-1").await.expect("idle stop is a no-op");
+        assert!(server.interrupt_params().is_empty());
+    }
+
+    /// Ticket #881 acceptance 4: `/compact` runs `thread/compact/start`, and
+    /// the server's `contextCompaction` item is projected as the neutral
+    /// Compaction the existing card path already renders — exactly once.
+    #[tokio::test]
+    async fn compact_runs_and_projects_the_compaction_once() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client.compact("thread-1").await.expect("the compaction starts");
+
+        assert_eq!(
+            server.compact_params(),
+            vec![json!({ "threadId": "thread-1" })],
+            "thread/compact/start names the thread"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let transcript = client.transcript("thread-1").await.expect("read");
+            let compactions: Vec<_> = transcript
+                .messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, crate::backend::Part::Compaction(_)))
+                })
+                .collect();
+            if !compactions.is_empty() {
+                assert_eq!(compactions.len(), 1, "one compaction item, one row");
+                let crate::backend::Part::Compaction(fact) = &compactions[0].parts[0] else {
+                    unreachable!()
+                };
+                assert_eq!(fact.status, crate::backend::CompactionStatus::Completed);
+                assert_eq!(
+                    fact.reason,
+                    crate::backend::CompactionReason::Manual,
+                    "a /compact-requested row is manual, not auto"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the compaction never reached the transcript"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // A second read is not a second compaction (the projection dedupes on
+        // the server's item id).
+        let read = client.transcript("thread-1").await.expect("second read");
+        assert_eq!(
+            read.messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .parts
+                        .iter()
+                        .any(|part| matches!(part, crate::backend::Part::Compaction(_)))
+                })
+                .count(),
+            1
+        );
+    }
+
+    /// Ticket #881 acceptance 5 (listing half): `/model` shows the server's
+    /// catalog, paged, with each model's reasoning efforts as its variants.
+    #[tokio::test]
+    async fn list_models_pages_the_catalog_with_effort_variants() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_models(vec![
+            json!({
+                "id": "gpt-5.1-codex",
+                "displayName": "GPT-5.1 Codex",
+                "hidden": false,
+                "supportedReasoningEfforts": [
+                    { "reasoningEffort": "low", "description": "fast" },
+                    { "reasoningEffort": "high", "description": "careful" }
+                ],
+                "defaultReasoningEffort": "high"
+            }),
+            json!({
+                "id": "an-internal-model",
+                "displayName": "Internal",
+                "hidden": true,
+                "supportedReasoningEfforts": [],
+                "defaultReasoningEffort": "low"
+            }),
+        ]);
+        server.set_model_page_size(1);
+        let client = connect(&url).await;
+
+        let providers = client.list_models().await;
+
+        assert_eq!(providers.len(), 1, "one neutral provider bucket");
+        assert_eq!(providers[0].provider, "codex");
+        assert_eq!(
+            providers[0]
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5.1-codex"],
+            "a hidden model is not offered"
+        );
+        assert_eq!(providers[0].models[0].variants, ["low", "high"]);
+        assert_eq!(
+            server.model_list_calls(),
+            2,
+            "the catalog is paged to the end, not read as its first page"
+        );
+    }
+
+    /// Ticket #881 acceptance 5 (skills half): `/skill` lists what the server
+    /// advertises, and a pick reaches the next turn as the protocol's `skill`
+    /// input (which needs the path the neutral DTO does not carry).
+    #[tokio::test]
+    async fn a_skill_pick_reaches_the_next_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        server.set_skills(vec![json!({
+            "name": "caveman",
+            "description": "Ultra-compressed communication mode.",
+            "path": "/home/u/.codex/skills/caveman/SKILL.md",
+            "scope": "user",
+            "enabled": true,
+            "pluginId": null,
+        })]);
+        let client = connect(&url).await;
+
+        let skills = client.list_skills(Some("/work/cola")).await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "caveman", "Codex's identity is the name");
+        assert_eq!(skills[0].name, "caveman");
+        assert_eq!(
+            skills[0].description.as_deref(),
+            Some("Ultra-compressed communication mode.")
+        );
+        assert_eq!(skills[0].content, None, "the list route carries no body to fold");
+
+        client
+            .prompt(
+                "thread-1",
+                "explain this",
+                &[],
+                &[PromptSkill {
+                    id: "caveman".into(),
+                    name: "caveman".into(),
+                }],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("the prompt submits with the skill");
+
+        let params = server.turn_params("thread-1");
+        assert_eq!(
+            params[0]["input"][1],
+            json!({ "type": "skill", "name": "caveman", "path": "/home/u/.codex/skills/caveman/SKILL.md" })
+        );
+    }
+
+    /// A skill the last list did not name is a named error, never a silently
+    /// dropped request (the model would answer without it).
+    #[tokio::test]
+    async fn an_unknown_skill_fails_the_prompt_by_name() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        let error = client
+            .prompt(
+                "thread-1",
+                "x",
+                &[],
+                &[PromptSkill {
+                    id: "never-listed".into(),
+                    name: "never-listed".into(),
+                }],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("an unknown skill is refused");
+        assert!(error.to_string().contains("never-listed"), "{error}");
+    }
+
+    /// A `/model` and `/think` pick ride the next `turn/start`: the model as
+    /// `model`, the variant as `effort`. That is the per-turn shape Codex
+    /// accepts (its durable-switch route does not exist), which is why
+    /// `switch_session_model` stays the trait's no-op here.
+    #[tokio::test]
+    async fn a_model_and_effort_pick_ride_the_next_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        let model = ModelInfo {
+            id: "gpt-5.1-codex".into(),
+            provider_id: "codex".into(),
+            variant: None,
+        };
+        client
+            .prompt(
+                "thread-1",
+                "run it",
+                &[],
+                &[],
+                Some(&model),
+                Some("high"),
+                None,
+                None,
+            )
+            .await
+            .expect("the prompt");
+        let params = server.turn_params("thread-1");
+        assert_eq!(params[0]["model"], "gpt-5.1-codex");
+        assert_eq!(params[0]["effort"], "high");
+        assert!(
+            !client.keeps_session_selection(),
+            "the pick is per-turn, not a durable session switch"
+        );
+    }
+
+    /// The provenance window (ADR-0092 decision 2): an item can reach the
+    /// subscription before the `turn/start` response names its turn. While the
+    /// submission is pending, the live turn is cola's — an older, completed
+    /// turn of the thread is not.
+    #[tokio::test]
+    async fn an_item_that_arrives_before_its_turn_is_bound_is_still_colas() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let authored = crate::codex::Authorship::in_memory();
+        let client = connect_with(&url, authored.clone()).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // An older, completed turn from another client.
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-old", "status": "inProgress", "startedAt": 1 } }),
+            ),
+            (
+                "item/started",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-old",
+                    "startedAtMs": 1_000_i64,
+                    "item": {
+                        "type": "userMessage",
+                        "id": "item-old",
+                        "clientId": null,
+                        "content": [{ "type": "text", "text": "someone else's message", "textElements": [] }],
+                    },
+                }),
+            ),
+            (
+                "turn/completed",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-old", "status": "completed", "startedAt": 1, "completedAt": 2 } }),
+            ),
+        ] {
+            server.push_to_thread("thread-1", method, params);
+        }
+        wait_for_text(&client, "thread-1", "someone else's message").await;
+        assert!(
+            !client.is_cola_authored("item-old").await,
+            "a completed turn cola never touched is external"
+        );
+
+        // cola's prompt is in flight; its turn's stream arrives first.
+        client.authored.begin("thread-1");
+        server.push_to_thread(
+            "thread-1",
+            "turn/started",
+            json!({ "threadId": "thread-1", "turn": { "id": "turn-live", "status": "inProgress", "startedAt": 3 } }),
+        );
+        server.push_to_thread(
+            "thread-1",
+            "item/started",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-live",
+                "startedAtMs": 3_000_i64,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-early",
+                    "clientId": "msg_cola_early",
+                    "content": [{ "type": "text", "text": "cola's early prompt", "textElements": [] }],
+                },
+            }),
+        );
+        wait_for_text(&client, "thread-1", "cola's early prompt").await;
+        assert!(
+            client.is_cola_authored("item-early").await,
+            "the in-flight submission vouches for the live turn before the response names it"
+        );
+        assert!(
+            !client.is_cola_authored("item-old").await,
+            "the pending marker never reaches back into a finished turn"
+        );
+
+        // The response binds the turn: the record answers from here on.
+        client.authored.bind("thread-1", "turn-live");
+        assert!(client.is_cola_authored("item-early").await);
+        assert!(!client.authored.is_pending("thread-1"));
     }
 
     /// The adapter is constructed by kind, and an unattached lifecycle is a
