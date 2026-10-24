@@ -24,8 +24,12 @@
 //!
 //! - a **writer** task owns the sink and serialises every outgoing frame;
 //! - a **reader** task owns the stream and fans each frame out: a response goes
-//!   to the one waiter registered for its id, a notification or server request
-//!   goes to [`RpcConnection::inbound`]'s broadcast.
+//!   to the one waiter registered for its id, a notification goes to
+//!   [`RpcConnection::inbound`]'s broadcast, and the server-request protocol
+//!   (a request, or its `serverRequest/resolved`) goes to the connection's
+//!   lossless [`RpcConnection::take_server_events`] stream — those are
+//!   decisions a server or a card is blocked on, so they cannot share the
+//!   broadcast's lossy lag.
 //!
 //! The connection is therefore safe to share: [`RpcConnection`] is a cheap
 //! handle over the tasks (`Clone`), and the tasks stop when the last handle is
@@ -52,10 +56,11 @@ use url::Url;
 
 use super::error::{CodexError, Result};
 
-/// How many inbound notifications/requests a subscriber may fall behind before
-/// the broadcast drops the oldest. A push-shaped runtime can outpace a slow
+/// How many inbound notifications a subscriber may fall behind before the
+/// broadcast drops the oldest. A push-shaped runtime can outpace a slow
 /// consumer; the adapter sees [`broadcast::error::RecvError::Lagged`] and
-/// reports it instead of silently rendering a hole.
+/// reports it instead of silently rendering a hole. The server-request
+/// protocol is not subject to this bound — see [`ServerEvent`].
 const INBOUND_CAPACITY: usize = 1024;
 
 /// How many outgoing frames may sit between a caller and the writer. Bounded on
@@ -108,13 +113,15 @@ impl Endpoint {
     }
 }
 
-/// One message this connection did not request: a server notification (no id)
-/// or a server-initiated request (an id the server owns).
+/// One notification this connection did not request, fanned out to every
+/// consumer of the connection's push stream (the thread dispatcher, the status
+/// watcher, doctor's turn probe).
 ///
-/// Both are fanned out here, not dispatched: notifications feed the adapter's
-/// thread subscriptions (#878), and server requests are the approval/question
-/// surface the adapter records and answers with [`RpcConnection::respond`]
-/// (#882).
+/// This stream is a **broadcast**: a consumer that falls behind loses the
+/// oldest events, which every reader here is prepared for (a thread dispatcher
+/// marks its subscriptions lagged and the status watcher clears its cache).
+/// Server-initiated requests deliberately do *not* ride it — see
+/// [`ServerEvent`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Inbound {
     Notification {
@@ -126,16 +133,44 @@ pub(crate) enum Inbound {
         method: String,
         params: Value,
     },
-    Request {
-        id: Value,
-        method: String,
-        params: Value,
-    },
     /// The socket is gone: no more responses or push traffic will arrive, and
     /// every subscription's stream ends. Sent once, by whichever task noticed
     /// first.
     Closed,
 }
+
+/// One frame of the server-request protocol: a request the server is waiting on
+/// (an id the server owns) or the notification that ends one.
+///
+/// These ride a dedicated, **lossless** stream
+/// ([`RpcConnection::take_server_events`]) rather than the notification
+/// broadcast. Both directions are decisions a server is blocked on, so a lost
+/// frame is a hang rather than a gap: a dropped request leaves the server
+/// waiting forever with no card, and a dropped resolution leaves a card
+/// clickable for a request nobody waits on any more. The stream is unbounded
+/// because the volume is one frame per tool call — a bounded queue would only
+/// turn a slow consumer into the same silence.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ServerEvent {
+    /// A request the server initiated; answer it with
+    /// [`RpcConnection::respond`].
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
+    /// [`SERVER_REQUEST_RESOLVED`]: the server no longer waits on `requestId`
+    /// (another client answered it, or the turn ended).
+    Resolved { params: Value },
+    /// The socket is gone: no answer can reach the server, so nothing may stay
+    /// pending.
+    Closed,
+}
+
+/// The notification the server sends when a request leaves its pending set,
+/// whether cola answered it, another client did, or the turn ended. Routed to
+/// [`ServerEvent`] so a lost resolution cannot leave a stale clickable card.
+pub(crate) const SERVER_REQUEST_RESOLVED: &str = "serverRequest/resolved";
 
 /// The one byte stream a `WebSocketStream` is built over.
 trait ByteStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -195,6 +230,14 @@ struct ConnectionInner {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     inbound: broadcast::Sender<Inbound>,
+    /// The lossless server-request stream's sender. Requests and their
+    /// resolutions are sent here from the reader loop; the receiver is handed
+    /// to the approval consumer once, by [`RpcConnection::take_server_events`].
+    /// A connection whose caller never takes it (doctor's attach, a liveness
+    /// probe) buffers what little arrives and drops it with the connection —
+    /// server requests are one frame per tool call, never a flood.
+    server_events: mpsc::UnboundedSender<ServerEvent>,
+    server_events_rx: Mutex<Option<mpsc::UnboundedReceiver<ServerEvent>>>,
     /// The receipt order of inbound notifications. Assigned in the reader loop
     /// (before fan-out), so every consumer sees one order even when two tasks
     /// process the same broadcast at different speeds.
@@ -294,6 +337,7 @@ impl RpcConnection {
         let (sink, stream) = socket.split();
         let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
+        let (server_events, server_events_rx) = mpsc::unbounded_channel();
         let (closing, closing_rx) = watch::channel(false);
 
         let inner = Arc::new(ConnectionInner {
@@ -301,6 +345,8 @@ impl RpcConnection {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             inbound,
+            server_events,
+            server_events_rx: Mutex::new(Some(server_events_rx)),
             inbound_seq: AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             closing,
@@ -410,9 +456,22 @@ impl RpcConnection {
     }
 
     /// Subscribe to everything the server pushed that was not a response to
-    /// one of this connection's requests.
+    /// one of this connection's requests. A broadcast, so a slow consumer loses
+    /// old events — the server-request protocol is *not* here; see
+    /// [`Self::take_server_events`].
     pub(crate) fn inbound(&self) -> broadcast::Receiver<Inbound> {
         self.inner.inbound.subscribe()
+    }
+
+    /// Take the connection's one lossless server-request stream.
+    ///
+    /// Only one consumer may own it (the approval record), so it is taken once
+    /// and `None` afterwards. Unlike [`Self::inbound`] nothing here is dropped
+    /// on lag: an approval request or its resolution is a decision a server (or
+    /// a card) is blocked on, not a notification whose loss a reader can
+    /// repair from a later read.
+    pub(crate) fn take_server_events(&self) -> Option<mpsc::UnboundedReceiver<ServerEvent>> {
+        self.inner.server_events_rx.lock().expect("server events").take()
     }
 
     /// The receipt sequence of the newest inbound notification fanned out by
@@ -434,12 +493,15 @@ impl RpcConnection {
     fn test_connection(capacity: usize) -> (Self, mpsc::Receiver<Message>, watch::Receiver<bool>) {
         let (outgoing, outgoing_rx) = mpsc::channel(capacity);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
+        let (server_events, server_events_rx) = mpsc::unbounded_channel();
         let (closing, closing_rx) = watch::channel(false);
         let inner = Arc::new(ConnectionInner {
             outgoing,
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             inbound,
+            server_events,
+            server_events_rx: Mutex::new(Some(server_events_rx)),
             inbound_seq: AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             closing,
@@ -573,6 +635,9 @@ fn close(inner: &ConnectionInner) {
     for (_, pending) in pending {
         let _ = pending.reply.send(Err(RpcFailure::Closed));
     }
+    // The server-request stream ends too: the approval record clears its
+    // pending set on this frame, because no answer can reach the server.
+    let _ = inner.server_events.send(ServerEvent::Closed);
     let _ = inner.inbound.send(Inbound::Closed);
 }
 
@@ -583,7 +648,9 @@ fn dispatch(inner: &Arc<ConnectionInner>, value: Value) {
     match (method, id) {
         (Some(method), Some(id)) => {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
-            let _ = inner.inbound.send(Inbound::Request {
+            // A server request is a server blocked on an answer: it rides the
+            // lossless stream, never the notification broadcast.
+            let _ = inner.server_events.send(ServerEvent::Request {
                 id,
                 method: method.to_string(),
                 params,
@@ -591,6 +658,12 @@ fn dispatch(inner: &Arc<ConnectionInner>, value: Value) {
         }
         (Some(method), None) => {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
+            if method == SERVER_REQUEST_RESOLVED {
+                // The end of a server request belongs to the same lossless
+                // stream: losing it strands a clickable card.
+                let _ = inner.server_events.send(ServerEvent::Resolved { params });
+                return;
+            }
             let seq = inner.inbound_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = inner.inbound.send(Inbound::Notification {
                 seq,
@@ -805,15 +878,17 @@ mod tests {
         let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
             .await
             .expect("connection");
-        let mut inbound = connection.inbound();
+        let mut server_events = connection
+            .take_server_events()
+            .expect("the connection's one server-request stream");
 
         let id = server.request_to_all("test/approval", json!({ "threadId": "t" }));
-        let event = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
+        let event = tokio::time::timeout(Duration::from_secs(2), server_events.recv())
             .await
             .expect("the server request arrives")
-            .expect("inbound stays open");
+            .expect("the stream stays open");
         match event {
-            Inbound::Request {
+            ServerEvent::Request {
                 id: received, method, ..
             } => {
                 assert_eq!(received, id);
@@ -840,6 +915,88 @@ mod tests {
             .await
             .expect("initialize still answers");
         assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
+    }
+
+    /// Whole-branch review #883: the server-request protocol is **lossless**.
+    /// The notification broadcast drops the oldest events for a consumer that
+    /// falls behind, so a request followed by a burst of notifications used to
+    /// be gone by the time the approval record read its stream — the server
+    /// then waits forever with no card. The dedicated stream keeps the request
+    /// (and its resolution) regardless of what the broadcast does.
+    #[tokio::test]
+    async fn a_server_request_survives_a_lagged_notification_burst() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        let mut server_events = connection
+            .take_server_events()
+            .expect("the connection's one server-request stream");
+        // A broadcast consumer that never drains: after more than
+        // INBOUND_CAPACITY events behind it, it is lagged — the state the
+        // approval record used to read requests from.
+        let _slow = connection.inbound();
+
+        dispatch(
+            &connection.inner,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "item/commandExecution/requestApproval",
+                "params": { "threadId": "t" },
+            }),
+        );
+        for seq in 0..=INBOUND_CAPACITY {
+            dispatch(
+                &connection.inner,
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "item/updated",
+                    "params": { "seq": seq },
+                }),
+            );
+        }
+
+        let event = tokio::time::timeout(Duration::from_secs(2), server_events.recv())
+            .await
+            .expect("the request is not dropped with the notifications")
+            .expect("the stream is open");
+        match event {
+            ServerEvent::Request { id, method, .. } => {
+                assert_eq!(id, json!(7));
+                assert_eq!(method, "item/commandExecution/requestApproval");
+            }
+            other => panic!("expected the request first, got {other:?}"),
+        }
+
+        // The resolution rides the same stream, so a burst cannot leave a card
+        // clickable for a request the server no longer waits on.
+        dispatch(
+            &connection.inner,
+            json!({
+                "jsonrpc": "2.0",
+                "method": SERVER_REQUEST_RESOLVED,
+                "params": { "requestId": 7 },
+            }),
+        );
+        assert!(matches!(
+            server_events.recv().await,
+            Some(ServerEvent::Resolved { params }) if params["requestId"] == json!(7)
+        ));
+    }
+
+    /// The lossless stream has exactly one owner, and the connection's close
+    /// ends it with `Closed` — the frame the approval record clears its pending
+    /// set on, because no answer can reach a closed server.
+    #[tokio::test]
+    async fn the_server_stream_is_taken_once_and_ends_with_the_connection() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        let mut events = connection.take_server_events().expect("the first take");
+        assert!(
+            connection.take_server_events().is_none(),
+            "a second taker would get an empty stream and record nothing"
+        );
+        close(&connection.inner);
+        assert_eq!(events.recv().await, Some(ServerEvent::Closed));
+        drop(connection);
+        assert_eq!(events.recv().await, None, "the stream ends with the connection");
     }
 
     /// A close must end the writer and drop the frame receiver, waking a
