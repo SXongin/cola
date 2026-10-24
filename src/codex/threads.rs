@@ -172,8 +172,9 @@ pub(crate) enum UnsubscribeStatus {
 /// sent them; the read model (#879) decodes them into transcript parts.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ThreadEvent {
-    /// A notification the server pushed for this thread.
-    Notification { method: String, params: Value },
+    /// A notification the server pushed for this thread, with the connection's
+    /// receipt sequence (the order the reader loop fanned it out).
+    Notification { seq: u64, method: String, params: Value },
     /// The dispatcher fell behind the connection's push stream and dropped
     /// `skipped` events. A silent gap would render a transcript with holes, so
     /// this is delivered to every live subscriber, which can resync through
@@ -299,6 +300,12 @@ impl Threads {
     pub(crate) fn new(connection: RpcConnection) -> Self {
         let registry = Registry::start(connection.clone());
         Self { connection, registry }
+    }
+
+    /// The connection's newest inbound notification sequence — the page
+    /// boundary a history rebuild records its derived status against.
+    pub(crate) fn inbound_seq(&self) -> u64 {
+        self.connection.inbound_seq()
     }
 
     /// List threads whose session cwd is exactly `cwd`, newest-page first as
@@ -712,7 +719,7 @@ async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Regi
             return;
         };
         match event {
-            Ok(Inbound::Notification { method, params }) => {
+            Ok(Inbound::Notification { seq, method, params }) => {
                 let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
                     continue;
                 };
@@ -720,7 +727,7 @@ async fn dispatch(mut inbound: broadcast::Receiver<Inbound>, registry: Weak<Regi
                     // No receiver means every local handle already dropped;
                     // the server stops sending once the connection unsubscribes
                     // or closes, so a dropped event costs nothing.
-                    let _ = sender.send(ThreadEvent::Notification { method, params });
+                    let _ = sender.send(ThreadEvent::Notification { seq, method, params });
                 }
             }
             Ok(Inbound::Request { .. }) => continue,
@@ -755,7 +762,7 @@ mod tests {
 
     fn notification(event: ThreadEvent) -> (String, Value) {
         match event {
-            ThreadEvent::Notification { method, params } => (method, params),
+            ThreadEvent::Notification { method, params, .. } => (method, params),
             other => panic!("expected a notification, got {other:?}"),
         }
     }
@@ -1248,6 +1255,7 @@ mod tests {
         for text in ["dropped-1", "dropped-2", "delivered"] {
             inbound
                 .send(Inbound::Notification {
+                    seq: 1,
                     method: "item/completed".to_string(),
                     params: json!({
                         "threadId": "thread-1",

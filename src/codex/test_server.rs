@@ -280,6 +280,12 @@ struct State {
     silent_resume: std::sync::atomic::AtomicBool,
     /// Fail this many `thread/turns/list` calls before answering normally.
     fail_turns_pages: AtomicUsize,
+    /// Scripted notifications a `turn/start` emits to the thread's subscribers:
+    /// the server-side origin of a turn a connection asked for.
+    scripted_turns: std::sync::Mutex<std::collections::HashMap<String, Vec<(String, Value)>>>,
+    /// `turn/start` calls received, so a test can prove which connection
+    /// originated the turn.
+    turn_starts: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
 }
@@ -305,6 +311,8 @@ impl Default for State {
             unsubscribe_calls: AtomicUsize::new(0),
             silent_resume: std::sync::atomic::AtomicBool::new(false),
             fail_turns_pages: AtomicUsize::new(0),
+            scripted_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            turn_starts: AtomicUsize::new(0),
             page_size: 2,
         }
     }
@@ -597,6 +605,31 @@ impl FakeServer {
     pub(crate) fn fail_turns_pages(&self, count: usize) {
         self.state.fail_turns_pages.store(count, Ordering::SeqCst);
     }
+
+    /// Script the notifications a `turn/start` on `thread_id` emits to that
+    /// thread's subscribers. The request itself is the origin: a test starts
+    /// the turn from another connection, and the fake server — not the test —
+    /// pushes the stream.
+    pub(crate) fn script_turn(&self, thread_id: &str, events: Vec<Value>) {
+        let events = events
+            .into_iter()
+            .filter_map(|event| {
+                let method = event.get("method")?.as_str()?.to_string();
+                let params = event.get("params").cloned().unwrap_or(Value::Null);
+                Some((method, params))
+            })
+            .collect();
+        self.state
+            .scripted_turns
+            .lock()
+            .expect("scripted turns")
+            .insert(thread_id.to_string(), events);
+    }
+
+    /// `turn/start` calls received.
+    pub(crate) fn turn_starts(&self) -> usize {
+        self.state.turn_starts.load(Ordering::SeqCst)
+    }
 }
 
 /// Count one accepted connection and serve it on its own task. The accept loop
@@ -803,6 +836,37 @@ where
             // A broken peer: a text frame that is not JSON. The client must
             // close the connection and fail the request instead of waiting.
             return send_text(sink, "this frame is not json").await;
+        }
+        Some("turn/start") => {
+            state.turn_starts.fetch_add(1, Ordering::SeqCst);
+            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            let scripted = state
+                .scripted_turns
+                .lock()
+                .expect("scripted turns")
+                .get(thread_id)
+                .cloned()
+                .unwrap_or_default();
+            let result = json!({
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000, "items": [] }
+            });
+            if !reply(sink, id, result).await {
+                return false;
+            }
+            // The server, not the test, emits the stream: a turn started on
+            // this connection fans out to every subscriber of the thread.
+            let mut subscribers = state.subscribers.lock().expect("subscribers");
+            if let Some(streams) = subscribers.get_mut(thread_id) {
+                for (method, params) in scripted {
+                    let message = Message::Text(
+                        json!({ "jsonrpc": "2.0", "method": method, "params": params })
+                            .to_string()
+                            .into(),
+                    );
+                    streams.retain(|(_, stream)| stream.send(message.clone()).is_ok());
+                }
+            }
+            true
         }
         Some("thread/resume") => {
             state.resume_calls.fetch_add(1, Ordering::SeqCst);

@@ -165,25 +165,25 @@ impl Projections {
             .clone()
     }
 
-    pub(crate) fn apply(&self, thread_id: &str, method: &str, params: &Value) {
+    pub(crate) fn apply_at(&self, thread_id: &str, seq: u64, method: &str, params: &Value) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .apply(method, params);
+            .apply_at(seq, method, params);
     }
 
-    pub(crate) fn seed(&self, thread_id: &str, turns: &[Value]) {
+    pub(crate) fn seed(&self, thread_id: &str, turns: &[Value], boundary_seq: u64) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .seed(turns);
+            .seed(turns, boundary_seq);
     }
 
-    pub(crate) fn resync(&self, thread_id: &str, turns: &[Value]) {
+    pub(crate) fn resync(&self, thread_id: &str, turns: &[Value], boundary_seq: u64) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .resync(turns);
+            .resync(turns, boundary_seq);
     }
 
     pub(crate) fn mark_incomplete(&self, thread_id: &str) {
@@ -257,7 +257,7 @@ impl Projections {
     /// deliberately independent of a subscription: the server broadcasts the
     /// notification to every connection, so Session Sync learns a thread's
     /// busy/idle state without `thread/resume`.
-    fn ingest_status(&self, params: &Value) {
+    fn ingest_status(&self, params: &Value, seq: u64) {
         let Some(thread_id) = params.get("threadId").and_then(Value::as_str) else {
             return;
         };
@@ -271,14 +271,14 @@ impl Projections {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .set_observed_status(decoded);
+            .set_observed_status_at(decoded, seq);
     }
 
     /// Forget every explicit status after the connection's push stream lagged:
     /// a status notification that was dropped could otherwise leave a session
     /// busy forever. With no cached state the next read adopts the thread (or
     /// answers from its subscription-derived live flag).
-    fn clear_statuses(&self) {
+    fn clear_statuses(&self, seq: u64) {
         let projections: Vec<_> = self
             .threads
             .lock()
@@ -290,7 +290,7 @@ impl Projections {
             projection
                 .lock()
                 .expect("codex projection")
-                .set_observed_status(None);
+                .clear_observed_status_at(seq);
         }
     }
 
@@ -300,22 +300,23 @@ impl Projections {
     /// consumes; it owns no thread and sends no request.
     pub(crate) fn watch_thread_status(self: &Arc<Self>, connection: &RpcConnection) {
         let mut inbound = connection.inbound();
+        let connection = connection.clone();
         let projections = Arc::downgrade(self);
         let task = tokio::spawn(async move {
             loop {
                 match inbound.recv().await {
-                    Ok(Inbound::Notification { method, params }) if method == THREAD_STATUS_CHANGED => {
+                    Ok(Inbound::Notification { seq, method, params }) if method == THREAD_STATUS_CHANGED => {
                         let Some(projections) = projections.upgrade() else {
                             return;
                         };
-                        projections.ingest_status(&params);
+                        projections.ingest_status(&params, seq);
                     }
                     Ok(Inbound::Closed) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // The socket is gone: a cached run state can no longer
                         // be trusted, so the next status read adopts (or fails)
                         // instead of presenting a stale busy.
                         if let Some(projections) = projections.upgrade() {
-                            projections.clear_statuses();
+                            projections.clear_statuses(connection.inbound_seq());
                         }
                         return;
                     }
@@ -325,7 +326,7 @@ impl Projections {
                             "the codex status stream fell behind; clearing the cached statuses"
                         );
                         if let Some(projections) = projections.upgrade() {
-                            projections.clear_statuses();
+                            projections.clear_statuses(connection.inbound_seq());
                         }
                     }
                     _ => {}
@@ -447,6 +448,10 @@ impl CodexClient {
             }
             None => {}
         }
+        // Every status this connection had already received when the history
+        // request starts is superseded by the page; a status received after
+        // this boundary still applies (it is newer than the page).
+        let boundary = self.threads().inbound_seq();
         match self.threads().adopt(thread_id).await? {
             Adoption::Subscribed(subscription) => {
                 // `thread/resume` carries only a bounded history page. A first
@@ -456,7 +461,7 @@ impl CodexClient {
                 // that arrive during this paging wait in its queue.
                 match self.threads().all_turns(thread_id).await {
                     Ok(turns) => {
-                        self.projections.resync(thread_id, &turns);
+                        self.projections.resync(thread_id, &turns, boundary);
                         self.projections.set_state(thread_id, SubscriptionState::Live);
                     }
                     Err(error) => {
@@ -465,7 +470,8 @@ impl CodexClient {
                             "could not page the codex thread history on adoption; \
                              the bounded resume page is explicitly incomplete: {error}"
                         );
-                        self.projections.seed(thread_id, &subscription.thread().turns);
+                        self.projections
+                            .seed(thread_id, &subscription.thread().turns, boundary);
                         self.projections.mark_incomplete(thread_id);
                         self.projections.set_state(
                             thread_id,
@@ -489,8 +495,8 @@ impl CodexClient {
                         break;
                     }
                     match subscription.try_next_event() {
-                        Ok(Some(ThreadEvent::Notification { method, params })) => {
-                            self.projections.apply(thread_id, &method, &params);
+                        Ok(Some(ThreadEvent::Notification { seq, method, params })) => {
+                            self.projections.apply_at(thread_id, seq, &method, &params);
                             drained += 1;
                         }
                         Ok(Some(ThreadEvent::Lagged { skipped })) => {
@@ -581,11 +587,11 @@ async fn consume(
                 }
             }
             event = subscription.next_event() => match event {
-                Ok(ThreadEvent::Notification { method, params }) => {
+                Ok(ThreadEvent::Notification { seq, method, params }) => {
                     let Some(projections) = projections.upgrade() else {
                         return;
                     };
-                    projections.apply(&thread_id, &method, &params);
+                    projections.apply_at(&thread_id, seq, &method, &params);
                 }
                 Ok(ThreadEvent::Lagged { skipped }) => {
                     tracing::warn!(
@@ -629,10 +635,11 @@ async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, t
     if let Some(projections) = projections.upgrade() {
         projections.mark_incomplete(thread_id);
     }
+    let boundary = threads.inbound_seq();
     match threads.all_turns(thread_id).await {
         Ok(turns) => {
             if let Some(projections) = projections.upgrade() {
-                projections.resync(thread_id, &turns);
+                projections.resync(thread_id, &turns, boundary);
                 // A lag resync recovers the history a failed adoption page
                 // could not; a later read need not retry paging.
                 projections.set_state(thread_id, SubscriptionState::Live);
@@ -1434,6 +1441,61 @@ mod tests {
             "a discarded run reads as idle"
         );
         assert_eq!(server.resume_calls(), 0);
+    }
+
+    /// Ticket #880 review finding: a closed connection cannot vouch for a
+    /// cached run state. The status watcher clears it, so a later read adopts
+    /// (or fails loudly) instead of reporting a stale busy forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_closed_connection_clears_its_cached_status() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a thread",
+        ));
+        let client = connect(&url).await;
+        server.push_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-1", "status": { "type": "active", "activeFlags": [] } }),
+        );
+        wait_for_observed_status(&client, "thread-1", Some(ThreadStatus::Active)).await;
+
+        server.die().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while client.projections.observed_status("thread-1").is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a closed connection kept its cached status"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// The lag path clears every thread's cached state through the same
+    /// wrapper: a dropped status notification must not leave a session busy.
+    #[test]
+    fn clearing_the_status_cache_drops_every_thread() {
+        let projections = Projections::default();
+        for thread in ["thread-a", "thread-b"] {
+            projections
+                .projection(thread)
+                .lock()
+                .expect("projection")
+                .set_observed_status_at(Some(ThreadStatus::Active), 5);
+        }
+        projections.clear_statuses(7);
+        assert_eq!(projections.observed_status("thread-a"), None);
+        assert_eq!(projections.observed_status("thread-b"), None);
+        // A status queued behind the clear is stale too.
+        projections
+            .projection("thread-a")
+            .lock()
+            .expect("projection")
+            .set_observed_status_at(Some(ThreadStatus::Active), 6);
+        assert_eq!(projections.observed_status("thread-a"), None);
     }
 
     /// A bounded `thread/resume` page is never presented as the whole history:
