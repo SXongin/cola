@@ -47,10 +47,21 @@
 //! exactly the turn a restart would report as external. An unresolved
 //! submission is never silently evicted to make room: at the per-thread cap the
 //! next prompt is refused instead, because dropping an older unresolved id is
-//! the same loss. Only a write that already succeeded is ever discarded, by the
-//! tail caps below and by an explicit expiry on the thread-wide fallback: a
-//! submission whose response never came and whose item never appeared stops
-//! vouching for a later external turn after [`PENDING_TTL_MS`].
+//! the same loss. Two windows bound the record:
+//!
+//! - the **id-less, thread-wide fallback** stops vouching after
+//!   [`PENDING_FALLBACK_TTL_MS`], so a request that never reached the server
+//!   cannot make a later foreign turn look cola's; and
+//! - a recorded id that never resolves is pruned after
+//!   [`PENDING_ID_TTL_MS`] (an hour), the safety valve for a marker whose
+//!   response and item both never came. Until then the per-thread cap refuses
+//!   new prompts rather than forgetting an outstanding id.
+//!
+//! The **precise** id match itself is never bounded by the fallback window: a
+//! chosen id stays reconcilable for as long as it is recorded, so a lost
+//! response that surfaces late still binds. Only a recorded id may vouch for a
+//! turn — never the shape of the id a peer sent, because a peer chooses its own
+//! `clientUserMessageId`.
 //!
 //! **Degrading safely.** This file is the only evidence of who wrote a turn, so
 //! it fails **closed**: a corrupt, unreadable or unwritable record marks the
@@ -89,12 +100,21 @@ const MAX_PENDING_PER_THREAD: usize = 32;
 /// How long an unresolved submission vouches for the thread-wide (id-less)
 /// fallback. A lost response reconciles as soon as its item appears, normally
 /// well inside this window; a request that never reached the server must stop
-/// making a later external turn look cola's. The precise id check is not
-/// bounded by this: no other client can mint cola's chosen id.
+/// making a later external turn look cola's. The precise id match is not
+/// bounded by this.
 #[cfg(not(test))]
-pub(crate) const PENDING_TTL_MS: i64 = 5 * 60 * 1000;
+pub(crate) const PENDING_FALLBACK_TTL_MS: i64 = 5 * 60 * 1000;
 #[cfg(test)]
-pub(crate) const PENDING_TTL_MS: i64 = 50;
+pub(crate) const PENDING_FALLBACK_TTL_MS: i64 = 50;
+
+/// The safety valve for a recorded submission that never resolves: after an
+/// hour it leaves the file. Nothing about the id's *shape* makes it ours, so
+/// the record cannot keep it forever; an hour is far longer than any accepted
+/// turn takes to surface, and the per-thread cap refuses new prompts until then.
+#[cfg(not(test))]
+const PENDING_ID_TTL_MS: i64 = 60 * 60 * 1000;
+#[cfg(test)]
+const PENDING_ID_TTL_MS: i64 = 500;
 
 /// The version-1 (ADR-0091) file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -116,7 +136,9 @@ struct AuthorshipFile {
 struct PendingSubmission {
     id: String,
     /// Epoch milliseconds, cola's own clock — the server never sees this
-    /// record. It bounds the thread-wide fallback ([`PENDING_TTL_MS`]).
+    /// record. It bounds the thread-wide fallback
+    /// ([`PENDING_FALLBACK_TTL_MS`]) and, eventually, the submission itself
+    /// ([`PENDING_ID_TTL_MS`]).
     at_ms: i64,
 }
 
@@ -259,6 +281,13 @@ impl Authorship {
                  without a durable provenance record"
             ));
         }
+        // The entry this call replaces, if any: a failed write must restore it,
+        // not lose a marker an earlier prompt may still owe.
+        let previous = state
+            .pending
+            .get(&self.client_id, thread)
+            .and_then(|pending| pending.iter().find(|known| known.id == submission))
+            .cloned();
         let at_capacity = {
             let pending = state.pending.entry_mut(&self.client_id, thread);
             if let Some(index) = pending.iter().position(|known| known.id == submission) {
@@ -287,9 +316,15 @@ impl Authorship {
         }
         if let Err(error) = self.persist(&state) {
             // Roll the marker back: the prompt is refused, and a later read
-            // must not treat it as in flight.
+            // must not treat it as in flight. A retry that refreshed an
+            // existing entry restores it — that earlier submission may still
+            // be owed, and losing its marker is the provenance loss this
+            // record exists to prevent.
             if let Some(pending) = state.pending.get_mut(&self.client_id, thread) {
                 pending.retain(|known| known.id != submission);
+                if let Some(previous) = previous {
+                    pending.push(previous);
+                }
             }
             prune_pending(&mut state.pending, &self.client_id, thread);
             return Err(format!(
@@ -403,33 +438,29 @@ impl Authorship {
     /// Whether a **live** prompt is in flight for `thread`. The turn id is not
     /// known yet, so an item with no client id in the thread's live turn is the
     /// record's stand-in until the response (or a history read) binds it. The
-    /// window is bounded by [`PENDING_TTL_MS`]: a submission whose request
-    /// never reached the server must stop vouching for later turns.
+    /// window is bounded by [`PENDING_FALLBACK_TTL_MS`]: a submission whose
+    /// request never reached the server must stop vouching for later turns.
     pub(crate) fn is_pending(&self, thread: &str) -> bool {
         let state = self.state.lock().expect("authorship record");
         let now = now_ms();
         state
             .pending
             .get(&self.client_id, thread)
-            .is_some_and(|pending| pending.iter().any(|known| is_live(known, now)))
+            .is_some_and(|pending| pending.iter().any(|known| is_fallback_live(known, now)))
             || state.anonymous.get(thread).copied().unwrap_or(0) > 0
     }
 
-    /// Whether `submission` is a **live** unresolved chosen id. This is the
+    /// Whether `submission` is a **recorded** unresolved chosen id. This is the
     /// precise provenance answer: the item carries exactly the id cola sent, so
-    /// no other client's message can match it.
+    /// no other client's message can match it, and it is never inferred from
+    /// the id's shape. Only the safety valve ([`PENDING_ID_TTL_MS`]) removes it.
     pub(crate) fn is_pending_submission(&self, thread: &str, submission: &str) -> bool {
-        let now = now_ms();
         self.state
             .lock()
             .expect("authorship record")
             .pending
             .get(&self.client_id, thread)
-            .is_some_and(|pending| {
-                pending
-                    .iter()
-                    .any(|known| known.id == submission && is_live(known, now))
-            })
+            .is_some_and(|pending| pending.iter().any(|known| known.id == submission))
     }
 
     /// Whether a message in `thread`'s turn `turn` is cola's own.
@@ -452,7 +483,7 @@ impl Authorship {
                 state
                     .pending
                     .get(&self.client_id, thread)
-                    .is_some_and(|pending| pending.iter().any(|known| is_live(known, now)))
+                    .is_some_and(|pending| pending.iter().any(|known| is_fallback_live(known, now)))
                     || state.anonymous.get(thread).copied().unwrap_or(0) > 0
             }
         }
@@ -496,17 +527,26 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Whether a submission is still inside the thread-wide fallback's window.
-fn is_live(submission: &PendingSubmission, now: i64) -> bool {
-    now.saturating_sub(submission.at_ms) <= PENDING_TTL_MS
+/// Whether a submission is still inside the thread-wide (id-less) fallback's
+/// window.
+fn is_fallback_live(submission: &PendingSubmission, now: i64) -> bool {
+    now.saturating_sub(submission.at_ms) <= PENDING_FALLBACK_TTL_MS
 }
 
-/// Drop expired submissions for one thread, reporting whether anything was
-/// removed (the caller persists once).
+/// Whether a recorded submission is still worth keeping for a precise match:
+/// only the never-resolving safety valve removes it.
+fn still_recorded(submission: &PendingSubmission, now: i64) -> bool {
+    now.saturating_sub(submission.at_ms) <= PENDING_ID_TTL_MS
+}
+
+/// Drop submissions past the precise-id safety valve for one thread, reporting
+/// whether anything was removed (the caller persists once). The fallback window
+/// is applied as a filtered view, not a deletion: a recorded id must remain
+/// matchable long after the id-less fallback has stopped vouching.
 fn drop_expired(state: &mut State, client: &str, thread: &str, now: i64) -> bool {
     let changed = state.pending.get_mut(client, thread).is_some_and(|pending| {
         let before = pending.len();
-        pending.retain(|submission| is_live(submission, now));
+        pending.retain(|submission| still_recorded(submission, now));
         pending.len() != before
     });
     prune_pending(&mut state.pending, client, thread);
@@ -724,23 +764,105 @@ mod tests {
         assert!(!record.is_pending_submission("thread-1", "msg_cola_over_capacity"));
     }
 
-    /// Finding 3: a submission whose request never reached the server stops
-    /// vouching for the thread-wide fallback once its window elapses. The item
-    /// that does carry the chosen id remains precisely cola's (nothing else can
-    /// mint it), but a foreign live turn with no client id does not.
+    /// A submission whose request never reached the server stops vouching for
+    /// the thread-wide fallback once its window elapses, so a foreign live turn
+    /// with no client id is external. The **precise** id stays recorded: an item
+    /// that does carry it is still cola's, however late it surfaces.
     #[test]
     fn an_expired_marker_stops_vouching_for_a_live_turn() {
         let record = Authorship::in_memory();
         record
             .begin("thread-1", Some("msg_cola_never"))
             .expect("the marker is recorded");
-        std::thread::sleep(std::time::Duration::from_millis((PENDING_TTL_MS as u64) + 30));
+        std::thread::sleep(std::time::Duration::from_millis(
+            (PENDING_FALLBACK_TTL_MS as u64) + 30,
+        ));
         assert!(!record.is_pending("thread-1"), "the fallback expired");
         assert!(
-            !record.is_pending_submission("thread-1", "msg_cola_never"),
-            "the precise window expired too"
+            record.is_pending_submission("thread-1", "msg_cola_never"),
+            "the recorded id still matches precisely"
         );
         assert!(!record.is_authored("thread-1", None));
+    }
+
+    /// Finding 1: the recorded-id match outlives the id-less fallback window, so
+    /// a lost response that surfaces late still binds; only the id-less
+    /// fallback stops vouching for the thread's live turn.
+    #[test]
+    fn the_precise_marker_outlives_the_idless_fallback() {
+        let record = Authorship::in_memory();
+        record
+            .begin("thread-1", Some("msg_cola_slow"))
+            .expect("the marker is recorded");
+        std::thread::sleep(std::time::Duration::from_millis(
+            (PENDING_FALLBACK_TTL_MS as u64) + 30,
+        ));
+        assert!(!record.is_pending("thread-1"), "the thread-wide fallback expired");
+        assert!(
+            record.is_pending_submission("thread-1", "msg_cola_slow"),
+            "the recorded id is still a precise match"
+        );
+        assert!(
+            !record.is_authored("thread-1", None),
+            "the id-less fallback no longer vouches"
+        );
+    }
+
+    /// Only the never-resolving safety valve prunes a recorded id.
+    #[test]
+    fn the_precise_marker_is_pruned_only_by_the_safety_valve() {
+        let mut state = State::default();
+        let now = now_ms();
+        state
+            .pending
+            .entry_mut("codex", "thread-1")
+            .push(PendingSubmission {
+                id: "fresh".into(),
+                at_ms: now,
+            });
+        state
+            .pending
+            .entry_mut("codex", "thread-1")
+            .push(PendingSubmission {
+                id: "ancient".into(),
+                at_ms: now - PENDING_ID_TTL_MS - 1,
+            });
+        assert!(drop_expired(&mut state, "codex", "thread-1", now));
+        let pending = state
+            .pending
+            .get("codex", "thread-1")
+            .expect("the fresh submission stays");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "fresh");
+    }
+
+    /// Finding 2: a retry whose write fails restores the earlier marker — the
+    /// prompt is refused, but the submission that may already be in flight is
+    /// still owed.
+    #[test]
+    fn a_failed_retry_restores_the_earlier_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("authored_turns.json");
+        let record = Authorship::open(path.clone(), "codex").expect("the record opens");
+        record
+            .begin("thread-1", Some("msg_cola_retry"))
+            .expect("the first marker persists");
+        let blocked = path.with_extension("tmp");
+        std::fs::create_dir(&blocked).expect("block the temp path");
+
+        let error = record
+            .begin("thread-1", Some("msg_cola_retry"))
+            .expect_err("the retry's marker cannot be persisted");
+        assert!(error.contains("could not be persisted"), "{error}");
+        assert!(
+            record.is_pending_submission("thread-1", "msg_cola_retry"),
+            "the earlier submission's marker must survive the failed retry"
+        );
+        assert!(record.is_trusted());
+
+        std::fs::remove_dir(&blocked).expect("unblock");
+        record.bind("thread-1", "turn-1", Some("msg_cola_retry"));
+        assert!(record.is_authored("thread-1", Some("turn-1")));
     }
 
     #[test]
