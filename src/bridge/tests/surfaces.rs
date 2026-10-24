@@ -1153,3 +1153,169 @@ async fn restart_retries_a_withdrawal_whose_card_update_failed() {
         "no chat card duplicates the receipt on the withdrawn card"
     );
 }
+
+/// Whole-branch re-review #883: one withdrawal PATCH may not wedge the sweep.
+/// A hung Feishu call is bounded by the flow's timeout, the attempt counts as
+/// failed, the handle is kept, and the same sweep completes — otherwise a
+/// stalled PATCH would freeze the whole permission poller with an old Allow
+/// card still clickable.
+#[tokio::test]
+async fn a_hung_withdrawal_patch_does_not_wedge_the_sweep() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, _backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    app.permission
+        .withdrawal_timeout_ms
+        .store(50, std::sync::atomic::Ordering::SeqCst);
+    let (entered, release) = platform.pause("update", "om_card");
+
+    let sweep = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut seen = std::collections::HashSet::new();
+            app.permission.sweep(&app.flow_handles(), &mut seen).await;
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the withdrawal PATCH is in flight");
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+        .await
+        .expect("a hung PATCH must not wedge the sweep")
+        .expect("the sweep task joins");
+
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        1,
+        "the timed-out attempt is kept for the next sweep"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_some(),
+        "and its handle is retained"
+    );
+    release.notify_waiters();
+}
+
+/// Whole-branch re-review #883: a permanent message-gone failure (`230002`,
+/// inside a 2xx body) means nothing is clickable, so the entry and the handle
+/// are dropped instead of retried forever — and the next sweep does not try
+/// again.
+#[tokio::test]
+async fn a_message_gone_withdrawal_is_terminated_not_retried() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, _backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    platform
+        .fail_update_message_gone_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        0,
+        "a gone message has nothing left to retry"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_none(),
+        "the dead handle is dropped"
+    );
+    assert!(
+        !persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "and the persisted record is gone"
+    );
+
+    // A second sweep has nothing to deliver: exactly one PATCH attempt.
+    sweep(&app.permission, &app).await;
+    let updates = {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .filter(|call| matches!(call, PlatformCall::UpdateMessage { message_id, .. } if message_id == "om_card"))
+            .count()
+    };
+    assert_eq!(updates, 1, "the terminated entry is never retried");
+}
+
+/// Whole-branch re-review #883: the retry backlog is bounded. Persistently
+/// failing withdrawals cannot retain card payloads without limit; past the cap
+/// the new entry is dropped (the vanished-surface pass still neutralizes the
+/// card) and the map stops growing.
+#[tokio::test]
+async fn the_withdrawal_backlog_is_capped() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    const REQUESTS: usize = 40;
+    let mut requests = Vec::with_capacity(REQUESTS);
+    for index in 0..REQUESTS {
+        let request_id = format!("per_{index}");
+        seed_stale_surface(&session_file, &request_id, true, &format!("om_card_{index}"));
+        requests.push(over_budget_perm(&request_id, "ses_1"));
+    }
+
+    let (app, platform, _backend) = restart_app(&session_file, move |b| {
+        b.ask_permissions(requests);
+    })
+    .await;
+    platform
+        .fail_update_count
+        .store(REQUESTS * 2, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        32,
+        "the backlog holds the documented cap, not one entry per request"
+    );
+    // Every request still attempted its PATCH (the cap drops the payload, not
+    // the safety check).
+    let attempts = {
+        let calls = platform.calls.lock().await;
+        calls
+            .iter()
+            .filter(|call| matches!(call, PlatformCall::UpdateMessage { .. }))
+            .count()
+    };
+    assert!(
+        attempts >= REQUESTS,
+        "every withdrawal was attempted: {attempts} < {REQUESTS}"
+    );
+}
