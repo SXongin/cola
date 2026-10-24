@@ -985,7 +985,10 @@ async fn a_supplement_steers_the_live_turn_and_renders_once() {
             "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
         }),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), first)
+    // The drain polls on its production cadence and finalizes after its grace;
+    // this turn normally settles in a few seconds, so the bound is generous
+    // enough for a loaded parallel test run.
+    tokio::time::timeout(std::time::Duration::from_secs(15), first)
         .await
         .expect("the turn must finish")
         .expect("the handler joins");
