@@ -134,10 +134,16 @@ pub(crate) fn permission_block_estimate(
     // A button's own labels, action, reply, colour and JSON punctuation. CJK
     // labels cost three bytes a character, which is why this is generous.
     const BUTTON_OVERHEAD: usize = 360;
-    // Both copies (the element and every button's `perm_body`) carry the
-    // cleaned body; `perm_body` is the same text `build_permission_card`
-    // passes after cleaning.
-    let body = json_escaped_len(&CardMarkdown::new().element(body));
+    // The element is rendered either cleaned (normal) or fenced (the card's
+    // content-rejection fallback, which wraps the body in a fence sized to its
+    // longest backtick run — a 1,000-backtick command gains ~2 KB). Charge the
+    // larger of the two so neither path can outgrow the reserve.
+    let cleaned = json_escaped_len(&CardMarkdown::new().element(body));
+    let fenced = json_escaped_len(body) + crate::feishu::card::fenced_block_overhead(body);
+    let element = cleaned.max(fenced);
+    // The buttons echo `perm_body`: the cleaned body on a standalone card, the
+    // authored one on the streaming card. Neither is ever fenced.
+    let echo = cleaned.max(json_escaped_len(body));
     let routing = json_escaped_len(request_id) + json_escaped_len(session_id) + json_escaped_len(directory);
     let buttons = permission_button_count(always_supported);
     let note = if always_supported {
@@ -145,7 +151,7 @@ pub(crate) fn permission_block_estimate(
     } else {
         0
     };
-    body + buttons * (body + routing + BUTTON_OVERHEAD) + note
+    element + buttons * (echo + routing + BUTTON_OVERHEAD) + note
 }
 
 /// Compact one-line target for a question's Interaction Receipt: each
@@ -1387,21 +1393,71 @@ mod tests {
 
     /// Whole-branch re-review #883: the estimate must charge the **rendered**
     /// body. `CardMarkdown` expands `<` to `&#60;`, so a reason full of `<` is
-    /// five times its authored length; a raw-byte estimate would let the split
-    /// reserve 600 bytes too little per copy.
+    /// five times its authored length; charging the authored bytes leaves 600
+    /// bytes per copy unaccounted, which the rendered card disproves.
     #[test]
     fn an_angle_bracket_reason_is_charged_at_its_sanitized_size() {
-        let reason = "<".repeat(150);
-        let body = format!("**原因**: {reason}");
-        let buttons = permission_block_components(true) - 1;
-        let estimate = permission_block_estimate(&body, true, "n:1", "ses", "/d");
-        let raw = permission_block_estimate(&"".repeat(0), true, "n:1", "ses", "/d");
-        let sanitized = crate::feishu::card::sanitize::CardMarkdown::new().element(&body);
-        assert_eq!(sanitized.len(), body.len() - 150 + 150 * "&#60;".len());
+        let body = format!("**原因**: {}", "<".repeat(150));
+        let cleaned = crate::feishu::card::sanitize::CardMarkdown::new().element(&body);
         assert_eq!(
-            estimate - raw,
-            (1 + buttons) * json_escaped_len(&sanitized),
-            "the element and every button carry the cleaned body's bytes"
+            cleaned.len(),
+            body.len() - 150 + 150 * "&#60;".len(),
+            "the sanitizer expands every '<'"
+        );
+        let card = build_permission_card("ses", "n:1", &body, "/d", true);
+        let elements = card["body"]["elements"].as_array().expect("body elements");
+        let rendered: usize = elements.iter().map(|element| element.to_string().len()).sum();
+        let estimate = permission_block_estimate(&body, true, "n:1", "ses", "/d");
+        assert!(
+            estimate >= rendered,
+            "estimate {estimate} under the rendered block's {rendered} bytes"
+        );
+        // The authored bytes alone would have been 4 bytes short per '<' on
+        // every copy (the element plus each button).
+        assert!(
+            json_escaped_len(&cleaned) - json_escaped_len(&body) >= 600,
+            "the expansion the raw charge would miss"
+        );
+    }
+
+    /// Whole-branch re-review #883: the content-rejection fallback renders the
+    /// body inside a fence sized to its longest backtick run, so a
+    /// backtick-heavy command adds up to twice the run around the element. The
+    /// estimate must charge that fence, or a near-limit streaming card can
+    /// carry the tail past Feishu's limit.
+    #[test]
+    fn a_backtick_heavy_body_is_charged_with_its_fence() {
+        let body = format!(
+            "⚡ **执行 Shell 命令**\n**对象**:\n- `{}`\n",
+            "`".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+        );
+        let estimate = permission_block_estimate(&body, false, "n:1", "ses", "/d");
+        // What the fallback writes: the fenced element plus one echoed button.
+        let fenced = crate::feishu::card::fenced_code(&body, None);
+        let element = serde_json::json!({ "tag": "markdown", "content": fenced })
+            .to_string()
+            .len();
+        let echoed = serde_json::json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "✅ 允许一次" },
+            "value": {
+                "action": "perm",
+                "reply": "once",
+                "session_id": "ses",
+                "request_id": "n:1",
+                "directory": "/d",
+                "perm_label": "✅ 已允许一次",
+                "perm_color": "green",
+                "perm_body": body,
+            }
+        })
+        .to_string()
+        .len();
+        let buttons = permission_block_components(false) - 1;
+        assert!(
+            estimate >= element + buttons * echoed,
+            "estimate {estimate} under the fallback's {} bytes",
+            element + buttons * echoed
         );
     }
 
