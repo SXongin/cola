@@ -310,8 +310,15 @@ impl Projections {
                         };
                         projections.ingest_status(&params);
                     }
-                    Ok(Inbound::Closed) => return,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Ok(Inbound::Closed) | Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // The socket is gone: a cached run state can no longer
+                        // be trusted, so the next status read adopts (or fails)
+                        // instead of presenting a stale busy.
+                        if let Some(projections) = projections.upgrade() {
+                            projections.clear_statuses();
+                        }
+                        return;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             skipped,
