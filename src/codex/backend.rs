@@ -68,10 +68,18 @@ pub(crate) struct Projections {
     /// first adoption. Entries are weak, so a thread that is never adopted
     /// again costs no retained lock.
     adopting: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    /// One apply lock per thread: the subscriber's notification fold and every
+    /// paging resync take it, so a page that was read before an event cannot
+    /// replace the projection after that event was applied. Weak entries for
+    /// the same reason as `adopting`.
+    applying: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     /// The subscriber tasks this cache owns. Aborted when the last client
     /// holding the cache is dropped, so a replaced attachment stops folding
     /// into a cache nothing reads.
     subscribers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The adoption backlog drain limit. Zero means the production default;
+    /// tests lower it to exercise the truncation-and-retry path.
+    drain_limit: Mutex<usize>,
 }
 
 impl Drop for Projections {
@@ -100,16 +108,11 @@ enum SubscriptionState {
 
 impl Projections {
     fn adoption_lock(&self, thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.adopting.lock().expect("codex adoption locks");
-        // Drop entries whose owner finished, so the map tracks live adoptions
-        // rather than every thread ever polled.
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(thread_id).and_then(std::sync::Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        locks.insert(thread_id.to_string(), Arc::downgrade(&lock));
-        lock
+        shared_lock(&self.adopting, thread_id)
+    }
+
+    fn apply_lock(&self, thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        shared_lock(&self.applying, thread_id)
     }
 
     /// Whether this thread's run state has a live subscription AND a paged
@@ -216,6 +219,20 @@ impl Projections {
         self.adopting.lock().expect("codex adoption locks").len()
     }
 
+    fn drain_limit(&self) -> usize {
+        let configured = *self.drain_limit.lock().expect("codex drain limit");
+        if configured == 0 {
+            ADOPTION_DRAIN_LIMIT
+        } else {
+            configured
+        }
+    }
+
+    #[cfg(test)]
+    fn set_drain_limit(&self, limit: usize) {
+        *self.drain_limit.lock().expect("codex drain limit") = limit;
+    }
+
     fn state(&self, thread_id: &str) -> Option<SubscriptionState> {
         self.states
             .lock()
@@ -253,10 +270,31 @@ impl Projections {
     }
 }
 
+/// One lazily-created lock per key, held weakly so a finished generation does
+/// not accumulate. Callers upgrade the same lock while any holder is alive.
+fn shared_lock(
+    locks: &Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    key: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = locks.lock().expect("codex shared locks");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
 impl CodexClient {
     /// Retry a failed history page on the live subscription. The subscription
     /// is not re-adopted: this only pages `thread/turns/list` again.
     async fn retry_paging(&self, thread_id: &str) -> CodexResult<()> {
+        // The subscriber cannot apply an event while this page is read, so an
+        // event delivered after the page cannot be erased by the resync that
+        // follows it.
+        let apply = self.projections.apply_lock(thread_id);
+        let _guard = apply.lock().await;
         match self.threads().all_turns(thread_id).await {
             Ok(turns) => {
                 self.projections.resync(thread_id, &turns);
@@ -343,8 +381,9 @@ impl CodexClient {
                 let mut subscription = *subscription;
                 let mut drained = 0;
                 let mut backlog_truncated = false;
+                let mut subscription_dead = false;
                 loop {
-                    if drained >= ADOPTION_DRAIN_LIMIT {
+                    if drained >= self.projections.drain_limit() {
                         backlog_truncated = true;
                         break;
                     }
@@ -370,12 +409,28 @@ impl CodexClient {
                                 "the adoption backlog ended before it drained: {error}"
                             );
                             backlog_truncated = true;
+                            subscription_dead = true;
                             break;
                         }
                     }
                 }
-                if backlog_truncated {
+                if subscription_dead {
+                    // No live subscription is left to page through: forget the
+                    // state so the next read re-adopts rather than sitting in a
+                    // paging retry against a dead connection.
+                    self.projections.forget(thread_id);
+                } else if backlog_truncated {
+                    // A limit hit (or a lag) leaves the projection incomplete
+                    // with no later lag to schedule a resync. Enter the
+                    // paging-retry state so a later read recovers instead of
+                    // staying truncated forever.
                     self.projections.mark_incomplete(thread_id);
+                    self.projections.set_state(
+                        thread_id,
+                        SubscriptionState::PagingIncomplete {
+                            retry_at: Instant::now() + PAGING_RETRY,
+                        },
+                    );
                 }
                 let task = tokio::spawn(consume(
                     subscription,
@@ -412,6 +467,13 @@ async fn consume(
         let event = subscription.next_event().await;
         match event {
             Ok(ThreadEvent::Notification { method, params }) => {
+                let apply = {
+                    let Some(projections) = projections.upgrade() else {
+                        return;
+                    };
+                    projections.apply_lock(&thread_id)
+                };
+                let _guard = apply.lock().await;
                 let Some(projections) = projections.upgrade() else {
                     return;
                 };
@@ -455,6 +517,15 @@ async fn consume(
 /// each step rather than held across the network await: a replaced attachment
 /// can still drop the cache (and abort this task) while a request is in flight.
 async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, thread_id: &str) {
+    // Hold the apply lock across the page so a notification cannot apply
+    // between the read and the replace. Only the lock is held, never the cache.
+    let apply = {
+        let Some(projections) = projections.upgrade() else {
+            return;
+        };
+        projections.apply_lock(thread_id)
+    };
+    let _guard = apply.lock().await;
     if let Some(projections) = projections.upgrade() {
         projections.mark_incomplete(thread_id);
     }
@@ -1303,6 +1374,137 @@ mod tests {
             server.turns_calls() >= 2,
             "the repeat is only detected after a second page"
         );
+    }
+
+    /// A paging retry must not erase an event the subscriber applied while the
+    /// page was in flight: paging and application share one serialisation.
+    #[tokio::test]
+    async fn an_event_during_a_paging_retry_survives_the_resync() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        thread.turns_page_delay_ms = 150;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        server.fail_turns_pages(1);
+
+        let first = client.transcript("thread-1").await.expect("first read");
+        assert!(first.truncated, "the failed page is stated");
+
+        tokio::time::sleep(PAGING_RETRY + Duration::from_millis(20)).await;
+        let retry = tokio::spawn({
+            let client = client.clone();
+            async move { client.transcript("thread-1").await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.turns_calls() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the paging retry never reached the server"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Lands after the retry's page was read but before its resync applies.
+        server.push_to_thread(
+            "thread-1",
+            "item/completed",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "completedAtMs": 1_700_000_002_000_i64,
+                "item": { "type": "agentMessage", "id": "item-late", "text": "late event" }
+            }),
+        );
+
+        retry.await.expect("retry joined").expect("the retried read");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let transcript = client.transcript("thread-1").await.expect("settled read");
+            if transcript
+                .messages
+                .iter()
+                .any(|message| message.id.as_str() == "item-late" && message.text() == "late event")
+            {
+                assert!(!transcript.truncated, "the retry completed");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "an event applied during the retry was erased by its resync"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A drain that reaches its limit must schedule a paging retry rather than
+    /// leaving the transcript truncated forever with no lag marker.
+    #[tokio::test]
+    async fn a_limited_drain_recovers_on_the_next_read() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        thread.turns_page_delay_ms = 150;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        client.projections.set_drain_limit(1);
+
+        let adoption = tokio::spawn({
+            let client = client.clone();
+            async move { client.transcript("thread-1").await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.turns_calls() < 1 {
+            assert!(tokio::time::Instant::now() < deadline, "adoption never paged");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for id in ["item-flood-a", "item-flood-b"] {
+            server.push_to_thread(
+                "thread-1",
+                "item/completed",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_003_000_i64,
+                    "item": { "type": "agentMessage", "id": id, "text": id }
+                }),
+            );
+        }
+        let first = adoption.await.expect("adoption joined").expect("first read");
+        assert!(first.truncated, "the drain limit leaves the first read truncated");
+
+        tokio::time::sleep(PAGING_RETRY + Duration::from_millis(20)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let transcript = client.transcript("thread-1").await.expect("retried read");
+            if !transcript.truncated {
+                assert!(
+                    transcript
+                        .messages
+                        .iter()
+                        .any(|message| message.id.as_str() == "item-1"),
+                    "the retry recovered the paged history"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a limited drain must schedule a paging retry"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// An in-progress historical turn is not authoritative: a statusless tool

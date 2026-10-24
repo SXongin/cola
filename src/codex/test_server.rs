@@ -208,6 +208,10 @@ pub(crate) struct ScriptedThread {
     /// Return a repeating `nextCursor` from `thread/turns/list`, so the client
     /// must refuse to loop and keep the projection incomplete.
     pub(crate) repeat_turns_cursor: bool,
+    /// Delay a successful `thread/turns/list` reply without blocking the
+    /// connection's push delivery, so a test can inject events while adoption
+    /// is paging.
+    pub(crate) turns_page_delay_ms: u64,
 }
 
 impl ScriptedThread {
@@ -228,6 +232,7 @@ impl ScriptedThread {
             read_turn_limit: None,
             malformed_turns_page: false,
             repeat_turns_cursor: false,
+            turns_page_delay_ms: 0,
         }
     }
 
@@ -758,16 +763,27 @@ where
             } else {
                 (end < thread.turns.len()).then(|| json!(end.to_string()))
             };
-            replying(
-                sink,
-                id,
-                json!({
-                    "data": thread.turns[offset..end],
-                    "nextCursor": next,
-                    "backwardsCursor": null,
-                }),
-            )
-            .await
+            let result = json!({
+                "data": thread.turns[offset..end],
+                "nextCursor": next,
+                "backwardsCursor": null,
+            });
+            if thread.turns_page_delay_ms == 0 {
+                return replying(sink, id, result).await;
+            }
+            // Reply from a spawned task so the serve loop keeps forwarding
+            // pushed notifications while the page is "in flight".
+            let outgoing = outgoing.clone();
+            let delay = thread.turns_page_delay_ms;
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                let _ = outgoing.send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                        .to_string()
+                        .into(),
+                ));
+            });
+            true
         }
         Some("test/malformed") => {
             // A broken peer: a text frame that is not JSON. The client must
