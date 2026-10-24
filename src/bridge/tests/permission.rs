@@ -2135,3 +2135,87 @@ async fn sweep_lists_once_per_directory_not_per_session() {
         "one form list per directory, not one per session"
     );
 }
+
+/// Whole-branch re-review #883: the completeness proof runs on the bridge, not
+/// in an adapter, so an **OpenCode** permission whose command is longer than the
+/// card can show is never offered for approval. The request is rejected on the
+/// server (freeing the turn) and the chat gets the named reason; no surface
+/// carries the clipped command with Allow buttons.
+#[tokio::test]
+async fn an_over_budget_permission_is_declined_and_never_offered() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let command = format!(
+        "echo {}",
+        "x".repeat(crate::backend::types::PERMISSION_COMMAND_MAX_CHARS)
+    );
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_long".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec![command.clone()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let replies = std::sync::Arc::clone(&backend.reply_permission_calls);
+    let (app, platform) = build_app(cfg, backend).await;
+
+    // Seed a session + accumulator so the poller has a reply target.
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.permission
+                .poll_interval_ms
+                .store(20, std::sync::atomic::Ordering::Relaxed);
+            let _ = app.permission.poll_loop(&app.flow_handles()).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while replies.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the unshowable permission was never declined"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        replies.lock().await.as_slice(),
+        &[("per_long".to_string(), "reject".to_string())],
+        "the server gets the refusal, not a stalled turn"
+    );
+
+    // No permission block, no Allow buttons, and no card carrying the raw
+    // command: the decision was never offered.
+    assert!(
+        Turn::live_permissions(&app.cards_handle(), "ses_test")
+            .await
+            .is_empty(),
+        "an unshowable permission must never become an inline block"
+    );
+    let mut cards = platform.sent_cards().await;
+    cards.extend(platform.replied_cards().await);
+    assert!(
+        cards
+            .iter()
+            .any(|card| card_text(card).contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_HEADER)),
+        "the chat gets the reason card"
+    );
+    assert!(
+        cards.iter().all(|card| !card_text(card).contains(&command)),
+        "the clipped target is never rendered as an approval"
+    );
+}

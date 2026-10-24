@@ -531,8 +531,10 @@ pub const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
 /// the card tests that pin the rendered card inside
 /// [`crate::feishu::card::MAX_CARD_JSON_CHARS`].
 ///
-/// An adapter that cannot show a command within it must **refuse** the request
-/// by name rather than offer a card that hides part of what it approves.
+/// A request must never be offered for approval unless every target fits:
+/// [`PermissionRequest::targets_are_fully_shown`] is the proof, and the
+/// permission flow declines what fails it with a named reason card rather than
+/// showing part of what a button would approve.
 pub const PERMISSION_COMMAND_MAX_CHARS: usize = 1000;
 
 /// Whether `action` names a shell command, i.e. a target whose text IS the
@@ -547,9 +549,10 @@ pub fn is_command_action(action: &str) -> bool {
 /// where the target is a command ([`is_command_action`]), the pattern budget
 /// everywhere else.
 ///
-/// One definition, shared by the renderer (which clips) and by an adapter's
-/// completeness proof (which refuses what the renderer would clip), so the two
-/// can never disagree about what "shown in full" means.
+/// One definition, shared by the renderer (which clips) and by the permission
+/// flow's completeness proof (`PermissionRequest::targets_are_fully_shown`,
+/// which refuses what the renderer would clip), so the two can never disagree
+/// about what "shown in full" means.
 pub fn permission_target_budget(action: &str) -> usize {
     if is_command_action(action) {
         PERMISSION_COMMAND_MAX_CHARS
@@ -584,6 +587,31 @@ pub struct PermissionRequest {
 
 fn always_supported_default() -> bool {
     true
+}
+
+impl PermissionRequest {
+    /// The character budget every target of this request is rendered at: the
+    /// command budget for a command target, the short pattern budget otherwise
+    /// (see [`permission_target_budget`]).
+    pub fn target_budget(&self) -> usize {
+        permission_target_budget(self.permission.as_deref().unwrap_or_default())
+    }
+
+    /// Whether the card renders **every** target in full at
+    /// [`Self::target_budget`].
+    ///
+    /// `false` means the card would have to clip one, so the request must never
+    /// be offered for approval: the buttons approve what the card shows, and a
+    /// clipped command would approve a suffix the user never saw. Every client
+    /// is covered here rather than in its adapter — the card is the shared
+    /// decision surface, so the completeness proof belongs to the same layer as
+    /// the renderer that clips.
+    pub fn targets_are_fully_shown(&self) -> bool {
+        let budget = self.target_budget();
+        self.patterns
+            .iter()
+            .all(|pattern| pattern.chars().count() <= budget)
+    }
 }
 
 #[cfg(test)]

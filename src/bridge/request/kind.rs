@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::bridge::handler::CardActionResult;
 use crate::bridge::handles::{CardsHandle, FlowHandles, RequestsHandle, SessionsHandle};
-use crate::bridge::pollers::result_card;
+use crate::bridge::pollers::{CardTarget, resolve_card_target, result_card};
 use crate::bridge::question::{MultiOutcome, action_toast, qa_completion_body, question_replay_card};
 use crate::bridge::snapshot_claims::ClaimKind;
 use crate::bridge::turn::Turn;
@@ -312,6 +312,17 @@ impl RequestKind for PermissionKind {
         // sessions up their parent chain so they inherit the parent's flag.
         let auto = should_auto_accept(&handles.sessions, &handles.backend, &sid, dir).await;
         if !auto {
+            // The card is the decision surface, and its buttons approve what it
+            // shows. A target the card would have to clip must therefore never
+            // be offered: decline it on the server and say why in the chat, so
+            // the turn is freed and the user is never asked to approve a suffix
+            // they cannot see. This lives here, on the neutral kind, rather than
+            // in an adapter, so every client (OpenCode V1/V2, Codex) is covered
+            // by the same proof (whole-branch re-review #883).
+            if !p.targets_are_fully_shown() {
+                decline_unshowable(handles, p, &sid, dir).await;
+                return true;
+            }
             return false;
         }
         match handles
@@ -625,6 +636,74 @@ pub(crate) async fn set_auto_accept(
         tracing::warn!("set_auto_accept: persist failed: {}", e);
     }
     approved
+}
+
+/// Decline a permission whose target the card cannot render in full, then post
+/// the reason.
+///
+/// The server answer comes first: the turn is blocked on the decision, and the
+/// notice card is only the explanation. Both the refusal and the copy are
+/// neutral — the card table owns the wording, so no adapter writes UI copy and
+/// every client gets the same behaviour.
+async fn decline_unshowable(
+    handles: &FlowHandles,
+    p: &crate::backend::types::PermissionRequest,
+    session_id: &str,
+    directory: &str,
+) {
+    let budget = p.target_budget();
+    let longest = p
+        .patterns
+        .iter()
+        .map(|pattern| pattern.chars().count())
+        .max()
+        .unwrap_or(0);
+    match handles
+        .backend
+        .clone()
+        .for_directory(directory)
+        .reply_permission(session_id, &p.request_id, "reject")
+        .await
+    {
+        Ok(()) => tracing::warn!(
+            "declined permission {} on session {}: its target is {longest} characters, past the \
+             card's {budget} character budget",
+            p.request_id,
+            session_id
+        ),
+        Err(e) => tracing::warn!(
+            "declining unshowable permission {} on session {} failed: {e}; the card is still not \
+             offered",
+            p.request_id,
+            session_id
+        ),
+    }
+    let card = crate::feishu::card::question::build_unshowable_permission_card(budget);
+    match resolve_card_target(
+        &handles.sessions,
+        &handles.cards,
+        &handles.backend,
+        &handles.platform,
+        session_id,
+        directory,
+    )
+    .await
+    {
+        Some(CardTarget::ReplyTo(message_id)) => {
+            if let Err(e) = handles.platform.reply_card(&message_id, &card).await {
+                tracing::warn!("unshowable permission notice reply failed: {e}");
+            }
+        }
+        Some(CardTarget::Chat(chat_id)) => {
+            if let Err(e) = handles.platform.send_card("chat_id", &chat_id, &card).await {
+                tracing::warn!("unshowable permission notice send failed: {e}");
+            }
+        }
+        None => tracing::warn!(
+            "unshowable permission {} on session {session_id}: no reply target for the notice",
+            p.request_id
+        ),
+    }
 }
 
 /// After `/autoaccept on`: answer every permission request that is ALREADY
@@ -1579,9 +1658,10 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
         s.push_str("**对象**:\n");
         // A command's target IS the command, so it gets the wider command
         // budget; every other pattern is a path/grant name and keeps the short
-        // one. An adapter proves its targets fit before offering the card, so
-        // a clip here means "shown in full up to the shared budget", never a
-        // decision the user did not see (see `permission_target_budget`).
+        // one. The permission flow proves its targets fit before offering the
+        // card (`PermissionRequest::targets_are_fully_shown`), so a clip here is
+        // only reachable on a surface that bypasses that proof — never on a
+        // button a user can approve (see `permission_target_budget`).
         let budget = crate::backend::permission_target_budget(action);
         for r in &p.patterns {
             s.push_str(&format!("- `{}`\n", truncate(r, budget)));
