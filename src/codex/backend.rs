@@ -577,13 +577,10 @@ impl CodexClient {
     /// on the read the bridge is about to make, before it asks authorship.
     fn reconcile_submissions(&self, thread_id: &str, transcript: &SessionTranscript) {
         for (submission, message) in &transcript.submissions {
-            // A pending marker names a submission of ours, and so does cola's
-            // own id convention: the bridge mints every `msg_cola_…` id, so an
-            // item the server echoed one for is cola's even after the marker's
-            // window (a slow item must still bind).
-            if !self.authored.is_pending_submission(thread_id, submission)
-                && !crate::backend::parsing::is_cola_message_id(submission)
-            {
+            // Only an id this record actually saw may vouch. A peer chooses its
+            // own `clientUserMessageId`, so the id's shape proves nothing: an
+            // unfamiliar id — however it is spelled — is somebody else's.
+            if !self.authored.is_pending_submission(thread_id, submission) {
                 continue;
             }
             let Some((owner, turn)) = self.projections.turn_of_item(message.as_str()) else {
@@ -964,20 +961,29 @@ impl SkillCatalog {
         }
     }
 
-    /// Resolve `name` for a prompt. The session's own directory is the first
-    /// answer; without it (or when that scope no longer carries the name), the
-    /// name is used only when every remaining scope agrees on one path.
+    /// Resolve `name` for the session's own directory, and only there. A skill
+    /// advertised for another project must never be substituted: the paths and
+    /// the skill itself may differ, and the prompt would silently use the wrong
+    /// one. A thread whose `cwd` is unknown resolves nothing — the adapter
+    /// reads the thread before a skill prompt rather than guessing.
     fn path_of(&self, name: &str, directory: Option<&str>) -> Option<String> {
-        let scopes = self.scopes.lock().expect("codex skill catalog");
-        if let Some(directory) = directory
-            && let Some(path) = scopes.get(directory).and_then(|scope| scope.get(name))
-        {
-            return Some(path.clone());
-        }
-        let mut candidates = scopes.values().filter_map(|scope| scope.get(name));
-        let first = candidates.next()?.clone();
-        candidates.all(|path| *path == first).then_some(first)
+        let directory = directory?;
+        self.scopes
+            .lock()
+            .expect("codex skill catalog")
+            .get(&scope_key(Some(directory)))
+            .and_then(|scope| scope.get(name))
+            .cloned()
     }
+}
+
+/// The catalog's key for a directory: trailing separators removed, so a
+/// configured `/work/cola` and a server `cwd` of `/work/cola/` meet.
+fn scope_key(directory: Option<&str>) -> String {
+    directory
+        .unwrap_or_default()
+        .trim_end_matches(['/', '\\'])
+        .to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1177,6 +1183,20 @@ impl Backend for CodexClient {
                 client: "codex",
                 detail: "prompt attachments are not mapped onto this adapter yet".to_string(),
             });
+        }
+        // A skill resolves in the session's own directory only, and the prompt
+        // axis carries no directory: learn the thread's `cwd` from the server
+        // when this client has not seen it yet (a fresh restart can prompt
+        // before its first read). A failed read leaves the directory unknown,
+        // and a skill is then refused rather than taken from another project.
+        if !skills.is_empty() && self.projections.cwd(session_id).is_none() {
+            match self.threads().read(session_id, false).await {
+                Ok(thread) => self.projections.set_cwd(&thread.id, &thread.cwd),
+                Err(error) => tracing::warn!(
+                    thread = %session_id,
+                    "could not read the thread's cwd before a skill prompt: {error}"
+                ),
+            }
         }
         // `turn/start` is the write half of this ticket's read model; a failed
         // submit is its own error, while the Turn's outcome is observed from
@@ -3613,20 +3633,24 @@ mod tests {
         );
         assert!(
             client.skills.path_of("caveman", None).is_none(),
-            "two distinct paths are ambiguous without a directory"
+            "without a directory no skill resolves, however many scopes agree"
         );
 
-        // The session's own skill vanishes: the remaining scope is the only
-        // answer, and once that is gone too the name is refused.
+        // The session's own skill vanishes: the other project's skill is NOT a
+        // substitute, even as the only remaining scope.
         server.set_skills(Vec::new());
         assert!(
             client.list_skills(Some("/work/cola")).await.is_empty(),
             "the vanished scope is replaced"
         );
+        assert!(
+            client.skills.path_of("caveman", Some("/work/cola")).is_none(),
+            "another directory's skill is never substituted"
+        );
         assert_eq!(
-            client.skills.path_of("caveman", Some("/work/cola")).as_deref(),
+            client.skills.path_of("caveman", Some("/work/other")).as_deref(),
             Some("/work/other/.codex/skills/caveman/SKILL.md"),
-            "the one remaining scope is unambiguous"
+            "the other directory still resolves its own"
         );
         assert!(client.list_skills(Some("/work/other")).await.is_empty());
         assert!(
@@ -3724,7 +3748,7 @@ mod tests {
             .begin("thread-1", Some("msg_cola_never"))
             .expect("the marker is recorded");
         tokio::time::sleep(Duration::from_millis(
-            (crate::codex::authorship::PENDING_TTL_MS as u64) + 30,
+            (crate::codex::authorship::PENDING_FALLBACK_TTL_MS as u64) + 30,
         ))
         .await;
         assert!(!client.authored.is_pending("thread-1"), "the window expired");
@@ -3876,6 +3900,114 @@ mod tests {
         assert!(
             server.interrupt_params().is_empty(),
             "the idle thread had nothing to interrupt"
+        );
+    }
+
+    /// Finding 1: a peer chooses its own `clientUserMessageId`, so the id's
+    /// spelling proves nothing. Only an id this record saw may vouch — an
+    /// unfamiliar id claiming cola's prefix is somebody else's turn.
+    #[tokio::test]
+    async fn a_foreign_client_id_claiming_colas_prefix_is_external() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-forged", "status": "inProgress", "startedAt": 5 } }),
+            ),
+            (
+                "item/started",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-forged",
+                    "startedAtMs": 5_000_i64,
+                    "item": {
+                        "type": "userMessage",
+                        "id": "item-forged",
+                        "clientId": "msg_cola_forged",
+                        "content": [{ "type": "text", "text": "a peer claiming cola's id", "textElements": [] }],
+                    },
+                }),
+            ),
+            (
+                "turn/completed",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-forged", "status": "completed", "startedAt": 5, "completedAt": 6 } }),
+            ),
+        ] {
+            server.push_to_thread("thread-1", method, params);
+        }
+        let transcript = wait_for_text(&client, "thread-1", "a peer claiming cola's id").await;
+        assert!(
+            transcript
+                .messages
+                .iter()
+                .any(|message| message.id.as_str() == "item-forged"),
+            "the read sees the peer's turn"
+        );
+        assert!(
+            !client.is_cola_authored("item-forged").await,
+            "an id the record never saw is never inferred from its spelling"
+        );
+        assert!(
+            !client.authored.is_authored("thread-1", Some("turn-forged")),
+            "the read must not bind a foreign turn as cola's"
+        );
+    }
+
+    /// Finding 3: a skill that exists only in another project is refused, not
+    /// silently taken from that directory.
+    #[tokio::test]
+    async fn a_skill_only_in_another_directory_is_refused() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.set_skills(vec![json!({
+            "name": "caveman",
+            "description": "Brief mode",
+            "path": "/work/other/.codex/skills/caveman/SKILL.md",
+            "scope": "repo",
+            "enabled": true,
+            "pluginId": null,
+        })]);
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("subscribe");
+        // Only the other project's directory was read.
+        client.list_skills(Some("/work/other")).await;
+
+        let error = client
+            .prompt(
+                "thread-1",
+                "be brief",
+                &[],
+                &[PromptSkill {
+                    id: "caveman".into(),
+                    name: "caveman".into(),
+                }],
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("another project's skill is not substituted");
+        assert!(error.to_string().contains("caveman"), "{error}");
+        assert_eq!(
+            server.turn_starts(),
+            0,
+            "the refused skill never reached the server"
         );
     }
 
