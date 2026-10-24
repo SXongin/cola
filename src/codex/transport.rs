@@ -117,6 +117,11 @@ impl Endpoint {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Inbound {
     Notification {
+        /// The order this connection received the notification, assigned in
+        /// the reader loop. Two independent consumers (the thread dispatcher
+        /// and the status watcher) need one receipt order to resolve a stale
+        /// event against a later history page.
+        seq: u64,
         method: String,
         params: Value,
     },
@@ -189,6 +194,10 @@ struct ConnectionInner {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, Pending>>,
     inbound: broadcast::Sender<Inbound>,
+    /// The receipt order of inbound notifications. Assigned in the reader loop
+    /// (before fan-out), so every consumer sees one order even when two tasks
+    /// process the same broadcast at different speeds.
+    inbound_seq: AtomicU64,
     /// Set by whichever task first sees the end. A request that arrives after
     /// this fails immediately instead of waiting on a response that cannot
     /// come.
@@ -291,6 +300,7 @@ impl RpcConnection {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             inbound,
+            inbound_seq: AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             closing,
             tasks: Mutex::new(Vec::new()),
@@ -371,6 +381,14 @@ impl RpcConnection {
         self.inner.inbound.subscribe()
     }
 
+    /// The receipt sequence of the newest inbound notification fanned out by
+    /// this connection. A history page read now reflects every status received
+    /// at or below this value, so a status carrying it or an older one is
+    /// stale against the page.
+    pub(crate) fn inbound_seq(&self) -> u64 {
+        self.inner.inbound_seq.load(Ordering::SeqCst)
+    }
+
     fn closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
     }
@@ -388,6 +406,7 @@ impl RpcConnection {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             inbound,
+            inbound_seq: AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             closing,
             tasks: Mutex::new(Vec::new()),
@@ -538,7 +557,9 @@ fn dispatch(inner: &Arc<ConnectionInner>, value: Value) {
         }
         (Some(method), None) => {
             let params = value.get("params").cloned().unwrap_or(Value::Null);
+            let seq = inner.inbound_seq.fetch_add(1, Ordering::SeqCst) + 1;
             let _ = inner.inbound.send(Inbound::Notification {
+                seq,
                 method: method.to_string(),
                 params,
             });
@@ -698,7 +719,7 @@ mod tests {
             .expect("the racing notification is not lost")
             .expect("inbound stays open");
         match event {
-            Inbound::Notification { method, params } => {
+            Inbound::Notification { method, params, .. } => {
                 assert_eq!(method, "remoteControl/status/changed");
                 assert_eq!(params["status"], "disabled");
             }
@@ -884,7 +905,7 @@ mod tests {
             .expect("a pushed notification arrives")
             .expect("inbound stays open");
         match event {
-            Inbound::Notification { method, params } => {
+            Inbound::Notification { method, params, .. } => {
                 assert_eq!(method, "thread/status/changed");
                 assert_eq!(params["threadId"], "thread-1");
             }

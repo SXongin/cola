@@ -113,6 +113,16 @@ pub(crate) struct ThreadProjection {
     /// a turn boundary folded from the subscription. `None` means no status
     /// has been observed, so the read falls back to [`Self::is_live`].
     status: Option<ThreadStatus>,
+    /// The receipt sequence of the event [`Self::status`] came from. The status
+    /// watcher and the thread subscriber are different tasks, so one order
+    /// (assigned in the connection's reader loop) decides which status is
+    /// newer; a history page records its own boundary here so a status it
+    /// supersedes can never write after it.
+    status_seq: u64,
+    /// The sequence a direct [`Self::apply`] feed (tests and replays) assigns to
+    /// its own events when no connection receipt exists.
+    #[cfg(test)]
+    feed_seq: u64,
     /// Set when a subscription gap means the projection may be missing events;
     /// cleared only by a successful `thread/read` resync.
     incomplete: bool,
@@ -146,9 +156,42 @@ impl ThreadProjection {
         self.status
     }
 
-    /// Record a `thread/status/changed` broadcast for this thread.
+    /// Record a `thread/status/changed` broadcast for this thread from a
+    /// direct feed (tests): it takes the next local sequence.
+    #[cfg(test)]
     pub(crate) fn set_observed_status(&mut self, status: Option<ThreadStatus>) {
-        self.status = status;
+        self.feed_seq += 1;
+        let seq = self.feed_seq;
+        self.set_observed_status_at(status, seq);
+    }
+
+    /// Record a `thread/status/changed` broadcast received at `seq`. A status
+    /// older than the one already recorded is stale (the watcher and the
+    /// subscriber process the same boundary out of order) and is dropped.
+    pub(crate) fn set_observed_status_at(&mut self, status: Option<ThreadStatus>, seq: u64) {
+        if seq > self.status_seq {
+            self.status = status;
+            self.status_seq = seq;
+        }
+    }
+
+    /// Forget the cached status at `seq` — a closed or lagged connection can no
+    /// longer vouch for it. A status queued at or below the boundary is stale
+    /// too, hence the inclusive comparison.
+    pub(crate) fn clear_observed_status_at(&mut self, seq: u64) {
+        if seq >= self.status_seq {
+            self.status = None;
+            self.status_seq = seq;
+        }
+    }
+
+    /// Record a status derived from a received event, provided it is newer than
+    /// the one already recorded.
+    fn set_status(&mut self, status: ThreadStatus, seq: u64) {
+        if seq > self.status_seq {
+            self.status = Some(status);
+            self.status_seq = seq;
+        }
     }
 
     /// Mark the projection as having missed events. The subscriber then
@@ -159,12 +202,23 @@ impl ThreadProjection {
     }
 
     /// Fold one notification into the projection. Returns whether the method
-    /// was one this read model understands.
+    /// was one this read model understands. A direct feed (tests, a replay)
+    /// assigns its own monotonically increasing sequence; the live path uses
+    /// [`Self::apply_at`] with the connection's receipt order.
+    #[cfg(test)]
+    pub(crate) fn apply(&mut self, method: &str, params: &Value) -> bool {
+        self.feed_seq += 1;
+        let seq = self.feed_seq;
+        self.apply_at(seq, method, params)
+    }
+
+    /// Fold one notification received at `seq` into the projection. Returns
+    /// whether the method was one this read model understands.
     ///
     /// A decode failure marks the projection incomplete instead of silently
     /// losing the event: a changed payload shape is visible on the read, never
     /// guessed around.
-    pub(crate) fn apply(&mut self, method: &str, params: &Value) -> bool {
+    pub(crate) fn apply_at(&mut self, seq: u64, method: &str, params: &Value) -> bool {
         if let Some(thread_id) = params.get("threadId").and_then(Value::as_str)
             && thread_id != self.thread_id
         {
@@ -173,8 +227,8 @@ impl ThreadProjection {
             return false;
         }
         match method {
-            TURN_STARTED => self.decode(params, |this, n: TurnNotification| this.turn_started(n)),
-            TURN_COMPLETED => self.decode(params, |this, n: TurnNotification| this.turn_completed(n)),
+            TURN_STARTED => self.decode(params, |this, n: TurnNotification| this.turn_started(n, seq)),
+            TURN_COMPLETED => self.decode(params, |this, n: TurnNotification| this.turn_completed(n, seq)),
             ITEM_STARTED => self.decode(params, |this, n: ItemStarted| this.item_started(n)),
             ITEM_COMPLETED => self.decode(params, |this, n: ItemCompleted| this.item_completed(n)),
             AGENT_DELTA => self.decode(params, |this, n: Delta| this.agent_delta(n)),
@@ -191,7 +245,7 @@ impl ThreadProjection {
             PLAN_DELTA => self.decode(params, |this, n: Delta| this.plan_delta(n)),
             TURN_DIFF_UPDATED => self.decode(params, |this, n: TurnDiffUpdated| this.turn_diff(n)),
             TOKEN_USAGE_UPDATED => self.decode(params, |this, n: TokenUsageUpdated| this.token_usage(n)),
-            ERROR_NOTIFICATION => self.decode(params, |this, n: ErrorNotification| this.turn_error(n)),
+            ERROR_NOTIFICATION => self.decode(params, |this, n: ErrorNotification| this.turn_error(n, seq)),
             _ => false,
         }
     }
@@ -220,7 +274,7 @@ impl ThreadProjection {
     /// Rebuild the item and turn projection from persisted `thread/read` turns
     /// (the `Lagged` recovery path). Diff and token-usage facts survive: they
     /// are per-turn notifications that history does not carry.
-    pub(crate) fn resync(&mut self, turns: &[Value]) {
+    pub(crate) fn resync(&mut self, turns: &[Value], boundary_seq: u64) {
         let previous: HashMap<String, Item> =
             self.items.drain(..).map(|item| (item.id.clone(), item)).collect();
         self.index.clear();
@@ -233,21 +287,26 @@ impl ThreadProjection {
         for item in &mut self.items {
             item.set_pending_from(previous.get(&item.id));
         }
-        // The replayed history is the authority on the turns it carries: a live
-        // turn outranks a stale `idle` set before the gap, and with no live turn
-        // a cached `active` can only be the ending the gap dropped.
-        self.status = match (self.live_turn.is_some(), self.status) {
-            (true, _) => Some(ThreadStatus::Active),
-            (false, Some(ThreadStatus::Active)) => Some(ThreadStatus::Idle),
-            (false, status) => status,
-        };
+        // The replayed history is the authority on the turns it carries, at the
+        // boundary of what this connection had received when it asked for the
+        // page: a live turn is active, and no live turn proves a cached active
+        // was the ending the gap dropped. A status received after the boundary
+        // has a higher sequence and still applies.
+        if boundary_seq >= self.status_seq {
+            self.status_seq = boundary_seq;
+            if self.live_turn.is_some() {
+                self.status = Some(ThreadStatus::Active);
+            } else if self.status == Some(ThreadStatus::Active) {
+                self.status = Some(ThreadStatus::Idle);
+            }
+        }
         self.incomplete = false;
     }
 
     /// Seed a fresh projection from `thread/resume`'s turn history. Unlike
     /// [`Self::resync`], this never clears existing items: it runs before the
     /// subscriber's first event on a fresh projection.
-    pub(crate) fn seed(&mut self, turns: &[Value]) {
+    pub(crate) fn seed(&mut self, turns: &[Value], boundary_seq: u64) {
         let previous: std::collections::HashSet<String> =
             self.items.iter().map(|item| item.id.clone()).collect();
         for turn in turns {
@@ -258,6 +317,16 @@ impl ThreadProjection {
         for item in &mut self.items {
             if !previous.contains(&item.id) {
                 item.set_pending_from(None);
+            }
+        }
+        // The page proves a live turn it carries; it cannot prove absence (the
+        // resume page is bounded), so no live turn here clears nothing. The
+        // boundary still advances, so a status received before this page can
+        // never overwrite it once its watcher resumes.
+        if boundary_seq >= self.status_seq {
+            self.status_seq = boundary_seq;
+            if self.live_turn.is_some() {
+                self.status = Some(ThreadStatus::Active);
             }
         }
     }
@@ -382,6 +451,57 @@ impl ThreadProjection {
             }
         }
 
+        // A turn that failed before producing any assistant item still owes its
+        // failure to the neutral read: the card reads a turn's error from its
+        // newest assistant message, so without one the error would vanish and
+        // the card would settle with no text. The message is synthetic but
+        // stable (the server's turn id, never a fabricated item id), and it is
+        // regenerated identically on every read, so the Rendered Cursor cannot
+        // see a duplicate. It carries no display content — only the failure and
+        // the terminal step finish that ends the turn.
+        let assistant_turns: std::collections::HashSet<&str> = self
+            .items
+            .iter()
+            .filter(|item| item.is_assistant())
+            .map(|item| item.turn_id.as_str())
+            .collect();
+        for turn_id in &self.turn_order {
+            let Some(turn) = self.turns.get(turn_id) else {
+                continue;
+            };
+            let Some(error) = turn.error.as_ref() else {
+                continue;
+            };
+            if assistant_turns.contains(turn_id.as_str()) {
+                continue;
+            }
+            // Place the failure at the turn's own start (the user message's
+            // server time when it has one), so it belongs to the turn's window
+            // even when `turn/started` carried no clock.
+            let created = self
+                .items
+                .iter()
+                .find(|item| item.turn_id == *turn_id && matches!(item.kind, ItemKind::UserMessage { .. }))
+                .and_then(|item| item.started_at_ms)
+                .or(turn.started_ms)
+                .or(turn.completed_ms)
+                .unwrap_or(0);
+            messages.push(TranscriptMessage {
+                id: MessageId::new(format!("cola:turn-error:{turn_id}")),
+                role: MessageRole::Assistant,
+                time: Some(MessageTime {
+                    created,
+                    completed: turn.completed_ms.or(Some(created)),
+                }),
+                model: None,
+                tokens: None,
+                error: Some(error.clone()),
+                parts: vec![Part::StepFinish(StepFinish {
+                    reason: FinishReason::Error,
+                })],
+            });
+        }
+
         let mut transcript = SessionTranscript::new(messages);
         transcript.truncated = self.incomplete;
         transcript
@@ -457,7 +577,7 @@ impl ThreadProjection {
         index
     }
 
-    fn turn_started(&mut self, notification: TurnNotification) {
+    fn turn_started(&mut self, notification: TurnNotification, seq: u64) {
         let id = notification.turn.id.clone();
         let started = notification
             .turn
@@ -472,11 +592,14 @@ impl ThreadProjection {
             .turn
             .completed_at
             .map(|seconds| seconds.saturating_mul(1000));
-        self.status = Some(if status == "inProgress" {
-            ThreadStatus::Active
-        } else {
-            ThreadStatus::Idle
-        });
+        self.set_status(
+            if status == "inProgress" {
+                ThreadStatus::Active
+            } else {
+                ThreadStatus::Idle
+            },
+            seq,
+        );
         {
             let turn = self.ensure_turn(&id);
             turn.started_ms = started.or(turn.started_ms);
@@ -503,7 +626,7 @@ impl ThreadProjection {
         }
     }
 
-    fn turn_completed(&mut self, notification: TurnNotification) {
+    fn turn_completed(&mut self, notification: TurnNotification, seq: u64) {
         let id = notification.turn.id.clone();
         let completed = notification
             .turn
@@ -514,7 +637,7 @@ impl ThreadProjection {
             .status
             .clone()
             .unwrap_or_else(|| "completed".to_string());
-        self.status = Some(ThreadStatus::Idle);
+        self.set_status(ThreadStatus::Idle, seq);
         {
             let turn = self.ensure_turn(&id);
             turn.completed_ms = completed.or(turn.completed_ms);
@@ -535,20 +658,23 @@ impl ThreadProjection {
         }
     }
 
-    fn turn_error(&mut self, notification: ErrorNotification) {
+    fn turn_error(&mut self, notification: ErrorNotification, seq: u64) {
         let Some(turn_id) = notification.turn_id else {
             return;
         };
+        // A retrying error leaves the turn live (the server schedules another
+        // attempt). Its text must NOT become the turn's failure while retries
+        // continue — ADR-0090's credential error is exactly this shape — so
+        // only a terminal error is recorded. A terminal one is the turn's
+        // ending even when no `turn/completed` follows: settle it here so the
+        // card can take its error text instead of hanging on a run that has
+        // already failed.
+        if notification.will_retry {
+            return;
+        }
         let message = notification.error.message;
         if !message.is_empty() {
             self.ensure_turn(&turn_id).error = Some(message);
-        }
-        // A retrying error leaves the turn live (the server schedules another
-        // attempt). A terminal one is the turn's ending even when no
-        // `turn/completed` follows: settle it here so the card can take its
-        // error text instead of hanging on a run that has already failed.
-        if notification.will_retry {
-            return;
         }
         {
             let turn = self.ensure_turn(&turn_id);
@@ -557,12 +683,12 @@ impl ThreadProjection {
         }
         if self.live_turn.as_deref() == Some(turn_id.as_str()) {
             self.live_turn = None;
-            self.status = Some(ThreadStatus::Idle);
+            self.set_status(ThreadStatus::Idle, seq);
         } else if self.live_turn.is_none() {
             // The error names a turn this projection never saw start: the
             // thread is still idle, unless another turn is live (then its own
             // status stands).
-            self.status = Some(ThreadStatus::Idle);
+            self.set_status(ThreadStatus::Idle, seq);
         }
     }
 
@@ -2524,7 +2650,7 @@ mod tests {
         // The gap may have dropped the ending while a stale `active` stayed
         // cached; the replayed history proves the turn is over.
         projection.set_observed_status(Some(ThreadStatus::Active));
-        projection.resync(history.as_array().unwrap());
+        projection.resync(history.as_array().unwrap(), projection.feed_seq + 1);
         assert!(!projection.transcript().truncated, "a resync clears the gap");
         assert_eq!(
             projection.observed_status(),
@@ -2543,6 +2669,54 @@ mod tests {
             "history rebuilds the projection, it does not append to it"
         );
         assert_eq!(transcript.messages[1].text(), "Done.");
+    }
+
+    /// Ticket #880 review finding: the status watcher and the thread subscriber
+    /// are separate tasks over one broadcast. A status the watcher dequeued
+    /// before a history resync must not write after it — the page's receipt
+    /// boundary is recorded even when the page writes no status of its own.
+    #[test]
+    fn a_status_older_than_the_replayed_page_cannot_resurrect_a_live_run() {
+        let mut projection = ThreadProjection::new("thread-1");
+        let history = json!([{
+            "id": "turn-1",
+            "status": "completed",
+            "startedAt": 1_700_000_000,
+            "completedAt": 1_700_000_002,
+            "error": null,
+            "items": []
+        }]);
+        // The connection received `active` as notification 5, but its watcher
+        // has not run yet. The page read at that boundary proves the turn over.
+        projection.resync(history.as_array().unwrap(), 5);
+        projection.set_observed_status_at(Some(ThreadStatus::Active), 5);
+        assert_ne!(
+            projection.observed_status(),
+            Some(ThreadStatus::Active),
+            "a status at the page's own boundary is stale"
+        );
+
+        // A status received after the page is newer and still applies.
+        projection.set_observed_status_at(Some(ThreadStatus::Active), 6);
+        assert_eq!(projection.observed_status(), Some(ThreadStatus::Active));
+    }
+
+    /// A closed or lagged connection cannot vouch for its cached status, and a
+    /// status that was already queued behind the boundary must not restore it.
+    #[test]
+    fn a_cleared_status_drops_queued_older_ones() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.set_observed_status_at(Some(ThreadStatus::Idle), 5);
+        projection.clear_observed_status_at(7);
+        assert_eq!(projection.observed_status(), None);
+        projection.set_observed_status_at(Some(ThreadStatus::Active), 6);
+        assert_eq!(
+            projection.observed_status(),
+            None,
+            "a queued status older than the clear is dropped"
+        );
+        projection.set_observed_status_at(Some(ThreadStatus::Active), 8);
+        assert_eq!(projection.observed_status(), Some(ThreadStatus::Active));
     }
 
     /// The `item/*` wire vocabulary is this module's alone: no file outside the
@@ -2692,6 +2866,82 @@ mod tests {
         );
     }
 
+    /// Ticket #880 acceptance 5, the harder shape: a terminal error that lands
+    /// before any assistant item still reaches the neutral read. The card reads
+    /// a turn's failure from its newest assistant message, so the read model
+    /// gives the failed turn a stable synthetic one (keyed by the server's turn
+    /// id) rather than dropping the text.
+    #[test]
+    fn a_terminal_error_before_an_assistant_item_keeps_its_text() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            TURN_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000_i64 }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_000_i64,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user",
+                    "content": [{ "type": "text", "text": "go" }]
+                }
+            }),
+        );
+        projection.apply_at(
+            7,
+            ERROR_NOTIFICATION,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "error": { "message": "401 unauthorized" },
+                "willRetry": false
+            }),
+        );
+
+        let transcript = projection.transcript();
+        let anchor = transcript
+            .newest_user()
+            .and_then(|user| user.anchor())
+            .expect("the turn anchor");
+        let turn = transcript.turn_for_user(&anchor);
+        assert_eq!(turn.error.as_deref(), Some("401 unauthorized"));
+        assert!(turn.complete, "the synthetic failure ends the turn");
+        assert_eq!(
+            transcript.settle(Some(&anchor)),
+            crate::backend::TurnSettle::Failed("401 unauthorized".to_string())
+        );
+
+        // The synthetic message is a stable projection of the turn, never an
+        // appended duplicate: two reads are identical.
+        let synthetic = transcript
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "cola:turn-error:turn-1")
+            .expect("the failure is exposed");
+        assert!(synthetic.text().is_empty(), "it carries no invented content");
+        let second = projection.transcript();
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|message| (message.id.clone(), message.error.clone()))
+                .collect::<Vec<_>>(),
+            transcript
+                .messages
+                .iter()
+                .map(|message| (message.id.clone(), message.error.clone()))
+                .collect::<Vec<_>>(),
+            "a re-read reproduces the same synthetic message"
+        );
+    }
+
     /// The retrying shape of the same notification is NOT an ending: the
     /// server schedules another attempt, so the turn stays live and its card
     /// keeps streaming.
@@ -2706,6 +2956,28 @@ mod tests {
             }),
         );
         projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_000_i64,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user",
+                    "content": [{ "type": "text", "text": "go" }]
+                }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_001_000_i64,
+                "item": { "type": "agentMessage", "id": "item-agent", "text": "working" }
+            }),
+        );
+        projection.apply(
             ERROR_NOTIFICATION,
             &json!({
                 "threadId": "thread-1",
@@ -2716,6 +2988,23 @@ mod tests {
         );
         assert!(projection.is_live(), "a retry keeps the run live");
         assert_eq!(projection.observed_status(), Some(ThreadStatus::Active));
+        let transcript = projection.transcript();
+        let anchor = transcript
+            .newest_user()
+            .and_then(|user| user.anchor())
+            .expect("the turn anchor");
+        assert_eq!(
+            transcript.turn_for_user(&anchor).error,
+            None,
+            "a retrying error is not the turn's failure"
+        );
+        assert!(
+            !matches!(
+                transcript.settle(Some(&anchor)),
+                crate::backend::TurnSettle::Failed(_)
+            ),
+            "the card must not take the retry's text as a terminal failure"
+        );
     }
 
     /// The status family is not transcript content: a stray broadcast routed to
@@ -2775,14 +3064,17 @@ mod tests {
         let created = carried.time.expect("the message's server time").created;
 
         // The restart path: rebuild from `thread/turns/list`'s persisted turns.
-        projection.resync(&[json!({
-            "id": "turn-1",
-            "status": "completed",
-            "startedAt": 1_700_000_000,
-            "completedAt": 1_700_000_002,
-            "error": null,
-            "items": [{ "type": "contextCompaction", "id": "item-compaction" }]
-        })]);
+        projection.resync(
+            &[json!({
+                "id": "turn-1",
+                "status": "completed",
+                "startedAt": 1_700_000_000,
+                "completedAt": 1_700_000_002,
+                "error": null,
+                "items": [{ "type": "contextCompaction", "id": "item-compaction" }]
+            })],
+            projection.feed_seq + 1,
+        );
 
         let after = projection.transcript();
         let rebuilt = after
