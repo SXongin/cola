@@ -38,7 +38,7 @@ For each ticket, in order:
 1. **Mark the window** — `PRE=$(git rev-parse HEAD)`, the review's fixed point.
 2. **Dispatch the implementer** (`subagent_type: implementer`) with the dispatch prompt below.
 3. **Review the window** — run the repo's review pair over `PRE...HEAD` with the ticket as the spec source (`docs/agents/flow.md`). The review sub-agents dispatch from this main session; a sub-agent cannot spawn them. Keep the three reviewer session ids for step 4.
-4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review at the same scope by resuming the reviewer sessions that raised them (`docs/agents/flow.md`; `/code-review`, "Re-review round"), under the binding's re-review bound.
+4. **Fix findings** — resume the same implementer session (`task_id`) with the findings, then re-review at the same scope by resuming the reviewer sessions that raised them (`docs/agents/flow.md`; `/code-review`, "Re-review round").
 5. **Record progress** — post the progress comment below. It carries the review outcome and marks the batch's sanctioned `/compact` boundary; never compact mid-ticket.
 
 Done when the ticket's commits are on the branch, its window review is clean or fixed, and the progress comment is posted. Then take the next ticket; never two at once.
@@ -47,7 +47,7 @@ Done when the ticket's commits are on the branch, its window review is clean or 
 
 Fetch and, if `origin/main` advanced, rebase the branch onto it — a conflict pauses the batch.
 
-Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run the repo's review pair once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch under the binding's re-review bound (`docs/agents/flow.md`). The whole-branch pass is a **new scope**, so it starts fresh reviewers rather than resuming a ticket window's.
+Then close the per-ticket review's fidelity gap: no per-ticket pass saw the tickets together, and two tickets on different files can still interact (a config default one changes, the code another consumes). Run the repo's review pair once each over the **whole branch** — `git diff origin/main...HEAD` (the branch was just rebased onto the fetched `origin/main`), the spec issue as the spec source — the same diff the PR's Codex gate will review. Fix findings like step 3.4 (the originating implementer for a ticket-local finding, a fresh implementer for a cross-ticket one or when the ticket's session is gone) and re-run the pass over the whole branch (`docs/agents/flow.md`). The whole-branch pass is a **new scope**, so it starts fresh reviewers rather than resuming a ticket window's.
 
 Then run the repo's full verification loop (`CONTRIBUTING.md`, "Verification loop") on the branch: fmt check, clippy, tests, release build.
 
@@ -79,7 +79,7 @@ Done when the PR exists, its branch is merge-commit-free, and `rebaseable` is `t
 
 ## 6. Drive the PR to green
 
-Watch the required checks (`gh pr checks <branch> --required`) and the Codex gate. A red check or a FAIL is a fix round — route it like step 3.4 — and a re-push, under the binding's bound (`docs/agents/flow.md`). Done when the required checks are green and the gate passes. Stop there — the user verifies and merges.
+Watch the required checks (`gh pr checks <branch> --required`) and the Codex gate. A red check or a FAIL is a fix round — route it like step 3.4 — and a re-push (`docs/agents/flow.md`). Done when the required checks are green and the gate passes. Stop there — the user verifies and merges.
 
 ## Dispatch prompt
 
@@ -107,7 +107,7 @@ Put the decision to the user when:
 - no tickets resolve, or a blocker falls outside the batch;
 - a ticket produces no commits;
 - the implementer reports a blocker or a question;
-- review findings survive two fix rounds;
+- a finding the implementer has argued against and the reviewer still raises;
 - the rebase onto `main` conflicts, or full verification fails and the implementer cannot fix it;
 - the working tree is dirty with work that is not a ticket's (Recovery covers a ticket's own uncommitted work).
 

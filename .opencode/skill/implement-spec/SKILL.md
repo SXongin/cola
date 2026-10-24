@@ -16,7 +16,7 @@ Communicate with sub-agents through sparse **context pointers** — the spec, ti
 
 [cola] **Landing is linear.** This repo merges a PR by **rebase only**, so the integration branch must never gain a merge commit. Every landing is a rebase of the ticket branch onto the integration tip followed by `git merge --ff-only`, never `git merge` of the ticket branch. The branch stays merge-commit-free (`git log --merges main..HEAD` empty) and, once the PR exists, rebase-mergeable (`gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` is `true`) — step 8 sequences those two checks. The `merger` sub-agent (`.opencode/agent/merger.md`) owns landings: it lands, it never judges.
 
-[cola] **Review is the pair, run at every landing.** `/code-review` carries both the two axes and the adversarial pass; *when* it runs, *who* calls it, how findings route, and the re-review bound are the binding in `docs/agents/flow.md`.
+[cola] **Review is the pair, run at every landing.** `/code-review` carries both the two axes and the adversarial pass; *when* it runs, *who* calls it, and how findings route are the binding in `docs/agents/flow.md`.
 
 [cola] **Run to a green PR, then stop.** This is `CONTRIBUTING.md`'s loop: push, open the PR, and drive it to a green required-check set and a passing Codex gate. Stop there — the user verifies and merges; agents never merge.
 
@@ -30,7 +30,7 @@ Communicate with sub-agents through sparse **context pointers** — the spec, ti
 6. Review with `/code-review` at each landing over that ticket's window, and again over the **whole branch** (`origin/main...HEAD`) once every ticket is in. A finding goes back to **the implementer that wrote that ticket** — resume its session: it holds the context, so the fix is one round rather than a re-brief. Only a finding the ticket cannot own (a cross-ticket interaction, or a session already gone) goes to a fresh implementer. Re-review at the scope that raised it, per `docs/agents/flow.md` — a same-scope fix round resumes the reviewer sessions that raised the finding (keep their ids from that round, so it re-reads the delta rather than the whole diff), while the whole-branch pass is a new scope and starts fresh reviewers.
 7. `git fetch` and rebase the integration branch onto the fetched `origin/main` — resolving a conflict by intent (a genuine conflict pauses the batch) — then run the repo's full verification loop (`CONTRIBUTING.md`, "Verification loop") on the **resulting** tree: the one that ships, not the pre-rebase one.
 8. Push. Open exactly **one** PR against `main` whose body carries the dossier and closes **every ticket and the spec** (one keyword per number), per `CONTRIBUTING.md` "Pull request rules". Then verify the branch is merge-commit-free (`git log --merges main..HEAD` empty) and rebase-mergeable (`gh api repos/<owner>/<repo>/pulls/<n> --jq .rebaseable` is `true`) — that read needs the PR's number to exist, and a conflict with `main` leaves it `false`, so rebase onto `origin/main`, re-run the checks the rebase touched, and push again.
-9. Drive the PR to **green**: `gh pr checks <branch> --required` plus the Codex gate. A red check or a FAIL is a fix round (route it like step 6) and a re-push, under the binding's bound. Then clean up the implementer worktrees.
+9. Drive the PR to **green**: `gh pr checks <branch> --required` plus the Codex gate. A red check or a FAIL is a fix round (route it like step 6) and a re-push. Then clean up the implementer worktrees.
 10. Stop at the green PR — the user verifies and merges.
 
 ## Guardrails

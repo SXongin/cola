@@ -10,7 +10,7 @@ Cola's entry point for review. It runs **both** halves of the repo's paired pass
 - **The two-axis review** — Standards + Spec, run as **parallel sub-agents** and reported separately.
 - **The adversarial pass** — the Codex gate's correctness / test-adequacy / robustness pass, run as its own sub-agent.
 
-The binding — *when* a review point runs, *who* calls it, how findings route, and the re-review bound — is `docs/agents/flow.md`. This skill owns only the composition and the two passes' mechanics.
+The binding — *when* a review point runs, *who* calls it, and how findings route — is `docs/agents/flow.md`. This skill owns only the composition and the two passes' mechanics.
 
 ## The two-axis half
 
@@ -24,7 +24,7 @@ Run the `adversarial-review` skill over the **same base** and, when one was give
 
 ## Re-review round (same scope)
 
-*When* a re-review runs, who routes the fix, and the two-round bound are `docs/agents/flow.md`; this is the mechanics.
+*When* a re-review runs and who routes the fix are `docs/agents/flow.md`; this is the mechanics.
 
 A fix round at the **same scope** resumes the sessions of the reviewers that raised the findings — all three — instead of dispatching fresh ones. Keep each reviewer's session id from the first round; `foreman` and `implement-spec` hold it for the lifetime of a ticket.
 
@@ -35,7 +35,7 @@ The resumed prompt carries:
 - the **refreshed** untracked-file **paths** (`git ls-files --others --exclude-standard` run again, `-- <paths>` when the review is scoped): a fix that adds a file leaves no hunk in either diff, so the first round's list is stale by definition — the reviewer reads each path, and a path it silently skips is a coverage hole;
 - the brief: for every finding, resolved / not resolved / partially, with the reason; and what the delta could break that the first round did not see.
 
-The adversarial half follows its own skill's re-review step, which re-derives its verdict from the whole diff rather than the delta alone. Resuming keeps the reviewer independent of the author and leaves the bound and the reported verdict untouched.
+The adversarial half follows its own skill's re-review step, which re-derives its verdict from the whole diff rather than the delta alone. Resuming keeps the reviewer independent of the author and leaves the reported verdict untouched.
 
 Start fresh reviewers the moment the scope is no longer the one that raised the findings — the whole-branch pass after a ticket window included. A resumed reviewer judges the delta it was briefed on and has already accepted the rest; a new scope has no such "rest".
 
