@@ -56,10 +56,10 @@ use std::sync::{Arc, Mutex};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
+use crate::backend::PERMISSION_PATTERN_MAX_CHARS;
 use crate::backend::types::{
     FormAnswer, FormFieldKind, FormValue, PermissionRequest, QuestionInfo, QuestionOption, QuestionRequest,
 };
-use crate::bridge::request::kind::PERMISSION_PATTERN_MAX_CHARS;
 use crate::error::{BridgeError, Result};
 
 use super::backend::Projections;

@@ -1550,11 +1550,6 @@ fn describe_action(action: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// The character budget one permission pattern is rendered within. The Codex
-/// adapter rejects a grant whose rendered pattern would be clipped, so what the
-/// user approves is exactly what the card shows.
-pub(crate) const PERMISSION_PATTERN_MAX_CHARS: usize = 150;
-
 /// A friendly description of what a permission request asks to do, shown on the
 /// permission card (and reused verbatim by the snapshot card's pending block,
 /// ADR-0028 — the adopt-time block must look and behave like today's cards).
@@ -1576,14 +1571,17 @@ pub(crate) fn describe_permission(p: &crate::backend::types::PermissionRequest) 
     {
         s.push_str(&format!(
             "**原因**: {}\n",
-            truncate(reason, PERMISSION_PATTERN_MAX_CHARS)
+            truncate(reason, crate::backend::PERMISSION_PATTERN_MAX_CHARS)
         ));
     }
 
     if !p.patterns.is_empty() {
         s.push_str("**对象**:\n");
         for r in &p.patterns {
-            s.push_str(&format!("- `{}`\n", truncate(r, PERMISSION_PATTERN_MAX_CHARS)));
+            s.push_str(&format!(
+                "- `{}`\n",
+                truncate(r, crate::backend::PERMISSION_PATTERN_MAX_CHARS)
+            ));
         }
     }
 
