@@ -35,6 +35,9 @@ pub(crate) mod transport;
 #[cfg(test)]
 pub(crate) mod test_server;
 
+#[cfg(test)]
+mod cards;
+
 #[allow(unused_imports)]
 pub(crate) use client::{CodexClient, CodexOptions, ServerInfo, ServerVersion, connect_for_active_client};
 #[allow(unused_imports)]
