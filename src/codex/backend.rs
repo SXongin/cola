@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -42,6 +43,19 @@ use super::lifecycle::CodexLifecycle;
 use super::read_model::ThreadProjection;
 use super::threads::{Adoption, ThreadEvent, ThreadSubscription, Threads};
 use super::transport::Endpoint;
+
+/// How long a truncated history waits before the next read retries paging. A
+/// persistently failing server is polled at this cadence, never in a loop; a
+/// healthy server clears the state on the first retry.
+#[cfg(not(test))]
+const PAGING_RETRY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const PAGING_RETRY: Duration = Duration::from_millis(20);
+
+/// Bound the adoption backlog drain. The subscription channel holds 1024
+/// events; draining at most that many means a first read either reflects every
+/// queued event or is explicitly marked incomplete.
+const ADOPTION_DRAIN_LIMIT: usize = 1024;
 
 /// One thread's projection and the state of its subscription.
 #[derive(Default)]
@@ -75,8 +89,13 @@ impl Drop for Projections {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscriptionState {
-    /// `thread/resume` succeeded; a subscriber task is folding events.
+    /// `thread/resume` succeeded and the full history was paged; a subscriber
+    /// task is folding events.
     Live,
+    /// The subscription is live but the first history page failed. The bounded
+    /// resume page is shown as truncated, and a later read retries paging after
+    /// `retry_at`.
+    PagingIncomplete { retry_at: Instant },
 }
 
 impl Projections {
@@ -93,10 +112,9 @@ impl Projections {
         lock
     }
 
-    /// Whether this thread's run state has a live subscription. Retained
-    /// history alone is NOT enough: a dead subscription leaves stale state, so
-    /// status/transcript must re-adopt before answering. An unseeded projection
-    /// must not answer `Idle` as if it had read the server.
+    /// Whether this thread's run state has a live subscription AND a paged
+    /// history. Retained history alone is NOT enough: a dead subscription
+    /// leaves stale state, so status/transcript must re-adopt before answering.
     pub(crate) fn is_seeded(&self, thread_id: &str) -> bool {
         self.state(thread_id) == Some(SubscriptionState::Live)
     }
@@ -236,6 +254,31 @@ impl Projections {
 }
 
 impl CodexClient {
+    /// Retry a failed history page on the live subscription. The subscription
+    /// is not re-adopted: this only pages `thread/turns/list` again.
+    async fn retry_paging(&self, thread_id: &str) -> CodexResult<()> {
+        match self.threads().all_turns(thread_id).await {
+            Ok(turns) => {
+                self.projections.resync(thread_id, &turns);
+                self.projections.set_state(thread_id, SubscriptionState::Live);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    thread = %thread_id,
+                    "could not retry the codex thread history page; staying truncated: {error}"
+                );
+                self.projections.mark_incomplete(thread_id);
+                self.projections.set_state(
+                    thread_id,
+                    SubscriptionState::PagingIncomplete {
+                        retry_at: Instant::now() + PAGING_RETRY,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The endpoint this connection dialled, for the neutral base-URL read.
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
@@ -245,13 +288,25 @@ impl CodexClient {
     /// **is** the subscription (ADR-0090's amendment, question 2). A never-run
     /// thread is a named state, not an error; its read is an empty transcript.
     pub(crate) async fn ensure_subscription(&self, thread_id: &str) -> CodexResult<()> {
-        if self.projections.state(thread_id).is_some() {
-            return Ok(());
+        match self.projections.state(thread_id) {
+            Some(SubscriptionState::Live) => return Ok(()),
+            Some(SubscriptionState::PagingIncomplete { retry_at }) if Instant::now() < retry_at => {
+                return Ok(());
+            }
+            Some(SubscriptionState::PagingIncomplete { .. }) => {}
+            None => {}
         }
         let adoption = self.projections.adoption_lock(thread_id);
         let _adopting = adoption.lock().await;
-        if self.projections.state(thread_id).is_some() {
-            return Ok(());
+        match self.projections.state(thread_id) {
+            Some(SubscriptionState::Live) => return Ok(()),
+            Some(SubscriptionState::PagingIncomplete { retry_at }) if Instant::now() < retry_at => {
+                return Ok(());
+            }
+            Some(SubscriptionState::PagingIncomplete { .. }) => {
+                return self.retry_paging(thread_id).await;
+            }
+            None => {}
         }
         match self.threads().adopt(thread_id).await? {
             Adoption::Subscribed(subscription) => {
@@ -261,7 +316,10 @@ impl CodexClient {
                 // receiver was registered before `thread/resume`, so events
                 // that arrive during this paging wait in its queue.
                 match self.threads().all_turns(thread_id).await {
-                    Ok(turns) => self.projections.resync(thread_id, &turns),
+                    Ok(turns) => {
+                        self.projections.resync(thread_id, &turns);
+                        self.projections.set_state(thread_id, SubscriptionState::Live);
+                    }
                     Err(error) => {
                         tracing::warn!(
                             thread = %thread_id,
@@ -270,11 +328,57 @@ impl CodexClient {
                         );
                         self.projections.seed(thread_id, &subscription.thread().turns);
                         self.projections.mark_incomplete(thread_id);
+                        self.projections.set_state(
+                            thread_id,
+                            SubscriptionState::PagingIncomplete {
+                                retry_at: Instant::now() + PAGING_RETRY,
+                            },
+                        );
                     }
                 }
-                self.projections.set_state(thread_id, SubscriptionState::Live);
+                // Drain the events that queued while `thread/resume` and the
+                // history page were in flight, so the first read reflects them
+                // and cannot present a transcript as complete when the backlog
+                // already overflowed the broadcast buffer.
+                let mut subscription = *subscription;
+                let mut drained = 0;
+                let mut backlog_truncated = false;
+                loop {
+                    if drained >= ADOPTION_DRAIN_LIMIT {
+                        backlog_truncated = true;
+                        break;
+                    }
+                    match subscription.try_next_event() {
+                        Ok(Some(ThreadEvent::Notification { method, params })) => {
+                            self.projections.apply(thread_id, &method, &params);
+                            drained += 1;
+                        }
+                        Ok(Some(ThreadEvent::Lagged { skipped })) => {
+                            tracing::warn!(
+                                thread = %thread_id,
+                                skipped,
+                                "the adoption backlog overflowed the event buffer; marking the \
+                                 projection incomplete"
+                            );
+                            backlog_truncated = true;
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                thread = %thread_id,
+                                "the adoption backlog ended before it drained: {error}"
+                            );
+                            backlog_truncated = true;
+                            break;
+                        }
+                    }
+                }
+                if backlog_truncated {
+                    self.projections.mark_incomplete(thread_id);
+                }
                 let task = tokio::spawn(consume(
-                    *subscription,
+                    subscription,
                     self.threads().clone(),
                     Arc::downgrade(&self.projections),
                 ));
@@ -358,6 +462,9 @@ async fn resync(threads: &Threads, projections: &std::sync::Weak<Projections>, t
         Ok(turns) => {
             if let Some(projections) = projections.upgrade() {
                 projections.resync(thread_id, &turns);
+                // A lag resync recovers the history a failed adoption page
+                // could not; a later read need not retry paging.
+                projections.set_state(thread_id, SubscriptionState::Live);
             }
         }
         Err(error) => tracing::warn!(
@@ -1195,6 +1302,135 @@ mod tests {
         assert!(
             server.turns_calls() >= 2,
             "the repeat is only detected after a second page"
+        );
+    }
+
+    /// An in-progress historical turn is not authoritative: a statusless tool
+    /// seeded from it must be running, and the queued completion settles it.
+    #[tokio::test]
+    async fn an_in_progress_history_item_seeds_as_running() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a live thread");
+        thread.turns = vec![json!({
+            "id": "turn-live",
+            "status": "inProgress",
+            "startedAt": 1_700_000_000,
+            "completedAt": null,
+            "error": null,
+            "items": [{
+                "type": "webSearch",
+                "id": "item-web",
+                "query": "still running",
+                "action": { "type": "search", "query": "still running", "queries": null },
+                "results": null
+            }],
+        })];
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        let first = client.transcript("thread-1").await.expect("first read");
+        let crate::backend::Part::Tool(call) = first
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == "item-web")
+            .and_then(|message| message.parts.first())
+            .expect("the web search item")
+        else {
+            panic!("web search maps to a tool part");
+        };
+        assert_eq!(
+            call.status,
+            crate::backend::ToolStatus::Running,
+            "an in-progress turn's item is not finished"
+        );
+
+        server.push_to_thread(
+            "thread-1",
+            "item/completed",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-live",
+                "completedAtMs": 1_700_000_002_000_i64,
+                "item": {
+                    "type": "webSearch",
+                    "id": "item-web",
+                    "query": "still running",
+                    "action": { "type": "search", "query": "still running", "queries": null },
+                    "results": [{ "title": "done", "url": "https://example.test" }]
+                }
+            }),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let transcript = client.transcript("thread-1").await.expect("settled read");
+            let crate::backend::Part::Tool(call) = transcript
+                .messages
+                .iter()
+                .find(|message| message.id.as_str() == "item-web")
+                .and_then(|message| message.parts.first())
+                .unwrap()
+            else {
+                panic!("web search maps to a tool part");
+            };
+            if call.status == crate::backend::ToolStatus::Completed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the queued completion must settle the seeded item"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A failed history page is retried on a later read (bounded by backoff),
+    /// not left truncated forever by the live subscription state.
+    #[tokio::test]
+    async fn a_failed_history_page_retries_on_the_next_read() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
+        thread.turns = vec![
+            scripted_turn("turn-1", "completed", 1_700_000_000, "item-1", "one"),
+            scripted_turn("turn-2", "completed", 1_700_000_010, "item-2", "two"),
+            scripted_turn("turn-3", "completed", 1_700_000_020, "item-3", "three"),
+        ];
+        thread.read_turn_limit = Some(1);
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        server.fail_turns_pages(1);
+
+        let first = client.transcript("thread-1").await.expect("first read");
+        assert_eq!(first.messages.len(), 1, "the bounded fallback is the only data");
+        assert!(first.truncated, "the failed page is stated");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let complete = loop {
+            let transcript = client.transcript("thread-1").await.expect("retried read");
+            if transcript.messages.len() == 3 && !transcript.truncated {
+                break transcript;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a failed history page must retry on a later read"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            complete
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["item-1", "item-2", "item-3"]
+        );
+        assert_eq!(
+            server.resume_calls(),
+            1,
+            "the retry pages history, it does not re-subscribe"
+        );
+        assert!(
+            server.turns_calls() >= 3,
+            "the failed page and both retry pages ran"
         );
     }
 
