@@ -76,12 +76,21 @@ refused with a named error and **nothing is sent** — a send the record did not
 learn about is exactly the turn a restart would report as external. The valid
 existing record stays trusted; only the marker is rolled back. At the per-thread
 cap (32 unresolved ids per thread) the next prompt is refused too: silently
-evicting an unresolved id is the same loss. Both windows are bounded by an
-explicit expiry (five minutes; shorter in tests): a submission whose response
-never came and whose item never appeared stops vouching for a later external
-turn. A slow item is not lost by that expiry — the history read also binds an
-item whose `clientId` carries cola's own id convention, which no other client
-mints.
+evicting an unresolved id is the same loss.
+
+Two windows bound the record. The **id-less, thread-wide fallback** stops
+vouching after five minutes (shorter in tests): a request that never reached the
+server must not make a later foreign turn with no client id look cola's. The
+**precise recorded id** is not bounded by that window — a lost response that
+surfaces late still binds, however long it took. What bounds the pending set
+when resolution never arrives is the safety valve: a recorded id that never
+resolves is pruned after an hour (shorter in tests), and until then the
+per-thread cap refuses new prompts rather than forgetting an outstanding id.
+
+Only an id **this record saw** may vouch. A peer chooses its own
+`clientUserMessageId`, so the id's spelling proves nothing: an unfamiliar id —
+including one claiming the `msg_cola_` shape — is somebody else's turn, and the
+reconciliation never infers authorship from it.
 
 **3. An unusable record fails closed.** A corrupt, unreadable or unwritable
 record makes the adapter answer **every** message as cola-authored, with an
@@ -126,10 +135,12 @@ the honest one — V1's shape, not V2's.
 is the source for `/skill`; Codex's `skill` input names a **path** the neutral
 `PromptSkill` does not carry, so the adapter keeps one `name → path` scope per
 directory it has read. Each read replaces its own scope, so a deleted skill
-stops resolving. A prompt resolves in the thread's own `cwd` (learned at
-creation/adoption) first; without that directory, a name is used only when the
-remaining scopes agree on one path. Codex has no separate skill id, so the name
-is the neutral id (V1's rule).
+stops resolving. A prompt resolves **only** in the thread's own `cwd` (learned
+at creation, adoption, or a metadata read taken before a skill prompt when it is
+still unknown); without that directory, every skill is refused by name — a
+skill advertised for another project is never substituted, because its path and
+even its content may differ. Codex has no separate skill id, so the name is the
+neutral id (V1's rule).
 
 **9. `/stop` and `/compact` use the protocol's own verbs.** `turn/interrupt`
 names the live turn; when the cache has not observed it — the subscription
@@ -164,11 +175,20 @@ durable shape for a label.
   after acceptance is indistinguishable from a refusal at the client, so
   abandoning it on transport failures re-opens the same hole. Only a JSON-RPC
   error is positive evidence the turn did not start.
-- **Scope the skill catalog per prompt directory.** Rejected as a *key* because
-  `prompt` carries no directory on the neutral seam. The adapter learns the
-  thread's `cwd` at creation/adoption and resolves there first; without it, a
-  name is used only when every scope agrees on one path, so a concurrent read
-  for another project cannot substitute a same-named skill.
+- **Bind any `clientId` that looks like cola's `msg_cola_` id.** Rejected on
+  review: a peer chooses its own `clientUserMessageId`, so the prefix is a claim,
+  not evidence. Only a recorded id may vouch; the lost-response case is kept by
+  recording the id before the send, not by trusting its spelling.
+- **Fall back to another directory's scope for a skill.** Rejected: a
+  same-named skill in another project is a different file with a different
+  body, and sending it silently would run the wrong instructions. The adapter
+  reads the thread's `cwd` before a skill prompt instead, and refuses when it
+  cannot establish the directory.
+- **Expire the precise verdict with the id-less fallback.** Rejected: a lost
+  response can surface later than five minutes, and the precise id cannot
+  collide with anything a peer sent unless that peer deliberately reuses the
+  recorded id (which is cola's claim, not the peer's). A separate one-hour
+  safety valve bounds the set; the cap refuses new prompts before then.
 - **Evict the oldest unresolved submission at the cap.** Rejected: an
   unresolved id may still be owed, and dropping it is exactly the provenance
   loss the record exists to prevent. The next prompt is refused instead.
@@ -198,7 +218,9 @@ message, and a broken record must not produce it.
 
 - A cola turn is durable state, not a process-local guess; its file is bounded
   (the newest 128 turns, and 32 unresolved submissions, per thread) because
-  authorship is only ever asked about the newest user message.
+  authorship is only ever asked about the newest user message. A submission
+  that never resolves leaves after an hour, so the cap cannot wedge a thread
+  forever.
 - An unresolved chosen id is resolved by the next history read, which is the
   bridge's own read before it asks authorship — so a lost response costs one
   read, not a misclassification. A prompt that cannot record its marker is
