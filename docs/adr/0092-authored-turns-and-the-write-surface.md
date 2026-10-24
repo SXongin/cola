@@ -70,6 +70,19 @@ before the marker is written, so a later external turn on the thread is never
 suppressed by one. A submission with no chosen id cannot be reconciled at all,
 so its in-memory marker is always cleared when the call returns.
 
+**The write is a precondition.** `begin` is fallible: if the chosen id cannot be
+made durable (a read-only state directory, an unusable record), the prompt is
+refused with a named error and **nothing is sent** — a send the record did not
+learn about is exactly the turn a restart would report as external. The valid
+existing record stays trusted; only the marker is rolled back. At the per-thread
+cap (32 unresolved ids per thread) the next prompt is refused too: silently
+evicting an unresolved id is the same loss. Both windows are bounded by an
+explicit expiry (five minutes; shorter in tests): a submission whose response
+never came and whose item never appeared stops vouching for a later external
+turn. A slow item is not lost by that expiry — the history read also binds an
+item whose `clientId` carries cola's own id convention, which no other client
+mints.
+
 **3. An unusable record fails closed.** A corrupt, unreadable or unwritable
 record makes the adapter answer **every** message as cola-authored, with an
 `error!` naming the path, and its bytes are left for a human. Silently answering
@@ -111,22 +124,30 @@ the honest one — V1's shape, not V2's.
 
 **8. `/skill` resolves through the list and the protocol's path.** `skills/list`
 is the source for `/skill`; Codex's `skill` input names a **path** the neutral
-`PromptSkill` does not carry, so the adapter keeps the last list's
-`name → path` catalog and fails a prompt that names a skill the last read did
-not. Codex has no separate skill id, so the name is the neutral id (V1's rule).
+`PromptSkill` does not carry, so the adapter keeps one `name → path` scope per
+directory it has read. Each read replaces its own scope, so a deleted skill
+stops resolving. A prompt resolves in the thread's own `cwd` (learned at
+creation/adoption) first; without that directory, a name is used only when the
+remaining scopes agree on one path. Codex has no separate skill id, so the name
+is the neutral id (V1's rule).
 
 **9. `/stop` and `/compact` use the protocol's own verbs.** `turn/interrupt`
 names the live turn; when the cache has not observed it — the subscription
 began after `turn/started`, or the start is still in flight — the adapter reads
 the thread's persisted turns and interrupts the `inProgress` one, so a stop
-right after a prompt is not a silent no-op. `thread/compact/start` is the
+right after a prompt is not a silent no-op. The lookup is polled within a
+bounded window and every read has its own deadline, so a stop either lands when
+the turn appears or answers as idle within about half a second — a stalled RPC
+cannot hold it. `thread/compact/start` is the
 compact; the resulting `contextCompaction` item projects as the neutral
 Compaction the existing card path renders exactly once (ADR-0082's Rendered
 Cursor rule). The protocol's item carries no reason, so the adapter records its
 own `/compact` request and the item consumes it: the row titles 手动, not 自动.
 Only a definite refusal clears the marker; an ambiguous failure keeps it,
 because the compaction may have started and its item still needs the right
-title.
+title. The marker is process-local on purpose: it is a display hint, so a
+restart before the item projects titles that one row 自动 rather than adding a
+durable shape for a label.
 
 ## Considered options
 
@@ -143,11 +164,18 @@ title.
   after acceptance is indistinguishable from a refusal at the client, so
   abandoning it on transport failures re-opens the same hole. Only a JSON-RPC
   error is positive evidence the turn did not start.
-- **Scope the skill catalog per prompt directory.** Rejected because `prompt`
-  carries no directory on the neutral seam. The catalog is scoped per directory
-  by its reads and resolves a name to the most recently read scope, which is the
-  one the `/skill` command just refreshed; a skill deleted from every scope is
-  refused.
+- **Scope the skill catalog per prompt directory.** Rejected as a *key* because
+  `prompt` carries no directory on the neutral seam. The adapter learns the
+  thread's `cwd` at creation/adoption and resolves there first; without it, a
+  name is used only when every scope agrees on one path, so a concurrent read
+  for another project cannot substitute a same-named skill.
+- **Evict the oldest unresolved submission at the cap.** Rejected: an
+  unresolved id may still be owed, and dropping it is exactly the provenance
+  loss the record exists to prevent. The next prompt is refused instead.
+- **Persist the manual-compaction hint.** Rejected: it is a label (手动 vs
+  自动) on a row whose fact — the compaction item — is already durable and
+  rendered either way. A second durable shape for a display hint adds a failure
+  mode without changing what the card shows.
 - **Make `/model` durable with a thread-level setting.** Rejected: Codex's
   schema accepts `model`/`effort` on `turn/start` and has no session-model
   switch to mirror V2's. Inventing a client-side durable setting would make the
@@ -173,7 +201,9 @@ message, and a broken record must not produce it.
   authorship is only ever asked about the newest user message.
 - An unresolved chosen id is resolved by the next history read, which is the
   bridge's own read before it asks authorship — so a lost response costs one
-  read, not a misclassification.
+  read, not a misclassification. A prompt that cannot record its marker is
+  refused, so an unwritable state directory stops prompts (loudly) instead of
+  risking a later false External Message.
 - A message another client folds into a turn cola started is reported as
   cola-authored too. That is the protocol's granularity, and the alternative is
   guessing an author.
@@ -183,7 +213,8 @@ message, and a broken record must not produce it.
 - The transcript carries one more map, empty on every OpenCode read.
 - A `/stop` on an idle thread spends a short bounded lookup (about half a
   second at worst) before it answers, because a stop racing a just-sent prompt
-  must still interrupt the run once the server persists it.
+  must still interrupt the run once the server persists it. Each read has its
+  own deadline, so a stalled RPC cannot extend the wait.
 - `[bridge]`-owned docs gain the new file in the state table; `/model`,
   `/skill`, `/stop` and `/compact` stay the same Feishu commands, with the
   client owning their wire.
