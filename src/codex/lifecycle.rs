@@ -36,8 +36,8 @@
 //! while it is live and deletes the thread. `--no-turn-check` is the explicit
 //! opt-out, and the doctor check names the write and possible provider spend.
 //!
-//! The `Backend` implementation that serves Sessions is a later ticket (#879);
-//! this type is the lifecycle half it will build on.
+//! The `Backend` implementation that serves Sessions is [`super::backend`]
+//! (ticket #879); this type is the lifecycle half it builds on.
 
 use std::path::Path;
 use std::sync::Arc;

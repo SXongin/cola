@@ -165,10 +165,11 @@ kind = "codex"                   # 必填：opencode | codex
 default_client = "ada"           # 哪个 Agent Client 处于活动状态（默认 "default"）
 ```
 
-- **`kind`** —— 必填，用于选择适配器。`opencode` 是本版本唯一能附加的 kind；
+- **`kind`** —— 必填，用于选择适配器。`opencode` 是 OpenCode 适配器；
   `codex`（`app-server` 适配器，ADR-0090）能解析成功、能在 `$CODEX_HOME`
-  下发现守护进程并探测其接口，但在该适配器的 `Backend` 落地前 cola 仍会
-  拒绝启动。
+  下发现守护进程并探测其接口。两种 kind 都能启动：活动的 Agent Client 就是
+  cola 所服务的那个，而 Codex 客户端需要其 app-server 守护进程可连接
+  （或按 `start_server` 可启动）。
 - **选项与 `kind` 写在同一个表里。** `opencode` 的 Agent Client 接受 `url`、
   `start_server`、`generation` 与 `model`，和 `[opencode]` 完全一样；
   `codex` 的 Agent Client 接受 `start_server`（`auto`/`never`/`eager`）：
