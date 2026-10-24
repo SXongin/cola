@@ -16,7 +16,9 @@
 //! {
 //!   "version": 1,
 //!   "turns":   { "<client id>": { "<thread id>": ["turn-1"] } },
-//!   "pending": { "<client id>": { "<thread id>": ["msg_cola_…"] } }
+//!   "pending": { "<client id>": { "<thread id>": [
+//!       { "id": "msg_cola_…", "at_ms": 1700000000000 }
+//!   ] } }
 //! }
 //! ```
 //!
@@ -39,10 +41,22 @@
 //! answered with a JSON-RPC error) clears its marker; an ambiguous one (a
 //! closed connection, a lost response) keeps it, because the turn may exist.
 //!
+//! **The record is a precondition, not a best effort.** A prompt whose chosen
+//! id cannot be made durable is **refused** ([`Self::begin`] returns an error
+//! and the adapter sends nothing): a send the record did not learn about is
+//! exactly the turn a restart would report as external. An unresolved
+//! submission is never silently evicted to make room: at the per-thread cap the
+//! next prompt is refused instead, because dropping an older unresolved id is
+//! the same loss. Only a write that already succeeded is ever discarded, by the
+//! tail caps below and by an explicit expiry on the thread-wide fallback: a
+//! submission whose response never came and whose item never appeared stops
+//! vouching for a later external turn after [`PENDING_TTL_MS`].
+//!
 //! **Degrading safely.** This file is the only evidence of who wrote a turn, so
 //! it fails **closed**: a corrupt, unreadable or unwritable record marks the
 //! whole record untrusted, and every message is then answered as cola-authored
-//! (with an error logged) until a human inspects the file. Silently answering
+//! (with an error logged) until a human inspects the file. A prompt on an
+//! untrusted record is refused rather than sent unrecorded. Silently answering
 //! "external" would notify the user about cola's own turns.
 //!
 //! What is *not* this file's problem: a message from another client that was
@@ -66,10 +80,21 @@ use crate::state::ClientScoped;
 /// plenty; the cap keeps a long-lived thread's file from growing forever.
 const MAX_TURNS_PER_THREAD: usize = 128;
 
-/// How many unresolved submissions one thread may carry. A resolved one is
-/// removed by the next history read; the cap keeps a server that never echoes a
-/// chosen id from growing the file without bound.
+/// How many unresolved submissions one thread may carry. Reaching it **refuses**
+/// the next prompt instead of evicting the oldest: an unresolved id is a
+/// provenance record that may still be owed, and dropping it would make the
+/// turn it names look external after a restart.
 const MAX_PENDING_PER_THREAD: usize = 32;
+
+/// How long an unresolved submission vouches for the thread-wide (id-less)
+/// fallback. A lost response reconciles as soon as its item appears, normally
+/// well inside this window; a request that never reached the server must stop
+/// making a later external turn look cola's. The precise id check is not
+/// bounded by this: no other client can mint cola's chosen id.
+#[cfg(not(test))]
+pub(crate) const PENDING_TTL_MS: i64 = 5 * 60 * 1000;
+#[cfg(test)]
+pub(crate) const PENDING_TTL_MS: i64 = 50;
 
 /// The version-1 (ADR-0091) file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,7 +107,17 @@ struct AuthorshipFile {
     #[serde(default)]
     turns: ClientScoped<Vec<String>>,
     #[serde(default)]
-    pending: ClientScoped<Vec<String>>,
+    pending: ClientScoped<Vec<PendingSubmission>>,
+}
+
+/// One unresolved submission: the id cola chose for a prompt, and when it was
+/// recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingSubmission {
+    id: String,
+    /// Epoch milliseconds, cola's own clock — the server never sees this
+    /// record. It bounds the thread-wide fallback ([`PENDING_TTL_MS`]).
+    at_ms: i64,
 }
 
 #[derive(Default)]
@@ -92,7 +127,7 @@ struct State {
     /// for a prompt whose `turn/start` may have been accepted without a usable
     /// answer. A chosen id (not a count): the user item the server persisted
     /// carries exactly this id, so a later read can bind the turn precisely.
-    pending: ClientScoped<Vec<String>>,
+    pending: ClientScoped<Vec<PendingSubmission>>,
     /// In-memory markers for a prompt with no chosen id (the bridge always
     /// passes one, so this is a defensive path): a count per thread, since an
     /// anonymous submission has nothing to match a later item against anyway.
@@ -202,28 +237,66 @@ impl Authorship {
         Ok(record)
     }
 
-    /// Mark a cola prompt as in flight for `thread` **before** it is sent. The
-    /// chosen submission id is durable, so a lost response (or a restart before
-    /// the turn id is known) still lets a later read recognise the item the
-    /// server persisted for it.
-    pub(crate) fn begin(&self, thread: &str, submission: Option<&str>) {
+    /// Mark a cola prompt as in flight for `thread` **before** it is sent, and
+    /// fail when that marker cannot be made durable. The adapter must not send
+    /// a prompt the record did not learn about: a restart would then report the
+    /// accepted turn as external.
+    ///
+    /// `submission` is the id cola chose (`clientUserMessageId`); `None` is the
+    /// defensive anonymous path, which has nothing a later read could match and
+    /// so lives only in memory.
+    pub(crate) fn begin(&self, thread: &str, submission: Option<&str>) -> Result<(), String> {
         let mut state = self.state.lock().expect("authorship record");
         let Some(submission) = submission else {
             *state.anonymous.entry(thread.to_string()).or_default() += 1;
-            return;
+            return Ok(());
         };
-        {
-            let pending = state.pending.entry_mut(&self.client_id, thread);
-            if pending.iter().any(|known| known == submission) {
-                return;
-            }
-            pending.push(submission.to_string());
-            if pending.len() > MAX_PENDING_PER_THREAD {
-                let excess = pending.len() - MAX_PENDING_PER_THREAD;
-                pending.drain(..excess);
-            }
+        let now = now_ms();
+        drop_expired(&mut state, &self.client_id, thread, now);
+        if self.path.is_some() && state.untrusted {
+            return Err(format!(
+                "the authored-turn record is unusable; refusing to submit `{submission}` \
+                 without a durable provenance record"
+            ));
         }
-        self.persist_or_untrust(&mut state);
+        let at_capacity = {
+            let pending = state.pending.entry_mut(&self.client_id, thread);
+            if let Some(index) = pending.iter().position(|known| known.id == submission) {
+                // A retry re-sends the same chosen id: refresh its window rather
+                // than adding a second marker.
+                pending[index].at_ms = now;
+                false
+            } else if pending.len() >= MAX_PENDING_PER_THREAD {
+                true
+            } else {
+                pending.push(PendingSubmission {
+                    id: submission.to_string(),
+                    at_ms: now,
+                });
+                false
+            }
+        };
+        if at_capacity {
+            return Err(format!(
+                "the authored-turn record already holds {MAX_PENDING_PER_THREAD} unresolved \
+                 submissions for this thread; inspect `authored_turns.json` before submitting again"
+            ));
+        }
+        if self.path.is_none() {
+            return Ok(());
+        }
+        if let Err(error) = self.persist(&state) {
+            // Roll the marker back: the prompt is refused, and a later read
+            // must not treat it as in flight.
+            if let Some(pending) = state.pending.get_mut(&self.client_id, thread) {
+                pending.retain(|known| known.id != submission);
+            }
+            prune_pending(&mut state.pending, &self.client_id, thread);
+            return Err(format!(
+                "the authored-turn record could not be persisted: {error}"
+            ));
+        }
+        Ok(())
     }
 
     /// A prompt the server **definitely refused** (it answered an error): drop
@@ -245,7 +318,7 @@ impl Authorship {
             .get_mut(&self.client_id, thread)
             .is_some_and(|pending| {
                 let before = pending.len();
-                pending.retain(|known| known != submission);
+                pending.retain(|known| known.id != submission);
                 pending.len() != before
             });
         prune_pending(&mut state.pending, &self.client_id, thread);
@@ -262,7 +335,7 @@ impl Authorship {
         match submission {
             Some(submission) => {
                 if let Some(pending) = state.pending.get_mut(&self.client_id, thread) {
-                    pending.retain(|known| known != submission);
+                    pending.retain(|known| known.id != submission);
                 }
                 prune_pending(&mut state.pending, &self.client_id, thread);
             }
@@ -275,49 +348,40 @@ impl Authorship {
                 }
             }
         }
-        {
-            let turns = state.turns.entry_mut(&self.client_id, thread);
-            if !turns.iter().any(|recorded| recorded == turn) {
-                turns.push(turn.to_string());
-                if turns.len() > MAX_TURNS_PER_THREAD {
-                    let excess = turns.len() - MAX_TURNS_PER_THREAD;
-                    turns.drain(..excess);
-                }
-            }
-        }
+        record_turn(&mut state, &self.client_id, thread, turn);
         self.persist_or_untrust(&mut state);
     }
 
-    /// Bind a durable pending submission to the turn its user item landed in.
-    /// The history read that sees `userMessage.clientId == submission` is what
-    /// resolves a lost `turn/start` response, across a restart included. A
-    /// submission that is no longer pending is a no-op (already bound), so a
-    /// read never rewrites the file for nothing.
+    /// Bind a submission to the turn its user item landed in. The history read
+    /// that sees `userMessage.clientId == submission` is what resolves a lost
+    /// `turn/start` response, across a restart included. The caller decides
+    /// which submissions are eligible (a pending marker, or one carrying
+    /// cola's own id convention); this records the turn and clears any marker.
     pub(crate) fn bind_submission(&self, thread: &str, submission: &str, turn: &str) {
         let mut state = self.state.lock().expect("authorship record");
-        let was_pending = state
+        let mut changed = state
             .pending
             .get_mut(&self.client_id, thread)
             .is_some_and(|pending| {
                 let before = pending.len();
-                pending.retain(|known| known != submission);
+                pending.retain(|known| known.id != submission);
                 pending.len() != before
             });
         prune_pending(&mut state.pending, &self.client_id, thread);
-        if !was_pending {
-            return;
+        changed |= record_turn(&mut state, &self.client_id, thread, turn);
+        if changed {
+            self.persist_or_untrust(&mut state);
         }
-        {
-            let turns = state.turns.entry_mut(&self.client_id, thread);
-            if !turns.iter().any(|recorded| recorded == turn) {
-                turns.push(turn.to_string());
-                if turns.len() > MAX_TURNS_PER_THREAD {
-                    let excess = turns.len() - MAX_TURNS_PER_THREAD;
-                    turns.drain(..excess);
-                }
-            }
+    }
+
+    /// Drop an expired submission from this thread's record, persisting the
+    /// removal when one was due. Called by the history read, so a marker whose
+    /// request never reached the server does not stay in the file forever.
+    pub(crate) fn expire(&self, thread: &str) {
+        let mut state = self.state.lock().expect("authorship record");
+        if drop_expired(&mut state, &self.client_id, thread, now_ms()) {
+            self.persist_or_untrust(&mut state);
         }
-        self.persist_or_untrust(&mut state);
     }
 
     /// Forget a thread's record (the thread was deleted): nothing can ask about
@@ -336,28 +400,36 @@ impl Authorship {
         !self.state.lock().expect("authorship record").untrusted
     }
 
-    /// Whether a prompt is in flight for `thread`. The turn id is not known
-    /// yet, so an item with no client id in the thread's live turn is the
-    /// record's stand-in until the response (or a history read) binds it.
+    /// Whether a **live** prompt is in flight for `thread`. The turn id is not
+    /// known yet, so an item with no client id in the thread's live turn is the
+    /// record's stand-in until the response (or a history read) binds it. The
+    /// window is bounded by [`PENDING_TTL_MS`]: a submission whose request
+    /// never reached the server must stop vouching for later turns.
     pub(crate) fn is_pending(&self, thread: &str) -> bool {
         let state = self.state.lock().expect("authorship record");
+        let now = now_ms();
         state
             .pending
             .get(&self.client_id, thread)
-            .is_some_and(|pending| !pending.is_empty())
+            .is_some_and(|pending| pending.iter().any(|known| is_live(known, now)))
             || state.anonymous.get(thread).copied().unwrap_or(0) > 0
     }
 
-    /// Whether `submission` is one of this thread's unresolved chosen ids. This
-    /// is the precise provenance answer: the item carries exactly the id cola
-    /// sent, so no other client's message can match it.
+    /// Whether `submission` is a **live** unresolved chosen id. This is the
+    /// precise provenance answer: the item carries exactly the id cola sent, so
+    /// no other client's message can match it.
     pub(crate) fn is_pending_submission(&self, thread: &str, submission: &str) -> bool {
+        let now = now_ms();
         self.state
             .lock()
             .expect("authorship record")
             .pending
             .get(&self.client_id, thread)
-            .is_some_and(|pending| pending.iter().any(|known| known == submission))
+            .is_some_and(|pending| {
+                pending
+                    .iter()
+                    .any(|known| known.id == submission && is_live(known, now))
+            })
     }
 
     /// Whether a message in `thread`'s turn `turn` is cola's own.
@@ -376,10 +448,11 @@ impl Authorship {
                 .get(&self.client_id, thread)
                 .is_some_and(|turns| turns.iter().any(|recorded| recorded == turn)),
             None => {
+                let now = now_ms();
                 state
                     .pending
                     .get(&self.client_id, thread)
-                    .is_some_and(|pending| !pending.is_empty())
+                    .is_some_and(|pending| pending.iter().any(|known| is_live(known, now)))
                     || state.anonymous.get(thread).copied().unwrap_or(0) > 0
             }
         }
@@ -417,9 +490,47 @@ impl Authorship {
     }
 }
 
+/// Cola's clock in epoch milliseconds (this record is never ordered against a
+/// server time).
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Whether a submission is still inside the thread-wide fallback's window.
+fn is_live(submission: &PendingSubmission, now: i64) -> bool {
+    now.saturating_sub(submission.at_ms) <= PENDING_TTL_MS
+}
+
+/// Drop expired submissions for one thread, reporting whether anything was
+/// removed (the caller persists once).
+fn drop_expired(state: &mut State, client: &str, thread: &str, now: i64) -> bool {
+    let changed = state.pending.get_mut(client, thread).is_some_and(|pending| {
+        let before = pending.len();
+        pending.retain(|submission| is_live(submission, now));
+        pending.len() != before
+    });
+    prune_pending(&mut state.pending, client, thread);
+    changed
+}
+
+/// Record a bound turn, keeping the per-thread tail bounded. Returns whether
+/// the record changed.
+fn record_turn(state: &mut State, client: &str, thread: &str, turn: &str) -> bool {
+    let turns = state.turns.entry_mut(client, thread);
+    if turns.iter().any(|recorded| recorded == turn) {
+        return false;
+    }
+    turns.push(turn.to_string());
+    if turns.len() > MAX_TURNS_PER_THREAD {
+        let excess = turns.len() - MAX_TURNS_PER_THREAD;
+        turns.drain(..excess);
+    }
+    true
+}
+
 /// Drop a thread's pending section once its last submission resolved, so a
 /// written file never carries an empty list.
-fn prune_pending(pending: &mut ClientScoped<Vec<String>>, client: &str, thread: &str) {
+fn prune_pending(pending: &mut ClientScoped<Vec<PendingSubmission>>, client: &str, thread: &str) {
     if pending
         .get(client, thread)
         .is_some_and(|submissions| submissions.is_empty())
@@ -445,7 +556,9 @@ mod tests {
     fn written(path: &std::path::Path, client: &str, thread: &str, turns: &[&str]) -> Arc<Authorship> {
         let record = Authorship::open(path.to_path_buf(), client).expect("the record loads");
         for turn in turns {
-            record.begin(thread, Some(&format!("msg_cola_{turn}")));
+            record
+                .begin(thread, Some(&format!("msg_cola_{turn}")))
+                .expect("the marker persists");
             record.bind(thread, turn, Some(&format!("msg_cola_{turn}")));
         }
         record
@@ -492,7 +605,9 @@ mod tests {
             "another client's turns are not this client's"
         );
         // Its own write preserves the other client's section verbatim.
-        opencode.begin("thread-1", Some("msg_cola_own"));
+        opencode
+            .begin("thread-1", Some("msg_cola_own"))
+            .expect("the marker persists");
         opencode.bind("thread-1", "turn-2", Some("msg_cola_own"));
         let file: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("the file")).expect("json");
@@ -511,7 +626,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("authored_turns.json");
         let first = Authorship::open(path.clone(), "codex").expect("the record opens");
-        first.begin("thread-1", Some("msg_cola_lost"));
+        first
+            .begin("thread-1", Some("msg_cola_lost"))
+            .expect("the marker persists");
         assert!(first.is_pending("thread-1"));
         assert!(first.is_pending_submission("thread-1", "msg_cola_lost"));
         drop(first);
@@ -534,11 +651,105 @@ mod tests {
         );
     }
 
+    /// Finding 1: a marker that cannot be made durable refuses the prompt —
+    /// nothing may be sent the record did not learn about — and a failed write
+    /// does not distrust the record's existing, valid contents.
+    #[test]
+    fn an_unwritable_marker_is_refused_and_costs_no_trust() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("authored_turns.json");
+        let record = written(&path, "codex", "thread-1", &["turn-1"]);
+        // A directory at the writer's temp path makes the atomic replace fail
+        // (deterministically, as root too).
+        std::fs::create_dir(path.with_extension("tmp")).expect("block the temp path");
+
+        let error = record
+            .begin("thread-1", Some("msg_cola_new"))
+            .expect_err("the marker cannot be persisted");
+        assert!(
+            error.contains("could not be persisted"),
+            "the refusal names the record: {error}"
+        );
+        assert!(
+            !record.is_pending_submission("thread-1", "msg_cola_new"),
+            "a refused marker is rolled back"
+        );
+        assert!(
+            record.is_trusted(),
+            "the valid record is still trustworthy for later reads"
+        );
+        assert!(
+            record.is_authored("thread-1", Some("turn-1")),
+            "the existing turns still answer"
+        );
+    }
+
+    /// A record that could not be read cannot take a new marker either: the
+    /// prompt is refused rather than sent unrecorded.
+    #[test]
+    fn a_corrupt_record_refuses_a_new_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("authored_turns.json");
+        std::fs::write(&path, "{not json").expect("write");
+        let record = Authorship::open(path, "codex").expect("a corrupt file loads");
+        assert!(!record.is_trusted());
+        let error = record
+            .begin("thread-1", Some("msg_cola_1"))
+            .expect_err("an unusable record refuses");
+        assert!(error.contains("unusable"), "{error}");
+        assert!(
+            record.is_authored("thread-1", Some("any-turn")),
+            "the record still fails closed for reads"
+        );
+    }
+
+    /// Finding 2: at capacity an unresolved submission is never evicted; the
+    /// new prompt is refused instead.
+    #[test]
+    fn the_pending_cap_refuses_rather_than_evicting() {
+        let record = Authorship::in_memory();
+        for index in 0..MAX_PENDING_PER_THREAD {
+            record
+                .begin("thread-1", Some(&format!("msg_cola_{index}")))
+                .expect("below the cap");
+        }
+        let error = record
+            .begin("thread-1", Some("msg_cola_over_capacity"))
+            .expect_err("at the cap");
+        assert!(error.contains("unresolved submissions"), "{error}");
+        assert!(
+            record.is_pending_submission("thread-1", "msg_cola_0"),
+            "the oldest unresolved submission is still owed"
+        );
+        assert!(!record.is_pending_submission("thread-1", "msg_cola_over_capacity"));
+    }
+
+    /// Finding 3: a submission whose request never reached the server stops
+    /// vouching for the thread-wide fallback once its window elapses. The item
+    /// that does carry the chosen id remains precisely cola's (nothing else can
+    /// mint it), but a foreign live turn with no client id does not.
+    #[test]
+    fn an_expired_marker_stops_vouching_for_a_live_turn() {
+        let record = Authorship::in_memory();
+        record
+            .begin("thread-1", Some("msg_cola_never"))
+            .expect("the marker is recorded");
+        std::thread::sleep(std::time::Duration::from_millis((PENDING_TTL_MS as u64) + 30));
+        assert!(!record.is_pending("thread-1"), "the fallback expired");
+        assert!(
+            !record.is_pending_submission("thread-1", "msg_cola_never"),
+            "the precise window expired too"
+        );
+        assert!(!record.is_authored("thread-1", None));
+    }
+
     #[test]
     fn a_definite_refusal_clears_only_its_own_marker() {
         let record = Authorship::in_memory();
-        record.begin("thread-1", Some("msg_cola_refused"));
-        record.begin("thread-1", Some("msg_cola_retry"));
+        record
+            .begin("thread-1", Some("msg_cola_refused"))
+            .expect("marker");
+        record.begin("thread-1", Some("msg_cola_retry")).expect("marker");
         record.abandon("thread-1", Some("msg_cola_refused"));
         assert!(!record.is_pending_submission("thread-1", "msg_cola_refused"));
         assert!(
@@ -551,7 +762,7 @@ mod tests {
     fn a_pending_prompt_answers_before_its_turn_id_is_known() {
         let record = Authorship::in_memory();
         assert!(!record.is_authored("thread-1", None), "nothing in flight");
-        record.begin("thread-1", Some("msg_cola_1"));
+        record.begin("thread-1", Some("msg_cola_1")).expect("marker");
         assert!(
             record.is_authored("thread-1", None),
             "the provenance window before the response is cola's"
@@ -571,7 +782,7 @@ mod tests {
     #[test]
     fn an_abandoned_prompt_leaves_no_marker() {
         let record = Authorship::in_memory();
-        record.begin("thread-1", Some("msg_cola_1"));
+        record.begin("thread-1", Some("msg_cola_1")).expect("marker");
         record.abandon("thread-1", Some("msg_cola_1"));
         assert!(!record.is_authored("thread-1", None));
     }
@@ -581,8 +792,8 @@ mod tests {
     #[test]
     fn a_pending_marker_is_counted_per_prompt() {
         let record = Authorship::in_memory();
-        record.begin("thread-1", None);
-        record.begin("thread-1", None);
+        record.begin("thread-1", None).expect("marker");
+        record.begin("thread-1", None).expect("marker");
         record.bind("thread-1", "turn-1", None);
         assert!(record.is_authored("thread-1", Some("turn-1")));
         assert!(
@@ -605,8 +816,6 @@ mod tests {
             record.is_authored("thread-1", Some("turn-1")),
             "cola's own turn must never be reported external"
         );
-        record.begin("thread-1", Some("msg_cola_1"));
-        record.bind("thread-1", "turn-2", Some("msg_cola_1"));
         assert_eq!(
             std::fs::read_to_string(&path).expect("the bytes"),
             "{not json",
@@ -630,7 +839,10 @@ mod tests {
         let path = dir.path().join("authored_turns.json");
         std::fs::write(
             &path,
-            r#"{"turns":{"codex":{"thread-1":["turn-1"]}},"pending":{"codex":{"thread-1":["msg_cola_1"]}}}"#,
+            format!(
+                r#"{{"turns":{{"codex":{{"thread-1":["turn-1"]}}}},"pending":{{"codex":{{"thread-1":[{{"id":"msg_cola_1","at_ms":{}}}]}}}}}}"#,
+                now_ms()
+            ),
         )
         .expect("write");
 
@@ -647,8 +859,8 @@ mod tests {
         );
         assert_eq!(file["turns"]["codex"]["thread-1"], serde_json::json!(["turn-1"]));
         assert_eq!(
-            file["pending"]["codex"]["thread-1"],
-            serde_json::json!(["msg_cola_1"])
+            file["pending"]["codex"]["thread-1"][0]["id"],
+            serde_json::json!("msg_cola_1")
         );
     }
 
@@ -657,7 +869,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("authored_turns.json");
         let record = written(&path, "codex", "thread-1", &["turn-1"]);
-        record.begin("thread-1", Some("msg_cola_pending"));
+        record
+            .begin("thread-1", Some("msg_cola_pending"))
+            .expect("marker");
         record.forget("thread-1");
         assert!(!record.is_authored("thread-1", Some("turn-1")));
         assert!(!record.is_pending("thread-1"));
@@ -674,7 +888,9 @@ mod tests {
     fn the_per_thread_tail_is_bounded() {
         let record = Authorship::in_memory();
         for index in 0..(MAX_TURNS_PER_THREAD + 10) {
-            record.begin("thread-1", Some(&format!("msg_cola_{index}")));
+            record
+                .begin("thread-1", Some(&format!("msg_cola_{index}")))
+                .expect("marker");
             record.bind(
                 "thread-1",
                 &format!("turn-{index}"),
@@ -687,22 +903,7 @@ mod tests {
         );
         assert!(
             !record.is_authored("thread-1", Some("turn-0")),
-            "the cap drops the oldest, not the newest"
-        );
-    }
-
-    #[test]
-    fn the_pending_tail_is_bounded() {
-        let record = Authorship::in_memory();
-        for index in 0..(MAX_PENDING_PER_THREAD + 5) {
-            record.begin("thread-1", Some(&format!("msg_cola_{index}")));
-        }
-        assert!(
-            record.is_pending_submission("thread-1", &format!("msg_cola_{}", MAX_PENDING_PER_THREAD + 4))
-        );
-        assert!(
-            !record.is_pending_submission("thread-1", "msg_cola_0"),
-            "the cap drops the oldest unresolved submission"
+            "the cap drops the oldest bound turn, not the newest"
         );
     }
 }

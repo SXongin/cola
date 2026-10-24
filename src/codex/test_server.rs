@@ -325,6 +325,8 @@ struct State {
     /// a `/stop` can be exercised in the window before the server persists the
     /// turn.
     hide_live_turns: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// One-shot: leave the next `thread/read` unanswered (a stalled read).
+    silent_thread_read: std::sync::atomic::AtomicBool,
     /// `model/list` calls received, so a paged catalog is proved by its pages.
     model_list_calls: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
@@ -370,6 +372,7 @@ impl Default for State {
             reject_compact: std::sync::atomic::AtomicBool::new(false),
             drop_on_compact: std::sync::atomic::AtomicBool::new(false),
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             model_list_calls: AtomicUsize::new(0),
             page_size: 2,
         }
@@ -778,6 +781,11 @@ impl FakeServer {
         self.state.drop_on_compact.store(true, Ordering::SeqCst);
     }
 
+    /// Leave the next `thread/read` unanswered, modelling a stalled request.
+    pub(crate) fn silence_next_thread_read(&self) {
+        self.state.silent_thread_read.store(true, Ordering::SeqCst);
+    }
+
     /// Hide a thread's in-progress turns from the next `reads` `thread/read`
     /// answers, modelling `/stop` landing before the server persisted the turn.
     pub(crate) fn hide_live_turn_for(&self, thread_id: &str, reads: usize) {
@@ -929,6 +937,9 @@ where
             replying(sink, id, list_threads(state, &params)).await
         }
         Some("thread/read") => {
+            if state.silent_thread_read.swap(false, Ordering::SeqCst) {
+                return true;
+            }
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let hide_live = {
                 let mut hidden = state.hide_live_turns.lock().expect("hidden live turns");
