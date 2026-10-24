@@ -97,11 +97,15 @@ enum Subcommand {
     Doctor {
         /// Skip the real-turn provider probe. `doctor` runs it by default
         /// because a provider that cannot complete a turn is the failure a
-        /// login-shaped check would miss; the probe writes a scratch thread
-        /// (deleted afterwards) on a daemon cola does not own, so opt out when
-        /// that write or spend is unwanted.
+        /// login-shaped check would miss; the probe starts and deletes a
+        /// scratch thread on the shared daemon and may incur provider spend,
+        /// so opt out when that write or spend is unwanted.
         #[arg(long)]
         no_turn_check: bool,
+        /// Deprecated no-op: the turn probe is on by default now. Accepted so
+        /// scripts written against the previous release keep working.
+        #[arg(long, hide = true)]
+        check_turn: bool,
     },
     /// Print the tail of the log file; `-f` follows it (ADR-0081).
     Logs {
@@ -955,7 +959,11 @@ async fn main() -> anyhow::Result<()> {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
         return status_cli(json, cli.config.as_deref(), &log_path).await;
     }
-    if let Some(Subcommand::Doctor { no_turn_check }) = cli.subcommand {
+    if let Some(Subcommand::Doctor {
+        no_turn_check,
+        check_turn: _,
+    }) = cli.subcommand
+    {
         let log_path = cli.log_file.clone().unwrap_or_else(default_log_path);
         let state = status::ConfigState::from_env(cli.config.as_deref());
         let client = status_client(&state);
@@ -1140,6 +1148,39 @@ async fn update_cli(check_only: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ticket #883: the turn probe is on by default, `--no-turn-check` is the
+    /// opt-out, and the previous release's `--check-turn` remains accepted as a
+    /// hidden no-op alias.
+    #[test]
+    fn doctor_flags_keep_the_legacy_alias_and_the_opt_out() {
+        let plain = Cli::try_parse_from(["cola", "doctor"]).expect("plain doctor parses");
+        assert!(matches!(
+            plain.subcommand,
+            Some(Subcommand::Doctor {
+                no_turn_check: false,
+                check_turn: false,
+            })
+        ));
+
+        let legacy = Cli::try_parse_from(["cola", "doctor", "--check-turn"]).expect("legacy alias parses");
+        assert!(matches!(
+            legacy.subcommand,
+            Some(Subcommand::Doctor {
+                no_turn_check: false,
+                check_turn: true,
+            })
+        ));
+
+        let opted_out = Cli::try_parse_from(["cola", "doctor", "--no-turn-check"]).expect("opt-out parses");
+        assert!(matches!(
+            opted_out.subcommand,
+            Some(Subcommand::Doctor {
+                no_turn_check: true,
+                ..
+            })
+        ));
+    }
 
     /// The named-active-client regression (#872/#875): `cola status`/`doctor`
     /// must build their probe from the **active** Agent Client's effective

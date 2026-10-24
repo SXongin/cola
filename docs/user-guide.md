@@ -520,13 +520,15 @@ a named failure. With no local client at all (a Feishu-only deployment) the
 check passes, because there is nothing to attach.
 
 `cola doctor` proves the configured provider can complete a real turn: it starts
-a minimal turn on a scratch thread and observes `turn/completed`, failing on a
-retryable or terminal error or when the turn does not finish within its
-60-second budget. That is a write on a daemon cola does not own — the scratch
-thread is named as a doctor probe and deleted afterwards, and a cleanup failure
-is reported as a warning — so `--no-turn-check` is the explicit opt-out. No
-check reads a ChatGPT account state: a provider-keyed `[model_providers.*]`
-setup is fully green.
+a minimal turn on a scratch thread on the **shared** daemon (which cola does not
+own) and observes `turn/completed`, failing on a retryable or terminal error or
+when the turn does not finish within its 60-second budget. That call writes to
+the shared daemon and **may incur provider spend**: doctor starts the named
+scratch thread, then interrupts the turn while it is live and deletes the thread
+(a cleanup failure is reported as a warning). `--no-turn-check` skips the probe;
+`--check-turn` is accepted as a no-op alias for scripts written against the
+previous release. No check reads a ChatGPT account state: a provider-keyed
+`[model_providers.*]` setup is fully green.
 
 `cola config path|show|validate` prints the resolved config path, the effective
 config with the app secret masked, or a parse check. `cola version` mirrors
