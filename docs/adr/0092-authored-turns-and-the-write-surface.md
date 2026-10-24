@@ -29,23 +29,46 @@ silently assumed the *message id is cola's*:
 adapter writes `authored_turns.json` beside `sessions.json`:
 
 ```json
-{ "version": 1, "turns": { "<client id>": { "<thread id>": ["turn-1"] } } }
+{
+  "version": 1,
+  "turns":   { "<client id>": { "<thread id>": ["turn-1"] } },
+  "pending": { "<client id>": { "<thread id>": ["msg_cola_…"] } }
+}
 ```
 
-It follows ADR-0091 for scope, version and migration. Authorship is
+It follows ADR-0091 for scope, version and migration: a version-0 body parses and
+is rewritten once at load (ADR-0091 §4), and a future version is refused. The
+file was never written by a released build, so the only version-0 shape is a
+hand-made one in this same form — migrating it is cheaper than teaching a user
+to delete it, and refusing it would make a harmless file block startup.
+Authorship is
 **turn-granular** because that is the finest granularity the protocol offers:
 a `turn/steer` and a folded `turn/start` both put a user message inside a turn
 that already exists, with no per-message author. A turn cola started therefore
 answers "cola's" for every user message in it, and the durable record survives
 a restart — the case the criterion names.
 
-**2. The record is bound before the prompt can produce output.** The turn id
-only arrives in the `turn/start` response, but the server can emit the turn's
-user item to the subscription before that response is processed. `prompt`
-therefore records a **pending submission** for the thread before the request
-goes out; an authorship question for a turn this process has not bound yet is
-answered "cola's" while that marker exists. The response binds the turn id and
-writes the file before `prompt` returns.
+**2. The chosen submission id is durable before the prompt can produce output,
+and an ambiguous outcome stays reconcilable.** The turn id only arrives in the
+`turn/start` response, but the server can emit the turn's user item before that
+response is processed, and the response itself can be lost (the connection
+closes after the server accepted the request). `prompt` therefore records the id
+it chose for the message (`clientUserMessageId`, a `msg_cola_…` value)
+**durably** before the request goes out. Until the turn is bound:
+
+- an item whose `userMessage.clientId` is that chosen id is cola's — a precise
+  match no other client's message can satisfy; and
+- an item with no client id is cola's only while it belongs to the thread's
+  live turn (the pre-response window).
+
+The next history read binds the chosen id to the turn its item landed in, which
+is what recovers a lost response across a restart. A **definitely refused**
+request — the server answered a JSON-RPC error — clears the marker; every other
+failure (closed connection, no response, an undecodable result) keeps it,
+because the turn may exist. Pre-send failures (an unknown skill) are raised
+before the marker is written, so a later external turn on the thread is never
+suppressed by one. A submission with no chosen id cannot be reconciled at all,
+so its in-memory marker is always cleared when the call returns.
 
 **3. An unusable record fails closed.** A corrupt, unreadable or unwritable
 record makes the adapter answer **every** message as cola-authored, with an
@@ -100,9 +123,38 @@ right after a prompt is not a silent no-op. `thread/compact/start` is the
 compact; the resulting `contextCompaction` item projects as the neutral
 Compaction the existing card path renders exactly once (ADR-0082's Rendered
 Cursor rule). The protocol's item carries no reason, so the adapter records its
-own `/compact` request and the item consumes it: the row titles 手动, not 自动,
-and a failed request clears the marker so a later automatic compaction is never
-mislabelled.
+own `/compact` request and the item consumes it: the row titles 手动, not 自动.
+Only a definite refusal clears the marker; an ambiguous failure keeps it,
+because the compaction may have started and its item still needs the right
+title.
+
+## Considered options
+
+- **Read authorship from the server's `userMessage.clientId` alone.** Rejected
+  as the whole answer. It is the precise per-message signal and the adapter does
+  use it, but it lives only in the server's item stream and rollout: a restart
+  may read a history page without it, and a client that never sends the field
+  gives no signal at all. The durable turn record is independent of it.
+- **Keep the chosen ids in memory only (the first cut).** Rejected on review: a
+  restart between `turn/start` and the response would lose the only link to the
+  turn, and cola's own message would notify. Recording the id durably changes a
+  lost response from a silent misclassification into a reconcilable state.
+- **Abandon the pending marker on every error.** Rejected: a closed connection
+  after acceptance is indistinguishable from a refusal at the client, so
+  abandoning it on transport failures re-opens the same hole. Only a JSON-RPC
+  error is positive evidence the turn did not start.
+- **Scope the skill catalog per prompt directory.** Rejected because `prompt`
+  carries no directory on the neutral seam. The catalog is scoped per directory
+  by its reads and resolves a name to the most recently read scope, which is the
+  one the `/skill` command just refreshed; a skill deleted from every scope is
+  refused.
+- **Make `/model` durable with a thread-level setting.** Rejected: Codex's
+  schema accepts `model`/`effort` on `turn/start` and has no session-model
+  switch to mirror V2's. Inventing a client-side durable setting would make the
+  footer and the server disagree the first time another client changes it.
+- **A per-message authorship table keyed by item id.** Rejected: item ids are
+  only known after the item arrives, so the table could not be written before
+  the request — the exact window it would have to cover.
 
 ## Why
 
@@ -117,8 +169,11 @@ message, and a broken record must not produce it.
 ## Consequences
 
 - A cola turn is durable state, not a process-local guess; its file is bounded
-  (the newest 128 turns per thread) because authorship is only ever asked about
-  the newest user message.
+  (the newest 128 turns, and 32 unresolved submissions, per thread) because
+  authorship is only ever asked about the newest user message.
+- An unresolved chosen id is resolved by the next history read, which is the
+  bridge's own read before it asks authorship — so a lost response costs one
+  read, not a misclassification.
 - A message another client folds into a turn cola started is reported as
   cola-authored too. That is the protocol's granularity, and the alternative is
   guessing an author.
@@ -126,6 +181,9 @@ message, and a broken record must not produce it.
   `steer`); an adapter that does not override them keeps its generation's
   behaviour unchanged.
 - The transcript carries one more map, empty on every OpenCode read.
+- A `/stop` on an idle thread spends a short bounded lookup (about half a
+  second at worst) before it answers, because a stop racing a just-sent prompt
+  must still interrupt the run once the server persists it.
 - `[bridge]`-owned docs gain the new file in the state table; `/model`,
   `/skill`, `/stop` and `/compact` stay the same Feishu commands, with the
   client owning their wire.
