@@ -33,8 +33,10 @@
 //! criterion, and the user invoked the diagnostic explicitly, so its write is
 //! within that contract. The probe reserves an exclusive scratch directory,
 //! starts a named thread and a minimal turn there, then interrupts the turn
-//! while it is live and deletes the thread. `--no-turn-check` is the explicit
-//! opt-out, and the doctor check names the write and possible provider spend.
+//! while it is live and deletes the thread. It is bounded by a **60-second**
+//! budget ([`TURN_PROBE_TIMEOUT`]) so an unreachable or wedged provider fails
+//! with a named timeout; `--no-turn-check` is the explicit opt-out, and the
+//! doctor check names the write and possible provider spend.
 //!
 //! The `Backend` implementation that serves Sessions is [`super::backend`]
 //! (ticket #879); this type is the lifecycle half it builds on.
@@ -114,10 +116,14 @@ const ATTACH_ATTEMPTS: usize = 2;
 /// crosses the configured provider, so this is generous; the point of the
 /// bound is that an unreachable or wedged provider fails with a clear timeout
 /// instead of hanging the command.
-#[cfg(not(test))]
+///
+/// **This is the whole budget, in every build** — the user guide, the CLI help,
+/// the module docs and ADR-0090's amendment all state sixty seconds, and a
+/// `cfg(test)` twin used to make the tested value differ from the documented
+/// one. Tests that need a short bound never wait for this one (they script the
+/// turn's outcome), so there is nothing to shorten here; the value is pinned by
+/// `the_doctor_turn_probe_budget_matches_its_documentation`.
 const TURN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-#[cfg(test)]
-const TURN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A bound on each probe bookkeeping call (`thread/name/set`, `thread/delete`):
 /// a wedged connection must not extend the diagnosis past its own turn budget.
@@ -1037,7 +1043,9 @@ impl ServerLifecycle for CodexLifecycle {
     /// and then fails as a retryable `error`, so doctor's proof that the
     /// configured provider works is a real turn. This is a write on a daemon
     /// cola does not own, so the CLI runs it by default and offers
-    /// `--no-turn-check` as the explicit opt-out.
+    /// `--no-turn-check` as the explicit opt-out. The turn is bounded by
+    /// [`TURN_PROBE_TIMEOUT`] — the documented 60-second budget — and a miss
+    /// fails the check by name instead of hanging `doctor`.
     ///
     /// The scratch thread is named as cola's diagnostic and cleaned up on
     /// every exit path, including cancellation: a [`ProbeThread`] guard owns
@@ -2164,6 +2172,17 @@ mod tests {
             .expect("the embedded client is named");
         assert_eq!(embedded.state, UserClientState::Embedded);
         assert!(embedded.detail.contains("embedded"), "{}", embedded.detail);
+    }
+
+    /// The documented doctor turn-probe budget is one number, and it is this
+    /// constant: the user guide, the CLI help, this module's docs and ADR-0090's
+    /// amendment promise sixty seconds, and a `cfg(test)` twin used to make the
+    /// tested build differ from the documented one. Pinned here so a value
+    /// change has to touch the documentation it contradicts.
+    #[test]
+    fn the_doctor_turn_probe_budget_matches_its_documentation() {
+        assert_eq!(TURN_PROBE_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(format!("{TURN_PROBE_TIMEOUT:?}"), "60s");
     }
 
     /// Ticket #883 acceptance 3: a daemon-attached client plus a provider that

@@ -93,13 +93,15 @@ enum Subcommand {
     /// credentials, OpenCode binary/server, singleton lock, autostart path) and
     /// exit non-zero when a check fails (ADR-0081). For a Codex client it also
     /// reports the daemon, the user's own client and that the configured
-    /// provider can complete a real turn (ticket #883).
+    /// provider can complete a real turn within a 60-second budget (ticket
+    /// #883).
     Doctor {
         /// Skip the real-turn provider probe. `doctor` runs it by default
         /// because a provider that cannot complete a turn is the failure a
-        /// login-shaped check would miss; the probe starts and deletes a
-        /// scratch thread on the shared daemon and may incur provider spend,
-        /// so opt out when that write or spend is unwanted.
+        /// login-shaped check would miss; the probe is bounded at 60 seconds
+        /// and starts and deletes a scratch thread on the shared daemon, and it
+        /// may incur provider spend, so opt out when that write or spend is
+        /// unwanted.
         #[arg(long)]
         no_turn_check: bool,
         /// Deprecated no-op: the turn probe is on by default now. Accepted so
