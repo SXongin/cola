@@ -563,6 +563,13 @@ impl OpenCodeBackend {
             .await
     }
 
+    /// Whether the attached generation publishes a Background Task surface
+    /// (V2 does; V1 carries none). See
+    /// [`crate::backend::Backend::background_tasks_supported`].
+    pub fn background_tasks_supported(&self) -> bool {
+        self.strategy().background_tasks_supported()
+    }
+
     /// One shell's captured output window (spec #588, #592). See
     /// [`crate::backend::Backend::shell_output`].
     pub async fn shell_output(

@@ -21,6 +21,7 @@ pub(crate) fn case() -> SessionCase {
         keeps_session_selection: false,
         reuse_continues_an_admitted_turn: true,
         resume_supported: false,
+        background_tasks_supported: false,
         mount,
         mount_transcript,
         mount_recorded_transcript,

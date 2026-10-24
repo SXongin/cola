@@ -149,6 +149,12 @@ impl RuntimeReconcile {
         transcript: &mut SessionTranscript,
         read_timeout_ms: u64,
     ) -> Option<ReconcilePass> {
+        if !backend.background_tasks_supported() {
+            // A client with no Background Task surface has nothing to
+            // reconcile: no verdict, no child evidence, no shell window. The
+            // absence is the client's declaration, not an empty read.
+            return None;
+        }
         let (shells, children) = live_task_ids(transcript);
         if shells.is_empty() && children.is_empty() {
             return None;
@@ -302,6 +308,9 @@ pub(crate) async fn reconcile_now(
     transcript: &mut SessionTranscript,
     budget: CycleBudget,
 ) -> Option<ReconcilePass> {
+    if !backend.background_tasks_supported() {
+        return None;
+    }
     let (shells, children) = live_task_ids(transcript);
     if shells.is_empty() && children.is_empty() {
         return None;
@@ -588,5 +597,51 @@ mod tests {
         );
 
         let _ = handle.await;
+    }
+
+    /// Spec #860, ticket #880: a client that declares no Background Task
+    /// surface is not asked for a verdict at all. The empty ledger is a
+    /// declaration, not an empty read — so the reconcile spends no request and
+    /// leaves the scripted transcript untouched.
+    #[tokio::test]
+    async fn a_client_without_a_task_surface_spends_no_runtime_read() {
+        let mut mock = MockBackend::new(Vec::new());
+        mock.without_task_surface();
+        let mock = Arc::new(mock);
+        let calls = Arc::clone(&mock.task_runtime_calls);
+        let backend: Arc<dyn Backend> = mock;
+        let mut transcript = SessionTranscript::new(vec![]).with_background_tasks(vec![task(
+            "call_bg",
+            Some("sh_call_bg"),
+            None,
+        )]);
+
+        let reconcile = RuntimeReconcile::new();
+        reconcile
+            .interval_ms
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            reconcile
+                .observe(&backend, "ses_test", "/work", &mut transcript, 50)
+                .await
+                .is_none(),
+            "a client with no task surface has nothing to reconcile"
+        );
+        assert!(
+            reconcile_now(
+                &backend,
+                "ses_test",
+                Some("/work"),
+                &mut transcript,
+                CycleBudget::within(50)
+            )
+            .await
+            .is_none()
+        );
+        assert!(calls.lock().await.is_empty(), "no runtime verdict was asked for");
+        assert!(
+            transcript.background_tasks.len() == 1,
+            "the pass changes nothing, exactly as a failed read would"
+        );
     }
 }

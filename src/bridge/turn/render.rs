@@ -1443,6 +1443,7 @@ pub(super) fn commit_planned_entries(
 /// card changed at all: a terminal card that did still owes its handover PATCH,
 /// while one the read did not touch keeps the ending it shows, and a yielded
 /// card is only PATCHed for a real change.
+#[allow(clippy::too_many_arguments)] // the read's ledger inputs: acc + read + gather + clock + cadence + endings + plans + capability
 pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
@@ -1451,7 +1452,14 @@ pub(super) fn apply_ledger_read(
     cadence: LedgerCadence,
     endings: Endings<'_>,
     plans: Vec<PlannedEntry>,
+    task_surface: bool,
 ) -> bool {
+    if !task_surface {
+        // No Background Task surface: no ledger rows, no completion entries and
+        // no `⚠️ 状态待确认` marker — the client declared the surface absent, so
+        // the card renders no section rather than an empty one.
+        return false;
+    }
     let mut changed = acc
         .set_ledger_from_read(transcript, activities, now_ms, cadence)
         .owes();
@@ -1482,7 +1490,7 @@ pub(super) fn render_new_turn_parts(acc: &mut StreamAccumulator, transcript: &Se
     let rendered = render_turn_parts(acc, transcript, None);
     let plans = plan_ledger_entries(acc, transcript, acc.turn_anchor(), Endings::none());
     let entries = commit_planned_entries(acc, plans, Endings::none());
-    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
+    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new(), true).owes() | entries
 }
 
 /// The completion entries a FINALIZATION read owes (spec #588, #593): capture
@@ -1517,10 +1525,13 @@ pub(super) fn render_new_turn_parts_committing(
     bound: Option<usize>,
     endings: Endings<'_>,
     plans: Vec<PlannedEntry>,
+    task_surface: bool,
 ) -> bool {
     let rendered = render_turn_parts(acc, transcript, bound);
     let entries = commit_planned_entries(acc, plans, endings);
-    rendered | refresh_ledger(acc, transcript, &std::collections::HashMap::new()).owes() | entries
+    rendered
+        | refresh_ledger(acc, transcript, &std::collections::HashMap::new(), task_surface).owes()
+        | entries
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
@@ -2267,7 +2278,13 @@ fn refresh_ledger(
     acc: &mut StreamAccumulator,
     transcript: &SessionTranscript,
     activities: &std::collections::HashMap<String, TaskLiveness>,
+    task_surface: bool,
 ) -> super::state::LedgerChange {
+    if !task_surface {
+        // The client publishes no Background Task surface: the card carries no
+        // ledger at all (never an empty `⏳ 后台任务（0）`, never a status row).
+        return super::state::LedgerChange::default();
+    }
     if !acc.has_turn_anchor() {
         return super::state::LedgerChange::default();
     }
@@ -2575,7 +2592,12 @@ async fn render_and_flush_inner(
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => {
-                let ledger = refresh_ledger(&mut card.acc, transcript, &liveness);
+                let ledger = refresh_ledger(
+                    &mut card.acc,
+                    transcript,
+                    &liveness,
+                    backend.background_tasks_supported(),
+                );
                 let liveness_changed = apply_task_liveness(&mut card.acc, &panel_children, &liveness);
                 // Only the ROW half is progress: a rendered elapsed/age
                 // crossing its cadence (the clock half) must not renew the
@@ -2767,6 +2789,11 @@ async fn gather_render_liveness(
 ) {
     let panels = live_panel_children(cards, session_id).await;
     let mut children = panels.clone();
+    if !backend.background_tasks_supported() {
+        // No Background Task surface: a live `task` panel still renders, but
+        // there is no child-session liveness registry to read for it.
+        return (panels, std::collections::HashMap::new());
+    }
     children.extend(background_subagent_children(transcript));
     if children.is_empty() {
         return (panels, std::collections::HashMap::new());
@@ -3596,6 +3623,54 @@ mod tests {
                 Endings::with_facts(owed),
             ),
             "an owed Wake ending still commits its entry"
+        );
+    }
+
+    /// Spec #860, ticket #880: a client that declares no Background Task
+    /// surface renders **no ledger** — not an empty one — and never a
+    /// `⚠️ 状态待确认` row, even when a read carries task facts. The control on
+    /// the same read proves the gate is the capability, not an empty read.
+    #[test]
+    fn a_client_without_a_task_surface_renders_no_ledger_or_marker() {
+        let mut transcript = SessionTranscript::new(vec![typed_message(
+            "msg_user",
+            MessageRole::User,
+            Some(1_000),
+            vec![text_part("跑一下构建")],
+        )])
+        .with_background_tasks(vec![live_subagent_task("call_sub")]);
+        transcript.unconfirmed_tasks.insert("call_sub".to_string());
+
+        let mut without = StreamAccumulator::new("test");
+        without.capture_turn_anchor(&transcript);
+        render_turn_parts(&mut without, &transcript, None);
+        assert!(
+            !refresh_ledger(
+                &mut without,
+                &transcript,
+                &std::collections::HashMap::new(),
+                false
+            )
+            .owes(),
+            "no surface means no ledger debt"
+        );
+        let card = card_text(&without.build_card());
+        assert!(!card.contains("后台任务"), "no ledger section: {card}");
+        assert!(!card.contains("状态待确认"), "no unconfirmed row: {card}");
+
+        // The control: the same read on a client WITH the surface renders both.
+        let mut with = StreamAccumulator::new("test");
+        with.adopt_turn_anchor(&transcript.anchor_of_user("msg_user").expect("the turn anchor"));
+        render_turn_parts(&mut with, &transcript, None);
+        assert!(
+            refresh_ledger(&mut with, &transcript, &std::collections::HashMap::new(), true).owes(),
+            "the surface owes its ledger"
+        );
+        let card = card_text(&with.build_card());
+        assert!(card.contains("后台任务"), "the control has a ledger: {card}");
+        assert!(
+            card.contains("状态待确认"),
+            "the control renders the unconfirmed marker: {card}"
         );
     }
 

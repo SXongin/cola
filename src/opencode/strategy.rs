@@ -209,6 +209,15 @@ pub(crate) trait GenerationStrategy: Send + Sync {
         children: &[String],
     ) -> Result<TaskRuntime>;
 
+    /// Whether this generation publishes a Background Task surface at all
+    /// (V2's live shells, subagent child sessions and shell records). V1
+    /// carries none, so it keeps the default `false`; the adapter forwards this
+    /// to the neutral [`crate::backend::Backend::background_tasks_supported`],
+    /// which the Bridge reads to render no ledger and spend no runtime read.
+    fn background_tasks_supported(&self) -> bool {
+        false
+    }
+
     /// One shell's captured output window (spec #588, #592): V2 reads
     /// `GET /api/shell/{id}/output` twice — once with a cursor past the end to
     /// learn the record's size, then once for its last bytes. V1 carries no

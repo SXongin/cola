@@ -863,6 +863,14 @@ impl Backend for CodexClient {
         &self.tasks
     }
 
+    /// Codex's app-server publishes no Background Task surface: its items are
+    /// turn-scoped tool calls, with no shell records, child-session registry or
+    /// runtime verdict endpoint. The Bridge therefore renders no ledger for a
+    /// Codex session and spends no runtime reconcile read on it.
+    fn background_tasks_supported(&self) -> bool {
+        false
+    }
+
     async fn model_context_window(&self, _provider: &str, _model: &str) -> Result<Option<i64>> {
         // The Codex usage notification states the window for the running
         // model; a read with no attached turn has no figure to report.
@@ -1047,6 +1055,13 @@ impl Backend for CodexLifecycle {
 
     fn tasks(&self) -> &TasksHandle {
         &self.tasks
+    }
+
+    /// Every Codex client this lifecycle can attach has the same surface: the
+    /// app-server publishes no Background Tasks, so this is false before and
+    /// after an attach.
+    fn background_tasks_supported(&self) -> bool {
+        false
     }
 
     async fn model_context_window(&self, provider: &str, model: &str) -> Result<Option<i64>> {
