@@ -216,6 +216,33 @@ pub(crate) fn build_unshowable_permission_card(budget: usize) -> serde_json::Val
     )
 }
 
+/// The receipt line an inline permission block collapses to when cola **could
+/// not land** the refusal it wanted (a failed server reply). It claims nothing:
+/// the request is still pending and the sweep retries, so the block must not
+/// look like a decision either way.
+pub(crate) const UNSHOWABLE_PERMISSION_RETRY_RECEIPT: &str = "⏳ 目标无法完整显示，稍后重试";
+
+/// The header of the card that replaces a standalone permission card while
+/// cola retries a refusal it could not land. Pinned with the retry note below.
+pub(crate) const UNSHOWABLE_PERMISSION_RETRY_HEADER: &str = "⏳ 权限请求待重试";
+
+/// Why that card carries no controls.
+pub(crate) fn unshowable_permission_retry_note() -> &'static str {
+    "该权限请求的目标过长，卡片无法完整显示；cola 暂时无法自动拒绝，稍后会自动重试。\
+     这张卡片不提供批准操作。"
+}
+
+/// The card that replaces a standalone permission card while the refusal is
+/// retried: non-interactive, and claiming neither a decision nor another
+/// client's.
+pub(crate) fn build_unshowable_permission_retry_card() -> serde_json::Value {
+    card_shell(
+        UNSHOWABLE_PERMISSION_RETRY_HEADER,
+        "grey",
+        vec![json!({ "tag": "markdown", "content": unshowable_permission_retry_note() })],
+    )
+}
+
 /// The receipt line an inline permission block collapses to when cola refused
 /// it before it could be offered — its target is too long for the card to show
 /// in full, so approving it would approve unseen text. Pinned with the refusal
