@@ -37,53 +37,53 @@ pub(crate) fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// The control socket under a fixture's relocated home, as a suffix: the
-/// deepest path any codex fixture puts under its temp root.
+/// The control socket under a fixture's relocated home, as a **relative**
+/// suffix: the deepest path any codex fixture puts under its temp root.
+///
+/// Relative on purpose: [`Path::join`] with an absolute argument *replaces* the
+/// root, so a leading `/` here would measure the suffix alone and call every
+/// root short enough.
 #[cfg(unix)]
-const DEEPEST_FIXTURE_SOCKET: &str = "/codex-home/app-server-control/app-server-control.sock";
+const DEEPEST_FIXTURE_SOCKET: &str = "codex-home/app-server-control/app-server-control.sock";
+
+/// macOS is the tight one: `sun_path` is 104 bytes *including* the terminating
+/// NUL, so a 103-byte path is the longest that binds there (Linux has 108).
+#[cfg(unix)]
+const SUN_PATH_MAX: usize = 104;
+
+/// Whether `root` keeps its deepest fixture control socket inside `sun_path`.
+#[cfg(unix)]
+fn socket_path_fits(root: &Path) -> bool {
+    root.join(DEEPEST_FIXTURE_SOCKET).as_os_str().len() < SUN_PATH_MAX
+}
 
 /// A temporary root for a fixture that binds (or dials) a **unix-domain
 /// socket**.
 ///
 /// The kernel copies a socket path verbatim into `sun_path` — it is never
-/// resolved or canonicalised — and that field is 104 bytes on macOS and 108 on
-/// Linux. `tempfile::tempdir()` roots under `$TMPDIR`, which on macOS is
-/// `/var/folders/<xx>/<32 hex>/T/` (~51 bytes) before tempfile's `.tmpXXXXXX`;
-/// codex's control socket then adds [`DEEPEST_FIXTURE_SOCKET`] (54 bytes), so
-/// `bind`/`connect`/`ln` fail with `ENAMETOOLONG` and the fixture reads as an
-/// absent daemon. Start the root in a short base instead — the default temp
-/// directory when it is short enough (so an exec-restricted `/tmp` is not
-/// forced), then `/tmp` and `/var/tmp` — and assert the deepest path still fits.
+/// resolved or canonicalised — so a path at or over the limit fails with
+/// `ENAMETOOLONG`. `tempfile::tempdir()` roots under `$TMPDIR`, which on macOS
+/// is `/var/folders/<xx>/<32 hex>/T/` (~51 bytes) before tempfile's own
+/// `.tmpXXXXXX`; codex's control socket then adds
+/// [`DEEPEST_FIXTURE_SOCKET`] (53 bytes, plus the joining separator),
+/// overflowing the field. The `connect`
+/// that overflows is reported as `Unreachable`, so the lifecycle correctly
+/// reads "no answering daemon" and every attaching test fails as `Serverless`.
+///
+/// Start the root in a short base instead — the default temp directory when it
+/// fits (so an exec-restricted `/tmp` is not forced), then `/tmp` and
+/// `/var/tmp` — and prove the deepest fixture socket still fits.
 #[cfg(unix)]
 pub(crate) fn socket_tempdir() -> tempfile::TempDir {
-    // macOS is the tight one: `sun_path` is 104 bytes *including* the NUL, so a
-    // 103-byte path is the longest that binds there.
-    const SUN_PATH_MAX: usize = 104;
-
-    let fits = |root: &Path| root.join(DEEPEST_FIXTURE_SOCKET).as_os_str().len() < SUN_PATH_MAX;
-    let mut tried = Vec::new();
-    for base in [
+    [
         std::env::temp_dir(),
         PathBuf::from("/tmp"),
         PathBuf::from("/var/tmp"),
-    ] {
-        if let Ok(root) = tempfile::Builder::new().prefix("cola").tempdir_in(&base) {
-            if fits(root.path()) {
-                return root;
-            }
-            tried.push(format!(
-                "{} (too long: {})",
-                base.display(),
-                root.path().display()
-            ));
-        } else {
-            tried.push(format!("{} (unusable)", base.display()));
-        }
-    }
-    panic!(
-        "no temp base keeps a codex fixture's control socket inside `sun_path`: {}",
-        tried.join(", ")
-    );
+    ]
+    .into_iter()
+    .filter_map(|base| tempfile::Builder::new().prefix("cola").tempdir_in(base).ok())
+    .find(|root| socket_path_fits(root.path()))
+    .expect("a temp base that keeps a codex fixture's control socket inside `sun_path`")
 }
 
 /// A scripted `codex` CLI for discovery and lifecycle tests.
@@ -1974,4 +1974,37 @@ where
     )
     .await
     .is_ok()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The fit check must measure the root **plus** its suffix. `Path::join`
+    /// replaces the root when the argument is absolute, so a leading `/` on the
+    /// suffix would silently measure 53 bytes and pronounce every root short —
+    /// the exact no-op that let a macOS `$TMPDIR` root through. This pins both
+    /// sides on every unix, not only where a socket actually fails to bind.
+    #[test]
+    fn a_fixture_root_is_measured_with_its_socket_suffix() {
+        assert!(socket_path_fits(Path::new("/tmp/colaAbCdEf")));
+        // A real macOS `$TMPDIR`: `/var/folders/<xx>/<32 hex>/T/` plus ours.
+        assert!(!socket_path_fits(Path::new(
+            "/var/folders/2x/abcdefghijklmnopqrstuvwxyz012345/T/colaAbCdEf"
+        )));
+    }
+
+    /// The helper returns a root whose deepest control socket can bind where
+    /// `sun_path` is tightest (macOS), and it is a short base rather than the
+    /// long `$TMPDIR` one.
+    #[test]
+    fn the_socket_fixture_root_is_short_enough_to_bind() {
+        let root = socket_tempdir();
+        assert!(socket_path_fits(root.path()), "{}", root.path().display());
+        assert!(
+            root.path().join(DEEPEST_FIXTURE_SOCKET).as_os_str().len() < SUN_PATH_MAX,
+            "{}",
+            root.path().join(DEEPEST_FIXTURE_SOCKET).display()
+        );
+    }
 }
