@@ -107,6 +107,12 @@ pub(crate) const PENDING_FALLBACK_TTL_MS: i64 = 5 * 60 * 1000;
 #[cfg(test)]
 pub(crate) const PENDING_FALLBACK_TTL_MS: i64 = 50;
 
+/// How many resolved **steer** ids one thread keeps for precise recognition.
+/// They never count toward the unresolved cap (their prompt can proceed), so
+/// this tail bounds them instead; a supplement older than the tail is no longer
+/// recognised by id, which is safe — its own card has long been settled.
+const MAX_RESOLVED_STEERS_PER_THREAD: usize = 256;
+
 /// The safety valve for a recorded submission that never resolves: after an
 /// hour it leaves the file. Nothing about the id's *shape* makes it ours, so
 /// the record cannot keep it forever; an hour is far longer than any accepted
@@ -114,7 +120,7 @@ pub(crate) const PENDING_FALLBACK_TTL_MS: i64 = 50;
 #[cfg(not(test))]
 pub(crate) const PENDING_ID_TTL_MS: i64 = 60 * 60 * 1000;
 #[cfg(test)]
-pub(crate) const PENDING_ID_TTL_MS: i64 = 500;
+pub(crate) const PENDING_ID_TTL_MS: i64 = 2_000;
 
 /// The version-1 (ADR-0091) file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -130,8 +136,23 @@ struct AuthorshipFile {
     pending: ClientScoped<Vec<PendingSubmission>>,
 }
 
-/// One unresolved submission: the id cola chose for a prompt, and when it was
-/// recorded.
+/// What a recorded submission id authorises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SubmissionKind {
+    /// A prompt: until it resolves, an id-less item in the thread's **live**
+    /// turn is cola's too (the pre-response window). Once bound, the whole turn
+    /// is cola's.
+    #[default]
+    Prompt,
+    /// A supplement steered into a turn cola did not start: only the item
+    /// carrying this exact id is cola's. The turn and its other items are not,
+    /// and an id-less item in it must stay external.
+    Steer,
+}
+
+/// One recorded submission: the id cola chose, what it authorises, when it was
+/// recorded, and whether its item has already been accounted for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingSubmission {
     id: String,
@@ -140,6 +161,14 @@ struct PendingSubmission {
     /// ([`PENDING_FALLBACK_TTL_MS`]) and, eventually, the submission itself
     /// ([`PENDING_ID_TTL_MS`]).
     at_ms: i64,
+    /// Defaults to [`SubmissionKind::Prompt`] so a record written before this
+    /// distinction existed keeps its prompt semantics.
+    #[serde(default)]
+    kind: SubmissionKind,
+    /// A steer whose item has been accounted for. It stays recorded for precise
+    /// recognition, but no longer counts as unresolved.
+    #[serde(default)]
+    resolved: bool,
 }
 
 #[derive(Default)]
@@ -266,11 +295,31 @@ impl Authorship {
     ///
     /// `submission` is the id cola chose (`clientUserMessageId`); `None` is the
     /// defensive anonymous path, which has nothing a later read could match and
-    /// so lives only in memory.
+    /// so lives only in memory. `kind` decides what the id authorises: a prompt
+    /// also vouches for an id-less item in the live turn, a steer for its own
+    /// item only.
     pub(crate) fn begin(&self, thread: &str, submission: Option<&str>) -> Result<(), String> {
+        self.begin_submission(thread, submission, SubmissionKind::Prompt)
+    }
+
+    /// Record a **steer** submission: only the item carrying this exact id is
+    /// cola's. The turn was started by somebody else, so neither it nor its
+    /// other items are claimed.
+    pub(crate) fn begin_steer(&self, thread: &str, submission: Option<&str>) -> Result<(), String> {
+        self.begin_submission(thread, submission, SubmissionKind::Steer)
+    }
+
+    fn begin_submission(
+        &self,
+        thread: &str,
+        submission: Option<&str>,
+        kind: SubmissionKind,
+    ) -> Result<(), String> {
         let mut state = self.state.lock().expect("authorship record");
         let Some(submission) = submission else {
-            *state.anonymous.entry(thread.to_string()).or_default() += 1;
+            if kind == SubmissionKind::Prompt {
+                *state.anonymous.entry(thread.to_string()).or_default() += 1;
+            }
             return Ok(());
         };
         let now = now_ms();
@@ -292,15 +341,18 @@ impl Authorship {
             let pending = state.pending.entry_mut(&self.client_id, thread);
             if let Some(index) = pending.iter().position(|known| known.id == submission) {
                 // A retry re-sends the same chosen id: refresh its window rather
-                // than adding a second marker.
+                // than adding a second marker (and keep its resolved state: the
+                // id is already recognisable).
                 pending[index].at_ms = now;
                 false
-            } else if pending.len() >= MAX_PENDING_PER_THREAD {
+            } else if pending.iter().filter(|known| !known.resolved).count() >= MAX_PENDING_PER_THREAD {
                 true
             } else {
                 pending.push(PendingSubmission {
                     id: submission.to_string(),
                     at_ms: now,
+                    kind,
+                    resolved: false,
                 });
                 false
             }
@@ -387,13 +439,16 @@ impl Authorship {
         self.persist_or_untrust(&mut state);
     }
 
-    /// Bind a submission to the turn its user item landed in. The history read
-    /// that sees `userMessage.clientId == submission` is what resolves a lost
-    /// `turn/start` response, across a restart included. The caller decides
-    /// which submissions are eligible (a pending marker, or one carrying
-    /// cola's own id convention); this records the turn and clears any marker.
+    /// Bind a **prompt** submission to the turn its user item landed in. The
+    /// history read that sees `userMessage.clientId == submission` is what
+    /// resolves a lost `turn/start` response, across a restart included. A
+    /// steer's marker is never bound this way: it must not claim the turn, so
+    /// [`Self::resolve_steer`] handles it instead.
     pub(crate) fn bind_submission(&self, thread: &str, submission: &str, turn: &str) {
         let mut state = self.state.lock().expect("authorship record");
+        if self.pending_kind_locked(&state, thread, submission) != Some(SubmissionKind::Prompt) {
+            return;
+        }
         let mut changed = state
             .pending
             .get_mut(&self.client_id, thread)
@@ -405,6 +460,46 @@ impl Authorship {
         prune_pending(&mut state.pending, &self.client_id, thread);
         changed |= record_turn(&mut state, &self.client_id, thread, turn);
         if changed {
+            self.persist_or_untrust(&mut state);
+        }
+    }
+
+    /// What a recorded id authorises, if it is still inside its recorded life.
+    /// The client dispatches resolution on this: a prompt binds a turn, a steer
+    /// only marks its own item.
+    pub(crate) fn pending_kind(&self, thread: &str, submission: &str) -> Option<SubmissionKind> {
+        let state = self.state.lock().expect("authorship record");
+        self.pending_kind_locked(&state, thread, submission)
+    }
+
+    fn pending_kind_locked(&self, state: &State, thread: &str, submission: &str) -> Option<SubmissionKind> {
+        let now = now_ms();
+        state.pending.get(&self.client_id, thread).and_then(|pending| {
+            pending
+                .iter()
+                .find(|known| known.id == submission && still_recorded(known, now))
+                .map(|known| known.kind)
+        })
+    }
+
+    /// Mark a steer's item as accounted for. The id stays recorded for precise
+    /// recognition (and across a restart), but it no longer counts as
+    /// unresolved. The turn is never recorded: it belongs to whoever started it.
+    pub(crate) fn resolve_steer(&self, thread: &str, submission: &str) {
+        let mut state = self.state.lock().expect("authorship record");
+        let now = now_ms();
+        let mut changed = false;
+        if let Some(pending) = state.pending.get_mut(&self.client_id, thread)
+            && let Some(entry) = pending.iter_mut().find(|known| {
+                known.id == submission && known.kind == SubmissionKind::Steer && still_recorded(known, now)
+            })
+            && !entry.resolved
+        {
+            entry.resolved = true;
+            changed = true;
+        }
+        if changed {
+            bound_resolved_steers(&mut state.pending, &self.client_id, thread);
             self.persist_or_untrust(&mut state);
         }
     }
@@ -443,11 +538,11 @@ impl Authorship {
     pub(crate) fn is_pending(&self, thread: &str) -> bool {
         let state = self.state.lock().expect("authorship record");
         let now = now_ms();
-        state
-            .pending
-            .get(&self.client_id, thread)
-            .is_some_and(|pending| pending.iter().any(|known| is_fallback_live(known, now)))
-            || state.anonymous.get(thread).copied().unwrap_or(0) > 0
+        state.pending.get(&self.client_id, thread).is_some_and(|pending| {
+            pending.iter().any(|known| {
+                known.kind == SubmissionKind::Prompt && !known.resolved && is_fallback_live(known, now)
+            })
+        }) || state.anonymous.get(thread).copied().unwrap_or(0) > 0
     }
 
     /// Whether `submission` is a **recorded, unaged** unresolved chosen id.
@@ -457,17 +552,7 @@ impl Authorship {
     /// ([`PENDING_ID_TTL_MS`]) also bounds the answer, so an id that outlived
     /// its recorded life cannot vouch even before the next read prunes it.
     pub(crate) fn is_pending_submission(&self, thread: &str, submission: &str) -> bool {
-        let now = now_ms();
-        self.state
-            .lock()
-            .expect("authorship record")
-            .pending
-            .get(&self.client_id, thread)
-            .is_some_and(|pending| {
-                pending
-                    .iter()
-                    .any(|known| known.id == submission && still_recorded(known, now))
-            })
+        self.pending_kind(thread, submission).is_some()
     }
 
     /// Whether a message in `thread`'s turn `turn` is cola's own.
@@ -487,11 +572,13 @@ impl Authorship {
                 .is_some_and(|turns| turns.iter().any(|recorded| recorded == turn)),
             None => {
                 let now = now_ms();
-                state
-                    .pending
-                    .get(&self.client_id, thread)
-                    .is_some_and(|pending| pending.iter().any(|known| is_fallback_live(known, now)))
-                    || state.anonymous.get(thread).copied().unwrap_or(0) > 0
+                state.pending.get(&self.client_id, thread).is_some_and(|pending| {
+                    pending.iter().any(|known| {
+                        known.kind == SubmissionKind::Prompt
+                            && !known.resolved
+                            && is_fallback_live(known, now)
+                    })
+                }) || state.anonymous.get(thread).copied().unwrap_or(0) > 0
             }
         }
     }
@@ -573,6 +660,36 @@ fn record_turn(state: &mut State, client: &str, thread: &str, turn: &str) -> boo
         turns.drain(..excess);
     }
     true
+}
+
+/// Keep the resolved-steer recognition tail bounded. Only resolved steers are
+/// dropped, oldest first: an unresolved marker is never evicted.
+fn bound_resolved_steers(pending: &mut ClientScoped<Vec<PendingSubmission>>, client: &str, thread: &str) {
+    let Some(entries) = pending.get_mut(client, thread) else {
+        return;
+    };
+    let mut resolved: Vec<(usize, i64)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.kind == SubmissionKind::Steer && entry.resolved)
+        .map(|(index, entry)| (index, entry.at_ms))
+        .collect();
+    if resolved.len() <= MAX_RESOLVED_STEERS_PER_THREAD {
+        return;
+    }
+    resolved.sort_by_key(|(_, at_ms)| *at_ms);
+    let excess = resolved.len() - MAX_RESOLVED_STEERS_PER_THREAD;
+    let dropped: std::collections::HashSet<usize> = resolved
+        .into_iter()
+        .take(excess)
+        .map(|(index, _)| index)
+        .collect();
+    let mut index = 0;
+    entries.retain(|_| {
+        let keep = !dropped.contains(&index);
+        index += 1;
+        keep
+    });
 }
 
 /// Drop a thread's pending section once its last submission resolved, so a
@@ -826,6 +943,8 @@ mod tests {
             .push(PendingSubmission {
                 id: "fresh".into(),
                 at_ms: now,
+                kind: SubmissionKind::Prompt,
+                resolved: false,
             });
         state
             .pending
@@ -833,6 +952,8 @@ mod tests {
             .push(PendingSubmission {
                 id: "ancient".into(),
                 at_ms: now - PENDING_ID_TTL_MS - 1,
+                kind: SubmissionKind::Prompt,
+                resolved: false,
             });
         assert!(drop_expired(&mut state, "codex", "thread-1", now));
         let pending = state
@@ -870,6 +991,63 @@ mod tests {
         std::fs::remove_dir(&blocked).expect("unblock");
         record.bind("thread-1", "turn-1", Some("msg_cola_retry"));
         assert!(record.is_authored("thread-1", Some("turn-1")));
+    }
+
+    /// A steer id is a precise match only: it never drives the thread-wide
+    /// fallback, so an id-less item in a turn cola did not start stays external.
+    #[test]
+    fn a_steer_marker_vouches_for_its_own_id_only() {
+        let record = Authorship::in_memory();
+        record
+            .begin_steer("thread-1", Some("msg_cola_steer"))
+            .expect("the steer marker is recorded");
+        assert!(record.is_pending_submission("thread-1", "msg_cola_steer"));
+        assert_eq!(
+            record.pending_kind("thread-1", "msg_cola_steer"),
+            Some(SubmissionKind::Steer)
+        );
+        assert!(
+            !record.is_pending("thread-1"),
+            "a steer must not turn on the thread-wide fallback"
+        );
+        assert!(!record.is_authored("thread-1", None));
+
+        record.resolve_steer("thread-1", "msg_cola_steer");
+        assert!(
+            record.is_pending_submission("thread-1", "msg_cola_steer"),
+            "a resolved steer stays recognisable by id"
+        );
+        assert!(
+            !record.is_authored("thread-1", Some("turn-tui")),
+            "resolving a steer never claims the turn"
+        );
+    }
+
+    /// Resolved steers never count toward the unresolved cap, and their own
+    /// recognition tail is bounded (oldest dropped first).
+    #[test]
+    fn resolved_steers_have_their_own_bounded_tail() {
+        let record = Authorship::in_memory();
+        for index in 0..(MAX_RESOLVED_STEERS_PER_THREAD + 5) {
+            let id = format!("msg_cola_steer_{index}");
+            record.begin_steer("thread-1", Some(&id)).expect("marker");
+            record.resolve_steer("thread-1", &id);
+        }
+        assert!(
+            record.is_pending_submission(
+                "thread-1",
+                &format!("msg_cola_steer_{}", MAX_RESOLVED_STEERS_PER_THREAD + 4)
+            ),
+            "the newest resolved steer is recognised"
+        );
+        assert!(
+            !record.is_pending_submission("thread-1", "msg_cola_steer_0"),
+            "the oldest resolved steer leaves the tail"
+        );
+        assert!(
+            record.begin("thread-1", Some("msg_cola_prompt")).is_ok(),
+            "resolved steers do not consume the unresolved cap"
+        );
     }
 
     #[test]
