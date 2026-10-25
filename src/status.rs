@@ -839,8 +839,48 @@ fn codex_client_checks(report: Option<&ClientReport>, turn: Option<&TurnProbe>) 
     }
 
     checks.push(local_client_check(report));
+    if report.state == ClientState::Attached {
+        checks.push(agent_questions_check(report));
+    }
     checks.push(turn_check(turn));
     checks
+}
+
+/// The daemon-side agent-question feature (`default_mode_request_user_input`).
+///
+/// It is a server config row, not a client capability: when off, the model
+/// asks in plain text instead of sending `item/tool/requestUserInput`, and no
+/// card can reach Feishu. A warning is deliberate — the setup still works, and
+/// MCP elicitation requests are unaffected — so it never fails `doctor`.
+fn agent_questions_check(report: &ClientReport) -> Check {
+    let state = report
+        .capabilities
+        .iter()
+        .find(|capability| capability.name == "agent_questions")
+        .map(|capability| capability.value.as_str())
+        .unwrap_or("unknown");
+    match state {
+        "enabled" => Check::pass(
+            "Codex 提问",
+            "`default_mode_request_user_input` 已启用；agent 的提问请求 \
+             （item/tool/requestUserInput）会以 Feishu 问题卡片到达"
+                .to_string(),
+        ),
+        "off" => Check::warn(
+            "Codex 提问",
+            "`default_mode_request_user_input` 未启用。在 ~/.codex/config.toml 中加入 \
+             `[features] default_mode_request_user_input = true`，然后重启 daemon 和 TUI；\
+             否则模型只会在文本中提问，不会发送 item/tool/requestUserInput。\
+             MCP elicitation（mcpServer/elicitation/request）不受影响"
+                .to_string(),
+        ),
+        _ => Check::warn(
+            "Codex 提问",
+            "无法读取 `default_mode_request_user_input` 的状态（experimentalFeature/list \
+             不可用、超时或未列出该特性）；这不影响其他检查"
+                .to_string(),
+        ),
+    }
 }
 
 /// The user's own client, classified honestly:
@@ -1623,7 +1663,7 @@ kind = "codex"
     /// fully green, with no ChatGPT account state read anywhere.
     #[test]
     fn a_daemon_attached_client_with_a_working_provider_passes() {
-        let report = codex_report(ClientState::Attached, vec![attached_user(77)]);
+        let report = report_with_agent_questions("enabled");
         let checks = codex_client_checks(
             Some(&report),
             Some(&TurnProbe::Passed {
@@ -1753,6 +1793,89 @@ kind = "codex"
                 .expect("the runtime check");
             assert_eq!(check.status, CheckStatus::Fail, "{label}: {check:?}");
         }
+    }
+
+    fn report_with_agent_questions(value: &str) -> ClientReport {
+        let mut report = codex_report(ClientState::Attached, vec![attached_user(77)]);
+        report.capabilities.push(crate::backend::lifecycle::Capability {
+            name: "agent_questions".into(),
+            value: value.into(),
+        });
+        report
+    }
+
+    fn passing_turn() -> TurnProbe {
+        TurnProbe::Passed {
+            detail: "ok".into(),
+            cleanup: None,
+        }
+    }
+
+    #[test]
+    fn agent_questions_enabled_passes_and_names_the_feature() {
+        let report = report_with_agent_questions("enabled");
+        let checks = codex_client_checks(Some(&report), Some(&passing_turn()));
+        let check = checks
+            .iter()
+            .find(|check| check.label == "Codex 提问")
+            .expect("the agent-question check");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(
+            check.detail.contains("default_mode_request_user_input"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("Feishu"), "{}", check.detail);
+        assert!(doctor_ok(&checks));
+    }
+
+    #[test]
+    fn agent_questions_off_warns_with_the_exact_config() {
+        let report = report_with_agent_questions("off");
+        let checks = codex_client_checks(Some(&report), Some(&passing_turn()));
+        let check = checks
+            .iter()
+            .find(|check| check.label == "Codex 提问")
+            .expect("the agent-question check");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .contains("[features] default_mode_request_user_input = true"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("~/.codex/config.toml"), "{}", check.detail);
+        assert!(check.detail.contains("重启"), "{}", check.detail);
+        assert!(check.detail.contains("文本"), "{}", check.detail);
+        assert!(check.detail.contains("MCP"), "{}", check.detail);
+        assert!(doctor_ok(&checks), "a warning must not fail doctor");
+    }
+
+    #[test]
+    fn agent_questions_unknown_warns_without_failing_doctor() {
+        let report = report_with_agent_questions("unknown");
+        let checks = codex_client_checks(Some(&report), Some(&passing_turn()));
+        let check = checks
+            .iter()
+            .find(|check| check.label == "Codex 提问")
+            .expect("the agent-question check");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("无法读取"), "{}", check.detail);
+        assert!(check.detail.contains("不影响其他检查"), "{}", check.detail);
+        assert!(doctor_ok(&checks));
+    }
+
+    /// The row exists only for an attached client: an absent daemon has no
+    /// feature state to report, and its own checks already fail.
+    #[test]
+    fn the_agent_questions_row_requires_an_attached_client() {
+        let report = codex_report(ClientState::Absent, Vec::new());
+        let checks = codex_client_checks(Some(&report), None);
+        assert!(
+            checks.iter().all(|check| check.label != "Codex 提问"),
+            "{checks:?}"
+        );
     }
 
     /// A working provider whose probe could not clean up is not a clean pass:

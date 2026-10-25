@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::bridge::tasks::TasksHandle;
@@ -28,6 +29,22 @@ use super::transport::{Endpoint, RpcConnection};
 
 /// How long the handshake (connect + `initialize` + `initialized`) may take.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The daemon-side feature that makes the model send
+/// `item/tool/requestUserInput` instead of asking in plain text.
+///
+/// It is a **server config** feature (`[features]
+/// default_mode_request_user_input = true` at daemon/TUI start), not a client
+/// capability: the request reaches a client that did not opt into the
+/// experimental API, and the client's answer is accepted.
+pub(crate) const AGENT_QUESTIONS_FEATURE: &str = "default_mode_request_user_input";
+
+/// The page size `experimentalFeature/list` is asked for.
+const EXPERIMENTAL_FEATURE_PAGE_SIZE: u32 = 200;
+
+/// Bound the feature-list walk. The list is small and the method is
+/// experimental; a server that keeps minting cursors must not hold the report.
+const MAX_EXPERIMENTAL_FEATURE_PAGES: usize = 8;
 
 /// How to construct the client. The endpoint is supplied by the caller today;
 /// daemon discovery under `$CODEX_HOME` lands with the lifecycle ticket (#877)
@@ -176,6 +193,27 @@ pub(crate) struct ServerInfo {
     pub(crate) surface_counts: (usize, usize, usize),
 }
 
+/// One `experimentalFeature/list` page. The method is experimental: a server
+/// that does not serve it answers an RPC error, which the caller treats as
+/// unknown rather than as a failed report.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExperimentalFeatureListResponse {
+    #[serde(default)]
+    data: Vec<ExperimentalFeature>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExperimentalFeature {
+    name: String,
+    /// Present in the pinned schema; kept optional so a malformed row is
+    /// "unknown", never a false `off`.
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 /// One attached app-server. Construction is the whole contract check; the
 /// thread surface (#878) and the `Backend` implementation (#879) build on it.
 ///
@@ -315,6 +353,58 @@ impl CodexClient {
 
     pub(crate) fn server_info(&self) -> &ServerInfo {
         &self.server
+    }
+
+    /// Whether the daemon-side agent-question feature is on, read from
+    /// `experimentalFeature/list`.
+    ///
+    /// `Ok(Some(true|false))` is the listed feature's `enabled`; `Ok(None)` means
+    /// the feature is not listed (or its row carries no `enabled` value), which
+    /// the caller reports as unknown. The method is **experimental** and not in
+    /// the required surface: an RPC error from a server that does not serve it
+    /// is the caller's to interpret as best-effort, so it is returned as `Err`
+    /// rather than hidden here.
+    pub(crate) async fn agent_questions_enabled(&self) -> Result<Option<bool>> {
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_EXPERIMENTAL_FEATURE_PAGES {
+            let mut params = json!({ "limit": EXPERIMENTAL_FEATURE_PAGE_SIZE });
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = json!(cursor);
+            }
+            let result = self
+                .connection
+                .request("experimentalFeature/list", params)
+                .await?;
+            let page: ExperimentalFeatureListResponse =
+                serde_json::from_value(result).map_err(|error| CodexError::Protocol {
+                    method: "experimentalFeature/list".to_string(),
+                    detail: error.to_string(),
+                })?;
+            for feature in page.data {
+                if feature.name == AGENT_QUESTIONS_FEATURE {
+                    return Ok(feature.enabled);
+                }
+            }
+            match page.next_cursor {
+                None => return Ok(None),
+                Some(next) => {
+                    if !seen.insert(next.clone()) {
+                        tracing::warn!(
+                            "codex experimentalFeature/list repeated cursor `{next}`; \
+                             the agent-question feature state is unknown"
+                        );
+                        return Ok(None);
+                    }
+                    cursor = Some(next);
+                }
+            }
+        }
+        tracing::warn!(
+            "codex experimentalFeature/list did not finish in {MAX_EXPERIMENTAL_FEATURE_PAGES} \
+             pages; the agent-question feature state is unknown"
+        );
+        Ok(None)
     }
 
     /// The live connection, shared by the lifecycle's probe and the thread
@@ -468,6 +558,49 @@ mod tests {
             .expect("a verified newer server passes");
         assert_eq!(client.server_info().version.to_string(), "0.164.0");
         assert_eq!(client.server_info().surface_source, "test fixture");
+    }
+
+    /// Ticket #883 live finding: the agent-question feature is a daemon-side
+    /// config row (`default_mode_request_user_input`), not a client capability.
+    /// The read is best-effort and reflects the server's row each time.
+    #[tokio::test]
+    async fn the_agent_question_feature_state_comes_from_the_server() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
+            .await
+            .expect("attach to the scripted app-server");
+        let row = |enabled: bool| {
+            json!({
+                "name": AGENT_QUESTIONS_FEATURE,
+                "enabled": enabled,
+                "defaultEnabled": false,
+                "stage": "underDevelopment",
+            })
+        };
+
+        server.set_experimental_features(vec![row(true)]);
+        assert_eq!(client.agent_questions_enabled().await.expect("read"), Some(true));
+
+        server.set_experimental_features(vec![row(false)]);
+        assert_eq!(client.agent_questions_enabled().await.expect("read"), Some(false));
+
+        server.set_experimental_features(vec![json!({
+            "name": "some_other_feature",
+            "enabled": true,
+            "defaultEnabled": false,
+            "stage": "beta",
+        })]);
+        assert_eq!(
+            client.agent_questions_enabled().await.expect("read"),
+            None,
+            "an unlisted feature is unknown, not off"
+        );
+        assert_eq!(
+            server.experimental_feature_calls(),
+            3,
+            "the adapter asks the server rather than caching a guess"
+        );
     }
 
     /// With only the pinned surface known, a newer or older server is refused

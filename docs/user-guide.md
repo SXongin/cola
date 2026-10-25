@@ -237,6 +237,11 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   discovers the daemon under `$CODEX_HOME` and probes its surface. Either kind
   boots: the active Agent Client is the one cola serves, and a Codex client
   needs its app-server daemon reachable (or startable, per `start_server`).
+  Agent-initiated questions reach Feishu only when the daemon-side
+  `[features] default_mode_request_user_input = true` is on in
+  `~/.codex/config.toml`; restart the daemon and TUI after changing it.
+  Without the feature the model asks in plain text. MCP elicitation requests
+  (`mcpServer/elicitation/request`) work regardless of that feature.
 - **Options live in the same table as `kind`.** An `opencode` Agent Client
   accepts `url`, `start_server`, `generation` and `model`, exactly as
   `[opencode]` does. A `codex` Agent Client accepts `start_server`
