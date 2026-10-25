@@ -15,7 +15,7 @@
 //! Compiled only for tests.
 
 #[cfg(unix)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -35,6 +35,55 @@ use tokio_tungstenite::tungstenite::Message;
 #[cfg(unix)]
 pub(crate) fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// The control socket under a fixture's relocated home, as a suffix: the
+/// deepest path any codex fixture puts under its temp root.
+#[cfg(unix)]
+const DEEPEST_FIXTURE_SOCKET: &str = "/codex-home/app-server-control/app-server-control.sock";
+
+/// A temporary root for a fixture that binds (or dials) a **unix-domain
+/// socket**.
+///
+/// The kernel copies a socket path verbatim into `sun_path` — it is never
+/// resolved or canonicalised — and that field is 104 bytes on macOS and 108 on
+/// Linux. `tempfile::tempdir()` roots under `$TMPDIR`, which on macOS is
+/// `/var/folders/<xx>/<32 hex>/T/` (~51 bytes) before tempfile's `.tmpXXXXXX`;
+/// codex's control socket then adds [`DEEPEST_FIXTURE_SOCKET`] (54 bytes), so
+/// `bind`/`connect`/`ln` fail with `ENAMETOOLONG` and the fixture reads as an
+/// absent daemon. Start the root in a short base instead — the default temp
+/// directory when it is short enough (so an exec-restricted `/tmp` is not
+/// forced), then `/tmp` and `/var/tmp` — and assert the deepest path still fits.
+#[cfg(unix)]
+pub(crate) fn socket_tempdir() -> tempfile::TempDir {
+    // macOS is the tight one: `sun_path` is 104 bytes *including* the NUL, so a
+    // 103-byte path is the longest that binds there.
+    const SUN_PATH_MAX: usize = 104;
+
+    let fits = |root: &Path| root.join(DEEPEST_FIXTURE_SOCKET).as_os_str().len() < SUN_PATH_MAX;
+    let mut tried = Vec::new();
+    for base in [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ] {
+        if let Ok(root) = tempfile::Builder::new().prefix("cola").tempdir_in(&base) {
+            if fits(root.path()) {
+                return root;
+            }
+            tried.push(format!(
+                "{} (too long: {})",
+                base.display(),
+                root.path().display()
+            ));
+        } else {
+            tried.push(format!("{} (unusable)", base.display()));
+        }
+    }
+    panic!(
+        "no temp base keeps a codex fixture's control socket inside `sun_path`: {}",
+        tried.join(", ")
+    );
 }
 
 /// A scripted `codex` CLI for discovery and lifecycle tests.

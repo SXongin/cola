@@ -1285,7 +1285,9 @@ mod tests {
         /// socket for the fake daemon. Nothing is started: the fake CLI links
         /// the control socket only when `daemon start` runs.
         fn new() -> Self {
-            let root = tempfile::tempdir().expect("tempdir");
+            // A unix socket lives under this root, so the root must be short
+            // enough for `sun_path`; see `socket_tempdir`.
+            let root = crate::codex::test_server::socket_tempdir();
             let home = root.path().join("codex-home");
             let daemon_socket = root.path().join("daemon-0").join("app-server-control");
             std::fs::create_dir_all(daemon_socket.parent().expect("daemon dir")).expect("daemon dir");

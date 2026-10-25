@@ -824,7 +824,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_unix_transport_follows_a_symlinked_socket() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::codex::test_server::socket_tempdir();
         let real = dir.path().join("app-server.sock");
         let link = dir.path().join("app-server-control.sock");
         let server = FakeServer::unix(&real, "codex-tui/0.163.0 (test)").await;

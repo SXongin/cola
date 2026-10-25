@@ -1107,7 +1107,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_lost_connection_ends_the_subscription() {
-        let directory = tempfile::tempdir().expect("tempdir");
+        let directory = crate::codex::test_server::socket_tempdir();
         let socket = directory.path().join("app-server.sock");
         let server = FakeServer::unix(&socket, "codex-tui/0.163.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
