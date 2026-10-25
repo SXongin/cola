@@ -82,6 +82,12 @@ const SERVER_EVENT_CAPACITY: usize = 64;
 /// which closes the connection and fails every waiter.
 const OUTGOING_CAPACITY: usize = 64;
 
+/// How long a server-initiated request's response may wait for room in that
+/// queue. A reply is not a fire-and-forget notification: a stalled writer must
+/// not hold a Feishu callback open, and the request must remain answerable, so
+/// this budget fails the send by name and lets the adapter restore it.
+pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How to reach an app-server.
 // `ws://` endpoints are how a TUI's own listener is addressed (and how every
 // hermetic test dials the fake server); the daemon path uses `Unix`.
@@ -445,15 +451,28 @@ impl RpcConnection {
     /// serialised writer rather than through [`Self::request`]. A closed
     /// connection refuses the frame by name, exactly like a call.
     pub(crate) async fn respond(&self, id: &Value, result: Value) -> Result<()> {
+        self.respond_within(id, result, RESPONSE_WRITE_TIMEOUT).await
+    }
+
+    /// [`Self::respond`] with an explicit enqueue budget. The caller gets
+    /// [`CodexError::ResponseTimeout`] when the writer's queue stays full, and
+    /// the request is still unanswered (the frame was never queued).
+    pub(crate) async fn respond_within(&self, id: &Value, result: Value, timeout: Duration) -> Result<()> {
         if self.closed() {
             return Err(CodexError::NoResponse(format!("server request {id}")));
         }
-        self.send(&json!({
+        let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": result,
-        }))
-        .await
+        });
+        match tokio::time::timeout(timeout, self.send(&frame)).await {
+            Ok(result) => result,
+            Err(_) => Err(CodexError::ResponseTimeout {
+                id: id.to_string(),
+                timeout,
+            }),
+        }
     }
 
     /// Refuse one server-initiated request by name. Used where cola cannot
@@ -461,15 +480,33 @@ impl RpcConnection {
     /// server then sees a refusal instead of waiting forever, and the failure
     /// is never guessed at.
     pub(crate) async fn respond_error(&self, id: &Value, code: i64, message: &str) -> Result<()> {
+        self.respond_error_within(id, code, message, RESPONSE_WRITE_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::respond_error`] with an explicit enqueue budget.
+    pub(crate) async fn respond_error_within(
+        &self,
+        id: &Value,
+        code: i64,
+        message: &str,
+        timeout: Duration,
+    ) -> Result<()> {
         if self.closed() {
             return Err(CodexError::NoResponse(format!("server request {id}")));
         }
-        self.send(&json!({
+        let frame = json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": { "code": code, "message": message },
-        }))
-        .await
+        });
+        match tokio::time::timeout(timeout, self.send(&frame)).await {
+            Ok(result) => result,
+            Err(_) => Err(CodexError::ResponseTimeout {
+                id: id.to_string(),
+                timeout,
+            }),
+        }
     }
 
     /// Subscribe to everything the server pushed that was not a response to
@@ -1097,6 +1134,54 @@ mod tests {
         assert_eq!(
             drained, SERVER_EVENT_CAPACITY,
             "the queue held exactly its capacity; the overflow frame closed instead of growing it"
+        );
+    }
+
+    /// Ticket #882's write-side bound: a stalled writer (a full queue with no
+    /// reader) cannot hold `respond` open indefinitely. The timeout is named,
+    /// the frame is not queued, and draining the queue lets the same response
+    /// succeed afterwards.
+    #[tokio::test]
+    async fn a_response_send_is_bounded_by_the_writer_queue() {
+        let (connection, mut frames, _closing) = RpcConnection::test_connection(1);
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+
+        let error = connection
+            .respond_within(
+                &json!(7),
+                json!({ "decision": "accept" }),
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("a full queue must time out");
+        assert!(
+            matches!(error, CodexError::ResponseTimeout { .. }),
+            "the timeout is named: {error}"
+        );
+
+        let filler = frames.recv().await.expect("the filler frame");
+        assert!(matches!(filler, Message::Text(_)));
+        connection
+            .respond_within(
+                &json!(7),
+                json!({ "decision": "accept" }),
+                Duration::from_millis(200),
+            )
+            .await
+            .expect("the retry is queued once there is room");
+        let response = frames.recv().await.expect("the response frame");
+        let Message::Text(text) = response else {
+            panic!("expected a text frame");
+        };
+        let value: Value = serde_json::from_str(&text).expect("the response is JSON");
+        assert_eq!(value["id"], json!(7));
+        assert_eq!(value["result"], json!({ "decision": "accept" }));
+        assert!(
+            frames.try_recv().is_err(),
+            "a timed-out frame is never silently queued"
         );
     }
 

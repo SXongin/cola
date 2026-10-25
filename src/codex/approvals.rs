@@ -51,7 +51,9 @@
 //! `always` reply against it is declined rather than approximated.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -64,7 +66,7 @@ use crate::error::{BridgeError, Result};
 
 use super::backend::Projections;
 use super::error::CodexError;
-use super::transport::{RpcConnection, ServerEvent};
+use super::transport::{RESPONSE_WRITE_TIMEOUT, RpcConnection, ServerEvent};
 
 /// The JSON-RPC error code for a method this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -121,6 +123,10 @@ impl Pending {
 #[derive(Default)]
 pub(crate) struct Approvals {
     pending: Mutex<HashMap<String, Pending>>,
+    /// How long a reply may wait for the writer's queue, in milliseconds. Zero
+    /// means the transport's [`RESPONSE_WRITE_TIMEOUT`]; tests lower it so a
+    /// stalled-writer path runs without waiting seconds.
+    reply_timeout_ms: AtomicU64,
     /// The watcher task. Aborted when the last client holding this record is
     /// dropped, so a replaced attachment stops recording into a map nothing
     /// reads.
@@ -136,6 +142,21 @@ impl Drop for Approvals {
 }
 
 impl Approvals {
+    fn reply_timeout(&self) -> Duration {
+        let millis = self.reply_timeout_ms.load(Ordering::Relaxed);
+        if millis == 0 {
+            RESPONSE_WRITE_TIMEOUT
+        } else {
+            Duration::from_millis(millis)
+        }
+    }
+
+    #[cfg(test)]
+    fn set_reply_timeout(&self, timeout: Duration) {
+        self.reply_timeout_ms
+            .store(timeout.as_millis() as u64, Ordering::Relaxed);
+    }
+
     /// Start consuming this connection's server requests and resolutions. The
     /// task holds a weak reference, so the record's own `Drop` is the lifetime
     /// edge (the same shape the projections' subscribers use).
@@ -380,10 +401,13 @@ impl Approvals {
             .collect()
     }
 
-    /// Answer one permission ask with the card's neutral reply. The request is
-    /// removed before the frame is written, so a losing second click (or a
-    /// racing sweep) can never produce a second JSON-RPC reply; the flow's own
-    /// claim guard is the first line and this is the last.
+    /// Answer one permission ask with the card's neutral reply.
+    ///
+    /// The pending record is removed for the duration of the send and put back
+    /// by [`PendingReply`]'s `Drop` unless the frame was queued: an enqueue
+    /// failure, a timeout, or a cancelled Feishu callback leaves the request
+    /// answerable, so a later poll/click can retry. Only a successful enqueue
+    /// commits the removal.
     pub(crate) async fn reply_permission(
         &self,
         connection: &RpcConnection,
@@ -391,14 +415,16 @@ impl Approvals {
         reply: &str,
     ) -> Result<()> {
         let pending = self.take_permission(request_id)?;
-        let result = permission_result(&pending, reply)?;
-        connection
-            .respond(&pending.id, result)
-            .await
-            .map_err(bridge_error)
+        let mut guard = PendingReply::new(self, request_id.to_string(), pending);
+        let result = permission_result(guard.pending(), reply)?;
+        self.respond(connection, guard.pending().id.clone(), result)
+            .await?;
+        guard.commit();
+        Ok(())
     }
 
-    /// Answer one question form with its keyed answers.
+    /// Answer one question form with its keyed answers. Same remove-on-success
+    /// ordering as [`Self::reply_permission`].
     pub(crate) async fn reply_question(
         &self,
         connection: &RpcConnection,
@@ -406,24 +432,36 @@ impl Approvals {
         answers: &[FormAnswer],
     ) -> Result<()> {
         let pending = self.take_question(request_id)?;
-        let result = question_result(&pending, answers)?;
-        connection
-            .respond(&pending.id, result)
-            .await
-            .map_err(bridge_error)
+        let mut guard = PendingReply::new(self, request_id.to_string(), pending);
+        let result = question_result(guard.pending(), answers)?;
+        self.respond(connection, guard.pending().id.clone(), result)
+            .await?;
+        guard.commit();
+        Ok(())
     }
 
     /// Cancel a question form. A tool's user-input request has no cancel
     /// variant, so it is answered with no answers (the tool continues);
-    /// an elicitation carries the protocol's own `decline`.
+    /// an elicitation carries the protocol's own `decline`. Same
+    /// remove-on-success ordering as [`Self::reply_permission`].
     pub(crate) async fn reject_question(&self, connection: &RpcConnection, request_id: &str) -> Result<()> {
         let pending = self.take_question(request_id)?;
-        let result = match pending.method.as_str() {
+        let mut guard = PendingReply::new(self, request_id.to_string(), pending);
+        let result = match guard.pending().method.as_str() {
             "mcpServer/elicitation/request" => json!({ "action": "decline" }),
             _ => json!({ "answers": {} }),
         };
+        self.respond(connection, guard.pending().id.clone(), result)
+            .await?;
+        guard.commit();
+        Ok(())
+    }
+
+    /// Enqueue one response with this record's budget. A timeout is a named
+    /// error, so the caller (and the card) can say the answer was not sent.
+    async fn respond(&self, connection: &RpcConnection, id: Value, result: Value) -> Result<()> {
         connection
-            .respond(&pending.id, result)
+            .respond_within(&id, result, self.reply_timeout())
             .await
             .map_err(bridge_error)
     }
@@ -458,6 +496,54 @@ impl Approvals {
             });
         }
         Ok(pending.remove(request_id).expect("pending request"))
+    }
+}
+
+/// A pending request removed while its answer is being written. It goes back
+/// into the map on every non-success exit — an error, an enqueue timeout, or a
+/// cancelled callback future — so the request stays pollable and clickable
+/// until the frame is actually queued. `commit` is called only after
+/// `respond_within` returns `Ok`.
+struct PendingReply<'a> {
+    approvals: &'a Approvals,
+    key: String,
+    pending: Option<Pending>,
+    committed: bool,
+}
+
+impl<'a> PendingReply<'a> {
+    fn new(approvals: &'a Approvals, key: String, pending: Pending) -> Self {
+        Self {
+            approvals,
+            key,
+            pending: Some(pending),
+            committed: false,
+        }
+    }
+
+    fn pending(&self) -> &Pending {
+        self.pending.as_ref().expect("pending until commit")
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+        self.pending.take();
+    }
+}
+
+impl Drop for PendingReply<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(pending) = self.pending.take() {
+            self.approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .entry(self.key.clone())
+                .or_insert(pending);
+        }
     }
 }
 
@@ -1385,6 +1471,7 @@ fn form_value_json(value: &FormValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::tungstenite::Message;
 
     fn pending(method: &str, permissions: PermissionRequest, params: Value) -> Pending {
         Pending {
@@ -1406,6 +1493,215 @@ mod tests {
             None,
             true,
         )
+    }
+
+    fn question_pending() -> Pending {
+        Pending {
+            id: json!(2),
+            method: "item/tool/requestUserInput".into(),
+            directory: None,
+            params: json!({}),
+            permission: None,
+            question: Some(QuestionRequest {
+                id: "n:2".into(),
+                session_id: "thread-1".into(),
+                title: String::new(),
+                questions: vec![QuestionInfo {
+                    key: "q1".into(),
+                    ..Default::default()
+                }],
+                uncollectable: None,
+            }),
+        }
+    }
+
+    fn frame_json(frame: Message) -> Value {
+        let Message::Text(text) = frame else {
+            panic!("expected a text frame");
+        };
+        serde_json::from_str(&text).expect("the frame is JSON")
+    }
+
+    /// The answer path must not consume the request before the frame is
+    /// queued: a stalled writer times the send out, the record returns, and a
+    /// retry then writes exactly one response.
+    #[tokio::test]
+    async fn a_timed_out_permission_answer_is_retryable() {
+        let (connection, mut frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Approvals::default();
+        approvals.set_reply_timeout(Duration::from_millis(20));
+        approvals.pending.lock().expect("pending approvals").insert(
+            "n:1".into(),
+            pending("item/commandExecution/requestApproval", command(), json!({})),
+        );
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+
+        let error = approvals
+            .reply_permission(&connection, "n:1", "once")
+            .await
+            .expect_err("the enqueue times out");
+        assert!(
+            error.to_string().contains("could not be queued"),
+            "the failure is named: {error}"
+        );
+        assert!(
+            approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:1"),
+            "the request is restored for a retry"
+        );
+
+        assert!(matches!(
+            frames.recv().await.expect("the filler frame"),
+            Message::Text(_)
+        ));
+        approvals
+            .reply_permission(&connection, "n:1", "once")
+            .await
+            .expect("the retry is queued");
+        assert!(
+            !approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:1"),
+            "a queued response commits the removal"
+        );
+        let response = frame_json(frames.recv().await.expect("the response frame"));
+        assert_eq!(response["id"], json!(1));
+        assert_eq!(response["result"], json!({ "decision": "accept" }));
+        assert!(frames.try_recv().is_err(), "the timed-out attempt queued nothing");
+    }
+
+    /// The Feishu callback's own cancellation (its deadline drops the click
+    /// future) must restore the request too: the guard, not an error path, is
+    /// what makes the ordering safe.
+    #[tokio::test]
+    async fn a_cancelled_answer_restores_the_request() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Arc::new(Approvals::default());
+        approvals.set_reply_timeout(Duration::from_secs(5));
+        approvals.pending.lock().expect("pending approvals").insert(
+            "n:1".into(),
+            pending("item/commandExecution/requestApproval", command(), json!({})),
+        );
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+
+        let task = tokio::spawn({
+            let approvals = Arc::clone(&approvals);
+            let connection = connection.clone();
+            async move { approvals.reply_permission(&connection, "n:1", "once").await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        task.abort();
+        let _ = task.await;
+        assert!(
+            approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:1"),
+            "a cancelled click puts the request back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_question_answer_is_retryable() {
+        let (connection, mut frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Approvals::default();
+        approvals.set_reply_timeout(Duration::from_millis(20));
+        approvals
+            .pending
+            .lock()
+            .expect("pending approvals")
+            .insert("n:2".into(), question_pending());
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+
+        let answers = [FormAnswer {
+            key: "q1".into(),
+            value: Some(FormValue::Text("Yes".into())),
+        }];
+        approvals
+            .reply_question(&connection, "n:2", &answers)
+            .await
+            .expect_err("the enqueue times out");
+        assert!(
+            approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:2"),
+            "the question is restored for a retry"
+        );
+
+        assert!(matches!(
+            frames.recv().await.expect("the filler frame"),
+            Message::Text(_)
+        ));
+        approvals
+            .reply_question(&connection, "n:2", &answers)
+            .await
+            .expect("the retry is queued");
+        let response = frame_json(frames.recv().await.expect("the response frame"));
+        assert_eq!(response["id"], json!(2));
+        assert_eq!(
+            response["result"],
+            json!({ "answers": { "q1": { "answers": ["Yes"] } } })
+        );
+        assert!(frames.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_question_rejection_is_retryable() {
+        let (connection, mut frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Approvals::default();
+        approvals.set_reply_timeout(Duration::from_millis(20));
+        approvals
+            .pending
+            .lock()
+            .expect("pending approvals")
+            .insert("n:2".into(), question_pending());
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+
+        approvals
+            .reject_question(&connection, "n:2")
+            .await
+            .expect_err("the enqueue times out");
+        assert!(
+            approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:2"),
+            "the question is restored for a retry"
+        );
+
+        assert!(matches!(
+            frames.recv().await.expect("the filler frame"),
+            Message::Text(_)
+        ));
+        approvals
+            .reject_question(&connection, "n:2")
+            .await
+            .expect("the retry is queued");
+        let response = frame_json(frames.recv().await.expect("the response frame"));
+        assert_eq!(response["id"], json!(2));
+        assert_eq!(response["result"], json!({ "answers": {} }));
+        assert!(frames.try_recv().is_err());
     }
 
     #[test]
