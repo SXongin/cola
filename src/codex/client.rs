@@ -69,13 +69,18 @@ impl CodexOptions {
     }
 }
 
-/// The `codex-*` product version from an `initialize` `userAgent` (or from
+/// The app-server version from an `initialize` `userAgent` (or from
 /// `codex --version`'s `codex-cli 0.164.0`).
 ///
-/// The user agent looks like
-/// `codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.1.0)`;
-/// only the `codex-*` token is the server's version — the parenthesised client
-/// version is not.
+/// The user agent's **leading** token is `<client name>/<app-server version>`:
+/// the observed live daemon sends
+/// `cola/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)`,
+/// where `0.164.0` is the server and the parenthetical `(cola; 0.14.2)` is the
+/// **client's own** version, never the server's. A `codex-*`-named
+/// `name/version` token is preferred wherever it appears — a TUI-originated
+/// `codex-tui/0.164.0 …` keeps its old meaning — and otherwise the first token
+/// whose slash-separated version is valid semver wins, whatever the client
+/// calls itself. The older space-separated `codex-cli 0.163.0` shape is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerVersion {
     raw: String,
@@ -85,29 +90,49 @@ pub(crate) struct ServerVersion {
 impl ServerVersion {
     pub(crate) fn parse(text: &str) -> Option<Self> {
         let tokens: Vec<&str> = text.split_whitespace().collect();
+        // Two passes over `name/version` tokens: a `codex-*` name wins wherever
+        // it appears, so a TUI-originated UA keeps its old meaning; otherwise
+        // the leading token's version is the server's, whatever the client
+        // calls itself. A parenthetical client version is never reached: it is
+        // a separate space-delimited token with no slash.
+        for require_codex in [true, false] {
+            for token in &tokens {
+                let Some((name, candidate)) = token.split_once('/') else {
+                    continue;
+                };
+                if require_codex && !name.starts_with("codex") {
+                    continue;
+                }
+                if let Some(version) = Self::from_candidate(candidate) {
+                    return Some(version);
+                }
+            }
+        }
+        // The older CLI shape has no slash: `codex-cli 0.163.0`.
         for (index, token) in tokens.iter().enumerate() {
-            let (name, inline) = match token.split_once('/') {
-                Some((name, version)) => (name, Some(version)),
-                None => (*token, None),
-            };
-            if !name.starts_with("codex") {
+            if !token.starts_with("codex") {
                 continue;
             }
-            let candidate = inline.or_else(|| tokens.get(index + 1).copied())?;
-            let candidate = candidate.trim_matches(|character: char| {
-                !(character.is_ascii_alphanumeric()
-                    || character == '.'
-                    || character == '-'
-                    || character == '+')
-            });
-            if let Ok(parsed) = semver::Version::parse(candidate) {
-                return Some(Self {
-                    raw: candidate.to_string(),
-                    parsed,
-                });
+            if let Some(candidate) = tokens.get(index + 1)
+                && let Some(version) = Self::from_candidate(candidate)
+            {
+                return Some(version);
             }
         }
         None
+    }
+
+    /// Parse one candidate version, trimming the protocol's punctuation (a
+    /// parenthesised or comma-terminated token keeps its semver intact).
+    fn from_candidate(candidate: &str) -> Option<Self> {
+        let candidate = candidate.trim_matches(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '.' || character == '-' || character == '+')
+        });
+        let parsed = semver::Version::parse(candidate).ok()?;
+        Some(Self {
+            raw: candidate.to_string(),
+            parsed,
+        })
     }
 
     fn pinned() -> semver::Version {
@@ -366,19 +391,52 @@ mod tests {
     }
 
     #[test]
-    fn the_version_comes_from_the_codex_product_not_the_client_parenthesis() {
-        let version = ServerVersion::parse(
+    fn the_version_comes_from_the_leading_server_token_not_the_client_parenthesis() {
+        // The observed live daemon: the client names itself in the leading
+        // token and again in the parenthetical. Only the leading token's
+        // version is the server's; `0.14.2` is cola's own.
+        let observed = "cola/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)";
+        let version = ServerVersion::parse(observed).expect("the observed UA parses");
+        assert_eq!(version.to_string(), "0.164.0");
+        assert!(!version.is_pinned());
+
+        // A `codex-*` name is preferred even when a non-codex token comes
+        // first: the TUI-originated shape keeps its old meaning.
+        let preferred = ServerVersion::parse(
+            "something/0.150.0 codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
+        )
+        .expect("the codex token wins");
+        assert_eq!(preferred.to_string(), "0.164.0");
+
+        let tui = ServerVersion::parse(
             "codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
         )
         .expect("version");
-        assert_eq!(version.to_string(), "0.164.0");
-        assert!(!version.is_pinned());
-        assert!(
-            ServerVersion::parse("codex-cli 0.163.0")
-                .expect("cli")
-                .is_pinned()
-        );
+        assert_eq!(tui.to_string(), "0.164.0");
+        assert!(!tui.is_pinned());
+
+        // The space-separated CLI shape still parses, and is pinned.
+        let cli = ServerVersion::parse("codex-cli 0.163.0").expect("cli");
+        assert_eq!(cli.to_string(), "0.163.0");
+        assert!(cli.is_pinned());
+
         assert!(ServerVersion::parse("codex-tui/not-a-version").is_none());
+        assert!(ServerVersion::parse("cola/not-a-version (cola; 0.14.2)").is_none());
+        assert!(ServerVersion::parse("no version here").is_none());
+    }
+
+    /// The observed UA attaches end to end: a fixed probe verifies the newer
+    /// surface, so construction records 0.164.0 instead of failing at version
+    /// parse on the non-`codex` client name.
+    #[tokio::test]
+    async fn the_observed_live_user_agent_attaches_at_its_server_version() {
+        let observed = "cola/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)";
+        let client = connect(observed, &FixedProbe(Surface::pinned()))
+            .await
+            .expect("the observed UA attaches");
+        assert_eq!(client.server_info().version.to_string(), "0.164.0");
+        assert_eq!(client.server_info().user_agent, observed);
+        assert_eq!(client.server_info().surface_source, "test fixture");
     }
 
     /// The acceptance criterion: a server that lacks a required method fails at
