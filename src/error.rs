@@ -90,19 +90,19 @@ impl BridgeError {
         }
     }
 
-    /// True when a failed card/message write means the addressed **message is
-    /// gone** (deleted, or the platform reports code `230002`): nothing can be
-    /// clicked on a message that no longer exists, so a caller neutralizing it
-    /// may stop instead of retrying forever.
+    /// True when a failed card/message write proves the addressed **message is
+    /// gone** (deleted): nothing can be clicked on a message that no longer
+    /// exists, so a caller neutralizing it may stop instead of retrying forever.
     ///
-    /// Feishu reports this inside a 2xx body as an API code
-    /// ([`BridgeError::Feishu`]'s `update error 230002: message not found`), not
-    /// as an HTTP status — hence the display-text check. A 404 or
-    /// [`BridgeError::NotFound`] is the same fact from a different transport.
+    /// Only the platform's **specific** message-missing response qualifies:
+    /// Feishu reports it inside a 2xx body as API code `230002`
+    /// ([`BridgeError::Feishu`]'s `update error 230002: message not found`), so
+    /// this is a detail check. A bare HTTP 404 — a proxy, an endpoint outage, a
+    /// transient routing miss — can leave the message intact, so it stays
+    /// **retryable**; discarding the withdrawal state on it would strand a
+    /// card whose controls are still live.
     pub(crate) fn is_message_gone(&self) -> bool {
         match self {
-            BridgeError::NotFound(_) => true,
-            BridgeError::FeishuHttp { status, .. } => *status == 404,
             BridgeError::Feishu(detail) => {
                 let detail = detail.to_ascii_lowercase();
                 detail.contains("230002")
@@ -147,6 +147,27 @@ impl BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the platform's specific message-missing response is terminal: a
+    /// bare 404 or a NotFound can come from a proxy or an endpoint outage and
+    /// leave the message (and its clickable controls) intact.
+    #[test]
+    fn message_gone_is_the_specific_missing_message_response_only() {
+        assert!(BridgeError::Feishu("update error 230002: message not found".into()).is_message_gone());
+        assert!(BridgeError::Feishu("message not found".into()).is_message_gone());
+        assert!(BridgeError::Feishu("update error 230002: 消息不存在".into()).is_message_gone());
+        assert!(!BridgeError::Feishu("update error 230020: rate limit".into()).is_message_gone());
+        assert!(
+            !BridgeError::FeishuHttp {
+                status: 404,
+                detail: "proxy miss".into()
+            }
+            .is_message_gone(),
+            "a bare 404 leaves the retry state alone"
+        );
+        assert!(!BridgeError::NotFound("message om_1".into()).is_message_gone());
+        assert!(!BridgeError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "x")).is_message_gone());
+    }
 
     /// ADR-0067's retry rule: transport, timeouts, 5xx and rate limits recover;
     /// a refused content or any other refusal is permanent.

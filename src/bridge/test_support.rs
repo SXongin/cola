@@ -407,6 +407,10 @@ pub struct RecordingPlatform {
     /// (`230002`, delivered inside a 2xx body as an API code) — the permanent
     /// shape a caller neutralizing a card must stop retrying.
     pub fail_update_message_gone_count: std::sync::atomic::AtomicUsize,
+    /// The next N `update_message` calls fail with a bare HTTP 404. Unlike the
+    /// `230002` shape this says nothing about the message (a proxy, an endpoint
+    /// outage), so a caller must keep its retry state.
+    pub fail_update_http_404_count: std::sync::atomic::AtomicUsize,
     /// The next N `update_message` calls fail with a transport-class error
     /// (`BridgeError::Io`, the shape a timeout or dropped connection surfaces
     /// as) instead of an API response. An ambiguous failure: the PATCH may
@@ -522,6 +526,7 @@ impl RecordingPlatform {
             fail_update_card_content_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_message_gone_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_update_http_404_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_transport_count: std::sync::atomic::AtomicUsize::new(0),
             fail_update_containing: std::sync::Mutex::new(Vec::new()),
             fail_reply_card_content_count: std::sync::atomic::AtomicUsize::new(0),
@@ -987,6 +992,14 @@ impl feishu::Platform for RecordingPlatform {
             self.fail_update_message_gone_count
                 .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
+        let http_404 = self
+            .fail_update_http_404_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0;
+        if http_404 {
+            self.fail_update_http_404_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if let Some(gate) = self.take_gate("update", message_id) {
             wait_gate(gate).await;
         }
@@ -1020,6 +1033,12 @@ impl feishu::Platform for RecordingPlatform {
             return Err(crate::error::BridgeError::Feishu(
                 "update error 230002: message not found".into(),
             ));
+        }
+        if http_404 {
+            return Err(crate::error::BridgeError::FeishuHttp {
+                status: 404,
+                detail: "simulated bare 404".into(),
+            });
         }
         Ok(())
     }
