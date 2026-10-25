@@ -527,6 +527,12 @@ mod tests {
         // The liveness probe names its method through a constant, so no literal
         // is at the call site; the constant itself is pinned here.
         called.insert(crate::codex::lifecycle::LIVENESS_METHOD.to_string());
+        // One deliberate exception to the construction contract:
+        // `experimentalFeature/list` is a best-effort diagnosis read
+        // (ticket #883). It is not part of the adapter's required surface,
+        // because an older or non-experimental server may not serve it; a
+        // failure only makes the `agent_questions` capability `unknown`.
+        called.remove("experimentalFeature/list");
 
         let required: BTreeSet<&str> = REQUIRED_CLIENT_METHODS.iter().copied().collect();
         let uncovered: Vec<&str> = called

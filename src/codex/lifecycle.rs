@@ -132,6 +132,12 @@ const TURN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// a wedged connection must not extend the diagnosis past its own turn budget.
 const TURN_PROBE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the best-effort `experimentalFeature/list` read in
+/// [`CodexLifecycle::client_report`] gets. The method is experimental and the
+/// answer only decorates the report, so a wedged or unsupported server must not
+/// hold `cola status`/`doctor`.
+const AGENT_QUESTIONS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// How long a cancelled probe's cleanup looks for the live turn it must
 /// interrupt when it never cached the turn id (a `turn/start` whose reply was
 /// still in flight when the probe was dropped). The server persists a turn
@@ -1126,6 +1132,34 @@ impl ServerLifecycle for CodexLifecycle {
                     report.platform = Some(info.platform.clone());
                     report.surface_source = Some(info.surface_source.clone());
                     report.capabilities = codex_capabilities(info);
+                    // Best effort: the daemon's agent-question feature is a
+                    // server config row, not part of the verified surface.
+                    // A timeout, an unsupported experimental method or an
+                    // unlisted feature is "unknown" and never changes the
+                    // report's state or fails it.
+                    let agent_questions =
+                        tokio::time::timeout(AGENT_QUESTIONS_PROBE_TIMEOUT, client.agent_questions_enabled())
+                            .await;
+                    let state = match agent_questions {
+                        Ok(Ok(Some(true))) => "enabled",
+                        Ok(Ok(Some(false))) => "off",
+                        Ok(Ok(None)) => "unknown",
+                        Ok(Err(error)) => {
+                            tracing::debug!("could not read the codex agent-question feature: {error}");
+                            "unknown"
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                "the codex agent-question feature read timed out after \
+                                 {AGENT_QUESTIONS_PROBE_TIMEOUT:?}"
+                            );
+                            "unknown"
+                        }
+                    };
+                    report.capabilities.push(Capability {
+                        name: "agent_questions".to_string(),
+                        value: state.to_string(),
+                    });
                 }
                 None => {
                     report.state = ClientState::Unattached;
@@ -2164,6 +2198,12 @@ mod tests {
         }
         let fixture = Fixture::new();
         let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        server.set_experimental_features(vec![json!({
+            "name": crate::codex::client::AGENT_QUESTIONS_FEATURE,
+            "enabled": false,
+            "defaultEnabled": false,
+            "stage": "underDevelopment",
+        })]);
         fixture.link_daemon();
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
         let remote = format!("unix://{}", fixture.environment.socket().display());
@@ -2214,6 +2254,14 @@ mod tests {
                 .iter()
                 .any(|capability| capability.name == "surface"),
             "{:?}",
+            report.capabilities
+        );
+        assert!(
+            report
+                .capabilities
+                .iter()
+                .any(|capability| capability.name == "agent_questions" && capability.value == "off"),
+            "the daemon's agent-question feature state is reported: {:?}",
             report.capabilities
         );
         assert_eq!(

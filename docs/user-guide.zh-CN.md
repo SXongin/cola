@@ -169,7 +169,11 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `codex`（`app-server` 适配器，ADR-0090）能解析成功、能在 `$CODEX_HOME`
   下发现守护进程并探测其接口。两种 kind 都能启动：活动的 Agent Client 就是
   cola 所服务的那个，而 Codex 客户端需要其 app-server 守护进程可连接
-  （或按 `start_server` 可启动）。
+  （或按 `start_server` 可启动）。agent 主动发起的提问只有在 daemon 侧的
+  `~/.codex/config.toml` 中启用 `[features] default_mode_request_user_input =
+  true` 时才会到达 Feishu；修改后需重启 daemon 与 TUI。未启用时模型只会在
+  文本中提问。MCP elicitation 请求（`mcpServer/elicitation/request`）不受该
+  特性影响。
 - **选项与 `kind` 写在同一个表里。** `opencode` 的 Agent Client 接受 `url`、
   `start_server`、`generation` 与 `model`，和 `[opencode]` 完全一样；
   `codex` 的 Agent Client 接受 `start_server`（`auto`/`never`/`eager`）：

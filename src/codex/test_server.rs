@@ -391,6 +391,10 @@ struct State {
     model_page_size: AtomicUsize,
     /// The skills `skills/list` advertises.
     skills: std::sync::Mutex<Vec<Value>>,
+    /// The rows `experimentalFeature/list` advertises.
+    experimental_features: std::sync::Mutex<Vec<Value>>,
+    /// `experimentalFeature/list` calls received.
+    experimental_feature_calls: AtomicUsize,
     /// One-shot: answer the next `turn/start` with this JSON-RPC error.
     reject_turn_start: std::sync::Mutex<Option<String>>,
     /// One-shot: accept the next `turn/start` (persist and emit its stream) but
@@ -461,6 +465,8 @@ impl Default for State {
             models: std::sync::Mutex::new(Vec::new()),
             model_page_size: AtomicUsize::new(50),
             skills: std::sync::Mutex::new(Vec::new()),
+            experimental_features: std::sync::Mutex::new(Vec::new()),
+            experimental_feature_calls: AtomicUsize::new(0),
             reject_turn_start: std::sync::Mutex::new(None),
             drop_on_turn_start: std::sync::atomic::AtomicBool::new(false),
             silent_turn_start: std::sync::atomic::AtomicBool::new(false),
@@ -1024,6 +1030,21 @@ impl FakeServer {
     pub(crate) fn set_skills(&self, skills: Vec<Value>) {
         *self.state.skills.lock().expect("skills") = skills;
     }
+
+    /// The rows `experimentalFeature/list` serves.
+    pub(crate) fn set_experimental_features(&self, features: Vec<Value>) {
+        *self
+            .state
+            .experimental_features
+            .lock()
+            .expect("experimental features") = features;
+    }
+
+    /// `experimentalFeature/list` calls received, so a test can prove the
+    /// adapter asked the server rather than guessing.
+    pub(crate) fn experimental_feature_calls(&self) -> usize {
+        self.state.experimental_feature_calls.load(Ordering::SeqCst)
+    }
 }
 
 /// Count one accepted connection and serve it on its own task. The accept loop
@@ -1538,6 +1559,28 @@ where
                 );
             }
             !drop_response
+        }
+        Some("experimentalFeature/list") => {
+            state.experimental_feature_calls.fetch_add(1, Ordering::SeqCst);
+            let (data, next) = {
+                let features = state.experimental_features.lock().expect("experimental features");
+                let offset = params
+                    .get("cursor")
+                    .and_then(Value::as_str)
+                    .and_then(|cursor| cursor.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    .min(features.len());
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .map(|limit| limit as usize)
+                    .filter(|limit| *limit > 0)
+                    .unwrap_or(200);
+                let end = (offset + limit).min(features.len());
+                let next = (end < features.len()).then(|| json!(end.to_string()));
+                (features[offset..end].to_vec(), next)
+            };
+            replying(sink, id, json!({ "data": data, "nextCursor": next })).await
         }
         Some("model/list") => {
             state.model_list_calls.fetch_add(1, Ordering::SeqCst);
