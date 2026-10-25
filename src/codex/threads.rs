@@ -157,9 +157,6 @@ pub(crate) enum Adoption {
 
 /// `thread/unsubscribe`'s answer. `NotSubscribed` is the server's reply for a
 /// connection that holds no subscription to the thread.
-// The release path's answer (#881); kept decoded so
-// `thread/unsubscribe`'s states are the server's own.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum UnsubscribeStatus {
@@ -187,15 +184,13 @@ pub(crate) enum ThreadEvent {
 ///
 /// Dropping it releases the local handle (the server-side subscription stays
 /// until the connection closes); [`ThreadSubscription::release`] is the
-/// explicit, server-acknowledged path the bridge's release will use.
+/// explicit, server-acknowledged path the adapter's release uses.
 pub(crate) struct ThreadSubscription {
     thread: Thread,
     events: broadcast::Receiver<ThreadEvent>,
     // Held for their `Drop`/release semantics: the guard releases this local
     // holder, and the connection sends the acknowledged unsubscribe.
-    #[allow(dead_code)]
     guard: ReleaseGuard,
-    #[allow(dead_code)]
     connection: RpcConnection,
 }
 
@@ -255,8 +250,6 @@ impl ThreadSubscription {
     /// holds it (no `thread/unsubscribe` is sent: the server must keep
     /// streaming to that handle). This is the **only** unsubscribe path, so a
     /// caller cannot stop a stream another handle is reading.
-    // The bridge's release path is #881; the tests exercise it today.
-    #[allow(dead_code)]
     pub(crate) async fn release(mut self) -> Result<Option<UnsubscribeStatus>> {
         // Claim the local release atomically: two handles releasing at once
         // cannot both decide they are the last (and neither can both skip).
@@ -688,7 +681,6 @@ struct ReleaseGuard {
 
 impl ReleaseGuard {
     /// Drop this local handle and report whether it was the last one.
-    #[allow(dead_code)]
     fn take(&mut self) -> bool {
         if self.released {
             return false;

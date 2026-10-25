@@ -1537,6 +1537,14 @@ pub struct MockBackend {
     pub interrupt_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
     /// Records every `compact` call's session id (the `/compact` path).
     pub compact_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Records every `release_session` call's session id, in call order — the
+    /// bridge's mirror teardown (a chat unmapping or switching away from a
+    /// session).
+    pub release_calls: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// Number of initial `release_session` calls to fail; a consumer treats a
+    /// failure as best-effort and must not fail the command that dropped the
+    /// mapping.
+    pub fail_release_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Request ids cola answered via `reply_permission` — filtered out of
     /// `list_permissions` like the real server drops a replied request. A test
     /// simulating resolution by ANOTHER client inserts the id here directly.
@@ -1932,6 +1940,8 @@ impl MockBackend {
             reply_permission_sessions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             compact_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            release_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            fail_release_count: std::sync::atomic::AtomicUsize::new(0).into(),
             replied_permissions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             reply_permission_not_found: false,
             fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2834,6 +2844,21 @@ impl crate::backend::Backend for MockBackend {
     /// keeps it, ADR-0008); the capability exists on the seam for the generation
     /// wire tests, so the mock is a no-op.
     async fn delete_session(&self, _session_id: &str) -> crate::error::Result<()> {
+        Ok(())
+    }
+
+    /// Record the release and serve a scripted failure when one is armed: the
+    /// bridge's release is best-effort, so a test can prove the command still
+    /// lands when the client cannot free its mirror.
+    async fn release_session(&self, session_id: &str) -> crate::error::Result<()> {
+        self.release_calls.lock().await.push(session_id.to_string());
+        if self.fail_release_count.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.fail_release_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                "Simulated release failure".into(),
+            ));
+        }
         Ok(())
     }
 
