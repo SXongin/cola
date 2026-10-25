@@ -224,6 +224,26 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     #[allow(dead_code)]
     async fn delete_session(&self, session_id: &str) -> Result<()>;
 
+    /// The bridge no longer mirrors this session: the client may free whatever
+    /// it retained to serve it — a push subscription, its fold of that stream.
+    /// The server session itself **stays**: releasing is local mirror teardown,
+    /// never a delete, and a released session can be adopted again later (the
+    /// next read re-subscribes).
+    ///
+    /// The bridge calls this wherever a chat stops owning a session —
+    /// `/switch forget`, a switch that displaces the previous one, a steal, a
+    /// dead mapping being recreated — and treats every call as best-effort: a
+    /// failure is logged, never surfaced to the user's command, because the
+    /// local unmap already happened and the server state is untouched.
+    ///
+    /// The default is the no-op `Ok(())`: a client whose reads are stateless
+    /// retains nothing to release, so the no-op is **not applicable to this
+    /// client**. A client that does retain a subscription overrides this and
+    /// answers `Err` when the release itself failed.
+    async fn release_session(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Submit one prompt: the message is persisted and a run is scheduled,
     /// then the call returns — it does NOT block until the turn finishes. How
     /// a generation sends a prompt does not change the contract: V1 uses the

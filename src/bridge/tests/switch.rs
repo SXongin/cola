@@ -1,3 +1,4 @@
+use crate::backend::Backend;
 use crate::bridge::test_support::*;
 
 /// Repeated session-list reads through the `/switch` card within the 30 s
@@ -2160,4 +2161,168 @@ async fn click_button_card(app: &Arc<App>, card: &serde_json::Value, op: &str) -
         .unwrap_or_else(|| panic!("button `{op}` returned no result"))
         .card
         .unwrap_or_else(|| panic!("button `{op}` returned no card"))
+}
+
+/// A real Codex client over the scripted app-server — the production adapter,
+/// so the release assertions read the adapter's own wire traffic instead of a
+/// mock's call log.
+async fn codex_client(url: &str) -> crate::codex::CodexClient {
+    let endpoint = crate::codex::Endpoint::parse(url).expect("endpoint");
+    crate::codex::CodexClient::connect(
+        &crate::codex::CodexOptions::new(endpoint),
+        &crate::codex::PinnedProbe,
+    )
+    .await
+    .expect("attach to the scripted app-server")
+}
+
+/// One mapped Codex thread for `/switch forget` / switch tests.
+fn codex_entry(thread_id: &str) -> crate::config::SessionEntry {
+    crate::config::SessionEntry {
+        client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+        thread_key: crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        session_id: thread_id.into(),
+        directory: "/work/cola".into(),
+        agent: None,
+        model: None,
+        auto_accept: false,
+        topic_anchor: None,
+        topic_root: None,
+        variant: None,
+    }
+}
+
+/// `/switch forget` on a Codex session releases the adapter's subscription:
+/// `thread/unsubscribe` goes out once, a second connection's subscription to
+/// the same thread keeps streaming, and the released session re-adopts later.
+#[tokio::test]
+async fn switch_forget_releases_only_this_chats_codex_subscription() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a real thread",
+    ));
+    let client = codex_client(&url).await;
+    let peer = codex_client(&url).await;
+    client
+        .transcript("thread-1")
+        .await
+        .expect("cola's connection adopts");
+    peer.transcript("thread-1").await.expect("the peer adopts");
+    server.wait_for_subscribers("thread-1", 2).await;
+
+    let app = Arc::new(App::new(cfg, Arc::new(client.clone()), Arc::new(RecordingPlatform::new())).unwrap());
+    seed_entry(&app, codex_entry("thread-1")).await;
+
+    send_command(&app, "/switch forget", "msg_forget").await;
+
+    assert_eq!(server.unsubscribe_calls(), 1, "one acknowledged unsubscribe");
+    server.wait_for_subscribers("thread-1", 1).await;
+    // The other subscriber still streams: the server did not unload the thread.
+    assert_eq!(
+        server.push_item("thread-1", "item-peer", "the peer still streams"),
+        1
+    );
+    assert!(
+        client
+            .projections
+            .transcript("thread-1")
+            .messages
+            .iter()
+            .all(|message| !message.text().contains("the peer still streams")),
+        "the released connection no longer folds this thread's items"
+    );
+    // Re-adopting the released session works (a fresh `thread/resume` and a
+    // live stream), which is the promise `/switch forget` makes to the user.
+    client
+        .transcript("thread-1")
+        .await
+        .expect("the released session re-adopts");
+    assert_eq!(
+        server.resume_calls(),
+        3,
+        "each connection adopted once; the release re-adopts once"
+    );
+    server.wait_for_subscribers("thread-1", 2).await;
+}
+
+/// Switching to another session releases the previous one's subscription: the
+/// displaced session stays mapped and switchable, but its stream is freed.
+#[tokio::test]
+async fn switching_to_another_session_releases_the_previous_codex_subscription() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "first session",
+    ));
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-2",
+        "session-root-2",
+        "/work/cola",
+        "second session",
+    ));
+    let client = codex_client(&url).await;
+    client
+        .transcript("thread-1")
+        .await
+        .expect("the mapped session is mirrored");
+    server.wait_for_subscribers("thread-1", 1).await;
+
+    let app = Arc::new(App::new(cfg, Arc::new(client), Arc::new(RecordingPlatform::new())).unwrap());
+    seed_entry(&app, codex_entry("thread-1")).await;
+
+    send_command(&app, "/switch second session", "msg_switch").await;
+
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key).unwrap().session_id,
+        "thread-2",
+        "the switch landed on the new session"
+    );
+    assert_eq!(server.unsubscribe_calls(), 1, "the displaced session is released");
+    server.wait_for_subscribers("thread-1", 0).await;
+    // The new session was adopted by the switch (its snapshot read), so the
+    // release did not disturb another thread's stream.
+    server.wait_for_subscribers("thread-2", 1).await;
+}
+
+/// A release the client cannot complete is logged, never surfaced: the local
+/// unmap and its user-facing confirmation still happen.
+#[tokio::test]
+async fn a_failed_release_does_not_fail_switch_forget() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let release_calls = backend.release_calls.clone();
+    backend
+        .fail_release_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(&app, codex_entry("ses_release_fails")).await;
+
+    send_command(&app, "/switch forget", "msg_forget").await;
+
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    assert!(
+        app.sessions.lock().await.get_active(&key).is_none(),
+        "the unmap still happened"
+    );
+    assert_eq!(
+        release_calls.lock().await.clone(),
+        vec!["ses_release_fails".to_string()],
+        "the release was attempted"
+    );
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("已解除"), "the confirmation still lands: {text}");
 }

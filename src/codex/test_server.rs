@@ -346,6 +346,9 @@ struct State {
     turns_calls: AtomicUsize,
     turns_params: std::sync::Mutex<Vec<Value>>,
     unsubscribe_calls: AtomicUsize,
+    /// How many upcoming `thread/unsubscribe` calls answer with a JSON-RPC
+    /// error, so the release path's failure arm is exercised.
+    reject_unsubscribe: AtomicUsize,
     /// Answer `thread/resume` without a response, so a test can cancel a
     /// pending adopt.
     silent_resume: std::sync::atomic::AtomicBool,
@@ -436,6 +439,7 @@ impl Default for State {
             turns_calls: AtomicUsize::new(0),
             turns_params: std::sync::Mutex::new(Vec::new()),
             unsubscribe_calls: AtomicUsize::new(0),
+            reject_unsubscribe: AtomicUsize::new(0),
             silent_resume: std::sync::atomic::AtomicBool::new(false),
             fail_turns_pages: AtomicUsize::new(0),
             scripted_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -770,6 +774,12 @@ impl FakeServer {
     /// `thread/unsubscribe` calls received so far.
     pub(crate) fn unsubscribe_calls(&self) -> usize {
         self.state.unsubscribe_calls.load(Ordering::SeqCst)
+    }
+
+    /// Answer the next `thread/unsubscribe` calls with a JSON-RPC error, so a
+    /// test can prove the release path survives a server that refuses it.
+    pub(crate) fn reject_unsubscribe(&self, count: usize) {
+        self.state.reject_unsubscribe.store(count, Ordering::SeqCst);
     }
 
     /// How many connection streams are currently subscribed to `thread_id`.
@@ -1576,6 +1586,10 @@ where
         }
         Some("thread/unsubscribe") => {
             state.unsubscribe_calls.fetch_add(1, Ordering::SeqCst);
+            if state.reject_unsubscribe.load(Ordering::SeqCst) > 0 {
+                state.reject_unsubscribe.fetch_sub(1, Ordering::SeqCst);
+                return reply_error(sink, id, -32600, "thread unsubscribe failed").await;
+            }
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let status = {
                 let mut subscribers = state.subscribers.lock().expect("subscribers");

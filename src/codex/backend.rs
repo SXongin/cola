@@ -83,6 +83,13 @@ pub(crate) struct Projections {
     /// holding the cache is dropped, so a replaced attachment stops folding
     /// into a cache nothing reads.
     subscribers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// One release channel per live thread consumer. The consumer task is the
+    /// **only** holder of the thread's [`ThreadSubscription`], so the release
+    /// path hands it a command and it is that task which sends
+    /// `thread/unsubscribe` — only the last local handle may unsubscribe.
+    /// Taking the entry here makes a second release of the same thread a
+    /// no-op instead of a second unsubscribe.
+    releases: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<ReleaseCommand>>>,
     /// Each thread's working directory, learned when it is created or adopted.
     /// The prompt axis carries no directory, so this is where a skill resolves
     /// against the session's own project first.
@@ -103,6 +110,15 @@ impl Drop for Projections {
             task.abort();
         }
     }
+}
+
+/// One request to the task that owns a thread's subscription: release it (the
+/// task is the only holder, so only it can decide whether this was the last
+/// local handle) and answer with the outcome. The answer lets the caller bound
+/// its wait and makes a returned release a clean point: the next
+/// `thread/resume` cannot race the teardown.
+struct ReleaseCommand {
+    ack: tokio::sync::oneshot::Sender<CodexResult<()>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +500,35 @@ impl Projections {
             .insert(thread_id.to_string(), state);
     }
 
+    /// Register the consumer that owns `thread_id`'s subscription. A re-adopt
+    /// replaces any previous sender (which by then belongs to a task that has
+    /// already ended or is about to).
+    fn watch_release(&self, thread_id: &str, sender: tokio::sync::mpsc::UnboundedSender<ReleaseCommand>) {
+        self.releases
+            .lock()
+            .expect("codex release channels")
+            .insert(thread_id.to_string(), sender);
+    }
+
+    /// Claim `thread_id`'s release channel. `None` means no consumer is live:
+    /// the thread was never adopted on this connection, or it was already
+    /// released — either way there is nothing to unsubscribe.
+    fn take_release(&self, thread_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<ReleaseCommand>> {
+        self.releases
+            .lock()
+            .expect("codex release channels")
+            .remove(thread_id)
+    }
+
+    /// Drop the live state of a released subscription so the next read
+    /// re-adopts, and mark the retained projection incomplete — the same shape
+    /// a lost subscription leaves. The retained history still serves a Turn
+    /// Diff or a card read in flight; `is_seeded` is what says the stream is no
+    /// longer live.
+    fn released(&self, thread_id: &str) {
+        self.forget(thread_id);
+    }
+
     /// Forget a dead subscription so the next read adopts again, and state the
     /// gap on the retained history: a later read must not present stale state
     /// as current.
@@ -519,6 +564,41 @@ impl CodexClient {
     /// The endpoint this connection dialled, for the neutral base-URL read.
     pub(crate) fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Stop mirroring `thread_id` on this connection: the subscriber task sends
+    /// `thread/unsubscribe` when it was the last local handle, then the thread's
+    /// live state is dropped (the retained history stays, explicitly
+    /// incomplete). The server session is untouched — it stays listable,
+    /// resumable and readable — and a thread this connection never adopted (or
+    /// already released) is a `Ok(())` no-op.
+    ///
+    /// Serialised with [`Self::ensure_subscription`] by the same per-thread
+    /// adoption lock: a release cannot kill a subscription a concurrent read
+    /// just made, and a release that has returned is not raced by the next
+    /// `thread/resume`.
+    pub(crate) async fn release_thread(&self, thread_id: &str) -> CodexResult<()> {
+        let adoption = self.projections.adoption_lock(thread_id);
+        let _adopting = adoption.lock().await;
+        let Some(release) = self.projections.take_release(thread_id) else {
+            return Ok(());
+        };
+        // Drop the live state before the unsubscribe can return, so a read
+        // arriving while it is in flight re-adopts instead of reading a stream
+        // that is ending.
+        self.projections.forget(thread_id);
+        let (ack, answer) = tokio::sync::oneshot::channel();
+        if release.send(ReleaseCommand { ack }).is_err() {
+            // The consumer already ended (its connection closed), taking the
+            // local handle with it; there is nothing left to unsubscribe.
+            return Ok(());
+        }
+        match answer.await {
+            Ok(result) => result,
+            // The consumer ended without answering: its task was aborted with
+            // the cache, so this connection is gone.
+            Err(_) => Err(CodexError::NoResponse(format!("thread/unsubscribe {thread_id}"))),
+        }
     }
 
     /// The live turn a `/stop` should interrupt.
@@ -770,11 +850,17 @@ impl CodexClient {
                         },
                     );
                 }
+                // Register the consumer's release channel before spawning it:
+                // a release that arrives once the state is `Live` must always
+                // find a task to hand its command to.
+                let (release, releases) = tokio::sync::mpsc::unbounded_channel();
+                self.projections.watch_release(thread_id, release);
                 let task = tokio::spawn(consume(
                     subscription,
                     self.threads().clone(),
                     Arc::downgrade(&self.projections),
                     self.projections.resync_signal(thread_id),
+                    releases,
                 ));
                 self.projections.track(task);
                 Ok(())
@@ -792,20 +878,25 @@ impl CodexClient {
 }
 
 /// Fold one subscription's events into the cache. Notifications are applied
-/// inline; a lag or a lost connection is explicitly surfaced.
+/// inline; a lag or a lost connection is explicitly surfaced. A release command
+/// ends the task: it is the only holder of the subscription, so it sends the
+/// acknowledged `thread/unsubscribe` (unless another local handle still holds
+/// the thread) and forgets the thread's live state.
 async fn consume(
     mut subscription: ThreadSubscription,
     threads: Threads,
     projections: std::sync::Weak<Projections>,
     signal: Arc<tokio::sync::Notify>,
+    mut releases: tokio::sync::mpsc::UnboundedReceiver<ReleaseCommand>,
 ) {
     let thread_id = subscription.thread().id.clone();
-    loop {
+    let command = loop {
         // The subscriber is the only consumer, so an event is either dequeued
         // and applied immediately or left queued while this task pages. It can
         // never be in hand across a page and applied twice.
         tokio::select! {
             biased;
+            command = releases.recv() => break command,
             _ = signal.notified() => {
                 let due = projections.upgrade().is_some_and(|projections| {
                     matches!(
@@ -852,7 +943,24 @@ async fn consume(
                 }
             }
         }
+    };
+    // A closed release channel means the cache went away with the client; the
+    // subscription's drop releases our local handle just the same.
+    let Some(command) = command else {
+        return;
+    };
+    // This task holds the subscription, so only it can ask whether this was the
+    // last local handle. `release` answers `Ok(None)` when another handle still
+    // holds the thread — the server must keep streaming to it, and no
+    // `thread/unsubscribe` is sent.
+    let result = subscription.release().await.map(|_| ());
+    if let Some(projections) = projections.upgrade() {
+        projections.released(&thread_id);
     }
+    // The caller may have bounded its wait and gone (a slow server, a
+    // cancelled command): the release still happened, so a dropped ack is not
+    // a failure.
+    let _ = command.ack.send(result);
 }
 
 /// Rebuild a projection from persisted turns. A failed read leaves the
@@ -1170,6 +1278,15 @@ impl Backend for CodexClient {
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
+        // Stop mirroring before the thread disappears, so the subscriber task is
+        // not left folding a stream whose thread is gone. A failed release is
+        // not the delete's failure: the server is the authority on the delete.
+        if let Err(error) = self.release_thread(session_id).await {
+            tracing::debug!(
+                thread = %session_id,
+                "could not release the codex thread subscription before deleting the thread: {error}"
+            );
+        }
         self.connection()
             .request("thread/delete", json!({ "threadId": session_id }))
             .await
@@ -1179,6 +1296,10 @@ impl Backend for CodexClient {
         // and a recreated id must not inherit them.
         self.authored.forget(session_id);
         Ok(())
+    }
+
+    async fn release_session(&self, session_id: &str) -> Result<()> {
+        self.release_thread(session_id).await.map_err(client_error)
     }
 
     async fn prompt(
@@ -1675,6 +1796,10 @@ impl Backend for CodexLifecycle {
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
         Backend::delete_session(&self.current().await?, session_id).await
+    }
+
+    async fn release_session(&self, session_id: &str) -> Result<()> {
+        Backend::release_session(&self.current().await?, session_id).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4586,5 +4711,121 @@ mod tests {
             status_error.to_string().contains("not attached"),
             "{status_error}"
         );
+    }
+
+    /// A release frees this connection's subscription: `thread/unsubscribe`
+    /// goes out once, the released thread's items stop reaching its projection,
+    /// and another connection's subscription to the SAME thread keeps
+    /// streaming (the server must not unload a thread another subscriber
+    /// holds).
+    #[tokio::test]
+    async fn releasing_a_thread_unsubscribes_this_connection_only() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let first = connect(&url).await;
+        let second = connect(&url).await;
+        first.transcript("thread-1").await.expect("adopt on the first");
+        second.transcript("thread-1").await.expect("adopt on the second");
+        server.wait_for_subscribers("thread-1", 2).await;
+
+        first.release_session("thread-1").await.expect("release");
+        assert_eq!(server.unsubscribe_calls(), 1, "exactly one unsubscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // The peer's stream survives, so the server had another subscriber.
+        assert_eq!(
+            server.push_item("thread-1", "item-1", "after the release"),
+            1,
+            "only the peer is still subscribed"
+        );
+        wait_for_text(&second, "thread-1", "after the release").await;
+        assert!(
+            first
+                .projections
+                .transcript("thread-1")
+                .messages
+                .iter()
+                .all(|message| !message.text().contains("after the release")),
+            "a released thread folds no further items"
+        );
+    }
+
+    /// Releasing a session no read ever adopted is a `Ok(())` no-op: no
+    /// `thread/unsubscribe` for a subscription this connection never made.
+    #[tokio::test]
+    async fn releasing_a_session_that_was_never_adopted_is_a_no_op() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+
+        client
+            .release_session("thread-1")
+            .await
+            .expect("an unadopted release is a no-op");
+        assert_eq!(server.unsubscribe_calls(), 0);
+        assert_eq!(server.resume_calls(), 0, "a release never adopts");
+    }
+
+    /// A released thread is adoptable again: the next read sends a fresh
+    /// `thread/resume` and its item stream works.
+    #[tokio::test]
+    async fn re_adopting_a_released_thread_resumes_again() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client.release_session("thread-1").await.expect("release");
+        server.wait_for_subscribers("thread-1", 0).await;
+
+        client.transcript("thread-1").await.expect("re-adopt");
+        assert_eq!(server.resume_calls(), 2, "the re-adoption resumes again");
+        server.wait_for_subscribers("thread-1", 1).await;
+        assert_eq!(server.push_item("thread-1", "item-2", "after re-adoption"), 1);
+        wait_for_text(&client, "thread-1", "after re-adoption").await;
+    }
+
+    /// A server that refuses `thread/unsubscribe` reports the failure to the
+    /// caller, but the local teardown already happened: the next read adopts
+    /// again rather than sitting on a phantom subscription.
+    #[tokio::test]
+    async fn a_refused_unsubscribe_is_reported_and_the_thread_re_adopts() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.reject_unsubscribe(1);
+
+        let error = client
+            .release_session("thread-1")
+            .await
+            .expect_err("the refusal is reported");
+        assert!(error.to_string().contains("thread unsubscribe failed"), "{error}");
+
+        client.transcript("thread-1").await.expect("re-adopt");
+        assert_eq!(server.resume_calls(), 2);
+        server.wait_for_subscribers("thread-1", 1).await;
     }
 }

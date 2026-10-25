@@ -1579,6 +1579,38 @@ pub(crate) struct FlowHandles {
 }
 
 impl FlowHandles {
+    /// How long a mapping change waits for the client's best-effort release of
+    /// the session it no longer mirrors. The client's unsubscribe is one round
+    /// trip; a stalled server must not hold the user's command, so past this
+    /// bound the release is logged and abandoned (the client still finishes it
+    /// on its own — a bounded wait never abandons the local teardown).
+    const SESSION_RELEASE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Tell the client the bridge no longer mirrors `session_id`, so it may
+    /// free whatever it retained for it (a push subscription, say). **Best
+    /// effort**: the mapping change has already happened locally and the server
+    /// session stays untouched, so a failure — or a client too slow to answer —
+    /// is logged and never fails the command that dropped the mapping.
+    async fn release_mirror(&self, session_id: &str) {
+        match tokio::time::timeout(
+            Self::SESSION_RELEASE_BOUND,
+            self.backend.release_session(session_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
+                session = %session_id,
+                "the client could not release the session it no longer mirrors: {error}"
+            ),
+            Err(_) => tracing::warn!(
+                session = %session_id,
+                "the client did not release the session it no longer mirrors within {:?}",
+                Self::SESSION_RELEASE_BOUND
+            ),
+        }
+    }
+
     /// Promote `entry` as its thread's Active Session, collecting the displaced
     /// Session's waiting card first (ADR-0059, spec #405): the displaced
     /// Session can no longer be continued by a message in this thread, so a
@@ -1588,6 +1620,10 @@ impl FlowHandles {
     /// polling Wake cannot resume a chain the switch is leaving behind.
     /// Re-activating the already-active session collects nothing.
     ///
+    /// The displaced Session is no longer what this chat mirrors, so its
+    /// client-held stream is released best-effort (it stays mapped and
+    /// switchable; a later read re-adopts it).
+    ///
     /// This and the other operations below are the ONLY way to change a
     /// thread's Active Session mapping outside [`SessionsHandle`]: the raw
     /// mutators are module-private, so no switch/adopt/steal path can forget
@@ -1596,12 +1632,20 @@ impl FlowHandles {
     /// next Turn in the thread collects its card — the Turn's supersede collect
     /// reads every mapped session.
     pub(crate) async fn activate(&self, entry: SessionEntry) -> crate::error::Result<()> {
-        if let Some(previous) = self.sessions.active_entry(&entry.thread_key).await
-            && previous.session_id != entry.session_id
-        {
-            Turn::collect_waiting(&self.cards, &previous.session_id, CollectReason::SwitchedAway).await;
+        let displaced = self
+            .sessions
+            .active_entry(&entry.thread_key)
+            .await
+            .filter(|previous| previous.session_id != entry.session_id)
+            .map(|previous| previous.session_id);
+        if let Some(previous) = &displaced {
+            Turn::collect_waiting(&self.cards, previous, CollectReason::SwitchedAway).await;
         }
-        self.sessions.activate(entry).await
+        self.sessions.activate(entry).await?;
+        if let Some(previous) = displaced {
+            self.release_mirror(&previous).await;
+        }
+        Ok(())
     }
 
     /// Unmap `session_id` — a `--force` steal by another thread, or a dead
@@ -1609,17 +1653,20 @@ impl FlowHandles {
     /// first (ADR-0059, spec #405): the Session stops being any thread's Active
     /// Session, so its card must not keep sitting on 「⏳ 等待后台任务」. The
     /// returned entry is the removed mapping, `None` when nothing was mapped
-    /// (and then nothing is collected).
+    /// (and then nothing is collected). A removed mapping has its client-held
+    /// stream released best-effort — the server session stays.
     pub(crate) async fn unmap(&self, session_id: &str) -> crate::error::Result<Option<SessionEntry>> {
         let removed = self.sessions.remove_session(session_id).await?;
         if removed.is_some() {
             Turn::collect_waiting(&self.cards, session_id, CollectReason::SwitchedAway).await;
+            self.release_mirror(session_id).await;
         }
         Ok(removed)
     }
 
     /// Unmap every mapping of `thread_key` (`/switch forget`), collecting each
-    /// removed Session's waiting card (ADR-0059, spec #405).
+    /// removed Session's waiting card (ADR-0059, spec #405) and releasing its
+    /// client-held stream best-effort (the server sessions stay).
     pub(crate) async fn unmap_thread(
         &self,
         thread_key: &ThreadKey,
@@ -1627,6 +1674,7 @@ impl FlowHandles {
         let removed = self.sessions.remove_thread_sessions(thread_key).await?;
         for entry in &removed {
             Turn::collect_waiting(&self.cards, &entry.session_id, CollectReason::SwitchedAway).await;
+            self.release_mirror(&entry.session_id).await;
         }
         Ok(removed)
     }
