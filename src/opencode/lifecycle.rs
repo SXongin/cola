@@ -310,6 +310,79 @@ impl OpenCodeBackend {
     }
 }
 
+/// The Background Task capability a **resolved** generation proves (ADR-0079,
+/// ticket #883). V2 publishes the shell/child records and runtime verdicts;
+/// V1 does not. An unknown generation claims nothing either way.
+fn background_tasks_capability(generation: Option<&str>) -> &'static str {
+    match generation {
+        Some("v2") => "yes",
+        Some("v1") => "unsupported",
+        _ => "unknown",
+    }
+}
+
+/// Build the neutral client report from one attachment read.
+///
+/// Split from [`ServerLifecycle::client_report`] so the one-shot CLI shape is
+/// directly testable: `with_tasks` constructs a V1 strategy, and a `cola
+/// status` process never runs `reconnect` to replace it with the generation
+/// the attach probe resolved. The Background Task capability must therefore
+/// follow the **attachment's** generation, exactly like the display row, never
+/// the not-yet-attached strategy.
+fn report_from_attachment(backend: &OpenCodeBackend, attachment: Option<AttachmentStatus>) -> ClientReport {
+    let configured = backend
+        .settings()
+        .url
+        .clone()
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| "http://localhost:4096".to_string());
+    let endpoint = attachment
+        .as_ref()
+        .map(|status| status.url.clone())
+        .unwrap_or(configured);
+    let capabilities = attachment
+        .as_ref()
+        .map(|status| {
+            let generation = status.generation.clone().unwrap_or_else(|| "unknown".to_string());
+            vec![
+                Capability {
+                    name: "generation".to_string(),
+                    value: generation,
+                },
+                Capability {
+                    name: "background_tasks".to_string(),
+                    value: background_tasks_capability(status.generation.as_deref()).to_string(),
+                },
+            ]
+        })
+        .unwrap_or_default();
+    let (state, detail) = match attachment {
+        Some(status) => (
+            ClientState::Attached,
+            match status.generation {
+                Some(generation) => format!("attached (generation {generation})"),
+                None => format!("attached, generation unknown: {}", status.evidence),
+            },
+        ),
+        None => (
+            ClientState::Absent,
+            "no shared OpenCode server was found; LAZY start or attach-only".to_string(),
+        ),
+    };
+    ClientReport {
+        endpoint,
+        state,
+        detail,
+        runtime_binary: None,
+        version: None,
+        platform: None,
+        surface_source: None,
+        capabilities,
+        user_clients: Vec::new(),
+        client_binary: None,
+    }
+}
+
 #[async_trait]
 impl ServerLifecycle for OpenCodeBackend {
     async fn ensure_attached(&self, request: EnsureAttached<'_>) -> crate::error::Result<AttachOutcome> {
@@ -375,66 +448,9 @@ impl ServerLifecycle for OpenCodeBackend {
 
     /// The client-scoped diagnosis (ticket #883). OpenCode's runtime is the
     /// shared server the attach probe already resolves, so this reuses
-    /// [`Self::attachment_status`] rather than inventing a second probe; the
-    /// only capability the attachment itself proves is the generation, and the
-    /// Background Task surface is this adapter's own answer.
+    /// [`Self::attachment_status`] rather than inventing a second probe.
     async fn client_report(&self) -> Option<ClientReport> {
-        let settings = self.settings();
-        let configured = settings
-            .url
-            .clone()
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| "http://localhost:4096".to_string());
-        let attachment = self.attachment_status().await;
-        let endpoint = attachment
-            .as_ref()
-            .map(|status| status.url.clone())
-            .unwrap_or(configured);
-        let capabilities = attachment
-            .as_ref()
-            .map(|status| {
-                let generation = status.generation.clone().unwrap_or_else(|| "unknown".to_string());
-                vec![
-                    Capability {
-                        name: "generation".to_string(),
-                        value: generation,
-                    },
-                    Capability {
-                        name: "background_tasks".to_string(),
-                        value: if self.background_tasks_supported() {
-                            "yes".to_string()
-                        } else {
-                            "unsupported".to_string()
-                        },
-                    },
-                ]
-            })
-            .unwrap_or_default();
-        let (state, detail) = match attachment {
-            Some(status) => (
-                ClientState::Attached,
-                match status.generation {
-                    Some(generation) => format!("attached (generation {generation})"),
-                    None => format!("attached, generation unknown: {}", status.evidence),
-                },
-            ),
-            None => (
-                ClientState::Absent,
-                "no shared OpenCode server was found; LAZY start or attach-only".to_string(),
-            ),
-        };
-        Some(ClientReport {
-            endpoint,
-            state,
-            detail,
-            runtime_binary: None,
-            version: None,
-            platform: None,
-            surface_source: None,
-            capabilities,
-            user_clients: Vec::new(),
-            client_binary: None,
-        })
+        Some(report_from_attachment(self, self.attachment_status().await))
     }
 
     async fn restart_server(&self) -> crate::error::Result<RestartOutcome> {
@@ -523,6 +539,56 @@ mod tests {
             crate::state::StateLayout::default(),
             crate::bridge::tasks::TasksHandle::new(),
         )
+    }
+
+    /// Ticket #883 regression: the one-shot `cola status` process builds the
+    /// backend with `with_tasks`, whose constructed strategy is V1, and never
+    /// runs `reconnect` with the resolved generation. The report must still
+    /// take the Background Task capability from the attachment's generation —
+    /// the same fact the display row uses — not from the strategy.
+    #[test]
+    fn the_report_takes_background_tasks_from_the_attached_generation() {
+        let backend = serverless_backend(crate::config::OpenCodeConfig::default());
+        assert!(
+            !backend.background_tasks_supported(),
+            "the one-shot shape's constructed strategy is V1"
+        );
+        let attachment = |generation: Option<&str>| AttachmentStatus {
+            url: "http://localhost:49374".into(),
+            pid: 7,
+            generation: generation.map(str::to_string),
+            evidence: String::new(),
+            other_servers: Vec::new(),
+        };
+        let capability = |report: &ClientReport, name: &str| {
+            report
+                .capabilities
+                .iter()
+                .find(|capability| capability.name == name)
+                .map(|capability| capability.value.clone())
+        };
+
+        let v2 = report_from_attachment(&backend, Some(attachment(Some("v2"))));
+        assert_eq!(capability(&v2, "generation").as_deref(), Some("v2"));
+        assert_eq!(capability(&v2, "background_tasks").as_deref(), Some("yes"));
+
+        let v1 = report_from_attachment(&backend, Some(attachment(Some("v1"))));
+        assert_eq!(
+            capability(&v1, "background_tasks").as_deref(),
+            Some("unsupported")
+        );
+
+        let unknown = report_from_attachment(&backend, Some(attachment(None)));
+        assert_eq!(
+            capability(&unknown, "background_tasks").as_deref(),
+            Some("unknown")
+        );
+
+        let absent = report_from_attachment(&backend, None);
+        assert!(
+            capability(&absent, "background_tasks").is_none(),
+            "no attachment advertises no capability"
+        );
     }
 
     /// The demand path's real decision, not an extracted helper: with
