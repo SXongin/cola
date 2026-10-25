@@ -90,6 +90,7 @@ const MAX_PENDING: usize = 64;
 
 /// One approval/question request a server is waiting on, keyed by the canonical
 /// spelling of its id.
+#[derive(Clone)]
 struct Pending {
     /// The exact JSON-RPC id the server chose; the response frame must echo it
     /// verbatim (a string id stays a string, a number stays a number).
@@ -104,6 +105,11 @@ struct Pending {
     params: Value,
     permission: Option<PermissionRequest>,
     question: Option<QuestionRequest>,
+    /// The token of the answer currently being written, when one is. The entry
+    /// stays in the map so `serverRequest/resolved` can remove it while the
+    /// send is in flight; it is hidden from the polled lists until the send
+    /// commits or fails. `None` means the request is idle and answerable.
+    replying: Option<u64>,
 }
 
 impl Pending {
@@ -131,6 +137,10 @@ pub(crate) struct Approvals {
     /// dropped, so a replaced attachment stops recording into a map nothing
     /// reads.
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The next reply token. A token distinguishes this send from a resolved or
+    /// replaced entry with the same id, so a late guard can only touch its own
+    /// in-flight state.
+    next_reply: AtomicU64,
 }
 
 impl Drop for Approvals {
@@ -256,14 +266,16 @@ impl Approvals {
         let Some(key) = request_key(id) else {
             return;
         };
-        if self
-            .pending
-            .lock()
-            .expect("pending approvals")
-            .remove(&key)
-            .is_some()
-        {
-            tracing::info!("codex server request {key} resolved elsewhere");
+        let removed = self.pending.lock().expect("pending approvals").remove(&key);
+        match removed {
+            Some(pending) if pending.replying.is_some() => {
+                // Removing the entry is what stops a failed/cancelled send from
+                // restoring it: the reply guard only clears a `replying` flag it
+                // still owns, and never re-inserts a removed entry.
+                tracing::info!("codex server request {key} resolved elsewhere while a reply was in flight");
+            }
+            Some(_) => tracing::info!("codex server request {key} resolved elsewhere"),
+            None => {}
         }
     }
 
@@ -357,6 +369,7 @@ impl Approvals {
             params,
             permission: decoded.permission,
             question: decoded.question,
+            replying: None,
         };
         if let Some(previous) = self
             .pending
@@ -381,7 +394,9 @@ impl Approvals {
             .expect("pending approvals")
             .values()
             .filter(|pending| {
-                pending.is_permission() && directory_matches(pending.directory.as_deref(), directory)
+                pending.replying.is_none()
+                    && pending.is_permission()
+                    && directory_matches(pending.directory.as_deref(), directory)
             })
             .filter_map(|pending| pending.permission.clone())
             .collect()
@@ -395,7 +410,9 @@ impl Approvals {
             .expect("pending approvals")
             .values()
             .filter(|pending| {
-                pending.is_question() && directory_matches(pending.directory.as_deref(), directory)
+                pending.replying.is_none()
+                    && pending.is_question()
+                    && directory_matches(pending.directory.as_deref(), directory)
             })
             .filter_map(|pending| pending.question.clone())
             .collect()
@@ -414,8 +431,7 @@ impl Approvals {
         request_id: &str,
         reply: &str,
     ) -> Result<()> {
-        let pending = self.take_permission(request_id)?;
-        let mut guard = PendingReply::new(self, request_id.to_string(), pending);
+        let mut guard = self.take_permission(request_id)?;
         let result = permission_result(guard.pending(), reply)?;
         self.respond(connection, guard.pending().id.clone(), result)
             .await?;
@@ -431,8 +447,7 @@ impl Approvals {
         request_id: &str,
         answers: &[FormAnswer],
     ) -> Result<()> {
-        let pending = self.take_question(request_id)?;
-        let mut guard = PendingReply::new(self, request_id.to_string(), pending);
+        let mut guard = self.take_question(request_id)?;
         let result = question_result(guard.pending(), answers)?;
         self.respond(connection, guard.pending().id.clone(), result)
             .await?;
@@ -445,8 +460,7 @@ impl Approvals {
     /// an elicitation carries the protocol's own `decline`. Same
     /// remove-on-success ordering as [`Self::reply_permission`].
     pub(crate) async fn reject_question(&self, connection: &RpcConnection, request_id: &str) -> Result<()> {
-        let pending = self.take_question(request_id)?;
-        let mut guard = PendingReply::new(self, request_id.to_string(), pending);
+        let mut guard = self.take_question(request_id)?;
         let result = match guard.pending().method.as_str() {
             "mcpServer/elicitation/request" => json!({ "action": "decline" }),
             _ => json!({ "answers": {} }),
@@ -466,9 +480,9 @@ impl Approvals {
             .map_err(bridge_error)
     }
 
-    fn take_permission(&self, request_id: &str) -> Result<Pending> {
+    fn take_permission(&self, request_id: &str) -> Result<PendingReply<'_>> {
         let mut pending = self.pending.lock().expect("pending approvals");
-        let Some(request) = pending.get(request_id) else {
+        let Some(request) = pending.get_mut(request_id) else {
             return Err(BridgeError::NotFound(format!(
                 "codex approval {request_id} is no longer pending"
             )));
@@ -479,12 +493,27 @@ impl Approvals {
                 detail: format!("{request_id} is a question request, not a permission"),
             });
         }
-        Ok(pending.remove(request_id).expect("pending request"))
+        if request.replying.is_some() {
+            return Err(BridgeError::Client {
+                client: "codex",
+                detail: format!("codex approval {request_id} is already being answered"),
+            });
+        }
+        let token = self.next_reply.fetch_add(1, Ordering::Relaxed);
+        request.replying = Some(token);
+        let view = request.clone();
+        Ok(PendingReply {
+            approvals: self,
+            key: request_id.to_string(),
+            token,
+            view,
+            committed: false,
+        })
     }
 
-    fn take_question(&self, request_id: &str) -> Result<Pending> {
+    fn take_question(&self, request_id: &str) -> Result<PendingReply<'_>> {
         let mut pending = self.pending.lock().expect("pending approvals");
-        let Some(request) = pending.get(request_id) else {
+        let Some(request) = pending.get_mut(request_id) else {
             return Err(BridgeError::NotFound(format!(
                 "codex question {request_id} is no longer pending"
             )));
@@ -495,39 +524,60 @@ impl Approvals {
                 detail: format!("{request_id} is a permission request, not a question"),
             });
         }
-        Ok(pending.remove(request_id).expect("pending request"))
+        if request.replying.is_some() {
+            return Err(BridgeError::Client {
+                client: "codex",
+                detail: format!("codex question {request_id} is already being answered"),
+            });
+        }
+        let token = self.next_reply.fetch_add(1, Ordering::Relaxed);
+        request.replying = Some(token);
+        let view = request.clone();
+        Ok(PendingReply {
+            approvals: self,
+            key: request_id.to_string(),
+            token,
+            view,
+            committed: false,
+        })
     }
 }
 
-/// A pending request removed while its answer is being written. It goes back
-/// into the map on every non-success exit — an error, an enqueue timeout, or a
-/// cancelled callback future — so the request stays pollable and clickable
-/// until the frame is actually queued. `commit` is called only after
-/// `respond_within` returns `Ok`.
+/// A pending request whose answer is being written. The entry stays in the
+/// map, marked `replying` with this guard's token, so `serverRequest/resolved`
+/// can remove it while the send is in flight.
+///
+/// On a successful enqueue the entry is removed. On an error, timeout or
+/// cancelled callback future the `replying` flag is cleared **only when the
+/// entry still carries this token** — so an answer that resolved elsewhere
+/// mid-send is never resurrected, and a replacement request that reused the id
+/// is never touched. This token is the whole resolution record: no separate
+/// resolved set is needed, because resolution removes the entry and the guard
+/// never re-inserts from its view.
 struct PendingReply<'a> {
     approvals: &'a Approvals,
     key: String,
-    pending: Option<Pending>,
+    token: u64,
+    /// The entry as it looked when the send began, for building the wire
+    /// result. Never restored.
+    view: Pending,
     committed: bool,
 }
 
-impl<'a> PendingReply<'a> {
-    fn new(approvals: &'a Approvals, key: String, pending: Pending) -> Self {
-        Self {
-            approvals,
-            key,
-            pending: Some(pending),
-            committed: false,
-        }
-    }
-
+impl PendingReply<'_> {
     fn pending(&self) -> &Pending {
-        self.pending.as_ref().expect("pending until commit")
+        &self.view
     }
 
     fn commit(&mut self) {
         self.committed = true;
-        self.pending.take();
+        let mut pending = self.approvals.pending.lock().expect("pending approvals");
+        if pending
+            .get(&self.key)
+            .is_some_and(|entry| entry.replying == Some(self.token))
+        {
+            pending.remove(&self.key);
+        }
     }
 }
 
@@ -536,13 +586,14 @@ impl Drop for PendingReply<'_> {
         if self.committed {
             return;
         }
-        if let Some(pending) = self.pending.take() {
-            self.approvals
-                .pending
-                .lock()
-                .expect("pending approvals")
-                .entry(self.key.clone())
-                .or_insert(pending);
+        let mut pending = self.approvals.pending.lock().expect("pending approvals");
+        if let Some(entry) = pending.get_mut(&self.key)
+            && entry.replying == Some(self.token)
+        {
+            // No entry means the server resolved it (or the connection cleared
+            // it). Restoring the view here is the bug this guard must not
+            // reintroduce.
+            entry.replying = None;
         }
     }
 }
@@ -1481,6 +1532,7 @@ mod tests {
             params,
             permission: Some(permissions),
             question: None,
+            replying: None,
         }
     }
 
@@ -1512,6 +1564,7 @@ mod tests {
                 }],
                 uncollectable: None,
             }),
+            replying: None,
         }
     }
 
@@ -1576,6 +1629,184 @@ mod tests {
         assert_eq!(response["id"], json!(1));
         assert_eq!(response["result"], json!({ "decision": "accept" }));
         assert!(frames.try_recv().is_err(), "the timed-out attempt queued nothing");
+    }
+
+    async fn wait_for_replying(approvals: &Approvals, key: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .get(key)
+                .is_some_and(|pending| pending.replying.is_some())
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{key} never entered the replying state"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Ticket #882 regression: a reply in flight while `serverRequest/resolved`
+    /// arrives must not resurrect the request when the send then times out.
+    /// The request is removed by the resolution; the guard only clears its own
+    /// `replying` flag and never re-inserts from its view.
+    #[tokio::test]
+    async fn a_resolution_during_an_answer_never_restores_the_permission() {
+        let (connection, mut frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Arc::new(Approvals::default());
+        approvals.set_reply_timeout(Duration::from_millis(200));
+        approvals.pending.lock().expect("pending approvals").insert(
+            "n:1".into(),
+            pending("item/commandExecution/requestApproval", command(), json!({})),
+        );
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+
+        let task = tokio::spawn({
+            let approvals = Arc::clone(&approvals);
+            let connection = connection.clone();
+            async move { approvals.reply_permission(&connection, "n:1", "once").await }
+        });
+        wait_for_replying(&approvals, "n:1").await;
+        assert!(
+            approvals.permissions(None).is_empty(),
+            "an in-flight answer is hidden from the polled list"
+        );
+
+        approvals.resolve(&json!({ "requestId": 1 }));
+        assert!(task.await.expect("join").is_err(), "the stalled send still fails");
+        assert!(
+            !approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:1"),
+            "a resolved request is not restored by a failed reply"
+        );
+        assert!(
+            approvals.permissions(None).is_empty(),
+            "no card remains clickable after the resolution"
+        );
+        assert!(
+            matches!(
+                approvals.reply_permission(&connection, "n:1", "once").await,
+                Err(BridgeError::NotFound(_))
+            ),
+            "a retry after the resolution is a no-op"
+        );
+        assert!(
+            !approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:1")
+        );
+        assert!(matches!(
+            frames.recv().await.expect("the filler frame"),
+            Message::Text(_)
+        ));
+        assert!(
+            frames.try_recv().is_err(),
+            "the resolved reply queued no response"
+        );
+    }
+
+    /// The same interleaving for both question paths: a form answer and a
+    /// rejection share the guard, so neither may restore a resolved request.
+    #[tokio::test]
+    async fn a_resolution_during_a_question_change_never_restores_it() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Arc::new(Approvals::default());
+        approvals.set_reply_timeout(Duration::from_millis(200));
+        connection
+            .notify("filler", None)
+            .await
+            .expect("fill the writer queue");
+        let answers = [FormAnswer {
+            key: "q1".into(),
+            value: Some(FormValue::Text("Yes".into())),
+        }];
+
+        // A form answer in flight.
+        approvals
+            .pending
+            .lock()
+            .expect("pending approvals")
+            .insert("n:2".into(), question_pending());
+        let task = tokio::spawn({
+            let approvals = Arc::clone(&approvals);
+            let connection = connection.clone();
+            let answers = answers.clone();
+            async move { approvals.reply_question(&connection, "n:2", &answers).await }
+        });
+        wait_for_replying(&approvals, "n:2").await;
+        approvals.resolve(&json!({ "requestId": 2 }));
+        assert!(task.await.expect("join").is_err());
+        assert!(
+            !approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:2"),
+            "a resolved question is not restored by a failed answer"
+        );
+
+        // A rejection in flight on a fresh request.
+        approvals
+            .pending
+            .lock()
+            .expect("pending approvals")
+            .insert("n:2".into(), question_pending());
+        let task = tokio::spawn({
+            let approvals = Arc::clone(&approvals);
+            let connection = connection.clone();
+            async move { approvals.reject_question(&connection, "n:2").await }
+        });
+        wait_for_replying(&approvals, "n:2").await;
+        approvals.resolve(&json!({ "requestId": 2 }));
+        assert!(task.await.expect("join").is_err());
+        assert!(
+            !approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:2"),
+            "a resolved question is not restored by a failed rejection"
+        );
+    }
+
+    /// The ordinary path: a resolution with no reply in flight drops the
+    /// request and a later click is a no-op.
+    #[tokio::test]
+    async fn a_resolved_request_is_dropped_without_a_reply() {
+        let (connection, _frames, _closing) = RpcConnection::test_connection(1);
+        let approvals = Approvals::default();
+        approvals.pending.lock().expect("pending approvals").insert(
+            "n:1".into(),
+            pending("item/commandExecution/requestApproval", command(), json!({})),
+        );
+        assert_eq!(approvals.permissions(None).len(), 1);
+
+        approvals.resolve(&json!({ "requestId": 1 }));
+        assert!(approvals.permissions(None).is_empty());
+        assert!(
+            !approvals
+                .pending
+                .lock()
+                .expect("pending approvals")
+                .contains_key("n:1")
+        );
+        assert!(matches!(
+            approvals.reply_permission(&connection, "n:1", "once").await,
+            Err(BridgeError::NotFound(_))
+        ));
     }
 
     /// The Feishu callback's own cancellation (its deadline drops the click
@@ -1936,6 +2167,7 @@ mod tests {
             params: json!({}),
             permission: None,
             question: Some(question),
+            replying: None,
         };
         let answers = [FormAnswer {
             key: "q1".into(),
