@@ -70,6 +70,11 @@ pub struct RequestFlow {
     /// clickable behind a stalled sweep). Defaults to 5 s; tests store a small
     /// value.
     pub withdrawal_timeout_ms: std::sync::atomic::AtomicU64,
+    /// The total budget (milliseconds) one sweep's withdrawal-retry phase may
+    /// spend. The phase runs before the permission listing, so its worst case
+    /// must stay near one poll interval even when several PATCHes hang; entries
+    /// it does not reach are simply retried next sweep. Defaults to 2 s.
+    pub withdrawal_retry_budget_ms: std::sync::atomic::AtomicU64,
     /// request_id → the card cola sent (used to mark a card stale when the
     /// request is resolved by ANOTHER client).
     pub sent_cards: Arc<Mutex<HashMap<String, SentCard>>>,
@@ -225,6 +230,18 @@ enum Withdrawal {
 /// neutralization later, so a timeout is a retry, not a failure to record.
 const WITHDRAWAL_PATCH_TIMEOUT_MS: u64 = 5_000;
 
+/// The total time one sweep's withdrawal-retry phase may spend. Kept below the
+/// per-PATCH budget and near one poll interval: the phase runs before the
+/// listing, so a pile of hung PATCHes must not push permission polling back by
+/// minutes. Entries it does not reach stay for the next sweep.
+const WITHDRAWAL_RETRY_PHASE_BUDGET_MS: u64 = 2_000;
+
+/// How many decided-but-undelivered withdrawals one sweep retries. Together
+/// with the phase budget this bounds the sweep's start-up work even when every
+/// entry is stuck; the rest follow on later sweeps, so a full backlog costs
+/// several sweeps rather than one long stall.
+const MAX_WITHDRAWAL_RETRIES_PER_SWEEP: usize = 4;
+
 /// How many decided-but-undelivered withdrawals one flow retains.
 ///
 /// Each entry carries its rendered replacement card, so an unbounded map would
@@ -276,6 +293,7 @@ impl RequestFlow {
             poll_interval_ms: std::sync::atomic::AtomicU64::new(3000),
             list_timeout_ms: std::sync::atomic::AtomicU64::new(30_000),
             withdrawal_timeout_ms: std::sync::atomic::AtomicU64::new(WITHDRAWAL_PATCH_TIMEOUT_MS),
+            withdrawal_retry_budget_ms: std::sync::atomic::AtomicU64::new(WITHDRAWAL_RETRY_PHASE_BUDGET_MS),
             sent_cards: Arc::new(Mutex::new(sent_cards)),
             listed_dirs: Arc::new(Mutex::new(std::collections::HashSet::new())),
             question_state: Arc::new(Mutex::new(HashMap::new())),
@@ -1613,22 +1631,47 @@ impl RequestFlow {
         self.pending_withdrawals.lock().await.len()
     }
 
-    /// Retry every decided-but-undelivered withdrawal. The request may already
-    /// have left the pending list (a decline that landed before its card PATCH
-    /// failed), so this cannot wait for the per-request sweep. Success clears
-    /// the entry; a failure keeps it for the next sweep.
+    /// Retry a bounded slice of the decided-but-undelivered withdrawals. The
+    /// request may already have left the pending list (a decline that landed
+    /// before its card PATCH failed), so this cannot wait for the per-request
+    /// sweep.
+    ///
+    /// The phase runs before the listing, so its cost is capped twice: at most
+    /// [`MAX_WITHDRAWAL_RETRIES_PER_SWEEP`] entries are attempted, and the whole
+    /// phase is cut off at `withdrawal_retry_budget_ms`. Entries not reached (or
+    /// cut off mid-PATCH) are left untouched for the next sweep — the
+    /// cancellation is safe because a withdrawal only mutates state after a
+    /// landed PATCH.
     async fn retry_pending_withdrawals(&self, handles: &FlowHandles) {
         let pending: Vec<(String, PendingWithdrawal)> = self
             .pending_withdrawals
             .lock()
             .await
             .iter()
+            .take(MAX_WITHDRAWAL_RETRIES_PER_SWEEP)
             .map(|(id, withdrawal)| (id.clone(), withdrawal.clone()))
             .collect();
-        for (id, withdrawal) in pending {
-            if self.apply_stored_withdrawal(handles, &id, &withdrawal).await != WithdrawalOutcome::Failed {
-                self.pending_withdrawals.lock().await.remove(&id);
+        if pending.is_empty() {
+            return;
+        }
+        let budget = std::time::Duration::from_millis(
+            self.withdrawal_retry_budget_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let phase = async {
+            for (id, withdrawal) in pending {
+                if self.apply_stored_withdrawal(handles, &id, &withdrawal).await != WithdrawalOutcome::Failed
+                {
+                    self.pending_withdrawals.lock().await.remove(&id);
+                }
             }
+        };
+        if tokio::time::timeout(budget, phase).await.is_err() {
+            tracing::warn!(
+                "withdrawal retry phase used its {}ms budget; the remaining entries retry next \
+                 sweep",
+                budget.as_millis()
+            );
         }
     }
 

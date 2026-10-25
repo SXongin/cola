@@ -1252,9 +1252,14 @@ async fn a_message_gone_withdrawal_is_terminated_not_retried() {
             .is_none(),
         "the dead handle is dropped"
     );
+    let raw = persisted(&session_file).unwrap_or_default();
     assert!(
-        !persisted(&session_file).unwrap_or_default().contains("per_long"),
-        "and the persisted record is gone"
+        !raw.contains("per_long"),
+        "the persisted inline record is gone: {raw}"
+    );
+    assert!(
+        !raw.contains("om_card"),
+        "and so is the dead card's cached JSON: {raw}"
     );
 
     // A second sweep has nothing to deliver: exactly one PATCH attempt.
@@ -1318,4 +1323,166 @@ async fn the_withdrawal_backlog_is_capped() {
         attempts >= REQUESTS,
         "every withdrawal was attempted: {attempts} < {REQUESTS}"
     );
+}
+
+/// Whole-branch re-review #883: the retry phase is bounded per sweep. A backlog
+/// larger than the per-sweep attempt budget is finished across later sweeps
+/// instead of delaying the listing with every entry at once.
+#[tokio::test]
+async fn the_withdrawal_retry_attempts_are_budgeted_per_sweep() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    // Six requests whose first withdrawal PATCH fails: six backlog entries.
+    const REQUESTS: usize = 6;
+    let mut requests = Vec::with_capacity(REQUESTS);
+    for index in 0..REQUESTS {
+        let request_id = format!("per_{index}");
+        seed_stale_surface(&session_file, &request_id, true, &format!("om_card_{index}"));
+        requests.push(over_budget_perm(&request_id, "ses_1"));
+    }
+
+    let (app, platform, _backend) = restart_app(&session_file, move |b| {
+        b.ask_permissions(requests);
+    })
+    .await;
+    platform
+        .fail_update_count
+        .store(REQUESTS, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+    assert_eq!(app.permission.pending_withdrawal_count().await, REQUESTS);
+
+    // One sweep retries at most the documented per-sweep budget (4).
+    sweep(&app.permission, &app).await;
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        REQUESTS - 4,
+        "the first retry sweep attempts four entries, not the whole backlog"
+    );
+
+    sweep(&app.permission, &app).await;
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        0,
+        "the remaining entries finish on the next sweep"
+    );
+}
+
+/// Whole-branch re-review #883: one sweep's retry phase is also cut off by a
+/// total time budget, so a single hung PATCH cannot stretch the sweep to the
+/// per-PATCH timeout times the backlog.
+#[tokio::test]
+async fn the_withdrawal_retry_phase_is_time_bounded() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    // First sweep: the decline lands, the PATCH fails, one entry is stored.
+    let (app, platform, _backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+    assert_eq!(app.permission.pending_withdrawal_count().await, 1);
+
+    // Second sweep: the retry hangs on the gate, and the phase budget cuts it
+    // off long before the per-PATCH timeout would.
+    app.permission
+        .withdrawal_retry_budget_ms
+        .store(50, std::sync::atomic::Ordering::SeqCst);
+    app.permission
+        .withdrawal_timeout_ms
+        .store(10_000, std::sync::atomic::Ordering::SeqCst);
+    let (entered, release) = platform.pause("update", "om_card");
+    let sweep = tokio::spawn({
+        let app = app.clone();
+        async move {
+            let mut seen = std::collections::HashSet::new();
+            app.permission.sweep(&app.flow_handles(), &mut seen).await;
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .expect("the retry PATCH is in flight");
+    tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+        .await
+        .expect("the retry phase's budget must end the sweep")
+        .expect("the sweep task joins");
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        1,
+        "the unreached entry stays for the next sweep"
+    );
+    release.notify_waiters();
+}
+
+/// Whole-branch re-review #883: a bare HTTP 404 is not proof the message is
+/// gone (a proxy or endpoint outage can answer it), so the withdrawal state is
+/// kept and retried rather than discarded alongside a still-clickable card.
+#[tokio::test]
+async fn a_bare_404_keeps_the_withdrawal_retryable() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, _backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    platform
+        .fail_update_http_404_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        1,
+        "a bare 404 stays retryable"
+    );
+    assert!(
+        app.cards_handle()
+            .card_handles
+            .lock()
+            .await
+            .message_of("per_long")
+            .is_some(),
+        "and keeps the handle, because the message may still exist"
+    );
+    assert!(
+        persisted(&session_file).unwrap_or_default().contains("per_long"),
+        "and keeps the persisted record"
+    );
+
+    // The next sweep (no injected 404) finishes the withdrawal.
+    sweep(&app.permission, &app).await;
+    assert_eq!(app.permission.pending_withdrawal_count().await, 0);
+    let final_card = last_update_of(&platform, "om_card")
+        .await
+        .expect("the retry patched the card");
+    let text = card_text(&final_card);
+    assert!(
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT),
+        "and the card ends non-interactive: {text}"
+    );
+    assert!(!text.contains("允许一次"), "no control survives: {text}");
 }
