@@ -753,20 +753,28 @@ async fn doctor_checks(
 
 /// The Codex client's checks (ADR-0090 decision 3, ticket #883): the client
 /// binary exists, a daemon was found, this process is attached, the user's own
-/// client is attached to it, and — only when explicitly requested — the
-/// configured provider can complete a turn.
+/// client is attached to it, and the configured provider can complete a turn
+/// (unless the user opts out with `--no-turn-check`).
 ///
-/// A proven embedded client is a **named failure**; an unverified sharing state
-/// is a warning that says exactly what could not be established, never a pass.
+/// An absent daemon is a **named failure**, not a warning: a Codex setup with
+/// nothing to attach to cannot mirror a turn, and #883's support criterion is a
+/// runtime that can actually complete one. `start_server = "never"` changes
+/// who starts the daemon, never whether one must exist. A proven embedded
+/// client is also a failure; an unverified sharing state is a warning that says
+/// exactly what could not be established, never a pass.
 fn codex_client_checks(report: Option<&ClientReport>, turn: Option<&TurnProbe>) -> Vec<Check> {
     let mut checks = Vec::new();
     let Some(report) = report else {
-        checks.push(Check::warn(
-            "Codex 二进制",
-            "无法构建 Codex 客户端（缺少 CODEX_HOME 或 home 目录）".to_string(),
+        let reason = "无法构建 Codex 客户端（缺少 CODEX_HOME 或 home 目录）";
+        checks.push(Check::warn("Codex 二进制", reason.to_string()));
+        checks.push(Check::fail(
+            "Codex daemon",
+            format!("{reason}；无法发现共享 daemon。请设置 CODEX_HOME 或 home 目录后重试"),
         ));
-        checks.push(Check::warn("Codex daemon", "未知：没有客户端报告"));
-        checks.push(Check::warn("Codex 连接", "未知：没有客户端报告"));
+        checks.push(Check::fail(
+            "Codex 连接",
+            format!("{reason}；无法检查连接。请设置 CODEX_HOME 或 home 目录后重试"),
+        ));
         checks.push(Check::warn("Codex 本地客户端", "未知：没有客户端报告"));
         checks.push(turn_check(turn));
         return checks;
@@ -792,9 +800,14 @@ fn codex_client_checks(report: Option<&ClientReport>, turn: Option<&TurnProbe>) 
     checks.push(if daemon_running {
         Check::pass("Codex daemon", daemon_detail)
     } else {
-        Check::warn(
+        Check::fail(
             "Codex daemon",
-            format!("未发现（LAZY 启动或 attach-only）：{}", report.detail),
+            format!(
+                "未发现共享 Codex daemon：{}。请运行 `codex app-server daemon start`，\
+                 并用 `--remote` 让你的客户端连接到它（`start_server = \"never\"` 只禁止 \
+                 cola 启动 daemon，不会让缺失的 daemon 变成可用）",
+                report.detail
+            ),
         )
     });
 
@@ -815,9 +828,13 @@ fn codex_client_checks(report: Option<&ClientReport>, turn: Option<&TurnProbe>) 
             "Codex 连接",
             format!("daemon 存在但无法连接：{}", report.detail),
         )),
-        ClientState::Absent => checks.push(Check::warn(
+        ClientState::Absent => checks.push(Check::fail(
             "Codex 连接",
-            format!("无 daemon 可连接：{}", report.detail),
+            format!(
+                "无 daemon 可连接：{}。启动 daemon 后 cola 会连接；用 \
+                 `codex --remote unix://<control socket>` 让本地客户端共享同一 daemon",
+                report.detail
+            ),
         )),
     }
 
@@ -1690,6 +1707,52 @@ kind = "codex"
             .expect("the local-client check");
         assert_eq!(local.status, CheckStatus::Pass);
         assert!(local.detail.contains("Feishu-only"), "{}", local.detail);
+    }
+
+    /// Ticket #883 review: `start_server = "never"` with no daemon must fail,
+    /// not warn. The daemon/connection checks are independent of the turn
+    /// opt-out — otherwise plain `doctor` exits 0 with no runtime at all.
+    #[test]
+    fn an_absent_daemon_fails_doctor_even_with_the_turn_check_opted_out() {
+        let report = codex_report(ClientState::Absent, Vec::new());
+        let checks = codex_client_checks(Some(&report), None);
+        assert!(!doctor_ok(&checks), "{checks:?}");
+        let daemon = checks
+            .iter()
+            .find(|check| check.label == "Codex daemon")
+            .expect("the daemon check");
+        assert_eq!(daemon.status, CheckStatus::Fail);
+        assert!(daemon.detail.contains("daemon start"), "{}", daemon.detail);
+        let connection = checks
+            .iter()
+            .find(|check| check.label == "Codex 连接")
+            .expect("the connection check");
+        assert_eq!(connection.status, CheckStatus::Fail);
+        assert!(connection.detail.contains("启动 daemon"), "{}", connection.detail);
+        let turn = checks
+            .iter()
+            .find(|check| check.label == "Codex 回合")
+            .expect("the turn check");
+        assert_eq!(
+            turn.status,
+            CheckStatus::Warn,
+            "the opt-out itself stays an explicit warning"
+        );
+    }
+
+    /// A client that cannot be built is also a runtime failure: doctor must not
+    /// pass on unknown daemon/connection state.
+    #[test]
+    fn a_missing_client_report_fails_the_runtime_checks() {
+        let checks = codex_client_checks(None, None);
+        assert!(!doctor_ok(&checks), "{checks:?}");
+        for label in ["Codex daemon", "Codex 连接"] {
+            let check = checks
+                .iter()
+                .find(|check| check.label == label)
+                .expect("the runtime check");
+            assert_eq!(check.status, CheckStatus::Fail, "{label}: {check:?}");
+        }
     }
 
     /// A working provider whose probe could not clean up is not a clean pass:
