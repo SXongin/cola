@@ -48,14 +48,24 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The methods this adapter calls. A surface missing any of them cannot serve
 /// a single feature cola's Codex path promises, so construction fails.
+///
+/// Every **production** request the adapter makes belongs here, not only the
+/// prompt/read path: rename (`thread/name/set`), delete (`thread/delete`, also
+/// the doctor probe's cleanup) and the liveness probe
+/// (`thread/loaded/list`) are construction requirements too.
+/// `the_required_set_covers_every_production_client_request` scans the
+/// adapter's production sources so a new call cannot silently skip the gate.
 pub(crate) const REQUIRED_CLIENT_METHODS: &[&str] = &[
     "initialize",
     "model/list",
     "skills/list",
     "thread/compact/start",
+    "thread/delete",
     "thread/fork",
     "thread/items/list",
     "thread/list",
+    "thread/loaded/list",
+    "thread/name/set",
     "thread/read",
     "thread/resume",
     "thread/start",
@@ -494,6 +504,64 @@ mod tests {
         let missing = surface.missing_required();
         assert!(missing.contains(&"turn/steer".to_string()));
         assert!(missing.contains(&"thread/status/changed".to_string()));
+    }
+
+    /// The gate exists so a newer daemon's generated surface cannot pass with a
+    /// method the adapter calls: rename, delete and the liveness probe are as
+    /// much a construction requirement as the prompt path. The sources are
+    /// scanned rather than mirrored in a second hand-kept list, so adding a
+    /// `request("…")` call fails here until `REQUIRED_CLIENT_METHODS` covers it.
+    #[test]
+    fn the_required_set_covers_every_production_client_request() {
+        let mut called = BTreeSet::new();
+        for source in [
+            include_str!("approvals.rs"),
+            include_str!("backend.rs"),
+            include_str!("client.rs"),
+            include_str!("lifecycle.rs"),
+            include_str!("threads.rs"),
+            include_str!("transport.rs"),
+        ] {
+            called.extend(request_methods(source));
+        }
+        // The liveness probe names its method through a constant, so no literal
+        // is at the call site; the constant itself is pinned here.
+        called.insert(crate::codex::lifecycle::LIVENESS_METHOD.to_string());
+
+        let required: BTreeSet<&str> = REQUIRED_CLIENT_METHODS.iter().copied().collect();
+        let uncovered: Vec<&str> = called
+            .iter()
+            .map(String::as_str)
+            .filter(|method| !required.contains(method))
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "the adapter calls these client methods without requiring them at \
+             construction: {uncovered:?}"
+        );
+    }
+
+    /// The string literals passed as the method to `.request(…)` in `source`,
+    /// scanning only its production half — each file's tests module follows
+    /// everything else, so its scripted calls are excluded (they use methods
+    /// like `thread/loaded/list` and `test/malformed` for fixtures, not the
+    /// adapter's contract).
+    fn request_methods(source: &str) -> BTreeSet<String> {
+        let production = source.split("\nmod tests {").next().unwrap_or(source);
+        let mut methods = BTreeSet::new();
+        let mut rest = production;
+        while let Some(position) = rest.find(".request(") {
+            rest = &rest[position + ".request(".len()..];
+            let call = rest.trim_start();
+            let Some(literal) = call.strip_prefix('"') else {
+                continue;
+            };
+            let Some(end) = literal.find('"') else {
+                continue;
+            };
+            methods.insert(literal[..end].to_string());
+        }
+        methods
     }
 
     #[tokio::test]
