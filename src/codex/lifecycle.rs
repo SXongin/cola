@@ -105,7 +105,10 @@ const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// (ticket #876 checks for it at construction), is server-global and read-only,
 /// and answers from the daemon's own state — so `Ok` proves the connection is
 /// still served by a live daemon.
-const LIVENESS_METHOD: &str = "thread/loaded/list";
+///
+/// `pub(crate)` so the schema gate's completeness test can add it: the call
+/// names this constant, not a literal, so a source scan cannot see the method.
+pub(crate) const LIVENESS_METHOD: &str = "thread/loaded/list";
 
 /// How many times one attach pass re-dials when the control socket is replaced
 /// under it. Two is enough for the deterministic race; a third race in a row is

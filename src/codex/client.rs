@@ -387,11 +387,17 @@ mod tests {
     async fn a_missing_required_method_fails_at_construction_naming_it() {
         let mut surface = Surface::pinned();
         surface.client_requests.remove("turn/steer");
+        // Rename/delete are contract-critical too: administered calls that
+        // would otherwise fail on the first `/name` or probe cleanup.
+        surface.client_requests.remove("thread/delete");
+        surface.client_requests.remove("thread/name/set");
         let error = connect("codex-tui/0.163.0 (test)", &FixedProbe(surface))
             .await
             .expect_err("construction must fail");
         let message = error.to_string();
         assert!(message.contains("turn/steer"), "{message}");
+        assert!(message.contains("thread/delete"), "{message}");
+        assert!(message.contains("thread/name/set"), "{message}");
         assert!(message.contains("0.163.0"), "{message}");
     }
 
@@ -449,6 +455,32 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_generated_surface_missing_a_method_fails_at_construction() {
+        match connect_against_generated_surface_missing("turn/steer").await {
+            CodexError::MissingContract { missing, .. } => {
+                assert!(missing.contains("turn/steer"), "{missing}");
+            }
+            other => panic!("expected a missing contract, got {other}"),
+        }
+    }
+
+    /// A generated surface without `thread/delete` is refused at construction,
+    /// naming it: the adapter deletes (rename, and the doctor probe's cleanup)
+    /// must never pass the gate and only fail at the first delete.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_generated_surface_missing_thread_delete_fails_at_construction() {
+        match connect_against_generated_surface_missing("thread/delete").await {
+            CodexError::MissingContract { missing, .. } => {
+                assert!(missing.contains("thread/delete"), "{missing}");
+            }
+            other => panic!("expected a missing contract, got {other}"),
+        }
+    }
+
+    /// Connect to a scripted newer daemon whose generated schema omits the
+    /// client-request method `missing`, and return the construction failure.
+    #[cfg(unix)]
+    async fn connect_against_generated_surface_missing(missing: &str) -> CodexError {
         use std::os::unix::fs::PermissionsExt;
 
         use crate::codex::schema::{
@@ -465,7 +497,7 @@ mod tests {
         let client_methods: Vec<&str> = REQUIRED_CLIENT_METHODS
             .iter()
             .copied()
-            .filter(|method| *method != "turn/steer")
+            .filter(|method| *method != missing)
             .collect();
         write_generated_surface(
             &fixture,
@@ -488,15 +520,9 @@ mod tests {
             .expect("make fake codex executable");
 
         let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
-        let error = CodexClient::connect(&CodexOptions::new(endpoint), &AutoProbe::new(&binary))
+        CodexClient::connect(&CodexOptions::new(endpoint), &AutoProbe::new(&binary))
             .await
-            .expect_err("a missing generated method fails construction");
-        match error {
-            CodexError::MissingContract { missing, .. } => {
-                assert!(missing.contains("turn/steer"), "{missing}");
-            }
-            other => panic!("expected a missing contract, got {other}"),
-        }
+            .expect_err("a missing generated method fails construction")
     }
 
     /// The adapter is selected by `kind`, never by the configured id.
