@@ -42,7 +42,7 @@ use super::authorship::SubmissionKind;
 use super::client::CodexClient;
 use super::error::{CodexError, Result as CodexResult};
 use super::lifecycle::CodexLifecycle;
-use super::read_model::{ThreadProjection, ThreadStatus, decode_thread_status};
+use super::read_model::{DiffSnapshot, ThreadProjection, ThreadStatus, decode_thread_status};
 use super::threads::{Adoption, ThreadEvent, ThreadSubscription, Threads};
 use super::transport::{Endpoint, Inbound, RpcConnection};
 
@@ -53,6 +53,14 @@ use super::transport::{Endpoint, Inbound, RpcConnection};
 const PAGING_RETRY: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const PAGING_RETRY: Duration = Duration::from_millis(20);
+
+/// How long a first read waits for the subscriber to install a projection
+/// before returning the current cache. A read must never block on adoption or
+/// a history page; this bound only lets a fast local page finish.
+#[cfg(not(test))]
+const INITIAL_READ_BOUND: Duration = Duration::from_millis(150);
+#[cfg(test)]
+const INITIAL_READ_BOUND: Duration = Duration::from_millis(100);
 
 /// Bound the adoption backlog drain. The subscription channel holds 1024
 /// events; draining at most that many means a first read either reflects every
@@ -80,6 +88,9 @@ pub(crate) struct Projections {
     /// entries: the subscriber holds the strong handle, and a finished thread
     /// keeps no signal.
     resync: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Notify>>>,
+    /// Wakes a bounded first read when its thread leaves `Adopting` (and, for a
+    /// failed adoption, when the next retry state is known).
+    ready: Mutex<HashMap<String, std::sync::Weak<tokio::sync::Notify>>>,
     /// The subscriber tasks this cache owns. Aborted when the last client
     /// holding the cache is dropped, so a replaced attachment stops folding
     /// into a cache nothing reads.
@@ -95,6 +106,10 @@ pub(crate) struct Projections {
     /// The prompt axis carries no directory, so this is where a skill resolves
     /// against the session's own project first.
     cwds: Mutex<HashMap<String, String>>,
+    /// Small Turn Diff snapshots for threads whose transcripts were evicted on
+    /// release, so an in-flight diff card can still resolve without retaining
+    /// the whole transcript.
+    diff_snapshots: Mutex<HashMap<String, DiffSnapshot>>,
     /// The adoption backlog drain limit. Zero means the production default;
     /// tests lower it to exercise the truncation-and-retry path.
     drain_limit: Mutex<usize>,
@@ -124,6 +139,9 @@ struct ReleaseCommand {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubscriptionState {
+    /// No subscriber task has finished `thread/resume` yet. Reads wait a
+    /// bounded time and then answer from the (empty) cache.
+    Adopting,
     /// `thread/resume` succeeded and the full history was paged; a subscriber
     /// task is folding events.
     Live,
@@ -170,6 +188,29 @@ impl Projections {
         drop(states);
         self.resync_signal(thread_id).notify_one();
         true
+    }
+
+    fn ready_signal(&self, thread_id: &str) -> Arc<tokio::sync::Notify> {
+        let mut signals = self.ready.lock().expect("codex ready signals");
+        signals.retain(|_, signal| signal.strong_count() > 0);
+        if let Some(signal) = signals.get(thread_id).and_then(std::sync::Weak::upgrade) {
+            return signal;
+        }
+        let signal = Arc::new(tokio::sync::Notify::new());
+        signals.insert(thread_id.to_string(), Arc::downgrade(&signal));
+        signal
+    }
+
+    fn notify_ready(&self, thread_id: &str) {
+        if let Some(signal) = self
+            .ready
+            .lock()
+            .expect("codex ready signals")
+            .get(thread_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            signal.notify_one();
+        }
     }
 
     /// Whether this thread's run state has a live subscription AND a paged
@@ -223,10 +264,30 @@ impl Projections {
     }
 
     pub(crate) fn diff(&self, thread_id: &str, from: Option<&str>) -> Option<TurnDiff> {
-        self.projection(thread_id)
+        let live = self
+            .threads
             .lock()
-            .expect("codex projection")
-            .diff_for(from)
+            .expect("codex projections")
+            .get(thread_id)
+            .cloned()
+            .and_then(|projection| projection.lock().expect("codex projection").diff_for(from));
+        if live.as_ref().is_some_and(|diff| !diff.is_empty()) {
+            return live;
+        }
+        if let Some(snapshot) = self
+            .diff_snapshots
+            .lock()
+            .expect("codex diff snapshots")
+            .get(thread_id)
+            .and_then(|snapshot| snapshot.resolve(from))
+        {
+            // A live empty diff (a re-adopted completed turn) must not hide
+            // the snapshot from the turn that actually changed files.
+            if live.is_none() || (!snapshot.is_empty() && live.as_ref().is_some_and(TurnDiff::is_empty)) {
+                return Some(snapshot);
+            }
+        }
+        live
     }
 
     /// The context window of whichever projection last recorded one. The
@@ -499,6 +560,44 @@ impl Projections {
             .lock()
             .expect("codex subscription states")
             .insert(thread_id.to_string(), state);
+        self.notify_ready(thread_id);
+    }
+
+    /// Leave no subscription state (a never-run thread): the next read retries
+    /// adoption.
+    fn clear_state(&self, thread_id: &str) {
+        self.states
+            .lock()
+            .expect("codex subscription states")
+            .remove(thread_id);
+        self.notify_ready(thread_id);
+    }
+
+    fn clear_incomplete(&self, thread_id: &str) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .clear_incomplete();
+    }
+
+    /// Whether the thread is still waiting for its first `thread/resume`.
+    pub(crate) fn is_adopting(&self, thread_id: &str) -> bool {
+        self.state(thread_id) == Some(SubscriptionState::Adopting)
+    }
+
+    /// Mark a timed-out first read truncated, but only if it is still the
+    /// adoption that is pending. Held under the state lock so a concurrent
+    /// `Live` transition (and its completed page) cannot be marked after the
+    /// fact.
+    fn mark_incomplete_if_adopting(&self, thread_id: &str) {
+        let states = self.states.lock().expect("codex subscription states");
+        if !matches!(states.get(thread_id), Some(SubscriptionState::Adopting)) {
+            return;
+        }
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .mark_incomplete_if_unseeded();
     }
 
     /// Register the consumer that owns `thread_id`'s subscription. A re-adopt
@@ -521,13 +620,48 @@ impl Projections {
             .remove(thread_id)
     }
 
-    /// Drop the live state of a released subscription so the next read
-    /// re-adopts, and mark the retained projection incomplete — the same shape
-    /// a lost subscription leaves. The retained history still serves a Turn
-    /// Diff or a card read in flight; `is_seeded` is what says the stream is no
-    /// longer live.
+    /// Drop a released thread's live state and evict its transcript. Only the
+    /// small Turn Diff snapshot survives, so an in-flight diff card can still
+    /// resolve; re-adoption pages the history again.
     fn released(&self, thread_id: &str) {
-        self.forget(thread_id);
+        self.evict(thread_id, true);
+    }
+
+    /// Remove a thread's live state and projection. `keep_diffs` retains the
+    /// small Turn Diff snapshot (release); a deleted thread keeps nothing.
+    fn evict(&self, thread_id: &str, keep_diffs: bool) {
+        self.states
+            .lock()
+            .expect("codex subscription states")
+            .remove(thread_id);
+        self.notify_ready(thread_id);
+        let projection = self.threads.lock().expect("codex projections").remove(thread_id);
+        if let Some(projection) = projection
+            && keep_diffs
+        {
+            let snapshot = projection.lock().expect("codex projection").diff_snapshot();
+            if !snapshot.is_empty() {
+                self.diff_snapshots
+                    .lock()
+                    .expect("codex diff snapshots")
+                    .insert(thread_id.to_string(), snapshot);
+            }
+        } else if !keep_diffs {
+            self.diff_snapshots
+                .lock()
+                .expect("codex diff snapshots")
+                .remove(thread_id);
+        }
+        self.cwds.lock().expect("codex thread cwds").remove(thread_id);
+        self.releases
+            .lock()
+            .expect("codex release channels")
+            .remove(thread_id);
+    }
+
+    #[cfg(test)]
+    fn projection_count(&self) -> usize {
+        self.threads.lock().expect("codex projections").len()
     }
 
     /// Forget a dead subscription so the next read adopts again, and state the
@@ -542,6 +676,7 @@ impl Projections {
             .lock()
             .expect("codex projection")
             .mark_incomplete();
+        self.notify_ready(thread_id);
     }
 }
 
@@ -744,6 +879,11 @@ impl CodexClient {
     /// Subscribe the thread if this connection has not already: `thread/resume`
     /// **is** the subscription (ADR-0090's amendment, question 2). A never-run
     /// thread is a named state, not an error; its read is an empty transcript.
+    ///
+    /// Adoption and paging run in the subscriber task, never on the read path.
+    /// A read waits at most [`INITIAL_READ_BOUND`] for the first projection and
+    /// otherwise returns what is cached, explicitly truncated; the task keeps
+    /// paging and the next read sees the complete history.
     pub(crate) async fn ensure_subscription(&self, thread_id: &str) -> CodexResult<()> {
         match self.projections.state(thread_id) {
             Some(SubscriptionState::Live) => return Ok(()),
@@ -753,135 +893,203 @@ impl CodexClient {
                 self.projections.request_resync(thread_id);
                 return Ok(());
             }
+            Some(SubscriptionState::Adopting) => {
+                self.wait_for_initial(thread_id).await;
+                return Ok(());
+            }
             None => {}
         }
         let adoption = self.projections.adoption_lock(thread_id);
-        let _adopting = adoption.lock().await;
+        let adopting = adoption.lock().await;
         match self.projections.state(thread_id) {
             Some(SubscriptionState::Live) => return Ok(()),
             Some(SubscriptionState::PagingIncomplete { .. }) => {
                 self.projections.request_resync(thread_id);
                 return Ok(());
             }
-            None => {}
-        }
-        // Every status this connection had already received when the history
-        // request starts is superseded by the page; a status received after
-        // this boundary still applies (it is newer than the page).
-        let boundary = self.threads().inbound_seq();
-        match self.threads().adopt(thread_id).await? {
-            Adoption::Subscribed(subscription) => {
-                self.projections.set_cwd(thread_id, &subscription.thread().cwd);
-                // `thread/resume` carries only a bounded history page. A first
-                // read must not present that prefix as the whole thread, so
-                // page every turn before the subscriber starts folding. The
-                // receiver was registered before `thread/resume`, so events
-                // that arrive during this paging wait in its queue.
-                match self.threads().all_turns(thread_id).await {
-                    Ok(turns) => {
-                        self.projections.resync(thread_id, &turns, boundary);
-                        self.projections.set_state(thread_id, SubscriptionState::Live);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            thread = %thread_id,
-                            "could not page the codex thread history on adoption; \
-                             the bounded resume page is explicitly incomplete: {error}"
-                        );
-                        self.projections
-                            .seed(thread_id, &subscription.thread().turns, boundary);
-                        self.projections.mark_incomplete(thread_id);
-                        self.projections.set_state(
-                            thread_id,
-                            SubscriptionState::PagingIncomplete {
-                                retry_at: Instant::now() + PAGING_RETRY,
-                            },
-                        );
-                    }
-                }
-                // Drain the events that queued while `thread/resume` and the
-                // history page were in flight, so the first read reflects them
-                // and cannot present a transcript as complete when the backlog
-                // already overflowed the broadcast buffer.
-                let mut subscription = *subscription;
-                let mut drained = 0;
-                let mut backlog_truncated = false;
-                let mut subscription_dead = false;
-                loop {
-                    if drained >= self.projections.drain_limit() {
-                        backlog_truncated = true;
-                        break;
-                    }
-                    match subscription.try_next_event() {
-                        Ok(Some(ThreadEvent::Notification { seq, method, params })) => {
-                            self.projections.apply_at(thread_id, seq, &method, &params);
-                            drained += 1;
-                        }
-                        Ok(Some(ThreadEvent::Lagged { skipped })) => {
-                            tracing::warn!(
-                                thread = %thread_id,
-                                skipped,
-                                "the adoption backlog overflowed the event buffer; marking the \
-                                 projection incomplete"
-                            );
-                            backlog_truncated = true;
-                            break;
-                        }
-                        Ok(None) => break,
-                        Err(error) => {
-                            tracing::warn!(
-                                thread = %thread_id,
-                                "the adoption backlog ended before it drained: {error}"
-                            );
-                            backlog_truncated = true;
-                            subscription_dead = true;
-                            break;
-                        }
-                    }
-                }
-                if subscription_dead {
-                    // No live subscription is left to page through: forget the
-                    // state so the next read re-adopts rather than sitting in a
-                    // paging retry against a dead connection.
-                    self.projections.forget(thread_id);
-                } else if backlog_truncated {
-                    // A limit hit (or a lag) leaves the projection incomplete
-                    // with no later lag to schedule a resync. Enter the
-                    // paging-retry state so a later read recovers instead of
-                    // staying truncated forever.
-                    self.projections.mark_incomplete(thread_id);
-                    self.projections.set_state(
-                        thread_id,
-                        SubscriptionState::PagingIncomplete {
-                            retry_at: Instant::now() + PAGING_RETRY,
-                        },
-                    );
-                }
-                // Register the consumer's release channel before spawning it:
-                // a release that arrives once the state is `Live` must always
-                // find a task to hand its command to.
+            Some(SubscriptionState::Adopting) => {
+                drop(adopting);
+                self.wait_for_initial(thread_id).await;
+                return Ok(());
+            }
+            None => {
+                // Register the release channel before spawning: a release that
+                // arrives while `thread/resume` is in flight is queued for the
+                // task instead of being lost.
                 let (release, releases) = tokio::sync::mpsc::unbounded_channel();
                 self.projections.watch_release(thread_id, release);
-                let task = tokio::spawn(consume(
-                    subscription,
+                self.projections.set_state(thread_id, SubscriptionState::Adopting);
+                let task = tokio::spawn(run_thread(
                     self.threads().clone(),
                     Arc::downgrade(&self.projections),
+                    thread_id.to_string(),
                     self.projections.resync_signal(thread_id),
                     releases,
                 ));
                 self.projections.track(task);
-                Ok(())
             }
-            Adoption::NoHistoryYet => {
-                // A thread created by `thread/start` cannot be resumed until
-                // it has run a turn. That turn may be started by the user's
-                // own client, so the state is NOT remembered as terminal: the
-                // next read retries, and the subscription starts the moment
-                // the rollout exists (the peer-attachment promise).
-                Ok(())
+        }
+        drop(adopting);
+        self.wait_for_initial(thread_id).await;
+        Ok(())
+    }
+
+    /// Wait a bounded time for the subscriber to leave `Adopting`. On expiry
+    /// the current projection is marked truncated (empty is acceptable) and
+    /// the task keeps paging in the background.
+    async fn wait_for_initial(&self, thread_id: &str) {
+        if !self.projections.is_adopting(thread_id) {
+            return;
+        }
+        let ready = self.projections.ready_signal(thread_id);
+        let _ = tokio::time::timeout(INITIAL_READ_BOUND, async {
+            loop {
+                if !self.projections.is_adopting(thread_id) {
+                    break;
+                }
+                ready.notified().await;
+            }
+        })
+        .await;
+        self.projections.mark_incomplete_if_adopting(thread_id);
+    }
+}
+
+/// Adopt, page, drain and then consume one thread. This runs as the thread's
+/// subscriber task: the read path only signals it, so a slow `thread/resume`
+/// or `thread/turns/list` can never hold a read.
+async fn run_thread(
+    threads: Threads,
+    projections: std::sync::Weak<Projections>,
+    thread_id: String,
+    signal: Arc<tokio::sync::Notify>,
+    releases: tokio::sync::mpsc::UnboundedReceiver<ReleaseCommand>,
+) {
+    let subscription = match threads.adopt(&thread_id).await {
+        Ok(Adoption::Subscribed(subscription)) => *subscription,
+        Ok(Adoption::NoHistoryYet) => {
+            // A thread created by `thread/start` cannot be resumed until it
+            // has run a turn. That turn may be started by the user's own
+            // client, so the state is NOT remembered as terminal: the next
+            // read retries, and the subscription starts the moment the
+            // rollout exists (the peer-attachment promise).
+            if let Some(cache) = projections.upgrade() {
+                // A thread with no rollout has an empty, complete history; an
+                // earlier bounded read must not leave it looking truncated.
+                // Clear the state first so a timed-out waiter stops marking;
+                // then clear the flag its earlier mark may have set.
+                cache.clear_state(&thread_id);
+                cache.clear_incomplete(&thread_id);
+            }
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(thread = %thread_id, "could not adopt the codex thread: {error}");
+            if let Some(cache) = projections.upgrade() {
+                cache.forget(&thread_id);
+            }
+            return;
+        }
+    };
+    {
+        let Some(cache) = projections.upgrade() else {
+            return;
+        };
+        cache.set_cwd(&thread_id, &subscription.thread().cwd);
+    }
+    // Every status this connection had already received when the history
+    // request starts is superseded by the page; a status received after this
+    // boundary still applies (it is newer than the page).
+    let boundary = threads.inbound_seq();
+    // `thread/resume` carries only a bounded history page. Page every turn
+    // before the subscriber starts folding; the receiver was registered
+    // before `thread/resume`, so events that arrive during this paging wait
+    // in its queue. Hold no cache reference across the await: a replaced
+    // attachment must still be able to drop the cache and abort this task.
+    let paged = threads.all_turns(&thread_id).await;
+    let Some(cache) = projections.upgrade() else {
+        return;
+    };
+    match paged {
+        Ok(turns) => {
+            cache.resync(&thread_id, &turns, boundary);
+            cache.set_state(&thread_id, SubscriptionState::Live);
+        }
+        Err(error) => {
+            tracing::warn!(
+                thread = %thread_id,
+                "could not page the codex thread history on adoption; the bounded resume \
+                 page is explicitly incomplete: {error}"
+            );
+            cache.seed(&thread_id, &subscription.thread().turns, boundary);
+            cache.mark_incomplete(&thread_id);
+            cache.set_state(
+                &thread_id,
+                SubscriptionState::PagingIncomplete {
+                    retry_at: Instant::now() + PAGING_RETRY,
+                },
+            );
+        }
+    }
+    // Drain the events that queued while `thread/resume` and the history page
+    // were in flight, so the first read reflects them and cannot present a
+    // transcript as complete when the backlog already overflowed the broadcast
+    // buffer.
+    let mut subscription = subscription;
+    let mut drained = 0;
+    let mut backlog_truncated = false;
+    let mut subscription_dead = false;
+    loop {
+        if drained >= cache.drain_limit() {
+            backlog_truncated = true;
+            break;
+        }
+        match subscription.try_next_event() {
+            Ok(Some(ThreadEvent::Notification { seq, method, params })) => {
+                cache.apply_at(&thread_id, seq, &method, &params);
+                drained += 1;
+            }
+            Ok(Some(ThreadEvent::Lagged { skipped })) => {
+                tracing::warn!(
+                    thread = %thread_id,
+                    skipped,
+                    "the adoption backlog overflowed the event buffer; marking the projection \
+                     incomplete"
+                );
+                backlog_truncated = true;
+                break;
+            }
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(
+                    thread = %thread_id,
+                    "the adoption backlog ended before it drained: {error}"
+                );
+                backlog_truncated = true;
+                subscription_dead = true;
+                break;
             }
         }
     }
+    if subscription_dead {
+        // No live subscription is left to page through: forget the state so
+        // the next read re-adopts rather than sitting in a paging retry
+        // against a dead connection.
+        cache.forget(&thread_id);
+    } else if backlog_truncated {
+        // A limit hit (or a lag) leaves the projection incomplete with no
+        // later lag to schedule a resync. Enter the paging-retry state so a
+        // later read recovers instead of staying truncated forever.
+        cache.mark_incomplete(&thread_id);
+        cache.set_state(
+            &thread_id,
+            SubscriptionState::PagingIncomplete {
+                retry_at: Instant::now() + PAGING_RETRY,
+            },
+        );
+    }
+    drop(cache);
+    consume(subscription, threads, projections, signal, releases).await;
 }
 
 /// Fold one subscription's events into the cache. Notifications are applied
@@ -1298,7 +1506,7 @@ impl Backend for CodexClient {
             .request("thread/delete", json!({ "threadId": session_id }))
             .await
             .map_err(client_error)?;
-        self.projections.forget(session_id);
+        self.projections.evict(session_id, false);
         // The thread is gone; its authorship turns cannot be asked about again,
         // and a recreated id must not inherit them.
         self.authored.forget(session_id);
@@ -1591,6 +1799,11 @@ impl Backend for CodexClient {
         // thread then genuinely has no live run.
         if self.projections.observed_status(session_id).is_none() && !self.projections.is_seeded(session_id) {
             self.ensure_subscription(session_id).await.map_err(client_error)?;
+        }
+        if self.projections.is_adopting(session_id) {
+            // The bounded first-read wait expired before adoption finished; an
+            // empty cache must not answer `Idle` as if it were observed.
+            return Ok(None);
         }
         Ok(self.projections.status(session_id))
     }
@@ -2799,6 +3012,120 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Spec #879: a mid-turn (here, first) read never blocks on a history
+    /// page. A stalled page returns the cache as truncated, and the subscriber
+    /// finishes the page in the background.
+    #[tokio::test]
+    async fn a_stalled_first_history_page_returns_promptly_then_completes() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        thread.turns_page_delay_ms = 400;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        let started = std::time::Instant::now();
+        let first = client.transcript("thread-1").await.expect("bounded first read");
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "the first read waited for the stalled page: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            first.truncated,
+            "a read that outran the page must say it is truncated"
+        );
+        assert!(
+            first.messages.is_empty(),
+            "the stalled page has not delivered a projection yet"
+        );
+
+        let complete = wait_for_text(&client, "thread-1", "one").await;
+        assert!(!complete.truncated, "the background page completed the read");
+    }
+
+    /// Released threads evict their transcripts; only the small Turn Diff
+    /// snapshot survives, and re-adoption pages the history again.
+    #[tokio::test]
+    async fn released_threads_evict_transcripts_and_keep_their_diff() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        for index in 0..3 {
+            let id = format!("thread-{index}");
+            let mut thread = ScriptedThread::adopted(&id, "session-root", "/work/cola", &id);
+            thread.turns = vec![scripted_turn(
+                "turn-1",
+                "completed",
+                1_700_000_000,
+                &format!("item-{index}"),
+                &format!("text {index}"),
+            )];
+            server.seed_thread(thread);
+        }
+        let client = connect(&url).await;
+
+        for index in 0..3 {
+            let id = format!("thread-{index}");
+            wait_for_text(&client, &id, &format!("text {index}")).await;
+        }
+        assert_eq!(client.projections.projection_count(), 3);
+
+        server.push_to_thread(
+            "thread-0",
+            "turn/diff/updated",
+            json!({
+                "threadId": "thread-0",
+                "turnId": "turn-1",
+                "diff": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+            }),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let diff = client
+                .session_diff("thread-0", Some("item-0"), None, None)
+                .await
+                .expect("diff read");
+            if diff.as_ref().is_some_and(|diff| !diff.is_empty()) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the diff notification never applied"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        for index in 0..3 {
+            let id = format!("thread-{index}");
+            client.release_thread(&id).await.expect("release");
+        }
+        assert_eq!(
+            client.projections.projection_count(),
+            0,
+            "released threads must not retain their transcripts"
+        );
+
+        let diff = client
+            .session_diff("thread-0", Some("item-0"), None, None)
+            .await
+            .expect("diff read")
+            .expect("the retained diff snapshot");
+        assert_eq!(diff.0.len(), 1);
+        assert_eq!(diff.0[0].path, "src/lib.rs");
+
+        let restored = wait_for_text(&client, "thread-0", "text 0").await;
+        assert!(
+            !restored.truncated,
+            "re-adoption pages the evicted transcript again"
+        );
+        assert_eq!(client.projections.projection_count(), 1);
     }
 
     /// An in-progress historical turn is not authoritative: a statusless tool
