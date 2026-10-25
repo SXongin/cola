@@ -669,6 +669,17 @@ impl RecordingPlatform {
         .await
     }
 
+    /// Every card replied into a thread — the shape a continuation uses when
+    /// the conversation is a Topic. Kept separate from [`Self::replied_cards`]
+    /// because its call carries a thread id too.
+    pub(crate) async fn replied_in_thread_cards(&self) -> Vec<serde_json::Value> {
+        self.cards_of(|c| match c {
+            PlatformCall::ReplyCardInThread { card, .. } => Some(card),
+            _ => None,
+        })
+        .await
+    }
+
     /// Every replied card paired with the message id it replied under, in call
     /// order (asserts a reply lands under the right message).
     pub(crate) async fn replied_cards_with_targets(&self) -> Vec<(String, serde_json::Value)> {
@@ -3904,16 +3915,72 @@ pub(crate) enum CardUpdates {
     Latest,
 }
 
+/// The overall deadline a test gives an observable outcome — a spawned
+/// handler, a recorded card, a continuation. Generous on purpose: every wait
+/// polls the fact it needs, so this bounds a genuine regression instead of
+/// turning a loaded parallel suite into a flake.
+pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Await a spawned handler by polling `is_finished`, not by racing a fixed
+/// timeout: the very next poll after the work lands sees it, so the wait cannot
+/// lose a race a longer timeout would merely postpone.
+pub(crate) async fn wait_for_handler<T>(
+    handle: tokio::task::JoinHandle<T>,
+    label: &str,
+    within: std::time::Duration,
+) -> T {
+    let deadline = tokio::time::Instant::now() + within;
+    while !handle.is_finished() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{label} did not finish within {within:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    handle.await.expect("the handler joins")
+}
+
+/// Await `check` over every card the platform recorded — in-place updates and
+/// new/reply sends — within `within`. [`wait_for_card_update`] sees updates
+/// only; a continuation is a reply, so a wait for one must look at both.
+///
+/// A timeout names the headers that *were* recorded: if the expected outcome
+/// never arrived, the failure says whether the card was missing, still live, or
+/// carried different content, instead of only "timed out".
+pub(crate) async fn wait_for_recorded_card(
+    platform: &RecordingPlatform,
+    label: &str,
+    within: std::time::Duration,
+    check: impl Fn(&serde_json::Value) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let mut cards = platform.updated_cards().await;
+        cards.extend(platform.replied_cards().await);
+        cards.extend(platform.replied_in_thread_cards().await);
+        if cards.iter().any(&check) {
+            return;
+        }
+        let headers: Vec<&str> = cards.iter().map(card_header).collect();
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{label} never appeared within {within:?}; recorded card headers: {headers:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 /// Await a recorded in-place card update satisfying `check`, or panic after
-/// 5 s. Keeps a test on an observed side effect instead of a sleep; `updates`
-/// selects whether any update or only the newest one counts.
+/// [`SETTLE_DEADLINE`]. Keeps a test on an observed side effect instead of a
+/// fixed sleep; `updates` selects whether any update or only the newest one
+/// counts.
 pub(crate) async fn wait_for_card_update(
     platform: &RecordingPlatform,
     label: &str,
     updates: CardUpdates,
     check: impl Fn(&serde_json::Value) -> bool,
 ) {
-    wait_for_card_update_within(platform, label, std::time::Duration::from_secs(5), updates, check).await;
+    wait_for_card_update_within(platform, label, SETTLE_DEADLINE, updates, check).await;
 }
 
 /// [`wait_for_card_update`] with an explicit bound: a test that must wait out

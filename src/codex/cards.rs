@@ -15,8 +15,9 @@ use serde_json::{Value, json};
 use crate::backend::Backend;
 use crate::bridge::App;
 use crate::bridge::test_support::{
-    CardUpdates, HostCardAction, PlatformCall, RecordingPlatform, card_buttons, card_header, card_text,
-    incoming, seed_entry, send_command_in, test_config, wait_for_card_update,
+    CardUpdates, HostCardAction, PlatformCall, RecordingPlatform, SETTLE_DEADLINE, card_buttons, card_header,
+    card_text, incoming, seed_entry, send_command_in, test_config, wait_for_card_update, wait_for_handler,
+    wait_for_recorded_card,
 };
 use crate::bridge::turn::Turn;
 use crate::config::SessionEntry;
@@ -121,7 +122,7 @@ fn recording() -> Vec<Value> {
 /// Wait until no connection holds the thread: a dropped client deregisters its
 /// server-side stream asynchronously.
 async fn wait_for_all_unsubscribed(server: &FakeServer) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while server.subscribers(THREAD) > 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -137,7 +138,7 @@ async fn wait_for_all_unsubscribed(server: &FakeServer) {
 /// has already been released (and whose events are therefore dropped), so the
 /// client's own state is the fact a test must wait on.
 async fn wait_for_seeded(client: &CodexClient) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while !client.projections.is_seeded(THREAD) {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -230,7 +231,7 @@ async fn a_turn_started_on_another_connection_renders_on_the_feishu_card() {
 
     // The other face saw the same stream: the TUI's read is not a different
     // transcript. The subscriber runs on its own task, so await its read.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         let read = tui.transcript(THREAD).await.expect("the TUI's read");
         if read
@@ -810,7 +811,7 @@ fn prompt_message(text: &str, message_id: &str) -> crate::bridge::IncomingMessag
 /// took its guard before submitting, so a supplement or `/stop` sent after this
 /// is racing nothing).
 async fn wait_for_live_turn(server: &FakeServer) -> String {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         if let Some(turn) = server.live_turn(THREAD) {
             return turn;
@@ -826,7 +827,7 @@ async fn wait_for_live_turn(server: &FakeServer) -> String {
 /// Wait until `turn/start` has arrived for the thread (the bridge submits on
 /// its own task, so a synchronous assertion would race it).
 async fn wait_for_turn_start(server: &FakeServer) -> Value {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         if let Some(params) = server.turn_params(THREAD).last().cloned() {
             return params;
@@ -889,10 +890,11 @@ async fn a_feishu_prompt_becomes_a_user_message_and_completes() {
         card_text(card).contains("the codex answer")
     })
     .await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
-        .await
-        .expect("the prompt must finish")
-        .expect("the handler joins");
+    wait_for_card_update(&platform, "the settled turn", CardUpdates::Any, |card| {
+        card_header(card).contains("完成")
+    })
+    .await;
+    wait_for_handler(handler, "the prompt", SETTLE_DEADLINE).await;
 
     let card = platform
         .updated_cards()
@@ -946,6 +948,9 @@ async fn a_supplement_steers_the_live_turn_and_renders_once() {
         }
     });
     let live = wait_for_live_turn(&server).await;
+    // `thread/resume` is the subscription: pushing the turn's events before it
+    // registers would send them to nobody, and the turn would never finish.
+    server.wait_for_subscribers(THREAD, 1).await;
 
     // The supplement: cola holds the live execution, so it steers.
     tokio::time::timeout(
@@ -985,13 +990,22 @@ async fn a_supplement_steers_the_live_turn_and_renders_once() {
             "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
         }),
     );
-    // The drain polls on its production cadence and finalizes after its grace;
-    // this turn normally settles in a few seconds, so the bound is generous
-    // enough for a loaded parallel test run.
-    tokio::time::timeout(std::time::Duration::from_secs(15), first)
-        .await
-        .expect("the turn must finish")
-        .expect("the handler joins");
+    // Wait on the observable outcomes, not on the handler: the supplement's
+    // continuation (a reply) and the steered run's answer (on a card or its
+    // continuation) are what "the turn finished" means, and both are polled
+    // until they appear. Only then is the handler's join a formality.
+    wait_for_recorded_card(
+        &platform,
+        "the supplement continuation",
+        SETTLE_DEADLINE,
+        |card| card_text(card).contains("📨 已收到补充"),
+    )
+    .await;
+    wait_for_recorded_card(&platform, "the steered answer", SETTLE_DEADLINE, |card| {
+        card_text(card).contains("the steered answer")
+    })
+    .await;
+    wait_for_handler(first, "the steered turn", SETTLE_DEADLINE).await;
 
     // The message settled as a Supplement: its own continuation carries the
     // receipt, and the steered run's answer renders on a card.
@@ -1056,10 +1070,11 @@ async fn stop_interrupts_the_turn_and_settles_the_card_as_stopped() {
     )
     .await;
 
-    tokio::time::timeout(std::time::Duration::from_secs(5), turn)
-        .await
-        .expect("the stopped turn must settle, not hang")
-        .expect("the handler joins");
+    wait_for_card_update(&platform, "the stopped card", CardUpdates::Any, |card| {
+        card_header(card).contains("已停止")
+    })
+    .await;
+    wait_for_handler(turn, "the stopped turn", SETTLE_DEADLINE).await;
 
     let interrupts = server.interrupt_params();
     assert_eq!(interrupts.len(), 1, "one turn/interrupt");
@@ -1160,6 +1175,8 @@ async fn a_model_pick_reaches_the_next_turn() {
     let params = wait_for_turn_start(&server).await;
     assert_eq!(params["model"], "gpt-5.1-codex");
     assert_eq!(params["effort"], "high");
+    // The completion push below reaches subscribers only; wait for the resume.
+    server.wait_for_subscribers(THREAD, 1).await;
 
     // End the turn so the spawned turn stops cleanly.
     let live = server.live_turn(THREAD).expect("the turn is running");
@@ -1172,10 +1189,10 @@ async fn a_model_pick_reaches_the_next_turn() {
             "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
         }),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
-        .await
-        .expect("the turn must finish")
-        .expect("the handler joins");
+    // This turn renders no agent message, so no card outcome exists to poll;
+    // the handler's completion is the signal. Poll it rather than racing a
+    // fixed timeout: the first poll after the work lands sees it.
+    wait_for_handler(handler, "the model turn", SETTLE_DEADLINE).await;
 }
 
 /// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves
@@ -1221,6 +1238,8 @@ async fn a_skill_pick_reaches_the_next_turn() {
     );
 
     let live = server.live_turn(THREAD).expect("the turn is running");
+    // The completion push below reaches subscribers only; wait for the resume.
+    server.wait_for_subscribers(THREAD, 1).await;
     let now = chrono::Utc::now().timestamp();
     server.push_to_thread(
         THREAD,
@@ -1230,10 +1249,9 @@ async fn a_skill_pick_reaches_the_next_turn() {
             "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
         }),
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
-        .await
-        .expect("the turn must finish")
-        .expect("the handler joins");
+    // No agent message renders on the card, so the handler's completion is the
+    // only signal: poll it under the shared generous deadline.
+    wait_for_handler(handler, "the skill turn", SETTLE_DEADLINE).await;
 }
 
 /// Ticket #881 acceptance 4 through the bridge: `/compact` runs, and the
@@ -1299,10 +1317,11 @@ async fn compact_renders_through_the_existing_compaction_path_once() {
         card_text(card).contains("已压缩上下文（手动）")
     })
     .await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
-        .await
-        .expect("the turn must finish")
-        .expect("the handler joins");
+    wait_for_card_update(&platform, "the compaction answer", CardUpdates::Any, |card| {
+        card_text(card).contains("after the compaction")
+    })
+    .await;
+    wait_for_handler(handler, "the compact turn", SETTLE_DEADLINE).await;
 
     let card = platform
         .updated_cards()
@@ -1377,10 +1396,8 @@ async fn a_cola_turn_is_never_an_external_message_after_a_restart() {
                 .await
         }
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), handler)
-        .await
-        .expect("the first turn must finish")
-        .expect("the handler joins");
+    wait_for_all_unsubscribed(&server).await;
+    wait_for_handler(handler, "the first turn", SETTLE_DEADLINE).await;
     drop(first);
     drop(first_client);
     drop(first_platform);
@@ -1421,7 +1438,7 @@ async fn a_cola_turn_is_never_an_external_message_after_a_restart() {
     tui.prompt(THREAD, "from OpenChamber", &[], &[], None, None, None, None)
         .await
         .expect("the TUI's prompt");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         if second_platform
             .sent_cards()
@@ -1481,7 +1498,7 @@ async fn wait_for_sent_card(
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+    tokio::time::timeout(SETTLE_DEADLINE, wait)
         .await
         .unwrap_or_else(|_| panic!("the card never reached {label}"))
 }
@@ -1610,7 +1627,7 @@ async fn a_tui_command_approval_is_answered_from_the_feishu_card() {
 
     // The server's resolution reaches the TUI too, so the turn it started has
     // no pending approval left — the answer unblocked it.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while !tui
         .list_permissions(Some(WORK))
         .await
@@ -1716,7 +1733,7 @@ async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdra
                 .await
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while server.turn_starts() == 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -1741,7 +1758,7 @@ async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdra
     // Both faces see the same pending approval: cola's poll-shaped read and
     // the TUI's own request record.
     let request_id = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
         loop {
             if let Some(pending) = tui
                 .list_permissions(Some(WORK))
@@ -1759,7 +1776,7 @@ async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdra
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while client
         .list_permissions(Some(WORK))
         .await
@@ -1774,7 +1791,7 @@ async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdra
     }
 
     // The live cola turn carries the inline block.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while Turn::live_permissions(&app.cards_handle(), THREAD)
         .await
         .is_empty()
@@ -1796,7 +1813,7 @@ async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdra
     assert_eq!(replies[0].result, Some(json!({ "decision": "accept" })));
 
     // `serverRequest/resolved` withdraws cola's copy.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while !client
         .list_permissions(Some(WORK))
         .await
@@ -1823,7 +1840,7 @@ async fn an_approval_for_a_cola_turn_is_answered_by_the_other_client_and_withdra
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     };
-    let card = tokio::time::timeout(std::time::Duration::from_secs(2), receipt)
+    let card = tokio::time::timeout(SETTLE_DEADLINE, receipt)
         .await
         .expect("the withdrawn block leaves a receipt");
     assert!(
@@ -1949,7 +1966,7 @@ async fn a_child_session_approval_reaches_the_parents_chat() {
     );
     let poll = spawn_permission_poll(&app);
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         if let Some((receive_id, card)) = sent_cards_with_targets(&platform)
             .await
@@ -2186,7 +2203,7 @@ async fn question_titles_and_refusals_render_inline() {
                 .await
         }
     });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     while server.turn_starts() == 0 {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -2212,7 +2229,7 @@ async fn question_titles_and_refusals_render_inline() {
         }),
     );
     let message = "把文件写入工作区？";
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         if let Some(card) = Turn::rendered_card(&app.cards_handle(), THREAD).await
             && card_text(&card).contains(message)
@@ -2242,7 +2259,7 @@ async fn question_titles_and_refusals_render_inline() {
             }]
         }),
     );
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
     loop {
         if let Some(card) = Turn::rendered_card(&app.cards_handle(), THREAD).await
             && card_text(&card).contains("私密输入")
