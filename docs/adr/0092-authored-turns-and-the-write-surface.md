@@ -41,12 +41,12 @@ is rewritten once at load (ADR-0091 §4), and a future version is refused. The
 file was never written by a released build, so the only version-0 shape is a
 hand-made one in this same form — migrating it is cheaper than teaching a user
 to delete it, and refusing it would make a harmless file block startup.
-Authorship is
-**turn-granular** because that is the finest granularity the protocol offers:
-a `turn/steer` and a folded `turn/start` both put a user message inside a turn
-that already exists, with no per-message author. A turn cola started therefore
-answers "cola's" for every user message in it, and the durable record survives
-a restart — the case the criterion names.
+A turn cola
+started answers "cola's" for every user message in it — the protocol carries no
+per-message author for a turn — and the durable record survives a restart, the
+case the criterion names. A Supplement steered into a turn cola did **not**
+start is the exception, recognised by its own item id only (decision 2b): the
+turn and its other messages are somebody else's.
 
 **2. The chosen submission id is durable before the prompt can produce output,
 and an ambiguous outcome stays reconcilable.** The turn id only arrives in the
@@ -69,6 +69,26 @@ because the turn may exist. Pre-send failures (an unknown skill) are raised
 before the marker is written, so a later external turn on the thread is never
 suppressed by one. A submission with no chosen id cannot be reconciled at all,
 so its in-memory marker is always cleared when the call returns.
+
+**2b. A Supplement into another client's turn is recorded per item, never per
+turn.** `turn/steer` may join a turn the user's TUI started. The adapter records
+the steer's chosen id durably as a **steer** submission before the request:
+
+- only the item whose `userMessage.clientId` is that id is cola's; the turn is
+  never added to the authored turns, and every other item in it — including an
+  id-less TUI message — stays external;
+- the thread-wide, id-less fallback never applies to a steer, so it cannot turn
+  an unrelated message in the joined turn into cola's;
+- a successful response marks the id **resolved**: it stays recorded for
+  precise recognition (across a restart) but no longer counts toward the
+  unresolved cap; the resolved-steer tail is bounded separately (256 per
+  thread, oldest dropped), while an unresolved steer obeys the same one-hour
+  valve and lost-response reconciliation as a prompt;
+- a definitely refused steer clears its marker; an ambiguous one keeps it, and
+  the next history read resolves it by id;
+- `SessionTranscript::submissions` already carries the steer id (the server
+  echoes `clientUserMessageId` as `userMessage.clientId`), so the Turn's anchor
+  map and the external-turn boundary both see the message as cola's.
 
 **The write is a precondition.** `begin` is fallible: if the chosen id cannot be
 made durable (a read-only state directory, an unusable record), the prompt is
@@ -192,6 +212,13 @@ durable shape for a label.
   after acceptance is indistinguishable from a refusal at the client, so
   abandoning it on transport failures re-opens the same hole. Only a JSON-RPC
   error is positive evidence the turn did not start.
+- **Record nothing for a steer (the first cut).** Rejected on review: the
+  supplement's item then answers "external", so Session Sync announces cola's
+  own message and the external renderer opens a new boundary inside the turn.
+- **Record a steer as an ordinary prompt.** Rejected: a prompt marker turns on
+  the thread-wide fallback and binds the whole turn, which would make the TUI's
+  own id-less messages in that turn cola's. The steer kind is precise by
+  construction.
 - **Bind any `clientId` that looks like cola's `msg_cola_` id.** Rejected on
   review: a peer chooses its own `clientUserMessageId`, so the prefix is a claim,
   not evidence. Only a recorded id may vouch; the lost-response case is kept by
@@ -235,6 +262,9 @@ message, and a broken record must not produce it.
 
 ## Consequences
 
+- A steered Supplement is recognised by its own item id, not by claiming the
+  turn it joined; the resolved ids are a bounded recognition tail, so a TUI turn
+  can never be mistaken for cola's wholesale.
 - A cola turn is durable state, not a process-local guess; its file is bounded
   (the newest 128 turns, and 32 unresolved submissions, per thread) because
   authorship is only ever asked about the newest user message. A submission
