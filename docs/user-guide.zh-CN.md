@@ -413,7 +413,9 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 客户端则报告 app-server daemon、你自己的客户端是否连接到它，以及运行时是否
 公布了预期的能力。连接与否由 Linux 上客户端进程打开的套接字描述符（`/proc`、
 `ss`）证明，而不是只看 argv：无法证明的 argv 匹配会给出警告，而带
-`--no-daemon` 或指向其他端点的客户端会被明确判为失败。完全没有本地客户端时
+`--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少 daemon 同样判为
+失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行运行
+`codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时
 （纯 Feishu 部署）该检查通过，因为没有需要连接的对象。
 
 `cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在**共享**
