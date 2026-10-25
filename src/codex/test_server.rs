@@ -397,6 +397,9 @@ struct State {
     /// close the connection without answering — an accepted request whose
     /// response was lost.
     drop_on_turn_start: std::sync::atomic::AtomicBool,
+    /// One-shot: accept and persist the next `turn/start` (and emit its stream)
+    /// but never answer, so the client cannot cache the turn id.
+    silent_turn_start: std::sync::atomic::AtomicBool,
     /// One-shot: answer the next `thread/compact/start` with a JSON-RPC error.
     reject_compact: std::sync::atomic::AtomicBool,
     /// One-shot: accept the next `thread/compact/start` (persist and emit the
@@ -460,6 +463,7 @@ impl Default for State {
             skills: std::sync::Mutex::new(Vec::new()),
             reject_turn_start: std::sync::Mutex::new(None),
             drop_on_turn_start: std::sync::atomic::AtomicBool::new(false),
+            silent_turn_start: std::sync::atomic::AtomicBool::new(false),
             reject_compact: std::sync::atomic::AtomicBool::new(false),
             drop_on_compact: std::sync::atomic::AtomicBool::new(false),
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -780,6 +784,31 @@ impl FakeServer {
     /// test can prove the release path survives a server that refuses it.
     pub(crate) fn reject_unsubscribe(&self, count: usize) {
         self.state.reject_unsubscribe.store(count, Ordering::SeqCst);
+    }
+
+    /// Wait until the server has recorded a live turn for a thread — the
+    /// `turn/start` was accepted and persisted — returning `(thread id, turn
+    /// id)`. A cancelled probe's cleanup depends on this record, not on the
+    /// client having processed `turn/start`'s reply.
+    pub(crate) async fn wait_for_live_turn_record(&self) -> (String, String) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some((thread, turn)) = self.state.live_turns.lock().expect("live turns").iter().next() {
+                return (thread.clone(), turn.clone());
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the server never recorded a live turn"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// One-shot: accept and persist the next `turn/start` (and emit its
+    /// `turn/started`) but never answer it, so a client cannot cache the turn
+    /// id — the cancelled-cleanup path that must find it from the thread.
+    pub(crate) fn silence_next_turn_start(&self) {
+        self.state.silent_turn_start.store(true, Ordering::SeqCst);
     }
 
     /// How many connection streams are currently subscribed to `thread_id`.
@@ -1332,7 +1361,11 @@ where
             let result = json!({
                 "turn": { "id": turn_id, "status": "inProgress", "startedAt": started_at, "items": [] }
             });
-            if !drop_response && !reply(sink, id, result).await {
+            // A silent start persists and streams the turn but never answers:
+            // the client can never cache the id (a cancelled cleanup must find
+            // it from the thread itself).
+            let silent = state.silent_turn_start.swap(false, Ordering::SeqCst);
+            if !drop_response && !silent && !reply(sink, id, result).await {
                 return false;
             }
             emit(
