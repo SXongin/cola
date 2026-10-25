@@ -249,6 +249,11 @@ pub(crate) fn build_unshowable_permission_retry_card() -> serde_json::Value {
     )
 }
 
+/// The label of the result card cola shows when it refuses a click on a
+/// permission whose target it cannot show in full (the click asked to approve
+/// text the user never saw). Pinned with the refusal copy above.
+pub(crate) const UNSHOWABLE_PERMISSION_DECLINED_LABEL: &str = "🚫 已自动拒绝（目标无法完整显示）";
+
 /// The receipt line an inline permission block collapses to when cola refused
 /// it before it could be offered — its target is too long for the card to show
 /// in full, so approving it would approve unseen text. Pinned with the refusal

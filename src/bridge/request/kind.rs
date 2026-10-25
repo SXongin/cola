@@ -537,6 +537,56 @@ impl RequestKind for PermissionKind {
             return Some(r);
         }
 
+        // The completeness guard again, at the decision point (whole-branch
+        // re-review #883): an Allow click must never approve a target the card
+        // cannot show in full, even when this card escaped the surface-time
+        // refusal (an older build's persisted card, a failed withdrawal, a
+        // retry dropped at the backlog cap). The server's pending list is the
+        // authority — the payload only describes what the card displayed — so
+        // the click reads the request and refuses when it cannot be shown.
+        let mut unshowable: Option<usize> = None;
+        if matches!(reply, "once" | "always")
+            && let Some(dir) = directory
+        {
+            let listed = crate::bridge::bounded_call(
+                "permission click: list pending",
+                flow.list_timeout_ms.load(std::sync::atomic::Ordering::Relaxed),
+                handles.backend.clone().for_directory(dir).list_permissions(),
+            )
+            .await;
+            match listed {
+                Some(Ok(perms)) => {
+                    if let Some(p) = perms.iter().find(|p| p.request_id == req_id)
+                        && !p.targets_are_fully_shown()
+                    {
+                        unshowable = Some(p.target_budget());
+                    }
+                }
+                // The target is unknown, so the approval is not verifiable:
+                // refuse to decide this time and let the click be retried.
+                Some(Err(e)) => {
+                    tracing::warn!("permission {req_id}: could not verify its target: {e}");
+                    return Some(failed_result_card(
+                        inline,
+                        "无法校验该权限请求的目标，未批准；请重试。",
+                        "无法校验目标，未批准",
+                    ));
+                }
+                None => {
+                    tracing::warn!("permission {req_id}: verifying its target timed out; not approved");
+                    return Some(failed_result_card(
+                        inline,
+                        "无法校验该权限请求的目标，未批准；请重试。",
+                        "无法校验目标，未批准",
+                    ));
+                }
+            }
+        }
+        // A target the card cannot show is always declined, whatever the
+        // button asked for: the click sought an approval the user could not
+        // have reviewed.
+        let reply = if unshowable.is_some() { "reject" } else { reply };
+
         // Double-click guard: the atomic claim decides who replies. A click
         // that loses the race re-serves the winning click's result; only the
         // winner may reach the backend.
@@ -570,6 +620,14 @@ impl RequestKind for PermissionKind {
                 // survives later flushes) and the ack below carries the
                 // clicked card's updated JSON — no PATCH race, no dependence
                 // on which card is current.
+                let unshowable_receipt =
+                    |_target: &str| crate::feishu::card::question::UNSHOWABLE_PERMISSION_RECEIPT.to_string();
+                let normal_receipt = |target: &str| permission_receipt(target, reply);
+                let residue = if unshowable.is_some() {
+                    Residue::PerBlock(&unshowable_receipt)
+                } else {
+                    Residue::PerBlock(&normal_receipt)
+                };
                 resolve_blocks(
                     flow,
                     &handles.cards,
@@ -578,7 +636,7 @@ impl RequestKind for PermissionKind {
                     session_id,
                     Origin::Click { clicked },
                     &[req_id.to_string()],
-                    Residue::PerBlock(&|target| permission_receipt(target, reply)),
+                    residue,
                 )
                 .await
             }
@@ -616,19 +674,33 @@ impl RequestKind for PermissionKind {
                 ));
             }
         };
-        // Result card: shows the decision, no buttons.
-        let label = if !perm_label.is_empty() { perm_label } else { reply };
-        let toast = match reply {
-            "once" => "已允许本次执行".to_string(),
-            "always" => "已允许，后续将自动放行".to_string(),
-            _ => "已拒绝".to_string(),
+        // Result card: shows the decision, no buttons. A forced refusal says
+        // why — it is not the decision the button label claimed.
+        let label = if let Some(_budget) = unshowable {
+            crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL
+        } else if !perm_label.is_empty() {
+            perm_label
+        } else {
+            reply
         };
-        let body = if perm_body.is_empty() {
+        let toast = if unshowable.is_some() {
+            "已自动拒绝：目标无法完整显示".to_string()
+        } else {
+            match reply {
+                "once" => "已允许本次执行".to_string(),
+                "always" => "已允许，后续将自动放行".to_string(),
+                _ => "已拒绝".to_string(),
+            }
+        };
+        let body = if let Some(budget) = unshowable {
+            crate::feishu::card::question::unshowable_permission_note(budget)
+        } else if perm_body.is_empty() {
             format!("Permission: {}", reply)
         } else {
             perm_body.to_string()
         };
-        let mut r = result_card(label, perm_color, &body);
+        let color = if unshowable.is_some() { "red" } else { perm_color };
+        let mut r = result_card(label, color, &body);
         r.toast = Some(toast);
         settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
         flow.remember_answered_result(req_id, &r).await;

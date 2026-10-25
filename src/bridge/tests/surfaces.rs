@@ -1486,3 +1486,83 @@ async fn a_bare_404_keeps_the_withdrawal_retryable() {
     );
     assert!(!text.contains("允许一次"), "no control survives: {text}");
 }
+
+/// Whole-branch re-review #883: the completeness guard also runs at the
+/// **click** path. A card can stay live with its Allow buttons through the
+/// worst window — the server refusal fails, the retry-receipt PATCH fails, and
+/// the backlog entry waits — so a click must re-read the request and refuse,
+/// never approve a target the card cannot show.
+#[tokio::test]
+async fn a_click_on_a_stale_allow_card_declines_an_unshowable_target() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let session_file = dir.path().join("sessions.json");
+
+    let (app, _platform, _backend) = restart_app(&session_file, |_| {}).await;
+    seed_session(&app, "ses_1", "/work").await;
+    drop(app);
+
+    seed_stale_surface(&session_file, "per_long", true, "om_card");
+
+    let (app, platform, backend) = restart_app(&session_file, |b| {
+        b.ask_permission(over_budget_perm("per_long", "ses_1"));
+    })
+    .await;
+    // Worst window: the decline fails AND the retry receipt cannot be patched.
+    backend
+        .fail_reply_permission_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    platform
+        .fail_update_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    sweep(&app.permission, &app).await;
+    assert_eq!(
+        backend.reply_permission_calls.lock().await.len(),
+        1,
+        "the sweep tried and failed the decline"
+    );
+    assert_eq!(
+        app.permission.pending_withdrawal_count().await,
+        1,
+        "and kept the withdrawal for a retry"
+    );
+
+    // The user now clicks the old card's Allow button (the card is still live).
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "request_id": "per_long",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "⚡ **执行 Shell 命令**",
+        }))
+        .await
+        .expect("the click produces a result");
+
+    let calls = backend.reply_permission_calls.lock().await.clone();
+    assert_eq!(
+        calls,
+        vec![
+            ("per_long".to_string(), "reject".to_string()),
+            ("per_long".to_string(), "reject".to_string()),
+        ],
+        "the click is declined, never approved: {calls:?}"
+    );
+    assert_eq!(
+        result.toast.as_deref(),
+        Some("已自动拒绝：目标无法完整显示"),
+        "the toast names the refusal"
+    );
+    let text = card_text(result.card.as_ref().expect("the result card"));
+    assert!(
+        text.contains(crate::feishu::card::question::UNSHOWABLE_PERMISSION_DECLINED_LABEL),
+        "the result explains the forced refusal: {text}"
+    );
+    assert!(
+        !text.contains("已允许"),
+        "nothing may claim the approval happened: {text}"
+    );
+}
