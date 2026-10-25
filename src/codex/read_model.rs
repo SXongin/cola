@@ -86,6 +86,40 @@ pub(crate) fn decode_thread_status(value: &Value) -> Option<ThreadStatus> {
     }
 }
 
+/// The small Turn Diff facts a released thread keeps: the diff map and the
+/// item→turn mapping a Turn anchor needs, without the transcript. Retaining
+/// this is what lets a card's 「查看完整变化」 resolve after the projection is
+/// evicted.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DiffSnapshot {
+    pub(crate) diffs: HashMap<String, TurnDiff>,
+    pub(crate) item_turn: HashMap<String, String>,
+    pub(crate) completed_turns: std::collections::HashSet<String>,
+    pub(crate) latest_turn: Option<String>,
+}
+
+impl DiffSnapshot {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.diffs.is_empty() && self.completed_turns.is_empty() && self.latest_turn.is_none()
+    }
+
+    /// Resolve `from` exactly as [`ThreadProjection::diff_for`] does, over the
+    /// snapshot's small maps.
+    pub(crate) fn resolve(&self, from: Option<&str>) -> Option<TurnDiff> {
+        let turn_id = from
+            .and_then(|id| self.item_turn.get(id).cloned())
+            .or_else(|| {
+                from.filter(|id| self.completed_turns.contains(*id) || self.diffs.contains_key(*id))
+                    .map(str::to_string)
+            })
+            .or_else(|| self.latest_turn.clone())?;
+        if let Some(diff) = self.diffs.get(&turn_id) {
+            return Some(diff.clone());
+        }
+        self.completed_turns.contains(&turn_id).then(TurnDiff::default)
+    }
+}
+
 /// One thread's folded notifications. Construct with [`Self::new`]; apply
 /// decoded events with [`Self::apply`] and read the neutral view with
 /// [`Self::transcript`].
@@ -222,6 +256,21 @@ impl ThreadProjection {
     /// complete.
     pub(crate) fn mark_incomplete(&mut self) {
         self.incomplete = true;
+    }
+
+    /// Clear a truncation that no longer applies (a thread resolved as
+    /// never-run: an empty transcript is complete, not a prefix).
+    pub(crate) fn clear_incomplete(&mut self) {
+        self.incomplete = false;
+    }
+
+    /// Mark a bounded read truncated only while no page has seeded a turn. If
+    /// adoption completed between the wait's timeout and this mark, the
+    /// projection already has content and must not be called a prefix.
+    pub(crate) fn mark_incomplete_if_unseeded(&mut self) {
+        if self.turn_order.is_empty() {
+            self.incomplete = true;
+        }
     }
 
     /// Fold one notification into the projection. Returns whether the method
@@ -564,6 +613,25 @@ impl ThreadProjection {
             .get(&turn_id)
             .filter(|turn| !turn.live)
             .map(|_| TurnDiff::default())
+    }
+
+    /// The small Turn Diff state retained when the transcript is evicted.
+    pub(crate) fn diff_snapshot(&self) -> DiffSnapshot {
+        DiffSnapshot {
+            diffs: self.diffs.clone(),
+            item_turn: self
+                .items
+                .iter()
+                .map(|item| (item.id.clone(), item.turn_id.clone()))
+                .collect(),
+            completed_turns: self
+                .turns
+                .iter()
+                .filter(|(_, turn)| !turn.live)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            latest_turn: self.turn_order.last().cloned(),
+        }
     }
 
     pub(crate) fn model_context_window(&self) -> Option<i64> {
