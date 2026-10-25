@@ -38,6 +38,7 @@ use crate::backend::{Backend, BackendDirectory, PromptSkill, SessionTranscript, 
 use crate::bridge::tasks::TasksHandle;
 use crate::error::{BridgeError, Result};
 
+use super::authorship::SubmissionKind;
 use super::client::CodexClient;
 use super::error::{CodexError, Result as CodexResult};
 use super::lifecycle::CodexLifecycle;
@@ -663,16 +664,22 @@ impl CodexClient {
             // Only an id this record actually saw may vouch. A peer chooses its
             // own `clientUserMessageId`, so the id's shape proves nothing: an
             // unfamiliar id — however it is spelled — is somebody else's.
-            if !self.authored.is_pending_submission(thread_id, submission) {
+            let Some(kind) = self.authored.pending_kind(thread_id, submission) else {
                 continue;
-            }
+            };
             let Some((owner, turn)) = self.projections.turn_of_item(message.as_str()) else {
                 continue;
             };
             if owner != thread_id {
                 continue;
             }
-            self.authored.bind_submission(thread_id, submission, &turn);
+            match kind {
+                // A prompt claims the turn it started.
+                SubmissionKind::Prompt => self.authored.bind_submission(thread_id, submission, &turn),
+                // A steer claims only its own item; the turn belongs to whoever
+                // started it.
+                SubmissionKind::Steer => self.authored.resolve_steer(thread_id, submission),
+            }
         }
     }
 
@@ -1443,13 +1450,37 @@ impl Backend for CodexClient {
         if let Some(message_id) = message_id {
             params["clientUserMessageId"] = json!(message_id);
         }
+        // Record the id before the request, as a **steer**: only the item the
+        // server writes for it is cola's. The turn may have been started by the
+        // user's TUI, so neither the turn nor its other items are claimed — an
+        // id-less item in it must stay external. Recording before the send also
+        // keeps an ambiguous (lost) response reconcilable by id.
+        self.authored
+            .begin_steer(session_id, message_id)
+            .map_err(|detail| BridgeError::Client {
+                client: "codex",
+                detail,
+            })?;
         // No `model`/`effort` here: a steer adds input to a turn that already
-        // captured its settings. The turn is cola's — the bridge only steers
-        // while it owns the live execution — so no new provenance is recorded.
-        self.connection()
-            .request("turn/steer", params)
-            .await
-            .map_err(client_error)?;
+        // captured its settings.
+        let result = match self.connection().request("turn/steer", params).await {
+            Ok(result) => result,
+            Err(error) => {
+                if definitely_refused(&error) || message_id.is_none() {
+                    self.authored.abandon(session_id, message_id);
+                }
+                // An ambiguous failure keeps the marker: the steer may have
+                // landed, and the next history read resolves it by its id.
+                return Err(client_error(error));
+            }
+        };
+        let _ = result;
+        // The server accepted the steer, so the item exists and the id is now a
+        // resolved precise match (it stays recorded for later reads, including
+        // after a restart, but no longer counts as unresolved).
+        if let Some(message_id) = message_id {
+            self.authored.resolve_steer(session_id, message_id);
+        }
         Ok(())
     }
 
@@ -4066,6 +4097,205 @@ mod tests {
         assert!(
             server.interrupt_params().is_empty(),
             "the idle thread had nothing to interrupt"
+        );
+    }
+
+    /// A steer into a turn the user's TUI started claims only the item the
+    /// supplement created: the turn and its other (id-less) items stay external.
+    #[tokio::test]
+    async fn a_steer_into_a_tui_turn_marks_only_its_own_item() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let tui = connect(&url).await;
+        tui.transcript("thread-1").await.expect("the TUI's subscription");
+        tui.prompt("thread-1", "from the TUI", &[], &[], None, None, None, None)
+            .await
+            .expect("the TUI's prompt");
+        let live = server.live_turn("thread-1").expect("the turn is running");
+
+        let cola = connect(&url).await;
+        cola.transcript("thread-1").await.expect("cola's subscription");
+        wait_for_live_turn(&cola, "thread-1").await;
+
+        cola.steer(
+            "thread-1",
+            "feishu supplement",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some("msg_cola_supp"),
+        )
+        .await
+        .expect("the supplement steers");
+
+        let steers = server.steer_params();
+        assert_eq!(steers.len(), 1);
+        assert_eq!(steers[0]["expectedTurnId"].as_str(), Some(live.as_str()));
+        let transcript = wait_for_text(&cola, "thread-1", "feishu supplement").await;
+        let supplement = transcript
+            .messages
+            .iter()
+            .find(|message| message.text() == "feishu supplement")
+            .expect("the supplement's user item");
+        let tui_message = transcript
+            .messages
+            .iter()
+            .find(|message| message.text() == "from the TUI")
+            .expect("the TUI's own message");
+        assert!(
+            cola.is_cola_authored(supplement.id.as_str()).await,
+            "the supplement item is cola's, even though the turn is not"
+        );
+        assert!(
+            !cola.is_cola_authored(tui_message.id.as_str()).await,
+            "the TUI's id-less item in the same turn stays external"
+        );
+        assert!(
+            !cola.authored.is_authored("thread-1", Some(live.as_str())),
+            "a steer never claims the turn it joined"
+        );
+        assert!(
+            transcript.submissions.contains_key("msg_cola_supp"),
+            "the anchor map carries the steer id: {:?}",
+            transcript.submissions
+        );
+    }
+
+    /// The steer id is durable: a rebuilt client still classifies the item.
+    #[tokio::test]
+    async fn a_steer_id_survives_a_restart() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        server.echo_prompts("thread-1");
+        let tui = connect(&url).await;
+        tui.transcript("thread-1").await.expect("the TUI's subscription");
+        tui.prompt("thread-1", "from the TUI", &[], &[], None, None, None, None)
+            .await
+            .expect("the TUI's prompt");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+        let first = connect_with(
+            &url,
+            crate::codex::Authorship::open(path.clone(), "codex").expect("the record opens"),
+        )
+        .await;
+        first.transcript("thread-1").await.expect("subscribe");
+        wait_for_live_turn(&first, "thread-1").await;
+        first
+            .steer(
+                "thread-1",
+                "feishu supplement",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_supp"),
+            )
+            .await
+            .expect("the supplement steers");
+        let transcript = wait_for_text(&first, "thread-1", "feishu supplement").await;
+        let item_id = transcript
+            .messages
+            .iter()
+            .find(|message| message.text() == "feishu supplement")
+            .map(|message| message.id.as_str().to_string())
+            .expect("the supplement item");
+        drop(first);
+
+        let second = connect_with(
+            &url,
+            crate::codex::Authorship::open(path, "codex").expect("the record reloads"),
+        )
+        .await;
+        let rebuilt = second.transcript("thread-1").await.expect("the rebuilt read");
+        assert!(
+            second.is_cola_authored(&item_id).await,
+            "the durable steer id still classifies its item after a restart"
+        );
+        let tui_message = rebuilt
+            .messages
+            .iter()
+            .find(|message| message.text() == "from the TUI")
+            .expect("the TUI's message");
+        assert!(!second.is_cola_authored(tui_message.id.as_str()).await);
+    }
+
+    /// An aged, never-delivered steer marker neither vouches for its id nor
+    /// drives the thread-wide fallback.
+    #[tokio::test]
+    async fn an_aged_steer_marker_vouches_for_nothing() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("authored_turns.json");
+        let aged = chrono::Utc::now().timestamp_millis() - crate::codex::authorship::PENDING_ID_TTL_MS - 1;
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"turns":{{}},"pending":{{"codex":{{"thread-1":[{{"id":"msg_cola_steer","at_ms":{aged},"kind":"steer"}}]}}}}}}"#
+            ),
+        )
+        .expect("write an aged steer record");
+        let record = crate::codex::Authorship::open(path.clone(), "codex").expect("the record opens");
+        let cola = connect_with(&url, record.clone()).await;
+        cola.transcript("thread-1").await.expect("subscribe");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        for (method, params) in [
+            (
+                "turn/started",
+                json!({ "threadId": "thread-1", "turn": { "id": "turn-tui", "status": "inProgress", "startedAt": 5 } }),
+            ),
+            (
+                "item/started",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-tui",
+                    "startedAtMs": 5_000_i64,
+                    "item": {
+                        "type": "userMessage",
+                        "id": "item-tui",
+                        "clientId": null,
+                        "content": [{ "type": "text", "text": "from the TUI", "textElements": [] }],
+                    },
+                }),
+            ),
+        ] {
+            server.push_to_thread("thread-1", method, params);
+        }
+        wait_for_text(&cola, "thread-1", "from the TUI").await;
+        assert!(
+            !cola.is_cola_authored("item-tui").await,
+            "an aged steer marker must not vouch for an id-less TUI item"
+        );
+        assert!(
+            !cola.authored.is_pending_submission("thread-1", "msg_cola_steer"),
+            "the aged steer entry is out of its recorded life"
+        );
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("the file")).expect("json");
+        assert!(
+            file["pending"].get("codex").is_none(),
+            "the read pruned the aged steer entry: {file}"
         );
     }
 

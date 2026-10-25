@@ -1340,6 +1340,126 @@ async fn compact_renders_through_the_existing_compaction_path_once() {
     );
 }
 
+/// Wait until the client's transcript carries `needle`, returning that read.
+async fn wait_for_transcript_text(client: &CodexClient, needle: &str) -> crate::backend::SessionTranscript {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let transcript = client.transcript(THREAD).await.expect("the transcript read");
+        if transcript
+            .messages
+            .iter()
+            .any(|message| message.text().contains(needle))
+        {
+            return transcript;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for `{needle}`"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Wait until the app's client has folded the thread's live turn, so a steer
+/// targets it rather than falling back to `turn/start`.
+async fn wait_for_client_live_turn(client: &CodexClient) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if client.projections.live_turn(THREAD).is_some() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the client never saw the TUI's live turn"
+        );
+        let _ = client.transcript(THREAD).await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The gate's case: the user's TUI starts the turn, and a Feishu Supplement is
+/// steered into it. The supplement is cola's, so Session Sync must not announce
+/// it (the notification path is also the external-turn boundary), while the
+/// TUI's own id-less message in the same turn stays external.
+#[tokio::test]
+async fn a_steered_supplement_is_never_an_external_message() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, client) = build_bridge(
+        &url,
+        &directory.path().join("sessions.json"),
+        chrono::Utc::now().timestamp_millis() - 60_000,
+    )
+    .await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    // The user's own client starts the turn; its message carries no client id.
+    let tui = connect(&url).await;
+    tui.transcript(THREAD).await.expect("the TUI's subscription");
+    tui.prompt(THREAD, "from the TUI", &[], &[], None, None, None, None)
+        .await
+        .expect("the TUI's prompt");
+    wait_for_client_live_turn(&client).await;
+
+    // The Feishu Supplement steers the running turn.
+    client
+        .steer(
+            THREAD,
+            "feishu supplement",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            Some("msg_cola_supp"),
+        )
+        .await
+        .expect("the supplement steers");
+    let transcript = wait_for_transcript_text(&client, "feishu supplement").await;
+    let supplement = transcript
+        .messages
+        .iter()
+        .find(|message| message.text() == "feishu supplement")
+        .expect("the supplement's user message");
+    assert!(
+        client.is_cola_authored(supplement.id.as_str()).await,
+        "the steered supplement is cola's"
+    );
+    let tui_message = transcript
+        .messages
+        .iter()
+        .find(|message| message.text() == "from the TUI")
+        .expect("the TUI's message");
+    assert!(
+        !client.is_cola_authored(tui_message.id.as_str()).await,
+        "the TUI's id-less message in the same turn is external"
+    );
+
+    // Give Session Sync several passes: the supplement must never be announced.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let announced: Vec<String> = platform
+        .sent_cards()
+        .await
+        .iter()
+        .filter(|card| card_text(card).contains("feishu supplement"))
+        .map(card_text)
+        .collect();
+    assert!(
+        announced.is_empty(),
+        "a steered supplement must not be announced as external: {announced:?}"
+    );
+
+    sync.abort();
+}
+
 /// Ticket #881 acceptance 6 through the bridge: a turn cola started is never an
 /// External Message — including after a restart, which reads the durable record
 /// rather than an in-memory one. A genuinely external turn still notifies.
