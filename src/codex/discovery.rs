@@ -1038,38 +1038,49 @@ mod tests {
     }
 
     /// The pure resolver is where `CODEX_HOME` is honoured: the variable wins
-    /// over the home directory, and the socket follows it.
+    /// over the home directory, and the socket follows it. The roots are built
+    /// from the platform's own temp directory, so the assertion is portable:
+    /// only the *appended* shape (`app-server-control/app-server-control.sock`,
+    /// the managed-binary package path) is what this pins.
     #[test]
     fn codex_home_follows_the_variable() {
+        let configured = std::env::temp_dir().join("codex-home");
         let environment = Environment {
-            home: resolve_home(
-                Some(PathBuf::from("/elsewhere/codex-home")),
-                Some(PathBuf::from("/home/user")),
-            )
-            .expect("an absolute CODEX_HOME resolves"),
+            home: resolve_home(Some(configured.clone()), Some(std::env::temp_dir()))
+                .expect("an absolute CODEX_HOME resolves"),
             cli: PathBuf::from("codex"),
             version_timeout: VERSION_TIMEOUT,
             start_timeout: START_TIMEOUT,
             socket_ready_timeout: SOCKET_READY_TIMEOUT,
         };
         assert_eq!(
+            environment.home, configured,
+            "the variable wins over the home directory, unchanged"
+        );
+        assert_eq!(
             environment.socket(),
-            Path::new("/elsewhere/codex-home/app-server-control/app-server-control.sock")
+            configured.join(CONTROL_DIR).join(CONTROL_SOCKET)
         );
         assert_eq!(
             environment.home.join(MANAGED_BINARY),
-            Path::new("/elsewhere/codex-home/packages/app-server-daemon/current/bin/codex")
+            configured.join(MANAGED_BINARY)
         );
     }
 
     #[test]
     fn an_absent_or_empty_variable_falls_back_to_the_default_home() {
+        let user_home = std::env::temp_dir();
+        let fallback = resolve_home(None, Some(user_home.clone())).expect("default home");
+        assert_eq!(fallback, user_home.join(".codex"));
+        assert_eq!(
+            resolve_home(Some(PathBuf::new()), Some(user_home.clone())).expect("empty means unset"),
+            user_home.join(".codex")
+        );
+        // The POSIX literal is pinned where it is meaningful; Windows builds the
+        // same shape from its own absolute root above.
+        #[cfg(unix)]
         assert_eq!(
             resolve_home(None, Some(PathBuf::from("/home/user"))).expect("default home"),
-            Path::new("/home/user/.codex")
-        );
-        assert_eq!(
-            resolve_home(Some(PathBuf::new()), Some(PathBuf::from("/home/user"))).expect("empty means unset"),
             Path::new("/home/user/.codex")
         );
         let error = resolve_home(None, None).expect_err("no home is a named failure");
@@ -1338,7 +1349,7 @@ mod tests {
     async fn a_live_descriptor_connection_is_proven_and_a_replaced_one_is_not() {
         use std::os::unix::net::UnixListener;
 
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::codex::test_server::socket_tempdir();
         let old = root.path().join("old.sock");
         let new = root.path().join("new.sock");
         let control = root.path().join("app-server-control.sock");
@@ -1462,7 +1473,7 @@ mod tests {
     async fn discovery_honours_a_relocated_home_and_a_symlinked_socket() {
         use crate::codex::test_server::FakeCodex;
 
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::codex::test_server::socket_tempdir();
         let home = root.path().join("relocated-codex-home");
         let environment = test_environment(&home);
         let control = environment.socket();
@@ -1549,7 +1560,7 @@ mod tests {
     async fn start_waits_for_the_control_socket_and_names_a_launcher_that_leaves_none() {
         use crate::codex::test_server::FakeCodex;
 
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::codex::test_server::socket_tempdir();
         let environment = test_environment(&root.path().join("codex-home"));
         std::fs::create_dir_all(environment.socket().parent().expect("control dir")).expect("control dir");
         let daemon_socket = root.path().join("daemon.sock");
@@ -1607,7 +1618,7 @@ mod tests {
     async fn an_idempotent_start_returns_the_daemon_already_serving() {
         use crate::codex::test_server::FakeCodex;
 
-        let root = tempfile::tempdir().expect("tempdir");
+        let root = crate::codex::test_server::socket_tempdir();
         let environment = test_environment(&root.path().join("codex-home"));
         let control = environment.socket();
         std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");

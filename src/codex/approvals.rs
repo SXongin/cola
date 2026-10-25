@@ -2159,7 +2159,7 @@ mod tests {
         use crate::codex::test_server::FakeServer;
         use crate::codex::transport::Endpoint;
 
-        let directory = tempfile::tempdir().expect("tempdir");
+        let directory = crate::codex::test_server::socket_tempdir();
         let path = directory.path().join("app-server.sock");
         let server = FakeServer::unix(&path, "codex-tui/0.163.0 (test)").await;
         let endpoint = Endpoint::parse(&format!("unix://{}", path.display())).expect("endpoint");
