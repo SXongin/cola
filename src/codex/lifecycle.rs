@@ -129,6 +129,30 @@ const TURN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6
 /// a wedged connection must not extend the diagnosis past its own turn budget.
 const TURN_PROBE_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a cancelled probe's cleanup looks for the live turn it must
+/// interrupt when it never cached the turn id (a `turn/start` whose reply was
+/// still in flight when the probe was dropped). The server persists a turn
+/// before answering `turn/start`, so this only covers that in-flight reply — the
+/// same bounded persisted-turn lookup `/stop` makes, and far below one cleanup
+/// step's budget.
+#[cfg(not(test))]
+const TURN_PROBE_LOOKUP_BOUND: std::time::Duration = std::time::Duration::from_millis(600);
+#[cfg(test)]
+const TURN_PROBE_LOOKUP_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The bound on one `thread/read` in that lookup: a wedged read must not hold
+/// the cleanup for its whole lookup bound.
+#[cfg(not(test))]
+const TURN_PROBE_LOOKUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(test)]
+const TURN_PROBE_LOOKUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// How often the lookup retries a thread whose live turn is not persisted yet.
+#[cfg(not(test))]
+const TURN_PROBE_LOOKUP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+#[cfg(test)]
+const TURN_PROBE_LOOKUP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// The probe thread's name. The thread is a real write on a daemon cola does
 /// not own, so it is named as cola's own diagnostic and deleted afterwards.
 const TURN_PROBE_THREAD_NAME: &str = "cola doctor probe";
@@ -671,11 +695,11 @@ impl ProbeThread {
     /// ambiguous create. Returns the failure when the probe's write is not
     /// gone.
     async fn finish(&mut self, stop_turn: bool) -> Option<String> {
-        let turn_id = if stop_turn { self.turn_id.as_deref() } else { None };
         let cleanup = clean_probe_thread(
             &self.connection,
             self.thread_id.as_deref(),
-            turn_id,
+            self.turn_id.as_deref(),
+            stop_turn,
             &self.directory,
         )
         .await
@@ -699,8 +723,16 @@ impl Drop for ProbeThread {
         let thread_id = self.thread_id.clone();
         let turn_id = self.turn_id.clone();
         runtime.spawn(async move {
-            if let Err(failure) =
-                clean_probe_thread(&connection, thread_id.as_deref(), turn_id.as_deref(), &directory).await
+            // A cancelled probe always stops its turn: the cached id when it
+            // saw `turn/start`'s reply, else the thread's persisted live turn.
+            if let Err(failure) = clean_probe_thread(
+                &connection,
+                thread_id.as_deref(),
+                turn_id.as_deref(),
+                true,
+                &directory,
+            )
+            .await
             {
                 tracing::warn!("the cancelled codex doctor probe could not clean up: {failure}");
             }
@@ -709,18 +741,32 @@ impl Drop for ProbeThread {
     }
 }
 
-/// Remove the probe's turn and thread. An unknown id is not "nothing to do":
-/// an ambiguous `thread/start` may have created the thread, so the distinctive
-/// directory is looked up and every match deleted.
+/// Remove the probe's turn and thread. `stop_turn` says the probe did not see
+/// its turn complete, so a live turn must be interrupted before the thread is
+/// deleted: the cached id when the probe learned it, else the thread's own
+/// persisted `inProgress` turn — a cancelled probe can have sent `turn/start`
+/// and been dropped before its reply arrived, so no id was ever cached. An
+/// unknown id is not "nothing to do": an ambiguous `thread/start` may have
+/// created the thread, so the distinctive directory is looked up and every
+/// match deleted.
 async fn clean_probe_thread(
     connection: &RpcConnection,
     thread_id: Option<&str>,
     turn_id: Option<&str>,
+    stop_turn: bool,
     directory: &Path,
 ) -> std::result::Result<(), String> {
     let mut failures = Vec::new();
     let mut deleted = false;
     if let Some(thread_id) = thread_id {
+        let turn_id = if stop_turn {
+            match turn_id {
+                Some(turn_id) => Some(turn_id.to_string()),
+                None => probe_live_turn(connection, thread_id).await,
+            }
+        } else {
+            None
+        };
         if let Some(turn_id) = turn_id {
             match tokio::time::timeout(
                 TURN_PROBE_CLEANUP_TIMEOUT,
@@ -764,6 +810,62 @@ async fn clean_probe_thread(
         Ok(())
     } else {
         Err(failures.join("; "))
+    }
+}
+
+/// The probe thread's persisted `inProgress` turn, for a cleanup whose probe
+/// never cached the id. `thread/read` carries the turns the server persisted —
+/// a real server writes the turn before answering `turn/start`, so a reply
+/// still in flight is covered by a short bounded retry. Best-effort: a failed
+/// or slow read is "no turn to interrupt" (the delete still runs), never a
+/// cleanup failure of its own.
+async fn probe_live_turn(connection: &RpcConnection, thread_id: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + TURN_PROBE_LOOKUP_BOUND;
+    loop {
+        match tokio::time::timeout(
+            TURN_PROBE_LOOKUP_READ_TIMEOUT,
+            connection.request(
+                "thread/read",
+                json!({ "threadId": thread_id, "includeTurns": true }),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(result)) => {
+                if let Some(turn_id) = result
+                    .pointer("/thread/turns")
+                    .and_then(Value::as_array)
+                    .and_then(|turns| {
+                        turns
+                            .iter()
+                            .rev()
+                            .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))
+                    })
+                    .and_then(|turn| turn.get("id").and_then(Value::as_str))
+                {
+                    return Some(turn_id.to_string());
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    thread = %thread_id,
+                    "the codex doctor probe cleanup could not read the thread's live turn: {error}"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    thread = %thread_id,
+                    "the codex doctor probe cleanup's thread read did not answer within \
+                     {TURN_PROBE_LOOKUP_READ_TIMEOUT:?}; retrying until the lookup bound"
+                );
+            }
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        tokio::time::sleep(TURN_PROBE_LOOKUP_INTERVAL.min(deadline - now)).await;
     }
 }
 
@@ -2264,6 +2366,11 @@ mod tests {
     /// Cancellation safety: dropping the probe future while it waits on the
     /// turn stream still interrupts the turn and deletes the scratch thread
     /// (the guard's `Drop` spawns the cleanup).
+    ///
+    /// The test waits for the state the cleanup actually depends on — the
+    /// server's **persisted** live turn — not for the client to have processed
+    /// `turn/start`'s reply, which is a race (a slow runtime can cancel before
+    /// the id is cached). Either way the cleanup must interrupt.
     #[tokio::test]
     async fn a_cancelled_turn_probe_still_cleans_up() {
         let fixture = Fixture::new();
@@ -2275,17 +2382,51 @@ mod tests {
             async move { lifecycle.probe_turn().await }
         });
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while server.turn_starts() == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the probe never started its turn"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let (thread_id, _) = server.wait_for_live_turn_record().await;
         task.abort();
         let _ = task.await;
 
+        wait_for_probe_thread_deletion(&server).await;
+        let interrupts = server.interrupt_params();
+        assert_eq!(interrupts.len(), 1, "cancellation stops the live probe turn");
+        assert_eq!(interrupts[0]["threadId"], thread_id);
+    }
+
+    /// A probe cancelled before `turn/start`'s reply arrives never caches the
+    /// turn id. The cleanup still finds the thread's persisted `inProgress`
+    /// turn and interrupts it before deleting the thread — the `/stop`-shaped
+    /// fallback, not a skipped interrupt.
+    #[tokio::test]
+    async fn a_cancelled_probe_interrupts_a_turn_it_never_cached() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        // Accept and persist the turn but never answer `turn/start`: the
+        // probe is still awaiting the id when it is cancelled.
+        server.silence_next_turn_start();
+        let lifecycle = Arc::new(fixture.lifecycle(crate::config::ServerStartPolicy::Never));
+        let task = tokio::spawn({
+            let lifecycle = Arc::clone(&lifecycle);
+            async move { lifecycle.probe_turn().await }
+        });
+
+        let (thread_id, turn_id) = server.wait_for_live_turn_record().await;
+        task.abort();
+        let _ = task.await;
+
+        wait_for_probe_thread_deletion(&server).await;
+        let interrupts = server.interrupt_params();
+        assert_eq!(
+            interrupts.len(),
+            1,
+            "an uncached turn id is found through the thread's persisted live turn"
+        );
+        assert_eq!(interrupts[0]["threadId"], thread_id);
+        assert_eq!(interrupts[0]["turnId"], turn_id);
+    }
+
+    /// Wait until a cancelled probe's `Drop` cleanup deleted its scratch thread.
+    async fn wait_for_probe_thread_deletion(server: &FakeServer) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while server.deleted_threads().is_empty() {
             assert!(
@@ -2294,11 +2435,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(
-            server.interrupt_params().len(),
-            1,
-            "cancellation stops the live probe turn"
-        );
     }
 
     /// An ambiguous `thread/start` (the server created the thread, the reply
@@ -2327,7 +2463,7 @@ mod tests {
             .await
             .expect("attach to the scripted daemon");
 
-        let result = clean_probe_thread(client.connection(), None, None, &directory).await;
+        let result = clean_probe_thread(client.connection(), None, None, false, &directory).await;
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             server.deleted_threads(),
