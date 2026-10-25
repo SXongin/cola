@@ -61,6 +61,14 @@ pub(crate) enum CodexError {
     #[error("codex app-server closed the connection before answering `{0}`")]
     NoResponse(String),
 
+    /// A server-initiated request's response could not enter the writer's
+    /// bounded queue inside the budget — the peer stopped reading. The request
+    /// is still unanswered, so the caller may retry it.
+    #[error(
+        "codex app-server response for request {id} could not be queued within {timeout:?}; the request is still unanswered"
+    )]
+    ResponseTimeout { id: String, timeout: Duration },
+
     /// A thread subscription could not keep up with the server's push stream:
     /// the broadcast dropped `skipped` events. A silent gap would render a
     /// transcript with holes, so the adapter reports it by name.
