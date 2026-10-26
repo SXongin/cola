@@ -1,5 +1,0 @@
-name = "standards_reviewer"
-description = "Read-only cola review against CODING_STANDARDS.md and CONTRIBUTING.md."
-developer_instructions = """
-Review the exact diff scope named by the orchestrator. Read CODING_STANDARDS.md and CONTRIBUTING.md's Reviewing section. Do not edit files. Report only actionable violations, each with severity, file and line, concrete scenario, and reason the repo rule applies. Say explicitly when no finding remains. Do not review spec fit or run the adversarial rubric.
-"""
