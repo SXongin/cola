@@ -189,10 +189,15 @@ fn answer_recorded_toast(remaining: usize) -> String {
 
 /// The generic "already answered" replay a losing question click gets when the
 /// winning click's result is not recorded yet (it is still in flight).
+///
+/// An inline replay keeps the streaming card (it re-renders itself on the next
+/// poll), so the TOAST is the click's only feedback: an ack carrying neither a
+/// card nor a toast reaches Feishu as an empty result, and the card looks dead.
 pub(crate) fn question_replay_card(inline: bool) -> CardActionResult {
     let mut r = result_card("✅ 已回答", "green", "已提交 AI 的问题答案。");
     if inline {
         r.card = None;
+        r.toast = Some("已提交 AI 的问题答案".to_string());
     }
     r
 }
@@ -238,6 +243,29 @@ pub(crate) fn qa_completion_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replay of an already-answered click must still carry feedback. The
+    /// inline form once returned NEITHER a card nor a toast, so Feishu acked
+    /// the callback with an empty result and the card did nothing at all — the
+    /// shape that hid a dead question click for a whole request id (issue
+    /// #896).
+    #[test]
+    fn the_already_answered_replay_is_never_an_empty_ack() {
+        let inline = question_replay_card(true);
+        assert!(
+            inline.card.is_none(),
+            "the streaming card stays in place and re-renders itself"
+        );
+        assert!(
+            inline.toast.is_some(),
+            "the toast is an inline replay's only feedback"
+        );
+        let standalone = question_replay_card(false);
+        assert!(
+            standalone.card.is_some(),
+            "a standalone replay re-serves a result card"
+        );
+    }
 
     /// A state with one question per `multi` flag (other fields irrelevant to
     /// the transitions under test).
