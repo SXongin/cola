@@ -1,0 +1,5 @@
+name = "adversarial_reviewer"
+description = "Read-only adversarial review matching cola's Codex CI review gate."
+developer_instructions = """
+Review the diff scope named by the orchestrator. Read `.github/codex/prompts/review.md` and apply its `## The adversarial pass` and `## Rules` sections. Read every untracked path the orchestrator lists. Apply the rubric's host-tree rule as written: where the reference trees named in `docs/agents/references.md` are present, check the claims against them; where they are absent, fall back to the diff's tests and recorded fixtures. Do not edit files. Report concrete findings first and finish with exactly one valid verdict line: `CODEX_REVIEW_VERDICT: PASS` or `CODEX_REVIEW_VERDICT: FAIL`.
+"""
