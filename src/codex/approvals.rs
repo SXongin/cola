@@ -38,19 +38,20 @@
 //!
 //! # Which decisions are offered, and how confidently
 //!
-//! The session-scoped control is a declared per-method capability
-//! ([`advertises_session_decision`]), read from the **response schemas** of the
-//! pinned `0.163.0` surface: the two modern approvals and the legacy pair
-//! advertise a session decision, while `item/permissions/requestApproval`
-//! advertises a grant profile plus a `turn`/`session` scope and no
-//! `acceptForSession` variant. Construction verifies **method names**, not
-//! payload variants (ADR-0090's method-level note), so a server on another
-//! version keeps this declared set rather than being re-probed: the typed
-//! decoders below are what turn a changed payload into a named decode error.
-//! A method outside the table never shows the session control, and a stale
-//! `always` reply against it is declined rather than approximated.
+//! The session-scoped control is a per-method capability read from the
+//! **response schemas** of the attached server: [`super::schema::Surface`]
+//! records the approval methods whose generated response advertises
+//! `acceptForSession` (or the legacy `approved_for_session`), and this module
+//! consults that set ([`advertises_session_decision`]). The pinned `0.163.0`
+//! surface contributes the four it advertises; a probed newer daemon
+//! contributes only what its own generated files declare, so a server that
+//! kept the method but dropped the variant gets no "always" control.
+//! `item/permissions/requestApproval` is never in the set: its response is a
+//! granted profile with a `turn`/`session` scope, not an `acceptForSession`
+//! decision. A method outside the set never shows the session control, and a
+//! stale `always` reply against it is declined rather than approximated.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -126,9 +127,14 @@ impl Pending {
 ///
 /// Cloning is not needed: [`super::client::CodexClient`] holds one `Arc` and
 /// its clones share it, exactly like the read-model cache.
-#[derive(Default)]
 pub(crate) struct Approvals {
     pending: Mutex<HashMap<String, Pending>>,
+    /// The approval methods the attached server's own response schemas
+    /// advertise a session decision for (ticket #882). Production always
+    /// supplies this from the probed surface — [`Approvals::new`] — so a newer
+    /// daemon that kept a method but dropped `acceptForSession` gets no
+    /// "always" control and an unadvertised decision is never sent.
+    session_decisions: BTreeSet<String>,
     /// How long a reply may wait for the writer's queue, in milliseconds. Zero
     /// means the transport's [`RESPONSE_WRITE_TIMEOUT`]; tests lower it so a
     /// stalled-writer path runs without waiting seconds.
@@ -143,6 +149,16 @@ pub(crate) struct Approvals {
     next_reply: AtomicU64,
 }
 
+impl Default for Approvals {
+    /// The pinned surface's session decisions, for a record built without an
+    /// attached server (tests, and a hermetic construction). Production goes
+    /// through [`Approvals::new`] with the probed surface, so this default is
+    /// never what an attached client offers a newer daemon.
+    fn default() -> Self {
+        Self::new(super::schema::Surface::pinned().session_decisions())
+    }
+}
+
 impl Drop for Approvals {
     fn drop(&mut self) {
         for task in self.tasks.get_mut().expect("approval tasks").drain(..) {
@@ -152,6 +168,18 @@ impl Drop for Approvals {
 }
 
 impl Approvals {
+    /// Record server requests against one attached server, whose advertised
+    /// session decisions are `session_decisions`.
+    pub(crate) fn new(session_decisions: BTreeSet<String>) -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            session_decisions,
+            reply_timeout_ms: AtomicU64::new(0),
+            tasks: Mutex::new(Vec::new()),
+            next_reply: AtomicU64::new(0),
+        }
+    }
+
     fn reply_timeout(&self) -> Duration {
         let millis = self.reply_timeout_ms.load(Ordering::Relaxed);
         if millis == 0 {
@@ -292,7 +320,7 @@ impl Approvals {
             return;
         };
 
-        let mut decoded = match decode_request(&method, &params, projections) {
+        let mut decoded = match decode_request(&method, &params, projections, &self.session_decisions) {
             Ok(request) => request,
             Err(Decode::Unsupported) => {
                 tracing::warn!(
@@ -647,8 +675,9 @@ fn decode_request(
     method: &str,
     params: &Value,
     projections: &Projections,
+    session_decisions: &BTreeSet<String>,
 ) -> std::result::Result<Decoded, Decode> {
-    let decoded = match method {
+    let mut decoded = match method {
         "item/commandExecution/requestApproval" => {
             let approval: CommandApproval = decode(method, params)?;
             Decoded {
@@ -716,6 +745,12 @@ fn decode_request(
         }
         _ => return Err(Decode::Unsupported),
     };
+    // The session control is a property of the **method** — whether the
+    // server's response schema advertises the variant — so it is decided once
+    // here from the attached surface, never inferred from a request payload.
+    if let Some(permission) = &mut decoded.permission {
+        permission.always_supported = advertises_session_decision(session_decisions, method);
+    }
     Ok(decoded)
 }
 
@@ -896,6 +931,12 @@ fn metadata(fields: &[(&str, Option<String>)]) -> Option<Value> {
     (!object.is_empty()).then_some(Value::Object(object))
 }
 
+/// Build the neutral permission ask.
+///
+/// `always_supported` is the construction default. The wire mappings below pass
+/// `false`: the session control is the **attached server's** answer, so
+/// `decode_request` fills it from the advertised variants (ticket #882) rather
+/// than each mapping claiming it.
 fn permission(
     id: &str,
     thread_id: &str,
@@ -915,20 +956,15 @@ fn permission(
     }
 }
 
-/// Which approval methods advertise a session-scoped decision in their
-/// response schema. See the module doc: this is a declared, method-level set
-/// (the same granularity the construction probe checks), never inferred from
-/// the request payload. `item/permissions/requestApproval` is absent: its
+/// Whether `method` advertises a session-scoped decision on the attached
+/// server. The set is the **response schema's** word (ticket #882), probed at
+/// construction — never a fixed table: a newer daemon that kept the method but
+/// removed `acceptForSession` must not get an "always" button.
+/// `item/permissions/requestApproval` is outside the set's domain: its
 /// response is a granted profile with a `turn`/`session` scope, not an
 /// `acceptForSession` decision.
-fn advertises_session_decision(method: &str) -> bool {
-    matches!(
-        method,
-        "item/commandExecution/requestApproval"
-            | "item/fileChange/requestApproval"
-            | "execCommandApproval"
-            | "applyPatchApproval"
-    )
+fn advertises_session_decision(session_decisions: &BTreeSet<String>, method: &str) -> bool {
+    session_decisions.contains(method)
 }
 
 fn permission_from_command(approval: &CommandApproval) -> PermissionRequest {
@@ -952,7 +988,7 @@ fn permission_from_command(approval: &CommandApproval) -> PermissionRequest {
             ("turn_id", approval.turn_id.clone()),
             ("approval_id", approval.approval_id.clone()),
         ]),
-        advertises_session_decision("item/commandExecution/requestApproval"),
+        false,
     )
 }
 
@@ -969,7 +1005,9 @@ fn permission_from_file_change(approval: &FileChangeApproval) -> PermissionReque
             ("turn_id", approval.turn_id.clone()),
             ("grant_root", approval.grant_root.clone()),
         ]),
-        advertises_session_decision("item/fileChange/requestApproval"),
+        // The session control is decided by `decode_request` from the
+        // server's advertised response variants, not here.
+        false,
     )
 }
 
@@ -990,7 +1028,7 @@ fn permission_from_permissions(approval: &PermissionsApproval) -> PermissionRequ
         // `advertises_session_decision`). A session-wide arbitrary profile is
         // the one grant cola cannot express faithfully, so the card offers
         // once/deny only.
-        advertises_session_decision("item/permissions/requestApproval"),
+        false,
     )
 }
 
@@ -1010,7 +1048,7 @@ fn permission_from_exec(approval: &ExecCommandApproval) -> PermissionRequest {
             ("item_id", Some(approval.call_id.clone())),
             ("approval_id", approval.approval_id.clone()),
         ]),
-        advertises_session_decision("execCommandApproval"),
+        false,
     )
 }
 
@@ -1029,7 +1067,7 @@ fn permission_from_patch(approval: &PatchApproval) -> PermissionRequest {
             ("grant_root", approval.grant_root.clone()),
             ("item_id", Some(approval.call_id.clone())),
         ]),
-        advertises_session_decision("applyPatchApproval"),
+        false,
     )
 }
 
@@ -1575,6 +1613,12 @@ mod tests {
         serde_json::from_str(&text).expect("the frame is JSON")
     }
 
+    /// The session decisions the pinned surface advertises — what a record built
+    /// without a probed server (`Default`) consults.
+    fn pinned_decisions() -> BTreeSet<String> {
+        crate::codex::schema::Surface::pinned().session_decisions()
+    }
+
     /// The answer path must not consume the request before the frame is
     /// queued: a stalled writer times the send out, the record returns, and a
     /// retry then writes exactly one response.
@@ -1962,6 +2006,7 @@ mod tests {
             "item/commandExecution/requestApproval",
             &params,
             &Projections::default(),
+            &pinned_decisions(),
         )
         .expect("decodes");
         let permission = permission.expect("a permission");
@@ -2001,6 +2046,7 @@ mod tests {
             "item/commandExecution/requestApproval",
             &params,
             &Projections::default(),
+            &pinned_decisions(),
         )
         .expect("decodes");
         let permission = permission.expect("a permission");
@@ -2023,8 +2069,13 @@ mod tests {
             "command": ["a".repeat(budget), "b".to_string()],
             "cwd": "/work/cola",
         });
-        let Decoded { permission, .. } =
-            decode_request("execCommandApproval", &params, &Projections::default()).expect("decodes");
+        let Decoded { permission, .. } = decode_request(
+            "execCommandApproval",
+            &params,
+            &Projections::default(),
+            &pinned_decisions(),
+        )
+        .expect("decodes");
         assert!(!permission.expect("a permission").targets_are_fully_shown());
     }
 
@@ -2044,6 +2095,7 @@ mod tests {
             "item/permissions/requestApproval",
             &params,
             &Projections::default(),
+            &pinned_decisions(),
         )
         .expect("decodes");
         let permission = permission.expect("a permission");
@@ -2196,9 +2248,13 @@ mod tests {
                 "required": ["folder"]
             }
         });
-        let Decoded { question, .. } =
-            decode_request("mcpServer/elicitation/request", &params, &Projections::default())
-                .expect("decodes");
+        let Decoded { question, .. } = decode_request(
+            "mcpServer/elicitation/request",
+            &params,
+            &Projections::default(),
+            &pinned_decisions(),
+        )
+        .expect("decodes");
         let question = question.expect("a form");
         assert_eq!(question.title, "Pick a folder");
         assert_eq!(question.questions.len(), 3);
@@ -2222,7 +2278,12 @@ mod tests {
             "elicitationId": "e-1"
         });
         assert!(matches!(
-            decode_request("mcpServer/elicitation/request", &params, &Projections::default()),
+            decode_request(
+                "mcpServer/elicitation/request",
+                &params,
+                &Projections::default(),
+                &pinned_decisions()
+            ),
             Err(Decode::CannotExpress(_))
         ));
     }
@@ -2241,8 +2302,13 @@ mod tests {
                 "isSecret": true
             }]
         });
-        let Decoded { question, .. } =
-            decode_request("item/tool/requestUserInput", &params, &Projections::default()).expect("decodes");
+        let Decoded { question, .. } = decode_request(
+            "item/tool/requestUserInput",
+            &params,
+            &Projections::default(),
+            &pinned_decisions(),
+        )
+        .expect("decodes");
         let question = question.expect("a refusal form");
         assert_eq!(
             question.uncollectable,
@@ -2277,7 +2343,8 @@ mod tests {
             decode_request(
                 "item/permissions/requestApproval",
                 &hidden,
-                &Projections::default()
+                &Projections::default(),
+                &pinned_decisions()
             ),
             Err(Decode::CannotExpress(_))
         ));
@@ -2300,7 +2367,8 @@ mod tests {
             decode_request(
                 "item/permissions/requestApproval",
                 &hidden_special,
-                &Projections::default()
+                &Projections::default(),
+                &pinned_decisions()
             ),
             Err(Decode::CannotExpress(_))
         ));
@@ -2325,7 +2393,8 @@ mod tests {
             decode_request(
                 "item/permissions/requestApproval",
                 &visible,
-                &Projections::default()
+                &Projections::default(),
+                &pinned_decisions()
             )
             .is_ok(),
             "every rendered field decodes"
@@ -2333,7 +2402,8 @@ mod tests {
     }
 
     #[test]
-    fn session_decisions_follow_the_method_table() {
+    fn session_decisions_follow_the_probed_surface() {
+        let decisions = pinned_decisions();
         for method in [
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
@@ -2341,7 +2411,7 @@ mod tests {
             "applyPatchApproval",
         ] {
             assert!(
-                advertises_session_decision(method),
+                advertises_session_decision(&decisions, method),
                 "{method} advertises a session decision"
             );
         }
@@ -2351,10 +2421,103 @@ mod tests {
             "mcpServer/elicitation/request",
         ] {
             assert!(
-                !advertises_session_decision(method),
+                !advertises_session_decision(&decisions, method),
                 "{method} does not advertise a session decision"
             );
         }
+
+        // The set is the server's answer, not a fixed table: dropping a
+        // method's response variant hides the control for that method alone.
+        let mut narrowed = decisions.clone();
+        narrowed.remove("item/commandExecution/requestApproval");
+        assert!(!advertises_session_decision(
+            &narrowed,
+            "item/commandExecution/requestApproval"
+        ));
+        assert!(advertises_session_decision(
+            &narrowed,
+            "item/fileChange/requestApproval"
+        ));
+    }
+
+    /// Ticket #882's acceptance case: a newer daemon's generated schema that
+    /// keeps the method but drops `acceptForSession` must yield a card with no
+    /// session control — and a stale `always` reply against it is still
+    /// declined rather than approximated.
+    #[test]
+    fn a_generated_surface_without_the_variant_hides_the_session_control() {
+        use crate::codex::schema::{Surface, write_generated_surface, write_response_schema};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_generated_surface(
+            directory.path(),
+            &["thread/start"],
+            &["error"],
+            &[
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            ],
+        )
+        .expect("write schema fixture");
+        write_response_schema(
+            directory.path(),
+            "CommandExecutionRequestApprovalResponse.json",
+            &["accept", "decline"],
+        );
+        write_response_schema(
+            directory.path(),
+            "FileChangeRequestApprovalResponse.json",
+            &["accept", "acceptForSession", "decline"],
+        );
+        let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
+
+        let command = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": "rm -rf build",
+            "cwd": "/work/cola",
+        });
+        let Decoded { permission, .. } = decode_request(
+            "item/commandExecution/requestApproval",
+            &command,
+            &Projections::default(),
+            &surface.session_decisions(),
+        )
+        .expect("decodes");
+        let permission = permission.expect("a permission");
+        assert!(
+            !permission.always_supported,
+            "the dropped variant must hide the session control"
+        );
+        let declined = permission_result(
+            &pending("item/commandExecution/requestApproval", permission, json!({})),
+            "always",
+        )
+        .expect("a reply");
+        assert_eq!(
+            declined,
+            json!({ "decision": "decline" }),
+            "a stale always reply is declined, never approximated"
+        );
+
+        let file_change = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-2",
+            "grantRoot": "/work/cola",
+        });
+        let Decoded { permission, .. } = decode_request(
+            "item/fileChange/requestApproval",
+            &file_change,
+            &Projections::default(),
+            &surface.session_decisions(),
+        )
+        .expect("decodes");
+        assert!(
+            permission.expect("a permission").always_supported,
+            "the method whose schema kept the variant still offers it"
+        );
     }
 
     #[test]
@@ -2370,9 +2533,13 @@ mod tests {
                 "required": ["confirm"]
             }
         });
-        let Decoded { question, .. } =
-            decode_request("mcpServer/elicitation/request", &params, &Projections::default())
-                .expect("decodes");
+        let Decoded { question, .. } = decode_request(
+            "mcpServer/elicitation/request",
+            &params,
+            &Projections::default(),
+            &pinned_decisions(),
+        )
+        .expect("decodes");
         assert_eq!(
             question.expect("a form").title,
             "把文件写入工作区？",
@@ -2447,7 +2614,7 @@ mod tests {
             "item/tool/call",
         ] {
             assert!(matches!(
-                decode_request(method, &json!({}), &Projections::default()),
+                decode_request(method, &json!({}), &Projections::default(), &pinned_decisions()),
                 Err(Decode::Unsupported)
             ));
         }

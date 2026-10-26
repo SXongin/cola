@@ -350,6 +350,15 @@ uses it — never silently. The measured shape diff above (additive only across
 the pin-to-running delta) is what makes probing at that level honest rather
 than a guess.
 
+One capability is finer than a method name and is read from the response
+schemas: whether an approval method advertises a session-scoped decision
+(`acceptForSession` in the modern pair, `approved_for_session` in the legacy
+pair). A fixed table would offer the card's "always" control to a daemon that
+kept the method but dropped the variant, and the reply would then be a decision
+the server never advertised (#882's re-review). The read is fail-safe — a
+response file the generated directory does not carry advertises nothing — so a
+partial schema generator can only remove a control, never add one.
+
 ## Amendment (ticket #883): the doctor turn probe is default-on
 
 Decision 3's diagnosis needs the provider-turn evidence, and the amendment above
