@@ -1745,9 +1745,12 @@ async fn a_tui_command_approval_is_answered_from_the_feishu_card() {
     );
 
     let once = button_value(&card, "once").expect("the allow-once button");
-    assert_eq!(
-        once["request_id"].as_str(),
-        Some(format!("n:{}", request_id.as_u64().unwrap()).as_str())
+    // The neutral id is the wire id plus this connection's namespace tag, so a
+    // request from another connection can never alias it (issue #896).
+    let neutral = once["request_id"].as_str().expect("the card names a request");
+    assert!(
+        neutral.starts_with(&format!("n:{}@", request_id.as_u64().unwrap())),
+        "the card carries this connection's request id, got {neutral}"
     );
 
     let result = app.host_action(once).await.expect("the answer card");
