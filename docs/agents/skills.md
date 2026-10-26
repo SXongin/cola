@@ -15,7 +15,7 @@ Both `.opencode/skill/<id>/SKILL.md` and `.agents/skills/<id>/SKILL.md` are live
 
 ## Codex counterparts
 
-Codex reads project skills from `.codex/skills/` and `.agents/skills/`, and project sub-agents from `.codex/agents/` (personal ones from `~/.codex/agents/`). Cola keeps `.opencode/agent/` and `.opencode/skill/` as the OpenCode sources; the `cola-*` adapters under `.codex/skills/` translate those workflows to Codex sub-agents and invocation. They sit in the Codex-only root deliberately: OpenCode also loads `.agents/skills/`, so adapters there would add five near-duplicate entries (`cola-code-review` beside `code-review`) to the `#<id>` tokens and the `/skill` picker.
+Codex reads project skills from `.codex/skills/` and `.agents/skills/`, and project sub-agents from `.codex/agents/` (personal ones from `~/.codex/agents/`). Cola keeps `.opencode/agent/` and `.opencode/skill/` as the OpenCode sources; the `cola-*` adapters under `.codex/skills/` translate those workflows to Codex sub-agents and invocation. The two sides mirror each other: `implementer` and `merger` exist on both, and the review axes are a single `reviewer` agent whose dispatch names the axis (`standards`, `spec`, `adversarial`) — the same shape as the OpenCode skill prompting one reviewer per axis. They sit in the Codex-only root deliberately: OpenCode also loads `.agents/skills/`, so adapters there would add five near-duplicate entries (`cola-code-review` beside `code-review`) to the `#<id>` tokens and the `/skill` picker.
 
 In Codex, invoke an adapter with `$cola-code-review`, `$cola-adversarial-review`, `$cola-foreman`, `$cola-implement-spec`, or `$cola-upgrade-skills`. Feishu's `#<id>` and `/skill` never see these files.
 
