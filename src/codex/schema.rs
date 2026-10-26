@@ -27,6 +27,14 @@
 //! the typed decoders already make strictly, so the constructor keeps the
 //! method contract and records the version; the ADR amendment carries the
 //! measured shape diff for the pinned-to-running delta.
+//!
+//! One capability is finer than a method name, and is read from the response
+//! schemas: whether an approval method advertises a session-scoped decision
+//! (`acceptForSession` / `approved_for_session`). The method list cannot say
+//! it, and a newer daemon that kept the method while dropping the variant
+//! would otherwise get a card control the server refuses (ticket #882). That
+//! read is deliberately **fail-safe**: a response file the directory does not
+//! carry advertises nothing.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -118,17 +126,49 @@ pub(crate) const REQUIRED_SERVER_REQUESTS: &[&str] = &[
 /// drift from the document it ships beside.
 const PINNED_REFERENCE: &str = include_str!("../../docs/reference/codex-app-server-0.163.0.md");
 
+/// The approval methods whose **response** schema can carry a session-scoped
+/// decision, and the generated file that declares it. `item/permissions/\
+/// requestApproval` is deliberately absent: its response is a granted profile
+/// with a `turn`/`session` scope, not an `acceptForSession` variant.
+const SESSION_DECISION_RESPONSES: &[(&str, &str)] = &[
+    (
+        "item/commandExecution/requestApproval",
+        "CommandExecutionRequestApprovalResponse.json",
+    ),
+    (
+        "item/fileChange/requestApproval",
+        "FileChangeRequestApprovalResponse.json",
+    ),
+    ("execCommandApproval", "ExecCommandApprovalResponse.json"),
+    ("applyPatchApproval", "ApplyPatchApprovalResponse.json"),
+];
+
+/// The variants a response schema uses to spell "the same answer for the rest
+/// of the session" — the modern `acceptForSession` decision and the legacy
+/// `approved_for_session` one.
+const SESSION_DECISION_VARIANTS: &[&str] = &["acceptForSession", "approved_for_session"];
+
 /// One server's own method lists, in the three directions the protocol
-/// defines.
+/// defines, plus the approval methods whose response advertises a session-wide
+/// decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Surface {
     pub(crate) client_requests: BTreeSet<String>,
     pub(crate) notifications: BTreeSet<String>,
     pub(crate) server_requests: BTreeSet<String>,
+    /// Methods whose generated response schema advertises a session-scoped
+    /// decision (ticket #882). An empty set offers no session control at all,
+    /// so a surface that could not be read is fail-safe rather than permissive.
+    pub(crate) session_decisions: BTreeSet<String>,
 }
 
 impl Surface {
     /// The pinned `0.163.0` surface, parsed from the checked-in reference.
+    ///
+    /// The session-decision set is the four methods the pinned response
+    /// schemas advertise, recorded from
+    /// [`SESSION_DECISION_RESPONSES`] rather than parsed: the reference
+    /// document lists method names, not response variants.
     pub(crate) fn pinned() -> Self {
         let mut surface = Self::default();
         let mut section = None;
@@ -155,16 +195,26 @@ impl Surface {
                 }
             }
         }
+        for (method, _) in SESSION_DECISION_RESPONSES {
+            surface.session_decisions.insert((*method).to_string());
+        }
         surface
     }
 
-    /// Read the three lists out of a `generate-json-schema` directory.
+    /// Read the three lists — and the approval response variants — out of a
+    /// `generate-json-schema` directory.
     pub(crate) fn from_generated_dir(directory: &Path) -> Result<Self> {
         Ok(Self {
             client_requests: methods_in(&directory.join("ClientRequest.json"))?,
             notifications: methods_in(&directory.join("ServerNotification.json"))?,
             server_requests: methods_in(&directory.join("ServerRequest.json"))?,
+            session_decisions: session_decisions_in(directory),
         })
+    }
+
+    /// The approval methods this server advertises a session decision for.
+    pub(crate) fn session_decisions(&self) -> BTreeSet<String> {
+        self.session_decisions.clone()
     }
 
     /// The required methods this surface lacks, in the constants' order (so a
@@ -376,6 +426,50 @@ fn bullet_method(line: &str) -> Option<&str> {
     line.strip_prefix("- `")?.split('`').next()
 }
 
+/// The approval methods a generated directory advertises a session decision
+/// for, read from the four response schemas.
+///
+/// Fail-safe by construction: a file the directory does not carry (an older
+/// server, or one whose generator was restricted) advertises nothing, so the
+/// card offers no session control rather than a decision the server would
+/// refuse; an unparseable file is treated the same way. The check is the
+/// variant's presence as a **schema value** (`enum` member or `const`), not a
+/// substring of the document, so prose in a description cannot advertise a
+/// decision the schema does not define.
+fn session_decisions_in(directory: &Path) -> BTreeSet<String> {
+    let mut methods = BTreeSet::new();
+    for (method, file) in SESSION_DECISION_RESPONSES {
+        let Ok(raw) = std::fs::read_to_string(directory.join(file)) else {
+            continue;
+        };
+        let Ok(response) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        if carries_session_variant(&response) {
+            methods.insert((*method).to_string());
+        }
+    }
+    methods
+}
+
+/// Whether a schema value declares a session-decision variant as one of its
+/// legal values. Every `enum` member and `const` is inspected, at any depth:
+/// the generated shape nests the decision under `properties`/`oneOf`.
+fn carries_session_variant(value: &Value) -> bool {
+    let is_variant = |name: &str| SESSION_DECISION_VARIANTS.contains(&name);
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| match key.as_str() {
+            "enum" => value
+                .as_array()
+                .is_some_and(|values| values.iter().filter_map(Value::as_str).any(is_variant)),
+            "const" => value.as_str().is_some_and(is_variant),
+            _ => carries_session_variant(value),
+        }),
+        Value::Array(items) => items.iter().any(carries_session_variant),
+        _ => false,
+    }
+}
+
 fn methods_in(path: &Path) -> Result<BTreeSet<String>> {
     let raw = std::fs::read_to_string(path)
         .map_err(|error| CodexError::Probe(format!("read {}: {error}", path.display())))?;
@@ -463,6 +557,22 @@ pub(crate) fn write_generated_surface(
     Ok(())
 }
 
+/// Write one approval response schema with `decisions` as its decision enum —
+/// the shape a response-variant probe reads. Tests use it to model a newer
+/// daemon that kept a method but dropped `acceptForSession`.
+#[cfg(test)]
+pub(crate) fn write_response_schema(directory: &Path, file: &str, decisions: &[&str]) {
+    std::fs::write(
+        directory.join(file),
+        serde_json::json!({
+            "type": "object",
+            "properties": { "decision": { "type": "string", "enum": decisions } },
+        })
+        .to_string(),
+    )
+    .expect("write response schema fixture");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,6 +603,135 @@ mod tests {
         assert!(surface.client_requests.contains("beta"));
         assert!(surface.notifications.contains("gamma"));
         assert!(surface.server_requests.contains("delta"));
+        assert!(
+            surface.session_decisions().is_empty(),
+            "a directory with no response schemas offers no session control"
+        );
+    }
+
+    /// The pinned surface's session decisions are the four approval methods the
+    /// `0.163.0` response schemas advertise; the permissions grant is not one.
+    #[test]
+    fn the_pinned_surface_offers_the_four_session_decisions() {
+        let decisions = Surface::pinned().session_decisions();
+        assert_eq!(
+            decisions,
+            [
+                "applyPatchApproval",
+                "execCommandApproval",
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+        );
+    }
+
+    /// The set comes from the generated response schemas, not the method list:
+    /// a schema that dropped `acceptForSession` advertises no session decision
+    /// even though the method itself is still served.
+    #[test]
+    fn a_generated_directory_reads_the_session_decisions_from_its_responses() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_generated_surface(
+            directory.path(),
+            &["m"],
+            &["n"],
+            &[
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+                "execCommandApproval",
+                "applyPatchApproval",
+            ],
+        )
+        .expect("write schema fixture");
+        write_response_schema(
+            directory.path(),
+            "CommandExecutionRequestApprovalResponse.json",
+            &["accept", "acceptForSession", "decline"],
+        );
+        write_response_schema(
+            directory.path(),
+            "FileChangeRequestApprovalResponse.json",
+            &["accept", "acceptForSession", "decline"],
+        );
+        write_response_schema(
+            directory.path(),
+            "ExecCommandApprovalResponse.json",
+            &["approved", "approved_for_session", "denied"],
+        );
+        write_response_schema(
+            directory.path(),
+            "ApplyPatchApprovalResponse.json",
+            &["approved", "approved_for_session", "denied"],
+        );
+
+        let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
+        assert_eq!(
+            surface.session_decisions(),
+            Surface::pinned().session_decisions(),
+            "a modern directory carries the same four methods"
+        );
+
+        // A newer daemon that kept the method but removed the variant: the
+        // session decision is not offered, and the other three are untouched.
+        write_response_schema(
+            directory.path(),
+            "CommandExecutionRequestApprovalResponse.json",
+            &["accept", "decline"],
+        );
+        let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
+        let decisions = surface.session_decisions();
+        assert!(
+            !decisions.contains("item/commandExecution/requestApproval"),
+            "a dropped variant must not be offered: {decisions:?}"
+        );
+        assert_eq!(decisions.len(), 3);
+        assert!(decisions.contains("item/fileChange/requestApproval"));
+        assert!(decisions.contains("execCommandApproval"));
+        assert!(decisions.contains("applyPatchApproval"));
+
+        // The same method staying in the request list proves the set is read
+        // from the response, not inferred from the method's presence.
+        assert!(
+            surface
+                .server_requests
+                .contains("item/commandExecution/requestApproval")
+        );
+    }
+
+    /// A schema that only *mentions* the variant — in prose — advertises
+    /// nothing: the decision has to be one of its legal values.
+    #[test]
+    fn prose_mentioning_the_variant_is_not_an_advertisement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_generated_surface(
+            directory.path(),
+            &["m"],
+            &["n"],
+            &["item/commandExecution/requestApproval"],
+        )
+        .expect("write schema fixture");
+        std::fs::write(
+            directory
+                .path()
+                .join("CommandExecutionRequestApprovalResponse.json"),
+            serde_json::json!({
+                "type": "object",
+                "description": "acceptForSession is never offered by this build",
+                "properties": { "decision": { "type": "string", "enum": ["accept", "decline"] } },
+            })
+            .to_string(),
+        )
+        .expect("write response schema");
+
+        let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
+        assert!(
+            surface.session_decisions().is_empty(),
+            "prose is not a legal value: {:?}",
+            surface.session_decisions()
+        );
     }
 
     #[test]

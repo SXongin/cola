@@ -324,8 +324,10 @@ impl CodexClient {
 
         // Record server-initiated requests before any subscription can produce
         // one: an approval is answered on this connection's inbound stream, and
-        // a missed request would leave the server waiting.
-        let approvals = Arc::new(super::approvals::Approvals::default());
+        // a missed request would leave the server waiting. The session-decision
+        // set rides with it: the card offers "always" only where this server's
+        // own response schemas declare the variant (ticket #882).
+        let approvals = Arc::new(super::approvals::Approvals::new(surface.session_decisions()));
         approvals.watch(&connection, &projections);
 
         Ok(Self {
@@ -651,6 +653,129 @@ mod tests {
                 assert!(missing.contains("turn/steer"), "{missing}");
             }
             other => panic!("expected a missing contract, got {other}"),
+        }
+    }
+
+    /// Ticket #882 acceptance: a `0.164.0` daemon's generated surface (106
+    /// client methods) carries the session-decision set its own response
+    /// schemas declare, so the approval card offers the session control. The
+    /// same method with the variant removed from its response schema hides it —
+    /// the set is the server's answer, never a fixed table.
+    #[tokio::test]
+    async fn a_generated_surface_decides_the_session_control_its_responses_declare() {
+        use crate::codex::schema::{write_generated_surface, write_response_schema};
+
+        let pinned = Surface::pinned();
+        let mut client_methods: Vec<&str> = pinned.client_requests.iter().map(String::as_str).collect();
+        client_methods.push("feedback/save");
+        client_methods.sort_unstable();
+        let notifications: Vec<&str> = pinned.notifications.iter().map(String::as_str).collect();
+        let server_requests: Vec<&str> = pinned.server_requests.iter().map(String::as_str).collect();
+        let modern_files = [
+            (
+                "CommandExecutionRequestApprovalResponse.json",
+                &["accept", "acceptForSession", "decline"][..],
+            ),
+            (
+                "FileChangeRequestApprovalResponse.json",
+                &["accept", "acceptForSession", "decline"][..],
+            ),
+            (
+                "ExecCommandApprovalResponse.json",
+                &["approved", "approved_for_session", "denied"][..],
+            ),
+            (
+                "ApplyPatchApprovalResponse.json",
+                &["approved", "approved_for_session", "denied"][..],
+            ),
+        ];
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        write_generated_surface(
+            directory.path(),
+            &client_methods,
+            &notifications,
+            &server_requests,
+        )
+        .expect("write schema fixture");
+        for (file, decisions) in modern_files {
+            write_response_schema(directory.path(), file, decisions);
+        }
+        let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
+        assert_eq!(surface.counts(), (106, 85, 10), "the 0.164.0 method lists");
+        assert_eq!(
+            surface.session_decisions(),
+            Surface::pinned().session_decisions(),
+            "the modern response schemas advertise the same four methods"
+        );
+
+        let approval = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": "ls",
+            "cwd": "/work",
+        });
+        let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
+        let client = CodexClient::connect(&CodexOptions::new(endpoint), &FixedProbe(surface))
+            .await
+            .expect("a verified 0.164.0 surface attaches");
+        assert_eq!(client.server_info().surface_counts, (106, 85, 10));
+        _server.request_to_all("item/commandExecution/requestApproval", approval.clone());
+        let permission = recorded_permission(&client, "/work").await;
+        assert!(
+            permission.always_supported,
+            "the card offers the session control the response schema declares"
+        );
+
+        // The hypothetical newer daemon: the method is still served, but its
+        // response schema no longer carries the variant.
+        write_response_schema(
+            directory.path(),
+            "CommandExecutionRequestApprovalResponse.json",
+            &["accept", "decline"],
+        );
+        let narrowed = Surface::from_generated_dir(directory.path()).expect("generated surface");
+        assert!(
+            !narrowed
+                .session_decisions()
+                .contains("item/commandExecution/requestApproval")
+        );
+        let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
+        let client = CodexClient::connect(&CodexOptions::new(endpoint), &FixedProbe(narrowed))
+            .await
+            .expect("the narrowed surface still attaches");
+        _server.request_to_all("item/commandExecution/requestApproval", approval);
+        let permission = recorded_permission(&client, "/work").await;
+        assert!(
+            !permission.always_supported,
+            "no session control is offered for a variant the server dropped"
+        );
+    }
+
+    /// Wait for a scripted server approval to be recorded and return it.
+    async fn recorded_permission(
+        client: &CodexClient,
+        directory: &str,
+    ) -> crate::backend::types::PermissionRequest {
+        use crate::backend::Backend;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(permission) = client
+                .list_permissions(Some(directory))
+                .await
+                .expect("the pending list")
+                .into_iter()
+                .next()
+            {
+                return permission;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the approval was never recorded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 
