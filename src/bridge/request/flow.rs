@@ -1158,9 +1158,19 @@ impl RequestFlow {
         // ADR-0028: a claimed request is hosted by a snapshot card — already
         // surfaced, never a standalone card, never re-inlined.
         if handles.requests.snapshot_claims.lock().await.contains(req.id()) {
+            tracing::debug!(
+                "{} {}: already hosted by a snapshot claim",
+                self.kind.label(),
+                req.id()
+            );
             return false;
         }
         if seen.contains(req.id()) {
+            tracing::debug!(
+                "{} {}: already surfaced; re-hosting on the current card",
+                self.kind.label(),
+                req.id()
+            );
             // Already surfaced: if it outlived the turn that hosted it,
             // re-host it onto the session's current card so the live controls
             // follow the newest card (ADR-0038, rule 1).
