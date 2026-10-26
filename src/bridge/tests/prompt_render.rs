@@ -2889,3 +2889,119 @@ async fn a_later_turn_does_not_inherit_an_orphans_failure() {
         "the later Turn must finalize Done: {text}"
     );
 }
+
+/// A Loading reply Feishu refuses as card content (`230099`) must not kill the
+/// prompt (live 2026-10-26: after a `/restart` the next prompt failed here and
+/// the bot went silent). A typed content rejection created no message, so the
+/// minimal card is a safe second create — and the turn reaches its Done card.
+#[tokio::test]
+async fn a_rejected_loading_card_degrades_and_the_turn_still_runs() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    platform
+        .fail_reply_card_content_count
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let replies: Vec<serde_json::Value> = platform
+        .calls
+        .lock()
+        .await
+        .clone()
+        .into_iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies.len(),
+        2,
+        "the refused create degrades exactly once: {replies:?}"
+    );
+    assert!(
+        replies[0].get("header").is_some(),
+        "the primary is the header-only Loading card: {}",
+        replies[0]
+    );
+    assert!(
+        replies[1].get("header").is_none(),
+        "the fallback drops the refused header shape: {}",
+        replies[1]
+    );
+    assert_eq!(
+        replies[1]["schema"], "2.0",
+        "the fallback stays schema 2.0 so the streaming PATCHes keep landing: {}",
+        replies[1]
+    );
+
+    wait_for_card_update(&platform, "the Done card", CardUpdates::Latest, |card| {
+        card_header(card) == "✅ 完成"
+    })
+    .await;
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        card_text(&card).contains("当前目录有 src/ 和 Cargo.toml。"),
+        "the answer renders on the degraded card: {card}"
+    );
+}
+
+/// If even the minimal card is refused, the message must not be answered with
+/// silence: a plain text notice says the prompt was not processed.
+#[tokio::test]
+async fn a_loading_card_that_cannot_be_created_at_all_says_so_in_text() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    platform
+        .fail_reply_card_content_count
+        .store(2, std::sync::atomic::Ordering::SeqCst);
+    let app = Arc::new(App::new(cfg, backend, platform.clone()).unwrap());
+
+    app.handle_message(incoming(
+        "msg_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    let calls = platform.calls.lock().await.clone();
+    let replies = calls
+        .iter()
+        .filter(|c| matches!(c, PlatformCall::ReplyCard { .. }))
+        .count();
+    assert_eq!(replies, 2, "primary plus one degraded attempt: {calls:?}");
+    let notices: Vec<String> = calls
+        .iter()
+        .filter_map(|c| match c {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.contains(&crate::bridge::turn::LOADING_CARD_FAILED_NOTICE.to_string()),
+        "the user must be told the message was not processed: {calls:?}"
+    );
+    assert!(
+        platform.updated_cards().await.is_empty(),
+        "no turn ran, so no card was updated"
+    );
+}

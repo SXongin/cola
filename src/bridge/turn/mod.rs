@@ -601,7 +601,7 @@ impl Turn {
         // stays below the new one, marked `Retried` by the retry handler before
         // this submit (spec #391). The reply target is the failed turn's own
         // user message, so the new card lands directly below the failure.
-        let new_card_id = match handles.cards.feishu.reply_card(&message_id, &loading).await {
+        let new_card_id = match Self::reply_loading_card(handles, &message_id, &loading, &subtitle).await {
             Ok(id) => id,
             Err(e) => {
                 // The turn never started: drop the just-inserted card
@@ -609,6 +609,15 @@ impl Turn {
                 // session does not look busy until a restart.
                 handles.cards.cards.lock().await.remove(&session_id);
                 release_inflight(handles, &session_id).await;
+                // No card exists to carry the failure, so say it in plain text:
+                // a refused create must never leave the message unanswered
+                // (live 2026-10-26: `230099` on the loading card and the bot
+                // went silent with the prompt unprocessed).
+                let _ = handles
+                    .cards
+                    .feishu
+                    .reply_text(&message_id, LOADING_CARD_FAILED_NOTICE)
+                    .await;
                 return Err(e);
             }
         };
@@ -2021,6 +2030,13 @@ const MERGE_OPENING: &str = "📨 已收到，将并入当前运行";
 /// the run merging the message, or in the Unreceived ending.
 const RECEIVE_HINT: &str = "⏳ 等待当前运行接收…";
 
+/// The plain-text notice when NO reply card can be created for a prompt: the
+/// message was not processed (the Turn never started), and the user must be
+/// able to tell that from silence. A reply card Feishu refuses as card content
+/// (`230099`) is logged, degraded once — but if even the minimal card is
+/// refused, this text is the last thing that can reach the chat.
+pub(crate) const LOADING_CARD_FAILED_NOTICE: &str = "⚠️ 无法创建回复卡片，这条消息没有被处理，请稍后重发。";
+
 impl SplitKind {
     /// The one receipt line this cause's continuation carries: every queued
     /// split gets exactly one, in arrival order.
@@ -3189,6 +3205,75 @@ impl Turn {
             FlushOutcome::Refused => YieldedUpdate::Refused,
             FlushOutcome::Unwritten => YieldedUpdate::Unchanged,
         }
+    }
+}
+
+/// The Loading card's create: the one write on the prompt path that leaves a
+/// message unanswered when Feishu refuses it, so it owns its own degradation.
+impl Turn {
+    /// Reply the Loading card for a fresh attempt, degrading once when Feishu
+    /// refuses it as card content (`230099`).
+    ///
+    /// The typed rejection means the platform refused the JSON before creating
+    /// anything — there is no message to double-post, which is exactly why
+    /// ADR-0067 forbids a blanket retry of creates — so a DIFFERENT, minimal
+    /// card is safe to send. The refused payload is logged (truncated): the card
+    /// JSON is the only evidence of which element the platform refused, and the
+    /// live 2026-10-26 failure logged only the umbrella (`200800 create
+    /// universal card fail`).
+    async fn reply_loading_card(
+        handles: &TurnHandles,
+        message_id: &str,
+        primary: &serde_json::Value,
+        subtitle: &str,
+    ) -> crate::error::Result<String> {
+        match handles.cards.feishu.reply_card(message_id, primary).await {
+            Ok(id) => Ok(id),
+            Err(crate::error::BridgeError::CardContentRejected { code, detail }) => {
+                tracing::warn!(
+                    "loading card rejected ({code}): {detail}; retrying with the minimal card: {}",
+                    rejected_card_json(primary)
+                );
+                let fallback = loading_fallback_card(subtitle);
+                match handles.cards.feishu.reply_card(message_id, &fallback).await {
+                    Ok(id) => Ok(id),
+                    Err(e) => {
+                        tracing::warn!("loading card fallback rejected too: {e}");
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The minimal schema-2.0 card a rejected Loading card degrades to: no header,
+/// one markdown element — it differs from the refused shape in every part that
+/// could be at fault. Staying in schema 2.0 keeps every later streaming PATCH —
+/// which the accumulator builds as 2.0 — updating this message normally.
+fn loading_fallback_card(subtitle: &str) -> serde_json::Value {
+    let mut content = String::from("⏳ 正在处理，请稍候…");
+    if !subtitle.is_empty() {
+        content.push_str(&format!(
+            "\n\n{}",
+            crate::feishu::card::sanitize::sanitize_markdown(subtitle)
+        ));
+    }
+    serde_json::json!({
+        "schema": "2.0",
+        "config": { "wide_screen_mode": true },
+        "body": { "elements": [{ "tag": "markdown", "content": content }] }
+    })
+}
+
+/// A bounded rendering of a refused card for the log — enough to see its shape
+/// and the offending element, never a card's worth of text.
+fn rejected_card_json(card: &serde_json::Value) -> String {
+    let json = card.to_string();
+    match json.char_indices().nth(2000) {
+        Some((idx, _)) => format!("{}… ({} chars)", &json[..idx], json.chars().count()),
+        None => json,
     }
 }
 
