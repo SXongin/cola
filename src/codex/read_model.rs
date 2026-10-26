@@ -769,9 +769,6 @@ impl ThreadProjection {
     }
 
     fn turn_error(&mut self, notification: ErrorNotification, seq: u64) {
-        let Some(turn_id) = notification.turn_id else {
-            return;
-        };
         // A retrying error leaves the turn live (the server schedules another
         // attempt). Its text must NOT become the turn's failure while retries
         // continue — ADR-0090's credential error is exactly this shape — so
@@ -779,9 +776,24 @@ impl ThreadProjection {
         // ending even when no `turn/completed` follows: settle it here so the
         // card can take its error text instead of hanging on a run that has
         // already failed.
+        //
+        // Checked before the turn is resolved: a retry settles nothing, and
+        // that is equally true of the thread-scoped shape below.
         if notification.will_retry {
             return;
         }
+        // A terminal error the server did not scope to a turn belongs to the
+        // turn this projection has live — that is the run it abandoned, and
+        // settling it is what stops the card hanging on it. With no live turn
+        // there is no run to end: a thread-level error settles no turn, and a
+        // phantom one must never be invented for it.
+        let turn_id = match notification.turn_id {
+            Some(turn_id) => turn_id,
+            None => match self.live_turn.clone() {
+                Some(turn_id) => turn_id,
+                None => return,
+            },
+        };
         let message = notification.error.message;
         if !message.is_empty() {
             self.ensure_turn(&turn_id).error = Some(message);
@@ -3175,6 +3187,158 @@ mod tests {
                 crate::backend::TurnSettle::Failed(_)
             ),
             "the card must not take the retry's text as a terminal failure"
+        );
+    }
+
+    /// Ticket #880 re-review: an `error` notification mid-turn settles the card
+    /// even when the server scoped it to the thread rather than the turn. The
+    /// live run is the one it abandoned, so its text lands on that turn and the
+    /// projection stops reporting a live run instead of hanging on one.
+    #[test]
+    fn a_thread_scoped_terminal_error_settles_the_live_turn() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            TURN_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000_i64 }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_000_i64,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user",
+                    "content": [{ "type": "text", "text": "go" }]
+                }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_001_000_i64,
+                "item": { "type": "agentMessage", "id": "item-agent", "text": "working" }
+            }),
+        );
+        assert!(projection.is_live());
+
+        projection.apply(
+            ERROR_NOTIFICATION,
+            &json!({
+                "threadId": "thread-1",
+                "error": { "message": "401 unauthorized" },
+                "willRetry": false
+            }),
+        );
+
+        assert_eq!(
+            projection.live_turn(),
+            None,
+            "the abandoned run is no longer live"
+        );
+        assert!(!projection.is_live());
+        assert_eq!(projection.observed_status(), Some(ThreadStatus::Idle));
+        let transcript = projection.transcript();
+        let anchor = transcript
+            .newest_user()
+            .and_then(|user| user.anchor())
+            .expect("turn anchor");
+        let turn = transcript.turn_for_user(&anchor);
+        assert_eq!(turn.error.as_deref(), Some("401 unauthorized"));
+        assert!(turn.complete, "the failure is a terminal ending");
+        assert_eq!(
+            transcript.settle(Some(&anchor)),
+            crate::backend::TurnSettle::Failed("401 unauthorized".to_string())
+        );
+
+        // A second read is the same settled turn, not a re-opened one.
+        let second = projection.transcript();
+        assert!(!projection.is_live());
+        assert_eq!(
+            second.turn_for_user(&anchor).error.as_deref(),
+            Some("401 unauthorized")
+        );
+    }
+
+    /// The retrying shape of a thread-scoped error is not an ending either:
+    /// the check comes before the turn is resolved, so the live turn stands.
+    #[test]
+    fn a_thread_scoped_retrying_error_keeps_the_turn_live() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            TURN_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turn": { "id": "turn-1", "status": "inProgress", "startedAt": 1_700_000_000_i64 }
+            }),
+        );
+        projection.apply(
+            ITEM_STARTED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_000_i64,
+                "item": {
+                    "type": "userMessage",
+                    "id": "item-user",
+                    "content": [{ "type": "text", "text": "go" }]
+                }
+            }),
+        );
+        projection.apply(
+            ERROR_NOTIFICATION,
+            &json!({
+                "threadId": "thread-1",
+                "error": { "message": "stream disconnected" },
+                "willRetry": true
+            }),
+        );
+
+        assert_eq!(projection.live_turn(), Some("turn-1"));
+        assert!(projection.is_live(), "a retry keeps the run live");
+        assert_eq!(projection.observed_status(), Some(ThreadStatus::Active));
+        let transcript = projection.transcript();
+        let anchor = transcript
+            .newest_user()
+            .and_then(|user| user.anchor())
+            .expect("the turn anchor");
+        assert_eq!(
+            transcript.turn_for_user(&anchor).error,
+            None,
+            "a retrying error is not the turn's failure"
+        );
+    }
+
+    /// A terminal error with no turn at all is the thread's, not a run's: it
+    /// settles no turn and invents no phantom one for the next read.
+    #[test]
+    fn a_thread_level_terminal_error_without_a_live_turn_invents_no_turn() {
+        let mut projection = ThreadProjection::new("thread-1");
+        projection.apply(
+            ERROR_NOTIFICATION,
+            &json!({
+                "threadId": "thread-1",
+                "error": { "message": "no credential" },
+                "willRetry": false
+            }),
+        );
+
+        assert!(!projection.is_live());
+        assert_eq!(projection.live_turn(), None);
+        let transcript = projection.transcript();
+        assert!(
+            transcript.messages.is_empty(),
+            "a thread-level error is not a turn's failure"
+        );
+        assert!(
+            projection.diff_for(None).is_none(),
+            "no phantom turn was created for the thread-level error"
         );
     }
 
