@@ -6,6 +6,7 @@ use crate::backend::{
 };
 use crate::bridge::chain::AdoptedFollow;
 use crate::bridge::test_support::*;
+use crate::bridge::turn::ExternalCardLead;
 
 /// A user message's typed view; the Session Transcript's newest-user projection
 /// decides the external message from it.
@@ -2023,7 +2024,7 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
         "sub",
         "/tmp/ext",
         None,
-        Some("👤 新消息"),
+        Some(ExternalCardLead::Static("👤 新消息")),
     )
     .await;
     {
@@ -2631,6 +2632,122 @@ async fn external_reply_keeps_the_user_message_above_it() {
         "the user's message must stay above the streamed reply: {}",
         card
     );
+    assert_user_block(&card, user_message, "OpenChamber 里发的消息", reply);
+}
+
+/// Assert timeline element `user` is the External Message's own quoted user
+/// block — marked 👤, wholly quoted, and holding none of the reply — and that
+/// the reply element `reply` does not carry the user's text back. The live
+/// 2026-10-26 defect made the two indistinguishable: the preview and the
+/// answer's first text were consecutive plain-text entries, which the card
+/// merges into ONE markdown element.
+fn assert_user_block(card: &serde_json::Value, user: usize, message: &str, reply: usize) {
+    let elements = card["body"]["elements"].as_array().expect("elements");
+    assert_ne!(
+        user, reply,
+        "the External Message and the reply must be separate elements: {card}"
+    );
+    let block = elements[user]["content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the user message element carries no markdown: {card}"));
+    assert!(
+        block.contains("👤") && block.contains("用户"),
+        "the External Message must be marked as the user's own: {block}"
+    );
+    assert!(
+        block.lines().all(|line| line.starts_with('>')),
+        "the External Message must render as one quoted block: {block}"
+    );
+    assert!(
+        block.contains(message),
+        "the user block carries the message: {block}"
+    );
+    let reply_text = elements[reply]["content"].as_str().unwrap_or_default();
+    assert!(
+        !reply_text.contains(message),
+        "the reply must not absorb the user's message: {reply_text}"
+    );
+}
+
+/// The same distinction WITHOUT a reasoning panel between the two: the External
+/// Message and the answer's first text are consecutive timeline entries, which
+/// is exactly the shape that merged them into one paragraph in the live test
+/// (the TUI's "这是个什么项目？" read as the opening of the answer).
+#[tokio::test]
+async fn external_reply_renders_its_user_message_as_a_separate_block() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut mock = MockBackend::new(realistic_parts());
+    mock.external_message("这是个什么项目？");
+    mock.external_message_created_at(now - 30_000);
+    // The answer opens with a text part — no reasoning before it — so a plain
+    // text preview would be merged straight into the reply's text run.
+    let reply_ready = mock.external_reply(vec![
+        Part::Text(crate::backend::TextPart {
+            text: "这是一个把 OpenCode 接进飞书的桥接项目。".into(),
+            started_at: Some(now - 18_000),
+        }),
+        Part::StepFinish(StepFinish {
+            reason: FinishReason::Stop,
+        }),
+    ]);
+    let (app, platform) = build_app(cfg, mock).await;
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: crate::config::ThreadKey::new("oc_group_1".into(), "oc_group_1".into()),
+            session_id: "ses_ext".into(),
+            directory: dir.path().to_string_lossy().to_string(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+    app.external
+        .last_user_msg_epoch
+        .lock()
+        .await
+        .insert("ses_ext".into(), now - 60_000);
+    app.external
+        .poll_interval_ms
+        .store(50, std::sync::atomic::Ordering::Relaxed);
+    tokio::spawn({
+        let app = app.clone();
+        async move {
+            let _ = app.external.poll_loop(&app.flow_handles()).await;
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    reply_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+
+    let calls = platform.calls.lock().await.clone();
+    let card = calls
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            PlatformCall::UpdateMessage { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the notification card must be updated in place");
+    let elements = card["body"]["elements"].as_array().expect("elements");
+    let index_of = |needle: &str| {
+        elements
+            .iter()
+            .position(|e| e["content"].as_str().is_some_and(|c| c.contains(needle)))
+            .unwrap_or_else(|| panic!("{} not on the card: {}", needle, card))
+    };
+    let user = index_of("这是个什么项目？");
+    let reply = index_of("这是一个把 OpenCode 接进飞书的桥接项目。");
+    assert!(user < reply, "the message heads the card: {card}");
+    assert_user_block(&card, user, "这是个什么项目？", reply);
 }
 
 /// ADR-0041 / ADR-0017 parity: while a Pending Session supersedes the active

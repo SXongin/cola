@@ -218,6 +218,20 @@ pub(crate) fn move_line(directory: &str) -> String {
     format!("**会话已迁移**: `{directory}`")
 }
 
+/// The External Message's user block on a live card (ADR-0028): the text
+/// another client — the TUI, another IDE — sent into the Session, as a Feishu
+/// blockquote that names the role. The blockquote is what makes it read as the
+/// user's message rather than the first paragraph of the agent's answer; every
+/// line is quoted, so a multi-line message stays one visual block.
+pub(crate) fn user_message_block(text: &str) -> String {
+    let quoted = text
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("> 👤 **用户**\n{quoted}")
+}
+
 /// How much text ONE card carries before it is finalized and the rest continues
 /// on the next card. Kept below Feishu's card limits so a card full of text
 /// never overflows; long answers flow across continuation cards instead of a

@@ -228,6 +228,29 @@ async fn a_turn_started_on_another_connection_renders_on_the_feishu_card() {
         "the user's prompt renders: {card}"
     );
     assert!(text.contains("The fix"), "the answer renders: {card}");
+    // The TUI's message and the agent's answer must be DISTINGUISHABLE, not
+    // merely both present: the user's text is its own quoted user block, and
+    // the answer is a different element (live 2026-10-26: both read as one
+    // paragraph).
+    let elements = card["body"]["elements"].as_array().expect("elements");
+    let user = elements
+        .iter()
+        .position(|e| e["content"].as_str().is_some_and(|c| c.contains("Fix the build")))
+        .unwrap_or_else(|| panic!("the user block is missing: {card}"));
+    let answer = elements
+        .iter()
+        .position(|e| e["content"].as_str().is_some_and(|c| c.contains("The fix")))
+        .unwrap_or_else(|| panic!("the answer is missing: {card}"));
+    assert_ne!(
+        user, answer,
+        "the message and the answer must be separate elements: {card}"
+    );
+    assert!(user < answer, "the message heads the card: {card}");
+    let block = elements[user]["content"].as_str().unwrap();
+    assert!(
+        block.starts_with("> 👤") && block.lines().all(|line| line.starts_with('>')),
+        "the TUI's message renders as its own quoted user block: {block}"
+    );
 
     // The other face saw the same stream: the TUI's read is not a different
     // transcript. The subscriber runs on its own task, so await its read.
