@@ -6,8 +6,8 @@ use tracing::Instrument;
 use crate::backend::{FileContent, MessageRole, Part, SessionTranscript, TailEntry, TurnAnchor, TurnSettle};
 use crate::bridge::handles::{CardsHandle, FlowHandles, NoticeRules};
 use crate::bridge::turn::{
-    CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, SettleTiming, Turn,
-    WakeContinuation, YieldedUpdate,
+    CardClass, CardOwnership, ContinuationFacts, ContinuationLine, Disposition, ExternalCardLead,
+    SettleTiming, Turn, WakeContinuation, YieldedUpdate,
 };
 
 /// The external-message flow: watches for user messages that were NOT sent by
@@ -584,7 +584,10 @@ impl ExternalFlow {
         // place, so its preview would otherwise vanish when the reply renders.
         // Keyed just before the turn's anchor so the reply's parts — whose
         // server times are at or after it — always insert BELOW the preview.
-        let anchor_text = (!preview.is_empty()).then(|| format!("👤 {}", preview));
+        // It rides as a USER BLOCK, not plain text: the reply's own text run
+        // merges consecutive text, which made the TUI's message and the answer
+        // read as one paragraph (live 2026-10-26).
+        let lead = (!preview.is_empty()).then_some(ExternalCardLead::UserMessage(preview));
         // This render starts a NEW external run: a `/stop` from before it is
         // not this run's ending — the same rule a fresh Turn applies to the
         // sticky marker (ADR-0043). A stop landing after this point ends the
@@ -598,7 +601,7 @@ impl ExternalFlow {
             &subtitle,
             &session_dir,
             variant,
-            anchor_text.as_deref(),
+            lead,
         )
         .await;
         tracing::info!("external reply render armed for session {}", session_id);
@@ -807,7 +810,7 @@ impl ExternalFlow {
             "",
             &session_dir,
             variant,
-            Some(&static_text),
+            Some(ExternalCardLead::Static(&static_text)),
         )
         .await;
         // The adopt-time pending blocks ride as inline sections: the poll's

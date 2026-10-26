@@ -461,6 +461,14 @@ pub(super) enum TimelineKind {
     Text(String),
     Reasoning(String),
     Tool(String),
+    /// The External Message's own user block (ADR-0028): the text another
+    /// client — the TUI, another IDE — sent into the Session, rendered as a
+    /// blockquote that names the role. Keyed just before the Turn's anchor, so
+    /// it heads the card; a distinct kind (never a `Text` entry) is what keeps
+    /// it out of the reply's text run, which merges consecutive text chunks
+    /// into one element (live 2026-10-26: the TUI's message and the answer read
+    /// as one paragraph).
+    UserMessage(String),
     /// A resolved interaction block's Interaction Receipt (ADR-0038, rule 4):
     /// one markdown line keyed by the moment it was resolved, so it sits below
     /// everything that was on the card when the Host clicked and above
@@ -2651,6 +2659,18 @@ impl StreamAccumulator {
         self.insert_kind(key, None, TimelineKind::Receipt(text.to_string()));
     }
 
+    /// Place the External Message's own text (ADR-0028) on the timeline at
+    /// `at_ms` — normally just before the Turn's anchor, so it heads the card.
+    /// An empty message renders nothing. A distinct kind, so the reply's text
+    /// run can never absorb it (see [`TimelineKind::UserMessage`]).
+    pub(super) fn push_user_message(&mut self, at_ms: Option<i64>, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let key = at_ms.unwrap_or_else(|| self.next_order());
+        self.insert_kind(key, None, TimelineKind::UserMessage(text.to_string()));
+    }
+
     /// Place one Compaction row (ADR-0082) at `at_ms` — the catalogued fact's own
     /// server time (its MESSAGE's `time.created`; a part carries none) — keyed by
     /// the position it rendered from. A row this position already carries is
@@ -4377,6 +4397,13 @@ impl StreamAccumulator {
                 }
                 // A receipt is one small markdown line.
                 TimelineKind::Receipt(line) => (1, line.len() + 40, 0),
+                // The External Message's user block is one quoted markdown
+                // element (the preview is capped at 80 characters on the arm
+                // path, so it never chunks).
+                TimelineKind::UserMessage(text) => {
+                    let block = crate::feishu::card::user_message_block(text);
+                    (1, block.len() + 40, block.chars().count())
+                }
                 // A completion entry is one folded panel: its estimate is owned
                 // beside its render, like the ledger section's.
                 TimelineKind::LedgerEntry(entry, _) => {
@@ -4508,6 +4535,16 @@ impl StreamAccumulator {
                         pending.clear();
                     }
                     builder = builder.with_text(line);
+                }
+                // The External Message's own block (ADR-0028): its own element,
+                // never merged into the reply's text run, and quoted so the
+                // message reads as the user's — not as part of the answer.
+                TimelineKind::UserMessage(text) => {
+                    if !pending.is_empty() {
+                        builder = builder.with_text(&pending);
+                        pending.clear();
+                    }
+                    builder = builder.with_text(&crate::feishu::card::user_message_block(text));
                 }
                 // A completed Background Task's ledger entry (ADR-0060): one
                 // folded panel in the Wake's own position, its `entry_{seq}`

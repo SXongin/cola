@@ -12,7 +12,9 @@ mod wake;
 /// types (ADR-0059, ADR-0071): defined in [`wake`] and re-exported here so
 /// every external `turn::…` path — `bridge/external.rs`, `chain/reconcile.rs`,
 /// `turn/state.rs`'s card session — is unchanged by the module split.
-pub(crate) use wake::{ArmedTakeover, ContinuationFacts, ContinuationLine, ProjectedSlice, WakeContinuation};
+pub(crate) use wake::{
+    ArmedTakeover, ContinuationFacts, ContinuationLine, ExternalCardLead, ProjectedSlice, WakeContinuation,
+};
 
 /// `ProjectedCard` (spec #561) carried the `turn::ProjectedCard` path before the
 /// split. #617 requires external call paths to stay unchanged, so the path is

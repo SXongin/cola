@@ -18,6 +18,18 @@ use crate::bridge::turn::state::StreamAccumulator;
 
 use super::{Disposition, SettleTiming, Turn, WAKE_RECEIPT, ownership, render, settle, state};
 
+/// What an armed external card opens with, above the Turn's parts (ADR-0028).
+/// The two shapes are not interchangeable: the External Message is the user's
+/// own text and must read as a user block, while the snapshot's static prefix
+/// (its identity line plus the 最近对话 tail) is cola's own composition.
+pub(crate) enum ExternalCardLead<'a> {
+    /// The External Message the run answers: rendered as a distinct, quoted
+    /// user block ([`crate::feishu::card::user_message_block`]).
+    UserMessage(&'a str),
+    /// A static prefix the arm itself composed: plain card text.
+    Static(&'a str),
+}
+
 /// What Session Sync owes for one read (ADR-0059): the decision carries
 /// everything the caller needs to act on it, so the same lock acquisition
 /// that found the chain also says which handoff to use — nothing is
@@ -392,12 +404,12 @@ impl Turn {
     }
 
     /// Arm an external renderer's card: build the turn's accumulator, attach
-    /// the work context, push the anchor text (the message preview / snapshot
-    /// identity) just before the turn's server-time anchor so the reply's parts
-    /// always insert below it, and insert the card session the render loop
-    /// streams into. `anchor` is the external message's identity together with
-    /// its server time, one fact; `variant` is the session's `/think` override
-    /// captured at ARM time (ADR-0019).
+    /// the work context, push the lead (the External Message's user block, or a
+    /// snapshot's static identity text) just before the turn's server-time
+    /// anchor so the reply's parts always insert below it, and insert the card
+    /// session the render loop streams into. `anchor` is the external message's
+    /// identity together with its server time, one fact; `variant` is the
+    /// session's `/think` override captured at ARM time (ADR-0019).
     #[allow(clippy::too_many_arguments)] // the card's whole arming fixture
     pub(crate) async fn arm_external_render(
         cards: &CardsHandle,
@@ -407,7 +419,7 @@ impl Turn {
         subtitle: &str,
         session_dir: &str,
         variant: Option<String>,
-        anchor_text: Option<&str>,
+        lead: Option<ExternalCardLead<'_>>,
     ) {
         let mut acc = state::StreamAccumulator::new(subtitle);
         // The external message's anchor — identity plus server time — is the
@@ -419,8 +431,16 @@ impl Turn {
         acc.set_reply_target(Some(card_id.to_string()));
         acc.attach_work_context(session_dir).await;
         acc.set_variant(variant);
-        if let Some(text) = anchor_text.filter(|text| !text.is_empty()) {
-            acc.push_text_at(Some(anchor.created_ms - 1), text);
+        if let Some(lead) = lead {
+            match lead {
+                ExternalCardLead::UserMessage(text) => {
+                    acc.push_user_message(Some(anchor.created_ms - 1), text)
+                }
+                ExternalCardLead::Static(text) if !text.is_empty() => {
+                    acc.push_text_at(Some(anchor.created_ms - 1), text)
+                }
+                ExternalCardLead::Static(_) => {}
+            }
         }
         {
             // The durable seed and the insert share ONE cards-map critical
