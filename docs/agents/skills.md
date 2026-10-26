@@ -13,6 +13,17 @@ Both `.opencode/skill/<id>/SKILL.md` and `.agents/skills/<id>/SKILL.md` are live
 - **`.opencode/skill/`** — the skill drives OpenCode machinery: it dispatches sub-agents (`implementer`, `merger`, `code-reviewer`) or leans on OpenCode config (`subagent` denials, `disable-model-invocation`, the skill tool). Every skill here — `foreman`, `adversarial-review`, `code-review`, `implement-spec`, `upgrade-skills` — is this case: the sub-agent types they dispatch exist only in `.opencode/agent/`.
 - **`.agents/skills/`** — the skill is instructions any agent could follow, with no OpenCode coupling; put it there so another tool (Claude Code, Codex) can share it. Note the two traps in that path: it reads **only `skills/`** (plural — `.agents/skill/` silently loads nothing), and `.opencode` outranks it, so a same-id `.opencode/skill/` silently shadows it. Sub-agents are OpenCode-only: `.agents/agent/` is not read at all.
 
+## Codex counterparts
+
+Codex reads project skills from `.codex/skills/` and `.agents/skills/`, and project sub-agents from `.codex/agents/` (personal ones from `~/.codex/agents/`). Cola keeps `.opencode/agent/` and `.opencode/skill/` as the OpenCode sources; the `cola-*` adapters under `.codex/skills/` translate those workflows to Codex sub-agents and invocation. They sit in the Codex-only root deliberately: OpenCode also loads `.agents/skills/`, so adapters there would add five near-duplicate entries (`cola-code-review` beside `code-review`) to the `#<id>` tokens and the `/skill` picker.
+
+In Codex, invoke an adapter with `$cola-code-review`, `$cola-adversarial-review`, `$cola-foreman`, `$cola-implement-spec`, or `$cola-upgrade-skills`. Feishu's `#<id>` and `/skill` never see these files.
+
+Two traps, both verified against Codex 0.164:
+
+- `.codex/agents/` and `.codex/config.toml` are read when the app-server daemon starts, so editing either needs `codex app-server daemon restart`; skill files are read live. Agents added after the daemon started stay invisible — `spawn_agent` knows only the built-ins.
+- A project `.codex/config.toml` applies only to a project Codex trusts: without `[projects."<path>"] trust_level = "trusted"` in `~/.codex/config.toml` the same file is ignored (a `sandbox_mode` set there changes nothing).
+
 ## Shadowing
 
 OpenCode loads `~/.agents/skills/<id>` (global, via the compatibility plugin) and every `.opencode/skill/<id>` (project) into one map keyed by **id**; the later write wins, and project sources load **after** global ones. So a repo-local `.opencode/skill/<id>/SKILL.md` **shadows** the global skill with the same id — `/code-review` and `/implement-spec` are cola's. (Verified live 2026-10-17: a repo-local `.opencode/skill/caveman/` replaced the global `caveman`, and a repo-local `.agents/skills/caveman/` did too; with both present `.opencode` won; removing them restored the global one.) The **id is the folder name**, so the folder must match the skill's `name`.
