@@ -81,6 +81,18 @@ and the map from the old numbers.
   payloads carry **no `id`** (it is a database column, not serialised), so dedupe
   text and reasoning on **content**: a poll-keyed dedupe never fires and the text
   doubles.
+- **`codex-request-ids`** — Codex's app-server numbers its **server-initiated**
+  requests per connection and restarts the counter on every reconnect, so the bare
+  wire id (`0`, `1`, …) does not identify a request across connections. The bridge
+  keys long-lived process state by the neutral request id — the double-click
+  guard, the poller's `seen` set, snapshot claims, persisted card surfaces — so a
+  reused id aliased a request an *earlier* connection had already answered: the
+  card's click was re-served as "already answered", and for an inline question
+  that replay was a completely empty ack (no card, no toast), so the option
+  button did nothing at all (#896; the sibling wedge of #893). The adapter mints
+  the neutral id with its connection's random tag (`n:0@3f9a1c2b`,
+  `Approvals::request_key`, `src/codex/approvals.rs`); never mint or hardcode a
+  bare id, and never make an "already handled" replay carry neither feedback.
 - **`attach`** — **One store, many clients**: cola attaches to whatever
   `opencode serve` is on the default store, whoever started it, and starts one of
   its own only when `start_server` allows it (`auto` by default, `never` for

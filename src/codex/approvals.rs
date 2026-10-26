@@ -6,6 +6,16 @@
 //! is a response frame on this connection — never a client call
 //! ([`RpcConnection::respond`]).
 //!
+//! The server numbers those ids per **connection** and restarts the counter on
+//! a reconnect, so the wire id alone does not identify a request across
+//! connections. The bridge, however, keys its long-lived records by the neutral
+//! id for the whole process — the double-click guard, the surfaced set, the
+//! snapshot claims — so this module mints each neutral id with its connection's
+//! own tag (`Approvals::request_key`). Without it, a request from a new
+//! connection could be mistaken for one an earlier connection already answered,
+//! and its click would be re-served as "already answered" instead of answered
+//! (issue #896; the same collision as #893).
+//!
 //! The spike (ADR-0090's amendment, question 1) established the peer property
 //! this module preserves: an approval is delivered to **every subscriber** of
 //! the thread, and an answer from the non-initiating client resolves it on all
@@ -129,6 +139,17 @@ impl Pending {
 /// its clones share it, exactly like the read-model cache.
 pub(crate) struct Approvals {
     pending: Mutex<HashMap<String, Pending>>,
+    /// This connection's namespace for the neutral request ids. The server
+    /// numbers its JSON-RPC requests per **connection** and restarts the
+    /// counter, so the wire id alone does not identify a request across a
+    /// reconnect. The bridge keys several long-lived records by the neutral id
+    /// — the double-click guard, the surfaced set, snapshot claims — for the
+    /// life of the cola process, so two requests from two connections must
+    /// never share one (issue #896; the same collision as #893). The tag is
+    /// random rather than a counter because a persisted card surface outlives
+    /// the process: a fresh process must not re-adopt a dead connection's card
+    /// as the new request's own.
+    tag: String,
     /// The approval methods the attached server's own response schemas
     /// advertise a session decision for (ticket #882). Production always
     /// supplies this from the probed surface — [`Approvals::new`] — so a newer
@@ -171,8 +192,12 @@ impl Approvals {
     /// Record server requests against one attached server, whose advertised
     /// session decisions are `session_decisions`.
     pub(crate) fn new(session_decisions: BTreeSet<String>) -> Self {
+        // 48 random bits: enough that a fresh process never re-adopts a card
+        // persisted for a dead connection (see the field's own note).
+        let uuid = uuid::Uuid::new_v4().simple().to_string();
         Self {
             pending: Mutex::new(HashMap::new()),
+            tag: uuid[..12].to_string(),
             session_decisions,
             reply_timeout_ms: AtomicU64::new(0),
             tasks: Mutex::new(Vec::new()),
@@ -284,6 +309,21 @@ impl Approvals {
         self.pending.lock().expect("pending approvals").clear();
     }
 
+    /// The neutral id of one wire request on **this** connection: a
+    /// wire-type-preserving encoding of the JSON-RPC id (a string id and a
+    /// number id are distinct protocol `RequestId`s) plus this record's
+    /// namespace tag. The card carries it back, so it must round-trip exactly
+    /// (`take_permission`/`take_question` look it up) and it must never
+    /// describe a request another connection received.
+    fn request_key(&self, id: &Value) -> Option<String> {
+        let (prefix, text) = match id {
+            Value::String(text) => ("s", text.clone()),
+            Value::Number(number) => ("n", number.to_string()),
+            _ => return None,
+        };
+        Some(format!("{prefix}:{text}@{}", self.tag))
+    }
+
     /// Drop a request the server resolved (another client answered it, or the
     /// turn ended). The bridge's next sweep sees it absent and withdraws the
     /// card through the existing stale-card path.
@@ -291,7 +331,7 @@ impl Approvals {
         let Some(id) = params.get("requestId") else {
             return;
         };
-        let Some(key) = request_key(id) else {
+        let Some(key) = self.request_key(id) else {
             return;
         };
         let removed = self.pending.lock().expect("pending approvals").remove(&key);
@@ -315,7 +355,7 @@ impl Approvals {
         method: String,
         params: Value,
     ) {
-        let Some(key) = request_key(&id) else {
+        let Some(key) = self.request_key(&id) else {
             tracing::warn!("codex server request {method} carries no routable id");
             return;
         };
@@ -623,18 +663,6 @@ impl Drop for PendingReply<'_> {
             // reintroduce.
             entry.replying = None;
         }
-    }
-}
-
-/// The canonical, wire-type-preserving key for a JSON-RPC request id. A string
-/// id and a number id are distinct request ids (the protocol's `RequestId` is
-/// either), so the encoding keeps the type; `serverRequest/resolved` uses the
-/// same function on the same value.
-fn request_key(id: &Value) -> Option<String> {
-    match id {
-        Value::String(text) => Some(format!("s:{text}")),
-        Value::Number(number) => Some(format!("n:{number}")),
-        _ => None,
     }
 }
 
@@ -1675,6 +1703,12 @@ mod tests {
         assert!(frames.try_recv().is_err(), "the timed-out attempt queued nothing");
     }
 
+    /// The neutral id `approvals` mints for a numeric wire id, so a test that
+    /// seeds the pending map by hand answers the same request `resolve` names.
+    fn key_of(approvals: &Approvals, wire: i64) -> String {
+        approvals.request_key(&json!(wire)).expect("a numeric wire id")
+    }
+
     async fn wait_for_replying(approvals: &Approvals, key: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1704,8 +1738,9 @@ mod tests {
         let (connection, mut frames, _closing) = RpcConnection::test_connection(1);
         let approvals = Arc::new(Approvals::default());
         approvals.set_reply_timeout(Duration::from_millis(200));
+        let key = key_of(&approvals, 1);
         approvals.pending.lock().expect("pending approvals").insert(
-            "n:1".into(),
+            key.clone(),
             pending("item/commandExecution/requestApproval", command(), json!({})),
         );
         connection
@@ -1716,9 +1751,10 @@ mod tests {
         let task = tokio::spawn({
             let approvals = Arc::clone(&approvals);
             let connection = connection.clone();
-            async move { approvals.reply_permission(&connection, "n:1", "once").await }
+            let key = key.clone();
+            async move { approvals.reply_permission(&connection, &key, "once").await }
         });
-        wait_for_replying(&approvals, "n:1").await;
+        wait_for_replying(&approvals, &key).await;
         assert!(
             approvals.permissions(None).is_empty(),
             "an in-flight answer is hidden from the polled list"
@@ -1731,7 +1767,7 @@ mod tests {
                 .pending
                 .lock()
                 .expect("pending approvals")
-                .contains_key("n:1"),
+                .contains_key(&key),
             "a resolved request is not restored by a failed reply"
         );
         assert!(
@@ -1740,7 +1776,7 @@ mod tests {
         );
         assert!(
             matches!(
-                approvals.reply_permission(&connection, "n:1", "once").await,
+                approvals.reply_permission(&connection, &key, "once").await,
                 Err(BridgeError::NotFound(_))
             ),
             "a retry after the resolution is a no-op"
@@ -1750,7 +1786,7 @@ mod tests {
                 .pending
                 .lock()
                 .expect("pending approvals")
-                .contains_key("n:1")
+                .contains_key(&key)
         );
         assert!(matches!(
             frames.recv().await.expect("the filler frame"),
@@ -1778,19 +1814,21 @@ mod tests {
             value: Some(FormValue::Text("Yes".into())),
         }];
 
+        let key = key_of(&approvals, 2);
         // A form answer in flight.
         approvals
             .pending
             .lock()
             .expect("pending approvals")
-            .insert("n:2".into(), question_pending());
+            .insert(key.clone(), question_pending());
         let task = tokio::spawn({
             let approvals = Arc::clone(&approvals);
             let connection = connection.clone();
             let answers = answers.clone();
-            async move { approvals.reply_question(&connection, "n:2", &answers).await }
+            let key = key.clone();
+            async move { approvals.reply_question(&connection, &key, &answers).await }
         });
-        wait_for_replying(&approvals, "n:2").await;
+        wait_for_replying(&approvals, &key).await;
         approvals.resolve(&json!({ "requestId": 2 }));
         assert!(task.await.expect("join").is_err());
         assert!(
@@ -1798,7 +1836,7 @@ mod tests {
                 .pending
                 .lock()
                 .expect("pending approvals")
-                .contains_key("n:2"),
+                .contains_key(&key),
             "a resolved question is not restored by a failed answer"
         );
 
@@ -1807,13 +1845,14 @@ mod tests {
             .pending
             .lock()
             .expect("pending approvals")
-            .insert("n:2".into(), question_pending());
+            .insert(key.clone(), question_pending());
         let task = tokio::spawn({
             let approvals = Arc::clone(&approvals);
             let connection = connection.clone();
-            async move { approvals.reject_question(&connection, "n:2").await }
+            let key = key.clone();
+            async move { approvals.reject_question(&connection, &key).await }
         });
-        wait_for_replying(&approvals, "n:2").await;
+        wait_for_replying(&approvals, &key).await;
         approvals.resolve(&json!({ "requestId": 2 }));
         assert!(task.await.expect("join").is_err());
         assert!(
@@ -1821,7 +1860,7 @@ mod tests {
                 .pending
                 .lock()
                 .expect("pending approvals")
-                .contains_key("n:2"),
+                .contains_key(&key),
             "a resolved question is not restored by a failed rejection"
         );
     }
@@ -1832,8 +1871,9 @@ mod tests {
     async fn a_resolved_request_is_dropped_without_a_reply() {
         let (connection, _frames, _closing) = RpcConnection::test_connection(1);
         let approvals = Approvals::default();
+        let key = key_of(&approvals, 1);
         approvals.pending.lock().expect("pending approvals").insert(
-            "n:1".into(),
+            key.clone(),
             pending("item/commandExecution/requestApproval", command(), json!({})),
         );
         assert_eq!(approvals.permissions(None).len(), 1);
@@ -1845,10 +1885,10 @@ mod tests {
                 .pending
                 .lock()
                 .expect("pending approvals")
-                .contains_key("n:1")
+                .contains_key(&key)
         );
         assert!(matches!(
-            approvals.reply_permission(&connection, "n:1", "once").await,
+            approvals.reply_permission(&connection, &key, "once").await,
             Err(BridgeError::NotFound(_))
         ));
     }
@@ -1981,10 +2021,65 @@ mod tests {
 
     #[test]
     fn request_ids_keep_their_wire_type() {
-        assert_eq!(request_key(&json!(7)), Some("n:7".into()));
-        assert_eq!(request_key(&json!("7")), Some("s:7".into()));
-        assert_ne!(request_key(&json!(7)), request_key(&json!("7")));
-        assert_eq!(request_key(&Value::Null), None);
+        let approvals = Approvals::default();
+        let number = approvals.request_key(&json!(7)).expect("a numeric id");
+        let text = approvals.request_key(&json!("7")).expect("a string id");
+        assert!(number.starts_with("n:7@"), "{number}");
+        assert!(text.starts_with("s:7@"), "{text}");
+        assert_ne!(number, text, "the wire type is part of the identity");
+        assert_eq!(approvals.request_key(&Value::Null), None);
+        // The tag belongs to the record, not to the value: the same wire id
+        // maps to the same neutral id for as long as the connection lives, so
+        // the card's click resolves the request it was rendered from.
+        assert_eq!(approvals.request_key(&json!(7)), Some(number));
+    }
+
+    /// The server owns its request ids and numbers them per **connection**, so
+    /// two connections both number their first request `0`. The neutral id the
+    /// card carries is the bridge's identity for the request — the answered
+    /// guard, the surfaced set and every snapshot claim are keyed by it — so it
+    /// must be unique to the connection. Otherwise a brand-new request is
+    /// mistaken for one an earlier connection already answered, and its click
+    /// is re-served as "already answered" instead of answered.
+    #[tokio::test]
+    async fn two_connections_never_project_the_same_request_id() {
+        let params = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "item-1",
+            "command": "ls",
+            "cwd": "/work",
+        });
+        let (first_connection, _first_frames, _first_closing) = RpcConnection::test_connection(8);
+        let (second_connection, _second_frames, _second_closing) = RpcConnection::test_connection(8);
+        let projections = Arc::new(Projections::default());
+        let first = Approvals::default();
+        let second = Approvals::default();
+        first
+            .ingest(
+                &first_connection,
+                &projections,
+                json!(0),
+                "item/commandExecution/requestApproval".into(),
+                params.clone(),
+            )
+            .await;
+        second
+            .ingest(
+                &second_connection,
+                &projections,
+                json!(0),
+                "item/commandExecution/requestApproval".into(),
+                params,
+            )
+            .await;
+
+        let first_id = first.permissions(None)[0].request_id.clone();
+        let second_id = second.permissions(None)[0].request_id.clone();
+        assert_ne!(
+            first_id, second_id,
+            "a request id reused by a new connection must not alias the old one"
+        );
     }
 
     #[test]
