@@ -592,6 +592,17 @@ fn hash_slice_content(kind: &TimelineKind, hasher: &mut impl std::hash::Hasher) 
             compaction.reason.hash(hasher);
             compaction.summary.hash(hasher);
             compaction.error.hash(hasher);
+            // The row's title renders the compaction's own usage (ADR-0044).
+            match compaction.usage {
+                Some(usage) => {
+                    usage.input.hash(hasher);
+                    usage.output.hash(hasher);
+                    usage.total.hash(hasher);
+                    usage.cache_read.hash(hasher);
+                    usage.cache_write.hash(hasher);
+                }
+                None => 0u8.hash(hasher),
+            }
         }
     }
 }
@@ -5512,6 +5523,20 @@ mod tests {
         let after = acc.slice_fingerprint(0, acc.timeline_len());
         assert_eq!(acc.timeline_len(), 1, "the row was replaced in place");
         assert_ne!(before, after, "a same-length rewrite must change the fingerprint");
+
+        let with_usage = crate::backend::Compaction {
+            usage: Some(crate::backend::TokenUsage {
+                input: 1,
+                output: 2,
+                total: 3,
+                cache_read: 4,
+                cache_write: 5,
+            }),
+            ..compaction("xyz")
+        };
+        acc.push_compaction_at(Some(1_000), source(), &with_usage);
+        let after_usage = acc.slice_fingerprint(0, acc.timeline_len());
+        assert_ne!(after, after_usage, "the row's usage changes the fingerprint too");
     }
 
     #[test]
