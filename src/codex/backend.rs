@@ -3082,6 +3082,46 @@ mod tests {
         assert_eq!(model.provider_id, "opencode-go");
     }
 
+    /// A `thread/read` that answers with a **different** thread than the one
+    /// asked for must not hand this session the other thread's cached model:
+    /// the read's id keys both the metadata update and the model lookup.
+    #[tokio::test]
+    async fn a_response_naming_another_thread_is_not_answered_with_this_ones_model() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut asked = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "asked");
+        asked.model = Some("gpt-6-luna".into());
+        asked.model_provider = Some("opencode-go".into());
+        server.seed_thread(asked);
+        let mut other = ScriptedThread::adopted("thread-2", "session-other", "/work/other", "other");
+        other.model = Some("gpt-5.5".into());
+        other.model_provider = Some("opencode-go".into());
+        server.seed_thread(other);
+        let client = connect(&url).await;
+
+        assert_eq!(
+            client
+                .session_info("thread-1", Some("/work/cola"))
+                .await
+                .expect("the first read")
+                .model
+                .map(|model| model.id),
+            Some("gpt-6-luna".to_string()),
+            "thread-1's own model"
+        );
+
+        server.answer_next_thread_read_with("thread-2");
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the substituted read");
+        assert_eq!(info.id, "thread-2", "the response names thread-2");
+        assert_eq!(
+            info.model.map(|model| model.id),
+            Some("gpt-5.5".to_string()),
+            "the model comes from the thread the response named, never thread-1's cache"
+        );
+    }
+
     /// A bounded `thread/resume` page is never presented as the whole history:
     /// adoption pages `thread/turns/list` before the first transcript read.
     #[tokio::test]
