@@ -4656,6 +4656,11 @@ impl App {
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
+        // One deadline for this callback. The current-selection ladder and the
+        // backend read are charged against it (see `command::model_surface`),
+        // so neither can spend the other's slice; the remainder is the card's
+        // build and response margin.
+        let deadline = tokio::time::Instant::now() + crate::feishu::ws::CARD_ACK_BUDGET;
         let thread_key = thread_key_from_value(value);
         let picked = value
             .get("value")
@@ -4681,7 +4686,7 @@ impl App {
                 &thread_key,
                 scope,
                 selected,
-                Some(crate::feishu::ws::CARD_ACK_BUDGET),
+                Some(deadline),
             )
             .await;
             let cards = crate::feishu::card::picker::build_model_surface_cards(&thread_key, &surface, back);

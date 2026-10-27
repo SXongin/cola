@@ -633,10 +633,15 @@ impl SessionsHandle {
                 selected: Some(provider),
                 // This lookup runs on a card callback's short ack budget and
                 // needs only the advertised variants: no config read, no
-                // provider probe, no session context. The budget bounds the
-                // catalog read (a callback must not wait on a stalled server).
+                // provider probe, no session context.
                 catalog_only: true,
-                ack_budget: Some(crate::feishu::ws::CARD_ACK_BUDGET),
+                // A **validation** read, not a card render: a truncated
+                // catalog would return `None` for a model on a later page and
+                // the caller would silently keep a `/think` variant the model
+                // does not declare, failing the next turn. A full read that
+                // overruns only forfeits the toast — the handler keeps running
+                // and still records the pick.
+                ack_budget: None,
                 ..Default::default()
             })
             .await

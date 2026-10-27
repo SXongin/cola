@@ -1460,6 +1460,17 @@ pub(crate) type TaskRuntimeCall = (String, Vec<String>, Vec<String>);
 /// at a specific read without a timing race.
 pub(crate) type TranscriptReadHook = Box<dyn Fn(usize) + Send + Sync>;
 
+/// One `model_surface` request's callback-relevant context, recorded so a test
+/// can pin what a caller sent — the `/think` validation read's `catalog_only`,
+/// a callback's remaining budget, or a drilled page's scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelSurfaceQueryRecord {
+    pub scope: Option<String>,
+    pub selected: Option<String>,
+    pub catalog_only: bool,
+    pub ack_budget: Option<std::time::Duration>,
+}
+
 /// Serves scripted parts/permissions instead of a live OpenCode server.
 pub struct MockBackend {
     /// The parts the default assistant turn carries: reasoning → tool → text.
@@ -1733,6 +1744,8 @@ pub struct MockBackend {
     /// mapped into an OpenCode-shaped `model_surface` when no explicit
     /// `model_surface` is set.
     pub provider_models: Vec<crate::backend::types::ProviderModels>,
+    /// Every `model_surface` request's context, in call order.
+    pub model_surface_queries: Arc<tokio::sync::Mutex<Vec<ModelSurfaceQueryRecord>>>,
     /// When set, served verbatim by `model_surface`, overriding the
     /// OpenCode-shaped mapping of `provider_models`. Lets a test declare any
     /// client's surface (Codex's flat catalog, a two-scope fake, …).
@@ -2002,6 +2015,7 @@ impl MockBackend {
             turn_probe: None,
             ensure_attached_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_models: Vec::new(),
+            model_surface_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             model_surface: None,
             default_model: None,
             context_window: Some(100_000),
@@ -3195,6 +3209,15 @@ impl crate::backend::Backend for MockBackend {
         &self,
         query: crate::backend::types::ModelSurfaceQuery<'_>,
     ) -> crate::backend::types::ModelSurface {
+        self.model_surface_queries
+            .lock()
+            .await
+            .push(ModelSurfaceQueryRecord {
+                scope: query.scope.map(str::to_string),
+                selected: query.selected.map(str::to_string),
+                catalog_only: query.catalog_only,
+                ack_budget: query.ack_budget,
+            });
         if let Some(surface) = &self.model_surface {
             // A client's declared shape, with the caller's current selection
             // filled in the way both real adapters do.

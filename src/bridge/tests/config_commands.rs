@@ -376,7 +376,7 @@ async fn drilled_model_page_does_not_resolve_the_current_selection() {
         &key,
         Some("provider"),
         Some("opencode"),
-        Some(std::time::Duration::from_secs(2)),
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2)),
     )
     .await;
     assert!(
@@ -394,6 +394,115 @@ async fn drilled_model_page_does_not_resolve_the_current_selection() {
     assert!(
         drilled.scopes[0].options.iter().any(|o| o.id == "gpt-4o"),
         "the catalog is still fetched"
+    );
+}
+
+/// `/model` and `/think` validate a model's variants against the **whole**
+/// catalog. A callback's ack slice could truncate a later page, make
+/// `model_variants` return `None`, and silently keep a `/think` variant the
+/// model does not declare — so this read is explicitly not budgeted.
+#[tokio::test]
+async fn model_variants_reads_the_full_catalog_not_a_callback_slice() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: "codex".into(),
+        models: vec![model_option("model-late", &["low"])],
+    }]);
+    let queries = backend.model_surface_queries.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+
+    let handles = app.command_handles();
+    let variants = handles
+        .flow
+        .sessions
+        .model_variants(&handles.flow.backend, "codex", "model-late")
+        .await;
+    assert_eq!(variants, Some(vec!["low".to_string()]));
+
+    let recorded = queries.lock().await;
+    let query = recorded.last().expect("the surface read was recorded");
+    assert!(
+        query.catalog_only,
+        "the validation read asks for the catalog only"
+    );
+    assert_eq!(
+        query.ack_budget, None,
+        "a validation read must not be truncated by a callback's ack slice"
+    );
+}
+
+/// A back-to-root callback resolves the current selection first. A stalled
+/// ladder gets only half of what is left of the ack budget; the page still
+/// renders (without the current line) inside the budget, and the backend read
+/// receives just the remainder.
+#[tokio::test]
+async fn a_stalled_selection_ladder_still_returns_the_root_page_inside_the_ack_budget() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: "opencode".into(),
+        models: vec![model_option("gpt-4o", &[])],
+    }]);
+    // Only the ladder's server-recorded rung can answer, and that read hangs.
+    backend.with_session_model(crate::backend::types::SessionModel {
+        provider_id: "opencode".into(),
+        id: "gpt-4o".into(),
+    });
+    backend.hang_session_info_reads(1);
+    let queries = backend.model_surface_queries.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key,
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let value = serde_json::json!({
+        "action": "model",
+        "level": "provider",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "__providers__",
+    });
+    let started = std::time::Instant::now();
+    let result = app.host_action(value).await.expect("back action");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the stalled ladder must still beat the ack: {elapsed:?}"
+    );
+    let card = result.card.expect("the root page still renders");
+    let text = card.to_string();
+    assert!(
+        !text.contains("当前模型"),
+        "the stalled ladder left no current line: {text}"
+    );
+    let recorded = queries.lock().await;
+    let query = recorded.last().expect("the backend read still happened");
+    let remaining = query
+        .ack_budget
+        .expect("a callback passes the budget left after the ladder");
+    assert!(
+        remaining > std::time::Duration::ZERO && remaining < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the backend got only the ladder's remainder: {remaining:?}"
     );
 }
 
