@@ -1283,7 +1283,7 @@ impl Item {
                     MessageRole::Assistant,
                     vec![Part::Tool(ToolCall {
                         identity: ToolIdentity {
-                            name: "command_execution".to_string(),
+                            name: codex_tool_id("command_execution"),
                             call_id: self.id.clone(),
                         },
                         status: status.clone(),
@@ -1317,7 +1317,7 @@ impl Item {
                     MessageRole::Assistant,
                     vec![Part::Tool(ToolCall {
                         identity: ToolIdentity {
-                            name: "file_change".to_string(),
+                            name: codex_tool_id("file_change"),
                             call_id: self.id.clone(),
                         },
                         status: status.clone(),
@@ -1395,7 +1395,7 @@ impl Item {
                 MessageRole::Assistant,
                 vec![Part::Tool(ToolCall {
                     identity: ToolIdentity {
-                        name: "web_search".to_string(),
+                        name: codex_tool_id("web_search"),
                         call_id: self.id.clone(),
                     },
                     status: self.tool_completion_status(),
@@ -1413,7 +1413,7 @@ impl Item {
                 MessageRole::Assistant,
                 vec![Part::Tool(ToolCall {
                     identity: ToolIdentity {
-                        name: "image".to_string(),
+                        name: codex_tool_id("image"),
                         call_id: self.id.clone(),
                     },
                     status: self.tool_completion_status(),
@@ -2022,6 +2022,17 @@ fn user_parts(item: &Value) -> Vec<Part> {
         }
     }
     parts
+}
+
+/// The tool id a Codex item kind carries into the neutral transcript.
+///
+/// The `codex/` namespace keeps the adapter's own vocabulary (`command_execution`
+/// / `file_change` / `web_search` / `image`) from colliding with a third-party
+/// tool's id, the way an MCP call is `server/tool` (ADR-0042's amendment). The
+/// card maps these ids to its own words; a tool that merely shares the raw item
+/// kind is untouched.
+fn codex_tool_id(kind: &str) -> String {
+    format!("codex/{kind}")
 }
 
 fn command_status(status: &Option<String>, exit_code: Option<i64>) -> ToolStatus {
