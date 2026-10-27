@@ -2092,22 +2092,45 @@ impl Backend for CodexClient {
     /// listing only — switching is a later ticket, so a provider click falls
     /// back to this same page (with the bridge's back button) rather than
     /// pretending to change the thread's channel.
+    ///
+    /// # Read budgets
+    ///
+    /// A root `/model` page is a text command and keeps full fidelity: its
+    /// config read gets [`super::model_surface::CONFIG_READ_TIMEOUT`] (2 s) and
+    /// its probes get the fresh 2 s each, concurrently.
+    ///
+    /// A **drilled** page is a card callback, answered under
+    /// [`crate::feishu::ws::CARD_ACK_BUDGET`] (2 s). It cannot chain those two
+    /// waits, so config gets only
+    /// [`crate::codex::model_surface::DRILLED_CONFIG_READ_TIMEOUT`] (600 ms), probes are
+    /// served **cache-only** (zero network), and the only remaining await is the
+    /// catalog's one websocket round-trip — leaving the ack card's render and
+    /// response well inside the budget. A cold drilled click therefore shows
+    /// the providers without their probed models; the next root open fills them.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
         // `/think`'s variant lookup is the one caller that asks for the bare
         // catalog (`catalog_only`): it runs on a card callback's short ack
         // budget and needs only the advertised variants. Every card page —
         // a root page or a Pending Session's drilled provider read — keeps the
-        // full surface: config providers, presets and probes.
+        // full config/provider shape.
         let fast = query.catalog_only;
+        // A drilled page (a provider click) is the card-callback shape; the root
+        // page is not. `catalog_only` never reaches the config/probe path.
+        let drilled = query.scope.is_some() && !fast;
         let (catalog, config) = if fast {
             (
                 Backend::list_models(self).await,
                 super::model_surface::CodexModelConfig::default(),
             )
         } else {
+            let timeout = if drilled {
+                crate::codex::model_surface::DRILLED_CONFIG_READ_TIMEOUT
+            } else {
+                super::model_surface::CONFIG_READ_TIMEOUT
+            };
             let (catalog, config) = tokio::join!(
                 Backend::list_models(self),
-                super::model_surface::read_config(self.connection(), query.directory)
+                super::model_surface::read_config(self.connection(), query.directory, timeout)
             );
             let config = config.unwrap_or_else(|error| {
                 tracing::debug!(
@@ -2122,6 +2145,11 @@ impl Backend for CodexClient {
         };
         let probes = if fast {
             Default::default()
+        } else if drilled {
+            // A callback must not start a probe: 2 s of network on top of the
+            // config read would miss the ack budget. The previous root open
+            // already warmed this cache; a cold click simply omits the groups.
+            self.model_probes.cached(&config.providers)
         } else {
             self.model_probes.probe_all(&config.providers).await
         };
@@ -4808,9 +4836,13 @@ mod tests {
 
     /// A Pending Session's drilled provider read has a directory but no session
     /// id. Only `/think`'s explicit `catalog_only` read skips config — this page
-    /// is a card page, so the provider options survive the click.
+    /// is a card page, so the provider options survive the click. It is a card
+    /// callback, so a cold cache must not start a probe: the page is bounded to
+    /// config + catalog, and the provider list still renders.
     #[tokio::test]
     async fn a_pending_sessions_drilled_provider_read_keeps_its_options() {
+        let probed = crate::test_http::TestHttpServer::start().await;
+        probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.set_models(vec![
             json!({ "id": "gpt-5.1-codex", "supportedReasoningEfforts": [] }),
@@ -4822,7 +4854,11 @@ mod tests {
                 "version": "v1",
                 "config": {
                     "model_providers": {
-                        "deepseek": { "name": "DeepSeek" },
+                        "deepseek": {
+                            "name": "DeepSeek",
+                            "base_url": format!("{}/v1", probed.base_url()),
+                            "experimental_bearer_token": "sentinel-drilled-token"
+                        },
                         "opencode-go": { "name": "OpenCode Go" }
                     }
                 }
@@ -4846,15 +4882,63 @@ mod tests {
             1,
             "a card page reads config even without a session id"
         );
+        assert_eq!(
+            probed.request_count(),
+            0,
+            "a drilled callback never starts a probe on a cold cache"
+        );
         let providers: Vec<&str> = surface.scopes[1]
             .options
             .iter()
             .map(|option| option.id.as_str())
             .collect();
         assert_eq!(providers, ["deepseek", "opencode-go"], "the options survive");
+        assert!(
+            !surface.scopes[0]
+                .options
+                .iter()
+                .any(|option| option.callback_value() == "codex/one"),
+            "a cold drilled read omits the probed models rather than probing"
+        );
         let params = server.config_read_params();
         assert_eq!(params[0]["includeLayers"], true);
         assert_eq!(params[0]["cwd"], "/work/cola");
+    }
+
+    /// A drilled page is a card callback: a stalled config read is abandoned at
+    /// the drilled slice of `CARD_ACK_BUDGET` (600 ms), not at the root page's
+    /// 2 s, and probes are not started. The provider scope then says config was
+    /// unreadable instead of hanging the ack.
+    #[tokio::test]
+    async fn a_drilled_config_read_is_bounded_by_the_ack_budget() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_config_read_delay(Duration::from_secs(5));
+        let client = connect(&url).await;
+
+        let started = Instant::now();
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("deepseek"),
+                directory: Some("/work/cola"),
+                ..Default::default()
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(server.config_read_calls(), 1, "the read was sent");
+        assert!(
+            elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+            "a drilled read took {elapsed:?}, past the 2s ack budget"
+        );
+        assert!(
+            elapsed >= crate::codex::model_surface::DRILLED_CONFIG_READ_TIMEOUT,
+            "the drilled read should wait for its 600ms config slice, took {elapsed:?}"
+        );
+        let note = surface.scopes[1].note.as_deref().unwrap_or_default();
+        assert!(note.contains("读不到 config"), "note: {note}");
     }
 
     /// A profile preset's callback value reaches the next `turn/start` as its

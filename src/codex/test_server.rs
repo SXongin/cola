@@ -398,6 +398,9 @@ struct State {
     config_read: std::sync::Mutex<Value>,
     /// `config/read` params received, in send order.
     config_read_params: std::sync::Mutex<Vec<Value>>,
+    /// How long a `config/read` answer waits before it is written, for
+    /// exercising the drilled read's deadline.
+    config_read_delay: std::sync::Mutex<std::time::Duration>,
     /// `config/read` calls received.
     config_read_calls: AtomicUsize,
     /// The page size `model/list` uses when the caller sends no `limit`.
@@ -489,6 +492,7 @@ impl Default for State {
                 "origins": {},
             })),
             config_read_params: std::sync::Mutex::new(Vec::new()),
+            config_read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             config_read_calls: AtomicUsize::new(0),
             model_page_size: AtomicUsize::new(50),
             skills: std::sync::Mutex::new(Vec::new()),
@@ -1045,6 +1049,12 @@ impl FakeServer {
             .lock()
             .expect("config read params")
             .clone()
+    }
+
+    /// Hold the next `config/read` answers for `delay` before writing them (a
+    /// stalled config read, for the drilled card-callback deadline).
+    pub(crate) fn set_config_read_delay(&self, delay: std::time::Duration) {
+        *self.state.config_read_delay.lock().expect("config read delay") = delay;
     }
 
     /// The page size `model/list` uses when the caller sends no `limit`.
@@ -1673,6 +1683,10 @@ where
                 .expect("config read params")
                 .push(params.clone());
             let result = state.config_read.lock().expect("config read").clone();
+            let delay = *state.config_read_delay.lock().expect("config read delay");
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             replying(sink, id, result).await
         }
         Some("model/list") => {

@@ -63,9 +63,18 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(80);
 /// `config/read` is a local app-server read, but a wedged connection must not
 /// hold `/model` open. On expiry the surface degrades to the catalog.
 #[cfg(not(test))]
-const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
-const CONFIG_READ_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const CONFIG_READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// A drilled page is a card **callback**, answered under
+/// [`crate::feishu::ws::CARD_ACK_BUDGET`] (2 s). Config gets this slice of it;
+/// probes are served from the cache only and the catalog is one websocket
+/// round-trip, so the page cannot chain the root page's 2 s config read with a
+/// fresh 2 s probe. The root `/model` page is a text command, not a callback,
+/// and keeps [`CONFIG_READ_TIMEOUT`] + fresh probes.
+pub(crate) const DRILLED_CONFIG_READ_TIMEOUT: Duration =
+    crate::feishu::ws::CARD_ACK_BUDGET.saturating_sub(Duration::from_millis(1400));
 
 /// The `model` scope's identity (also the card callback's `level`).
 pub(crate) const MODEL_SCOPE: &str = "model";
@@ -101,18 +110,37 @@ pub(crate) struct ConfiguredProvider {
     pub(crate) env_key: Option<String>,
 }
 
-/// The token is redacted, so a `{:?}` of a config (or a provider) can never
-/// print a credential into a panic, a debug log or a test artefact.
+/// The token and every URL part beyond scheme+host are redacted, so a `{:?}`
+/// of a config (or a provider) can never print a credential into a panic, a
+/// debug log or a test artefact. A URL can carry a secret in its userinfo or
+/// query, exactly where the module's logging rule already refuses to look.
 impl std::fmt::Debug for ConfiguredProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConfiguredProvider")
             .field("id", &self.id)
             .field("name", &self.name)
-            .field("base_url", &self.base_url)
+            .field("base_url", &safe_base_url(self.base_url.as_deref()))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("env_key", &self.env_key)
             .finish()
+    }
+}
+
+/// The most a provider URL may show in a debug surface: scheme + host, never
+/// userinfo, path, query or fragment. An unparseable URL is `<invalid>` for the
+/// same reason — the raw string could be the only place a secret lives.
+fn safe_base_url(base_url: Option<&str>) -> Option<String> {
+    let base_url = base_url?;
+    match reqwest::Url::parse(base_url) {
+        // Only the schemes the probe itself accepts are shown; anything else
+        // (including a no-host parse of a secret-looking string) is opaque.
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Some(format!(
+            "{}://{}",
+            url.scheme(),
+            url.host_str().unwrap_or("<invalid>")
+        )),
+        Ok(_) | Err(_) => Some("<invalid>".to_string()),
     }
 }
 
@@ -362,6 +390,15 @@ struct ProbeEntry {
     outcome: ProbeOutcome,
 }
 
+/// Drop every entry past [`PROBE_TTL`]. Called under the cache lock before a
+/// lookup and on insert, so expired provider/base-URL pairs are removed rather
+/// than merely ignored — visiting projects with distinct endpoints cannot grow
+/// one connection's map without bound.
+fn prune_expired(entries: &mut HashMap<(String, Option<String>), ProbeEntry>) {
+    let now = Instant::now();
+    entries.retain(|_, entry| now.saturating_duration_since(entry.at) < PROBE_TTL);
+}
+
 /// Per-provider `/models` cache (one per attached connection). Clones of a
 /// [`super::client::CodexClient`] share it through an `Arc`.
 pub(crate) struct ModelProbes {
@@ -403,15 +440,38 @@ impl ModelProbes {
         (provider.id.clone(), provider.base_url.clone())
     }
 
+    /// Serve this read from the cache only: a drilled card page runs on the
+    /// card-ack budget and must never start a fresh probe. Expired entries are
+    /// pruned here too, so a cold cache stays small rather than growing with
+    /// every project that names a provider.
+    pub(crate) fn cached(&self, providers: &[ConfiguredProvider]) -> HashMap<String, ProbeOutcome> {
+        let mut entries = self.entries.lock().expect("codex model probes");
+        prune_expired(&mut entries);
+        providers
+            .iter()
+            .filter_map(|provider| {
+                entries
+                    .get(&Self::cache_key(provider))
+                    .map(|entry| (provider.id.clone(), entry.outcome.clone()))
+            })
+            .collect()
+    }
+
     async fn outcome(&self, provider: &ConfiguredProvider) -> ProbeOutcome {
         let key = Self::cache_key(provider);
-        if let Some(entry) = self.entries.lock().expect("codex model probes").get(&key)
-            && entry.at.elapsed() < PROBE_TTL
         {
-            return entry.outcome.clone();
+            let mut entries = self.entries.lock().expect("codex model probes");
+            prune_expired(&mut entries);
+            if let Some(entry) = entries.get(&key) {
+                return entry.outcome.clone();
+            }
         }
         let outcome = self.probe(provider).await;
-        self.entries.lock().expect("codex model probes").insert(
+        let mut entries = self.entries.lock().expect("codex model probes");
+        // Prune on insert as well: a probe for a new provider must not let an
+        // unrelated expired entry linger until the next read names it again.
+        prune_expired(&mut entries);
+        entries.insert(
             key,
             ProbeEntry {
                 at: Instant::now(),
@@ -556,16 +616,17 @@ fn model_ids(body: &Value) -> Vec<String> {
 pub(crate) async fn read_config(
     connection: &RpcConnection,
     directory: Option<&str>,
+    timeout: Duration,
 ) -> CodexResult<CodexModelConfig> {
     let mut params = json!({ "includeLayers": true });
     if let Some(directory) = directory.filter(|directory| !directory.is_empty()) {
         params["cwd"] = json!(directory);
     }
-    let result = tokio::time::timeout(CONFIG_READ_TIMEOUT, connection.request("config/read", params)).await;
+    let result = tokio::time::timeout(timeout, connection.request("config/read", params)).await;
     match result {
         Ok(Ok(result)) => Ok(CodexModelConfig::from_read(&result)),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(super::error::CodexError::Timeout(CONFIG_READ_TIMEOUT)),
+        Err(_) => Err(super::error::CodexError::Timeout(timeout)),
     }
 }
 
@@ -898,6 +959,61 @@ mod tests {
         assert_eq!(config.providers[0].name, "X");
     }
 
+    /// A provider's `Debug` shows at most scheme+host. A URL can carry a
+    /// credential in userinfo or a query, and an unparseable one may be the only
+    /// place a secret lives, so neither its path/query nor a raw invalid string
+    /// may appear — nor can the bearer token.
+    #[test]
+    fn provider_debug_shows_only_scheme_and_host() {
+        let provider = ConfiguredProvider {
+            id: "deepseek".into(),
+            name: "DeepSeek".into(),
+            base_url: Some(
+                "https://sentinel-user:sentinel-pass@example.test/v1?token=sentinel-query#fragment".into(),
+            ),
+            token: Some(TOKEN.into()),
+            env_key: None,
+        };
+        let debugged = format!("{provider:?}");
+        assert!(debugged.contains("https://example.test"), "{debugged}");
+        for secret in [
+            "sentinel-user",
+            "sentinel-pass",
+            "sentinel-query",
+            "/v1",
+            "fragment",
+            TOKEN,
+        ] {
+            assert!(
+                !debugged.contains(secret),
+                "provider Debug leaked {secret:?}: {debugged}"
+            );
+        }
+
+        let config = CodexModelConfig {
+            providers: vec![provider],
+            ..Default::default()
+        };
+        let debugged = format!("{config:?}");
+        for secret in ["sentinel-user", "sentinel-pass", "sentinel-query", TOKEN] {
+            assert!(
+                !debugged.contains(secret),
+                "config Debug leaked {secret:?}: {debugged}"
+            );
+        }
+
+        let invalid = ConfiguredProvider {
+            id: "bad".into(),
+            name: "Bad".into(),
+            base_url: Some("sentinel-user:sentinel-pass@not a url".into()),
+            token: None,
+            env_key: None,
+        };
+        let debugged = format!("{invalid:?}");
+        assert!(debugged.contains("<invalid>"), "{debugged}");
+        assert!(!debugged.contains("sentinel"), "invalid URL leaked: {debugged}");
+    }
+
     /// The token rides the Authorization header, never a note or a log line,
     /// and a second probe inside the TTL does not reach the provider.
     #[tokio::test]
@@ -910,10 +1026,11 @@ mod tests {
             r#"{"object":"list","data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"},{"id":"deepseek-flash"}]}"#,
         );
         let probes = ModelProbes::new();
+        const URL_SECRET: &str = "sentinel-url-query";
         let provider = ConfiguredProvider {
             id: "deepseek".into(),
             name: "DeepSeek".into(),
-            base_url: Some(format!("{}/v1", server.base_url())),
+            base_url: Some(format!("{}/v1?token={URL_SECRET}", server.base_url())),
             token: Some(TOKEN.into()),
             env_key: None,
         };
@@ -936,7 +1053,15 @@ mod tests {
             requests[0].header("authorization"),
             Some(format!("Bearer {TOKEN}").as_str())
         );
+        assert!(
+            requests[0].query.contains(URL_SECRET),
+            "the query was really sent, so a leak would be possible"
+        );
         assert!(!logs.contains(TOKEN), "the token leaked into a log: {logs}");
+        assert!(
+            !logs.contains(URL_SECRET),
+            "a URL query leaked into a log: {logs}"
+        );
         assert!(!logs.contains("deepseek-flash"), "the answer body leaked too");
         assert!(
             !format!("{first:?}").contains(TOKEN),
@@ -1231,26 +1356,53 @@ mod tests {
         assert!(!note.contains("没有 provider"), "note: {note}");
     }
 
-    /// A provider probe answer is stale outside the TTL; a fresh open asks the
-    /// provider again. The clock is advanced by waiting the (test-short) TTL.
+    /// An expired answer is re-probed **and** dropped from the cache: a drilled
+    /// click's cache-only read prunes it, and a subsequent probe only replaces
+    /// the requested provider's entry. Without pruning, one connection would
+    /// accumulate every provider/base-URL pair a project ever named.
     #[tokio::test]
-    async fn a_probe_answer_expires_after_the_ttl() {
+    async fn an_expired_probe_is_dropped_and_reprobed() {
         let server = crate::test_http::TestHttpServer::start().await;
         server.route("GET", "/models", 200, r#"{"data":[{"id":"one"}]}"#);
         let probes = ModelProbes::new();
         let provider = provider("p", Some(server.base_url()), None, None);
+        let key = ModelProbes::cache_key(&provider);
         assert_eq!(
             probes.probe_all(std::slice::from_ref(&provider)).await.get("p"),
             Some(&ProbeOutcome::Models(vec!["one".into()]))
         );
-        // `PROBE_TTL` is minutes in production; do not sleep that in a test.
-        // Expire the entry by rewriting its instant, which is the same state a
-        // later open would see.
+
+        // `PROBE_TTL` is minutes in production; expiry is simulated by moving
+        // the instants, which is the same state a later read would see. The
+        // unrelated key stands for an old project's endpoint.
+        let stale = ("old".to_string(), Some("http://old.example".to_string()));
         {
             let mut entries = probes.entries.lock().unwrap();
-            entries.values_mut().next().unwrap().at = Instant::now() - PROBE_TTL - Duration::from_secs(1);
+            entries.insert(
+                stale.clone(),
+                ProbeEntry {
+                    at: Instant::now() - PROBE_TTL - Duration::from_secs(1),
+                    outcome: ProbeOutcome::Forbidden,
+                },
+            );
+            entries.get_mut(&key).unwrap().at = Instant::now() - PROBE_TTL - Duration::from_secs(1);
         }
+
+        // The drilled page's cache-only read prunes both expired entries and
+        // returns nothing fresh.
+        assert!(
+            probes.cached(std::slice::from_ref(&provider)).is_empty(),
+            "an expired answer is not served"
+        );
+        assert!(
+            !probes.entries.lock().unwrap().contains_key(&stale),
+            "the cache-only read drops an unrelated expired entry"
+        );
+
         probes.probe_all(std::slice::from_ref(&provider)).await;
         assert_eq!(server.request_count(), 2, "a stale entry probes again");
+        let entries = probes.entries.lock().unwrap();
+        assert!(entries.contains_key(&key), "the re-probed entry is fresh");
+        assert_eq!(entries.len(), 1, "nothing expired survives the insert");
     }
 }
