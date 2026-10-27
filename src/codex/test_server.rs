@@ -394,6 +394,10 @@ struct State {
     echo_prompts: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The models `model/list` advertises, in server order.
     models: std::sync::Mutex<Vec<Value>>,
+    /// The `config/read` answer (layers included), or the empty default.
+    config_read: std::sync::Mutex<Value>,
+    /// `config/read` calls received.
+    config_read_calls: AtomicUsize,
     /// The page size `model/list` uses when the caller sends no `limit`.
     model_page_size: AtomicUsize,
     /// The skills `skills/list` advertises.
@@ -477,6 +481,12 @@ impl Default for State {
             reject_thread_deletes: AtomicUsize::new(0),
             echo_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             models: std::sync::Mutex::new(Vec::new()),
+            config_read: std::sync::Mutex::new(json!({
+                "config": {},
+                "layers": [],
+                "origins": {},
+            })),
+            config_read_calls: AtomicUsize::new(0),
             model_page_size: AtomicUsize::new(50),
             skills: std::sync::Mutex::new(Vec::new()),
             experimental_features: std::sync::Mutex::new(Vec::new()),
@@ -1013,6 +1023,16 @@ impl FakeServer {
     /// The models `model/list` serves.
     pub(crate) fn set_models(&self, models: Vec<Value>) {
         *self.state.models.lock().expect("models") = models;
+    }
+
+    /// The `config/read` result, raw layers included (ticket #908).
+    pub(crate) fn set_config_read(&self, result: Value) {
+        *self.state.config_read.lock().expect("config read") = result;
+    }
+
+    /// `config/read` calls received.
+    pub(crate) fn config_read_calls(&self) -> usize {
+        self.state.config_read_calls.load(Ordering::SeqCst)
     }
 
     /// The page size `model/list` uses when the caller sends no `limit`.
@@ -1632,6 +1652,11 @@ where
                 (features[offset..end].to_vec(), next)
             };
             replying(sink, id, json!({ "data": data, "nextCursor": next })).await
+        }
+        Some("config/read") => {
+            state.config_read_calls.fetch_add(1, Ordering::SeqCst);
+            let result = state.config_read.lock().expect("config read").clone();
+            replying(sink, id, result).await
         }
         Some("model/list") => {
             state.model_list_calls.fetch_add(1, Ordering::SeqCst);
