@@ -2717,9 +2717,10 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         // Codex's `fileChange` names its targets in `changes[].path` (one entry
         // per file), not in a top-level `path`. A payload where any entry lacks
         // a usable path is rendered generically rather than silently reporting
-        // a partial file list.
+        // a partial file list. Backticks are flattened (`permission_target`'s
+        // rule) so a path cannot break the inline code span it sits in.
         "file_change" => {
-            let paths: Option<Vec<&str>> = obj
+            let paths: Option<Vec<String>> = obj
                 .get("changes")
                 .and_then(|changes| changes.as_array())
                 .and_then(|changes| {
@@ -2730,6 +2731,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                                 .get("path")
                                 .and_then(|path| path.as_str())
                                 .filter(|path| !path.trim().is_empty())
+                                .map(|path| path.replace('`', "'"))
                         })
                         .collect()
                 });
@@ -2742,9 +2744,10 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             }
         }
         // Codex's `imageView`: the file it looked at. Unlike a `read` there is
-        // no preview body to fold, so the panel only names it.
-        "image" => match get("path") {
-            Some(path) => format!("🖼 `{path}`"),
+        // no preview body to fold, so the panel only names it — with the same
+        // backtick flattening as a file change's path.
+        "image" => match get("path").filter(|path| !path.trim().is_empty()) {
+            Some(path) => format!("🖼 `{}`", path.replace('`', "'")),
             None => generic_tool_input(obj),
         },
         "execute" => match get("code") {
@@ -7354,6 +7357,25 @@ Index: /a/one.rs
         assert!(
             blank.starts_with("- changes:"),
             "a blank path is malformed too: {blank}"
+        );
+        // A backtick in a path cannot escape the inline span it names.
+        assert_eq!(
+            format_tool_input("file_change", &json!({"changes": [{"path": "a`b.rs"}]})),
+            "📄 `a'b.rs`"
+        );
+    }
+
+    /// Codex's `imageView` names the file it looked at, with the same backtick
+    /// flattening as a file change's path.
+    #[test]
+    fn codex_image_input_names_its_file() {
+        assert_eq!(
+            format_tool_input("image", &json!({"path": "/w/shot `1`.png"})),
+            "🖼 `/w/shot '1'.png`"
+        );
+        assert!(
+            format_tool_input("image", &json!({"path": "  "})).starts_with("- path:"),
+            "a blank path falls back to the generic rendering"
         );
     }
 
