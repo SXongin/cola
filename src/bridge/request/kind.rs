@@ -963,10 +963,15 @@ fn permission_receipt(target: &str, reply: &str) -> String {
 }
 
 /// The Interaction Receipt for a resolved question:
-/// `✅ 已回答：目录 /a、分支 main` — each question's header (or a clipped
-/// question text) with the answers chosen for it; a skipped slot reads
-/// 未作答. `answers[i]` is the finalized selection for field `i` (`None` =
-/// never answered); option values render as their display labels.
+/// `✅ 已回答：Which color should I use? Red；Which size? L` — each question's
+/// own text (not its short header) with the answers chosen for it; a skipped
+/// slot reads 未作答. `answers[i]` is the finalized selection for field `i`
+/// (`None` = never answered); option values render as their display labels.
+///
+/// The text is clipped per question so several fit the one-line residue, but it
+/// still says what was asked: a Codex question's header is a 12-character label
+/// (`Color`), which alone would leave the reader unable to tell what the card
+/// had just answered.
 fn question_receipt(
     questions: &[crate::backend::types::QuestionInfo],
     answers: &[Option<Vec<String>>],
@@ -975,11 +980,7 @@ fn question_receipt(
         .iter()
         .enumerate()
         .map(|(i, qi)| {
-            let label = if qi.header.is_empty() {
-                truncate(&qi.question, 24)
-            } else {
-                truncate(&qi.header, 24)
-            };
+            let label = crate::feishu::card::question::question_label(qi, 40);
             match answers
                 .get(i)
                 .and_then(|slot| slot.as_ref())
@@ -993,7 +994,7 @@ fn question_receipt(
     if parts.is_empty() {
         return "✅ 已回答".to_string();
     }
-    truncate(&format!("✅ 已回答：{}", parts.join("、")), RECEIPT_MAX_CHARS)
+    truncate(&format!("✅ 已回答：{}", parts.join("；")), RECEIPT_MAX_CHARS)
 }
 
 /// Compact one-line target for a permission's receipt: the action plus the

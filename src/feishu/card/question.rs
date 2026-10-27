@@ -155,24 +155,33 @@ pub(crate) fn permission_block_estimate(
 }
 
 /// Compact one-line target for a question's Interaction Receipt: each
-/// question's header (or a clipped question text), joined, clipped to stay a
-/// residue (ADR-0038, rule 4). Shared by the inline block's receipt and the
-/// standalone-card path that names the same request.
+/// question's own text, joined, clipped to stay a residue (ADR-0038, rule 4).
+/// Shared by the inline block's receipt and the standalone-card path that names
+/// the same request.
+///
+/// The text is what the question actually asked. The header is only Codex's
+/// own 12-character UI label (a word like `Color`), so a receipt built from it
+/// leaves the reader unable to tell what they answered — the question's
+/// sentence is the only part that can.
 pub(crate) fn question_target(questions: &[crate::backend::types::QuestionInfo]) -> String {
     super::truncate_md(
         &questions
             .iter()
-            .map(|qi| {
-                if qi.header.is_empty() {
-                    super::truncate_md(&qi.question, 24)
-                } else {
-                    qi.header.clone()
-                }
-            })
+            .map(|qi| question_label(qi, 24))
             .collect::<Vec<_>>()
             .join("、"),
         60,
     )
+}
+
+/// One question's display label for a residue: the question it asked, clipped,
+/// with its short header as the fallback when the text is empty.
+pub(crate) fn question_label(question: &crate::backend::types::QuestionInfo, max_chars: usize) -> String {
+    if !question.question.is_empty() {
+        super::truncate_md(&question.question, max_chars)
+    } else {
+        super::truncate_md(&question.header, max_chars)
+    }
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.

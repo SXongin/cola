@@ -237,11 +237,11 @@ async fn aborted_turn_rejects_its_pending_question() {
     );
     let card = final_card(&platform).await.to_string();
     assert!(
-        card.contains("🚫 已拒绝：目录"),
-        "the question block must settle into a denial receipt: {card}"
+        card.contains("🚫 已拒绝：选择目录"),
+        "the question block must settle into a denial receipt naming its question: {card}"
     );
     assert!(
-        !card.contains("选择目录") && !card.contains("提交"),
+        !card.contains("- /a") && !card.contains("提交"),
         "no live controls may survive on the card: {card}"
     );
 }
