@@ -167,10 +167,29 @@ pub(crate) struct ThreadProjection {
     /// automatic; the next compaction item consumes it.
     manual_compaction: bool,
     /// The model the **thread** runs with, learned from `thread/start`,
-    /// `thread/resume` or `thread/read` (issue #904). Codex items carry no
-    /// model of their own, so this is the only per-message model fact the
-    /// adapter has; `None` until the server named one.
-    model: Option<ModelIdentity>,
+    /// `thread/resume`, `thread/read` or cola's own accepted `turn/start`
+    /// (issue #904). Codex items carry no model of their own, so this is the
+    /// only per-message model fact the adapter has; `None` until one was named.
+    model: Option<ModelFact>,
+}
+
+/// Where the projection learned the thread's model (issue #904). The two
+/// sources age differently: a server **observation** is superseded by a later
+/// observation that names nothing, while cola's own accepted pick is not
+/// contradicted by a server that simply omits the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelSource {
+    /// `thread/start`, `thread/resume` or `thread/read` reported it.
+    Thread,
+    /// cola's own `turn/start` sent it and the server accepted the turn.
+    ColaSent,
+}
+
+/// The model a thread runs with, and where that fact came from.
+#[derive(Debug, Clone)]
+struct ModelFact {
+    model: ModelIdentity,
+    source: ModelSource,
 }
 
 impl ThreadProjection {
@@ -196,17 +215,36 @@ impl ThreadProjection {
         self.live_turn.as_deref()
     }
 
-    /// Remember the model the thread runs with (issue #904): `thread/start`,
-    /// `thread/resume` and `thread/read` report it, and no item does. The
-    /// transcript stamps it onto assistant messages, so the card footer and the
-    /// `/model` current-model line can name what actually ran.
+    /// Apply what a thread read reported (issue #904): `thread/start`,
+    /// `thread/resume` and `thread/read` carry the thread's model, and no item
+    /// does. The transcript stamps it onto assistant messages, so the card
+    /// footer and the `/model` current-model line can name what actually ran.
     ///
-    /// The latest thread answer is authoritative, including silence: `None`
-    /// clears a previously reported model, so a thread the server stops naming
-    /// a model for shows none rather than an old name. A stale name is worse
-    /// than a missing one — it would claim the wrong model answered.
-    pub(crate) fn set_model(&mut self, model: Option<ModelIdentity>) {
-        self.model = model;
+    /// A **reported** model always wins. Silence (`None` — an absent or null
+    /// field, indistinguishable on the wire) is not evidence that the model
+    /// changed, so it drops a name the server itself gave earlier — an old name
+    /// would claim the wrong model answered — but never a model cola sent: a
+    /// server that omits the field must not erase what cola just picked.
+    pub(crate) fn observe_thread_model(&mut self, model: Option<ModelIdentity>) {
+        self.model = match (model, self.model.as_ref().map(|fact| fact.source)) {
+            (Some(model), _) => Some(ModelFact {
+                model,
+                source: ModelSource::Thread,
+            }),
+            (None, Some(ModelSource::Thread)) => None,
+            (None, _) => self.model.take(),
+        };
+    }
+
+    /// Record the model cola itself asked for on an accepted `turn/start`: the
+    /// protocol's model is "for this turn and subsequent turns", so the thread
+    /// now runs it (issue #904). A later read that names another model still
+    /// wins — a peer's switch is a newer fact.
+    pub(crate) fn record_sent_model(&mut self, model: ModelIdentity) {
+        self.model = Some(ModelFact {
+            model,
+            source: ModelSource::ColaSent,
+        });
     }
 
     /// The turn an item belongs to, for the authorship record: Codex assigns
@@ -666,7 +704,7 @@ impl ThreadProjection {
         // Codex's items carry no model — the thread does (issue #904), and only
         // an assistant message can honestly name the model that produced it.
         let model = matches!(role, MessageRole::Assistant)
-            .then(|| self.model.clone())
+            .then(|| self.model.as_ref().map(|fact| fact.model.clone()))
             .flatten();
         TranscriptMessage {
             id: MessageId::new(item.id.clone()),
@@ -2490,7 +2528,7 @@ mod tests {
             "a projection that was told no model must not invent one"
         );
 
-        projection.set_model(Some(ModelIdentity {
+        projection.observe_thread_model(Some(ModelIdentity {
             provider_id: "opencode-go".into(),
             model_id: "gpt-6-luna".into(),
             variant: None,
@@ -2512,6 +2550,50 @@ mod tests {
             }
         }
         assert!(assistants > 0, "the recording carries assistant messages");
+    }
+
+    /// Issue #904, review round 2: what silence means depends on where the fact
+    /// came from. A name the **server** gave is dropped when a later read names
+    /// none (a stale name would claim the wrong model answered); a model cola
+    /// **sent** on an accepted `turn/start` survives an omitted field, because
+    /// silence cannot contradict it. A reported model always wins, pick or not.
+    #[test]
+    fn silence_drops_a_reported_model_but_never_a_picked_one() {
+        fn model_of(projection: &ThreadProjection) -> Option<String> {
+            projection
+                .transcript()
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == crate::backend::MessageRole::Assistant)
+                .and_then(|message| message.model.as_ref())
+                .map(|model| model.model_id.clone())
+        }
+        let identity = |model_id: &str| ModelIdentity {
+            provider_id: "opencode-go".into(),
+            model_id: model_id.into(),
+            variant: None,
+        };
+
+        let mut projection = projected();
+        projection.observe_thread_model(Some(identity("gpt-6-luna")));
+        assert_eq!(model_of(&projection), Some("gpt-6-luna".into()));
+
+        // A silent read drops the name the server itself gave.
+        projection.observe_thread_model(None);
+        assert_eq!(model_of(&projection), None);
+
+        // A picked model survives a silent read ...
+        projection.record_sent_model(identity("gpt-5.5"));
+        projection.observe_thread_model(None);
+        assert_eq!(model_of(&projection), Some("gpt-5.5".into()));
+
+        // ... and a server that names another model still wins over it.
+        projection.observe_thread_model(Some(identity("gpt-6-luna")));
+        assert_eq!(model_of(&projection), Some("gpt-6-luna".into()));
+        // That reported name is again droppable, i.e. the source moved back.
+        projection.observe_thread_model(None);
+        assert_eq!(model_of(&projection), None);
     }
 
     /// Ticket #879 acceptance 1: the same recording replayed twice yields the

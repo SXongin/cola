@@ -481,21 +481,29 @@ impl Projections {
     /// fact cannot be forgotten at one of the sites that read a thread.
     pub(crate) fn remember_thread_metadata(&self, thread: &Thread) {
         self.set_cwd(&thread.id, &thread.cwd);
-        // The read is authoritative even when it names no model: a silent
-        // answer clears the last one rather than leaving a stale name on the
-        // footer (issue #904).
-        self.set_model(&thread.id, thread_model(thread));
+        // The projection decides what silence means (a name the server itself
+        // gave is dropped; a model cola sent survives an omitted field).
+        self.observe_thread_model(&thread.id, thread_model(thread));
     }
 
-    /// Record the model a thread runs with. `thread/read` reports it, and
-    /// `turn/start`'s model "for this turn and subsequent turns" changes it, so
-    /// cola's own pick updates this too — otherwise the footer would name the
-    /// model from before the pick. `None` clears it.
-    pub(crate) fn set_model(&self, thread_id: &str, model: Option<ModelIdentity>) {
+    /// Apply the model a thread read reported, including its silence: the
+    /// projection owns what silence may clear (see
+    /// [`ThreadProjection::observe_thread_model`]).
+    pub(crate) fn observe_thread_model(&self, thread_id: &str, model: Option<ModelIdentity>) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .set_model(model);
+            .observe_thread_model(model);
+    }
+
+    /// Record the model cola's own accepted `turn/start` sent: it is "for this
+    /// turn and subsequent turns", so the thread now runs it — without this the
+    /// footer would keep naming the model from before the pick.
+    pub(crate) fn record_sent_model(&self, thread_id: &str, model: ModelIdentity) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .record_sent_model(model);
     }
 
     pub(crate) fn cwd(&self, thread_id: &str) -> Option<String> {
@@ -1669,13 +1677,13 @@ impl Backend for CodexClient {
         // response is the acceptance this waits for — a refused turn/start
         // changed nothing.
         if let Some(model) = model {
-            self.projections.set_model(
+            self.projections.record_sent_model(
                 session_id,
-                Some(ModelIdentity {
+                ModelIdentity {
                     provider_id: model.provider_id.clone(),
                     model_id: model.id.clone(),
                     variant: None,
-                }),
+                },
             );
         }
         Ok(())
@@ -2905,6 +2913,56 @@ mod tests {
             answering.model.as_ref().map(|model| model.model_id.as_str()),
             Some("gpt-6-luna"),
             "a refused turn/start changed nothing on the thread"
+        );
+    }
+
+    /// A server that omits the model field must not erase what cola just
+    /// picked (review round 2): silence is not evidence against cola's own
+    /// accepted `turn/start`, while a name the server gave IS dropped on
+    /// silence (the test above). Same rule, seen from the two sources.
+    #[tokio::test]
+    async fn a_silent_read_keeps_the_models_cola_picked() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.push_item("thread-1", "item-1", "one");
+        wait_for_text(&client, "thread-1", "one").await;
+
+        let pick = ModelInfo {
+            id: "gpt-5.5".into(),
+            provider_id: "opencode-go".into(),
+            variant: None,
+        };
+        client
+            .prompt("thread-1", "run it", &[], &[], Some(&pick), None, None, None)
+            .await
+            .expect("the prompt");
+
+        // The server stops naming a model on the wire.
+        server.set_thread_model("thread-1", None, None);
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        assert!(info.model.is_none(), "the read itself names nothing");
+
+        let transcript = client.transcript("thread-1").await.expect("the read");
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the assistant item");
+        assert_eq!(
+            answering.model.as_ref().map(|model| model.model_id.as_str()),
+            Some("gpt-5.5"),
+            "an omitted field must not erase the model cola sent"
         );
     }
 
