@@ -396,6 +396,8 @@ struct State {
     models: std::sync::Mutex<Vec<Value>>,
     /// The `config/read` answer (layers included), or the empty default.
     config_read: std::sync::Mutex<Value>,
+    /// `config/read` params received, in send order.
+    config_read_params: std::sync::Mutex<Vec<Value>>,
     /// `config/read` calls received.
     config_read_calls: AtomicUsize,
     /// The page size `model/list` uses when the caller sends no `limit`.
@@ -486,6 +488,7 @@ impl Default for State {
                 "layers": [],
                 "origins": {},
             })),
+            config_read_params: std::sync::Mutex::new(Vec::new()),
             config_read_calls: AtomicUsize::new(0),
             model_page_size: AtomicUsize::new(50),
             skills: std::sync::Mutex::new(Vec::new()),
@@ -1033,6 +1036,15 @@ impl FakeServer {
     /// `config/read` calls received.
     pub(crate) fn config_read_calls(&self) -> usize {
         self.state.config_read_calls.load(Ordering::SeqCst)
+    }
+
+    /// Every `config/read` request's params, in send order.
+    pub(crate) fn config_read_params(&self) -> Vec<Value> {
+        self.state
+            .config_read_params
+            .lock()
+            .expect("config read params")
+            .clone()
     }
 
     /// The page size `model/list` uses when the caller sends no `limit`.
@@ -1655,6 +1667,11 @@ where
         }
         Some("config/read") => {
             state.config_read_calls.fetch_add(1, Ordering::SeqCst);
+            state
+                .config_read_params
+                .lock()
+                .expect("config read params")
+                .push(params.clone());
             let result = state.config_read.lock().expect("config read").clone();
             replying(sink, id, result).await
         }

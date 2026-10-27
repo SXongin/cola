@@ -631,6 +631,10 @@ impl SessionsHandle {
             .model_surface(crate::backend::types::ModelSurfaceQuery {
                 scope: Some("provider"),
                 selected: Some(provider),
+                // This lookup runs on a card callback's short ack budget and
+                // needs only the advertised variants: no config read, no
+                // provider probe, no session context.
+                catalog_only: true,
                 ..Default::default()
             })
             .await
