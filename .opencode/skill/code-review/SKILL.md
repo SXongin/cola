@@ -26,7 +26,7 @@ Run the `adversarial-review` skill over the **same base** and, when one was give
 
 *When* a re-review runs and who routes the fix are `docs/agents/flow.md`; this is the mechanics.
 
-A fix round at the **same scope** resumes the sessions of the reviewers that raised the findings — all three — instead of dispatching fresh ones. Keep each reviewer's session id from the first round; `foreman` and `implement-spec` hold it for the lifetime of a ticket.
+A fix round at the **same scope** resumes the sessions of the reviewers that raised the findings — all three — instead of dispatching fresh ones. Keep each reviewer's session id from the first round; `implement-spec` holds it for the lifetime of a ticket.
 
 The resumed prompt carries:
 

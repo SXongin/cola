@@ -14,7 +14,7 @@ Input: optional skill ids. Default: every local skill, `.opencode/skill/*/SKILL.
 
 ## 1. Enumerate the shadows
 
-List `.opencode/skill/<id>/SKILL.md`. Each one's upstream is `~/.agents/skills/<id>/SKILL.md`. A local skill with **no** upstream is cola's own (`foreman`, `adversarial-review`, `upgrade-skills`) — skip it, there is nothing to fold.
+List `.opencode/skill/<id>/SKILL.md`. Each one's upstream is `~/.agents/skills/<id>/SKILL.md`. A local skill with **no** upstream is cola's own (`adversarial-review`, `upgrade-skills`) — skip it, there is nothing to fold.
 
 ## 2. Classify: compose or fork
 
