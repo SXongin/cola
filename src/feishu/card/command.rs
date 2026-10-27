@@ -755,6 +755,8 @@ pub(crate) async fn model_surface(
             current,
             scope,
             selected,
+            // A card page, not `/think`'s variant lookup: the full surface.
+            catalog_only: false,
         })
         .await
 }

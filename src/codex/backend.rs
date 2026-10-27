@@ -2093,13 +2093,12 @@ impl Backend for CodexClient {
     /// back to this same page (with the bridge's back button) rather than
     /// pretending to change the thread's channel.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
-        // The bridge's variant lookup (`/think`'s model check) is the only
-        // drilled read without a session: it names a scope but neither a
-        // session nor a directory. It must stay cheap — a card callback runs on
-        // a short ack budget — so it reads the catalog only and never touches
-        // config or a provider's `/models`. A root page (`scope` absent), even a
-        // Pending Session's, keeps the full surface.
-        let fast = query.scope.is_some() && query.session_id.is_none();
+        // `/think`'s variant lookup is the one caller that asks for the bare
+        // catalog (`catalog_only`): it runs on a card callback's short ack
+        // budget and needs only the advertised variants. Every card page —
+        // a root page or a Pending Session's drilled provider read — keeps the
+        // full surface: config providers, presets and probes.
+        let fast = query.catalog_only;
         let (catalog, config) = if fast {
             (
                 Backend::list_models(self).await,
@@ -4707,6 +4706,10 @@ mod tests {
         let surface = Backend::model_surface(&client, query()).await;
 
         assert_eq!(server.config_read_calls(), 1);
+        let params = server.config_read_params();
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0]["includeLayers"], true, "layers are required");
+        assert_eq!(params[0]["cwd"], "/work/cola", "the project scope is resolved");
         assert_eq!(probed.request_count(), 1);
         assert_eq!(surface.scopes.len(), 2);
         let model = &surface.scopes[0];
@@ -4787,6 +4790,7 @@ mod tests {
             crate::backend::types::ModelSurfaceQuery {
                 scope: Some("provider"),
                 selected: Some("codex"),
+                catalog_only: true,
                 ..Default::default()
             },
         )
@@ -4800,6 +4804,57 @@ mod tests {
         );
         assert_eq!(server.config_read_calls(), 0, "the cheap read never asks config");
         assert_eq!(probed.request_count(), 0, "and never probes a provider");
+    }
+
+    /// A Pending Session's drilled provider read has a directory but no session
+    /// id. Only `/think`'s explicit `catalog_only` read skips config — this page
+    /// is a card page, so the provider options survive the click.
+    #[tokio::test]
+    async fn a_pending_sessions_drilled_provider_read_keeps_its_options() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_models(vec![
+            json!({ "id": "gpt-5.1-codex", "supportedReasoningEfforts": [] }),
+        ]);
+        server.set_config_read(json!({
+            "config": {},
+            "layers": [{
+                "name": { "type": "user" },
+                "version": "v1",
+                "config": {
+                    "model_providers": {
+                        "deepseek": { "name": "DeepSeek" },
+                        "opencode-go": { "name": "OpenCode Go" }
+                    }
+                }
+            }]
+        }));
+        let client = connect(&url).await;
+
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("deepseek"),
+                directory: Some("/work/cola"),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            server.config_read_calls(),
+            1,
+            "a card page reads config even without a session id"
+        );
+        let providers: Vec<&str> = surface.scopes[1]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect();
+        assert_eq!(providers, ["deepseek", "opencode-go"], "the options survive");
+        let params = server.config_read_params();
+        assert_eq!(params[0]["includeLayers"], true);
+        assert_eq!(params[0]["cwd"], "/work/cola");
     }
 
     /// A profile preset's callback value reaches the next `turn/start` as its

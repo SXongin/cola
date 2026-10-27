@@ -233,6 +233,11 @@ pub struct ModelSurfaceQuery<'a> {
     /// The option tapped on the parent page that selected [`Self::scope`]
     /// (OpenCode: the provider id).
     pub selected: Option<&'a str>,
+    /// Ask for the bare catalog only, with no config read and no provider
+    /// probe. Set **only** by `/think`'s context-free variant lookup, which runs
+    /// on a card callback's short ack budget; every card page — including a
+    /// Pending Session's drilled provider page — leaves it false.
+    pub catalog_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
