@@ -434,8 +434,17 @@ pub(crate) fn header_title_and_template(
             if let Some(tool) = running_tool {
                 // One icon only: `status_icon` already marks running/pending
                 // with ⏳, so an extra hardcoded 🔧 would show TWO icons
-                // (e.g. "🔧 ⏳ bench") on long-running tools.
-                (format!("{} {}", tool.status_icon(), tool.name()), "orange")
+                // (e.g. "🔧 ⏳ bench") on long-running tools. The name goes
+                // through the panel's display mapping, so a Codex item kind
+                // reads "命令" here too, never `codex/command_execution`.
+                (
+                    format!(
+                        "{} {}",
+                        tool.status_icon(),
+                        super::tool_render::tool_display_name(tool)
+                    ),
+                    "orange",
+                )
             } else {
                 ("✍️ 回复中".to_string(), "blue")
             }
@@ -911,6 +920,23 @@ mod tests {
             header
         );
         assert_eq!(card["header"]["template"].as_str().unwrap(), "orange");
+    }
+
+    /// A running Codex command reaches the header with the same display mapping
+    /// the panel uses — never the adapter's namespaced id.
+    #[test]
+    fn a_running_codex_command_shows_its_display_name_in_the_header() {
+        let tool = ToolPanel::for_test(
+            "codex/command_execution",
+            ToolStatus::Running,
+            Some(json!({"command": "cargo test", "cwd": "/w"})),
+            None,
+        );
+        let card = CardBuilder::new()
+            .with_state(CardState::Streaming)
+            .with_tool(tool)
+            .build();
+        assert_eq!(card["header"]["title"]["content"].as_str().unwrap(), "⏳ 命令");
     }
 
     /// A card whose slice has NO tool panel still shows the Turn's running tool
