@@ -17,7 +17,7 @@ use crate::bridge::handles::CardsHandle;
 use crate::bridge::tasks::TaskCell;
 use crate::bridge::tasks::model::TaskRunId;
 use crate::feishu::card::first_n_chars_bytes;
-use crate::feishu::card::ledger::{TaskCompletionEntry, TaskKind, TaskLedgerRow};
+use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskLedgerRow};
 use crate::feishu::card::shell::CardBuilder;
 use crate::feishu::card::tool_render::{FileDelivery, TaskLiveness, ToolPanel, is_task_tool};
 use crate::feishu::card::{AwaitingAction, CardState, format_tokens};
@@ -543,43 +543,55 @@ pub(super) struct SliceFingerprint {
 
 impl SliceFingerprint {
     fn of(items: &[TimelineItem]) -> Self {
-        let mut content = 0u64;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for item in items {
-            content = content.wrapping_mul(31).wrapping_add(item.seq);
-            content = content
-                .wrapping_mul(31)
-                .wrapping_add(slice_content_len(&item.kind) as u64);
-            content = content
-                .wrapping_mul(31)
-                .wrapping_add(item.lead.as_deref().map_or(0, str::len) as u64);
+            item.seq.hash(&mut hasher);
+            hash_slice_content(&item.kind, &mut hasher);
+            item.lead.hash(&mut hasher);
         }
         Self {
             entries: items.len(),
-            content,
+            content: hasher.finish(),
         }
     }
 }
 
-/// The part of a timeline entry that can change IN PLACE while a card write is
+/// Hash the content a timeline entry can change IN PLACE while a card write is
 /// in flight: streamed text/reasoning, an updated compaction row, a receipt's
-/// line. A settled tool panel is immutable and lives in `tools`, so its entry
-/// only carries the call id.
-fn slice_content_len(kind: &TimelineKind) -> usize {
+/// line. Values are hashed, not lengths, so a same-length rewrite (a compaction
+/// summary swapping one sentence for another) is still detected. A settled tool
+/// panel is immutable and lives in `tools`, so its entry only carries the call
+/// id.
+fn hash_slice_content(kind: &TimelineKind, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
     match kind {
         TimelineKind::Text(text)
         | TimelineKind::Reasoning(text)
         | TimelineKind::Receipt(text)
-        | TimelineKind::UserMessage(text) => text.len(),
-        TimelineKind::Tool(call_id) => call_id.len(),
-        TimelineKind::LedgerEntry(entry, _) => entry.label.as_deref().map_or(0, str::len),
-        TimelineKind::Compaction(compaction) => {
-            compaction.summary.len()
-                + compaction.error.as_deref().map_or(0, str::len)
-                + match compaction.status {
-                    crate::backend::CompactionStatus::Running => 0,
-                    crate::backend::CompactionStatus::Completed => 1,
-                    crate::backend::CompactionStatus::Failed => 2,
+        | TimelineKind::UserMessage(text) => text.hash(hasher),
+        TimelineKind::Tool(call_id) => call_id.hash(hasher),
+        TimelineKind::LedgerEntry(entry, ending) => {
+            entry.label.hash(hasher);
+            entry.id.hash(hasher);
+            entry.started_at.hash(hasher);
+            entry.finished_at.hash(hasher);
+            match &entry.ending {
+                TaskEnding::Wake { state } => {
+                    0u8.hash(hasher);
+                    state.hash(hasher);
                 }
+                TaskEnding::RuntimeEnded => 1u8.hash(hasher),
+                TaskEnding::Lost => 2u8.hash(hasher),
+                TaskEnding::Cleaned => 3u8.hash(hasher),
+            }
+            ending.is_some().hash(hasher);
+        }
+        TimelineKind::Compaction(compaction) => {
+            compaction.status.hash(hasher);
+            compaction.reason.hash(hasher);
+            compaction.summary.hash(hasher);
+            compaction.error.hash(hasher);
         }
     }
 }
@@ -5478,6 +5490,29 @@ mod tests {
     use super::*;
     use crate::backend::{BackgroundTask, ToolIdentity, ToolStatus};
     use crate::feishu::card::MAX_CARD_TEXT_CHARS;
+
+    /// The slice fingerprint hashes VALUES, not lengths (issue #886 review): a
+    /// compaction summary rewritten to a same-length sentence changes the
+    /// fingerprint, so an in-flight rewrite is never skipped.
+    #[test]
+    fn a_same_length_compaction_rewrite_changes_the_slice_fingerprint() {
+        let source = || PartSource::at(crate::backend::MessageId::new("msg_1"), 0);
+        let compaction = |summary: &str| crate::backend::Compaction {
+            status: crate::backend::CompactionStatus::Running,
+            reason: crate::backend::CompactionReason::Auto,
+            summary: summary.to_string(),
+            usage: None,
+            error: None,
+            recent: String::new(),
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_compaction_at(Some(1_000), source(), &compaction("abc"));
+        let before = acc.slice_fingerprint(0, acc.timeline_len());
+        acc.push_compaction_at(Some(1_000), source(), &compaction("xyz"));
+        let after = acc.slice_fingerprint(0, acc.timeline_len());
+        assert_eq!(acc.timeline_len(), 1, "the row was replaced in place");
+        assert_ne!(before, after, "a same-length rewrite must change the fingerprint");
+    }
 
     #[test]
     fn card_footer_shows_directory_model_and_context() {

@@ -568,3 +568,40 @@ Consequences:
   removal share the release's single write.
 
 Related: ADR-0082, #721, ADR-0069.
+
+## Amendment (2026-10-27): a twice-refused payload is abandoned, and the cursor may pass it (issue #886)
+
+The Decision bullet **"Advance only on a confirmed write"** ends "a permanent
+refusal or a failed create drops the stage, so a write that reached no card can
+never hide content from a later recovery." That still holds for the stage the
+refused write carried. It is narrowed for the slice itself: when Feishu refuses
+the SAME payload twice (plain and fenced), the flush now **abandons the slice**
+rather than the card — it skips the refused timeline range, leaves one visible
+`⚠️ 部分内容未能显示` marker on the continuation, and continues the chain on a
+NEW card (issue #886). The continuation's confirmed create advances the record's
+cursor past content no card received.
+
+That is the ONE deliberate exception to "the frontier is content confirmed
+delivered": a cursor is a single frontier and cannot express "later content
+delivered, earlier content dropped", so the drop is recorded where the user can
+see it — the marker on the card — and at WARN with the payload's size,
+component count and slice. The alternative (never advancing the cursor) would
+re-render the refused content forever, which is the failure #886 is about.
+
+Two guards keep the exception narrow:
+
+- **Only refused content is dropped.** The build fingerprints its slice's
+  content (a hash of the entries' values, not their lengths); if a streaming
+  text/reasoning part or an updated compaction row changed while the refused
+  write was in flight, the slice is NOT skipped: the boundary is kept and the
+  grown slice is attempted on the next flush. A slice is abandoned only when it
+  is byte-for-byte what Feishu refused.
+- **Bounded.** At most two consecutive abandonments per Turn without a
+  delivered write; a delivered write clears the budget. A card whose SHELL is
+  refused has nothing to skip, keeps the conservative refusal, and retries on
+  the next flush.
+
+The `Forbid` ledger refresh (ADR-0060) keeps the old latch: it must never post
+a new card, so it cannot abandon a slice.
+
+Related: #886, ADR-0060, ADR-0069, ADR-0072.

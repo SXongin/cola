@@ -748,17 +748,22 @@ pub(super) async fn flush_card_locked(
                         true
                     }
                     Err(e) => {
+                        let content_rejected = is_card_content_rejected(&e);
                         log_card_rejection(
                             cards,
                             session_id,
                             &e,
-                            "update refused; fallback None/Fenced -> Fenced/Suspended",
+                            if content_rejected {
+                                "content refused; fallback None/Fenced -> Fenced/Suspended"
+                            } else {
+                                "permanent refusal; fallback unchanged"
+                            },
                             &built.card,
                             slice_from,
                             built.end,
                         )
                         .await;
-                        if is_card_content_rejected(&e) {
+                        if content_rejected {
                             match advance_card_fallback(cards, session_id).await {
                                 // Feishu refused the content: rebuild the SAME
                                 // slice with every markdown element fenced and
@@ -989,17 +994,22 @@ pub(super) async fn flush_card_locked(
                         true
                     }
                     Err(e) => {
+                        let content_rejected = is_card_content_rejected(&e);
                         log_card_rejection(
                             cards,
                             session_id,
                             &e,
-                            "finalized update refused; fallback None/Fenced -> Fenced/Suspended",
+                            if content_rejected {
+                                "finalized content refused; fallback None/Fenced -> Fenced/Suspended"
+                            } else {
+                                "finalized permanent refusal; fallback unchanged"
+                            },
                             &finalized.card,
                             slice_from,
                             finalized.end,
                         )
                         .await;
-                        if is_card_content_rejected(&e) {
+                        if content_rejected {
                             if matches!(
                                 advance_card_fallback(cards, session_id).await,
                                 FallbackAdvance::RetryFenced
@@ -1271,11 +1281,16 @@ pub(super) async fn flush_card_locked(
                 // next slice's card.
             }
             Err(e) => {
+                let content_rejected = is_card_content_rejected(&e);
                 log_card_rejection(
                     cards,
                     session_id,
                     &e,
-                    "continuation create refused; fallback None/Fenced -> Fenced/Suspended",
+                    if content_rejected {
+                        "continuation content refused; fallback None/Fenced -> Fenced/Suspended"
+                    } else {
+                        "continuation permanent refusal; fallback unchanged"
+                    },
                     &built.card,
                     slice_from,
                     built.end,
@@ -1293,7 +1308,6 @@ pub(super) async fn flush_card_locked(
                     &built.rendered_endings,
                 )
                 .await;
-                let content_rejected = is_card_content_rejected(&e);
                 let retry_fenced = content_rejected
                     && matches!(
                         advance_card_fallback(cards, session_id).await,
@@ -2021,6 +2035,40 @@ mod tests {
         let (bytes, components) = super::card_payload_metrics(&card);
         assert_eq!(components, 5, "every tagged element counts: {card}");
         assert_eq!(bytes, serde_json::to_string(&card).unwrap().len());
+    }
+
+    /// The production rejection WARN carries the payload's exact metrics and
+    /// the fallback transition (issue #886): a test that only checked the
+    /// helper would pass with the log call removed.
+    #[tokio::test]
+    async fn the_rejection_warn_records_the_payload_and_transition() {
+        let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        let (_, logs) = capture_logs(async {
+            Turn::flush_card(&app.cards_handle(), "ses_test").await;
+        })
+        .await;
+
+        let first = assert_line_level(&logs, "Card update failed", "WARN");
+        assert!(
+            first.contains("components") && first.contains("bytes"),
+            "the WARN carries the payload's exact size: {first}"
+        );
+        assert!(
+            first.contains("fallback Some(None)"),
+            "the first attempt records the pre-fallback state: {first}"
+        );
+        assert!(
+            logs.contains("fallback Some(Fenced)"),
+            "the fenced retry records its own state:\n{logs}"
+        );
+        assert!(
+            logs.contains("Fenced -> Suspended"),
+            "the abandoned payload records the transition:\n{logs}"
+        );
     }
 
     /// The abandonment budget bounds the continuation cards a broken card can
