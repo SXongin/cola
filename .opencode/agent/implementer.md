@@ -1,5 +1,5 @@
 ---
-description: Implements one ticket end-to-end on the branch a foreman or implement-spec batch prepared, committing Conventional Commits and reporting back. Dispatched by the batch flow; never reviews, pushes, or touches other tickets.
+description: Implements one ticket end-to-end on the branch an implement-spec batch prepared, committing Conventional Commits and reporting back. Dispatched by the batch flow; never reviews, pushes, or touches other tickets.
 mode: subagent
 permissions:
   - action: subagent

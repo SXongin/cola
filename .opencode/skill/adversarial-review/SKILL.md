@@ -17,7 +17,7 @@ Do not invent the checks. The sub-agent lifts its `## The adversarial pass (the 
 
 ### 1. Pin the base
 
-Whatever the caller names for the **base**: a branch, a SHA, or a **ticket window** — the run of commits carrying one ticket's `Refs: #<n>` trailer, with the base at the commit before the run (the `foreman` window definition). Default the base to `main` when none is given. A caller may also scope the review to a **pathspec** (a subset of the touched files) — carry it through to both commands.
+Whatever the caller names for the **base**: a branch, a SHA, or a **ticket window** — the run of commits carrying one ticket's `Refs: #<n>` trailer, with the base at the commit before the run (the `implement-spec` window definition). Default the base to `main` when none is given. A caller may also scope the review to a **pathspec** (a subset of the touched files) — carry it through to both commands.
 
 Confirm the base resolves (`git rev-parse <base>`). Review with the gate's merge-base semantics: `BASE=$(git merge-base <base> HEAD)`, then `git diff "$BASE"` (add `-- <paths>` when scoped) — the scope of CI's `git diff <base>...HEAD`, extended to the working tree so committed, staged, and unstaged work are all in scope. That diff still omits **untracked** files, so list them with `git ls-files --others --exclude-standard` (add `-- <paths>` when scoped) and hand the reviewer the **paths** — it reads each one itself and reports any it could not. The commit list is `git log <base>..HEAD --oneline` (add `-- <paths>` when scoped). Fail here when the diff and the untracked list are both empty, never inside the sub-agent.
 
