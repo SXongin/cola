@@ -163,5 +163,6 @@ shape-gated:
 
 Each arm additionally requires the **whole** input shape the adapter writes (not
 one key), so even a tool that squats the namespaced id with a partial payload
-falls through to raw. The boundary is otherwise unchanged: a payload whose shape
+falls through to raw. `fileChange`'s shape includes the empty `changes` list the
+adapter emits at `item/started` and fills through `patchUpdated`. The boundary is otherwise unchanged: a payload whose shape
 cola's own adapter did not write stays raw, and no third-party id is renamed.
