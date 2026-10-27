@@ -359,7 +359,7 @@ async fn drilled_model_page_does_not_resolve_the_current_selection() {
     .await;
 
     let handles = app.command_handles();
-    let root = crate::feishu::card::command::model_surface(&handles, &key, None, None).await;
+    let root = crate::feishu::card::command::model_surface(&handles, &key, None, None, None).await;
     assert!(
         root.current.is_some(),
         "the root page still shows the resolved current model"
@@ -371,8 +371,14 @@ async fn drilled_model_page_does_not_resolve_the_current_selection() {
     );
 
     session_info_calls.lock().await.clear();
-    let drilled =
-        crate::feishu::card::command::model_surface(&handles, &key, Some("provider"), Some("opencode")).await;
+    let drilled = crate::feishu::card::command::model_surface(
+        &handles,
+        &key,
+        Some("provider"),
+        Some("opencode"),
+        Some(std::time::Duration::from_secs(2)),
+    )
+    .await;
     assert!(
         drilled.current.is_none(),
         "a drilled page carries no current selection"

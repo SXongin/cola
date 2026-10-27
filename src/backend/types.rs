@@ -25,6 +25,8 @@
 
 #![allow(dead_code)] // protocol types — field coverage matches server contract
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +240,12 @@ pub struct ModelSurfaceQuery<'a> {
     /// on a card callback's short ack budget; every card page — including a
     /// Pending Session's drilled provider page — leaves it false.
     pub catalog_only: bool,
+    /// When this read answers a card callback, that callback's total budget
+    /// (Feishu's 2 s ack budget). An adapter must fit callback-originated
+    /// network work inside it; `None` means the read is not callback-bound (a
+    /// command's page). OpenCode ignores it; Codex derives its config-read
+    /// slice from it and serves probe answers from cache only.
+    pub ack_budget: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

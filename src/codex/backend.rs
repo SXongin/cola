@@ -2095,15 +2095,14 @@ impl Backend for CodexClient {
     ///
     /// # Read budgets
     ///
-    /// A root `/model` page is a text command and keeps full fidelity: its
-    /// config read gets [`super::model_surface::CONFIG_READ_TIMEOUT`] (2 s) and
-    /// its probes get the fresh 2 s each, concurrently.
+    /// A root `/model` page is a text command, so `query.ack_budget` is `None`:
+    /// it keeps full fidelity, with a [`super::model_surface::CONFIG_READ_TIMEOUT`]
+    /// (2 s) config read and fresh probes (2 s each, concurrent).
     ///
-    /// A **drilled** page is a card callback, answered under
-    /// [`crate::feishu::ws::CARD_ACK_BUDGET`] (2 s). It cannot chain those two
-    /// waits, so config gets only
-    /// [`crate::codex::model_surface::DRILLED_CONFIG_READ_TIMEOUT`] (600 ms), probes are
-    /// served **cache-only** (zero network), and the only remaining await is the
+    /// A **drilled** page is a card callback and arrives with `ack_budget =
+    /// Some(budget)`. It cannot chain those two waits, so its config read gets
+    /// only `budget - 1.4 s` (600 ms out of a 2 s budget), probes are served
+    /// **cache-only** (zero network), and the only remaining await is the
     /// catalog's one websocket round-trip — leaving the ack card's render and
     /// response well inside the budget. A cold drilled click therefore shows
     /// the providers without their probed models; the next root open fills them.
@@ -2114,23 +2113,22 @@ impl Backend for CodexClient {
         // a root page or a Pending Session's drilled provider read — keeps the
         // full config/provider shape.
         let fast = query.catalog_only;
-        // A drilled page (a provider click) is the card-callback shape; the root
-        // page is not. `catalog_only` never reaches the config/probe path.
-        let drilled = query.scope.is_some() && !fast;
+        // A callback-originated read carries its budget; a command's page does
+        // not. `catalog_only` never reaches the config/probe path.
+        let callback = query.ack_budget.is_some();
         let (catalog, config) = if fast {
             (
                 Backend::list_models(self).await,
                 super::model_surface::CodexModelConfig::default(),
             )
         } else {
-            let timeout = if drilled {
-                crate::codex::model_surface::DRILLED_CONFIG_READ_TIMEOUT
-            } else {
-                super::model_surface::CONFIG_READ_TIMEOUT
-            };
             let (catalog, config) = tokio::join!(
                 Backend::list_models(self),
-                super::model_surface::read_config(self.connection(), query.directory, timeout)
+                super::model_surface::read_config(
+                    self.connection(),
+                    query.directory,
+                    super::model_surface::config_read_timeout(query.ack_budget),
+                )
             );
             let config = config.unwrap_or_else(|error| {
                 tracing::debug!(
@@ -2145,7 +2143,7 @@ impl Backend for CodexClient {
         };
         let probes = if fast {
             Default::default()
-        } else if drilled {
+        } else if callback {
             // A callback must not start a probe: 2 s of network on top of the
             // config read would miss the ack budget. The previous root open
             // already warmed this cache; a cold click simply omits the groups.
@@ -4872,6 +4870,9 @@ mod tests {
                 scope: Some("provider"),
                 selected: Some("deepseek"),
                 directory: Some("/work/cola"),
+                // A provider click is a card callback; 2 s mirrors the
+                // bridge's ack budget without naming the Feishu layer here.
+                ack_budget: Some(Duration::from_secs(2)),
                 ..Default::default()
             },
         )
@@ -4922,6 +4923,9 @@ mod tests {
                 scope: Some("provider"),
                 selected: Some("deepseek"),
                 directory: Some("/work/cola"),
+                // A provider click is a card callback; 2 s mirrors the
+                // bridge's ack budget without naming the Feishu layer here.
+                ack_budget: Some(Duration::from_secs(2)),
                 ..Default::default()
             },
         )
@@ -4930,12 +4934,12 @@ mod tests {
 
         assert_eq!(server.config_read_calls(), 1, "the read was sent");
         assert!(
-            elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
-            "a drilled read took {elapsed:?}, past the 2s ack budget"
+            elapsed < Duration::from_secs(2),
+            "a callback read took {elapsed:?}, past the 2s ack budget"
         );
         assert!(
-            elapsed >= crate::codex::model_surface::DRILLED_CONFIG_READ_TIMEOUT,
-            "the drilled read should wait for its 600ms config slice, took {elapsed:?}"
+            elapsed >= Duration::from_millis(600),
+            "the callback read should wait for its 600ms config slice, took {elapsed:?}"
         );
         let note = surface.scopes[1].note.as_deref().unwrap_or_default();
         assert!(note.contains("读不到 config"), "note: {note}");
