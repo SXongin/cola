@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::backend::types::{SessionListInfo, SessionTime};
-use crate::config::{ApprovalPolicy, SandboxMode};
+use crate::config::{ApprovalPolicy, ReasoningSummary, SandboxMode};
 
 use super::error::{CodexError, Result};
 use super::transport::{Inbound, RpcConnection};
@@ -272,21 +272,28 @@ struct UnsubscribeResponse {
     status: UnsubscribeStatus,
 }
 
-/// The per-thread sandbox and approval policy cola asks the daemon to apply
-/// (issue #898). Both are optional: an unset one sends nothing, so the daemon's
-/// own default stays in force — the behaviour before this existed.
+/// The per-thread settings cola asks the daemon to apply (issues #898, #900).
+/// The sandbox/approval pair is optional: an unset one sends nothing, so the
+/// daemon's own default stays in force — the behaviour before this existed. The
+/// reasoning summary is optional in the same sense, but the client's config
+/// always names one (`auto` by default), because the daemon's own default
+/// leaves the model's reasoning invisible on the card.
 ///
-/// This is the **only** lever in the released schema: named permission profiles
-/// (`[permissions.<name>]`, defined in the daemon's own config — the middle
-/// ground where `.git`/`.codex` are writable while the rest stays sandboxed) are
-/// not client-schema fields, so cola cannot select one. Mutating the daemon's
-/// config instead is not cola's to do: the daemon is shared, may be started by
-/// the user's own client, and carries their provider tokens.
+/// These are the **only** levers in the released schema: named permission
+/// profiles (`[permissions.<name>]`, defined in the daemon's own config — the
+/// middle ground where `.git`/`.codex` are writable while the rest stays
+/// sandboxed) are not client-schema fields, so cola cannot select one. Mutating
+/// the daemon's config instead is not cola's to do: the daemon is shared, may be
+/// started by the user's own client, and carries their provider tokens.
 ///
-/// Both fields are in the **pinned** 0.163 `ThreadStartParams` and
+/// Every field is in the **pinned** 0.163 `ThreadStartParams` and
 /// `ThreadResumeParams` (checked with `codex-cli 0.163.0 app-server
 /// generate-json-schema`), with the same value sets, so no version gate guards
-/// them.
+/// them. The summary is a config override rather than `TurnStartParams.summary`:
+/// the live 0.163 daemon ignores the turn-level field (a turn asked for
+/// `detailed` still recorded `none`), while the same value under
+/// `thread/start`'s `config` takes effect and streams
+/// `item/reasoning/summaryTextDelta`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ThreadSettings {
     /// `thread/start`'s `sandbox`.
@@ -297,12 +304,14 @@ pub(crate) struct ThreadSettings {
     /// default: an adopted thread may be shared with the user's own
     /// TUI/VSCode, and a silent override would change their session as well.
     pub(crate) apply_on_adopt: bool,
+    /// `thread/start`'s `config.model_reasoning_summary` (issue #900).
+    pub(crate) reasoning_summary: Option<ReasoningSummary>,
 }
 
 impl ThreadSettings {
-    /// Merge the pair into a request's params. The caller decides whether the
-    /// request may carry them: `thread/start` always may, `thread/resume` only
-    /// for a client that set `apply_on_adopt`.
+    /// Merge the overrides into a request's params. The caller decides whether
+    /// the request may carry them: `thread/start` always may, `thread/resume`
+    /// only for a client that set `apply_on_adopt`.
     fn add_overrides(self, params: &mut Value) {
         if let Some(sandbox) = self.sandbox {
             params["sandbox"] = json!(sandbox.as_str());
@@ -310,17 +319,21 @@ impl ThreadSettings {
         if let Some(policy) = self.approval_policy {
             params["approvalPolicy"] = json!(policy.as_str());
         }
+        if let Some(summary) = self.reasoning_summary {
+            params["config"] = json!({ "model_reasoning_summary": summary.as_str() });
+        }
     }
 }
 
 impl From<&crate::config::CodexConfig> for ThreadSettings {
-    /// The active client's options are the source: the same three keys the
-    /// file spells are the ones the thread requests carry.
+    /// The active client's options are the source: the same keys the file
+    /// spells are the ones the thread requests carry.
     fn from(config: &crate::config::CodexConfig) -> Self {
         Self {
             sandbox: config.sandbox,
             approval_policy: config.approval_policy,
             apply_on_adopt: config.apply_on_adopt,
+            reasoning_summary: Some(config.reasoning_summary),
         }
     }
 }
@@ -333,8 +346,8 @@ pub(crate) struct Threads {
     /// not by [`Threads`], so a subscription taken from a client that is later
     /// dropped still receives its stream.
     registry: Arc<Registry>,
-    /// The sandbox/approval overrides this client's threads are asked to run
-    /// under (issue #898); `Default` sends nothing.
+    /// The overrides this client's threads are asked to run under (issues #898,
+    /// #900); `Default` sends nothing.
     settings: ThreadSettings,
 }
 
@@ -499,8 +512,9 @@ impl Threads {
     /// `cwd` scopes it to the session's directory when the caller has one.
     /// The response is the same [`Thread`] `thread/read` returns.
     ///
-    /// The configured `sandbox`/`approvalPolicy` ride along: cola creates this
-    /// thread, so it owns the choice (issue #898). Unset sends nothing.
+    /// The configured sandbox/approval pair and reasoning summary ride along:
+    /// cola creates this thread, so it owns the choice (issues #898, #900).
+    /// Unset sends nothing.
     pub(crate) async fn start(&self, cwd: Option<&str>) -> Result<Thread> {
         let mut params = json!({});
         if let Some(cwd) = cwd {
@@ -516,9 +530,10 @@ impl Threads {
     /// amendment, question 2). The receiver is registered **before** the call,
     /// so a turn that starts while the response is in flight is not lost.
     ///
-    /// The sandbox/approval overrides ride along only when the client opted in
+    /// The overrides ride along only when the client opted in
     /// (`apply_on_adopt`): a resumed thread may be shared with the user's own
-    /// client, so adopting alone must not change their session (issue #898).
+    /// client, so adopting alone must not change their session (issues #898,
+    /// #900).
     pub(crate) async fn adopt(&self, thread_id: &str) -> Result<Adoption> {
         // The holder is counted before the await and released by `guard`'s
         // `Drop` on every exit that does not hand it to a returned
@@ -858,6 +873,7 @@ mod tests {
                 sandbox: Some(SandboxMode::DangerFullAccess),
                 approval_policy: Some(ApprovalPolicy::OnRequest),
                 apply_on_adopt: false,
+                reasoning_summary: None,
             },
         )
         .await;
@@ -870,6 +886,63 @@ mod tests {
         assert_eq!(params[0]["cwd"], "/work/cola");
         assert_eq!(params[0]["sandbox"], "danger-full-access");
         assert_eq!(params[0]["approvalPolicy"], "on-request");
+    }
+
+    /// Issue #900: the reasoning summary is a `thread/start` config override.
+    /// The daemon's own default on the pinned build is `none`, so a client that
+    /// did not set one would keep every reasoning item empty; the adapter's
+    /// config always names it, and `thread/resume` stays opt-in like the rest.
+    #[tokio::test]
+    async fn thread_start_carries_the_reasoning_summary_and_resume_only_when_opted_in() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        let settings = ThreadSettings {
+            reasoning_summary: Some(ReasoningSummary::Detailed),
+            ..ThreadSettings::default()
+        };
+        let client = connect_with(&url, settings).await;
+
+        client.threads().start(Some("/work/cola")).await.expect("start");
+        let params = server.start_params();
+        assert_eq!(
+            params[0]["config"],
+            json!({ "model_reasoning_summary": "detailed" }),
+            "the summary rides thread/start's config: {params:?}"
+        );
+        assert!(
+            params[0].get("sandbox").is_none() && params[0].get("approvalPolicy").is_none(),
+            "the summary alone must not invent the other overrides: {params:?}"
+        );
+
+        let Adoption::Subscribed(_first) = client.threads().adopt("thread-1").await.expect("adopt") else {
+            panic!("must subscribe");
+        };
+        assert_eq!(
+            server.resume_params(),
+            vec![json!({ "threadId": "thread-1" })],
+            "adopting alone must not reconfigure a shared thread"
+        );
+
+        let opted_in = ThreadSettings {
+            reasoning_summary: Some(ReasoningSummary::Auto),
+            apply_on_adopt: true,
+            ..ThreadSettings::default()
+        };
+        let client = connect_with(&url, opted_in).await;
+        let Adoption::Subscribed(_second) = client.threads().adopt("thread-1").await.expect("adopt") else {
+            panic!("must subscribe");
+        };
+        let params = server.resume_params();
+        assert_eq!(
+            params[1]["config"],
+            json!({ "model_reasoning_summary": "auto" }),
+            "the opt-in extends the summary to an adopted thread: {params:?}"
+        );
     }
 
     /// Unset means "send nothing": the daemon's own default stays in force, so
@@ -903,6 +976,7 @@ mod tests {
             sandbox: Some(SandboxMode::DangerFullAccess),
             approval_policy: Some(ApprovalPolicy::Never),
             apply_on_adopt: false,
+            reasoning_summary: None,
         };
         let client = connect_with(&url, overrides).await;
         let Adoption::Subscribed(_first) = client.threads().adopt("thread-1").await.expect("adopt") else {

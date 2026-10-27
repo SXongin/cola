@@ -2534,7 +2534,7 @@ mod tests {
         );
     }
 
-    /// Issue #898's config-to-wire path: the same three keys the file spells
+    /// Issues #898/#900's config-to-wire path: the same keys the file spells
     /// reach the attached client's `thread/start`, so a configured client
     /// cannot silently send the old request.
     #[tokio::test]
@@ -2547,6 +2547,7 @@ mod tests {
             sandbox: Some(crate::config::SandboxMode::DangerFullAccess),
             approval_policy: Some(crate::config::ApprovalPolicy::OnRequest),
             apply_on_adopt: false,
+            reasoning_summary: crate::config::ReasoningSummary::Detailed,
         });
         let never_busy = || false;
         assert_eq!(
@@ -2568,6 +2569,10 @@ mod tests {
         assert_eq!(params.len(), 1, "one thread/start: {params:?}");
         assert_eq!(params[0]["sandbox"], "danger-full-access");
         assert_eq!(params[0]["approvalPolicy"], "on-request");
+        assert_eq!(
+            params[0]["config"],
+            serde_json::json!({ "model_reasoning_summary": "detailed" })
+        );
     }
 
     /// The probe directory is reserved exclusively: a colliding name moves to
