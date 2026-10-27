@@ -261,6 +261,10 @@ pub(crate) struct CodexClient {
     /// Codex's skill input needs the skill's `path`, which the neutral
     /// [`crate::backend::PromptSkill`] does not carry.
     pub(crate) skills: Arc<SkillCatalog>,
+    /// Per-provider `GET <base_url>/models` answers (ticket #908). Shared by
+    /// clones so re-opening `/model` on one connection reuses what it already
+    /// learned, including failures.
+    pub(crate) model_probes: Arc<super::model_surface::ModelProbes>,
     server: ServerInfo,
 }
 
@@ -351,6 +355,7 @@ impl CodexClient {
             tasks: options.tasks.clone(),
             authored: options.authored.clone(),
             skills: Arc::new(SkillCatalog::default()),
+            model_probes: Arc::new(super::model_surface::ModelProbes::new()),
             server: ServerInfo {
                 user_agent,
                 version,

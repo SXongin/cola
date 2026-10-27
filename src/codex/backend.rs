@@ -31,9 +31,9 @@ use serde_json::{Value, json};
 
 use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, ServerLifecycle};
 use crate::backend::types::{
-    AgentInfo, ChangeScope, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, ModelScope,
-    ModelSurface, ModelSurfaceQuery, PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session,
-    SessionInfo, SessionListInfo, SessionModel, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, ModelSurface,
+    ModelSurfaceQuery, PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo,
+    SessionListInfo, SessionModel, SessionStatus,
 };
 use crate::backend::{
     Backend, BackendDirectory, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo, TurnDiff,
@@ -1346,36 +1346,19 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
 /// was read so far, and the truncation is logged.
 const MAX_MODEL_PAGES: usize = 64;
 
-/// Map Codex's flat `model/list` catalog onto the client-declared
-/// [`ModelSurface`]: **one** `model` scope, no provider level. A pick keeps the
-/// `codex/<id>` callback value the `/model <provider/model>` text form already
-/// records, and the free-text hint tells the user that shape.
+/// Map Codex's flat `model/list` catalog onto the client-declared surface when
+/// there is no config read to enrich it (an unattached lifecycle, or the cheap
+/// catalog-only read the `/think` variant lookup asks for). The real surface is
+/// [`super::model_surface::build_surface`], which adds the config default,
+/// profile presets, probed provider models and the provider scope.
 fn model_surface_from_catalog(providers: &[ProviderModels], query: &ModelSurfaceQuery<'_>) -> ModelSurface {
-    let options: Vec<ModelOption> = providers
-        .iter()
-        .flat_map(|provider| provider.models.iter())
-        .map(|model| ModelOption {
-            id: model.id.clone(),
-            variants: model.variants.clone(),
-            value: Some(format!("{MODEL_PROVIDER}/{}", model.id)),
-            ..ModelOption::default()
-        })
-        .collect();
-    let note = options.is_empty().then(|| "_(没有可用模型)_".to_string());
-    ModelSurface {
-        current: query.current.clone(),
-        scopes: vec![ModelScope {
-            id: "model".into(),
-            title: "模型（每轮可换）".into(),
-            changeable: ChangeScope::ThisTurn,
-            options,
-            note,
-            free_text: Some(format!(
-                "💡 也可以直接发送 `/model {MODEL_PROVIDER}/<id>` 选择目录之外的模型。"
-            )),
-            intro: None,
-        }],
-    }
+    super::model_surface::build_surface(
+        providers,
+        &super::model_surface::CodexModelConfig::default(),
+        &std::collections::HashMap::new(),
+        None,
+        query,
+    )
 }
 
 /// The `skills/list` reads, scoped by the directory the read was made for.
@@ -2101,13 +2084,56 @@ impl Backend for CodexClient {
         }]
     }
 
-    /// The `/model` surface: Codex has **one** flat catalog (`model/list`), so
-    /// the surface is one `model` scope — no provider pseudo-level. A pick's
-    /// callback value keeps the `codex/<id>` shape the text form already
-    /// records, and the free-text hint names it.
+    /// The `/model` surface: the built-in catalog (global, its own group), the
+    /// config default and `[profiles.*]` presets (one-click model picks), every
+    /// successfully probed provider's models (per-provider groups), and the
+    /// configured providers as a thread-level scope. Every model pick keeps the
+    /// `codex/<id>` callback value the text form records; the provider scope is
+    /// listing only — switching is a later ticket, so a provider click falls
+    /// back to this same page (with the bridge's back button) rather than
+    /// pretending to change the thread's channel.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
-        let catalog = Backend::list_models(self).await;
-        model_surface_from_catalog(&catalog, &query)
+        // The bridge's variant lookup (`/think`'s model check) is the only
+        // drilled read without a session: it names a scope but neither a
+        // session nor a directory. It must stay cheap — a card callback runs on
+        // a short ack budget — so it reads the catalog only and never touches
+        // config or a provider's `/models`. A root page (`scope` absent), even a
+        // Pending Session's, keeps the full surface.
+        let fast = query.scope.is_some() && query.session_id.is_none();
+        let (catalog, config) = if fast {
+            (
+                Backend::list_models(self).await,
+                super::model_surface::CodexModelConfig::default(),
+            )
+        } else {
+            let (catalog, config) = tokio::join!(
+                Backend::list_models(self),
+                super::model_surface::read_config(self.connection(), query.directory)
+            );
+            let config = config.unwrap_or_else(|error| {
+                tracing::debug!(
+                    "codex config/read failed; the model surface shows the catalog only: {error}"
+                );
+                super::model_surface::CodexModelConfig {
+                    read_failed: true,
+                    ..Default::default()
+                }
+            });
+            (catalog, config)
+        };
+        let probes = if fast {
+            Default::default()
+        } else {
+            self.model_probes.probe_all(&config.providers).await
+        };
+        // A picker pick records the neutral `codex` bucket, so the thread's own
+        // ordered model fact (when this connection has one) is the honest
+        // provider marker.
+        let thread_provider = query
+            .session_id
+            .and_then(|session_id| self.projections.model(session_id))
+            .map(|model| model.provider_id);
+        super::model_surface::build_surface(&catalog, &config, &probes, thread_provider.as_deref(), &query)
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
@@ -4531,12 +4557,12 @@ mod tests {
         );
     }
 
-    /// The `/model` surface is ONE flat `model` scope — Codex's catalog has no
-    /// provider level, so the card must not grow a pseudo provider page. The
-    /// callback value stays `codex/<id>` (what the text form records), and the
-    /// hand-write hint names that shape.
+    /// The `/model` surface has two scopes: the per-turn `model` scope (the
+    /// built-in catalog in its own group plus whatever config/probes add) and
+    /// the thread-level `provider` scope. The callback value stays `codex/<id>`
+    /// (what the text form records), and the hand-write hint names that shape.
     #[test]
-    fn model_surface_is_one_flat_model_scope() {
+    fn model_surface_has_a_model_scope_and_a_provider_scope() {
         use crate::backend::types::{ChangeScope, ModelSelection, ModelSurfaceQuery};
 
         let providers = vec![ProviderModels {
@@ -4551,33 +4577,61 @@ mod tests {
             session_id: Some("thread-1"),
             directory: Some("/work/cola"),
             current: Some(ModelSelection {
-                label: "codex/gpt-5.1-codex@high".into(),
-                reference: "codex/gpt-5.1-codex".into(),
+                label: "opencode-go/gpt-6-luna@high".into(),
+                reference: "opencode-go/gpt-6-luna".into(),
             }),
             ..Default::default()
         };
+        let mut config = crate::codex::model_surface::CodexModelConfig::default();
+        config
+            .providers
+            .push(crate::codex::model_surface::ConfiguredProvider {
+                id: "opencode-go".into(),
+                name: "OpenCode Go".into(),
+                base_url: None,
+                token: None,
+                env_key: None,
+            });
 
-        let surface = model_surface_from_catalog(&providers, &query);
+        let surface = crate::codex::model_surface::build_surface(
+            &providers,
+            &config,
+            &std::collections::HashMap::new(),
+            Some("opencode-go"),
+            &query,
+        );
 
-        assert_eq!(surface.scopes.len(), 1, "no provider pseudo-level");
-        let scope = &surface.scopes[0];
-        assert_eq!(scope.id, "model");
-        assert_eq!(scope.title, "模型（每轮可换）");
-        assert_eq!(scope.changeable, ChangeScope::ThisTurn);
-        assert_eq!(scope.options[0].id, "gpt-5.1-codex");
-        assert_eq!(scope.options[0].callback_value(), "codex/gpt-5.1-codex");
-        assert_eq!(scope.options[0].variants, ["low", "high"]);
+        assert_eq!(surface.scopes.len(), 2, "model + provider, no pseudo level");
+        let model = &surface.scopes[0];
+        assert_eq!(model.id, "model");
+        assert_eq!(model.title, "模型（每轮可换）");
+        assert_eq!(model.changeable, ChangeScope::ThisTurn);
+        assert_eq!(model.options[0].id, "gpt-5.1-codex");
+        assert_eq!(model.options[0].callback_value(), "codex/gpt-5.1-codex");
+        assert_eq!(model.options[0].variants, ["low", "high"]);
+        assert_eq!(
+            model.options[0].group.as_deref(),
+            Some(crate::codex::model_surface::CATALOG_GROUP),
+            "the global catalog is its own group, never a provider's"
+        );
         assert!(
-            scope.free_text.as_deref().unwrap().contains("codex/<id>"),
+            model.free_text.as_deref().unwrap().contains("codex/<id>"),
             "hand-write hint names the provider prefix"
         );
         assert_eq!(
             surface.current.as_ref().map(|c| c.label.as_str()),
-            Some("codex/gpt-5.1-codex@high")
+            Some("opencode-go/gpt-6-luna@high")
         );
+
+        let provider = &surface.scopes[1];
+        assert_eq!(provider.id, "provider");
+        assert_eq!(provider.changeable, ChangeScope::NewThread);
+        assert_eq!(provider.options[0].id, "opencode-go");
+        assert_eq!(provider.options[0].label.as_deref(), Some("OpenCode Go（当前）"));
+        assert_eq!(provider.options[0].callback_value(), "opencode-go");
     }
 
-    /// An empty catalog still answers its one scope with a note and the
+    /// An empty catalog still answers both scopes with a note and the
     /// hand-write hint — never a blank card.
     #[test]
     fn model_surface_degrades_to_a_note_and_hint() {
@@ -4588,6 +4642,197 @@ mod tests {
         assert!(scope.options.is_empty());
         assert_eq!(scope.note.as_deref(), Some("_(没有可用模型)_"));
         assert!(scope.free_text.is_some());
+        let provider = &surface.scopes[1];
+        assert!(provider.options.is_empty());
+        assert_eq!(provider.note.as_deref(), Some("_(config 里没有 provider)_"));
+    }
+
+    /// The wired surface: `config/read` supplies providers, the config default
+    /// and profiles; a provider with a token is probed against its own
+    /// `/models`; a second open inside the TTL reuses that answer.
+    #[tokio::test]
+    async fn model_surface_wires_config_read_and_per_provider_probes() {
+        use crate::backend::types::{ChangeScope, ModelSelection, ModelSurfaceQuery};
+
+        let probed = crate::test_http::TestHttpServer::start().await;
+        probed.route(
+            "GET",
+            "/v1/models",
+            200,
+            r#"{"data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"}]}"#,
+        );
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_models(vec![json!({
+            "id": "gpt-5.1-codex",
+            "hidden": false,
+            "supportedReasoningEfforts": [],
+        })]);
+        server.set_config_read(json!({
+            "config": {},
+            "layers": [{
+                "name": { "type": "user" },
+                "version": "v1",
+                "config": {
+                    "model": "gpt-5.1-codex",
+                    "model_provider": "opencode-go",
+                    "model_providers": {
+                        "deepseek": {
+                            "name": "DeepSeek",
+                            "base_url": format!("{}/v1", probed.base_url()),
+                            "experimental_bearer_token": "sentinel-wired-token"
+                        },
+                        "opencode-go": {
+                            "name": "OpenCode Go",
+                            "base_url": "http://127.0.0.1:1/v1",
+                            "env_key": "OPENCODE_KEY"
+                        }
+                    },
+                    "profiles": {
+                        "fast": { "model": "deepseek-v4-pro", "model_provider": "deepseek" }
+                    }
+                }
+            }]
+        }));
+        let client = connect(&url).await;
+
+        let query = || ModelSurfaceQuery {
+            session_id: Some("thread-1"),
+            directory: Some("/work/cola"),
+            current: Some(ModelSelection {
+                label: "opencode-go/gpt-6-luna".into(),
+                reference: "opencode-go/gpt-6-luna".into(),
+            }),
+            ..Default::default()
+        };
+        let surface = Backend::model_surface(&client, query()).await;
+
+        assert_eq!(server.config_read_calls(), 1);
+        assert_eq!(probed.request_count(), 1);
+        assert_eq!(surface.scopes.len(), 2);
+        let model = &surface.scopes[0];
+        assert_eq!(
+            model
+                .options
+                .iter()
+                .filter(|option| option.group.as_deref() == Some(crate::codex::model_surface::CATALOG_GROUP))
+                .count(),
+            1,
+            "the catalog keeps its own group"
+        );
+        assert!(
+            model
+                .options
+                .iter()
+                .any(|option| option.callback_value() == "codex/deepseek-flash"),
+            "a probed model is a model-only pick"
+        );
+        assert!(
+            model
+                .options
+                .iter()
+                .any(|option| option.callback_value() == "codex/deepseek-v4-pro"
+                    && option.group.as_deref() == Some(crate::codex::model_surface::PROFILE_GROUP)),
+            "the profile preset is offered with its model"
+        );
+        assert!(
+            model.note.as_deref().unwrap_or_default().contains("env_key"),
+            "the env_key provider's reason is on the card"
+        );
+        let provider_scope = &surface.scopes[1];
+        assert_eq!(provider_scope.changeable, ChangeScope::NewThread);
+        assert!(
+            provider_scope
+                .options
+                .iter()
+                .any(|option| option.id == "opencode-go" && option.display_label().contains("当前"))
+        );
+
+        // A second open within the cache TTL: another `config/read` and
+        // catalog read, but no second `/models` request.
+        let again = Backend::model_surface(&client, query()).await;
+        assert_eq!(again.scopes.len(), 2);
+        assert_eq!(probed.request_count(), 1, "the probe answer was cached");
+    }
+
+    /// The context-free read (`/think`'s variant lookup: no session, no
+    /// directory) is answered from the catalog alone, so a pick callback never
+    /// waits on config or a provider.
+    #[tokio::test]
+    async fn model_surface_variant_lookup_skips_config_and_probes() {
+        let probed = crate::test_http::TestHttpServer::start().await;
+        probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_models(vec![
+            json!({ "id": "gpt-5.1-codex", "supportedReasoningEfforts": [] }),
+        ]);
+        server.set_config_read(json!({
+            "layers": [{
+                "name": { "type": "user" },
+                "version": "v1",
+                "config": {
+                    "model_providers": {
+                        "deepseek": {
+                            "name": "DeepSeek",
+                            "base_url": format!("{}/v1", probed.base_url()),
+                            "experimental_bearer_token": "sentinel-fast-token"
+                        }
+                    }
+                }
+            }]
+        }));
+        let client = connect(&url).await;
+
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("codex"),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(
+            surface.scopes[0]
+                .options
+                .iter()
+                .any(|option| option.id == "gpt-5.1-codex")
+        );
+        assert_eq!(server.config_read_calls(), 0, "the cheap read never asks config");
+        assert_eq!(probed.request_count(), 0, "and never probes a provider");
+    }
+
+    /// A profile preset's callback value reaches the next `turn/start` as its
+    /// bare model id — the profile's provider is a declaration, not a
+    /// per-turn protocol field.
+    #[tokio::test]
+    async fn a_profile_preset_pick_rides_the_next_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        // `codex/deepseek-v4-pro` is the value a profile preset's button sends;
+        // the bridge parses it into this ModelInfo.
+        let model = ModelInfo {
+            id: "deepseek-v4-pro".into(),
+            provider_id: "codex".into(),
+            variant: None,
+        };
+        client
+            .prompt("thread-1", "run it", &[], &[], Some(&model), None, None, None)
+            .await
+            .expect("the prompt");
+        let params = server.turn_params("thread-1");
+        assert_eq!(params[0]["model"], "deepseek-v4-pro");
+        assert_eq!(
+            params[0].get("modelProvider"),
+            None,
+            "turn/start has no provider field; the thread's provider stays put"
+        );
     }
 
     /// Ticket #881 acceptance 5 (skills half): `/skill` lists what the server
