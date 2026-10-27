@@ -315,6 +315,12 @@ fn scope_cards(
             scope.free_text.as_deref(),
         )];
     }
+    // A grouped scope (#908: the built-in catalog, config presets and probed
+    // providers are separate sections inside one `model` scope) needs the group
+    // heading rendered between options, so it cannot ride the flat chunker.
+    if scope.options.iter().any(|option| option.group.is_some()) {
+        return grouped_scope_cards(thread_key, current, scope, back);
+    }
     chunk_picker_cards(
         &header,
         &intro,
@@ -354,7 +360,14 @@ fn combined_surface_card(
             heading.push_str(scope_intro);
         }
         elements.push(markdown_element(&heading));
+        let mut current_group: Option<&str> = None;
         for option in &scope.options {
+            if option.group.as_deref() != current_group {
+                if let Some(group) = option.group.as_deref() {
+                    elements.push(markdown_element(&format!("**{group}**")));
+                }
+                current_group = option.group.as_deref();
+            }
             elements.push(option_button(
                 thread_key,
                 "model",
@@ -372,6 +385,146 @@ fn combined_surface_card(
         }
     }
     card_shell("🎯 选择模型", "blue", elements)
+}
+
+/// One grouped scope's card page(s): options keep their group order, every page
+/// that starts in the middle of a group repeats that group's heading, and the
+/// usual intro / back button / note / hand-write hint are unchanged. Charging
+/// the heading as a component too keeps a many-group surface inside Feishu's
+/// element ceiling, not just its byte ceiling.
+fn grouped_scope_cards(
+    thread_key: &crate::config::ThreadKey,
+    current: Option<&crate::backend::types::ModelSelection>,
+    scope: &crate::backend::types::ModelScope,
+    back: bool,
+) -> Vec<serde_json::Value> {
+    let header = format!("🎯 {}", scope.title);
+    let mut intro = current_model_line(current);
+    if let Some(scope_intro) = &scope.intro {
+        intro.push_str(scope_intro);
+    }
+    let pages = grouped_page_windows(scope, &intro);
+    let n_pages = pages.len();
+    pages
+        .into_iter()
+        .enumerate()
+        .map(|(index, page)| {
+            let mut intro_text = intro.clone();
+            if n_pages > 1 {
+                intro_text.push_str(&format!("（第 {} / {} 页）", index + 1, n_pages));
+            }
+            grouped_picker_card(
+                &header,
+                &intro_text,
+                thread_key,
+                Some(scope.id.as_str()),
+                back,
+                &page,
+                scope.note.as_deref(),
+                scope.free_text.as_deref(),
+            )
+        })
+        .collect()
+}
+
+/// Page windows over a grouped scope. An option costs one picker row and its
+/// group heading one more (a page that starts mid-group re-renders it), so a
+/// page with G headings and O options stays at `G + O` rows and roughly
+/// `G + 2O` Feishu components. A single oversized option still gets its own
+/// page, exactly as [`chunk_picker_cards`] guarantees.
+fn grouped_page_windows<'a>(
+    scope: &'a crate::backend::types::ModelScope,
+    intro: &str,
+) -> Vec<Vec<&'a crate::backend::types::ModelOption>> {
+    let mut pages: Vec<Vec<&crate::backend::types::ModelOption>> = Vec::new();
+    let mut page: Vec<&crate::backend::types::ModelOption> = Vec::new();
+    let base_bytes = intro.len() + 64;
+    let mut bytes = base_bytes;
+    let mut rows = 0usize;
+    let mut current_group: Option<&str> = None;
+    for option in &scope.options {
+        let option_bytes = 200 + option.display_label().len() * 2 + option.callback_value().len();
+        let mut group_changed = option.group.as_deref() != current_group;
+        let mut heading_bytes = if group_changed {
+            option.group.as_deref().map_or(0, |group| 100 + group.len())
+        } else {
+            0
+        };
+        let mut cost = 1 + usize::from(group_changed && option.group.is_some());
+        if !page.is_empty()
+            && (rows + cost > MAX_PICKER_BUTTONS_PER_CARD
+                || bytes + heading_bytes + option_bytes > MAX_CARD_JSON_CHARS)
+        {
+            pages.push(std::mem::take(&mut page));
+            bytes = base_bytes;
+            rows = 0;
+            current_group = None;
+            group_changed = option.group.as_deref() != current_group;
+            heading_bytes = if group_changed {
+                option.group.as_deref().map_or(0, |group| 100 + group.len())
+            } else {
+                0
+            };
+            cost = 1 + usize::from(group_changed && option.group.is_some());
+        }
+        bytes += heading_bytes + option_bytes;
+        rows += cost;
+        if group_changed {
+            current_group = option.group.as_deref();
+        }
+        page.push(option);
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    if pages.is_empty() {
+        pages.push(Vec::new());
+    }
+    pages
+}
+
+/// One page of a grouped scope: intro, optional back button, the page's options
+/// with a bold heading whenever the group changes, then the note and the
+/// hand-write hint.
+#[allow(clippy::too_many_arguments)] // picker builder: every knob is a first-class card axis
+fn grouped_picker_card(
+    header: &str,
+    intro: &str,
+    thread_key: &crate::config::ThreadKey,
+    level: Option<&str>,
+    back: bool,
+    options: &[&crate::backend::types::ModelOption],
+    note: Option<&str>,
+    free_text: Option<&str>,
+) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = vec![markdown_element(intro)];
+    if back {
+        elements.push(back_button(thread_key, "model", &[]));
+    }
+    let mut current_group: Option<&str> = None;
+    for option in options {
+        if option.group.as_deref() != current_group {
+            if let Some(group) = option.group.as_deref() {
+                elements.push(markdown_element(&format!("**{group}**")));
+            }
+            current_group = option.group.as_deref();
+        }
+        elements.push(option_button(
+            thread_key,
+            "model",
+            option.display_label(),
+            option.callback_value(),
+            level,
+            &[],
+        ));
+    }
+    if let Some(note) = note {
+        elements.push(markdown_element(note));
+    }
+    if let Some(free_text) = free_text {
+        elements.push(markdown_element(free_text));
+    }
+    card_shell(header, "blue", elements)
 }
 
 /// The leading "current model" line shared by the `/model` picker cards.
@@ -915,6 +1068,155 @@ mod tests {
             .filter_map(|e| e["value"]["value"].as_str().map(str::to_string))
             .collect();
         assert_eq!(values, ["codex/gpt-5.1-codex", "custom/model"]);
+    }
+
+    /// A grouped scope renders a bold heading per group (#908): the built-in
+    /// catalog is its own group and never appears under a provider's heading,
+    /// and a probed provider's models sit under that provider's group.
+    #[test]
+    fn grouped_surface_keeps_the_catalog_apart_from_provider_groups() {
+        const CATALOG: &str = "内置目录（任何 provider 可试）";
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let model = scope(
+            "model",
+            "模型（每轮可换）",
+            vec![
+                ModelOption {
+                    id: "gpt-5.1-codex".into(),
+                    value: Some("codex/gpt-5.1-codex".into()),
+                    group: Some(CATALOG.into()),
+                    ..Default::default()
+                },
+                ModelOption {
+                    id: "deepseek-flash".into(),
+                    value: Some("codex/deepseek-flash".into()),
+                    group: Some("DeepSeek（/models）".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        let provider = scope(
+            "provider",
+            "Provider（线程级：新线程 / resume）",
+            vec![ModelOption {
+                id: "deepseek".into(),
+                label: Some("DeepSeek（当前）".into()),
+                ..Default::default()
+            }],
+        );
+        let cards = build_model_surface_cards(&key, &surface(None, vec![model, provider]), false);
+
+        // Walk every card and remember the nearest group heading per button.
+        let mut seen_catalog = false;
+        let mut seen_probed = false;
+        for card in &cards {
+            let mut group = String::new();
+            for element in card["body"]["elements"].as_array().unwrap() {
+                if element["tag"] == "markdown" {
+                    let content = element["content"].as_str().unwrap();
+                    if content.contains(CATALOG) {
+                        group = CATALOG.to_string();
+                    } else if content.contains("DeepSeek（/models）") {
+                        group = "DeepSeek（/models）".to_string();
+                    }
+                }
+                if element["tag"] == "button" {
+                    match element["value"]["value"].as_str() {
+                        Some("codex/gpt-5.1-codex") => {
+                            assert_eq!(
+                                group, CATALOG,
+                                "the catalog entry must not sit under a provider group"
+                            );
+                            seen_catalog = true;
+                        }
+                        Some("codex/deepseek-flash") => {
+                            assert_eq!(
+                                group, "DeepSeek（/models）",
+                                "a probed model sits under its provider's group"
+                            );
+                            seen_probed = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert!(
+            seen_catalog && seen_probed,
+            "both grouped options rendered: {cards:?}"
+        );
+    }
+
+    /// A grouped scope larger than one card chunks by page, re-renders a
+    /// group's heading when a page starts mid-group, and keeps every card inside
+    /// both Feishu budgets.
+    #[test]
+    fn grouped_scope_pages_repeat_headings_and_stay_within_budget() {
+        const GROUPS: [&str; 3] = [
+            "内置目录（任何 provider 可试）",
+            "DeepSeek（/models）",
+            "Profile 预设",
+        ];
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut options = Vec::new();
+        for (g, group) in GROUPS.iter().enumerate() {
+            for i in 0..40 {
+                let id = format!("model-{g}-{i}");
+                options.push(ModelOption {
+                    id: id.clone(),
+                    value: Some(format!("codex/{id}")),
+                    group: Some((*group).to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+        let cards = build_model_surface_cards(
+            &key,
+            &surface(None, vec![scope("model", "模型（每轮可换）", options)]),
+            false,
+        );
+        assert!(cards.len() > 1, "120 options cannot fit one card");
+
+        for card in &cards {
+            assert!(
+                card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
+                "a grouped page exceeded the byte budget"
+            );
+            let elements = card["body"]["elements"].as_array().unwrap();
+            let buttons = elements
+                .iter()
+                .filter(|element| element["tag"] == "button")
+                .count();
+            assert!(
+                buttons <= MAX_PICKER_BUTTONS_PER_CARD,
+                "a grouped page exceeded the component budget: {buttons} buttons"
+            );
+            // Every button has its group heading on the same page.
+            let mut group: Option<String> = None;
+            for element in elements {
+                if element["tag"] == "markdown" {
+                    let content = element["content"].as_str().unwrap();
+                    for candidate in GROUPS {
+                        if content.contains(candidate) {
+                            group = Some(candidate.to_string());
+                        }
+                    }
+                }
+                if element["tag"] == "button"
+                    && let Some(value) = element["value"]["value"].as_str()
+                    && let Some((g, _)) = value
+                        .strip_prefix("codex/model-")
+                        .and_then(|rest| rest.split_once('-'))
+                    && let Ok(index) = g.parse::<usize>()
+                {
+                    assert_eq!(
+                        group.as_deref(),
+                        Some(GROUPS[index]),
+                        "a page starting mid-group must repeat its heading"
+                    );
+                }
+            }
+        }
     }
 
     /// The `/think` card lists the current model, its declared variants, and a
