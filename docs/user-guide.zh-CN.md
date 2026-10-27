@@ -163,6 +163,7 @@ kind = "codex"                   # 必填：opencode | codex
 # sandbox = "danger-full-access" # 可选：read-only | workspace-write | danger-full-access
 # approval_policy = "on-request" # 可选：untrusted | on-request | never
 # apply_on_adopt = false         # 可选：在 thread/resume 上也发送这一对
+# reasoning_summary = "auto"     # 可选：auto | concise | detailed | none
 
 [bridge]
 default_client = "ada"           # 哪个 Agent Client 处于活动状态（默认 "default"）
@@ -182,8 +183,8 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `codex` 的 Agent Client 接受 `start_server`（`auto`/`never`/`eager`）：
   `never` 只附加，其余取值允许通过 `codex app-server daemon start` 启动共享
   守护进程——cola 从不拥有、也从不回收它。它还接受 `sandbox`、
-  `approval_policy` 与 `apply_on_adopt`（下一条）。具名的 Agent Client 不会
-  继承 `[opencode]` 的取值。
+  `approval_policy`、`apply_on_adopt` 与 `reasoning_summary`（后两条）。具名的
+  Agent Client 不会继承 `[opencode]` 的取值。
 - **`sandbox` / `approval_policy` / `apply_on_adopt`（仅 codex）** —— Codex
   线程运行在什么策略下。cola 在 `thread/start` 上发送这一对，因此它创建的
   线程可以在这个仓库里开发：`sandbox = "danger-full-access"` 去掉沙箱及其
@@ -202,6 +203,15 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
   改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
   也一样——除非 `apply_on_adopt = true`。
+- **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
+  被总结成文字。cola 把它作为 `thread/start` 的
+  `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
+  过程面板；取值有 `auto`、`concise`、`detailed` 与 `none`。Codex 在固定版本
+  上的默认值是 `none`，这会让每个 reasoning item 都是空的，卡片上完全看不到
+  思考——cola 的默认值因此改为 `auto`。`none` 恢复静默（也省掉总结产生的
+  token）。和沙箱那一对一样，它是**线程**设置：只作用于新线程；被接管的线程
+  保留自己的设置，除非 `apply_on_adopt = true`。只有文件里显式写了它，
+  `cola config show` 才会打印。
 - **给其他客户端一个全放行默认值是 Codex 自己的配置，不是 cola 的事。** 如果
   你自己的 TUI/VSCode 线程也应默认全放行，请在守护进程所用 `$CODEX_HOME` 的
   `~/.codex/config.toml` 中设置 `default_permissions = ":danger-full-access"`，

@@ -265,6 +265,73 @@ impl<'de> Deserialize<'de> for ApprovalPolicy {
     }
 }
 
+/// Whether — and with what depth — a Codex thread's reasoning is summarised
+/// back to the client (issue #900): `thread/start`'s
+/// `config.model_reasoning_summary`.
+///
+/// Codex keeps the model's reasoning in an encrypted payload and only renders
+/// what the model summarises. The daemon's own default on the pinned build is
+/// **no summary at all**, so every reasoning item reaches cola empty and the
+/// card shows no thinking at all. `Auto` requests the protocol's normal
+/// summary (the wire value `auto`); `None` restores the silent behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningSummary {
+    /// The model chooses the summary's depth (the wire value `auto`).
+    #[default]
+    Auto,
+    /// A short summary (the wire value `concise`).
+    Concise,
+    /// The model's fuller summary (the wire value `detailed`).
+    Detailed,
+    /// No summary: the reasoning stays invisible (the wire value `none`).
+    None,
+}
+
+impl ReasoningSummary {
+    /// See [`SandboxMode::CHOICES`]: the parse table is the accepted set.
+    const CHOICES: &'static [(&'static str, Self)] = &[
+        ("auto", Self::Auto),
+        ("concise", Self::Concise),
+        ("detailed", Self::Detailed),
+        ("none", Self::None),
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        // See `SandboxMode::as_str`: exhaustive by construction.
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ReasoningSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// See [`SandboxMode`]'s manual `Deserialize`: the message names the key.
+impl<'de> Deserialize<'de> for ReasoningSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        parse_choice(deserializer, "reasoning_summary", Self::CHOICES)
+    }
+}
+
 /// How cola picks the attached server's protocol generation (spec #364 §2,
 /// ADR-0055). The glossary calls this the **Generation Override**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -365,13 +432,21 @@ pub struct CodexConfig {
     /// permission cards arrive for the session.
     #[serde(default)]
     pub approval_policy: Option<ApprovalPolicy>,
-    /// Whether `thread/resume` carries the two overrides as well (issue #898).
+    /// Whether `thread/resume` carries the overrides as well (issue #898).
     /// Off by default: an adopted thread may be shared with the user's own
     /// TUI/VSCode, and a silent override would change their session too. Off
     /// means cola only adopts — a thread created by the user keeps the policy
     /// it was created with.
     #[serde(default)]
     pub apply_on_adopt: bool,
+    /// How much of the model's reasoning is summarised into this client's
+    /// **new** threads (issue #900), sent as `thread/start`'s
+    /// `config.model_reasoning_summary`. `auto` by default: the daemon's own
+    /// default on the pinned build is `none`, which leaves every reasoning item
+    /// empty on the card. `none` restores that silence; an adopted thread keeps
+    /// its own setting unless `apply_on_adopt` is set.
+    #[serde(default)]
+    pub reasoning_summary: ReasoningSummary,
 }
 
 /// The explicit port of an endpoint URL (`http://localhost:4096`,
@@ -534,7 +609,13 @@ const OPENCODE_CLIENT_KEYS: &[&str] = &["url", "model", "start_server", "generat
 /// the same [`ServerStartPolicy`] the `opencode` kind reads; a shared key is
 /// legal on both kinds and is checked against the kind's own list, never
 /// rejected as "another kind's".
-const CODEX_CLIENT_KEYS: &[&str] = &["start_server", "sandbox", "approval_policy", "apply_on_adopt"];
+const CODEX_CLIENT_KEYS: &[&str] = &[
+    "start_server",
+    "sandbox",
+    "approval_policy",
+    "apply_on_adopt",
+    "reasoning_summary",
+];
 
 /// Every option key any kind accepts, derived rather than repeated: the table
 /// is parsed before `kind` is validated, so this union is what must be kept out
@@ -1698,6 +1779,7 @@ mod tests {
             sandbox: Some(SandboxMode::DangerFullAccess),
             approval_policy: Some(ApprovalPolicy::OnRequest),
             apply_on_adopt: true,
+            reasoning_summary: ReasoningSummary::Detailed,
         };
         let toml::Value::Table(serialised) = toml::Value::try_from(&full).unwrap() else {
             panic!("a config struct serialises to a table");
@@ -1805,6 +1887,61 @@ mod tests {
         }
     }
 
+    /// The reasoning summary (#900): the key parses into its protocol value,
+    /// defaults to `auto` when the file is silent, and `config show` prints what
+    /// the file spelled.
+    #[test]
+    fn a_codex_client_reads_its_reasoning_summary() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             reasoning_summary = \"detailed\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let settings = cfg.active_client().unwrap().codex().cloned().unwrap();
+        assert_eq!(settings.reasoning_summary, ReasoningSummary::Detailed);
+        let dumped = masked_config_toml(&cfg).unwrap();
+        assert!(
+            dumped.contains("reasoning_summary = \"detailed\""),
+            "config show must print the summary the file spelled: {dumped}"
+        );
+
+        // Silent means `auto` — the fix for the invisible reasoning — but an
+        // unspelled key must stay out of `config show`.
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n",
+            minimal()
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.active_client().unwrap().codex().unwrap().reasoning_summary,
+            ReasoningSummary::Auto
+        );
+        let dumped = masked_config_toml(&cfg).unwrap();
+        assert!(
+            !dumped.contains("reasoning_summary"),
+            "an unset summary must not be invented by config show: {dumped}"
+        );
+    }
+
+    /// An unknown summary value names the key, the value and the accepted set.
+    #[test]
+    fn an_unknown_reasoning_summary_names_the_key_and_the_choices() {
+        let err = toml::from_str::<Config>(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             reasoning_summary = \"verbose\"\n",
+            minimal()
+        ))
+        .unwrap_err()
+        .to_string();
+        for expected in ["reasoning_summary", "verbose", "detailed"] {
+            assert!(
+                err.contains(expected),
+                "the summary error names {expected}: {err}"
+            );
+        }
+    }
+
     /// An unknown mode names the key, the value and the accepted set — the
     /// parser sees a `toml::Value` table, so the field's own error is what says
     /// which key to fix.
@@ -1855,6 +1992,11 @@ mod tests {
             assert_eq!(cfg.approval_policy, Some(*policy), "`{value}` parses");
             assert_eq!(policy.as_str(), *value, "`{value}` serialises back");
         }
+        for (value, summary) in ReasoningSummary::CHOICES {
+            let cfg: CodexConfig = toml::from_str(&format!("reasoning_summary = \"{value}\"")).unwrap();
+            assert_eq!(cfg.reasoning_summary, *summary, "`{value}` parses");
+            assert_eq!(summary.as_str(), *value, "`{value}` serialises back");
+        }
     }
 
     /// A row missing from a choice table is not a compile error — `CHOICES`
@@ -1887,6 +2029,22 @@ mod tests {
             assert!(
                 ApprovalPolicy::CHOICES.iter().any(|(_, value)| *value == policy),
                 "{policy:?} is missing from the choice table"
+            );
+        }
+
+        let summaries = [
+            ReasoningSummary::Auto,
+            ReasoningSummary::Concise,
+            ReasoningSummary::Detailed,
+            ReasoningSummary::None,
+        ];
+        assert_eq!(ReasoningSummary::CHOICES.len(), summaries.len());
+        for summary in summaries {
+            assert!(
+                ReasoningSummary::CHOICES
+                    .iter()
+                    .any(|(_, value)| *value == summary),
+                "{summary:?} is missing from the choice table"
             );
         }
     }

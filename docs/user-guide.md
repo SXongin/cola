@@ -230,6 +230,7 @@ kind = "codex"                   # required: opencode | codex
 # sandbox = "danger-full-access" # optional: read-only | workspace-write | danger-full-access
 # approval_policy = "on-request" # optional: untrusted | on-request | never
 # apply_on_adopt = false         # optional: also send the pair on thread/resume
+# reasoning_summary = "auto"     # optional: auto | concise | detailed | none
 
 [bridge]
 default_client = "ada"           # which Agent Client is active (default: "default")
@@ -250,8 +251,9 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   `[opencode]` does. A `codex` Agent Client accepts `start_server`
   (`auto`/`never`/`eager`): `never` is attach-only, while the others may start
   the shared daemon through `codex app-server daemon start` — cola never owns
-  or reaps it. It also accepts `sandbox`, `approval_policy` and `apply_on_adopt`
-  (next). A named Agent Client does not inherit `[opencode]`'s values.
+  or reaps it. It also accepts `sandbox`, `approval_policy`, `apply_on_adopt` and
+  `reasoning_summary` (next two). A named Agent Client does not inherit
+  `[opencode]`'s values.
 - **`sandbox` / `approval_policy` / `apply_on_adopt` (codex only)** — what a
   Codex thread runs under. cola sends the pair on `thread/start`, so a thread it
   creates can develop in this repo: `sandbox = "danger-full-access"` removes the
@@ -274,6 +276,17 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   settings: a thread created before the change keeps the policy it was created
   with, and a thread your TUI created and cola adopted keeps it too unless
   `apply_on_adopt = true`.
+- **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
+  reasoning is summarised into a Codex thread. cola sends it as
+  `thread/start`'s `config.model_reasoning_summary`, and the card renders the
+  result as a folded 💭 推理过程 panel; the values are `auto`, `concise`,
+  `detailed` and `none`. Codex's own default on the pinned build is `none`, which
+  leaves every reasoning item empty, so the card shows no thinking at all —
+  `auto` is why cola's default differs. `none` restores the silent behaviour (and
+  saves the summary's tokens). Like the sandbox pair it is a **thread** setting:
+  new threads only, and an adopted thread keeps its own unless
+  `apply_on_adopt = true`. `cola config show` prints it only when the file spells
+  it.
 - **A full-access default for your other clients is Codex's config, not cola's.**
   If your own TUI/VSCode threads should also default to full access, set
   `default_permissions = ":danger-full-access"` in the `~/.codex/config.toml` of
