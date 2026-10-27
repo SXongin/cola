@@ -1627,7 +1627,7 @@ pub(super) fn tool_panel_element(
     }
     let content = md.element(&content);
     let icon = if todo_panel { "📋" } else { tool.status_icon() };
-    let mut title = format!("{icon} {}{}", name, panel_time_suffix(at_ms));
+    let mut title = format!("{icon} {}{}", tool_display_name(name), panel_time_suffix(at_ms));
     if let Some(details) = &title_details {
         title.push_str(&format!(" · {}", details));
     }
@@ -2596,6 +2596,24 @@ fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> 
         .find_map(|key| obj.get(*key).and_then(|value| value.as_str()))
 }
 
+/// The name a Tool Panel's folded header shows.
+///
+/// OpenCode's built-in ids (`bash`, `read`, …) are already the words a reader
+/// expects, so they pass through unchanged. The Codex adapter's item kinds are
+/// **protocol** names (`commandExecution`, `fileChange`, … mapped onto the
+/// neutral transcript's snake_case ids); rendering one raw would put
+/// `command_execution` on every folded card, so they take the card's own
+/// vocabulary. A third-party tool keeps its own name (ADR-0042's opaque path).
+fn tool_display_name(name: &str) -> &str {
+    match name {
+        "command_execution" => "命令",
+        "file_change" => "文件修改",
+        "web_search" => "网页搜索",
+        "image" => "图片",
+        other => other,
+    }
+}
+
 /// Render a tool's input JSON as human-readable markdown, keyed on the tool
 /// name. Recognized tools get tailored one-liners (bash → the command, read →
 /// the file path, edit → the file; the edit's actual change comes from its diff
@@ -2608,12 +2626,14 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
     };
     let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
     match name {
-        "bash" | "shell" => {
+        // Codex's `commandExecution` carries `command` plus `cwd`; the
+        // OpenCode arm's `workdir` is the same fact under another name.
+        "bash" | "shell" | "command_execution" => {
             let mut s = String::new();
             if let Some(cmd) = get("command") {
                 s.push_str(&format!("`{}`", cmd));
             }
-            if let Some(dir) = get("workdir") {
+            if let Some(dir) = get("workdir").or_else(|| get("cwd")) {
                 s.push_str(&format!("\n📁 `{}`", dir));
             }
             if let Some(d) = get("description") {
@@ -2682,8 +2702,33 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 input.to_string()
             }
         }
-        "websearch" => match get("query") {
+        "websearch" | "web_search" => match get("query") {
             Some(query) => format!("🔎 `{}`", query),
+            None => generic_tool_input(obj),
+        },
+        // Codex's `fileChange` names its targets in `changes[].path` (one entry
+        // per file), not in a top-level `path`.
+        "file_change" => {
+            let paths: Vec<&str> = obj
+                .get("changes")
+                .and_then(|changes| changes.as_array())
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .filter_map(|change| change.get("path").and_then(|path| path.as_str()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match paths.as_slice() {
+                [] => generic_tool_input(obj),
+                [only] => format!("📄 `{only}`"),
+                [first, ..] => format!("📄 `{first}` 等 {} 个文件", paths.len()),
+            }
+        }
+        // Codex's `imageView`: the file it looked at. Unlike a `read` there is
+        // no preview body to fold, so the panel only names it.
+        "image" => match get("path") {
+            Some(path) => format!("🖼 `{path}`"),
             None => generic_tool_input(obj),
         },
         "execute" => match get("code") {
@@ -7202,11 +7247,73 @@ Index: /a/one.rs
         );
     }
 
+    /// Codex's neutral item kinds are protocol names, not tool names: a folded
+    /// panel must say what happened (`命令`, `文件修改`, …) instead of printing
+    /// `command_execution` on nearly every card (issue #900). An OpenCode
+    /// built-in and a third-party tool keep their own names (ADR-0042).
+    #[test]
+    fn codex_item_kinds_render_a_human_title() {
+        let title = |name: &str| {
+            let tool = ToolPanel::for_test(name, ToolStatus::Completed, None, Some("ok"));
+            let card = CardBuilder::new()
+                .with_state(CardState::Done)
+                .with_tool(tool)
+                .build();
+            card["body"]["elements"][0]["header"]["title"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(title("command_execution"), "✅ 命令");
+        assert_eq!(title("file_change"), "✅ 文件修改");
+        assert_eq!(title("web_search"), "✅ 网页搜索");
+        assert_eq!(title("image"), "✅ 图片");
+        assert_eq!(title("bash"), "✅ bash");
+        assert_eq!(title("context7/query-docs"), "✅ context7/query-docs");
+    }
+
+    /// The Codex command item carries `command` + `cwd` (`workdir` on the
+    /// OpenCode arm): the panel shows the command it ran and where.
+    #[test]
+    fn codex_command_input_shows_the_command_and_its_cwd() {
+        assert_eq!(
+            format_tool_input(
+                "command_execution",
+                &json!({"command": "/usr/bin/zsh -lc 'echo hi'", "cwd": "/work/cola"})
+            ),
+            "`/usr/bin/zsh -lc 'echo hi'`\n📁 `/work/cola`"
+        );
+    }
+
+    /// A Codex file change names its targets in `changes[].path`, one entry per
+    /// file — not in a top-level `path`.
+    #[test]
+    fn codex_file_change_input_lists_its_files() {
+        assert_eq!(
+            format_tool_input(
+                "file_change",
+                &json!({"changes": [{"path": "src/main.rs", "kind": {"type": "update"}}]})
+            ),
+            "📄 `src/main.rs`"
+        );
+        assert_eq!(
+            format_tool_input(
+                "file_change",
+                &json!({"changes": [{"path": "a.rs"}, {"path": "b.rs"}]})
+            ),
+            "📄 `a.rs` 等 2 个文件"
+        );
+    }
+
     /// A `websearch` input had no V1 arm either: the query leads the panel.
     #[test]
     fn websearch_input_shows_the_query() {
         assert_eq!(
             format_tool_input("websearch", &json!({"query": "rust lifetimes"})),
+            "🔎 `rust lifetimes`"
+        );
+        assert_eq!(
+            format_tool_input("web_search", &json!({"query": "rust lifetimes"})),
             "🔎 `rust lifetimes`"
         );
     }
