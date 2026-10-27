@@ -49,8 +49,9 @@ use crate::error::Result;
 use async_trait::async_trait;
 use client::OpenCodeBackend;
 use types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery, PermissionRequest,
+    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
+    SessionStatus,
 };
 
 #[async_trait]
@@ -235,6 +236,10 @@ impl Backend for OpenCodeBackend {
 
     async fn list_models(&self) -> Vec<ProviderModels> {
         OpenCodeBackend::list_models(self).await
+    }
+
+    async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
+        OpenCodeBackend::model_surface(self, query).await
     }
 
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo> {

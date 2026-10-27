@@ -318,6 +318,124 @@ async fn model_picker_back_button_returns_to_providers() {
     );
 }
 
+/// A client that declares a flat model surface (Codex's shape) gets a flat
+/// `/model` card: the "current model" line, one 「模型（每轮可换）」 scope, and
+/// the hand-write hint — no provider pseudo-level. Tapping a model records the
+/// `codex/<id>` override, and the next prompt carries that id.
+#[tokio::test]
+async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    let prompt_models = backend.prompt_models.clone();
+    backend.with_model_surface(crate::backend::types::ModelSurface {
+        current: None,
+        scopes: vec![crate::backend::types::ModelScope {
+            id: "model".into(),
+            title: "模型（每轮可换）".into(),
+            changeable: crate::backend::types::ChangeScope::ThisTurn,
+            options: vec![
+                crate::backend::types::ModelOption {
+                    id: "gpt-5.1-codex".into(),
+                    variants: vec!["low".into(), "high".into()],
+                    value: Some("codex/gpt-5.1-codex".into()),
+                    ..Default::default()
+                },
+                crate::backend::types::ModelOption {
+                    id: "gpt-5.1".into(),
+                    value: Some("codex/gpt-5.1".into()),
+                    ..Default::default()
+                },
+            ],
+            note: None,
+            free_text: Some("💡 也可以直接发送 `/model codex/<id>` 选择目录之外的模型。".into()),
+            intro: None,
+        }],
+    });
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("codex/gpt-5.1".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "msg_model_card",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|c| match c {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .expect("a model card should be sent");
+    let text = card.to_string();
+    assert!(
+        text.contains("当前模型") && text.contains("codex/gpt-5.1"),
+        "{text}"
+    );
+    assert!(text.contains("模型（每轮可换）"), "flat scope title: {text}");
+    assert!(text.contains("/model codex/<id>"), "hand-write hint: {text}");
+    assert!(
+        !text.contains("选择 provider"),
+        "no provider pseudo-level: {text}"
+    );
+    assert!(
+        text.contains("\"level\":\"model\""),
+        "a model button picks directly: {text}"
+    );
+
+    // Tapping the model records the `codex/<id>` override …
+    let picked = serde_json::json!({
+        "action": "model",
+        "level": "model",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "codex/gpt-5.1-codex",
+    });
+    let step = app.host_action(picked).await.expect("model card action");
+    assert!(step.card.is_none(), "selection is toast-only");
+    let stored = app.sessions.lock().await.get_active(&key).cloned().unwrap();
+    assert_eq!(stored.model.as_deref(), Some("codex/gpt-5.1-codex"));
+
+    // … and the next prompt sends that id (Codex's next `turn/start.model`).
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        prompt_models.lock().await.as_slice(),
+        &[Some("codex/gpt-5.1-codex".to_string())],
+        "the picked ref is what the next turn carries"
+    );
+}
+
 /// `/agent` (no args) sends the agent-picker card: it shows the CURRENT
 /// agent (the server's default when no override is set — derived as the
 /// first primary non-hidden agent, skipping subagents), records an override

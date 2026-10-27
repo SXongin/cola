@@ -134,3 +134,159 @@ async fn v1_compact_posts_the_shared_route_without_a_body() {
     assert_eq!(request.query, "");
     assert_eq!(request.body, "", "compact carries no body");
 }
+
+/// The `/model` surface's root page is OpenCode's provider list: one
+/// `provider` scope, the provider ids as callback values, and the caller's
+/// current selection on top — the same shape the hand-built card had.
+#[test]
+fn model_surface_root_page_lists_providers_and_keeps_the_current_line() {
+    use super::client::model_surface_from_providers;
+    use crate::backend::types::{ModelOption, ModelSelection, ModelSurfaceQuery, ProviderModels};
+
+    let providers = vec![
+        ProviderModels {
+            provider: "opencode".into(),
+            models: vec![ModelOption::new("deepseek-v4-flash")],
+        },
+        ProviderModels {
+            provider: "openrouter".into(),
+            models: vec![ModelOption::new("gpt-4o")],
+        },
+    ];
+    let query = ModelSurfaceQuery {
+        session_id: Some("ses_1"),
+        directory: Some("/work/cola"),
+        current: Some(ModelSelection {
+            label: "opencode/deepseek-v4-flash@low".into(),
+            reference: "opencode/deepseek-v4-flash".into(),
+        }),
+        ..Default::default()
+    };
+
+    let surface = model_surface_from_providers(&providers, &query);
+
+    assert_eq!(surface.scopes.len(), 1);
+    let scope = &surface.scopes[0];
+    assert_eq!(scope.id, "provider");
+    assert_eq!(scope.title, "选择模型");
+    assert_eq!(
+        scope.options.iter().map(|o| o.id.as_str()).collect::<Vec<_>>(),
+        ["opencode", "openrouter"]
+    );
+    assert_eq!(
+        scope.options[0].callback_value(),
+        "opencode",
+        "the provider button's value is the provider id"
+    );
+    assert!(
+        scope.intro.as_deref().unwrap().contains("共 2 个"),
+        "provider count: {:?}",
+        scope.intro
+    );
+    assert_eq!(
+        surface.current.as_ref().map(|c| c.label.as_str()),
+        Some("opencode/deepseek-v4-flash@low"),
+        "the current line is the caller's resolved selection"
+    );
+}
+
+/// A drilled page is that provider's model list: bare model-id labels,
+/// `provider/model` callback values, the declared variants, and no current
+/// line (the model page never showed one).
+#[test]
+fn model_surface_provider_page_keeps_values_and_variants() {
+    use super::client::model_surface_from_providers;
+    use crate::backend::types::{ModelOption, ModelSelection, ModelSurfaceQuery, ProviderModels};
+
+    let providers = vec![ProviderModels {
+        provider: "opencode-go".into(),
+        models: vec![
+            ModelOption {
+                id: "deepseek-v4-pro".into(),
+                variants: vec!["low".into(), "high".into()],
+                ..Default::default()
+            },
+            ModelOption::new("deepseek-v4-flash"),
+        ],
+    }];
+    let query = ModelSurfaceQuery {
+        current: Some(ModelSelection {
+            label: "opencode-go/deepseek-v4-pro@high".into(),
+            reference: "opencode-go/deepseek-v4-pro".into(),
+        }),
+        scope: Some("provider"),
+        selected: Some("opencode-go"),
+        ..Default::default()
+    };
+
+    let surface = model_surface_from_providers(&providers, &query);
+
+    let scope = &surface.scopes[0];
+    assert_eq!(scope.id, "model");
+    assert_eq!(scope.title, "opencode-go", "the provider heads the page");
+    assert_eq!(
+        scope
+            .options
+            .iter()
+            .map(|o| o.display_label())
+            .collect::<Vec<_>>(),
+        ["deepseek-v4-pro", "deepseek-v4-flash"],
+        "the label stays the bare model id"
+    );
+    assert_eq!(
+        scope
+            .options
+            .iter()
+            .map(|o| o.callback_value())
+            .collect::<Vec<_>>(),
+        ["opencode-go/deepseek-v4-pro", "opencode-go/deepseek-v4-flash"]
+    );
+    assert_eq!(scope.options[0].variants, ["low", "high"]);
+    assert!(
+        surface.current.is_none(),
+        "the model page omitted the current line before, so it still does"
+    );
+}
+
+/// No providers degrades to the same single "no models" page; a drilled page
+/// for a provider that no longer exists keeps the old empty-model-page shape
+/// (the stale callback cannot strand the user on a missing page).
+#[test]
+fn model_surface_degrades_to_the_empty_root_page() {
+    use super::client::model_surface_from_providers;
+    use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
+
+    let query = ModelSurfaceQuery {
+        current: Some(ModelSelection {
+            label: "opencode-go/deepseek-v4-flash@low".into(),
+            reference: "opencode-go/deepseek-v4-flash".into(),
+        }),
+        ..Default::default()
+    };
+    let surface = model_surface_from_providers(&[], &query);
+    let scope = &surface.scopes[0];
+    assert_eq!(scope.id, "provider");
+    assert_eq!(scope.intro.as_deref(), Some("_(没有可用模型)_"));
+    assert_eq!(
+        surface.current.as_ref().map(|c| c.label.as_str()),
+        Some("opencode-go/deepseek-v4-flash@low")
+    );
+
+    let drilled = ModelSurfaceQuery {
+        scope: Some("provider"),
+        selected: Some("gone"),
+        ..Default::default()
+    };
+    let surface = model_surface_from_providers(
+        &[crate::backend::types::ProviderModels {
+            provider: "opencode".into(),
+            models: Vec::new(),
+        }],
+        &drilled,
+    );
+    assert_eq!(surface.scopes[0].id, "model");
+    assert_eq!(
+        surface.scopes[0].intro.as_deref(),
+        Some("_(该 provider 没有可用模型)_")
+    );
+}

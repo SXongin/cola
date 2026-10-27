@@ -31,9 +31,9 @@ use serde_json::{Value, json};
 
 use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, ServerLifecycle};
 use crate::backend::types::{
-    AgentInfo, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, PermissionRequest,
-    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionModel,
-    SessionStatus,
+    AgentInfo, ChangeScope, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, ModelScope,
+    ModelSurface, ModelSurfaceQuery, PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session,
+    SessionInfo, SessionListInfo, SessionModel, SessionStatus,
 };
 use crate::backend::{
     Backend, BackendDirectory, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo, TurnDiff,
@@ -1346,6 +1346,38 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
 /// was read so far, and the truncation is logged.
 const MAX_MODEL_PAGES: usize = 64;
 
+/// Map Codex's flat `model/list` catalog onto the client-declared
+/// [`ModelSurface`]: **one** `model` scope, no provider level. A pick keeps the
+/// `codex/<id>` callback value the `/model <provider/model>` text form already
+/// records, and the free-text hint tells the user that shape.
+fn model_surface_from_catalog(providers: &[ProviderModels], query: &ModelSurfaceQuery<'_>) -> ModelSurface {
+    let options: Vec<ModelOption> = providers
+        .iter()
+        .flat_map(|provider| provider.models.iter())
+        .map(|model| ModelOption {
+            id: model.id.clone(),
+            variants: model.variants.clone(),
+            value: Some(format!("{MODEL_PROVIDER}/{}", model.id)),
+            ..ModelOption::default()
+        })
+        .collect();
+    let note = options.is_empty().then(|| "_(没有可用模型)_".to_string());
+    ModelSurface {
+        current: query.current.clone(),
+        scopes: vec![ModelScope {
+            id: "model".into(),
+            title: "模型（每轮可换）".into(),
+            changeable: ChangeScope::ThisTurn,
+            options,
+            note,
+            free_text: Some(format!(
+                "💡 也可以直接发送 `/model {MODEL_PROVIDER}/<id>` 选择目录之外的模型。"
+            )),
+            intro: None,
+        }],
+    }
+}
+
 /// The `skills/list` reads, scoped by the directory the read was made for.
 /// Codex's `skill` prompt part carries a **path** as well as a name, and the
 /// neutral [`crate::backend::PromptSkill`] only carries `{ id, name }`, so the
@@ -2040,6 +2072,7 @@ impl Backend for CodexClient {
                         .into_iter()
                         .map(|effort| effort.reasoning_effort)
                         .collect(),
+                    ..ModelOption::default()
                 });
             }
             match response.next_cursor {
@@ -2066,6 +2099,15 @@ impl Backend for CodexClient {
             provider: MODEL_PROVIDER.to_string(),
             models,
         }]
+    }
+
+    /// The `/model` surface: Codex has **one** flat catalog (`model/list`), so
+    /// the surface is one `model` scope — no provider pseudo-level. A pick's
+    /// callback value keeps the `codex/<id>` shape the text form already
+    /// records, and the free-text hint names it.
+    async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
+        let catalog = Backend::list_models(self).await;
+        model_surface_from_catalog(&catalog, &query)
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
@@ -2326,6 +2368,13 @@ impl Backend for CodexLifecycle {
         match self.attached_client().await {
             Some(client) => Backend::list_models(&client).await,
             None => Vec::new(),
+        }
+    }
+
+    async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
+        match self.attached_client().await {
+            Some(client) => Backend::model_surface(&client, query).await,
+            None => model_surface_from_catalog(&[], &query),
         }
     }
 
@@ -4480,6 +4529,65 @@ mod tests {
             2,
             "the catalog is paged to the end, not read as its first page"
         );
+    }
+
+    /// The `/model` surface is ONE flat `model` scope — Codex's catalog has no
+    /// provider level, so the card must not grow a pseudo provider page. The
+    /// callback value stays `codex/<id>` (what the text form records), and the
+    /// hand-write hint names that shape.
+    #[test]
+    fn model_surface_is_one_flat_model_scope() {
+        use crate::backend::types::{ChangeScope, ModelSelection, ModelSurfaceQuery};
+
+        let providers = vec![ProviderModels {
+            provider: MODEL_PROVIDER.to_string(),
+            models: vec![ModelOption {
+                id: "gpt-5.1-codex".into(),
+                variants: vec!["low".into(), "high".into()],
+                ..Default::default()
+            }],
+        }];
+        let query = ModelSurfaceQuery {
+            session_id: Some("thread-1"),
+            directory: Some("/work/cola"),
+            current: Some(ModelSelection {
+                label: "codex/gpt-5.1-codex@high".into(),
+                reference: "codex/gpt-5.1-codex".into(),
+            }),
+            ..Default::default()
+        };
+
+        let surface = model_surface_from_catalog(&providers, &query);
+
+        assert_eq!(surface.scopes.len(), 1, "no provider pseudo-level");
+        let scope = &surface.scopes[0];
+        assert_eq!(scope.id, "model");
+        assert_eq!(scope.title, "模型（每轮可换）");
+        assert_eq!(scope.changeable, ChangeScope::ThisTurn);
+        assert_eq!(scope.options[0].id, "gpt-5.1-codex");
+        assert_eq!(scope.options[0].callback_value(), "codex/gpt-5.1-codex");
+        assert_eq!(scope.options[0].variants, ["low", "high"]);
+        assert!(
+            scope.free_text.as_deref().unwrap().contains("codex/<id>"),
+            "hand-write hint names the provider prefix"
+        );
+        assert_eq!(
+            surface.current.as_ref().map(|c| c.label.as_str()),
+            Some("codex/gpt-5.1-codex@high")
+        );
+    }
+
+    /// An empty catalog still answers its one scope with a note and the
+    /// hand-write hint — never a blank card.
+    #[test]
+    fn model_surface_degrades_to_a_note_and_hint() {
+        use crate::backend::types::ModelSurfaceQuery;
+
+        let surface = model_surface_from_catalog(&[], &ModelSurfaceQuery::default());
+        let scope = &surface.scopes[0];
+        assert!(scope.options.is_empty());
+        assert_eq!(scope.note.as_deref(), Some("_(没有可用模型)_"));
+        assert!(scope.free_text.is_some());
     }
 
     /// Ticket #881 acceptance 5 (skills half): `/skill` lists what the server

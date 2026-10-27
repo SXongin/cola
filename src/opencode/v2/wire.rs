@@ -275,6 +275,7 @@ impl RawModelInfo {
         ModelOption {
             id: self.id,
             variants: self.variants.into_iter().map(|variant| variant.id).collect(),
+            ..ModelOption::default()
         }
     }
 }

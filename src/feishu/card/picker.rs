@@ -16,7 +16,19 @@ fn option_picker_card(
     action: &str,
     options: &[(String, String)],
 ) -> serde_json::Value {
-    picker_card(header, intro, thread_key, action, None, false, None, options, &[])
+    picker_card(
+        header,
+        intro,
+        thread_key,
+        action,
+        None,
+        false,
+        None,
+        options,
+        &[],
+        None,
+        None,
+    )
 }
 
 /// The `/model` picker-card back button's value: clicking it returns from a
@@ -25,24 +37,12 @@ fn option_picker_card(
 /// navigation.
 pub(crate) const PICKER_BACK_TO_PROVIDERS: &str = "__providers__";
 
-/// The two levels of the `/model` picker card (ADR-0012 issue 05): a
-/// `Provider` button on the provider-list page (its `value` is a provider id,
-/// or [`PICKER_BACK_TO_PROVIDERS`] to go back); a `Model` button records the
-/// per-session override. Serialized as the callback's `level` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PickerLevel {
-    Provider,
-    Model,
-}
-
-impl PickerLevel {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            PickerLevel::Provider => "provider",
-            PickerLevel::Model => "model",
-        }
-    }
-}
+/// The callback `level` of the `/model` root page's provider buttons (and of
+/// the back button that returns to it). A model page's level is its scope id
+/// (`"model"` on OpenCode, `"model"` on Codex). A named constant (not a bare
+/// string literal) so the handler's comparison cannot typo-silently break
+/// navigation.
+pub(crate) const PICKER_LEVEL_PROVIDER: &str = "provider";
 
 /// A picker card whose buttons carry an optional `level` (two-step navigation
 /// for the `/model` provider → model flow) and an optional leading "back"
@@ -58,30 +58,20 @@ fn picker_card(
     intro: &str,
     thread_key: &crate::config::ThreadKey,
     action: &str,
-    level: Option<PickerLevel>,
+    level: Option<&str>,
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
     callback_fields: &[(&str, &str)],
+    note: Option<&str>,
+    free_text: Option<&str>,
 ) -> serde_json::Value {
     let mut elements: Vec<serde_json::Value> = vec![json!({
         "tag": "markdown",
         "content": crate::feishu::card::sanitize::sanitize_markdown(intro)
     })];
     if back {
-        elements.push(json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "← 返回全部 provider" },
-            "type": "default",
-            "width": "fill",
-            "value": with_callback_field(json!({
-                "action": action,
-                "chat_id": thread_key.chat_id,
-                "thread_id": thread_key.thread_id,
-                "level": PickerLevel::Provider.as_str(),
-                "value": PICKER_BACK_TO_PROVIDERS,
-            }), callback_fields),
-        }));
+        elements.push(back_button(thread_key, action, callback_fields));
     }
     if let Some((label, clear_action)) = clear {
         elements.push(json!({
@@ -98,24 +88,78 @@ fn picker_card(
         }));
     }
     for (label, value) in options {
-        let mut payload = json!({
+        elements.push(option_button(
+            thread_key,
+            action,
+            label,
+            value,
+            level,
+            callback_fields,
+        ));
+    }
+    if let Some(note) = note {
+        elements.push(markdown_element(note));
+    }
+    if let Some(free_text) = free_text {
+        elements.push(markdown_element(free_text));
+    }
+    card_shell(header, "blue", elements)
+}
+
+/// The leading "back to the root page" button of a drilled-in picker page.
+fn back_button(
+    thread_key: &crate::config::ThreadKey,
+    action: &str,
+    callback_fields: &[(&str, &str)],
+) -> serde_json::Value {
+    json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "← 返回全部 provider" },
+        "type": "default",
+        "width": "fill",
+        "value": with_callback_field(json!({
             "action": action,
             "chat_id": thread_key.chat_id,
             "thread_id": thread_key.thread_id,
-            "value": value,
-        });
-        if let Some(l) = level {
-            payload["level"] = json!(l.as_str());
-        }
-        elements.push(json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": label },
-            "type": "default",
-            "width": "fill",
-            "value": with_callback_field(payload, callback_fields),
-        }));
+            "level": PICKER_LEVEL_PROVIDER,
+            "value": PICKER_BACK_TO_PROVIDERS,
+        }), callback_fields),
+    })
+}
+
+/// One option button: its label, its callback value, and the `level` the
+/// handler dispatches on.
+fn option_button(
+    thread_key: &crate::config::ThreadKey,
+    action: &str,
+    label: &str,
+    value: &str,
+    level: Option<&str>,
+    callback_fields: &[(&str, &str)],
+) -> serde_json::Value {
+    let mut payload = json!({
+        "action": action,
+        "chat_id": thread_key.chat_id,
+        "thread_id": thread_key.thread_id,
+        "value": value,
+    });
+    if let Some(l) = level {
+        payload["level"] = json!(l);
     }
-    card_shell(header, "blue", elements)
+    json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": label },
+        "type": "default",
+        "width": "fill",
+        "value": with_callback_field(payload, callback_fields),
+    })
+}
+
+fn markdown_element(content: &str) -> serde_json::Value {
+    json!({
+        "tag": "markdown",
+        "content": crate::feishu::card::sanitize::sanitize_markdown(content)
+    })
 }
 
 /// The `/agent` picker card: one button per available agent plus a separate
@@ -166,112 +210,162 @@ pub fn build_agent_card(
         },
         &options,
         &[],
+        None,
+        None,
     )
 }
 
-/// The `/model` picker, step 1: one card page per set of `provider` buttons.
-/// Falls back to an empty intro when no providers are listed (the backend is
-/// unreachable).
+/// Render one page of a client-declared [`ModelSurface`] as `/model` cards.
 ///
-/// A shared OpenCode server advertises providers across every model source it
-/// knows (gateways included) — hundreds of providers and thousands of models,
-/// which in a single button-per-model card blows past Feishu's 30KB / component
-/// ceilings and the send fails silently (the `/model` command "does nothing").
-/// The flow is therefore two-step: pick a provider here, then one of its
-/// models ([`build_model_picker_cards`]); every card is chunked to stay under
-/// the card budgets, and any model stays selectable via the
-/// `/model <provider/model>` text form. `current` is the model the next turn
-/// will run (session override → configured default → server-recorded) — shown
-/// so the user can see what a pick would replace.
-pub fn build_model_provider_cards(
+/// The surface owns the shape: one scope is one titled section (a provider
+/// list on OpenCode, a provider's models, Codex's flat catalog). A page with
+/// one scope renders a single card whose header is that scope's title; a page
+/// with several scopes renders one card with a section per scope, falling
+/// back to per-scope cards when the combined page exceeds the card budget.
+/// Every scope's options are chunked through [`chunk_picker_cards`], so any
+/// provider/model count stays under Feishu's card limits.
+///
+/// `back` asks for the leading "← 返回全部 provider" button (a drilled-in page
+/// of the OpenCode two-level flow); its callback value is
+/// [`PICKER_BACK_TO_PROVIDERS`] at level [`PICKER_LEVEL_PROVIDER`].
+pub fn build_model_surface_cards(
     thread_key: &crate::config::ThreadKey,
-    providers: &[crate::backend::types::ProviderModels],
-    current: Option<&str>,
+    surface: &crate::backend::types::ModelSurface,
+    back: bool,
 ) -> Vec<serde_json::Value> {
-    let options: Vec<(String, String)> = providers
-        .iter()
-        .map(|p| (p.provider.clone(), p.provider.clone()))
-        .collect();
-    if options.is_empty() {
-        return vec![picker_card(
+    match surface.scopes.as_slice() {
+        [] => vec![picker_card(
             "🎯 选择模型",
-            &format!("{}_(没有可用模型)_", current_model_line(current)),
+            &format!("{}_(没有可用模型)_", current_model_line(surface.current.as_ref())),
             thread_key,
             "model",
-            Some(PickerLevel::Provider),
-            false,
+            None,
+            back,
             None,
             &[],
             &[],
+            None,
+            None,
+        )],
+        [scope] => scope_cards(thread_key, surface.current.as_ref(), scope, back),
+        scopes => {
+            let combined = combined_surface_card(thread_key, surface.current.as_ref(), scopes, back);
+            if combined.to_string().len() <= MAX_CARD_JSON_CHARS {
+                vec![combined]
+            } else {
+                scopes
+                    .iter()
+                    .flat_map(|scope| scope_cards(thread_key, surface.current.as_ref(), scope, back))
+                    .collect()
+            }
+        }
+    }
+}
+
+/// One scope's card page(s): its intro (with the current-model line on top),
+/// the back button, its options, then its note and hand-write hint.
+fn scope_cards(
+    thread_key: &crate::config::ThreadKey,
+    current: Option<&crate::backend::types::ModelSelection>,
+    scope: &crate::backend::types::ModelScope,
+    back: bool,
+) -> Vec<serde_json::Value> {
+    let header = format!("🎯 {}", scope.title);
+    let mut intro = current_model_line(current);
+    if let Some(scope_intro) = &scope.intro {
+        intro.push_str(scope_intro);
+    }
+    let options: Vec<(String, String)> = scope
+        .options
+        .iter()
+        .map(|option| {
+            (
+                option.display_label().to_string(),
+                option.callback_value().to_string(),
+            )
+        })
+        .collect();
+    if options.is_empty() {
+        return vec![picker_card(
+            &header,
+            &intro,
+            thread_key,
+            "model",
+            Some(scope.id.as_str()),
+            back,
+            None,
+            &[],
+            &[],
+            scope.note.as_deref(),
+            scope.free_text.as_deref(),
         )];
     }
     chunk_picker_cards(
-        "🎯 选择模型",
-        &format!(
-            "{}**选择 provider**（共 {} 个）：",
-            current_model_line(current),
-            options.len()
-        ),
+        &header,
+        &intro,
         thread_key,
         "model",
-        Some(PickerLevel::Provider),
-        false,
+        Some(scope.id.as_str()),
+        back,
         None,
         &options,
         &[],
+        scope.note.as_deref(),
+        scope.free_text.as_deref(),
     )
+}
+
+/// A multi-scope page in one card: a section heading per scope, its options,
+/// its note and its hand-write hint. Used when the client declares more than
+/// one scope (#908's provider + catalog page).
+fn combined_surface_card(
+    thread_key: &crate::config::ThreadKey,
+    current: Option<&crate::backend::types::ModelSelection>,
+    scopes: &[crate::backend::types::ModelScope],
+    back: bool,
+) -> serde_json::Value {
+    let mut elements: Vec<serde_json::Value> = Vec::new();
+    let intro = current_model_line(current);
+    if !intro.is_empty() {
+        elements.push(markdown_element(&intro));
+    }
+    if back {
+        elements.push(back_button(thread_key, "model", &[]));
+    }
+    for scope in scopes {
+        let mut heading = format!("**{}**", scope.title);
+        if let Some(scope_intro) = &scope.intro {
+            heading.push('\n');
+            heading.push_str(scope_intro);
+        }
+        elements.push(markdown_element(&heading));
+        for option in &scope.options {
+            elements.push(option_button(
+                thread_key,
+                "model",
+                option.display_label(),
+                option.callback_value(),
+                Some(scope.id.as_str()),
+                &[],
+            ));
+        }
+        if let Some(note) = &scope.note {
+            elements.push(markdown_element(note));
+        }
+        if let Some(free_text) = &scope.free_text {
+            elements.push(markdown_element(free_text));
+        }
+    }
+    card_shell("🎯 选择模型", "blue", elements)
 }
 
 /// The leading "current model" line shared by the `/model` picker cards.
-/// `current` is the caller's display label (`provider/model@variant`); empty
-/// when there is no session or no rung of the effective-model ladder resolves
-/// — the card then shows only its "选择 …" intro, exactly as before.
-fn current_model_line(current: Option<&str>) -> String {
+/// Empty when there is no session or no rung of the effective-model ladder
+/// resolves — the card then shows only its "选择 …" intro, exactly as before.
+fn current_model_line(current: Option<&crate::backend::types::ModelSelection>) -> String {
     current
-        .map(|c| format!("**当前模型**：`{c}`\n"))
+        .map(|c| format!("**当前模型**：`{}`\n", c.label))
         .unwrap_or_default()
-}
-
-/// The `/model` picker, step 2: one card page per set of `provider/model`
-/// buttons for a single chosen provider. Carries a leading "← 返回全部
-/// provider" button so the user can back out of a wrong provider.
-pub fn build_model_picker_cards(
-    thread_key: &crate::config::ThreadKey,
-    provider: &str,
-    models: &[crate::backend::types::ModelOption],
-) -> Vec<serde_json::Value> {
-    // The provider is already chosen (step 1), so the button LABEL shows just
-    // the model name — a `provider/model` label truncates in Feishu's button
-    // width. The callback VALUE keeps the full `provider/model` the handler
-    // records as the override.
-    let options: Vec<(String, String)> = models
-        .iter()
-        .map(|m| (m.id.clone(), format!("{provider}/{}", m.id)))
-        .collect();
-    if options.is_empty() {
-        return vec![picker_card(
-            &format!("🎯 {provider}"),
-            "_(该 provider 没有可用模型)_",
-            thread_key,
-            "model",
-            Some(PickerLevel::Model),
-            true,
-            None,
-            &[],
-            &[],
-        )];
-    }
-    chunk_picker_cards(
-        &format!("🎯 {provider}"),
-        "**选择 model**（下一条消息开始生效）：",
-        thread_key,
-        "model",
-        Some(PickerLevel::Model),
-        true,
-        None,
-        &options,
-        &[],
-    )
 }
 
 /// Max picker buttons per card. Feishu counts each button's inner `plain_text`
@@ -290,11 +384,13 @@ fn chunk_picker_cards(
     intro: &str,
     thread_key: &crate::config::ThreadKey,
     action: &str,
-    level: Option<PickerLevel>,
+    level: Option<&str>,
     back: bool,
     clear: Option<(&str, &str)>,
     options: &[(String, String)],
     callback_fields: &[(&str, &str)],
+    note: Option<&str>,
+    free_text: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let mut pages: Vec<&[(String, String)]> = Vec::new();
     let mut start = 0usize;
@@ -340,6 +436,8 @@ fn chunk_picker_cards(
             clear,
             page,
             callback_fields,
+            note,
+            free_text,
         ));
     }
     cards
@@ -390,6 +488,8 @@ pub fn build_think_card(
         Some(("默认（清除）", "think_clear")),
         &options,
         &[],
+        None,
+        None,
     )
 }
 
@@ -610,23 +710,44 @@ pub(crate) fn build_skill_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::types::{ChangeScope, ModelOption, ModelScope, ModelSelection, ModelSurface};
     use crate::feishu::card::FEISHU_CARD_LIMIT_BYTES;
-    /// A provider list of any size must never build a card over Feishu's
-    /// ceilings: the `/model` picker chunks into pages under the byte budget.
+
+    fn surface(current: Option<ModelSelection>, scopes: Vec<ModelScope>) -> ModelSurface {
+        ModelSurface { current, scopes }
+    }
+
+    fn scope(id: &str, title: &str, options: Vec<ModelOption>) -> ModelScope {
+        ModelScope {
+            id: id.into(),
+            title: title.into(),
+            changeable: ChangeScope::ThisTurn,
+            options,
+            note: None,
+            free_text: None,
+            intro: None,
+        }
+    }
+
+    /// OpenCode's provider page keeps its hand-built shape: the same header,
+    /// the same "选择 provider（共 N 个）" intro (with the current-model line on
+    /// top), and the same chunking under Feishu's ceilings.
     #[test]
-    fn provider_cards_chunk_without_exceeding_feishu_limits() {
+    fn opencode_provider_page_shape_unchanged_and_chunks() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        // A shared server advertising hundreds of providers.
-        let providers: Vec<crate::backend::types::ProviderModels> = (0..212)
-            .map(|p| crate::backend::types::ProviderModels {
-                provider: format!("provider-{p}"),
-                models: vec![crate::backend::types::ModelOption {
-                    id: "m".into(),
-                    variants: Vec::new(),
-                }],
-            })
+        let providers: Vec<ModelOption> = (0..212)
+            .map(|p| ModelOption::new(format!("provider-{p}")))
             .collect();
-        let cards = build_model_provider_cards(&key, &providers, None);
+        let mut provider_scope = scope("provider", "选择模型", providers.clone());
+        provider_scope.intro = Some(format!("**选择 provider**（共 {} 个）：", providers.len()));
+        let surface = surface(
+            Some(ModelSelection {
+                label: "opencode-go/deepseek-v4-flash@low".into(),
+                reference: "opencode-go/deepseek-v4-flash".into(),
+            }),
+            vec![provider_scope],
+        );
+        let cards = build_model_surface_cards(&key, &surface, false);
         assert!(cards.len() > 1, "huge provider list must split: {}", cards.len());
         let mut total_buttons = 0;
         for card in &cards {
@@ -643,20 +764,40 @@ mod tests {
             );
         }
         assert_eq!(total_buttons, providers.len(), "every provider gets a button");
+        let first = cards[0].to_string();
+        assert!(first.contains("选择模型"), "header: {first}");
+        assert!(first.contains("选择 provider"), "intro: {first}");
+        assert!(
+            first.contains("当前模型") && first.contains("opencode-go/deepseek-v4-flash@low"),
+            "current line: {first}"
+        );
+        let payload = &cards[0]["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .unwrap()["value"];
+        assert_eq!(payload["level"].as_str(), Some("provider"));
+        assert_eq!(payload["value"].as_str(), Some("provider-0"));
     }
 
-    /// The model picker for one provider carries a back button and honors the
-    /// card budgets even for a provider with hundreds of models.
+    /// OpenCode's per-provider model page keeps its hand-built shape: the
+    /// provider as header, the "选择 model" intro, the back button, and
+    /// `provider/model` callback values.
     #[test]
-    fn model_picker_chunks_and_has_back_button() {
+    fn opencode_model_page_shape_unchanged_with_back_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let models: Vec<crate::backend::types::ModelOption> = (0..400)
-            .map(|i| crate::backend::types::ModelOption {
+        let models: Vec<ModelOption> = (0..400)
+            .map(|i| ModelOption {
                 id: format!("model-{i}"),
-                variants: Vec::new(),
+                value: Some(format!("opencode/model-{i}")),
+                ..Default::default()
             })
             .collect();
-        let cards = build_model_picker_cards(&key, "opencode", &models);
+        let mut model_scope = scope("model", "opencode", models);
+        model_scope.intro = Some("**选择 model**（下一条消息开始生效）：".into());
+        let surface = surface(None, vec![model_scope]);
+        let cards = build_model_surface_cards(&key, &surface, true);
         assert!(cards.len() > 1, "huge model list must split: {}", cards.len());
         let first = &cards[0];
         let buttons = first["body"]["elements"]
@@ -668,8 +809,11 @@ mod tests {
         // The first card also carries the "back" button, so model buttons are
         // one fewer than the total button count.
         assert!(buttons - 1 <= MAX_PICKER_BUTTONS_PER_CARD);
+        let text = first.to_string();
+        assert!(text.contains("🎯 opencode"), "header: {text}");
+        assert!(text.contains("选择 model"), "intro: {text}");
         assert!(
-            first.to_string().contains("返回全部 provider"),
+            text.contains("返回全部 provider"),
             "model picker must offer a way back"
         );
         let payload = &first["body"]["elements"]
@@ -680,26 +824,82 @@ mod tests {
             .unwrap()["value"];
         assert_eq!(payload["level"].as_str(), Some("provider"), "back button level");
         assert_eq!(payload["value"].as_str(), Some("__providers__"));
-        assert!(first.to_string().contains("opencode/model-0"));
+        assert!(text.contains("\"value\":\"opencode/model-0\""), "value: {text}");
+        assert!(
+            !text.contains("\"content\":\"opencode/model-0\""),
+            "the label stays the bare model id: {text}"
+        );
         for card in &cards {
             assert!(card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES);
         }
     }
 
-    /// An empty provider list degrades to a single "no models" card, not zero;
-    /// a resolvable current model still renders its line on top.
+    /// A scope with no options degrades to its note + hand-write hint, never
+    /// an empty button group.
     #[test]
-    fn provider_cards_degrade_to_empty_intro() {
+    fn empty_scope_renders_note_and_free_text_without_buttons() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let cards = build_model_provider_cards(&key, &[], Some("opencode-go/deepseek-v4-flash@low"));
+        let mut empty = scope("model", "模型（每轮可换）", Vec::new());
+        empty.note = Some("_(没有可用模型)_".into());
+        empty.free_text = Some("也可以直接发送 `/model codex/<id>`".into());
+        let cards = build_model_surface_cards(&key, &surface(None, vec![empty]), false);
         assert_eq!(cards.len(), 1);
         let text = cards[0].to_string();
-        assert!(text.contains("没有可用模型"), "degrade intro: {text}");
-        assert!(text.contains("当前模型"), "current label: {text}");
-        assert!(
-            text.contains("opencode-go/deepseek-v4-flash@low"),
-            "current model: {text}"
+        assert!(text.contains("没有可用模型"), "note: {text}");
+        assert!(text.contains("/model codex/<id>"), "hint: {text}");
+        let buttons = cards[0]["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "button")
+            .count();
+        assert_eq!(buttons, 0, "an empty scope has no buttons: {text}");
+    }
+
+    /// A client-declared surface with two scopes renders two titled sections
+    /// plus each scope's note and hand-write hint, and every button's callback
+    /// value is passed through verbatim.
+    #[test]
+    fn fake_surface_renders_two_sections_and_returns_values() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut catalog = scope(
+            "catalog",
+            "内置目录",
+            vec![ModelOption {
+                id: "codex/gpt-5.1-codex".into(),
+                label: Some("GPT-5.1 Codex".into()),
+                ..Default::default()
+            }],
         );
+        catalog.note = Some("目录来自 Codex 的内置清单".into());
+        catalog.free_text = Some("也可以直接发送 `/model codex/<id>`".into());
+        let mut provider = scope(
+            "provider",
+            "自定义 provider",
+            vec![ModelOption {
+                id: "custom".into(),
+                value: Some("custom/model".into()),
+                group: Some("自定义".into()),
+                ..Default::default()
+            }],
+        );
+        provider.note = Some("provider 未开放 `/models`，请手写 id".into());
+        let cards = build_model_surface_cards(&key, &surface(None, vec![catalog, provider]), false);
+        assert_eq!(cards.len(), 1, "a small two-scope surface fits one card");
+        let text = cards[0].to_string();
+        assert!(text.contains("**内置目录**"), "first section: {text}");
+        assert!(text.contains("**自定义 provider**"), "second section: {text}");
+        assert!(text.contains("目录来自 Codex 的内置清单"), "note: {text}");
+        assert!(text.contains("请手写 id"), "provider note: {text}");
+        assert!(text.contains("/model codex/<id>"), "hint: {text}");
+        let values: Vec<String> = cards[0]["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["tag"] == "button")
+            .filter_map(|e| e["value"]["value"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(values, ["codex/gpt-5.1-codex", "custom/model"]);
     }
 
     /// The `/think` card lists the current model, its declared variants, and a

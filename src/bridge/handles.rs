@@ -617,10 +617,10 @@ impl SessionsHandle {
         }
     }
 
-    /// The declared variants of a provider/model, per `GET /provider`.
-    /// Best-effort: `None` when the model can't be found in the advertised
-    /// catalog (callers then leave a stored variant in place rather than
-    /// destroying it on an unknown).
+    /// The declared variants of a provider/model, read from the client's
+    /// model surface (a provider's model page). Best-effort: `None` when the
+    /// model can't be found in the advertised catalog (callers then leave a
+    /// stored variant in place rather than destroying it on an unknown).
     pub(crate) async fn model_variants(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -628,12 +628,17 @@ impl SessionsHandle {
         model: &str,
     ) -> Option<Vec<String>> {
         backend
-            .list_models()
+            .model_surface(crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some(provider),
+                ..Default::default()
+            })
             .await
+            .scopes
             .into_iter()
-            .find(|p| p.provider == provider)
-            .and_then(|p| p.models.into_iter().find(|m| m.id == model))
-            .map(|m| m.variants)
+            .flat_map(|scope| scope.options)
+            .find(|option| option.id == model)
+            .map(|option| option.variants)
     }
 
     /// Auto-clear a `/think` variant when switching to a model that doesn't

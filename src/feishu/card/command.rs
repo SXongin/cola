@@ -6,7 +6,7 @@
 //! inputs in, card JSON out: [`super::session::build_switch_card`],
 //! [`super::session::build_dir_card`] and [`super::session::build_child_card`],
 //! [`super::picker::build_agent_card`],
-//! [`super::picker::build_model_provider_cards`],
+//! [`super::picker::build_model_surface_cards`],
 //! [`super::picker::build_think_card`],
 //! [`super::picker::build_autoaccept_card`], and
 //! [`super::help::build_help_card`]. This module is the form layer over them:
@@ -17,7 +17,7 @@
 //! match and the text-command behavior.
 //!
 //! The fetch-and-shape functions ([`switch_card_data`], [`dir_card_data`],
-//! [`child_card_data`], [`agent_card`], [`think_card`], [`current_model_label`])
+//! [`child_card_data`], [`agent_card`], [`think_card`], [`model_surface`])
 //! are shared with the coordinator's card-ack refresh, which rebuilds a clicked
 //! card from the same one source of truth.
 
@@ -683,45 +683,72 @@ pub(crate) async fn send_agent_card(
     Ok(())
 }
 
-/// Send the `/model` provider-picker cards (ADR-0012, issue 05): step 1 of a
-/// two-level provider → model flow, chunked so any provider count stays under
-/// Feishu's card limits. The intro carries the CURRENT model
-/// ([`current_model_label`]) so the user sees what a pick would replace.
+/// Send the `/model` card surface's root page. The page is whatever the
+/// client declared (`Backend::model_surface`) — OpenCode's provider list,
+/// Codex's flat catalog — rather than a shape the bridge assumes; the current
+/// model line comes from the same surface.
 pub(crate) async fn send_model_card(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> Result<()> {
-    let current = current_model_label(handles, thread_key).await;
-    let providers = handles.flow.backend.list_models().await;
-    let cards = super::picker::build_model_provider_cards(thread_key, &providers, current.as_deref());
+    let surface = model_surface(handles, thread_key, None, None).await;
+    let cards = super::picker::build_model_surface_cards(thread_key, &surface, false);
     for card in cards {
         handles.flow.platform.reply_card(message_id, &card).await?;
     }
     Ok(())
 }
 
-/// The current model label the `/model` picker renders: `provider/model` from
-/// the effective-model ladder (the session's durable selection on V2, else the
-/// settings override → configured default → server-recorded), plus `@variant`
-/// from that same selection. The target is the Pending Session when one
-/// exists, else the active SessionEntry (ADR-0041). `None` when the thread has
-/// no target or no rung resolves — the picker then omits its current-model
-/// line. Shared by the text send path and the card-ack rebuild so both show one
-/// source of truth.
-pub(crate) async fn current_model_label(handles: &CommandHandles, thread_key: &ThreadKey) -> Option<String> {
-    let settings = handles.flow.sessions.session_settings(thread_key).await?;
-    let model = handles
+/// Read one page of the client-declared `/model` surface. `scope`/`selected`
+/// name the drill-down (OpenCode: the `provider` scope and the provider id the
+/// user tapped); both are `None` for the root page. The current model comes
+/// from the effective-model ladder (the session's durable selection on V2,
+/// else the settings override → configured default → server-recorded) and is
+/// handed to the backend with the session context, so the card's current line
+/// and its scopes have one source.
+pub(crate) async fn model_surface(
+    handles: &CommandHandles,
+    thread_key: &ThreadKey,
+    scope: Option<&str>,
+    selected: Option<&str>,
+) -> crate::backend::types::ModelSurface {
+    let settings = handles.flow.sessions.session_settings(thread_key).await;
+    let current = match &settings {
+        Some(settings) => handles
+            .flow
+            .sessions
+            .effective_selection(&handles.flow.backend, settings)
+            .await
+            .map(|model| {
+                let variant = model
+                    .variant
+                    .as_deref()
+                    .map(|v| format!("@{v}"))
+                    .unwrap_or_default();
+                crate::backend::types::ModelSelection {
+                    label: format!("{}/{}{}", model.provider_id, model.id, variant),
+                    reference: format!("{}/{}", model.provider_id, model.id),
+                }
+            }),
+        None => None,
+    };
+    let session_id = settings.as_ref().and_then(|s| s.session_id.as_deref());
+    let directory = settings
+        .as_ref()
+        .map(|s| s.directory.as_str())
+        .filter(|directory| !directory.is_empty());
+    handles
         .flow
-        .sessions
-        .effective_selection(&handles.flow.backend, &settings)
-        .await?;
-    let variant = model
-        .variant
-        .as_deref()
-        .map(|v| format!("@{v}"))
-        .unwrap_or_default();
-    Some(format!("{}/{}{}", model.provider_id, model.id, variant))
+        .backend
+        .model_surface(crate::backend::types::ModelSurfaceQuery {
+            session_id,
+            directory,
+            current,
+            scope,
+            selected,
+        })
+        .await
 }
 
 /// Resolve what the `/think` card should show for a thread's target session:
