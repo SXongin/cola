@@ -675,10 +675,10 @@ impl InteractionBlock {
 
     /// The compact one-line target an Interaction Receipt names for this block
     /// (ADR-0038, rule 4): permissions carry their action + first pattern /
-    /// edited file (computed at inline time), questions their headers (or a
-    /// clipped question text). Derived from the block itself, never from a
-    /// click payload, so a malformed callback cannot write arbitrary markdown
-    /// onto a card.
+    /// edited file (computed at inline time), questions their own text (or a
+    /// clipped header when a field has none). Derived from the block itself,
+    /// never from a click payload, so a malformed callback cannot write
+    /// arbitrary markdown onto a card.
     pub(super) fn receipt_target(&self) -> String {
         match self {
             InteractionBlock::Permission(p) => p.target.clone(),

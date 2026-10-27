@@ -675,7 +675,7 @@ async fn partial_question_answer_refreshes_the_clicked_card() {
         .expect("a card-action result");
     let ack2 = ack_text(&r2);
     assert!(
-        ack2.contains("✅ 已回答：目录 /a、分支 main"),
+        ack2.contains("✅ 已回答：选目录 /a；选分支 main"),
         "receipt missing: {ack2}"
     );
     assert!(
@@ -858,7 +858,7 @@ async fn rehost_preserves_a_questions_partial_answers() {
         .await
         .expect("a card-action result");
     assert!(
-        ack_text(&r2).contains("✅ 已回答：目录 /a、分支 main"),
+        ack_text(&r2).contains("✅ 已回答：选目录 /a；选分支 main"),
         "the receipt names both answers: {}",
         ack_text(&r2)
     );

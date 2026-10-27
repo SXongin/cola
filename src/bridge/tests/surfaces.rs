@@ -296,7 +296,7 @@ async fn restart_readopts_a_pending_inline_question() {
         .expect("a card-action result");
     let ack2 = card_text(r2.card.as_ref().expect("the ack carries the card"));
     assert!(
-        ack2.contains("✅ 已回答：目录 /a、分支 main"),
+        ack2.contains("✅ 已回答：选目录 /a；选分支 main"),
         "receipt missing: {ack2}"
     );
     assert!(
