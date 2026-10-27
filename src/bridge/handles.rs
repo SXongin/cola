@@ -640,7 +640,8 @@ impl SessionsHandle {
                 // the caller would silently keep a `/think` variant the model
                 // does not declare, failing the next turn. A full read that
                 // overruns only forfeits the toast — the handler keeps running
-                // and still records the pick.
+                // and still records the pick — and the adapter still bounds it,
+                // so a silent server is "unknown", never a hung pick.
                 ack_budget: None,
                 ..Default::default()
             })

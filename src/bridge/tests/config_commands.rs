@@ -506,6 +506,82 @@ async fn a_stalled_selection_ladder_still_returns_the_root_page_inside_the_ack_b
     );
 }
 
+/// The ack deadline is anchored at the callback's true start: time spent in
+/// the pre-dispatch store reads is charged too. Holding the sessions store for
+/// 400 ms must leave the backend visibly less than a fresh 2 s budget.
+#[tokio::test]
+async fn a_card_callback_charges_pre_dispatch_store_time_to_the_budget() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: "opencode".into(),
+        models: vec![model_option("gpt-4o", &[])],
+    }]);
+    // A fast ladder rung, so the measured budget is the pre-dispatch time.
+    backend.with_session_model(crate::backend::types::SessionModel {
+        provider_id: "opencode".into(),
+        id: "gpt-4o".into(),
+    });
+    let queries = backend.model_surface_queries.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key,
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    // Hold the sessions store across the click's pre-dispatch span read.
+    let store = app.command_handles().flow.sessions.store.clone();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let release = tokio::spawn(async move {
+        let guard = store.lock().await;
+        let _ = held_tx.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        drop(guard);
+    });
+    held_rx.await.expect("the store is held");
+
+    let value = serde_json::json!({
+        "action": "model",
+        "level": "provider",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "__providers__",
+    });
+    let result = app.host_action(value).await.expect("back action");
+    release.await.unwrap();
+
+    let card = result.card.expect("the root page still renders");
+    assert!(card.to_string().contains("选择 provider"), "{card}");
+    let recorded = queries.lock().await;
+    let query = recorded.last().expect("the backend read still happened");
+    let budget = query
+        .ack_budget
+        .expect("a callback passes the budget left after its earlier work");
+    assert!(
+        budget < crate::feishu::ws::CARD_ACK_BUDGET - std::time::Duration::from_millis(300),
+        "the 400ms spent before dispatch must be charged, got {budget:?}"
+    );
+    assert!(
+        budget > std::time::Duration::ZERO,
+        "the backend still gets what is left: {budget:?}"
+    );
+}
+
 /// A client that declares a flat model surface (Codex's shape) gets a flat
 /// `/model` card: the "current model" line, one 「模型（每轮可换）」 scope, and
 /// the hand-write hint — no provider pseudo-level. Tapping a model records the

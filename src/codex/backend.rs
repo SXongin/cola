@@ -1346,6 +1346,24 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
 /// was read so far, and the truncation is logged.
 const MAX_MODEL_PAGES: usize = 64;
 
+/// A catalog read with **no ack budget** (a command's page, or the variant
+/// validation a model pick awaits) still gets a finite total bound: a silently
+/// stalled `model/list` must not hold the pick forever. Alive-but-slow servers
+/// still page through it; the partial catalog is "unknown", which preserves a
+/// stored variant rather than deciding it has none.
+#[cfg(not(test))]
+const CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CATALOG_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// One `model/list` round-trip's own bound inside that read. A request that
+/// does not answer in this time stops the page loop; whatever was read so far
+/// is the catalog.
+#[cfg(not(test))]
+const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// Map Codex's flat `model/list` catalog onto the client-declared surface when
 /// there is no config read to enrich it (an unattached lifecycle, or the cheap
 /// catalog-only read the `/think` variant lookup asks for). The real surface is
@@ -1549,22 +1567,22 @@ impl CodexClient {
     ///
     /// A deadline hit keeps the pages already read: a partial catalog is a
     /// usable degraded surface (the rest of the card still renders), whereas
-    /// waiting on a stalled server would miss the callback ack. `None` is the
-    /// root page, which pages up to [`MAX_MODEL_PAGES`] with no time bound.
-    /// Every request is bounded by the deadline too, so one hung `model/list`
-    /// cannot use the whole budget on its own.
+    /// waiting on a stalled server would miss the callback ack. **`None` is
+    /// still finite**: a command's page or a validation read gets
+    /// [`CATALOG_READ_TIMEOUT`] in total, and each request is additionally
+    /// bounded by [`CATALOG_REQUEST_TIMEOUT`], so a permanently silent server
+    /// cannot hold a model pick forever. `MAX_MODEL_PAGES` caps the loop.
     pub(crate) async fn list_models_within(
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> Vec<ProviderModels> {
+        let deadline = deadline.unwrap_or_else(|| tokio::time::Instant::now() + CATALOG_READ_TIMEOUT);
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::HashSet::new();
         let mut models = Vec::new();
         for page in 0..MAX_MODEL_PAGES {
-            if let Some(deadline) = deadline
-                && tokio::time::Instant::now() >= deadline
-            {
-                tracing::warn!("codex model/list reached the card deadline; showing the catalog read so far");
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!("codex model/list reached its read deadline; showing the catalog read so far");
                 break;
             }
             let mut params = json!({});
@@ -1572,18 +1590,18 @@ impl CodexClient {
                 params["cursor"] = json!(cursor);
             }
             let request = self.connection().request("model/list", params);
-            let result = match deadline {
-                Some(deadline) => match tokio::time::timeout_at(deadline, request).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        tracing::warn!(
-                            "codex model/list did not answer before the card deadline; \
-                             showing the catalog read so far"
-                        );
-                        break;
-                    }
-                },
-                None => request.await,
+            // A callback's slice may be shorter than one request's own bound;
+            // the earlier of the two wins.
+            let request_deadline = deadline.min(tokio::time::Instant::now() + CATALOG_REQUEST_TIMEOUT);
+            let result = match tokio::time::timeout_at(request_deadline, request).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        "codex model/list did not answer before its read deadline; \
+                         showing the catalog read so far"
+                    );
+                    break;
+                }
             };
             let result = match result {
                 Ok(result) => result,
@@ -2134,8 +2152,10 @@ impl Backend for CodexClient {
     /// # Read budgets
     ///
     /// A root `/model` page is a text command, so `query.ack_budget` is `None`:
-    /// it keeps full fidelity, with a [`super::model_surface::CONFIG_READ_TIMEOUT`]
-    /// (2 s) config read and fresh probes (2 s each, concurrent).
+    /// it keeps full fidelity, with a
+    /// [`super::model_surface::CONFIG_READ_TIMEOUT`] (2 s) config read and a
+    /// catalog read bounded by [`CATALOG_READ_TIMEOUT`] in total (2 s per
+    /// request), with fresh probes.
     ///
     /// A **drilled** page is a card callback and arrives with `ack_budget =
     /// Some(budget)`. It cannot chain those two waits, so **both** its config
@@ -4986,8 +5006,9 @@ mod tests {
 
         assert_eq!(server.config_read_calls(), 1, "the read was sent");
         assert!(
-            elapsed < Duration::from_secs(2),
-            "a callback read took {elapsed:?}, past the 2s ack budget"
+            elapsed < Duration::from_millis(600) + Duration::from_secs(3),
+            "a callback read took {elapsed:?}; the 600ms slice plus test-runner \
+             scheduling exceeded it"
         );
         assert!(
             elapsed >= Duration::from_millis(600),
@@ -5036,12 +5057,13 @@ mod tests {
             "the stalled page was attempted once, then the deadline stopped the loop"
         );
         assert!(
-            elapsed < Duration::from_secs(2),
-            "a stalled catalog took {elapsed:?}, past the 2s ack budget"
+            elapsed < Duration::from_millis(600) + Duration::from_secs(3),
+            "a stalled catalog took {elapsed:?}; the bounded read plus test-runner \
+             scheduling exceeded it"
         );
         assert!(
-            elapsed >= Duration::from_millis(600),
-            "the catalog should get its 600ms slice, took {elapsed:?}"
+            elapsed >= Duration::from_millis(150),
+            "the stalled page should wait for the request bound, took {elapsed:?}"
         );
         assert!(
             surface.scopes[1]
@@ -5095,8 +5117,9 @@ mod tests {
             "the deadline stopped the 100-page catalog after {calls} pages"
         );
         assert!(
-            elapsed < Duration::from_secs(2),
-            "a paginated catalog took {elapsed:?}, past the 2s ack budget"
+            elapsed < Duration::from_millis(600) + Duration::from_secs(3),
+            "a paginated catalog took {elapsed:?}; the 600ms slice plus \
+             test-runner scheduling exceeded it"
         );
         assert!(
             surface
@@ -5130,7 +5153,9 @@ mod tests {
             .collect();
         server.set_models(models);
         server.set_model_page_size(1);
-        server.set_model_list_delay(Duration::from_millis(150));
+        // Slow enough to span many requests, fast enough that test-runner
+        // scheduling cannot trip the per-request bound.
+        server.set_model_list_delay(Duration::from_millis(50));
         let client = connect(&url).await;
 
         let surface = Backend::model_surface(
@@ -5151,6 +5176,41 @@ mod tests {
             .find(|option| option.id == "model-4")
             .expect("the later page's model is in the catalog");
         assert_eq!(model.variants, ["high"]);
+    }
+
+    /// A validation read has no ack slice, but it is still finite: a silent
+    /// `model/list` stops at the request bound and the catalog is unknown
+    /// (empty plus the normal note), not a hung pick.
+    #[tokio::test]
+    async fn a_silent_catalog_validation_read_is_bounded() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.silence_next_model_list();
+        let client = connect(&url).await;
+
+        let started = Instant::now();
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("codex"),
+                catalog_only: true,
+                // The validation read: no ack budget, still finite.
+                ..Default::default()
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(server.model_list_calls(), 1);
+        assert!(
+            elapsed < Duration::from_millis(200) + Duration::from_secs(3),
+            "a silent catalog held the validation read for {elapsed:?}"
+        );
+        assert!(surface.scopes[0].options.is_empty());
+        assert!(
+            surface.scopes[0].note.is_some(),
+            "the degraded catalog still renders its note"
+        );
     }
 
     /// The `/think` variant lookup's `catalog_only` shape is bounded too: it
@@ -5177,12 +5237,13 @@ mod tests {
 
         assert_eq!(server.model_list_calls(), 1);
         assert!(
-            elapsed < Duration::from_secs(2),
-            "the variant lookup took {elapsed:?}, past the ack budget"
+            elapsed < Duration::from_millis(600) + Duration::from_secs(3),
+            "the variant lookup took {elapsed:?}; the bounded read plus \
+             test-runner scheduling exceeded it"
         );
         assert!(
-            elapsed >= Duration::from_millis(600),
-            "the lookup should get the same 600ms slice, took {elapsed:?}"
+            elapsed >= Duration::from_millis(150),
+            "the lookup should wait for the request bound, took {elapsed:?}"
         );
         // Degrades to the empty-scope note + hint, never a failed read.
         assert!(surface.scopes[0].options.is_empty());

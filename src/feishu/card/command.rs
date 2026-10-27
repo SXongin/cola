@@ -728,7 +728,25 @@ pub(crate) async fn model_surface(
     selected: Option<&str>,
     deadline: Option<tokio::time::Instant>,
 ) -> crate::backend::types::ModelSurface {
-    let settings = handles.flow.sessions.session_settings(thread_key).await;
+    // The store read is part of the callback's work: charge it to the same
+    // deadline, so a wedged store cannot leave the ladder and backend a fresh
+    // budget. `None` is a command's page, with no ack to charge.
+    let settings = match deadline {
+        Some(deadline) => {
+            match tokio::time::timeout_at(deadline, handles.flow.sessions.session_settings(thread_key)).await
+            {
+                Ok(settings) => settings,
+                Err(_) => {
+                    tracing::warn!(
+                        "model card's session-settings read missed the callback budget; \
+                         rendering without the thread's context"
+                    );
+                    None
+                }
+            }
+        }
+        None => handles.flow.sessions.session_settings(thread_key).await,
+    };
     let current = match &settings {
         Some(settings) if scope.is_none() => {
             let resolve = handles
