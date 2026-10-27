@@ -138,7 +138,18 @@ pub enum SandboxMode {
 }
 
 impl SandboxMode {
+    /// The config value and the wire value are the same string, so the parse
+    /// table is also the source of the accepted set in an error message.
+    const CHOICES: &'static [(&'static str, Self)] = &[
+        ("read-only", Self::ReadOnly),
+        ("workspace-write", Self::WorkspaceWrite),
+        ("danger-full-access", Self::DangerFullAccess),
+    ];
+
     pub fn as_str(self) -> &'static str {
+        // An exhaustive match, so a new variant fails to compile here instead of
+        // panicking at a lookup. `CHOICES` governs **parsing** only: a variant
+        // missing from it is simply not configurable, never mis-serialised.
         match self {
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
@@ -170,18 +181,28 @@ impl<'de> Deserialize<'de> for SandboxMode {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::Error as _;
-
-        let raw = String::deserialize(deserializer)?;
-        match raw.as_str() {
-            "read-only" => Ok(Self::ReadOnly),
-            "workspace-write" => Ok(Self::WorkspaceWrite),
-            "danger-full-access" => Ok(Self::DangerFullAccess),
-            other => Err(D::Error::custom(format!(
-                "`sandbox` must be `read-only`, `workspace-write` or `danger-full-access`, got `{other}`"
-            ))),
-        }
+        parse_choice(deserializer, "sandbox", Self::CHOICES)
     }
+}
+
+/// The one parser behind both config choices: it returns the table's variant and
+/// names the key, the accepted set and the offending value when no row matches.
+fn parse_choice<'de, D, T>(deserializer: D, key: &str, choices: &[(&str, T)]) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Copy,
+{
+    use serde::de::Error as _;
+
+    let raw = String::deserialize(deserializer)?;
+    if let Some((_, value)) = choices.iter().find(|(name, _)| *name == raw.as_str()) {
+        return Ok(*value);
+    }
+    let accepted: Vec<String> = choices.iter().map(|(name, _)| format!("`{name}`")).collect();
+    Err(D::Error::custom(format!(
+        "`{key}` must be one of {}, got `{raw}`",
+        accepted.join(", ")
+    )))
 }
 
 /// When a Codex thread asks for approval (issue #898): `thread/start`'s
@@ -201,7 +222,16 @@ pub enum ApprovalPolicy {
 }
 
 impl ApprovalPolicy {
+    /// See [`SandboxMode::CHOICES`]: the parse table is the accepted set.
+    const CHOICES: &'static [(&'static str, Self)] = &[
+        ("untrusted", Self::Untrusted),
+        ("on-request", Self::OnRequest),
+        ("never", Self::Never),
+    ];
+
     pub fn as_str(self) -> &'static str {
+        // See `SandboxMode::as_str`: exhaustive by construction, so a new
+        // variant cannot reach a runtime panic.
         match self {
             Self::Untrusted => "untrusted",
             Self::OnRequest => "on-request",
@@ -231,17 +261,7 @@ impl<'de> Deserialize<'de> for ApprovalPolicy {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::Error as _;
-
-        let raw = String::deserialize(deserializer)?;
-        match raw.as_str() {
-            "untrusted" => Ok(Self::Untrusted),
-            "on-request" => Ok(Self::OnRequest),
-            "never" => Ok(Self::Never),
-            other => Err(D::Error::custom(format!(
-                "`approval_policy` must be `untrusted`, `on-request` or `never`, got `{other}`"
-            ))),
-        }
+        parse_choice(deserializer, "approval_policy", Self::CHOICES)
     }
 }
 
@@ -1815,6 +1835,58 @@ mod tests {
             assert!(
                 err.contains(expected),
                 "the approval error names {expected}: {err}"
+            );
+        }
+    }
+
+    /// The parse table is the single source of the values: every accepted
+    /// value parses to the variant whose `as_str` — and so its serialisation —
+    /// is that same string. A drift would let `config show` print a value the
+    /// parser rejects.
+    #[test]
+    fn every_sandbox_and_approval_value_round_trips() {
+        for (value, mode) in SandboxMode::CHOICES {
+            let cfg: CodexConfig = toml::from_str(&format!("sandbox = \"{value}\"")).unwrap();
+            assert_eq!(cfg.sandbox, Some(*mode), "`{value}` parses");
+            assert_eq!(mode.as_str(), *value, "`{value}` serialises back");
+        }
+        for (value, policy) in ApprovalPolicy::CHOICES {
+            let cfg: CodexConfig = toml::from_str(&format!("approval_policy = \"{value}\"")).unwrap();
+            assert_eq!(cfg.approval_policy, Some(*policy), "`{value}` parses");
+            assert_eq!(policy.as_str(), *value, "`{value}` serialises back");
+        }
+    }
+
+    /// A row missing from a choice table is not a compile error — `CHOICES`
+    /// governs parsing, `as_str` is an exhaustive match — so this test names
+    /// every current variant and asserts each one is present. A future variant
+    /// cannot be added without an `as_str` arm (the match fails to compile);
+    /// this is the reminder that its parse row is due with it.
+    #[test]
+    fn every_choice_table_names_every_variant() {
+        let sandboxes = [
+            SandboxMode::ReadOnly,
+            SandboxMode::WorkspaceWrite,
+            SandboxMode::DangerFullAccess,
+        ];
+        assert_eq!(SandboxMode::CHOICES.len(), sandboxes.len());
+        for mode in sandboxes {
+            assert!(
+                SandboxMode::CHOICES.iter().any(|(_, value)| *value == mode),
+                "{mode:?} is missing from the choice table"
+            );
+        }
+
+        let policies = [
+            ApprovalPolicy::Untrusted,
+            ApprovalPolicy::OnRequest,
+            ApprovalPolicy::Never,
+        ];
+        assert_eq!(ApprovalPolicy::CHOICES.len(), policies.len());
+        for policy in policies {
+            assert!(
+                ApprovalPolicy::CHOICES.iter().any(|(_, value)| *value == policy),
+                "{policy:?} is missing from the choice table"
             );
         }
     }
