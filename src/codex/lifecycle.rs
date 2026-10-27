@@ -359,7 +359,8 @@ impl CodexLifecycle {
             let probe = self.probes.probe(&current.daemon);
             let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()))
                 .with_tasks(self.tasks.clone())
-                .with_authorship(self.authored.clone());
+                .with_authorship(self.authored.clone())
+                .with_thread_settings(super::threads::ThreadSettings::from(&self.settings));
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
             // and the identity re-read right below. The hook opens exactly that
@@ -1457,8 +1458,17 @@ mod tests {
         }
 
         fn lifecycle(&self, start_server: crate::config::ServerStartPolicy) -> CodexLifecycle {
+            self.lifecycle_with(CodexConfig {
+                start_server,
+                ..CodexConfig::default()
+            })
+        }
+
+        /// A lifecycle over explicit Codex options, so a test can exercise the
+        /// config-to-wire path (issue #898).
+        fn lifecycle_with(&self, settings: CodexConfig) -> CodexLifecycle {
             CodexLifecycle::new(
-                CodexConfig { start_server },
+                settings,
                 self.environment.clone(),
                 Box::new(RecordingProbe {
                     seen: Arc::clone(&self.probe_binaries),
@@ -1820,6 +1830,7 @@ mod tests {
         let lifecycle = CodexLifecycle::new(
             CodexConfig {
                 start_server: crate::config::ServerStartPolicy::Never,
+                ..CodexConfig::default()
             },
             fixture.environment.clone(),
             Box::new(RepointingProbe {
@@ -2523,6 +2534,42 @@ mod tests {
         );
     }
 
+    /// Issue #898's config-to-wire path: the same three keys the file spells
+    /// reach the attached client's `thread/start`, so a configured client
+    /// cannot silently send the old request.
+    #[tokio::test]
+    async fn the_configured_thread_overrides_reach_thread_start() {
+        let fixture = Fixture::new();
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        let lifecycle = fixture.lifecycle_with(CodexConfig {
+            start_server: crate::config::ServerStartPolicy::Never,
+            sandbox: Some(crate::config::SandboxMode::DangerFullAccess),
+            approval_policy: Some(crate::config::ApprovalPolicy::OnRequest),
+            apply_on_adopt: false,
+        });
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("attach to the scripted daemon"),
+            AttachOutcome::Attached
+        );
+
+        let client = lifecycle.attached_client().await.expect("an attached client");
+        client
+            .threads()
+            .start(Some("/work/cola"))
+            .await
+            .expect("thread/start");
+
+        let params = server.start_params();
+        assert_eq!(params.len(), 1, "one thread/start: {params:?}");
+        assert_eq!(params[0]["sandbox"], "danger-full-access");
+        assert_eq!(params[0]["approvalPolicy"], "on-request");
+    }
+
     /// The probe directory is reserved exclusively: a colliding name moves to
     /// the next suffix rather than adopting a pre-existing directory (whose
     /// threads recovery would otherwise be entitled to delete).
@@ -2663,6 +2710,7 @@ mod tests {
         let lifecycle = CodexLifecycle::new(
             CodexConfig {
                 start_server: crate::config::ServerStartPolicy::Never,
+                ..CodexConfig::default()
             },
             Environment {
                 home,

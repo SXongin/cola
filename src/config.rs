@@ -115,6 +115,136 @@ impl ServerStartPolicy {
     }
 }
 
+/// The sandbox a Codex thread runs under (issue #898): `thread/start`'s
+/// `sandbox` and `thread/resume`'s same override. The three values are the
+/// protocol's `SandboxMode`, which is also what the desktop app's presets map
+/// onto — `danger-full-access` is its “完全放行”.
+///
+/// `:workspace` (the profile the project's own Codex threads use) is **not** a
+/// value here: named permission profiles are not in the released client schema,
+/// and they protect `.git`, `.agents`, `.codex` and `.aws` even inside a
+/// writable workspace, so cola could not offer them as a mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    /// Read anything, write nothing.
+    ReadOnly,
+    /// Write inside the workspace (plus configured extra roots); command
+    /// network stays restricted unless the daemon's config widens it.
+    WorkspaceWrite,
+    /// No sandbox: the thread may write anywhere the daemon's user can, and its
+    /// commands reach the network. No sandbox approvals are raised, so
+    /// permission cards stop arriving for the session.
+    DangerFullAccess,
+}
+
+impl SandboxMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for SandboxMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Written by hand, not derived, so an unknown value fails with the key and the
+/// accepted values in the message: the parser sees a `toml::Value` table and
+/// has no span or key path left to name.
+impl<'de> Deserialize<'de> for SandboxMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "read-only" => Ok(Self::ReadOnly),
+            "workspace-write" => Ok(Self::WorkspaceWrite),
+            "danger-full-access" => Ok(Self::DangerFullAccess),
+            other => Err(D::Error::custom(format!(
+                "`sandbox` must be `read-only`, `workspace-write` or `danger-full-access`, got `{other}`"
+            ))),
+        }
+    }
+}
+
+/// When a Codex thread asks for approval (issue #898): `thread/start`'s
+/// `approvalPolicy` and `thread/resume`'s same override.
+///
+/// The schema's fourth shape — the free-form `{ granular = … }` object — is not
+/// offered: cola's cards answer a whole request, and a per-category policy would
+/// silently decide some categories without a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// Ask before every command the model wants to run unsandboxed.
+    Untrusted,
+    /// The model decides when to ask (the daemon's common default).
+    OnRequest,
+    /// Never ask: failures are returned to the model instead.
+    Never,
+}
+
+impl ApprovalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Untrusted => "untrusted",
+            Self::OnRequest => "on-request",
+            Self::Never => "never",
+        }
+    }
+}
+
+impl std::fmt::Display for ApprovalPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ApprovalPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// See [`SandboxMode`]'s manual `Deserialize`: the message names the key.
+impl<'de> Deserialize<'de> for ApprovalPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "untrusted" => Ok(Self::Untrusted),
+            "on-request" => Ok(Self::OnRequest),
+            "never" => Ok(Self::Never),
+            other => Err(D::Error::custom(format!(
+                "`approval_policy` must be `untrusted`, `on-request` or `never`, got `{other}`"
+            ))),
+        }
+    }
+}
+
 /// How cola picks the attached server's protocol generation (spec #364 §2,
 /// ADR-0055). The glossary calls this the **Generation Override**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -203,6 +333,25 @@ pub struct CodexConfig {
     /// every path; the other two only decide when a start is attempted.
     #[serde(default)]
     pub start_server: ServerStartPolicy,
+    /// The sandbox cola asks the daemon to run this client's **new** threads
+    /// under (issue #898), sent as `thread/start`'s `sandbox`. `None` sends
+    /// nothing, so the daemon's own default applies — the behaviour before
+    /// this key existed.
+    #[serde(default)]
+    pub sandbox: Option<SandboxMode>,
+    /// The approval policy for those threads, sent as `thread/start`'s
+    /// `approvalPolicy`. `None` sends nothing. Paired with
+    /// `sandbox = "danger-full-access"` there is no sandbox to escape, so no
+    /// permission cards arrive for the session.
+    #[serde(default)]
+    pub approval_policy: Option<ApprovalPolicy>,
+    /// Whether `thread/resume` carries the two overrides as well (issue #898).
+    /// Off by default: an adopted thread may be shared with the user's own
+    /// TUI/VSCode, and a silent override would change their session too. Off
+    /// means cola only adopts — a thread created by the user keeps the policy
+    /// it was created with.
+    #[serde(default)]
+    pub apply_on_adopt: bool,
 }
 
 /// The explicit port of an endpoint URL (`http://localhost:4096`,
@@ -361,10 +510,11 @@ impl std::fmt::Display for ClientKind {
 const OPENCODE_CLIENT_KEYS: &[&str] = &["url", "model", "start_server", "generation"];
 
 /// The option keys a `kind = "codex"` Agent Client accepts (spec #860 ticket
-/// #877). `start_server` is the same key and the same [`ServerStartPolicy`] the
-/// `opencode` kind reads; a shared key is legal on both kinds and is checked
-/// against the kind's own list, never rejected as "another kind's".
-const CODEX_CLIENT_KEYS: &[&str] = &["start_server"];
+/// #877; issue #898 for the sandbox pair). `start_server` is the same key and
+/// the same [`ServerStartPolicy`] the `opencode` kind reads; a shared key is
+/// legal on both kinds and is checked against the kind's own list, never
+/// rejected as "another kind's".
+const CODEX_CLIENT_KEYS: &[&str] = &["start_server", "sandbox", "approval_policy", "apply_on_adopt"];
 
 /// Every option key any kind accepts, derived rather than repeated: the table
 /// is parsed before `kind` is validated, so this union is what must be kept out
@@ -604,7 +754,8 @@ pub enum ClientConfigError {
     #[error(
         "`clients.{id}.{key}` is not a recognised Agent Client setting; `[clients.{id}]` takes `kind` \
          plus that kind's option keys (`url`, `model`, `start_server`, `generation` for `opencode`; \
-         `start_server` for `codex`), never a nested table"
+         `start_server`, `sandbox`, `approval_policy`, `apply_on_adopt` for `codex`), never a nested \
+         table"
     )]
     UnknownSetting { id: String, key: String },
     /// `[clients.<id>]` carries an option another kind owns.
@@ -1524,6 +1675,9 @@ mod tests {
 
         let full = CodexConfig {
             start_server: ServerStartPolicy::Never,
+            sandbox: Some(SandboxMode::DangerFullAccess),
+            approval_policy: Some(ApprovalPolicy::OnRequest),
+            apply_on_adopt: true,
         };
         let toml::Value::Table(serialised) = toml::Value::try_from(&full).unwrap() else {
             panic!("a config struct serialises to a table");
@@ -1579,6 +1733,112 @@ mod tests {
             cfg.active_client().unwrap().codex().unwrap().start_server,
             ServerStartPolicy::Auto
         );
+    }
+
+    /// The thread overrides (#898): both keys parse into their protocol values,
+    /// an unset pair sends nothing, and `config show` prints what the file
+    /// spelled — the only place an operator sees the effective choice.
+    #[test]
+    fn a_codex_client_reads_its_thread_sandbox_and_approval_policy() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             sandbox = \"danger-full-access\"\napproval_policy = \"on-request\"\n\
+             apply_on_adopt = true\n",
+            minimal()
+        ))
+        .unwrap();
+        let settings = cfg.active_client().unwrap().codex().cloned().unwrap();
+        assert_eq!(settings.sandbox, Some(SandboxMode::DangerFullAccess));
+        assert_eq!(settings.approval_policy, Some(ApprovalPolicy::OnRequest));
+        assert!(settings.apply_on_adopt);
+
+        let dumped = masked_config_toml(&cfg).unwrap();
+        for expected in [
+            "sandbox = \"danger-full-access\"",
+            "approval_policy = \"on-request\"",
+            "apply_on_adopt = true",
+        ] {
+            assert!(
+                dumped.contains(expected),
+                "config show must print {expected}: {dumped}"
+            );
+        }
+
+        // Unset means "send nothing", so the client table must not grow keys
+        // `config show` would make look deliberate.
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let settings = cfg.active_client().unwrap().codex().cloned().unwrap();
+        assert_eq!(settings.sandbox, None);
+        assert_eq!(settings.approval_policy, None);
+        assert!(!settings.apply_on_adopt);
+
+        let dumped = masked_config_toml(&cfg).unwrap();
+        for absent in ["sandbox", "approval_policy", "apply_on_adopt"] {
+            assert!(
+                !dumped.contains(absent),
+                "an unset override must not be invented by config show: {absent} in {dumped}"
+            );
+        }
+    }
+
+    /// An unknown mode names the key, the value and the accepted set — the
+    /// parser sees a `toml::Value` table, so the field's own error is what says
+    /// which key to fix.
+    #[test]
+    fn an_unknown_sandbox_and_approval_value_names_the_key_and_the_choices() {
+        let err = toml::from_str::<Config>(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             sandbox = \"read-write\"\n",
+            minimal()
+        ))
+        .unwrap_err()
+        .to_string();
+        for expected in ["sandbox", "read-write", "danger-full-access"] {
+            assert!(
+                err.contains(expected),
+                "the sandbox error names {expected}: {err}"
+            );
+        }
+
+        let err = toml::from_str::<Config>(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             approval_policy = \"always\"\n",
+            minimal()
+        ))
+        .unwrap_err()
+        .to_string();
+        for expected in ["approval_policy", "always", "on-request"] {
+            assert!(
+                err.contains(expected),
+                "the approval error names {expected}: {err}"
+            );
+        }
+    }
+
+    /// The overrides belong to the `codex` kind: an `opencode` client carrying
+    /// one is rejected naming the key, never accepted and ignored.
+    #[test]
+    fn a_sandbox_override_on_an_opencode_client_is_rejected() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"work\"\n\n[clients.work]\nkind = \"opencode\"\n\
+             sandbox = \"danger-full-access\"\n",
+            minimal()
+        ))
+        .unwrap();
+        let err = cfg.active_client().unwrap_err();
+        assert_eq!(
+            err,
+            ClientConfigError::OptionForAnotherKind {
+                id: "work".into(),
+                key: "sandbox".into(),
+                kind: "opencode".into(),
+            }
+        );
+        assert!(err.to_string().contains("clients.work.sandbox"), "{err}");
     }
 
     /// Reading resolves but never writes: neither `load` nor resolution may

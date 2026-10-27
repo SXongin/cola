@@ -24,7 +24,7 @@ use crate::config::{ActiveClient, ClientKind};
 use super::backend::{Projections, SkillCatalog};
 use super::error::{CodexError, Result};
 use super::schema::{PINNED_VERSION, SurfaceProbe};
-use super::threads::Threads;
+use super::threads::{ThreadSettings, Threads};
 use super::transport::{Endpoint, RpcConnection};
 
 /// How long the handshake (connect + `initialize` + `initialized`) may take.
@@ -61,6 +61,10 @@ pub(crate) struct CodexOptions {
     /// The daemon hands the durable, client-scoped record; a bare client gets
     /// an in-memory one, which is still correct for its own lifetime.
     pub(crate) authored: Arc<super::authorship::Authorship>,
+    /// The sandbox/approval overrides this client's threads are asked to run
+    /// under (issue #898). `Default` sends nothing, so a bare client keeps the
+    /// daemon's own defaults.
+    pub(crate) thread_settings: ThreadSettings,
 }
 
 impl CodexOptions {
@@ -70,6 +74,7 @@ impl CodexOptions {
             timeout: HANDSHAKE_TIMEOUT,
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
+            thread_settings: ThreadSettings::default(),
         }
     }
 
@@ -82,6 +87,13 @@ impl CodexOptions {
     /// Carry the durable authorship record into the attached client.
     pub(crate) fn with_authorship(mut self, authored: Arc<super::authorship::Authorship>) -> Self {
         self.authored = authored;
+        self
+    }
+
+    /// Carry the active client's per-thread sandbox/approval overrides into
+    /// this connection (issue #898).
+    pub(crate) fn with_thread_settings(mut self, settings: ThreadSettings) -> Self {
+        self.thread_settings = settings;
         self
     }
 }
@@ -331,7 +343,7 @@ impl CodexClient {
         approvals.watch(&connection, &projections);
 
         Ok(Self {
-            threads: Threads::new(connection.clone()),
+            threads: Threads::new(connection.clone(), options.thread_settings),
             connection,
             endpoint: options.endpoint.clone(),
             projections,
