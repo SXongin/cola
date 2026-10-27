@@ -185,7 +185,7 @@ pub(crate) enum ModelSource {
     ColaSent,
 }
 
-/// The model a thread runs with, where that fact came from, and its position in
+/// The model a thread runs with, where that fact came from, and its stamp in
 /// this process's learning order (issue #904). The stamp is taken **before** the
 /// read that will learn the fact, or at the accepted `turn/start` of a pick, so
 /// a read that was in flight across a newer fact cannot resurrect the older
@@ -194,7 +194,8 @@ pub(crate) enum ModelSource {
 struct ModelFact {
     model: ModelIdentity,
     source: ModelSource,
-    learned_at: u64,
+    /// The fact's place in [`Projections::next_model_stamp`]'s order.
+    stamp: u64,
 }
 
 impl ThreadProjection {
@@ -230,21 +231,17 @@ impl ThreadProjection {
     /// model changed, so it drops a name the server itself gave earlier — an old
     /// name would claim the wrong model answered — but never a model cola sent:
     /// a server that omits the field must not erase what cola just picked.
-    /// `observed_at` is the stamp taken **before** the read that produced this
+    /// `observed` is the stamp taken **before** the read that produced this
     /// answer, so a read the pick overtook cannot overwrite the pick.
-    pub(crate) fn observe_thread_model(&mut self, model: Option<ModelIdentity>, observed_at: u64) {
-        if self
-            .model
-            .as_ref()
-            .is_some_and(|fact| fact.learned_at > observed_at)
-        {
+    pub(crate) fn observe_thread_model(&mut self, model: Option<ModelIdentity>, observed: u64) {
+        if self.model.as_ref().is_some_and(|fact| fact.stamp > observed) {
             return;
         }
         self.model = match (model, self.model.as_ref().map(|fact| fact.source)) {
             (Some(model), _) => Some(ModelFact {
                 model,
                 source: ModelSource::Thread,
-                learned_at: observed_at,
+                stamp: observed,
             }),
             (None, Some(ModelSource::Thread)) => None,
             (None, _) => self.model.take(),
@@ -253,14 +250,21 @@ impl ThreadProjection {
 
     /// Record the model cola itself asked for on an accepted `turn/start`: the
     /// protocol's model is "for this turn and subsequent turns", so the thread
-    /// now runs it (issue #904). `sent_at` is stamped at the acceptance; a read
+    /// now runs it (issue #904). `sent` is stamped at the acceptance; a read
     /// that started later still wins, because a peer's switch is a newer fact.
-    pub(crate) fn record_sent_model(&mut self, model: ModelIdentity, sent_at: u64) {
+    pub(crate) fn record_sent_model(&mut self, model: ModelIdentity, sent: u64) {
         self.model = Some(ModelFact {
             model,
             source: ModelSource::ColaSent,
-            learned_at: sent_at,
+            stamp: sent,
         });
+    }
+
+    /// The model the projection holds, if any: the ordered view the footer and
+    /// the `/model` line both read, so neither can report a stale answer a
+    /// fresh read already superseded (issue #904).
+    pub(crate) fn model(&self) -> Option<ModelIdentity> {
+        self.model.as_ref().map(|fact| fact.model.clone())
     }
 
     /// The turn an item belongs to, for the authorship record: Codex assigns

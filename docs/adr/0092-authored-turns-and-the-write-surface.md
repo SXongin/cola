@@ -334,7 +334,20 @@ works). Three consequences of that shape:
   it would put the previous name back on the footer — the same stale-name
   failure one interleaving later. The projection takes a fact only when it is
   at least as new as what it holds; a read that starts after a pick still wins,
-  which is exactly how a peer's switch lands.
+  which is exactly how a peer's switch lands. Both surfaces read the ordered
+  store, not their own response, so the `/model` line cannot disagree with the
+  footer. The trade is deliberate: a read whose answer reflects state newer
+  than the pick is dropped too, and the next read repairs it — showing the
+  pre-pick model is the failure that does not self-heal in front of the user.
+- **A pick keeps the thread's real provider.** A picker value carries the
+  neutral `codex` bucket (it is the reference cola sends back), but a model
+  override does not change `model_provider` — that is configuration, not part
+  of `turn/start`. So a provider the thread already named wins the label, and
+  only a thread that never named one shows the neutral bucket.
+- A projection released with its thread loses a pick that was never reported on
+  the wire; the pick is re-sent (and re-recorded) on the next prompt, and a
+  conforming server restores it on the next read. The window is a footer label,
+  not a dispatch decision, so it is not made durable.
 - With no thread model ever named, nothing is shown. Filling it from
   `~/.codex/config.toml` would be a different read (`config/read`) and is left
   out: a fact cola does not have must not be presented as the server's.
