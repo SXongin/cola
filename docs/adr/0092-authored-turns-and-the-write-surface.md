@@ -327,6 +327,14 @@ works). Three consequences of that shape:
   on an accepted `turn/start` — a server that omits the field must not undo
   the user's own pick. A reported model always wins over either, so a peer's
   switch lands on the next read.
+- **And a fact has an age**, because reads and picks can overlap: the stamp is
+  taken *before* the read that will learn the fact (or at the pick's
+  acceptance), and a fact older than the one the projection holds is dropped.
+  Without it, a `/model` read that started before the pick and answered after
+  it would put the previous name back on the footer — the same stale-name
+  failure one interleaving later. The projection takes a fact only when it is
+  at least as new as what it holds; a read that starts after a pick still wins,
+  which is exactly how a peer's switch lands.
 - With no thread model ever named, nothing is shown. Filling it from
   `~/.codex/config.toml` would be a different read (`config/read`) and is left
   out: a fact cola does not have must not be presented as the server's.
