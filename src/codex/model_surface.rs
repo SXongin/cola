@@ -43,7 +43,6 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::backend::types::{ChangeScope, ModelOption, ModelScope, ModelSurface, ModelSurfaceQuery};
-use crate::feishu::card::truncate_md;
 
 use super::error::Result as CodexResult;
 use super::transport::RpcConnection;
@@ -67,14 +66,24 @@ pub(crate) const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 pub(crate) const CONFIG_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// A drilled page is a card **callback**, answered under
-/// [`crate::feishu::ws::CARD_ACK_BUDGET`] (2 s). Config gets this slice of it;
-/// probes are served from the cache only and the catalog is one websocket
-/// round-trip, so the page cannot chain the root page's 2 s config read with a
-/// fresh 2 s probe. The root `/model` page is a text command, not a callback,
-/// and keeps [`CONFIG_READ_TIMEOUT`] + fresh probes.
-pub(crate) const DRILLED_CONFIG_READ_TIMEOUT: Duration =
-    crate::feishu::ws::CARD_ACK_BUDGET.saturating_sub(Duration::from_millis(1400));
+/// What a callback's budget must leave for the rest of the read: the catalog's
+/// websocket round-trip, the card build and the ack response. The remainder is
+/// the config read's slice.
+const CALLBACK_READ_MARGIN: Duration = Duration::from_millis(1400);
+
+/// The config-read slice for one surface read.
+///
+/// A callback read (`ack_budget = Some`) is answered inside a card-ack budget;
+/// it must not also run a fresh probe, so its config read gets
+/// `budget - CALLBACK_READ_MARGIN` (600 ms out of a 2 s budget) and probes come
+/// from the cache. A non-callback read (`None`) keeps [`CONFIG_READ_TIMEOUT`]
+/// and fresh probes — it is a command's page, not a callback.
+pub(crate) fn config_read_timeout(ack_budget: Option<Duration>) -> Duration {
+    match ack_budget {
+        Some(budget) => budget.saturating_sub(CALLBACK_READ_MARGIN),
+        None => CONFIG_READ_TIMEOUT,
+    }
+}
 
 /// The `model` scope's identity (also the card callback's `level`).
 pub(crate) const MODEL_SCOPE: &str = "model";
@@ -141,6 +150,17 @@ fn safe_base_url(base_url: Option<&str>) -> Option<String> {
             url.host_str().unwrap_or("<invalid>")
         )),
         Ok(_) | Err(_) => Some("<invalid>".to_string()),
+    }
+}
+
+/// Clip a surface label/note to `max_chars` characters, adding an ellipsis.
+/// The surface owns its one-line budget; a backend adapter does not reach into
+/// the card layer for it.
+fn clip(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(max_chars).collect::<String>())
     }
 }
 
@@ -686,7 +706,7 @@ pub(crate) fn build_surface(
         }
         options.push(ModelOption {
             id: profile.model.clone(),
-            label: Some(truncate_md(&label, 48)),
+            label: Some(clip(&label, 48)),
             value: Some(codex_ref(&profile.model)),
             group: Some(PROFILE_GROUP.to_string()),
             ..ModelOption::default()
@@ -736,7 +756,7 @@ pub(crate) fn build_surface(
             }
             ModelOption {
                 id: provider.id.clone(),
-                label: Some(truncate_md(&label, 48)),
+                label: Some(clip(&label, 48)),
                 value: Some(provider.id.clone()),
                 ..ModelOption::default()
             }
@@ -779,8 +799,8 @@ fn probe_note(config: &CodexModelConfig, probes: &HashMap<String, ProbeOutcome>)
         .collect();
     match reasons.as_slice() {
         [] => None,
-        [only] => Some(truncate_md(&format!("⚠️ {only}"), NOTE_MAX_CHARS)),
-        many => Some(truncate_md(
+        [only] => Some(clip(&format!("⚠️ {only}"), NOTE_MAX_CHARS)),
+        many => Some(clip(
             &format!(
                 "⚠️ {} 个 provider 的 /models 不可用：{}",
                 many.len(),
@@ -801,6 +821,23 @@ mod tests {
     use crate::backend::types::{ModelOption, ModelSelection, ProviderModels};
 
     const TOKEN: &str = "sentinel-probe-token-DO-NOT-LEAK";
+
+    /// A callback's budget is sliced for config and leaves the rest for the
+    /// catalog round-trip, card build and ack; no budget means the root page's
+    /// full config timeout.
+    #[test]
+    fn a_callback_budget_slices_the_config_read_and_leaves_a_margin() {
+        assert_eq!(
+            config_read_timeout(Some(Duration::from_secs(2))),
+            Duration::from_millis(600)
+        );
+        assert_eq!(config_read_timeout(None), CONFIG_READ_TIMEOUT);
+        assert_eq!(
+            config_read_timeout(Some(Duration::from_millis(100))),
+            Duration::ZERO,
+            "a budget below the margin leaves config no time, never a negative one"
+        );
+    }
 
     fn provider(
         id: &str,
@@ -1271,15 +1308,6 @@ mod tests {
         assert!(
             !rendered.contains(TOKEN),
             "the token leaked into the surface: {rendered}"
-        );
-        let card = crate::feishu::card::picker::build_model_surface_cards(
-            &crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-            &surface,
-            false,
-        );
-        assert!(
-            !format!("{card:?}").contains(TOKEN),
-            "the token leaked into a card"
         );
     }
 

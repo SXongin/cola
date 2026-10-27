@@ -692,7 +692,7 @@ pub(crate) async fn send_model_card(
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> Result<()> {
-    let surface = model_surface(handles, thread_key, None, None).await;
+    let surface = model_surface(handles, thread_key, None, None, None).await;
     let cards = super::picker::build_model_surface_cards(thread_key, &surface, false);
     for card in cards {
         handles.flow.platform.reply_card(message_id, &card).await?;
@@ -702,7 +702,9 @@ pub(crate) async fn send_model_card(
 
 /// Read one page of the client-declared `/model` surface. `scope`/`selected`
 /// name the drill-down (OpenCode: the `provider` scope and the provider id the
-/// user tapped); both are `None` for the root page.
+/// user tapped); both are `None` for the root page. `ack_budget` is `Some` when
+/// this read answers a card callback (a provider click), and `None` for a
+/// command's page: the client uses it to bound callback-originated work.
 ///
 /// `current` is resolved **only for the root page**. The running selection is
 /// a root-page fact for every client we have: OpenCode never rendered it on its
@@ -718,6 +720,7 @@ pub(crate) async fn model_surface(
     thread_key: &ThreadKey,
     scope: Option<&str>,
     selected: Option<&str>,
+    ack_budget: Option<std::time::Duration>,
 ) -> crate::backend::types::ModelSurface {
     let settings = handles.flow.sessions.session_settings(thread_key).await;
     let current = match &settings {
@@ -757,6 +760,7 @@ pub(crate) async fn model_surface(
             selected,
             // A card page, not `/think`'s variant lookup: the full surface.
             catalog_only: false,
+            ack_budget,
         })
         .await
 }

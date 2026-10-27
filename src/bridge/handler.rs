@@ -4676,8 +4676,14 @@ impl App {
                 (None, None)
             };
             let handles = core.command_handles();
-            let surface =
-                crate::feishu::card::command::model_surface(&handles, &thread_key, scope, selected).await;
+            let surface = crate::feishu::card::command::model_surface(
+                &handles,
+                &thread_key,
+                scope,
+                selected,
+                Some(crate::feishu::ws::CARD_ACK_BUDGET),
+            )
+            .await;
             let cards = crate::feishu::card::picker::build_model_surface_cards(&thread_key, &surface, back);
             return Some(Self::picker_pages_result(core, &thread_key, cards).await);
         }

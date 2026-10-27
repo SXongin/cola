@@ -30,6 +30,10 @@ use super::transport::Endpoint;
 const THREAD: &str = "thread-1";
 const CHAT: &str = "chat-1";
 const WORK: &str = "/work/cola";
+/// The Feishu question card's session-scope note, mirrored as text so this
+/// adapter test does not import the platform layer; the platform's own test
+/// pins the real constant.
+const SESSION_SCOPE_NOTE: &str = "🔁 始终允许：本会话内后续同类请求将自动批准";
 
 async fn connect(url: &str) -> CodexClient {
     let endpoint = Endpoint::parse(url).expect("endpoint");
@@ -1740,7 +1744,7 @@ async fn a_tui_command_approval_is_answered_from_the_feishu_card() {
         "the advertised decision is offered: {card}"
     );
     assert!(
-        text.contains(crate::feishu::card::question::SESSION_ALWAYS_NOTE),
+        text.contains(SESSION_SCOPE_NOTE),
         "the card explains the session scope: {card}"
     );
 
@@ -2051,7 +2055,7 @@ async fn a_permission_grant_offers_only_what_cola_can_express() {
         "the session decision was not advertised, so it is not offered: {card}"
     );
     assert!(
-        !text.contains(crate::feishu::card::question::SESSION_ALWAYS_NOTE),
+        !text.contains(SESSION_SCOPE_NOTE),
         "no scope copy for a decision the card does not offer: {card}"
     );
 

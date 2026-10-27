@@ -711,6 +711,11 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// resolved for the next turn, so the card has one source for its current
     /// line. Best-effort: an unreadable catalog yields an empty scope, never a
     /// failed read.
+    ///
+    /// `query.ack_budget` means **this read answers a card callback** and must
+    /// fit that budget; `None` is a command's page with no bound. A client that
+    /// does network work here decides how to spend it (Codex narrows its config
+    /// read and serves probe answers from cache only); OpenCode ignores it.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface;
 
     /// Available models grouped by provider (`GET /provider`), for the `/model`
