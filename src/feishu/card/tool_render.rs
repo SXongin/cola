@@ -1627,7 +1627,7 @@ pub(super) fn tool_panel_element(
     }
     let content = md.element(&content);
     let icon = if todo_panel { "📋" } else { tool.status_icon() };
-    let mut title = format!("{icon} {}{}", tool_display_name(name), panel_time_suffix(at_ms));
+    let mut title = format!("{icon} {}{}", tool_display_name(tool), panel_time_suffix(at_ms));
     if let Some(details) = &title_details {
         title.push_str(&format!(" · {}", details));
     }
@@ -2603,13 +2603,21 @@ fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> 
 /// **protocol** names (`commandExecution`, `fileChange`, … mapped onto the
 /// neutral transcript's snake_case ids); rendering one raw would put
 /// `command_execution` on every folded card, so they take the card's own
-/// vocabulary. A third-party tool keeps its own name (ADR-0042's opaque path).
-fn tool_display_name(name: &str) -> &str {
-    match name {
-        "command_execution" => "命令",
-        "file_change" => "文件修改",
-        "web_search" => "网页搜索",
-        "image" => "图片",
+/// vocabulary. A third-party tool keeps its own name (ADR-0042's opaque path):
+/// each mapping is gated on the input shape cola's own Codex adapter writes, so
+/// a foreign tool that merely shares the id still renders as itself — the same
+/// gate [`ToolPanel::is_code_mode`] puts on `execute`.
+fn tool_display_name(tool: &ToolPanel) -> &str {
+    let has = |key: &str| {
+        tool.input()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|input| input.contains_key(key))
+    };
+    match tool.name() {
+        "command_execution" if has("command") => "命令",
+        "file_change" if has("changes") => "文件修改",
+        "web_search" if has("query") => "网页搜索",
+        "image" if has("path") => "图片",
         other => other,
     }
 }
@@ -2707,22 +2715,25 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             None => generic_tool_input(obj),
         },
         // Codex's `fileChange` names its targets in `changes[].path` (one entry
-        // per file), not in a top-level `path`.
+        // per file), not in a top-level `path`. A payload where any entry lacks
+        // a usable path is rendered generically rather than silently reporting
+        // a partial file list.
         "file_change" => {
-            let paths: Vec<&str> = obj
+            let paths: Option<Vec<&str>> = obj
                 .get("changes")
                 .and_then(|changes| changes.as_array())
-                .map(|changes| {
+                .and_then(|changes| {
                     changes
                         .iter()
-                        .filter_map(|change| change.get("path").and_then(|path| path.as_str()))
+                        .map(|change| change.get("path").and_then(|path| path.as_str()))
                         .collect()
-                })
-                .unwrap_or_default();
-            match paths.as_slice() {
-                [] => generic_tool_input(obj),
-                [only] => format!("📄 `{only}`"),
-                [first, ..] => format!("📄 `{first}` 等 {} 个文件", paths.len()),
+                });
+            match paths.as_deref() {
+                None | Some([]) => generic_tool_input(obj),
+                Some([only]) => format!("📄 `{only}`"),
+                Some([first, rest @ ..]) => {
+                    format!("📄 `{first}` 等 {} 个文件", rest.len() + 1)
+                }
             }
         }
         // Codex's `imageView`: the file it looked at. Unlike a `read` there is
@@ -7250,11 +7261,12 @@ Index: /a/one.rs
     /// Codex's neutral item kinds are protocol names, not tool names: a folded
     /// panel must say what happened (`命令`, `文件修改`, …) instead of printing
     /// `command_execution` on nearly every card (issue #900). An OpenCode
-    /// built-in and a third-party tool keep their own names (ADR-0042).
+    /// built-in and a third-party tool keep their own names (ADR-0042), which is
+    /// why the mapping is gated on the item's own input shape.
     #[test]
     fn codex_item_kinds_render_a_human_title() {
-        let title = |name: &str| {
-            let tool = ToolPanel::for_test(name, ToolStatus::Completed, None, Some("ok"));
+        let title = |name: &str, input: serde_json::Value| {
+            let tool = ToolPanel::for_test(name, ToolStatus::Completed, Some(input), Some("ok"));
             let card = CardBuilder::new()
                 .with_state(CardState::Done)
                 .with_tool(tool)
@@ -7264,12 +7276,30 @@ Index: /a/one.rs
                 .unwrap()
                 .to_string()
         };
-        assert_eq!(title("command_execution"), "✅ 命令");
-        assert_eq!(title("file_change"), "✅ 文件修改");
-        assert_eq!(title("web_search"), "✅ 网页搜索");
-        assert_eq!(title("image"), "✅ 图片");
-        assert_eq!(title("bash"), "✅ bash");
-        assert_eq!(title("context7/query-docs"), "✅ context7/query-docs");
+        assert_eq!(
+            title("command_execution", json!({"command": "ls", "cwd": "/w"})),
+            "✅ 命令"
+        );
+        assert_eq!(
+            title("file_change", json!({"changes": [{"path": "a.rs"}]})),
+            "✅ 文件修改"
+        );
+        assert_eq!(title("web_search", json!({"query": "rust"})), "✅ 网页搜索");
+        assert_eq!(title("image", json!({"path": "/w/shot.png"})), "✅ 图片");
+
+        // Same id, a different payload shape: a third-party tool stays opaque.
+        assert_eq!(title("image", json!({"url": "https://x/y.png"})), "✅ image");
+        assert_eq!(
+            title("command_execution", json!({"argv": ["ls"]})),
+            "✅ command_execution"
+        );
+        // An OpenCode built-in keeps its own id.
+        assert_eq!(title("bash", json!({"command": "ls"})), "✅ bash");
+        // An MCP tool's own `server/tool` name is never remapped.
+        assert_eq!(
+            title("context7/query-docs", json!({"query": "rust"})),
+            "✅ context7/query-docs"
+        );
     }
 
     /// The Codex command item carries `command` + `cwd` (`workdir` on the
@@ -7286,7 +7316,8 @@ Index: /a/one.rs
     }
 
     /// A Codex file change names its targets in `changes[].path`, one entry per
-    /// file — not in a top-level `path`.
+    /// file — not in a top-level `path`. A payload with a malformed entry is
+    /// rendered generically instead of a partial list.
     #[test]
     fn codex_file_change_input_lists_its_files() {
         assert_eq!(
@@ -7302,6 +7333,14 @@ Index: /a/one.rs
                 &json!({"changes": [{"path": "a.rs"}, {"path": "b.rs"}]})
             ),
             "📄 `a.rs` 等 2 个文件"
+        );
+        let partial = format_tool_input(
+            "file_change",
+            &json!({"changes": [{"path": "a.rs"}, {"path": 17}]}),
+        );
+        assert!(
+            partial.starts_with("- changes:"),
+            "a malformed entry takes the generic shape, not a partial list: {partial}"
         );
     }
 
