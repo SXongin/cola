@@ -47,8 +47,9 @@ use async_trait::async_trait;
 use crate::error::Result;
 
 use types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, PermissionRequest, PromptFile, ProviderModels,
-    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery, PermissionRequest,
+    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
+    SessionStatus,
 };
 
 /// One skill a caller attaches to a prompt (spec #652): a small generation-neutral
@@ -696,8 +697,26 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// returns an empty list, so the picker degrades to its no-skills state.
     async fn list_skills(&self, directory: Option<&str>) -> Vec<SkillInfo>;
 
+    /// The `/model` card's one data source: what this client can offer, on the
+    /// page the caller asked for, plus the running selection.
+    ///
+    /// The surface is declared by the client, not assumed to be OpenCode's
+    /// provider → model tree: OpenCode's two-page flow is a root page whose
+    /// one `provider` scope lists providers, and a drilled page
+    /// (`query.scope = Some("provider")`, `query.selected = Some(id)`) whose
+    /// `model` scope lists that provider's models; Codex's flat catalog is one
+    /// `model` scope with no pseudo provider level. `session_id`/`directory`
+    /// are the session the card is for (a session fact, like
+    /// [`Self::session_info`]); `current` is the selection the caller already
+    /// resolved for the next turn, so the card has one source for its current
+    /// line. Best-effort: an unreadable catalog yields an empty scope, never a
+    /// failed read.
+    async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface;
+
     /// Available models grouped by provider (`GET /provider`), for the `/model`
     /// card picker. Empty on failure (the card degrades to a text prompt).
+    /// Kept for a client's own surface mapping and the `/think` variant read;
+    /// the `/model` card goes through [`Self::model_surface`].
     async fn list_models(&self) -> Vec<ProviderModels>;
 
     /// Fetch a session's info (exposes the parent chain for sub-task sessions).
@@ -872,6 +891,10 @@ mod core_only_client {
 
         async fn list_models(&self) -> Vec<ProviderModels> {
             Vec::new()
+        }
+
+        async fn model_surface(&self, _query: ModelSurfaceQuery<'_>) -> ModelSurface {
+            ModelSurface::default()
         }
 
         async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {

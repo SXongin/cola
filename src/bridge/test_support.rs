@@ -1729,9 +1729,14 @@ pub struct MockBackend {
     /// Counts `ensure_attached` passes, so a poll-loop test can prove the
     /// client-owned pass actually ran.
     pub ensure_attached_calls: Arc<std::sync::atomic::AtomicUsize>,
-    /// Available models grouped by provider, served by `list_models` (for the
-    /// `/model` card).
+    /// Available models grouped by provider, served by `list_models` and
+    /// mapped into an OpenCode-shaped `model_surface` when no explicit
+    /// `model_surface` is set.
     pub provider_models: Vec<crate::backend::types::ProviderModels>,
+    /// When set, served verbatim by `model_surface`, overriding the
+    /// OpenCode-shaped mapping of `provider_models`. Lets a test declare any
+    /// client's surface (Codex's flat catalog, a two-scope fake, …).
+    pub model_surface: Option<crate::backend::types::ModelSurface>,
     /// The configured default model served by `configured_default_model` (the
     /// second rung of the `/think` effective-model resolution).
     pub default_model: Option<crate::backend::types::ModelInfo>,
@@ -1997,6 +2002,7 @@ impl MockBackend {
             turn_probe: None,
             ensure_attached_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             provider_models: Vec::new(),
+            model_surface: None,
             default_model: None,
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2147,6 +2153,13 @@ impl MockBackend {
     /// Scenario: `list_models` serves `models`.
     pub(crate) fn with_models(&mut self, models: Vec<crate::backend::types::ProviderModels>) -> &mut Self {
         self.provider_models = models;
+        self
+    }
+
+    /// Scenario: `model_surface` serves `surface` verbatim, whatever its
+    /// scopes — a client shape other than OpenCode's provider tree.
+    pub(crate) fn with_model_surface(&mut self, surface: crate::backend::types::ModelSurface) -> &mut Self {
+        self.model_surface = Some(surface);
         self
     }
 
@@ -3178,6 +3191,77 @@ impl crate::backend::Backend for MockBackend {
         self.provider_models.clone()
     }
 
+    async fn model_surface(
+        &self,
+        query: crate::backend::types::ModelSurfaceQuery<'_>,
+    ) -> crate::backend::types::ModelSurface {
+        if let Some(surface) = &self.model_surface {
+            // A client's declared shape, with the caller's current selection
+            // filled in the way both real adapters do.
+            let mut surface = surface.clone();
+            if surface.current.is_none() {
+                surface.current = query.current.clone();
+            }
+            return surface;
+        }
+        // The default mock speaks OpenCode's two-page tree so the `/model`
+        // regression tests can keep seeding `provider_models`.
+        let providers = &self.provider_models;
+        if let (Some("provider"), Some(provider)) = (query.scope, query.selected) {
+            let models = providers
+                .iter()
+                .find(|p| p.provider == provider)
+                .map(|p| p.models.as_slice())
+                .unwrap_or_default();
+            let options: Vec<crate::backend::types::ModelOption> = models
+                .iter()
+                .map(|model| crate::backend::types::ModelOption {
+                    id: model.id.clone(),
+                    variants: model.variants.clone(),
+                    value: Some(format!("{provider}/{}", model.id)),
+                    ..Default::default()
+                })
+                .collect();
+            return crate::backend::types::ModelSurface {
+                current: query.current.clone(),
+                scopes: vec![crate::backend::types::ModelScope {
+                    id: "model".into(),
+                    title: provider.to_string(),
+                    changeable: crate::backend::types::ChangeScope::ThisTurn,
+                    options: options.clone(),
+                    note: None,
+                    free_text: None,
+                    intro: Some(if options.is_empty() {
+                        "_(该 provider 没有可用模型)_".to_string()
+                    } else {
+                        "**选择 model**（下一条消息开始生效）：".to_string()
+                    }),
+                }],
+            };
+        }
+        let options: Vec<crate::backend::types::ModelOption> = providers
+            .iter()
+            .map(|p| crate::backend::types::ModelOption::new(p.provider.clone()))
+            .collect();
+        let intro = if options.is_empty() {
+            "_(没有可用模型)_".to_string()
+        } else {
+            format!("**选择 provider**（共 {} 个）：", options.len())
+        };
+        crate::backend::types::ModelSurface {
+            current: query.current.clone(),
+            scopes: vec![crate::backend::types::ModelScope {
+                id: "provider".into(),
+                title: "选择模型".into(),
+                changeable: crate::backend::types::ChangeScope::ThisTurn,
+                options,
+                note: None,
+                free_text: None,
+                intro: Some(intro),
+            }],
+        }
+    }
+
     async fn is_cola_authored(&self, message_id: &str) -> bool {
         self.authored_message_ids
             .lock()
@@ -3668,6 +3752,7 @@ pub(crate) fn model_option(id: &str, variants: &[&str]) -> crate::backend::types
     crate::backend::types::ModelOption {
         id: id.to_string(),
         variants: variants.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     }
 }
 

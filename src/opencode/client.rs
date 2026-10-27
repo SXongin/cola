@@ -20,9 +20,9 @@ use super::strategy::{Generation, GenerationStrategy};
 use super::transport::Transport;
 use crate::backend::parsing::parse_model;
 use crate::backend::types::{
-    AgentInfo, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, ModelInfo, PermissionRequest,
-    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
-    SessionStatus,
+    AgentInfo, ChangeScope, CreateSessionInput, CreateSessionResponse, FormAnswer, Location, ModelInfo,
+    ModelOption, ModelScope, ModelSurface, ModelSurfaceQuery, PermissionRequest, PromptFile, ProviderModels,
+    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection, SessionStatus,
 };
 
 /// Session creation, on the `/api` surface both generations serve. It is a
@@ -616,6 +616,16 @@ impl OpenCodeBackend {
         self.strategy().list_models(&self.transport).await
     }
 
+    /// The `/model` surface for one card page (`GET /provider` mapped onto the
+    /// neutral DTO). The root page lists providers; a drilled page
+    /// (`query.scope = Some("provider")`, `query.selected = Some(id)`) lists
+    /// that provider's models, keeping the two-page flow's callback values —
+    /// provider ids on the root page, `provider/model` on the model page.
+    pub async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
+        let providers = self.list_models().await;
+        model_surface_from_providers(&providers, &query)
+    }
+
     pub async fn session_info(
         &self,
         session_id: &str,
@@ -651,5 +661,80 @@ impl OpenCodeBackend {
     #[cfg(test)]
     pub(crate) fn disable_env_proxy(&self, username: Option<&str>, password: Option<&str>) {
         self.transport.disable_env_proxy(username, password);
+    }
+}
+
+/// Map `GET /provider`'s provider → model tree onto the client-declared
+/// [`ModelSurface`], preserving OpenCode's two-page flow.
+///
+/// * Root (`query.scope = None`): one `provider` scope whose options are the
+///   provider ids, plus the current-model line. This is exactly the card
+///   [`crate::feishu::card::picker::build_model_surface_cards`] renders today.
+/// * Drilled (`query.scope = Some("provider")`, `query.selected = Some(id)`):
+///   one `model` scope titled with the provider, whose options keep the
+///   `provider/model` callback value and the model's declared variants. The
+///   provider is already chosen, so the label stays the bare model id.
+///
+/// Any other drill-down selection falls back to the root page — a stale
+/// callback cannot leave the user on an unreachable page.
+pub(crate) fn model_surface_from_providers(
+    providers: &[ProviderModels],
+    query: &ModelSurfaceQuery<'_>,
+) -> ModelSurface {
+    if let (Some("provider"), Some(provider)) = (query.scope, query.selected) {
+        let models = providers
+            .iter()
+            .find(|p| p.provider == provider)
+            .map(|p| p.models.as_slice())
+            .unwrap_or_default();
+        let options: Vec<ModelOption> = models
+            .iter()
+            .map(|model| ModelOption {
+                id: model.id.clone(),
+                variants: model.variants.clone(),
+                value: Some(format!("{provider}/{}", model.id)),
+                ..ModelOption::default()
+            })
+            .collect();
+        let intro = if options.is_empty() {
+            "_(该 provider 没有可用模型)_"
+        } else {
+            "**选择 model**（下一条消息开始生效）："
+        };
+        return ModelSurface {
+            // The model page never showed the current line (the provider page
+            // does), so it is omitted here — the page's shape stays identical.
+            current: None,
+            scopes: vec![ModelScope {
+                id: "model".into(),
+                title: provider.to_string(),
+                changeable: ChangeScope::ThisTurn,
+                options,
+                note: None,
+                free_text: None,
+                intro: Some(intro.to_string()),
+            }],
+        };
+    }
+    let options: Vec<ModelOption> = providers
+        .iter()
+        .map(|p| ModelOption::new(p.provider.clone()))
+        .collect();
+    let intro = if options.is_empty() {
+        "_(没有可用模型)_".to_string()
+    } else {
+        format!("**选择 provider**（共 {} 个）：", options.len())
+    };
+    ModelSurface {
+        current: query.current.clone(),
+        scopes: vec![ModelScope {
+            id: "provider".into(),
+            title: "选择模型".into(),
+            changeable: ChangeScope::ThisTurn,
+            options,
+            note: None,
+            free_text: None,
+            intro: Some(intro),
+        }],
     }
 }

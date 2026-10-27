@@ -4663,28 +4663,22 @@ impl App {
             .unwrap_or("")
             .to_string();
 
-        // Level 1: provider navigation — build and swap in the next picker page.
+        // Level 1: provider navigation — ask the client for the next surface
+        // page and swap it in. The bridge never assumes the provider tree: it
+        // only names the scope (`provider`) and the option that was tapped.
         if value.get("level").and_then(|v| v.as_str())
-            == Some(crate::feishu::card::picker::PickerLevel::Provider.as_str())
+            == Some(crate::feishu::card::picker::PICKER_LEVEL_PROVIDER)
         {
-            let providers = core.client.list_models().await;
-            let cards = if picked == crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS {
-                let current =
-                    crate::feishu::card::command::current_model_label(&core.command_handles(), &thread_key)
-                        .await;
-                crate::feishu::card::picker::build_model_provider_cards(
-                    &thread_key,
-                    &providers,
-                    current.as_deref(),
-                )
+            let back = picked != crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS;
+            let (scope, selected) = if back {
+                (Some("provider"), Some(picked.as_str()))
             } else {
-                let models: Vec<crate::backend::types::ModelOption> = providers
-                    .iter()
-                    .find(|p| p.provider == picked)
-                    .map(|p| p.models.clone())
-                    .unwrap_or_default();
-                crate::feishu::card::picker::build_model_picker_cards(&thread_key, &picked, &models)
+                (None, None)
             };
+            let handles = core.command_handles();
+            let surface =
+                crate::feishu::card::command::model_surface(&handles, &thread_key, scope, selected).await;
+            let cards = crate::feishu::card::picker::build_model_surface_cards(&thread_key, &surface, back);
             return Some(Self::picker_pages_result(core, &thread_key, cards).await);
         }
 

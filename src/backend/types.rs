@@ -111,9 +111,11 @@ pub struct ProviderModels {
     pub models: Vec<ModelOption>,
 }
 
-/// One selectable model under a provider.
-#[derive(Debug, Clone)]
+/// One selectable option under a provider or a model scope.
+#[derive(Debug, Clone, Default)]
 pub struct ModelOption {
+    /// The option's identity in its scope — a model id on a model page, a
+    /// provider id on a provider page.
     pub id: String,
     /// The model's declared variants (e.g. `["low", "medium", "high"]`),
     /// empty when it declares none. `GET /provider` serializes each model's
@@ -121,6 +123,116 @@ pub struct ModelOption {
     /// `{"high": {...}}`); the names are its keys. There is no universal
     /// scale — each model declares its own set (ADR-0020).
     pub variants: Vec<String>,
+    /// The button label, when it differs from [`Self::id`] (a display name
+    /// or a clipped row). `None` shows `id`.
+    pub label: Option<String>,
+    /// The callback value a pick sends, when it differs from [`Self::id`].
+    /// `None` sends `id` — OpenCode's provider page sends the provider id,
+    /// its model page sends `provider/model`.
+    pub value: Option<String>,
+    /// The section an option belongs to inside one scope (#908's grouped
+    /// provider scope: the built-in catalog must not render under a
+    /// provider). `None` leaves the option ungrouped.
+    pub group: Option<String>,
+}
+
+impl ModelOption {
+    /// A plain option whose label and callback value are its `id`.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            ..Self::default()
+        }
+    }
+
+    /// The label the card shows.
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
+
+    /// The callback value a pick sends.
+    pub fn callback_value(&self) -> &str {
+        self.value.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// What one axis of a client's model surface can offer, and where it may
+/// change. A scope is one titled section of the `/model` card: a provider
+/// list (OpenCode), a provider's models, or Codex's flat catalog.
+#[derive(Debug, Clone, Default)]
+pub struct ModelScope {
+    /// The scope's identity. It is the callback's `level` for every option in
+    /// the scope and the drill-down key a card sends back
+    /// (`"provider"` / `"model"` / `"catalog"` …).
+    pub id: String,
+    /// The section's title, also the card's header when it is the only scope.
+    pub title: String,
+    /// Where a pick on this scope takes effect.
+    pub changeable: ChangeScope,
+    /// The options, possibly empty.
+    pub options: Vec<ModelOption>,
+    /// A markdown note shown with the scope (why a list is empty, what a
+    /// failed probe means). `None` renders nothing.
+    pub note: Option<String>,
+    /// A hand-write hint shown beside the scope (e.g. `codex/<id>`).
+    pub free_text: Option<String>,
+    /// The instruction line above the options (e.g. `**选择 provider**（共
+    /// 3 个）：`). Kept as the client's own wording so the rendered card can
+    /// stay byte-identical to the hand-built one it replaces.
+    pub intro: Option<String>,
+}
+
+/// Where changing a model selection takes effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChangeScope {
+    /// The next turn picks it up (Codex's `turn/start.model`).
+    #[default]
+    ThisTurn,
+    /// Only a newly started thread can use it.
+    NewThread,
+    /// Only resuming a thread can change it.
+    ResumeOnly,
+}
+
+/// The running model selection for a session: the display label and the wire
+/// reference a pick would record.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelSelection {
+    /// `provider/model@variant`, what the card's "current model" line shows.
+    pub label: String,
+    /// `provider/model`, the wire reference a pick records.
+    pub reference: String,
+}
+
+/// What a client can offer on `/model`, and where each axis may change.
+#[derive(Debug, Clone, Default)]
+pub struct ModelSurface {
+    /// The running selection, shown as the "current model" line. `None` when
+    /// no rung of the caller's ladder resolves (or this page omits it).
+    pub current: Option<ModelSelection>,
+    /// The page's scopes, each rendered as one titled section.
+    pub scopes: Vec<ModelScope>,
+}
+
+/// The context a [`ModelSurface`] read is made in. The session identity is
+/// part of the request because `current` is a session fact and a client may
+/// need the thread's provider (#908); nothing is read from global state.
+#[derive(Debug, Clone, Default)]
+pub struct ModelSurfaceQuery<'a> {
+    /// The thread's target session (`None` for a Pending Session).
+    pub session_id: Option<&'a str>,
+    /// The directory the session is rooted at (a location-scoped read).
+    pub directory: Option<&'a str>,
+    /// The running selection the caller resolved (its settings mirror →
+    /// configured default → server-recorded ladder). A backend that knows a
+    /// stronger session fact may replace it; the bridge passes it so the
+    /// card's current line keeps its one source of truth.
+    pub current: Option<ModelSelection>,
+    /// The scope the card has drilled into (`None` = the root page).
+    pub scope: Option<&'a str>,
+    /// The option tapped on the parent page that selected [`Self::scope`]
+    /// (OpenCode: the provider id).
+    pub selected: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

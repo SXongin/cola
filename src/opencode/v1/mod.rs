@@ -933,6 +933,7 @@ fn parse_provider_models(v: &serde_json::Value) -> Vec<ProviderModels> {
                         .map(|(model_id, m_info)| ModelOption {
                             id: model_id.clone(),
                             variants: declared_variants(m_info),
+                            ..ModelOption::default()
                         })
                         .collect()
                 })
