@@ -2607,17 +2607,20 @@ fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> 
 /// each mapping is gated on the input shape cola's own Codex adapter writes, so
 /// a foreign tool that merely shares the id still renders as itself — the same
 /// gate [`ToolPanel::is_code_mode`] puts on `execute`.
-fn tool_display_name(tool: &ToolPanel) -> &str {
+pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
     let has = |key: &str| {
         tool.input()
             .and_then(serde_json::Value::as_object)
             .is_some_and(|input| input.contains_key(key))
     };
     match tool.name() {
-        "command_execution" if has("command") => "命令",
-        "file_change" if has("changes") => "文件修改",
-        "web_search" if has("query") => "网页搜索",
-        "image" if has("path") => "图片",
+        // The full adapter-written shape, not just one key: a foreign tool that
+        // shares a key still falls through, and the `codex/` namespace already
+        // keeps its raw item kind apart from a third-party id.
+        "codex/command_execution" if has("command") && has("cwd") => "命令",
+        "codex/file_change" if has("changes") => "文件修改",
+        "codex/web_search" if has("query") && has("action") => "网页搜索",
+        "codex/image" if has("path") => "图片",
         other => other,
     }
 }
@@ -2636,7 +2639,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
     match name {
         // Codex's `commandExecution` carries `command` plus `cwd`; the
         // OpenCode arm's `workdir` is the same fact under another name.
-        "bash" | "shell" | "command_execution" => {
+        "bash" | "shell" | "codex/command_execution" => {
             let mut s = String::new();
             if let Some(cmd) = get("command") {
                 s.push_str(&format!("`{}`", cmd));
@@ -2710,7 +2713,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 input.to_string()
             }
         }
-        "websearch" | "web_search" => match get("query") {
+        "websearch" | "codex/web_search" => match get("query") {
             Some(query) => format!("🔎 `{}`", query),
             None => generic_tool_input(obj),
         },
@@ -2719,7 +2722,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         // a usable path is rendered generically rather than silently reporting
         // a partial file list. Backticks are flattened (`permission_target`'s
         // rule) so a path cannot break the inline code span it sits in.
-        "file_change" => {
+        "codex/file_change" => {
             let paths: Option<Vec<String>> = obj
                 .get("changes")
                 .and_then(|changes| changes.as_array())
@@ -2746,7 +2749,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         // Codex's `imageView`: the file it looked at. Unlike a `read` there is
         // no preview body to fold, so the panel only names it — with the same
         // backtick flattening as a file change's path.
-        "image" => match get("path").filter(|path| !path.trim().is_empty()) {
+        "codex/image" => match get("path").filter(|path| !path.trim().is_empty()) {
             Some(path) => format!("🖼 `{}`", path.replace('`', "'")),
             None => generic_tool_input(obj),
         },
@@ -7285,21 +7288,35 @@ Index: /a/one.rs
                 .to_string()
         };
         assert_eq!(
-            title("command_execution", json!({"command": "ls", "cwd": "/w"})),
+            title("codex/command_execution", json!({"command": "ls", "cwd": "/w"})),
             "✅ 命令"
         );
         assert_eq!(
-            title("file_change", json!({"changes": [{"path": "a.rs"}]})),
+            title("codex/file_change", json!({"changes": [{"path": "a.rs"}]})),
             "✅ 文件修改"
         );
-        assert_eq!(title("web_search", json!({"query": "rust"})), "✅ 网页搜索");
-        assert_eq!(title("image", json!({"path": "/w/shot.png"})), "✅ 图片");
-
-        // Same id, a different payload shape: a third-party tool stays opaque.
-        assert_eq!(title("image", json!({"url": "https://x/y.png"})), "✅ image");
         assert_eq!(
-            title("command_execution", json!({"argv": ["ls"]})),
+            title("codex/web_search", json!({"query": "rust", "action": null})),
+            "✅ 网页搜索"
+        );
+        assert_eq!(title("codex/image", json!({"path": "/w/shot.png"})), "✅ 图片");
+
+        // A foreign tool keeps its own name even when it shares the raw kind or
+        // a payload key: the ids cola's adapter writes are namespaced.
+        assert_eq!(title("image", json!({"path": "/w/shot.png"})), "✅ image");
+        assert_eq!(
+            title("command_execution", json!({"command": "ls", "cwd": "/w"})),
             "✅ command_execution"
+        );
+        // A partial shape under the namespaced id is not the adapter's shape.
+        assert_eq!(
+            title("codex/command_execution", json!({"argv": ["ls"]})),
+            "✅ codex/command_execution"
+        );
+        assert_eq!(
+            title("codex/web_search", json!({"query": "rust"})),
+            "✅ codex/web_search",
+            "the adapter always writes `action`; a partial shape stays raw"
         );
         // An OpenCode built-in keeps its own id.
         assert_eq!(title("bash", json!({"command": "ls"})), "✅ bash");
@@ -7316,7 +7333,7 @@ Index: /a/one.rs
     fn codex_command_input_shows_the_command_and_its_cwd() {
         assert_eq!(
             format_tool_input(
-                "command_execution",
+                "codex/command_execution",
                 &json!({"command": "/usr/bin/zsh -lc 'echo hi'", "cwd": "/work/cola"})
             ),
             "`/usr/bin/zsh -lc 'echo hi'`\n📁 `/work/cola`"
@@ -7330,20 +7347,20 @@ Index: /a/one.rs
     fn codex_file_change_input_lists_its_files() {
         assert_eq!(
             format_tool_input(
-                "file_change",
+                "codex/file_change",
                 &json!({"changes": [{"path": "src/main.rs", "kind": {"type": "update"}}]})
             ),
             "📄 `src/main.rs`"
         );
         assert_eq!(
             format_tool_input(
-                "file_change",
+                "codex/file_change",
                 &json!({"changes": [{"path": "a.rs"}, {"path": "b.rs"}]})
             ),
             "📄 `a.rs` 等 2 个文件"
         );
         let partial = format_tool_input(
-            "file_change",
+            "codex/file_change",
             &json!({"changes": [{"path": "a.rs"}, {"path": 17}]}),
         );
         assert!(
@@ -7351,7 +7368,7 @@ Index: /a/one.rs
             "a malformed entry takes the generic shape, not a partial list: {partial}"
         );
         let blank = format_tool_input(
-            "file_change",
+            "codex/file_change",
             &json!({"changes": [{"path": "a.rs"}, {"path": "  "}]}),
         );
         assert!(
@@ -7360,7 +7377,7 @@ Index: /a/one.rs
         );
         // A backtick in a path cannot escape the inline span it names.
         assert_eq!(
-            format_tool_input("file_change", &json!({"changes": [{"path": "a`b.rs"}]})),
+            format_tool_input("codex/file_change", &json!({"changes": [{"path": "a`b.rs"}]})),
             "📄 `a'b.rs`"
         );
     }
@@ -7370,11 +7387,11 @@ Index: /a/one.rs
     #[test]
     fn codex_image_input_names_its_file() {
         assert_eq!(
-            format_tool_input("image", &json!({"path": "/w/shot `1`.png"})),
+            format_tool_input("codex/image", &json!({"path": "/w/shot `1`.png"})),
             "🖼 `/w/shot '1'.png`"
         );
         assert!(
-            format_tool_input("image", &json!({"path": "  "})).starts_with("- path:"),
+            format_tool_input("codex/image", &json!({"path": "  "})).starts_with("- path:"),
             "a blank path falls back to the generic rendering"
         );
     }
@@ -7387,7 +7404,10 @@ Index: /a/one.rs
             "🔎 `rust lifetimes`"
         );
         assert_eq!(
-            format_tool_input("web_search", &json!({"query": "rust lifetimes"})),
+            format_tool_input(
+                "codex/web_search",
+                &json!({"query": "rust lifetimes", "action": null})
+            ),
             "🔎 `rust lifetimes`"
         );
     }

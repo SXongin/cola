@@ -144,22 +144,24 @@ shape, and the renderer never inspects the tool id to do so.
 ## Amendment (2026-10-27): the Codex adapter's item kinds
 
 The Codex app-server adapter (ADR-0090) projects its `ThreadItem` kinds onto the
-neutral transcript as `command_execution`, `file_change`, `web_search` and
-`image`. Those ids are **cola's own vocabulary for its own adapter**, not a
-third party's payload names: cola writes them in `src/codex/read_model.rs` for
-every Codex client, and each wire shape is the adapter's typed decode of the
-pinned app-server schema. They therefore join the tailored set under this ADR's
-rule — exact id, shape-gated:
+neutral transcript as `codex/command_execution`, `codex/file_change`,
+`codex/web_search` and `codex/image`. Those ids are **cola's own vocabulary for
+its own adapter**, not a third party's payload names: cola writes them in
+`src/codex/read_model.rs` for every Codex client, and each wire shape is the
+adapter's typed decode of the pinned app-server schema. The `codex/` namespace
+is the same device an MCP call uses (`server/tool`): a third-party tool with a
+raw item-kind name (`image`, `command_execution`, …) is a different id and stays
+opaque.
 
-- `command_execution` — `{command, cwd}`, the adapter's `commandExecution`.
-- `file_change` — `{changes: [{path, kind}]}`, the adapter's `fileChange`.
-- `web_search` — `{query, action}`, the adapter's `webSearch`.
-- `image` — `{path}`, the adapter's `imageView`.
+They therefore join the tailored set under this ADR's rule — exact id,
+shape-gated:
 
-Each arm is gated on the input shape the adapter writes, so a foreign tool that
-merely shares one of those ids and not the shape stays opaque — the same
-name-keyed, shape-gated rule the built-in arms follow. A same-named,
-same-shaped foreign tool still gets the same rendering; the Consequence
-"a third-party tool that claims a built-in id" already accepts that, because the
-rendering is then truthful. The boundary is otherwise unchanged: a payload whose
-shape cola's own adapter did not write stays raw.
+- `codex/command_execution` — `{command, cwd}`, the adapter's `commandExecution`.
+- `codex/file_change` — `{changes: [{path, kind}]}`, the adapter's `fileChange`.
+- `codex/web_search` — `{query, action}`, the adapter's `webSearch`.
+- `codex/image` — `{path}`, the adapter's `imageView`.
+
+Each arm additionally requires the **whole** input shape the adapter writes (not
+one key), so even a tool that squats the namespaced id with a partial payload
+falls through to raw. The boundary is otherwise unchanged: a payload whose shape
+cola's own adapter did not write stays raw, and no third-party id is renamed.
