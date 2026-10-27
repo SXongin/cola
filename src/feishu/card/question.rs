@@ -187,7 +187,12 @@ pub(crate) fn question_label(question: &crate::backend::types::QuestionInfo, max
     } else {
         &question.question
     };
-    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A receipt is built on a card callback, which must stay cheap and
+    // bounded: cap the scan before flattening, so a model-sized question never
+    // walks its whole body for a one-line residue. `max_chars * 4` leaves room
+    // for whitespace runs that collapse away.
+    let capped: String = text.chars().take(max_chars.saturating_mul(4)).collect();
+    let flattened = capped.split_whitespace().collect::<Vec<_>>().join(" ");
     let safe = flattened.replace('`', "'");
     super::truncate_md(&safe, max_chars)
 }
@@ -1664,6 +1669,15 @@ mod tests {
         assert_eq!(
             question_target(&[question("Which color?", "Color"), question("", "Size")]),
             "Which color?、Size"
+        );
+
+        // A model-sized question is capped before flattening: the label stays a
+        // residue instead of walking the whole body on a card callback.
+        let clipped = question_label(&question(&"长".repeat(10_000), "选择"), 40);
+        assert!(
+            clipped.chars().count() <= 41,
+            "the label must stay clipped: {}",
+            clipped.chars().count()
         );
     }
 }

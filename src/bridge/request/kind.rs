@@ -1911,6 +1911,30 @@ mod tests {
         }
     }
 
+    /// A receipt is a one-line residue: a long question is clipped at the
+    /// receipt budget, while the answered prefix stays.
+    #[test]
+    fn a_question_receipt_clips_at_the_receipt_budget() {
+        let question = crate::backend::types::QuestionInfo {
+            key: "q".into(),
+            question: "哪".repeat(400),
+            header: "选择".into(),
+            options: vec![crate::backend::types::QuestionOption {
+                value: "a".into(),
+                label: "A".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let receipt = question_receipt(&[question], &[Some(vec!["a".to_string()])]);
+        assert!(
+            receipt.chars().count() <= RECEIPT_MAX_CHARS,
+            "receipt over its budget ({}): {receipt}",
+            receipt.chars().count()
+        );
+        assert!(receipt.starts_with("✅ 已回答："), "{receipt}");
+    }
+
     #[test]
     fn describe_edit_permission_shows_diff_not_raw_metadata() {
         let diff = "\
