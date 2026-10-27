@@ -700,36 +700,62 @@ pub(crate) async fn send_model_card(
     Ok(())
 }
 
+/// The current-selection ladder may use at most 1/N of a callback's remaining
+/// budget; the backend read gets the rest.
+const LADDER_SHARE_DIVISOR: u32 = 2;
+
 /// Read one page of the client-declared `/model` surface. `scope`/`selected`
 /// name the drill-down (OpenCode: the `provider` scope and the provider id the
-/// user tapped); both are `None` for the root page. `ack_budget` is `Some` when
-/// this read answers a card callback (a provider click), and `None` for a
-/// command's page: the client uses it to bound callback-originated work.
+/// user tapped); both are `None` for the root page. `deadline` is the card
+/// callback's absolute deadline (`now + CARD_ACK_BUDGET`) when this read answers
+/// a click, and `None` for a command's page.
 ///
 /// `current` is resolved **only for the root page**. The running selection is
 /// a root-page fact for every client we have: OpenCode never rendered it on its
 /// model page (its drilled surface omits it) and Codex has no drill-down. It is
 /// also a budget rule, not just an unused value: resolving it walks the
 /// effective-model ladder, whose server-recorded rung can take
-/// `SESSION_INFO_TIMEOUT` (3s) — longer than the card-ack budget (2s) — so a
-/// provider click that also resolved it could have its card update arrive too
-/// late and be dropped. A drilled page only needs the catalog, exactly as the
-/// hand-built flow did.
+/// `SESSION_INFO_TIMEOUT` (3s) — longer than the card-ack budget (2s). A
+/// callback therefore gives the ladder at most **half** of the budget still
+/// left when the page read starts, then hands the backend only the remainder;
+/// if the ladder misses its slice the page renders without the current line
+/// instead of blowing the ack. A command's root page (`deadline = None`) keeps
+/// the unlimited ladder.
 pub(crate) async fn model_surface(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
     scope: Option<&str>,
     selected: Option<&str>,
-    ack_budget: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
 ) -> crate::backend::types::ModelSurface {
     let settings = handles.flow.sessions.session_settings(thread_key).await;
     let current = match &settings {
-        Some(settings) if scope.is_none() => handles
-            .flow
-            .sessions
-            .effective_selection(&handles.flow.backend, settings)
-            .await
-            .map(|model| {
+        Some(settings) if scope.is_none() => {
+            let resolve = handles
+                .flow
+                .sessions
+                .effective_selection(&handles.flow.backend, settings);
+            let resolved = match deadline {
+                Some(deadline) => {
+                    let now = tokio::time::Instant::now();
+                    // The ladder may use at most half of what is left; the
+                    // backend read gets the other half.
+                    let ladder_deadline =
+                        now + deadline.saturating_duration_since(now) / LADDER_SHARE_DIVISOR;
+                    match tokio::time::timeout_at(ladder_deadline, resolve).await {
+                        Ok(current) => current,
+                        Err(_) => {
+                            tracing::warn!(
+                                "model card's current-selection ladder missed its callback slice; \
+                                 rendering the page without the current line"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => resolve.await,
+            };
+            resolved.map(|model| {
                 let variant = model
                     .variant
                     .as_deref()
@@ -739,7 +765,8 @@ pub(crate) async fn model_surface(
                     label: format!("{}/{}{}", model.provider_id, model.id, variant),
                     reference: format!("{}/{}", model.provider_id, model.id),
                 }
-            }),
+            })
+        }
         // A drilled page (`scope.is_some()`) or a thread with no target has no
         // current line to resolve.
         _ => None,
@@ -749,6 +776,10 @@ pub(crate) async fn model_surface(
         .as_ref()
         .map(|s| s.directory.as_str())
         .filter(|directory| !directory.is_empty());
+    // Only what is left after the ladder: a slow ladder cannot also give the
+    // backend the whole budget. A passed deadline yields `Some(0)`, which every
+    // adapter treats as "no time".
+    let ack_budget = deadline.map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
     handles
         .flow
         .backend

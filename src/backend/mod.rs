@@ -713,9 +713,11 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// failed read.
     ///
     /// `query.ack_budget` means **this read answers a card callback** and must
-    /// fit that budget; `None` is a command's page with no bound. A client that
-    /// does network work here decides how to spend it (Codex narrows its config
-    /// read and serves probe answers from cache only); OpenCode ignores it.
+    /// fit that budget; `None` is a read that is not bound by an ack — a
+    /// command's page, or a callback's validation read whose completeness
+    /// matters more than its toast. A client that does network work here
+    /// decides how to spend it (Codex narrows its config and catalog reads and
+    /// serves probe answers from cache only); OpenCode ignores it.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface;
 
     /// Available models grouped by provider (`GET /provider`), for the `/model`

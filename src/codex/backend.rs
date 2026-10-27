@@ -5112,6 +5112,47 @@ mod tests {
         );
     }
 
+    /// A model on a later catalog page still resolves its variants when the
+    /// earlier pages are slow — the validation read has no ack slice, so it is
+    /// never truncated before the target's page.
+    #[tokio::test]
+    async fn a_later_catalog_page_resolves_variants_without_an_ack_budget() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let models: Vec<Value> = (0..6)
+            .map(|index| {
+                let efforts = if index == 4 {
+                    json!([{ "reasoningEffort": "high" }])
+                } else {
+                    json!([])
+                };
+                json!({ "id": format!("model-{index}"), "supportedReasoningEfforts": efforts })
+            })
+            .collect();
+        server.set_models(models);
+        server.set_model_page_size(1);
+        server.set_model_list_delay(Duration::from_millis(150));
+        let client = connect(&url).await;
+
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("codex"),
+                catalog_only: true,
+                // The validation read: no budget, so every page is read.
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let model = surface.scopes[0]
+            .options
+            .iter()
+            .find(|option| option.id == "model-4")
+            .expect("the later page's model is in the catalog");
+        assert_eq!(model.variants, ["high"]);
+    }
+
     /// The `/think` variant lookup's `catalog_only` shape is bounded too: it
     /// sends a callback budget, so a stalled catalog cannot hold the pick.
     #[tokio::test]

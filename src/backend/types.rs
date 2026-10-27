@@ -242,9 +242,11 @@ pub struct ModelSurfaceQuery<'a> {
     pub catalog_only: bool,
     /// When this read answers a card callback, that callback's total budget
     /// (Feishu's 2 s ack budget). An adapter must fit callback-originated
-    /// network work inside it; `None` means the read is not callback-bound (a
-    /// command's page). OpenCode ignores it; Codex derives its config-read
-    /// slice from it and serves probe answers from cache only.
+    /// network work inside it; `None` means the read is not bounded by an ack —
+    /// a command's page, or a callback's **validation** read whose completeness
+    /// matters more than its toast (the handler keeps running and still records
+    /// the outcome). OpenCode ignores it; Codex derives its config-read and
+    /// catalog slices from it and serves probe answers from cache only.
     pub ack_budget: Option<Duration>,
 }
 
