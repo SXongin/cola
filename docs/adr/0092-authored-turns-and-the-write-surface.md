@@ -264,7 +264,8 @@ message, and a broken record must not produce it.
 
 - A steered Supplement is recognised by its own item id, not by claiming the
   turn it joined; the resolved ids are a bounded recognition tail, so a TUI turn
-  can never be mistaken for cola's wholesale.- A cola turn is durable state, not a process-local guess; its file is bounded
+  can never be mistaken for cola's wholesale.
+- A cola turn is durable state, not a process-local guess; its file is bounded
   (the newest 128 turns, and 32 unresolved submissions, per thread) because
   authorship is only ever asked about the newest user message. A submission
   that never resolves leaves after an hour, so the cap cannot wedge a thread

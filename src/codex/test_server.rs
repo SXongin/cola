@@ -603,6 +603,17 @@ impl FakeServer {
         self.state.threads.lock().expect("scripted threads").push(thread);
     }
 
+    /// Change a seeded thread's reported model, so a later `thread/read`
+    /// answers with it — a peer client switching the model, or a server that
+    /// stops naming one (both are `thread/model` facts, issue #904).
+    pub(crate) fn set_thread_model(&self, thread_id: &str, model: Option<&str>, provider: Option<&str>) {
+        let mut threads = self.state.threads.lock().expect("scripted threads");
+        if let Some(thread) = threads.iter_mut().find(|thread| thread.id == thread_id) {
+            thread.model = model.map(str::to_string);
+            thread.model_provider = provider.map(str::to_string);
+        }
+    }
+
     /// Send a notification to every live connection, whether it subscribed or
     /// not (the `thread/started` / `thread/status/changed` shape).
     pub(crate) fn push_notification(&self, method: &str, params: Value) {

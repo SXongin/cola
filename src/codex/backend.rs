@@ -478,31 +478,24 @@ impl Projections {
     /// Remember everything a thread read just told us about the thread: its
     /// directory (skill resolution) and the model it runs with (the card
     /// footer's only per-message fact, issue #904). One call so a new thread
-    /// fact cannot be forgotten at one of the three sites that read a thread.
-    pub(crate) fn remember(&self, thread: &Thread) {
+    /// fact cannot be forgotten at one of the sites that read a thread.
+    pub(crate) fn remember_thread_metadata(&self, thread: &Thread) {
         self.set_cwd(&thread.id, &thread.cwd);
-        let Some((provider_id, model_id)) = thread_model(thread) else {
-            return;
-        };
-        self.set_model(
-            &thread.id,
-            &ModelIdentity {
-                provider_id,
-                model_id,
-                variant: None,
-            },
-        );
+        // The read is authoritative even when it names no model: a silent
+        // answer clears the last one rather than leaving a stale name on the
+        // footer (issue #904).
+        self.set_model(&thread.id, thread_model(thread));
     }
 
     /// Record the model a thread runs with. `thread/read` reports it, and
     /// `turn/start`'s model "for this turn and subsequent turns" changes it, so
     /// cola's own pick updates this too — otherwise the footer would name the
-    /// model from before the pick.
-    pub(crate) fn set_model(&self, thread_id: &str, model: &ModelIdentity) {
+    /// model from before the pick. `None` clears it.
+    pub(crate) fn set_model(&self, thread_id: &str, model: Option<ModelIdentity>) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .set_model(model.clone());
+            .set_model(model);
     }
 
     pub(crate) fn cwd(&self, thread_id: &str) -> Option<String> {
@@ -1028,7 +1021,7 @@ async fn run_thread(
         let Some(cache) = projections.upgrade() else {
             return;
         };
-        cache.remember(subscription.thread());
+        cache.remember_thread_metadata(subscription.thread());
     }
     // Every status this connection had already received when the history
     // request starts is superseded by the page; a status received after this
@@ -1293,14 +1286,18 @@ const MODEL_PROVIDER: &str = "codex";
 /// claiming OpenAI. `None` when the server named no model: a fact cola does not
 /// have is never filled in from config (that would be `config/read`, a
 /// different read).
-fn thread_model(thread: &Thread) -> Option<(String, String)> {
-    let model = thread.model.as_deref().filter(|model| !model.trim().is_empty())?;
-    let provider = thread
+fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
+    let model_id = thread.model.as_deref().filter(|model| !model.trim().is_empty())?;
+    let provider_id = thread
         .model_provider
         .as_deref()
         .filter(|provider| !provider.trim().is_empty())
         .unwrap_or(MODEL_PROVIDER);
-    Some((provider.to_string(), model.to_string()))
+    Some(ModelIdentity {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        variant: None,
+    })
 }
 
 /// Bound the `/model` catalog read. A server that keeps minting fresh cursors
@@ -1514,7 +1511,7 @@ impl Backend for CodexClient {
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
         let thread = self.threads().start(cwd).await.map_err(client_error)?;
-        self.projections.remember(&thread);
+        self.projections.remember_thread_metadata(&thread);
         Ok(Session {
             id: thread.id.clone(),
             project_id: None,
@@ -1590,7 +1587,7 @@ impl Backend for CodexClient {
         // and a skill is then refused rather than taken from another project.
         if !skills.is_empty() && self.projections.cwd(session_id).is_none() {
             match tokio::time::timeout(SKILL_CWD_READ_TIMEOUT, self.threads().read(session_id, false)).await {
-                Ok(Ok(thread)) => self.projections.remember(&thread),
+                Ok(Ok(thread)) => self.projections.remember_thread_metadata(&thread),
                 Ok(Err(error)) => {
                     return Err(BridgeError::Client {
                         client: "codex",
@@ -1674,11 +1671,11 @@ impl Backend for CodexClient {
         if let Some(model) = model {
             self.projections.set_model(
                 session_id,
-                &ModelIdentity {
+                Some(ModelIdentity {
                     provider_id: model.provider_id.clone(),
                     model_id: model.id.clone(),
                     variant: None,
-                },
+                }),
             );
         }
         Ok(())
@@ -2026,8 +2023,11 @@ impl Backend for CodexClient {
         // The read is the freshest model fact cola has (a peer client may have
         // switched it), so the footer's projection learns it too — the same
         // read serves both surfaces (issue #904).
-        self.projections.remember(&thread);
-        let model = thread_model(&thread).map(|(provider_id, id)| SessionModel { provider_id, id });
+        self.projections.remember_thread_metadata(&thread);
+        let model = thread_model(&thread).map(|model| SessionModel {
+            provider_id: model.provider_id,
+            id: model.model_id,
+        });
         let title = (!thread.title().is_empty()).then(|| thread.title().to_string());
         Ok(SessionInfo {
             id: thread.id,
@@ -2788,6 +2788,123 @@ mod tests {
         assert!(
             transcript.messages.iter().all(|message| message.model.is_none()),
             "the transcript invents no model either"
+        );
+    }
+
+    /// A thread read is authoritative **including silence** (review round 1):
+    /// when the server stops naming a model for a thread, the projection clears
+    /// the one it remembered, so the footer drops the name instead of keeping a
+    /// stale one. A stale name would claim the wrong model answered.
+    #[tokio::test]
+    async fn a_read_that_names_no_model_clears_the_footers_model() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.push_item("thread-1", "item-1", "one");
+        let transcript = wait_for_text(&client, "thread-1", "one").await;
+        assert!(
+            transcript.messages.iter().any(|message| message.model.is_some()),
+            "the thread already names its model"
+        );
+
+        server.set_thread_model("thread-1", None, None);
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        assert!(info.model.is_none(), "the read named no model");
+        let transcript = client.transcript("thread-1").await.expect("the read");
+        assert!(
+            transcript.messages.iter().all(|message| message.model.is_none()),
+            "the silent read must clear the remembered model, not keep a stale one"
+        );
+    }
+
+    /// The `/model` read is also how the footer learns a **peer's** switch (a
+    /// TUI changing the thread's model), so `session_info` must feed the same
+    /// projection the footer reads — not just answer the picker.
+    #[tokio::test]
+    async fn a_peer_model_switch_reaches_the_footer_through_the_session_read() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.push_item("thread-1", "item-1", "one");
+        wait_for_text(&client, "thread-1", "one").await;
+
+        server.set_thread_model("thread-1", Some("gpt-5.5"), Some("opencode-go"));
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        assert_eq!(
+            info.model.map(|model| model.id),
+            Some("gpt-5.5".to_string()),
+            "the picker read names the model the peer switched to"
+        );
+        let transcript = client.transcript("thread-1").await.expect("the read");
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the assistant item");
+        assert_eq!(
+            answering.model.as_ref().map(|model| model.model_id.as_str()),
+            Some("gpt-5.5"),
+            "the footer's projection is refreshed by the same read"
+        );
+    }
+
+    /// A refused `turn/start` changed nothing on the thread, so it must not
+    /// move the recorded model: only the accepted response is evidence.
+    #[tokio::test]
+    async fn a_refused_pick_does_not_move_the_footers_model() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.push_item("thread-1", "item-1", "one");
+        wait_for_text(&client, "thread-1", "one").await;
+
+        server.reject_next_turn_start("model is not available here");
+        let pick = ModelInfo {
+            id: "gpt-5.5".into(),
+            provider_id: "opencode-go".into(),
+            variant: None,
+        };
+        client
+            .prompt("thread-1", "run it", &[], &[], Some(&pick), None, None, None)
+            .await
+            .expect_err("the refusal is an error");
+
+        let transcript = client.transcript("thread-1").await.expect("the read");
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the assistant item");
+        assert_eq!(
+            answering.model.as_ref().map(|model| model.model_id.as_str()),
+            Some("gpt-6-luna"),
+            "a refused turn/start changed nothing on the thread"
         );
     }
 

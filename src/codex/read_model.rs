@@ -200,8 +200,13 @@ impl ThreadProjection {
     /// `thread/resume` and `thread/read` report it, and no item does. The
     /// transcript stamps it onto assistant messages, so the card footer and the
     /// `/model` current-model line can name what actually ran.
-    pub(crate) fn set_model(&mut self, model: ModelIdentity) {
-        self.model = Some(model);
+    ///
+    /// The latest thread answer is authoritative, including silence: `None`
+    /// clears a previously reported model, so a thread the server stops naming
+    /// a model for shows none rather than an old name. A stale name is worse
+    /// than a missing one — it would claim the wrong model answered.
+    pub(crate) fn set_model(&mut self, model: Option<ModelIdentity>) {
+        self.model = model;
     }
 
     /// The turn an item belongs to, for the authorship record: Codex assigns
@@ -2485,11 +2490,11 @@ mod tests {
             "a projection that was told no model must not invent one"
         );
 
-        projection.set_model(ModelIdentity {
+        projection.set_model(Some(ModelIdentity {
             provider_id: "opencode-go".into(),
             model_id: "gpt-6-luna".into(),
             variant: None,
-        });
+        }));
         let transcript = projection.transcript();
         let mut assistants = 0;
         for message in &transcript.messages {
