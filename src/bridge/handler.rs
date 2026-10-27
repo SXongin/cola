@@ -2770,7 +2770,8 @@ impl App {
         // spend the same budget the later work is bounded by — a fresh deadline
         // after it would let a pending commit after the ack was already lost
         // (ADR-0089).
-        let deadline = tokio::time::Instant::now() + CARD_STORE_BUDGET;
+        let callback_started = tokio::time::Instant::now();
+        let deadline = callback_started + CARD_STORE_BUDGET;
         if let Some(refusal) = self.gate_card_action(&value).await {
             return Some(refusal);
         }
@@ -2850,7 +2851,10 @@ impl App {
                 },
                 "agent" => self.handle_agent_card_action(&self.core, &value, false).await,
                 "agent_clear" => self.handle_agent_card_action(&self.core, &value, true).await,
-                "model" => self.handle_model_card_action(&self.core, &value).await,
+                "model" => {
+                    self.handle_model_card_action(&self.core, &value, callback_started)
+                        .await
+                }
                 "think" => self.handle_think_card_action(&self.core, &value, false).await,
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
@@ -4655,12 +4659,13 @@ impl App {
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        callback_started: tokio::time::Instant,
     ) -> Option<CardActionResult> {
-        // One deadline for this callback. The current-selection ladder and the
-        // backend read are charged against it (see `command::model_surface`),
-        // so neither can spend the other's slice; the remainder is the card's
-        // build and response margin.
-        let deadline = tokio::time::Instant::now() + crate::feishu::ws::CARD_ACK_BUDGET;
+        // The ack deadline is anchored at the callback's **true start**, not at
+        // this handler: gate access, span setup and the store reads before the
+        // dispatch already spent part of the budget. The current-selection
+        // ladder and the backend read are charged against what is left.
+        let deadline = callback_started + crate::feishu::ws::CARD_ACK_BUDGET;
         let thread_key = thread_key_from_value(value);
         let picked = value
             .get("value")

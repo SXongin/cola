@@ -2648,3 +2648,66 @@ async fn a_profile_with_a_hidden_grant_is_declined() {
     poll.abort();
     sync.abort();
 }
+
+/// A silent `model/list` must not wedge a model pick: the full-catalog
+/// validation is finite, and a timeout is **unknown**, so the stored `/think`
+/// variant is preserved rather than cleared as if the model declared none.
+#[tokio::test]
+async fn a_silent_catalog_does_not_wedge_a_model_pick() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(THREAD, "session-root", WORK, "a thread"));
+    server.silence_next_model_list();
+    let dir = tempfile::tempdir().unwrap();
+    let (app, _platform, _client) = build_bridge(&url, &dir.path().join("sessions.json"), 0).await;
+    let handles = app.command_handles();
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+    let mut settings = handles
+        .flow
+        .sessions
+        .session_settings(&key)
+        .await
+        .expect("the seeded settings");
+    settings.variant = Some("high".into());
+    assert!(
+        handles
+            .flow
+            .sessions
+            .set_session_settings(&key, settings)
+            .await
+            .expect("persist the variant")
+    );
+
+    let started = std::time::Instant::now();
+    let outcome = handles
+        .flow
+        .sessions
+        .pick_model(&handles.flow.backend, &key, "codex/new-model")
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(
+            outcome,
+            Ok(crate::bridge::handles::PickOutcome::Applied {
+                cleared_variant: None
+            })
+        ),
+        "the pick proceeded with unknown variants: {outcome:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "a silent catalog held the pick for {elapsed:?}"
+    );
+    let stored = handles
+        .flow
+        .sessions
+        .session_settings(&key)
+        .await
+        .expect("the stored settings");
+    assert_eq!(stored.model.as_deref(), Some("codex/new-model"));
+    assert_eq!(
+        stored.variant.as_deref(),
+        Some("high"),
+        "a timeout is unknown, not 'no variants'"
+    );
+}
