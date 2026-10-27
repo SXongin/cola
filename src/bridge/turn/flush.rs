@@ -117,7 +117,7 @@ async fn abandon_rejected_payload(
     if !card.acc.note_card_abandonment() {
         return false;
     }
-    card.acc.skip_rejected_slice(slice_end);
+    card.acc.skip_rejected_slice(slice_from, slice_end);
     card.acc.push_receipt_at(None, CARD_CONTENT_SKIPPED);
     card.acc.reset_card_fallback();
     card.card_is_live = false;
@@ -2030,6 +2030,39 @@ mod tests {
             patches_to(&platform, "om_live").await.len(),
             3,
             "a suspended card is retried, never refused forever"
+        );
+    }
+
+    /// A refused slice's cursor is never confirmed (issue #886 review): the
+    /// continuation starts after it, and the durable record carries the
+    /// continuation's cursor — not the refused text's frontier.
+    #[tokio::test]
+    async fn an_abandoned_slice_does_not_confirm_its_cursor() {
+        let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
+        {
+            let mut cards = app.cards.lock().await;
+            cards
+                .get_mut("ses_test")
+                .unwrap()
+                .acc
+                .set_cola_message_id("msg_1");
+        }
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        let record = app
+            .cards_handle()
+            .chains
+            .get("ses_test")
+            .expect("the continuation re-points the record");
+        assert_eq!(record.card_message_id, "msg_reply");
+        let cursor = app.cards_handle().chains.cursor("ses_test");
+        assert!(
+            cursor.and_then(|cursor| cursor.frontier).is_none(),
+            "the refused text's frontier is not marked delivered"
         );
     }
 

@@ -1277,6 +1277,10 @@ pub(super) struct StreamAccumulator {
     /// the refusal is the card's own shell rather than its content: cleared by
     /// any delivered write, never by an abandonment.
     card_abandonments: u8,
+    /// Timeline entries an abandonment skipped (issue #886). A later chunk of
+    /// the same streaming part must start a NEW entry, never merge into a
+    /// skipped one — no card will ever render it again.
+    sealed_entries: std::collections::HashSet<u64>,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -2705,7 +2709,10 @@ impl StreamAccumulator {
     /// Skip the timeline slice `end` past the refused content (issue #886): the
     /// next build starts after it, so the same refused payload is never
     /// re-rendered on this card. Never rewinds a boundary already advanced.
-    pub(super) fn skip_rejected_slice(&mut self, end: usize) {
+    pub(super) fn skip_rejected_slice(&mut self, start: usize, end: usize) {
+        for item in &self.timeline[start.min(end)..end] {
+            self.sealed_entries.insert(item.seq);
+        }
         if end > self.render_from {
             self.render_from = end;
         }
@@ -3511,22 +3518,31 @@ impl StreamAccumulator {
         accepts: impl Fn(&TimelineKind) -> bool,
     ) -> Option<usize> {
         let end = self.timeline.partition_point(|item| item.key <= key);
-        self.timeline[..end]
+        for (idx, item) in self.timeline[..end]
             .iter()
             .enumerate()
             .rev()
             .take_while(|(_, item)| item.key == key)
-            .find_map(|(idx, item)| {
-                if !accepts(&item.kind) {
-                    return None;
-                }
-                let same = match (item.source.as_ref(), source) {
-                    (None, None) => true,
-                    (Some(item_source), Some(source)) => item_source.same_part(source),
-                    _ => false,
-                };
-                same.then_some(idx)
-            })
+        {
+            // A sealed entry was abandoned by a refused payload (issue #886):
+            // no card will render it again, so a later chunk of the same part
+            // must start a NEW entry instead of growing the dead one.
+            if self.sealed_entries.contains(&item.seq) {
+                return None;
+            }
+            if !accepts(&item.kind) {
+                continue;
+            }
+            let same = match (item.source.as_ref(), source) {
+                (None, None) => true,
+                (Some(item_source), Some(source)) => item_source.same_part(source),
+                _ => false,
+            };
+            if same {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     /// Insert `kind` directly AFTER timeline index `after` (spec #561, review
@@ -5619,6 +5635,31 @@ mod tests {
         assert_ne!(
             before, after,
             "the resolved image must be visible to the fingerprint"
+        );
+    }
+
+    /// A chunk that arrives AFTER an abandonment must not merge into the
+    /// skipped entry (issue #886 review): it starts a new entry the
+    /// continuation renders.
+    #[test]
+    fn a_chunk_after_an_abandonment_starts_a_new_entry() {
+        let mut acc = StreamAccumulator::new("test");
+        acc.push_text_at(Some(1_000), "被拒绝的内容");
+        acc.skip_rejected_slice(0, 1);
+        acc.push_text_at(Some(1_000), "后来的内容");
+        assert_eq!(
+            acc.timeline_len(),
+            2,
+            "the chunk did not merge into the skipped entry"
+        );
+        let card = acc.build_card_with_info().card.to_string();
+        assert!(
+            card.contains("后来的内容"),
+            "the continuation renders the new chunk: {card}"
+        );
+        assert!(
+            !card.contains("被拒绝的内容"),
+            "the skipped entry stays off the card: {card}"
         );
     }
 

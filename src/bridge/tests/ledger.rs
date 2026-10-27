@@ -2033,15 +2033,15 @@ async fn a_queued_entry_write_marks_rendered_only_once_it_delivers() {
 }
 
 /// ADR-0080's reopened trade (spec #699, ticket #701): the yielded-card refresh
-/// reports what really became of its write. Feishu permanently refuses the
-/// refresh that carries the retirement entry — the plain attempt AND its fenced
-/// retry — so the card suspends and the entry can never land on it. The
-/// process-local cache is not committed (ADR-0073), but the runtime's evidence
-/// ending was recorded at derivation, so the task LEAVES the ledger and its
-/// entry stays OWED to a card that CAN render it, while the suspended card is
-/// not PATCHed again; `Refreshed`/`Settled` stay reserved for an accepted write.
+/// reports what really became of its write. Feishu refuses the refresh that
+/// carries the retirement entry — the plain attempt AND its fenced retry — so
+/// the refresh is refused; the SETTLEMENT then continues on a new card (issue
+/// #886) instead of suspending forever. Its accepted write carries the entry,
+/// so the process-local cache commits (ADR-0073) and the task leaves the
+/// ledger, while the refused card is not PATCHed again; `Refreshed`/`Settled`
+/// stay reserved for an accepted write.
 #[tokio::test]
-async fn a_permanently_refused_yielded_refresh_leaves_the_entry_owed() {
+async fn a_refused_yielded_refresh_recovers_on_settlement() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     // A frozen row clock: no second-granular ledger churn can add a PATCH
@@ -2063,33 +2063,43 @@ async fn a_permanently_refused_yielded_refresh_leaves_the_entry_owed() {
     spawn_sync(&app);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await {
+    while patches_to(&platform, "om_waiting").await.len() < 2 {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the doubly-refused refresh never suspended the card"
+            "the doubly-refused refresh never made its two attempts"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    // The suspended-card handling is exactly as before: the plain attempt and
-    // its fenced retry are the card's only writes (both recorded, both
-    // refused), and no later pass PATCHes the suspended card again.
-    assert_eq!(
-        patches_to(&platform, "om_waiting").await.len(),
-        2,
-        "the plain attempt and its fenced retry only"
+    // The old card takes the plain attempt and its fenced retry; the
+    // SETTLEMENT then continues on a NEW card instead of suspending (issue
+    // #886), and the refused slice's entry stays owed.
+    assert!(
+        !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+        "the settlement recovers a refused yielded refresh"
+    );
+    assert!(
+        platform
+            .replied_cards()
+            .await
+            .last()
+            .is_some_and(|card| card_text(card).contains("部分内容未能显示")),
+        "the settlement continues on a card that names the dropped content"
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         patches_to(&platform, "om_waiting").await.len(),
         2,
-        "a suspended card is not PATCHed again"
+        "the refused card is not PATCHed again"
     );
 
-    // Nothing was recorded: the task stays live, so a later receivable card can
-    // still render its entry ...
+    // The settlement's accepted write carried the entry: the process-local
+    // cache commits only on an accepted write (ADR-0073), and this one landed.
     assert!(
-        backend.overlay.retired_ids("ses_test").is_empty(),
-        "a refused refresh commits no overlay cache: {:?}",
+        backend
+            .overlay
+            .retired_ids("ses_test")
+            .contains(&"call_bg".to_string()),
+        "the settlement's accepted write records the retirement: {:?}",
         backend.overlay.retired_ids("ses_test")
     );
     let later = crate::backend::Backend::transcript(backend.as_ref(), "ses_test")

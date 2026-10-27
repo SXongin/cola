@@ -3123,7 +3123,7 @@ impl Turn {
         };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        let (changed, settled, notice_at, stamped_card) = {
+        let (changed, settled, notice_at) = {
             // The same admission, re-checked under the write lock through the
             // module's lock-scoped helper: the returned card is still locked,
             // so the check and the write below share one lock.
@@ -3160,10 +3160,7 @@ impl Turn {
             } else {
                 card.acc.turn_started_at()
             };
-            // The card the ending landed on (spec #602, review finding 6):
-            // captured under the same lock as the stamp, so the caller's notice
-            // is bound to it.
-            (changed, settled, notice_at, card.card_message_id.clone())
+            (changed, settled, notice_at)
         };
         if let Some(disposition) = settled {
             // The footer is refreshed one last time (ADR-0019): the card
@@ -3173,8 +3170,23 @@ impl Turn {
             // Best effort, like every other finalize. The flush's own entry
             // drops the card's now-spent durable record (ADR-0063).
             state::refresh_work_context(cards, session_id).await;
-            let flush = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Forbid).await;
-            tracing::info!("yielded card settled in place: session {session_id} ({disposition:?})");
+            // The SETTLEMENT may split: unlike the ledger-only refresh below,
+            // a terminal ending is real content, and a card Feishu refused
+            // (or one over the split budget) must be able to continue on a new
+            // one — otherwise a suspended yielded card's ending and completion
+            // notice can never land (issue #886).
+            let flush = flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await;
+            tracing::info!("yielded card settled: session {session_id} ({disposition:?})");
+            // The card the ending landed on (spec #602, review finding 6):
+            // read AFTER the flush, so a continuation that took the terminal
+            // slice names itself — the pre-flush card would read as replaced
+            // and suppress the notice.
+            let settled_card = cards
+                .cards
+                .lock()
+                .await
+                .get(session_id)
+                .and_then(|card| card.card_message_id.clone());
             // The settle answer is the write's (review, PR #595): a
             // permanently refused ending never reached the card, so the caller
             // records nothing, announces nothing, and the task stays live for
@@ -3183,7 +3195,7 @@ impl Turn {
                 FlushOutcome::Accepted => YieldedUpdate::Settled {
                     disposition,
                     notice_at,
-                    card_message_id: stamped_card,
+                    card_message_id: settled_card,
                 },
                 FlushOutcome::Refused => YieldedUpdate::Refused,
                 // No write was issued (no card id): the card keeps what it
