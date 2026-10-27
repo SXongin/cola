@@ -2137,6 +2137,39 @@ mod tests {
         );
     }
 
+    /// The budget is enforced by the FLUSH, not just the counter (issue #886
+    /// review): two abandoned slices, then the third refusal stops instead of
+    /// posting another warning card.
+    #[tokio::test]
+    async fn the_flush_stops_after_the_abandonment_budget() {
+        let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
+        // The old card's plain + fenced attempt.
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        // Two abandoned continuations, each refused plain and fenced.
+        platform
+            .fail_reply_card_content_count
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        assert_eq!(
+            patches_to(&platform, "om_live").await.len(),
+            2,
+            "the old card's plain attempt and its fenced retry only"
+        );
+        assert_eq!(
+            sent_cards(&platform).await.len(),
+            4,
+            "two continuations, each refused plain and fenced; no third"
+        );
+        assert!(
+            Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+            "the exhausted budget keeps the conservative refusal"
+        );
+    }
+
     /// The abandonment budget bounds the continuation cards a broken card can
     /// post (issue #886); a delivered write restores it.
     #[test]
