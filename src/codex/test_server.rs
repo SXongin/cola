@@ -436,6 +436,11 @@ struct State {
     read_returns: std::sync::Mutex<Option<String>>,
     /// `model/list` calls received, so a paged catalog is proved by its pages.
     model_list_calls: AtomicUsize,
+    /// One-shot: leave the next `model/list` unanswered (a stalled catalog).
+    silent_model_list: std::sync::atomic::AtomicBool,
+    /// How long each `model/list` answer waits before it is written (a slow,
+    /// paginated catalog).
+    model_list_delay: std::sync::Mutex<std::time::Duration>,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
     /// Every `thread/start` request's params, in send order (issue #898).
@@ -507,6 +512,8 @@ impl Default for State {
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             read_returns: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
+            silent_model_list: std::sync::atomic::AtomicBool::new(false),
+            model_list_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             page_size: 2,
             start_params: std::sync::Mutex::new(Vec::new()),
             resume_params: std::sync::Mutex::new(Vec::new()),
@@ -1065,6 +1072,16 @@ impl FakeServer {
     /// `model/list` calls received, in order (a paged read proves its pages).
     pub(crate) fn model_list_calls(&self) -> usize {
         self.state.model_list_calls.load(Ordering::SeqCst)
+    }
+
+    /// Leave the next `model/list` unanswered: a stalled catalog read.
+    pub(crate) fn silence_next_model_list(&self) {
+        self.state.silent_model_list.store(true, Ordering::SeqCst);
+    }
+
+    /// Hold each `model/list` answer for `delay`: a slow, paginated catalog.
+    pub(crate) fn set_model_list_delay(&self, delay: std::time::Duration) {
+        *self.state.model_list_delay.lock().expect("model list delay") = delay;
     }
 
     /// Answer the next `turn/start` with `message` as a JSON-RPC error: a
@@ -1691,6 +1708,13 @@ where
         }
         Some("model/list") => {
             state.model_list_calls.fetch_add(1, Ordering::SeqCst);
+            if state.silent_model_list.swap(false, Ordering::SeqCst) {
+                return true;
+            }
+            let delay = *state.model_list_delay.lock().expect("model list delay");
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let models = state.models.lock().expect("models").clone();
             let offset = params
                 .get("cursor")

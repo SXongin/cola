@@ -1543,6 +1543,105 @@ impl ServerLifecycle for CodexClient {
     }
 }
 
+impl CodexClient {
+    /// `model/list` paged to exhaustion, or until `deadline` (a card
+    /// callback's slice) leaves no time for the next page.
+    ///
+    /// A deadline hit keeps the pages already read: a partial catalog is a
+    /// usable degraded surface (the rest of the card still renders), whereas
+    /// waiting on a stalled server would miss the callback ack. `None` is the
+    /// root page, which pages up to [`MAX_MODEL_PAGES`] with no time bound.
+    /// Every request is bounded by the deadline too, so one hung `model/list`
+    /// cannot use the whole budget on its own.
+    pub(crate) async fn list_models_within(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Vec<ProviderModels> {
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut models = Vec::new();
+        for page in 0..MAX_MODEL_PAGES {
+            if let Some(deadline) = deadline
+                && tokio::time::Instant::now() >= deadline
+            {
+                tracing::warn!("codex model/list reached the card deadline; showing the catalog read so far");
+                break;
+            }
+            let mut params = json!({});
+            if let Some(cursor) = cursor.as_deref() {
+                params["cursor"] = json!(cursor);
+            }
+            let request = self.connection().request("model/list", params);
+            let result = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, request).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(
+                            "codex model/list did not answer before the card deadline; \
+                             showing the catalog read so far"
+                        );
+                        break;
+                    }
+                },
+                None => request.await,
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!("codex model/list failed; the picker degrades: {error}");
+                    break;
+                }
+            };
+            let response: ModelListResponse = match decode("model/list", result) {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!("codex model/list did not decode: {error}");
+                    break;
+                }
+            };
+            for model in response.data {
+                if model.hidden {
+                    continue;
+                }
+                models.push(ModelOption {
+                    id: model.id,
+                    // The server's own reasoning-effort set rides the model
+                    // entry (ADR-0020: each model declares its own scale).
+                    variants: model
+                        .supported_reasoning_efforts
+                        .into_iter()
+                        .map(|effort| effort.reasoning_effort)
+                        .collect(),
+                    ..ModelOption::default()
+                });
+            }
+            match response.next_cursor {
+                None => break,
+                Some(next) => {
+                    if !seen.insert(next.clone()) {
+                        tracing::warn!(
+                            "codex model/list repeated pagination cursor `{next}`; \
+                             showing the catalog read so far"
+                        );
+                        break;
+                    }
+                    cursor = Some(next);
+                }
+            }
+            if page + 1 == MAX_MODEL_PAGES {
+                tracing::warn!("codex model/list did not finish in {MAX_MODEL_PAGES} pages");
+            }
+        }
+        if models.is_empty() {
+            return Vec::new();
+        }
+        vec![ProviderModels {
+            provider: MODEL_PROVIDER.to_string(),
+            models,
+        }]
+    }
+}
+
 #[async_trait]
 impl Backend for CodexClient {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
@@ -2020,68 +2119,7 @@ impl Backend for CodexClient {
     }
 
     async fn list_models(&self) -> Vec<ProviderModels> {
-        let mut cursor: Option<String> = None;
-        let mut seen = std::collections::HashSet::new();
-        let mut models = Vec::new();
-        for page in 0..MAX_MODEL_PAGES {
-            let mut params = json!({});
-            if let Some(cursor) = cursor.as_deref() {
-                params["cursor"] = json!(cursor);
-            }
-            let result = match self.connection().request("model/list", params).await {
-                Ok(result) => result,
-                Err(error) => {
-                    tracing::warn!("codex model/list failed; the picker degrades: {error}");
-                    break;
-                }
-            };
-            let response: ModelListResponse = match decode("model/list", result) {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::warn!("codex model/list did not decode: {error}");
-                    break;
-                }
-            };
-            for model in response.data {
-                if model.hidden {
-                    continue;
-                }
-                models.push(ModelOption {
-                    id: model.id,
-                    // The server's own reasoning-effort set rides the model
-                    // entry (ADR-0020: each model declares its own scale).
-                    variants: model
-                        .supported_reasoning_efforts
-                        .into_iter()
-                        .map(|effort| effort.reasoning_effort)
-                        .collect(),
-                    ..ModelOption::default()
-                });
-            }
-            match response.next_cursor {
-                None => break,
-                Some(next) => {
-                    if !seen.insert(next.clone()) {
-                        tracing::warn!(
-                            "codex model/list repeated pagination cursor `{next}`; \
-                             showing the catalog read so far"
-                        );
-                        break;
-                    }
-                    cursor = Some(next);
-                }
-            }
-            if page + 1 == MAX_MODEL_PAGES {
-                tracing::warn!("codex model/list did not finish in {MAX_MODEL_PAGES} pages");
-            }
-        }
-        if models.is_empty() {
-            return Vec::new();
-        }
-        vec![ProviderModels {
-            provider: MODEL_PROVIDER.to_string(),
-            models,
-        }]
+        self.list_models_within(None).await
     }
 
     /// The `/model` surface: the built-in catalog (global, its own group), the
@@ -2100,12 +2138,15 @@ impl Backend for CodexClient {
     /// (2 s) config read and fresh probes (2 s each, concurrent).
     ///
     /// A **drilled** page is a card callback and arrives with `ack_budget =
-    /// Some(budget)`. It cannot chain those two waits, so its config read gets
-    /// only `budget - 1.4 s` (600 ms out of a 2 s budget), probes are served
-    /// **cache-only** (zero network), and the only remaining await is the
-    /// catalog's one websocket round-trip — leaving the ack card's render and
-    /// response well inside the budget. A cold drilled click therefore shows
-    /// the providers without their probed models; the next root open fills them.
+    /// Some(budget)`. It cannot chain those two waits, so **both** its config
+    /// read and its catalog read get `budget - 1.4 s` (600 ms out of a 2 s
+    /// budget) — they run concurrently, so the surface returns by about that
+    /// slice — probes are served **cache-only** (zero network), and the rest of
+    /// the budget is left for the card build and the ack response. A stalled
+    /// `model/list` yields the pages read so far (or an empty catalog) plus the
+    /// normal note and hand-write hint, never a hung card. A cold drilled click
+    /// therefore shows the providers without their probed models; the next root
+    /// open fills them.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
         // `/think`'s variant lookup is the one caller that asks for the bare
         // catalog (`catalog_only`): it runs on a card callback's short ack
@@ -2116,14 +2157,25 @@ impl Backend for CodexClient {
         // A callback-originated read carries its budget; a command's page does
         // not. `catalog_only` never reaches the config/probe path.
         let callback = query.ack_budget.is_some();
+        // One slice, used by both concurrent reads. The catalog's own page loop
+        // is bounded by this deadline too, so a paginated-but-alive server
+        // cannot spend the whole budget.
+        let catalog_deadline = super::model_surface::callback_read_slice(query.ack_budget)
+            .map(|slice| tokio::time::Instant::now() + slice);
+        // With a deadline the catalog is read through the page loop's bounded
+        // form; without one it stays the trait's read (the declared catalog
+        // source). Both produce the same `ProviderModels`.
+        let catalog = async {
+            match catalog_deadline {
+                Some(deadline) => self.list_models_within(Some(deadline)).await,
+                None => Backend::list_models(self).await,
+            }
+        };
         let (catalog, config) = if fast {
-            (
-                Backend::list_models(self).await,
-                super::model_surface::CodexModelConfig::default(),
-            )
+            (catalog.await, super::model_surface::CodexModelConfig::default())
         } else {
             let (catalog, config) = tokio::join!(
-                Backend::list_models(self),
+                catalog,
                 super::model_surface::read_config(
                     self.connection(),
                     query.directory,
@@ -4943,6 +4995,158 @@ mod tests {
         );
         let note = surface.scopes[1].note.as_deref().unwrap_or_default();
         assert!(note.contains("读不到 config"), "note: {note}");
+    }
+
+    /// A stalled `model/list` is bounded by the same callback slice, and the
+    /// page still renders: provider options, the degraded model note and the
+    /// hand-write hint, never an empty card or a call past the ack budget.
+    #[tokio::test]
+    async fn a_stalled_model_list_is_bounded_by_the_callback_budget() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.silence_next_model_list();
+        server.set_config_read(json!({
+            "config": {},
+            "layers": [{
+                "name": { "type": "user" },
+                "version": "v1",
+                "config": {
+                    "model_providers": { "deepseek": { "name": "DeepSeek" } }
+                }
+            }]
+        }));
+        let client = connect(&url).await;
+
+        let started = Instant::now();
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("deepseek"),
+                directory: Some("/work/cola"),
+                ack_budget: Some(Duration::from_secs(2)),
+                ..Default::default()
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            server.model_list_calls(),
+            1,
+            "the stalled page was attempted once, then the deadline stopped the loop"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a stalled catalog took {elapsed:?}, past the 2s ack budget"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "the catalog should get its 600ms slice, took {elapsed:?}"
+        );
+        assert!(
+            surface.scopes[1]
+                .options
+                .iter()
+                .any(|option| option.id == "deepseek"),
+            "the provider options still render"
+        );
+        assert!(
+            surface.scopes[0].note.is_some(),
+            "the degraded model scope carries a note"
+        );
+        assert!(
+            surface.scopes[0].free_text.is_some(),
+            "the hand-write hint survives"
+        );
+    }
+
+    /// A paginated-but-alive catalog is capped by the deadline as well: the
+    /// page loop keeps what it read and does not spend 64 pages of the budget.
+    #[tokio::test]
+    async fn a_slow_paginated_catalog_is_capped_by_the_callback_budget() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_models(
+            (0..100)
+                .map(|index| json!({ "id": format!("model-{index}"), "supportedReasoningEfforts": [] }))
+                .collect(),
+        );
+        server.set_model_page_size(1);
+        server.set_model_list_delay(Duration::from_millis(150));
+        let client = connect(&url).await;
+
+        let started = Instant::now();
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("codex"),
+                directory: Some("/work/cola"),
+                ack_budget: Some(Duration::from_secs(2)),
+                ..Default::default()
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let calls = server.model_list_calls();
+        assert!(calls >= 1, "the first page was read");
+        assert!(
+            calls < 100,
+            "the deadline stopped the 100-page catalog after {calls} pages"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a paginated catalog took {elapsed:?}, past the 2s ack budget"
+        );
+        assert!(
+            surface
+                .scopes
+                .iter()
+                .flat_map(|scope| scope.options.iter())
+                .any(|option| option.id.starts_with("model-")),
+            "the partial catalog is shown, not discarded"
+        );
+        assert!(
+            surface.scopes[0].free_text.is_some(),
+            "the page still offers the hand-write hint"
+        );
+    }
+
+    /// The `/think` variant lookup's `catalog_only` shape is bounded too: it
+    /// sends a callback budget, so a stalled catalog cannot hold the pick.
+    #[tokio::test]
+    async fn a_stalled_catalog_only_variant_lookup_is_bounded() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.silence_next_model_list();
+        let client = connect(&url).await;
+
+        let started = Instant::now();
+        let surface = Backend::model_surface(
+            &client,
+            crate::backend::types::ModelSurfaceQuery {
+                scope: Some("provider"),
+                selected: Some("codex"),
+                catalog_only: true,
+                ack_budget: Some(Duration::from_secs(2)),
+                ..Default::default()
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(server.model_list_calls(), 1);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the variant lookup took {elapsed:?}, past the ack budget"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "the lookup should get the same 600ms slice, took {elapsed:?}"
+        );
+        // Degrades to the empty-scope note + hint, never a failed read.
+        assert!(surface.scopes[0].options.is_empty());
+        assert!(surface.scopes[0].note.is_some());
+        assert!(surface.scopes[0].free_text.is_some());
     }
 
     /// A profile preset's callback value reaches the next `turn/start` as its

@@ -633,8 +633,10 @@ impl SessionsHandle {
                 selected: Some(provider),
                 // This lookup runs on a card callback's short ack budget and
                 // needs only the advertised variants: no config read, no
-                // provider probe, no session context.
+                // provider probe, no session context. The budget bounds the
+                // catalog read (a callback must not wait on a stalled server).
                 catalog_only: true,
+                ack_budget: Some(crate::feishu::ws::CARD_ACK_BUDGET),
                 ..Default::default()
             })
             .await

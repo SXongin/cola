@@ -66,23 +66,28 @@ pub(crate) const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 pub(crate) const CONFIG_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// What a callback's budget must leave for the rest of the read: the catalog's
-/// websocket round-trip, the card build and the ack response. The remainder is
-/// the config read's slice.
+/// What a callback's budget must leave for the card build and the ack
+/// response. The remainder is the slice **both** the config read and the
+/// catalog read may use; they run concurrently, so the surface returns by
+/// about that slice, not their sum.
 const CALLBACK_READ_MARGIN: Duration = Duration::from_millis(1400);
 
-/// The config-read slice for one surface read.
+/// The slice a callback read may give each of its two concurrent reads
+/// (config and catalog): `budget - CALLBACK_READ_MARGIN` — 600 ms out of a 2 s
+/// budget. `None` means this is not a callback read.
+pub(crate) fn callback_read_slice(ack_budget: Option<Duration>) -> Option<Duration> {
+    ack_budget.map(|budget| budget.saturating_sub(CALLBACK_READ_MARGIN))
+}
+
+/// The config-read timeout for one surface read.
 ///
 /// A callback read (`ack_budget = Some`) is answered inside a card-ack budget;
 /// it must not also run a fresh probe, so its config read gets
-/// `budget - CALLBACK_READ_MARGIN` (600 ms out of a 2 s budget) and probes come
-/// from the cache. A non-callback read (`None`) keeps [`CONFIG_READ_TIMEOUT`]
-/// and fresh probes — it is a command's page, not a callback.
+/// [`callback_read_slice`] (600 ms out of a 2 s budget) and probes come from
+/// the cache. A non-callback read (`None`) keeps [`CONFIG_READ_TIMEOUT`] and
+/// fresh probes — it is a command's page, not a callback.
 pub(crate) fn config_read_timeout(ack_budget: Option<Duration>) -> Duration {
-    match ack_budget {
-        Some(budget) => budget.saturating_sub(CALLBACK_READ_MARGIN),
-        None => CONFIG_READ_TIMEOUT,
-    }
+    callback_read_slice(ack_budget).unwrap_or(CONFIG_READ_TIMEOUT)
 }
 
 /// The `model` scope's identity (also the card callback's `level`).
@@ -827,6 +832,11 @@ mod tests {
     /// full config timeout.
     #[test]
     fn a_callback_budget_slices_the_config_read_and_leaves_a_margin() {
+        assert_eq!(
+            callback_read_slice(Some(Duration::from_secs(2))),
+            Some(Duration::from_millis(600))
+        );
+        assert_eq!(callback_read_slice(None), None);
         assert_eq!(
             config_read_timeout(Some(Duration::from_secs(2))),
             Duration::from_millis(600)
