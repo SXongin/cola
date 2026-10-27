@@ -261,10 +261,12 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   keeps Codex's protected paths (`.git`, `.agents`, `.codex`, `.aws`) read-only
   and its command network restricted, so it does not unblock a commit or `gh`.
   `approval_policy` takes `untrusted`, `on-request` or `never`. The trade-off is
-  real: with no sandbox there is nothing to approve, so **permission cards stop
-  arriving for that session**, and everything it runs has the daemon user's
-  access (running cola as root means the thread can write wherever root can).
-  `apply_on_adopt`
+  real: `danger-full-access` raises no sandbox approval — there is no sandbox to
+  escape — so even with `on-request` **permission cards stop arriving for that
+  session**, and everything it runs has the daemon user's access (running cola as
+  root means the thread can write wherever root can). `approval_policy = "never"`
+  suppresses the cards as well, whatever the sandbox; a sandboxed client keeps
+  its write and network restrictions. `apply_on_adopt`
   (default `false`) extends the pair to `thread/resume`: a resumed thread may be
   shared with your TUI/VSCode, so cola only adopts, never reconfigures, unless
   you opt in. Unset keys send nothing and the daemon's own default applies;

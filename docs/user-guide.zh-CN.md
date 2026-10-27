@@ -192,9 +192,11 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `read-only`；`workspace-write` 会保留 Codex 的受保护路径（`.git`、`.agents`、
   `.codex`、`.aws`）只读，且其命令网络受限，所以它并不能让 `git commit` 或
   `gh` 变得可用。`approval_policy` 取 `untrusted`、`on-request` 或 `never`。
-  代价是真实的：没有沙箱就没有可批准的东西，所以**该会话不再收到权限卡片**，
-  而且它运行的一切都拥有守护进程用户的权限（以 root 运行 cola 时，线程就能
-  写 root 能写的任何位置）。`apply_on_adopt`（默认 `false`）把这一对也带到
+  代价是真实的：`danger-full-access` 没有可逃逸的沙箱，所以即使
+  `approval_policy` 是 `on-request`，**该会话也不再收到权限卡片**——它运行的
+  一切拥有守护进程用户的权限（以 root 运行 cola 时，线程就能写 root 能写的
+  任何位置）。`approval_policy = "never"` 同样会抑制卡片，与沙箱无关；带沙箱
+  的客户端仍保留写入与网络限制。`apply_on_adopt`（默认 `false`）把这一对也带到
   `thread/resume`：被接管的线程可能与你的 TUI/VSCode 共享，所以除非你显式
   选择，cola 只接管、从不重新配置。未设置的键不发送任何字段，由守护进程自己
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
