@@ -811,8 +811,11 @@ pub(super) async fn flush_card_locked(
                                     {
                                         // The tracked card keeps its last
                                         // delivered body; the chain continues
-                                        // from after the refused slice.
-                                        release_spent(cards, session_id).await;
+                                        // from after the refused slice. Do NOT
+                                        // release its record here: the
+                                        // continuation create re-points it, and
+                                        // a crash before that must leave the
+                                        // reap a card to reconcile.
                                         card_is_live = false;
                                         continue;
                                     }
@@ -1053,7 +1056,10 @@ pub(super) async fn flush_card_locked(
                                 "Card content fallback: fenced retry refused too (Fenced -> Suspended); abandoning finalized slice {slice_from}..{} for {session_id}",
                                 finalized.end
                             );
-                            release_spent(cards, session_id).await;
+                            // Do NOT release the record before the abandonment
+                            // is secured: if the slice grew in flight the
+                            // check below declines it, and a released record
+                            // would leave the reap nothing to reconcile.
                             if matches!(split_policy, SplitPolicy::Allow)
                                 && abandon_rejected_payload(
                                     cards,
@@ -1064,6 +1070,9 @@ pub(super) async fn flush_card_locked(
                                 )
                                 .await
                             {
+                                // The continuation create re-points the record;
+                                // a crash before it leaves the old card's
+                                // record intact.
                                 continue;
                             }
                             // Nothing to skip (the shell itself, or a slice
@@ -1077,6 +1086,7 @@ pub(super) async fn flush_card_locked(
                                     card.acc.restore_render_boundary(slice_from, finalized.end);
                                 }
                             }
+                            release_spent(cards, session_id).await;
                             cards
                                 .card_handles
                                 .lock()
@@ -1711,6 +1721,62 @@ mod tests {
             !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
             "a refused finalized prefix never suspends the turn's card"
         );
+    }
+
+    /// The refused prefix's record survives until the continuation create
+    /// re-points it (issue #886 review): a crash or a declined abandonment
+    /// between the two must leave the reap a card to reconcile.
+    #[tokio::test]
+    async fn a_refused_prefix_keeps_its_record_until_the_continuation_lands() {
+        let (app, platform) = app_with_session().await;
+        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
+        let slice = |i: usize| format!("【S{i:02}】{}", "长".repeat(max - 5));
+        let mut acc = StreamAccumulator::new("回合");
+        acc.set_card_state(CardState::Streaming);
+        acc.push_text(&slice(0));
+        acc.push_text(&slice(1));
+        acc.set_reply_target(Some("msg_1".into()));
+        acc.set_cola_message_id("msg_1");
+        app.cards
+            .lock()
+            .await
+            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+        app.inflight.lock().await.insert("ses_test".to_string());
+        app.cards_handle().chains.track(
+            "ses_test",
+            "om_live",
+            crate::backend::MessageId::new("msg_1"),
+            Some(1_000),
+            Some("/work"),
+            None,
+        );
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let (entered, release) = platform.pause("reply", "msg_1");
+
+        let flush = tokio::spawn({
+            let cards = app.cards_handle();
+            async move { Turn::flush_card(&cards, "ses_test").await }
+        });
+        entered.notified().await;
+        // The old card's record is still there while the continuation create is
+        // parked: the abandon did not release it.
+        let record = app
+            .cards_handle()
+            .chains
+            .get("ses_test")
+            .expect("the refused prefix keeps its record until the create lands");
+        assert_eq!(record.card_message_id, "om_live");
+
+        release.notify_one();
+        flush.await.unwrap();
+        let record = app
+            .cards_handle()
+            .chains
+            .get("ses_test")
+            .expect("the continuation re-points the record");
+        assert_eq!(record.card_message_id, "msg_reply");
     }
 
     /// The continuation `reply_card` can be rejected too: its retry re-renders the
