@@ -2608,20 +2608,80 @@ fn input_path(obj: &serde_json::Map<String, serde_json::Value>) -> Option<&str> 
 /// a foreign tool that merely shares the id still renders as itself — the same
 /// gate [`ToolPanel::is_code_mode`] puts on `execute`.
 pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
-    let has = |key: &str| {
-        tool.input()
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|input| input.contains_key(key))
-    };
     match tool.name() {
-        // The full adapter-written shape, not just one key: a foreign tool that
-        // shares a key still falls through, and the `codex/` namespace already
-        // keeps its raw item kind apart from a third-party id.
-        "codex/command_execution" if has("command") && has("cwd") => "命令",
-        "codex/file_change" if has("changes") => "文件修改",
-        "codex/web_search" if has("query") && has("action") => "网页搜索",
-        "codex/image" if has("path") => "图片",
+        // The **whole** adapter-written shape, not one key: ADR-0042's
+        // amendment requires the exact `{…}` shape cola's adapter writes, and
+        // the `codex/` namespace already keeps its ids apart from a third
+        // party's.
+        "codex/command_execution" if command_execution_shape(tool.input()) => "命令",
+        "codex/file_change" if file_change_shape(tool.input()) => "文件修改",
+        "codex/web_search" if web_search_shape(tool.input()) => "网页搜索",
+        "codex/image" if image_shape(tool.input()) => "图片",
         other => other,
+    }
+}
+
+/// The input shape cola's Codex adapter writes for `commandExecution`:
+/// `{command: string, cwd: string}`.
+fn command_execution_shape(input: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    obj.get("command").and_then(serde_json::Value::as_str).is_some()
+        && obj.get("cwd").and_then(serde_json::Value::as_str).is_some()
+}
+
+/// `fileChange`: `{changes: [{path: string, kind: …}, …]}`. The adapter starts
+/// the item with an **empty** list and fills it through its patch-update
+/// notification, so an empty array is its shape too; every entry that is
+/// present must still carry both keys.
+fn file_change_shape(input: Option<&serde_json::Value>) -> bool {
+    input
+        .and_then(|input| input.get("changes"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|changes| {
+            changes.iter().all(|change| {
+                change
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| !path.trim().is_empty())
+                    && change.get("kind").is_some()
+            })
+        })
+}
+
+/// `webSearch`: `{query: string, action: …}` — the adapter always writes the
+/// `action` key, even when it is `null`.
+fn web_search_shape(input: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = input.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    obj.get("query").and_then(serde_json::Value::as_str).is_some() && obj.contains_key("action")
+}
+
+/// `imageView`: `{path: string | null}`.
+fn image_shape(input: Option<&serde_json::Value>) -> bool {
+    input
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|obj| obj.contains_key("path"))
+}
+
+/// Wrap `text` in an inline code span whose delimiter is longer than any
+/// backtick run inside it, so a command or path containing backticks cannot
+/// close the span (Markdown's own rule). Content that starts or ends with a
+/// backtick takes one padding space on each side, or the delimiter merges with
+/// the content.
+fn inline_code(text: &str) -> String {
+    let longest = text
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    if text.starts_with('`') || text.ends_with('`') {
+        format!("{fence} {text} {fence}")
+    } else {
+        format!("{fence}{text}{fence}")
     }
 }
 
@@ -2642,7 +2702,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         "bash" | "shell" | "codex/command_execution" => {
             let mut s = String::new();
             if let Some(cmd) = get("command") {
-                s.push_str(&format!("`{}`", cmd));
+                s.push_str(&inline_code(cmd));
             }
             if let Some(dir) = get("workdir").or_else(|| get("cwd")) {
                 s.push_str(&format!("\n📁 `{}`", dir));
@@ -2734,15 +2794,15 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                                 .get("path")
                                 .and_then(|path| path.as_str())
                                 .filter(|path| !path.trim().is_empty())
-                                .map(|path| path.replace('`', "'"))
+                                .map(str::to_string)
                         })
                         .collect()
                 });
             match paths.as_deref() {
                 None | Some([]) => generic_tool_input(obj),
-                Some([only]) => format!("📄 `{only}`"),
+                Some([only]) => format!("📄 {}", inline_code(only)),
                 Some([first, rest @ ..]) => {
-                    format!("📄 `{first}` 等 {} 个文件", rest.len() + 1)
+                    format!("📄 {} 等 {} 个文件", inline_code(first), rest.len() + 1)
                 }
             }
         }
@@ -2750,7 +2810,7 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         // no preview body to fold, so the panel only names it — with the same
         // backtick flattening as a file change's path.
         "codex/image" => match get("path").filter(|path| !path.trim().is_empty()) {
-            Some(path) => format!("🖼 `{}`", path.replace('`', "'")),
+            Some(path) => format!("🖼 {}", inline_code(path)),
             None => generic_tool_input(obj),
         },
         "execute" => match get("code") {
@@ -7292,7 +7352,10 @@ Index: /a/one.rs
             "✅ 命令"
         );
         assert_eq!(
-            title("codex/file_change", json!({"changes": [{"path": "a.rs"}]})),
+            title(
+                "codex/file_change",
+                json!({"changes": [{"path": "a.rs", "kind": {"type": "update"}}]})
+            ),
             "✅ 文件修改"
         );
         assert_eq!(
@@ -7318,6 +7381,16 @@ Index: /a/one.rs
             "✅ codex/web_search",
             "the adapter always writes `action`; a partial shape stays raw"
         );
+        assert_eq!(
+            title("codex/file_change", json!({"changes": []})),
+            "✅ 文件修改",
+            "the adapter's start shape is an empty change list"
+        );
+        assert_eq!(
+            title("codex/file_change", json!({"changes": [{"path": "a.rs"}]})),
+            "✅ codex/file_change",
+            "an entry without `kind` is not the adapter's shape"
+        );
         // An OpenCode built-in keeps its own id.
         assert_eq!(title("bash", json!({"command": "ls"})), "✅ bash");
         // An MCP tool's own `server/tool` name is never remapped.
@@ -7337,6 +7410,15 @@ Index: /a/one.rs
                 &json!({"command": "/usr/bin/zsh -lc 'echo hi'", "cwd": "/work/cola"})
             ),
             "`/usr/bin/zsh -lc 'echo hi'`\n📁 `/work/cola`"
+        );
+        // A command may itself carry backticks: the inline span grows past the
+        // longest run, so the command cannot close it early.
+        assert_eq!(
+            format_tool_input(
+                "codex/command_execution",
+                &json!({"command": "echo `pwd`", "cwd": "/work/cola"})
+            ),
+            "`` echo `pwd` ``\n📁 `/work/cola`"
         );
     }
 
@@ -7378,7 +7460,7 @@ Index: /a/one.rs
         // A backtick in a path cannot escape the inline span it names.
         assert_eq!(
             format_tool_input("codex/file_change", &json!({"changes": [{"path": "a`b.rs"}]})),
-            "📄 `a'b.rs`"
+            "📄 ``a`b.rs``"
         );
     }
 
@@ -7388,7 +7470,7 @@ Index: /a/one.rs
     fn codex_image_input_names_its_file() {
         assert_eq!(
             format_tool_input("codex/image", &json!({"path": "/w/shot `1`.png"})),
-            "🖼 `/w/shot '1'.png`"
+            "🖼 ``/w/shot `1`.png``"
         );
         assert!(
             format_tool_input("codex/image", &json!({"path": "  "})).starts_with("- path:"),
