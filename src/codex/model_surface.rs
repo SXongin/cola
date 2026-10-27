@@ -92,13 +92,28 @@ const MODEL_PROVIDER: &str = "codex";
 
 /// One configured provider's probe-relevant fields. The bearer token is the
 /// only secret here; nothing else in this module formats it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredProvider {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) base_url: Option<String>,
     pub(crate) token: Option<String>,
     pub(crate) env_key: Option<String>,
+}
+
+/// The token is redacted, so a `{:?}` of a config (or a provider) can never
+/// print a credential into a panic, a debug log or a test artefact.
+impl std::fmt::Debug for ConfiguredProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfiguredProvider")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("env_key", &self.env_key)
+            .finish()
+    }
 }
 
 /// One `[profiles.<name>]` preset. Only `model` + `model_provider` are read:
@@ -1102,7 +1117,19 @@ mod tests {
         assert!(current.display_label().contains("env_key"));
         assert_eq!(current.callback_value(), "opencode-go");
 
-        // The token never reaches any surface field.
+        // The token never reaches any surface field, a card, or a `{:?}`.
+        assert!(
+            !format!("{config:?}").contains(TOKEN),
+            "the token leaked into a config debug: {config:?}"
+        );
+        assert!(
+            !format!("{:?}", config.providers[0]).contains(TOKEN),
+            "the token leaked into a provider debug"
+        );
+        assert!(
+            format!("{:?}", config.providers[0]).contains("<redacted>"),
+            "the provider debug redacts the token"
+        );
         let rendered = format!(
             "{:?}{:?}",
             surface
