@@ -84,7 +84,7 @@ pub(crate) struct Projections {
     /// `turn/start` of a pick. The projection drops a fact older than the one it
     /// holds, so a read in flight across a newer fact cannot resurrect a stale
     /// name.
-    model_seq: std::sync::atomic::AtomicU64,
+    model_stamps: std::sync::atomic::AtomicU64,
     states: Mutex<HashMap<String, SubscriptionState>>,
     /// One adoption lock per thread. Two concurrent reads of the same new
     /// thread must not both send `thread/resume`, but an unrelated thread (a
@@ -485,44 +485,51 @@ impl Projections {
     /// directory (skill resolution) and the model it runs with (the card
     /// footer's only per-message fact, issue #904). One call so a new thread
     /// fact cannot be forgotten at one of the sites that read a thread.
-    pub(crate) fn remember_thread_metadata(&self, thread: &Thread, observed_at: u64) {
+    pub(crate) fn remember_thread_metadata(&self, thread: &Thread, observed: u64) {
         self.set_cwd(&thread.id, &thread.cwd);
         // The projection decides what silence means (a name the server itself
         // gave is dropped; a model cola sent survives an omitted field), and
         // which of two answers is the newer one.
-        self.observe_thread_model(&thread.id, thread_model(thread), observed_at);
+        self.observe_thread_model(&thread.id, thread_model(thread), observed);
     }
 
     /// The stamp a read takes **before** it asks the server, so its answer can
     /// be ordered against a pick accepted while it was in flight (issue #904).
-    pub(crate) fn next_model_seq(&self) -> u64 {
-        self.model_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    pub(crate) fn next_model_stamp(&self) -> u64 {
+        self.model_stamps
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     /// Apply the model a thread read reported, including its silence: the
     /// projection owns what silence may clear (see
     /// [`ThreadProjection::observe_thread_model`]), and drops an answer an
     /// older read produced than the fact it already holds.
-    pub(crate) fn observe_thread_model(
-        &self,
-        thread_id: &str,
-        model: Option<ModelIdentity>,
-        observed_at: u64,
-    ) {
+    pub(crate) fn observe_thread_model(&self, thread_id: &str, model: Option<ModelIdentity>, observed: u64) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .observe_thread_model(model, observed_at);
+            .observe_thread_model(model, observed);
     }
 
     /// Record the model cola's own accepted `turn/start` sent: it is "for this
     /// turn and subsequent turns", so the thread now runs it — without this the
     /// footer would keep naming the model from before the pick.
-    pub(crate) fn record_sent_model(&self, thread_id: &str, model: ModelIdentity, sent_at: u64) {
+    pub(crate) fn record_sent_model(&self, thread_id: &str, model: ModelIdentity, sent: u64) {
         self.projection(thread_id)
             .lock()
             .expect("codex projection")
-            .record_sent_model(model, sent_at);
+            .record_sent_model(model, sent);
+    }
+
+    /// The model the ordered store holds for a thread (issue #904), which is
+    /// what both surfaces must report: a read whose answer an accepted pick
+    /// superseded is not shown, even to the caller that made the read.
+    pub(crate) fn model(&self, thread_id: &str) -> Option<ModelIdentity> {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .model()
     }
 
     pub(crate) fn cwd(&self, thread_id: &str) -> Option<String> {
@@ -1021,9 +1028,9 @@ async fn run_thread(
     // The model the resume reports describes the thread as it was when the
     // read started; stamp it BEFORE asking so an accepted pick cannot be
     // overwritten by an answer that was already in flight (issue #904).
-    let observed_at = projections
+    let observed = projections
         .upgrade()
-        .map(|cache| cache.next_model_seq())
+        .map(|cache| cache.next_model_stamp())
         .unwrap_or_default();
     let subscription = match threads.adopt(&thread_id).await {
         Ok(Adoption::Subscribed(subscription)) => *subscription,
@@ -1055,7 +1062,7 @@ async fn run_thread(
         let Some(cache) = projections.upgrade() else {
             return;
         };
-        cache.remember_thread_metadata(subscription.thread(), observed_at);
+        cache.remember_thread_metadata(subscription.thread(), observed);
     }
     // Every status this connection had already received when the history
     // request starts is superseded by the page; a status received after this
@@ -1544,9 +1551,9 @@ impl Backend for CodexClient {
             .as_ref()
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
-        let observed_at = self.projections.next_model_seq();
+        let observed_stamp = self.projections.next_model_stamp();
         let thread = self.threads().start(cwd).await.map_err(client_error)?;
-        self.projections.remember_thread_metadata(&thread, observed_at);
+        self.projections.remember_thread_metadata(&thread, observed_stamp);
         Ok(Session {
             id: thread.id.clone(),
             project_id: None,
@@ -1621,9 +1628,9 @@ impl Backend for CodexClient {
         // before its first read). A failed read leaves the directory unknown,
         // and a skill is then refused rather than taken from another project.
         if !skills.is_empty() && self.projections.cwd(session_id).is_none() {
-            let observed_at = self.projections.next_model_seq();
+            let observed_stamp = self.projections.next_model_stamp();
             match tokio::time::timeout(SKILL_CWD_READ_TIMEOUT, self.threads().read(session_id, false)).await {
-                Ok(Ok(thread)) => self.projections.remember_thread_metadata(&thread, observed_at),
+                Ok(Ok(thread)) => self.projections.remember_thread_metadata(&thread, observed_stamp),
                 Ok(Err(error)) => {
                     return Err(BridgeError::Client {
                         client: "codex",
@@ -1705,14 +1712,24 @@ impl Backend for CodexClient {
         // response is the acceptance this waits for — a refused turn/start
         // changed nothing.
         if let Some(model) = model {
+            // The pick's provider is the neutral `codex` bucket when it came from
+            // the picker, and a model pick does not change the thread's provider
+            // (`model_provider` is configuration, not part of `turn/start`). A
+            // provider the thread already named is the honest label to show —
+            // the footer must not claim `codex/<model>` for a custom provider.
+            let provider_id = self
+                .projections
+                .model(session_id)
+                .map(|held| held.provider_id)
+                .unwrap_or_else(|| model.provider_id.clone());
             self.projections.record_sent_model(
                 session_id,
                 ModelIdentity {
-                    provider_id: model.provider_id.clone(),
+                    provider_id,
                     model_id: model.id.clone(),
                     variant: None,
                 },
-                self.projections.next_model_seq(),
+                self.projections.next_model_stamp(),
             );
         }
         Ok(())
@@ -2052,7 +2069,7 @@ impl Backend for CodexClient {
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
-        let observed_at = self.projections.next_model_seq();
+        let observed_stamp = self.projections.next_model_stamp();
         let thread = self
             .threads()
             .read(session_id, false)
@@ -2061,9 +2078,12 @@ impl Backend for CodexClient {
         // The read is the freshest model fact cola has (a peer client may have
         // switched it), so the footer's projection learns it too — the same
         // read serves both surfaces (issue #904). Its stamp was taken before the
-        // request, so a pick accepted while it was in flight still wins.
-        self.projections.remember_thread_metadata(&thread, observed_at);
-        let model = thread_model(&thread).map(|model| SessionModel {
+        // request, so a pick accepted while it was in flight still wins; the
+        // answer therefore comes from the ordered store, never from this
+        // response alone (the picker must not show a name the picker's own pick
+        // superseded).
+        self.projections.remember_thread_metadata(&thread, observed_stamp);
+        let model = self.projections.model(session_id).map(|model| SessionModel {
             provider_id: model.provider_id,
             id: model.model_id,
         });
@@ -2981,7 +3001,12 @@ mod tests {
             .session_info("thread-1", Some("/work/cola"))
             .await
             .expect("the session read");
-        assert!(info.model.is_none(), "the read itself names nothing");
+        assert_eq!(
+            info.model.map(|model| model.id),
+            Some("gpt-5.5".to_string()),
+            "the picker line reads the same ordered store: cola's pick stands \
+             while the wire names nothing"
+        );
 
         let transcript = client.transcript("thread-1").await.expect("the read");
         let answering = transcript
@@ -2995,6 +3020,63 @@ mod tests {
             Some("gpt-5.5"),
             "an omitted field must not erase the model cola sent"
         );
+    }
+
+    /// A picker pick carries the neutral `codex` bucket as its provider (that
+    /// is the reference cola sends back), but a model pick does not move the
+    /// thread's `model_provider`. The footer must keep naming the real provider
+    /// the thread reported, not claim `codex/<model>` for a custom one.
+    #[tokio::test]
+    async fn a_neutral_picker_value_keeps_the_threads_real_provider() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.push_item("thread-1", "item-1", "one");
+        wait_for_text(&client, "thread-1", "one").await;
+
+        // Exactly what the picker's button value parses to: the neutral bucket.
+        let pick = ModelInfo {
+            id: "gpt-5.5".into(),
+            provider_id: "codex".into(),
+            variant: None,
+        };
+        client
+            .prompt("thread-1", "run it", &[], &[], Some(&pick), None, None, None)
+            .await
+            .expect("the prompt");
+
+        // The projection, not a fresh thread read: a read answers with what the
+        // server currently reports, which the scripted server does not apply.
+        let transcript = client.transcript("thread-1").await.expect("the read");
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the assistant item");
+        let model = answering.model.as_ref().expect("the picked model");
+        assert_eq!(model.model_id, "gpt-5.5");
+        assert_eq!(
+            model.provider_id, "opencode-go",
+            "the footer keeps the thread's real provider"
+        );
+
+        // Once the server reflects the pick (it does: the override is "for this
+        // turn and subsequent turns"), `/model`'s line names it too.
+        server.set_thread_model("thread-1", Some("gpt-5.5"), Some("opencode-go"));
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        let model = info.model.expect("the session's model");
+        assert_eq!(model.id, "gpt-5.5");
+        assert_eq!(model.provider_id, "opencode-go");
     }
 
     /// A bounded `thread/resume` page is never presented as the whole history:
