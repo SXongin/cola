@@ -1911,13 +1911,15 @@ mod tests {
         }
     }
 
-    /// A receipt is a one-line residue: a long question is clipped at the
-    /// receipt budget, while the answered prefix stays.
+    /// A receipt is a one-line residue: a genuinely over-budget set of answers
+    /// is clipped at the receipt budget, while the answered prefix stays.
     #[test]
     fn a_question_receipt_clips_at_the_receipt_budget() {
-        let question = crate::backend::types::QuestionInfo {
-            key: "q".into(),
-            question: "哪".repeat(400),
+        let question = |index: usize| crate::backend::types::QuestionInfo {
+            key: format!("q{index}"),
+            // 40 characters is the per-question label budget; three of them
+            // plus the answers and separators exceed the 120-char receipt.
+            question: "哪".repeat(40),
             header: "选择".into(),
             options: vec![crate::backend::types::QuestionOption {
                 value: "a".into(),
@@ -1926,9 +1928,15 @@ mod tests {
             }],
             ..Default::default()
         };
-        let receipt = question_receipt(&[question], &[Some(vec!["a".to_string()])]);
+        let questions: Vec<_> = (0..3).map(question).collect();
+        let answers: Vec<_> = (0..3).map(|_| Some(vec!["a".to_string()])).collect();
+        let receipt = question_receipt(&questions, &answers);
         assert!(
-            receipt.chars().count() <= RECEIPT_MAX_CHARS,
+            receipt.ends_with('…'),
+            "an over-budget receipt must be clipped: {receipt}"
+        );
+        assert!(
+            receipt.chars().count() <= RECEIPT_MAX_CHARS + 1,
             "receipt over its budget ({}): {receipt}",
             receipt.chars().count()
         );

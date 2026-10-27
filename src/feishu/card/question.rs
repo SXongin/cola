@@ -188,13 +188,21 @@ pub(crate) fn question_label(question: &crate::backend::types::QuestionInfo, max
         &question.question
     };
     // A receipt is built on a card callback, which must stay cheap and
-    // bounded: cap the scan before flattening, so a model-sized question never
-    // walks its whole body for a one-line residue. `max_chars * 4` leaves room
-    // for whitespace runs that collapse away.
-    let capped: String = text.chars().take(max_chars.saturating_mul(4)).collect();
+    // bounded: skip leading whitespace and cap the scan before flattening, so
+    // a model-sized question never walks its whole body for a one-line residue.
+    // `max_chars * 4` leaves room for whitespace runs that collapse away.
+    let trimmed = text.trim_start();
+    let capped: String = trimmed.chars().take(max_chars.saturating_mul(4)).collect();
     let flattened = capped.split_whitespace().collect::<Vec<_>>().join(" ");
     let safe = flattened.replace('`', "'");
-    super::truncate_md(&safe, max_chars)
+    let label = super::truncate_md(&safe, max_chars);
+    if label.is_empty() {
+        // Only whitespace inside the capped window: the header is still a
+        // usable one-word target.
+        super::truncate_md(&question.header, max_chars)
+    } else {
+        label
+    }
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.
@@ -1679,5 +1687,9 @@ mod tests {
             "the label must stay clipped: {}",
             clipped.chars().count()
         );
+        // Leading whitespace must not consume the whole capped window and
+        // leave the receipt with no question at all.
+        let padded = question_label(&question(&format!("{}  问什么？", " ".repeat(400)), "选择"), 40);
+        assert_eq!(padded, "问什么？");
     }
 }
