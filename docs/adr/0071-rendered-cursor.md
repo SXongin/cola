@@ -603,6 +603,9 @@ Two guards keep the exception narrow:
   the next flush.
 
 The `Forbid` ledger refresh (ADR-0060) keeps the old latch: it must never post
-a new card, so it cannot abandon a slice.
+a new card, so it cannot abandon a slice. The yielded card's SETTLEMENT is a
+true ending rather than a ledger update, so it uses the normal split policy and
+may continue on a new card — otherwise a suspended yielded card's ending and
+completion notice could never land.
 
 Related: #886, ADR-0060, ADR-0069, ADR-0072.
