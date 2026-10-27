@@ -520,19 +520,16 @@ async fn a_permanently_rejected_write_advances_nothing() {
     ];
     let (_dir, app, _backend, platform) =
         scripted_app(vec![SessionTranscript::new(timeline)], Some(SessionStatus::Busy)).await;
-    // The plain attempt and its fenced retry are both refused: the card is
-    // suspended and no later write will ever carry the text.
-    platform
-        .fail_update_card_content_count
-        .store(100, Ordering::SeqCst);
+    // Every write is permanently refused (a semantic refusal, not a content
+    // rejection): no later write can ever carry the text.
+    platform.fail_update_count.store(100, Ordering::SeqCst);
 
     // The merged drain keeps the turn running on its own task; the test
     // inspects the refused write's tombstone while it runs.
     let _turn = spawn_turn(&app, ctx("ses_test", "第一条消息"));
     // The loading card is the recorded card (`msg_reply` is the recording
-    // platform's create id), and its content update gets the plain rejection
-    // and the fenced retry: both refused.
-    wait_for_update_attempts(&platform, "msg_reply", 2).await;
+    // platform's create id); its content update is refused.
+    wait_for_update_attempts(&platform, "msg_reply", 1).await;
     assert!(
         !app.core.feishu.has_pending_card_update("msg_reply"),
         "a refused write leaves only a tombstone"
