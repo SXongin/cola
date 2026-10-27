@@ -702,11 +702,17 @@ pub(crate) async fn send_model_card(
 
 /// Read one page of the client-declared `/model` surface. `scope`/`selected`
 /// name the drill-down (OpenCode: the `provider` scope and the provider id the
-/// user tapped); both are `None` for the root page. The current model comes
-/// from the effective-model ladder (the session's durable selection on V2,
-/// else the settings override → configured default → server-recorded) and is
-/// handed to the backend with the session context, so the card's current line
-/// and its scopes have one source.
+/// user tapped); both are `None` for the root page.
+///
+/// `current` is resolved **only for the root page**. The running selection is
+/// a root-page fact for every client we have: OpenCode never rendered it on its
+/// model page (its drilled surface omits it) and Codex has no drill-down. It is
+/// also a budget rule, not just an unused value: resolving it walks the
+/// effective-model ladder, whose server-recorded rung can take
+/// `SESSION_INFO_TIMEOUT` (3s) — longer than the card-ack budget (2s) — so a
+/// provider click that also resolved it could have its card update arrive too
+/// late and be dropped. A drilled page only needs the catalog, exactly as the
+/// hand-built flow did.
 pub(crate) async fn model_surface(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
@@ -715,7 +721,7 @@ pub(crate) async fn model_surface(
 ) -> crate::backend::types::ModelSurface {
     let settings = handles.flow.sessions.session_settings(thread_key).await;
     let current = match &settings {
-        Some(settings) => handles
+        Some(settings) if scope.is_none() => handles
             .flow
             .sessions
             .effective_selection(&handles.flow.backend, settings)
@@ -731,7 +737,9 @@ pub(crate) async fn model_surface(
                     reference: format!("{}/{}", model.provider_id, model.id),
                 }
             }),
-        None => None,
+        // A drilled page (`scope.is_some()`) or a thread with no target has no
+        // current line to resolve.
+        _ => None,
     };
     let session_id = settings.as_ref().and_then(|s| s.session_id.as_deref());
     let directory = settings
