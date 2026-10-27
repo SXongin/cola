@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::state::CardFallback;
+use super::state::{CardFallback, SliceFingerprint};
 use super::wake::record_landed_rendered;
 use super::{MAX_CARD_CHAIN, SplitKind, Turn};
 
@@ -59,7 +59,8 @@ fn count_card_components(value: &serde_json::Value) -> usize {
 
 /// Log a rejected payload with the facts the next diagnosis needs (issue
 /// #886): the transition, the exact size and component count, and the slice.
-fn log_card_rejection(
+async fn log_card_rejection(
+    cards: &CardsHandle,
     session_id: &str,
     error: &crate::error::BridgeError,
     transition: &str,
@@ -68,8 +69,12 @@ fn log_card_rejection(
     to: usize,
 ) {
     let (bytes, components) = card_payload_metrics(card);
+    let fallback = {
+        let live = cards.cards.lock().await;
+        live.get(session_id).map(|card| card.acc.card_fallback())
+    };
     tracing::warn!(
-        "Card update failed: {error} ({transition}; session {session_id}; {bytes} bytes, {components} components, slice {from}..{to})"
+        "Card update failed: {error} ({transition}; fallback {fallback:?}; session {session_id}; {bytes} bytes, {components} components, slice {from}..{to})"
     );
 }
 
@@ -88,11 +93,22 @@ async fn abandon_rejected_payload(
     session_id: &str,
     slice_from: usize,
     slice_end: usize,
+    expected: SliceFingerprint,
 ) -> bool {
     let mut live = cards.cards.lock().await;
     let Some(card) = live.get_mut(session_id) else {
         return false;
     };
+    // A streaming text/reasoning part merges into an EXISTING entry, so the
+    // slice can grow while the write is in flight without `timeline_len`
+    // changing. Skipping it then would drop content Feishu never saw: keep the
+    // slice for the next flush instead, which re-renders (and attempts) it.
+    if card.acc.slice_fingerprint(slice_from, slice_end) != expected {
+        tracing::warn!(
+            "Card content fallback: the refused slice grew in flight; retrying it on the next flush (session {session_id})"
+        );
+        return false;
+    }
     let dropped = slice_end > slice_from;
     let newer = card.acc.timeline_len() > slice_end;
     if !dropped && !newer {
@@ -733,13 +749,15 @@ pub(super) async fn flush_card_locked(
                     }
                     Err(e) => {
                         log_card_rejection(
+                            cards,
                             session_id,
                             &e,
-                            "update refused",
+                            "update refused; fallback None/Fenced -> Fenced/Suspended",
                             &built.card,
                             slice_from,
                             built.end,
-                        );
+                        )
+                        .await;
                         if is_card_content_rejected(&e) {
                             match advance_card_fallback(cards, session_id).await {
                                 // Feishu refused the content: rebuild the SAME
@@ -773,12 +791,18 @@ pub(super) async fn flush_card_locked(
                                     )
                                     .await;
                                     tracing::warn!(
-                                        "Card content fallback: fenced retry refused too; abandoning slice {slice_from}..{} for {session_id}",
+                                        "Card content fallback: fenced retry refused too (Fenced -> Suspended); abandoning slice {slice_from}..{} for {session_id}",
                                         built.end
                                     );
                                     if matches!(split_policy, SplitPolicy::Allow)
-                                        && abandon_rejected_payload(cards, session_id, slice_from, built.end)
-                                            .await
+                                        && abandon_rejected_payload(
+                                            cards,
+                                            session_id,
+                                            slice_from,
+                                            built.end,
+                                            built.slice,
+                                        )
+                                        .await
                                     {
                                         // The tracked card keeps its last
                                         // delivered body; the chain continues
@@ -966,13 +990,15 @@ pub(super) async fn flush_card_locked(
                     }
                     Err(e) => {
                         log_card_rejection(
+                            cards,
                             session_id,
                             &e,
-                            "finalized update refused",
+                            "finalized update refused; fallback None/Fenced -> Fenced/Suspended",
                             &finalized.card,
                             slice_from,
                             finalized.end,
-                        );
+                        )
+                        .await;
                         if is_card_content_rejected(&e) {
                             if matches!(
                                 advance_card_fallback(cards, session_id).await,
@@ -1014,18 +1040,33 @@ pub(super) async fn flush_card_locked(
                             )
                             .await;
                             tracing::warn!(
-                                "Card content fallback: fenced retry refused too; abandoning finalized slice {slice_from}..{} for {session_id}",
+                                "Card content fallback: fenced retry refused too (Fenced -> Suspended); abandoning finalized slice {slice_from}..{} for {session_id}",
                                 finalized.end
                             );
                             release_spent(cards, session_id).await;
                             if matches!(split_policy, SplitPolicy::Allow)
-                                && abandon_rejected_payload(cards, session_id, slice_from, finalized.end)
-                                    .await
+                                && abandon_rejected_payload(
+                                    cards,
+                                    session_id,
+                                    slice_from,
+                                    finalized.end,
+                                    finalized.slice,
+                                )
+                                .await
                             {
                                 continue;
                             }
-                            // Nothing to skip: the card shell itself was
-                            // refused. Keep the conservative refusal.
+                            // Nothing to skip (the shell itself, or a slice
+                            // that grew while the write was in flight). Keep
+                            // the conservative refusal, and REWIND the
+                            // boundary the finalized build advanced: the next
+                            // flush must re-render what no card ever received.
+                            {
+                                let mut live = cards.cards.lock().await;
+                                if let Some(card) = live.get_mut(session_id) {
+                                    card.acc.restore_render_boundary(slice_from, finalized.end);
+                                }
+                            }
                             cards
                                 .card_handles
                                 .lock()
@@ -1231,13 +1272,15 @@ pub(super) async fn flush_card_locked(
             }
             Err(e) => {
                 log_card_rejection(
+                    cards,
                     session_id,
                     &e,
-                    "continuation create refused",
+                    "continuation create refused; fallback None/Fenced -> Fenced/Suspended",
                     &built.card,
                     slice_from,
                     built.end,
-                );
+                )
+                .await;
                 // The create reached no card and is never retried: its staged
                 // cursor is dropped (a fenced retry rebuilds and re-stages).
                 note_cursor_write_failure(
@@ -1278,7 +1321,7 @@ pub(super) async fn flush_card_locked(
                 }
                 if content_rejected
                     && matches!(split_policy, SplitPolicy::Allow)
-                    && abandon_rejected_payload(cards, session_id, slice_from, built.end).await
+                    && abandon_rejected_payload(cards, session_id, slice_from, built.end, built.slice).await
                 {
                     // The fenced retry was refused too: abandon the slice and
                     // let the chain continue on the next slice's card (issue
@@ -1613,6 +1656,49 @@ mod tests {
         );
     }
 
+    /// The finalized prefix's fenced retry can be refused too (issue #886): the
+    /// chain continues on a new card with the visible marker instead of
+    /// suspending, and the second slice still follows.
+    #[tokio::test]
+    async fn a_second_rejection_of_the_finalized_update_continues_on_a_new_card() {
+        let (app, platform) = app_with_session().await;
+        let max = crate::feishu::card::MAX_CARD_TEXT_CHARS;
+        let slice = |i: usize| format!("【S{i:02}】{}", "长".repeat(max - 5));
+        let mut acc = StreamAccumulator::new("回合");
+        acc.set_card_state(CardState::Streaming);
+        acc.push_text(&slice(0));
+        acc.push_text(&slice(1));
+        acc.set_reply_target(Some("msg_1".into()));
+        app.cards
+            .lock()
+            .await
+            .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+        app.inflight.lock().await.insert("ses_test".to_string());
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        assert_eq!(
+            patches_to(&platform, "om_live").await.len(),
+            2,
+            "the finalized attempt and its fenced retry only"
+        );
+        let continuation = sent_cards(&platform)
+            .await
+            .pop()
+            .expect("the refused prefix continues on a new card");
+        assert!(
+            card_text(&continuation).contains("部分内容未能显示"),
+            "the continuation names the dropped prefix: {continuation}"
+        );
+        assert!(
+            !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+            "a refused finalized prefix never suspends the turn's card"
+        );
+    }
+
     /// The continuation `reply_card` can be rejected too: its retry re-renders the
     /// same slice fenced and lands.
     #[tokio::test]
@@ -1652,6 +1738,51 @@ mod tests {
                 .card_fallback(),
             CardFallback::None,
             "the delivered create resets the fallback for the new card (#886)"
+        );
+    }
+
+    /// The continuation create's fenced retry can be refused too (issue #886):
+    /// the slice is abandoned and the chain continues on the NEXT slice's card
+    /// with the visible marker, instead of suspending the turn.
+    #[tokio::test]
+    async fn a_second_rejection_of_the_continuation_send_continues_on_the_next_slice() {
+        let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
+        {
+            let mut cards = app.cards.lock().await;
+            let session = cards.get_mut("ses_test").unwrap();
+            session.card_is_live = false;
+            session.acc.set_reply_target(Some("msg_1".into()));
+        }
+        platform
+            .fail_reply_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+        let cards = sent_cards(&platform).await;
+        assert_eq!(
+            cards.len(),
+            3,
+            "the rejected create, its fenced retry, then the next slice: {cards:?}"
+        );
+        assert!(
+            cards[1].to_string().contains("```"),
+            "the retry fences the model markdown: {}",
+            cards[1]
+        );
+        assert!(
+            card_text(&cards[2]).contains("部分内容未能显示"),
+            "the next slice's card names the dropped content: {}",
+            cards[2]
+        );
+        assert!(
+            !card_text(&cards[2]).contains("<number_tag>"),
+            "the refused content is not re-rendered on the next card: {}",
+            cards[2]
+        );
+        assert!(
+            !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+            "a refused continuation never suspends the turn's card"
         );
     }
 
@@ -1819,6 +1950,57 @@ mod tests {
             patches_to(&platform, "om_live").await.len(),
             3,
             "a suspended card is retried, never refused forever"
+        );
+    }
+
+    /// A streaming chunk can merge into an EXISTING timeline entry while the
+    /// refused PATCH is in flight, so `timeline_len` does not change (issue
+    /// #886). The abandon must see that growth and keep the slice for the next
+    /// flush instead of skipping content Feishu never attempted.
+    #[tokio::test]
+    async fn a_slice_that_grew_in_flight_is_not_skipped() {
+        let (app, _platform) = app_with_session().await;
+        {
+            let mut acc = StreamAccumulator::new("回合");
+            acc.set_card_state(CardState::Streaming);
+            // The same part start keys both chunks, so the second MERGES into
+            // the first entry instead of adding one.
+            acc.push_text_at(Some(1_000), "回答");
+            acc.set_reply_target(Some("msg_1".into()));
+            app.cards
+                .lock()
+                .await
+                .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+        }
+        let cards = app.cards_handle();
+        let built = {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut("ses_test").unwrap();
+            card.acc.build_card_with_info()
+        };
+        {
+            let mut live = cards.cards.lock().await;
+            let card = live.get_mut("ses_test").unwrap();
+            card.acc.push_text_at(Some(1_000), " 新到的内容。");
+            assert_eq!(
+                card.acc.timeline_len(),
+                built.end,
+                "the chunk merged into the same entry"
+            );
+        }
+
+        let skipped = super::abandon_rejected_payload(&cards, "ses_test", 0, built.end, built.slice).await;
+        assert!(!skipped, "content that arrived in flight is never dropped unseen");
+        let live = cards.cards.lock().await;
+        let card = live.get("ses_test").unwrap();
+        assert_eq!(
+            card.acc.render_from(),
+            0,
+            "the boundary did not move past the grown entry"
+        );
+        assert!(
+            !card.acc.has_receipt_prefix("⚠️ 部分内容未能显示"),
+            "no abandonment marker is left when nothing was abandoned"
         );
     }
 

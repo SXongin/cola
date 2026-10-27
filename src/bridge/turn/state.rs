@@ -508,6 +508,11 @@ pub(super) struct BuiltCard {
     /// card (issue #886), so the flush never re-renders content Feishu already
     /// refused.
     pub(super) end: usize,
+    /// The CONTENT identity of `render_from..end` at build time. A streaming
+    /// part merges into an existing entry without adding one, so `timeline_len`
+    /// alone cannot tell whether the refused payload is still what the timeline
+    /// holds; the flush skips only a slice whose fingerprint is unchanged.
+    pub(super) slice: SliceFingerprint,
     pub(super) spans: Vec<crate::bridge::card_handles::BlockSpan>,
     /// The Rendered Cursor this body delivers (spec #561): the frontier of the
     /// newest text/reasoning part it renders and the tool ids whose delivered
@@ -522,6 +527,61 @@ pub(super) struct BuiltCard {
     /// split's prefix carries only its own, and the continuation carries the
     /// rest.
     pub(super) rendered_endings: Vec<EndingKey>,
+}
+
+/// A cheap content identity of the timeline slice one card body rendered
+/// (issue #886). The entry COUNT alone is not enough: a streaming text or
+/// reasoning part merges into its existing entry, so the slice can grow while
+/// `timeline_len` stays the same. The flush compares this against the refused
+/// payload's before skipping a slice, so content that arrived while the write
+/// was in flight is never dropped unseen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) struct SliceFingerprint {
+    entries: usize,
+    content: u64,
+}
+
+impl SliceFingerprint {
+    fn of(items: &[TimelineItem]) -> Self {
+        let mut content = 0u64;
+        for item in items {
+            content = content.wrapping_mul(31).wrapping_add(item.seq);
+            content = content
+                .wrapping_mul(31)
+                .wrapping_add(slice_content_len(&item.kind) as u64);
+            content = content
+                .wrapping_mul(31)
+                .wrapping_add(item.lead.as_deref().map_or(0, str::len) as u64);
+        }
+        Self {
+            entries: items.len(),
+            content,
+        }
+    }
+}
+
+/// The part of a timeline entry that can change IN PLACE while a card write is
+/// in flight: streamed text/reasoning, an updated compaction row, a receipt's
+/// line. A settled tool panel is immutable and lives in `tools`, so its entry
+/// only carries the call id.
+fn slice_content_len(kind: &TimelineKind) -> usize {
+    match kind {
+        TimelineKind::Text(text)
+        | TimelineKind::Reasoning(text)
+        | TimelineKind::Receipt(text)
+        | TimelineKind::UserMessage(text) => text.len(),
+        TimelineKind::Tool(call_id) => call_id.len(),
+        TimelineKind::LedgerEntry(entry, _) => entry.label.as_deref().map_or(0, str::len),
+        TimelineKind::Compaction(compaction) => {
+            compaction.summary.len()
+                + compaction.error.as_deref().map_or(0, str::len)
+                + match compaction.status {
+                    crate::backend::CompactionStatus::Running => 0,
+                    crate::backend::CompactionStatus::Completed => 1,
+                    crate::backend::CompactionStatus::Failed => 2,
+                }
+        }
+    }
 }
 
 /// How far ONE built card body carries the chain's pending orphan gap (spec
@@ -4178,6 +4238,7 @@ impl StreamAccumulator {
     /// interaction block's element range, for the card handle (ADR-0038,
     /// rule 2).
     pub(super) fn build_card_with_info(&mut self) -> BuiltCard {
+        let start = self.render_from;
         // The slice that fits on its own. When items remain, it must hold at
         // least one: an empty slice would leave `render_from` frozen and the
         // flush loop would re-send empty "部分完成" cards forever.
@@ -4212,6 +4273,7 @@ impl StreamAccumulator {
             card,
             full,
             end: split,
+            slice: self.slice_fingerprint(start, split),
             spans,
             cursor,
             gap,
@@ -4242,6 +4304,7 @@ impl StreamAccumulator {
             card,
             full: false,
             end,
+            slice: self.slice_fingerprint(self.render_from, end),
             spans,
             cursor,
             gap,
@@ -4273,6 +4336,7 @@ impl StreamAccumulator {
             card: built.0,
             full: false,
             end,
+            slice: self.slice_fingerprint(start, end),
             spans: built.1,
             cursor: built.2,
             gap: built.3,
@@ -4296,6 +4360,13 @@ impl StreamAccumulator {
     /// restore read it.
     pub(super) fn render_from(&self) -> usize {
         self.render_from
+    }
+
+    /// The content identity of `start..end` (issue #886): what a refused
+    /// payload's [`BuiltCard::slice`] is compared against before the flush
+    /// skips it.
+    pub(super) fn slice_fingerprint(&self, start: usize, end: usize) -> SliceFingerprint {
+        SliceFingerprint::of(&self.timeline[start..end])
     }
 
     /// Rewind the render boundary to `from` when the build still left it at
