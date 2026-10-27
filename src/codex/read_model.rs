@@ -185,11 +185,16 @@ pub(crate) enum ModelSource {
     ColaSent,
 }
 
-/// The model a thread runs with, and where that fact came from.
+/// The model a thread runs with, where that fact came from, and its position in
+/// this process's learning order (issue #904). The stamp is taken **before** the
+/// read that will learn the fact, or at the accepted `turn/start` of a pick, so
+/// a read that was in flight across a newer fact cannot resurrect the older
+/// name when its response finally lands.
 #[derive(Debug, Clone)]
 struct ModelFact {
     model: ModelIdentity,
     source: ModelSource,
+    learned_at: u64,
 }
 
 impl ThreadProjection {
@@ -220,16 +225,26 @@ impl ThreadProjection {
     /// does. The transcript stamps it onto assistant messages, so the card
     /// footer and the `/model` current-model line can name what actually ran.
     ///
-    /// A **reported** model always wins. Silence (`None` — an absent or null
-    /// field, indistinguishable on the wire) is not evidence that the model
-    /// changed, so it drops a name the server itself gave earlier — an old name
-    /// would claim the wrong model answered — but never a model cola sent: a
-    /// server that omits the field must not erase what cola just picked.
-    pub(crate) fn observe_thread_model(&mut self, model: Option<ModelIdentity>) {
+    /// A **reported** model wins over anything older. Silence (`None` — an
+    /// absent or null field, indistinguishable on the wire) is not evidence the
+    /// model changed, so it drops a name the server itself gave earlier — an old
+    /// name would claim the wrong model answered — but never a model cola sent:
+    /// a server that omits the field must not erase what cola just picked.
+    /// `observed_at` is the stamp taken **before** the read that produced this
+    /// answer, so a read the pick overtook cannot overwrite the pick.
+    pub(crate) fn observe_thread_model(&mut self, model: Option<ModelIdentity>, observed_at: u64) {
+        if self
+            .model
+            .as_ref()
+            .is_some_and(|fact| fact.learned_at > observed_at)
+        {
+            return;
+        }
         self.model = match (model, self.model.as_ref().map(|fact| fact.source)) {
             (Some(model), _) => Some(ModelFact {
                 model,
                 source: ModelSource::Thread,
+                learned_at: observed_at,
             }),
             (None, Some(ModelSource::Thread)) => None,
             (None, _) => self.model.take(),
@@ -238,12 +253,13 @@ impl ThreadProjection {
 
     /// Record the model cola itself asked for on an accepted `turn/start`: the
     /// protocol's model is "for this turn and subsequent turns", so the thread
-    /// now runs it (issue #904). A later read that names another model still
-    /// wins — a peer's switch is a newer fact.
-    pub(crate) fn record_sent_model(&mut self, model: ModelIdentity) {
+    /// now runs it (issue #904). `sent_at` is stamped at the acceptance; a read
+    /// that started later still wins, because a peer's switch is a newer fact.
+    pub(crate) fn record_sent_model(&mut self, model: ModelIdentity, sent_at: u64) {
         self.model = Some(ModelFact {
             model,
             source: ModelSource::ColaSent,
+            learned_at: sent_at,
         });
     }
 
@@ -2528,11 +2544,14 @@ mod tests {
             "a projection that was told no model must not invent one"
         );
 
-        projection.observe_thread_model(Some(ModelIdentity {
-            provider_id: "opencode-go".into(),
-            model_id: "gpt-6-luna".into(),
-            variant: None,
-        }));
+        projection.observe_thread_model(
+            Some(ModelIdentity {
+                provider_id: "opencode-go".into(),
+                model_id: "gpt-6-luna".into(),
+                variant: None,
+            }),
+            1,
+        );
         let transcript = projection.transcript();
         let mut assistants = 0;
         for message in &transcript.messages {
@@ -2552,11 +2571,11 @@ mod tests {
         assert!(assistants > 0, "the recording carries assistant messages");
     }
 
-    /// Issue #904, review round 2: what silence means depends on where the fact
-    /// came from. A name the **server** gave is dropped when a later read names
-    /// none (a stale name would claim the wrong model answered); a model cola
-    /// **sent** on an accepted `turn/start` survives an omitted field, because
-    /// silence cannot contradict it. A reported model always wins, pick or not.
+    /// Issue #904, review rounds 2–3: a model fact is judged by **where** and
+    /// **when** it was learned. A name the server gave is dropped when a later
+    /// read names none (a stale name would claim the wrong model answered); a
+    /// model cola sent survives an omitted field; and a read that was already in
+    /// flight when the pick was accepted cannot resurrect the older name.
     #[test]
     fn silence_drops_a_reported_model_but_never_a_picked_one() {
         fn model_of(projection: &ThreadProjection) -> Option<String> {
@@ -2576,23 +2595,32 @@ mod tests {
         };
 
         let mut projection = projected();
-        projection.observe_thread_model(Some(identity("gpt-6-luna")));
+        projection.observe_thread_model(Some(identity("gpt-6-luna")), 1);
         assert_eq!(model_of(&projection), Some("gpt-6-luna".into()));
 
         // A silent read drops the name the server itself gave.
-        projection.observe_thread_model(None);
+        projection.observe_thread_model(None, 2);
         assert_eq!(model_of(&projection), None);
 
         // A picked model survives a silent read ...
-        projection.record_sent_model(identity("gpt-5.5"));
-        projection.observe_thread_model(None);
+        projection.record_sent_model(identity("gpt-5.5"), 3);
+        projection.observe_thread_model(None, 4);
         assert_eq!(model_of(&projection), Some("gpt-5.5".into()));
 
-        // ... and a server that names another model still wins over it.
-        projection.observe_thread_model(Some(identity("gpt-6-luna")));
+        // ... and a read that was already in flight when the pick was accepted
+        // (an older stamp) cannot resurrect the name it had read.
+        projection.observe_thread_model(Some(identity("gpt-6-luna")), 2);
+        assert_eq!(
+            model_of(&projection),
+            Some("gpt-5.5".into()),
+            "a read the pick overtook must not overwrite it"
+        );
+
+        // A read started after the pick does win: a peer's switch is newer.
+        projection.observe_thread_model(Some(identity("gpt-6-luna")), 5);
         assert_eq!(model_of(&projection), Some("gpt-6-luna".into()));
         // That reported name is again droppable, i.e. the source moved back.
-        projection.observe_thread_model(None);
+        projection.observe_thread_model(None, 6);
         assert_eq!(model_of(&projection), None);
     }
 
