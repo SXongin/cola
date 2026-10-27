@@ -250,7 +250,7 @@ pub fn build_model_surface_cards(
         [scope] => scope_cards(thread_key, surface.current.as_ref(), scope, back),
         scopes => {
             let combined = combined_surface_card(thread_key, surface.current.as_ref(), scopes, back);
-            if combined.to_string().len() <= MAX_CARD_JSON_CHARS {
+            if combined_card_fits(&combined) {
                 vec![combined]
             } else {
                 scopes
@@ -260,6 +260,21 @@ pub fn build_model_surface_cards(
             }
         }
     }
+}
+
+/// Whether the combined multi-scope card fits Feishu's budget. Unlike
+/// [`chunk_picker_cards`], this path does not chunk, so it must charge section
+/// headings, notes, the hand-write hint and the back button — every non-button
+/// element — against the same conservative component budget the chunker uses
+/// for buttons ([`MAX_PICKER_BUTTONS_PER_CARD`]), as well as the byte ceiling.
+/// A surface that fails either check falls back to the per-scope cards, which
+/// do chunk.
+fn combined_card_fits(card: &serde_json::Value) -> bool {
+    let components = card["body"]["elements"]
+        .as_array()
+        .map(|elements| elements.len())
+        .unwrap_or(usize::MAX);
+    card.to_string().len() <= MAX_CARD_JSON_CHARS && components <= MAX_PICKER_BUTTONS_PER_CARD
 }
 
 /// One scope's card page(s): its intro (with the current-model line on top),
@@ -1396,5 +1411,301 @@ mod tests {
                     .as_array()
                     .is_some_and(|cols| cols.iter().any(|c| c["elements"][0]["value"]["op"] == "page"))
         })
+    }
+
+    fn pinned(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("the pinned card JSON parses")
+    }
+
+    /// The OpenCode provider page is pinned byte-for-byte: any drift in the
+    /// header, the current-model line, the intro or a button's callback payload
+    /// fails, not just the fields one assertion happens to name.
+    #[test]
+    fn opencode_provider_page_is_pixel_identical() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut provider = scope(
+            "provider",
+            "选择模型",
+            vec![ModelOption::new("opencode"), ModelOption::new("openrouter")],
+        );
+        provider.intro = Some("**选择 provider**（共 2 个）：".into());
+        let surface = surface(
+            Some(ModelSelection {
+                label: "opencode-go/deepseek-v4-flash@low".into(),
+                reference: "opencode-go/deepseek-v4-flash".into(),
+            }),
+            vec![provider],
+        );
+
+        let cards = build_model_surface_cards(&key, &surface, false);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0],
+            pinned(
+                r#"{
+  "body": {
+    "elements": [
+      {
+        "content": "**当前模型**：`opencode-go/deepseek-v4-flash@low`\n**选择 provider**（共 2 个）：",
+        "tag": "markdown"
+      },
+      {
+        "tag": "button",
+        "text": { "content": "opencode", "tag": "plain_text" },
+        "type": "default",
+        "value": {
+          "action": "model",
+          "chat_id": "chat_1",
+          "level": "provider",
+          "thread_id": "chat_1",
+          "value": "opencode"
+        },
+        "width": "fill"
+      },
+      {
+        "tag": "button",
+        "text": { "content": "openrouter", "tag": "plain_text" },
+        "type": "default",
+        "value": {
+          "action": "model",
+          "chat_id": "chat_1",
+          "level": "provider",
+          "thread_id": "chat_1",
+          "value": "openrouter"
+        },
+        "width": "fill"
+      }
+    ]
+  },
+  "config": { "wide_screen_mode": true },
+  "header": {
+    "template": "blue",
+    "title": { "content": "🎯 选择模型", "tag": "plain_text" }
+  },
+  "schema": "2.0"
+}"#
+            )
+        );
+    }
+
+    /// The drilled OpenCode model page is pinned too: the provider header, the
+    /// "选择 model" intro, the back button (level `provider`,
+    /// `__providers__`) and the bare-label / `provider/model`-value buttons.
+    #[test]
+    fn opencode_model_page_is_pixel_identical() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut model = scope(
+            "model",
+            "opencode-go",
+            vec![
+                ModelOption {
+                    id: "deepseek-v4-flash".into(),
+                    value: Some("opencode-go/deepseek-v4-flash".into()),
+                    ..Default::default()
+                },
+                ModelOption {
+                    id: "deepseek-v4-pro".into(),
+                    value: Some("opencode-go/deepseek-v4-pro".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        model.intro = Some("**选择 model**（下一条消息开始生效）：".into());
+        let surface = surface(None, vec![model]);
+
+        let cards = build_model_surface_cards(&key, &surface, true);
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(
+            cards[0],
+            pinned(
+                r#"{
+  "body": {
+    "elements": [
+      {
+        "content": "**选择 model**（下一条消息开始生效）：",
+        "tag": "markdown"
+      },
+      {
+        "tag": "button",
+        "text": { "content": "← 返回全部 provider", "tag": "plain_text" },
+        "type": "default",
+        "value": {
+          "action": "model",
+          "chat_id": "chat_1",
+          "level": "provider",
+          "thread_id": "chat_1",
+          "value": "__providers__"
+        },
+        "width": "fill"
+      },
+      {
+        "tag": "button",
+        "text": { "content": "deepseek-v4-flash", "tag": "plain_text" },
+        "type": "default",
+        "value": {
+          "action": "model",
+          "chat_id": "chat_1",
+          "level": "model",
+          "thread_id": "chat_1",
+          "value": "opencode-go/deepseek-v4-flash"
+        },
+        "width": "fill"
+      },
+      {
+        "tag": "button",
+        "text": { "content": "deepseek-v4-pro", "tag": "plain_text" },
+        "type": "default",
+        "value": {
+          "action": "model",
+          "chat_id": "chat_1",
+          "level": "model",
+          "thread_id": "chat_1",
+          "value": "opencode-go/deepseek-v4-pro"
+        },
+        "width": "fill"
+      }
+    ]
+  },
+  "config": { "wide_screen_mode": true },
+  "header": {
+    "template": "blue",
+    "title": { "content": "🎯 opencode-go", "tag": "plain_text" }
+  },
+  "schema": "2.0"
+}"#
+            )
+        );
+    }
+
+    /// The empty-scope variants are pinned as well: the provider page keeps the
+    /// current-model line above its "no models" note, and the drilled page
+    /// keeps its "this provider has no models" note plus the back button.
+    #[test]
+    fn opencode_empty_pages_are_pixel_identical() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        let mut empty = scope("provider", "选择模型", Vec::new());
+        empty.intro = Some("_(没有可用模型)_".into());
+        let empty_root = surface(
+            Some(ModelSelection {
+                label: "opencode-go/deepseek-v4-flash@low".into(),
+                reference: "opencode-go/deepseek-v4-flash".into(),
+            }),
+            vec![empty],
+        );
+        assert_eq!(
+            build_model_surface_cards(&key, &empty_root, false),
+            vec![pinned(
+                r#"{
+  "body": {
+    "elements": [
+      {
+        "content": "**当前模型**：`opencode-go/deepseek-v4-flash@low`\n_(没有可用模型)_",
+        "tag": "markdown"
+      }
+    ]
+  },
+  "config": { "wide_screen_mode": true },
+  "header": {
+    "template": "blue",
+    "title": { "content": "🎯 选择模型", "tag": "plain_text" }
+  },
+  "schema": "2.0"
+}"#
+            )]
+        );
+
+        let mut empty_model = scope("model", "opencode-go", Vec::new());
+        empty_model.intro = Some("_(该 provider 没有可用模型)_".into());
+        assert_eq!(
+            build_model_surface_cards(&key, &surface(None, vec![empty_model]), true),
+            vec![pinned(
+                r#"{
+  "body": {
+    "elements": [
+      {
+        "content": "_(该 provider 没有可用模型)_",
+        "tag": "markdown"
+      },
+      {
+        "tag": "button",
+        "text": { "content": "← 返回全部 provider", "tag": "plain_text" },
+        "type": "default",
+        "value": {
+          "action": "model",
+          "chat_id": "chat_1",
+          "level": "provider",
+          "thread_id": "chat_1",
+          "value": "__providers__"
+        },
+        "width": "fill"
+      }
+    ]
+  },
+  "config": { "wide_screen_mode": true },
+  "header": {
+    "template": "blue",
+    "title": { "content": "🎯 opencode-go", "tag": "plain_text" }
+  },
+  "schema": "2.0"
+}"#
+            )]
+        );
+    }
+
+    /// A two-scope surface whose combined card would pass the byte ceiling but
+    /// exceed Feishu's component budget falls back to per-scope cards: every
+    /// emitted card stays within both budgets and no option is dropped.
+    #[test]
+    fn combined_surface_respects_the_component_budget() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let options = |prefix: &str| -> Vec<ModelOption> {
+            (0..45)
+                .map(|i| ModelOption::new(format!("{prefix}{i}")))
+                .collect()
+        };
+        let surface = surface(
+            None,
+            vec![
+                scope("catalog", "内置目录", options("c")),
+                scope("provider", "自定义 provider", options("p")),
+            ],
+        );
+
+        // The scenario is bytes-fit but components-over: the single-card path
+        // cannot be what produced the result.
+        let combined = combined_surface_card(&key, None, &surface.scopes, false);
+        assert!(
+            combined.to_string().len() <= MAX_CARD_JSON_CHARS,
+            "scenario needs the byte budget to pass: {}",
+            combined.to_string().len()
+        );
+        assert!(
+            combined["body"]["elements"].as_array().unwrap().len() > MAX_PICKER_BUTTONS_PER_CARD,
+            "scenario needs the component budget to fail"
+        );
+
+        let cards = build_model_surface_cards(&key, &surface, false);
+        assert!(
+            cards.len() > 1,
+            "an over-budget combined page must fall back per scope"
+        );
+        let mut total_buttons = 0;
+        for card in &cards {
+            let elements = card["body"]["elements"].as_array().unwrap();
+            total_buttons += elements.iter().filter(|e| e["tag"] == "button").count();
+            assert!(
+                elements.len() <= MAX_PICKER_BUTTONS_PER_CARD,
+                "page over the component budget: {}",
+                elements.len()
+            );
+            assert!(
+                card.to_string().len() <= FEISHU_CARD_LIMIT_BYTES,
+                "page over bytes"
+            );
+        }
+        assert_eq!(total_buttons, 90, "every option keeps a button");
     }
 }
