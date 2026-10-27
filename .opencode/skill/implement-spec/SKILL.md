@@ -37,14 +37,15 @@ Communicate with sub-agents through sparse **context pointers** — the spec, ti
 
 - The orchestrating session calls the reviewers (`implementer` and `merger` deny `subagent`); the merger only lands.
 - One PR per spec. Never merge.
-- The progress comments are the only writes the batch makes to the tracker; the PR closes the tickets.
+- [cola] The progress comments are the only writes the batch makes to the tracker; the PR closes the tickets.
 - The integration branch stays merge-commit-free and rebase-mergeable.
 
 ## Resume
 
-Re-run `/implement-spec <spec>` after an interruption. The integration branch's log and the tickets' progress comments are the batch's state; the session's captured ticket sessions do not survive it:
+[cola] Re-run `/implement-spec <spec>` after an interruption. The integration branch's log and the tickets' progress comments are the batch's state; the session's captured ticket sessions do not survive it:
 
+- **Adopt the branch**: resume only a branch whose every commit `origin/main` lacks carries a `Refs: #<n>` trailer naming one of this spec's tickets — a commit without one is not the batch's, and adopting the branch would ride it into the PR. A branch failing that check stops and asks instead of being resumed.
 - **Windows**: a ticket's window is the run of commits carrying its `Refs: #<n>` trailer, with the base at the commit before the run.
-- **Tickets**: one with a progress comment is done. One with commits but no comment gets its window reviewed, then its comment. One with neither is dispatched.
+- **Tickets**: one is done when its progress comment names this branch and a commit still on the integration tip (`git merge-base --is-ancestor <sha> HEAD`) — a comment whose commit the tip no longer has is stale (the branch was reset), so re-derive that ticket's window from the log, review it, and post a fresh comment. One with no progress comment at all is dispatched.
 - **Interrupted fix round**: the sessions are gone — re-review the window with fresh reviewers (the findings resurface), then dispatch a fresh implementer with them.
 - **Dirty tree or worktrees**: never start a ticket on a dirty tree, and never reuse a stale worktree — inspect and clean up before dispatching.
