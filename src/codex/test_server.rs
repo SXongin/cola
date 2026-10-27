@@ -261,6 +261,11 @@ pub(crate) struct ScriptedThread {
     /// connection's push delivery, so a test can inject events while adoption
     /// is paging.
     pub(crate) turns_page_delay_ms: u64,
+    /// The `model` the thread runs with, as `0.163.0` reports it (nullable).
+    pub(crate) model: Option<String>,
+    /// The `modelProvider` beside it (nullable), so a test can prove cola
+    /// shows the real provider rather than a fabricated one.
+    pub(crate) model_provider: Option<String>,
 }
 
 impl ScriptedThread {
@@ -282,6 +287,8 @@ impl ScriptedThread {
             malformed_turns_page: false,
             repeat_turns_cursor: false,
             turns_page_delay_ms: 0,
+            model: None,
+            model_provider: None,
         }
     }
 
@@ -2016,7 +2023,8 @@ fn thread_json(thread: &ScriptedThread) -> Value {
         "createdAt": thread.created_at,
         "updatedAt": thread.updated_at,
         "cliVersion": "0.163.0",
-        "modelProvider": "openai",
+        "model": thread.model,
+        "modelProvider": thread.model_provider,
         "ephemeral": false,
         "projectId": null,
         "source": thread.source,

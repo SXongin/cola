@@ -32,9 +32,12 @@ use serde_json::{Value, json};
 use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, ServerLifecycle};
 use crate::backend::types::{
     AgentInfo, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, PermissionRequest,
-    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionStatus,
+    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionModel,
+    SessionStatus,
 };
-use crate::backend::{Backend, BackendDirectory, PromptSkill, SessionTranscript, SkillInfo, TurnDiff};
+use crate::backend::{
+    Backend, BackendDirectory, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo, TurnDiff,
+};
 use crate::bridge::tasks::TasksHandle;
 use crate::error::{BridgeError, Result};
 
@@ -43,7 +46,7 @@ use super::client::CodexClient;
 use super::error::{CodexError, Result as CodexResult};
 use super::lifecycle::CodexLifecycle;
 use super::read_model::{DiffSnapshot, ThreadProjection, ThreadStatus, decode_thread_status};
-use super::threads::{Adoption, ThreadEvent, ThreadSubscription, Threads};
+use super::threads::{Adoption, Thread, ThreadEvent, ThreadSubscription, Threads};
 use super::transport::{Endpoint, Inbound, RpcConnection};
 
 /// How long a truncated history waits before the next read retries paging. A
@@ -470,6 +473,36 @@ impl Projections {
             .lock()
             .expect("codex thread cwds")
             .insert(thread_id.to_string(), cwd.to_string());
+    }
+
+    /// Remember everything a thread read just told us about the thread: its
+    /// directory (skill resolution) and the model it runs with (the card
+    /// footer's only per-message fact, issue #904). One call so a new thread
+    /// fact cannot be forgotten at one of the three sites that read a thread.
+    pub(crate) fn remember(&self, thread: &Thread) {
+        self.set_cwd(&thread.id, &thread.cwd);
+        let Some((provider_id, model_id)) = thread_model(thread) else {
+            return;
+        };
+        self.set_model(
+            &thread.id,
+            &ModelIdentity {
+                provider_id,
+                model_id,
+                variant: None,
+            },
+        );
+    }
+
+    /// Record the model a thread runs with. `thread/read` reports it, and
+    /// `turn/start`'s model "for this turn and subsequent turns" changes it, so
+    /// cola's own pick updates this too — otherwise the footer would name the
+    /// model from before the pick.
+    pub(crate) fn set_model(&self, thread_id: &str, model: &ModelIdentity) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .set_model(model.clone());
     }
 
     pub(crate) fn cwd(&self, thread_id: &str) -> Option<String> {
@@ -995,7 +1028,7 @@ async fn run_thread(
         let Some(cache) = projections.upgrade() else {
             return;
         };
-        cache.set_cwd(&thread_id, &subscription.thread().cwd);
+        cache.remember(subscription.thread());
     }
     // Every status this connection had already received when the history
     // request starts is superseded by the page; a status received after this
@@ -1254,6 +1287,22 @@ const SKILL_CWD_READ_TIMEOUT: Duration = Duration::from_millis(60);
 /// — never a claim that the model is served by OpenAI.
 const MODEL_PROVIDER: &str = "codex";
 
+/// The `(provider, model)` a thread runs with, as the server reports them
+/// (issue #904). `model/list` names no provider — its catalog is flat — so an
+/// absent `modelProvider` falls back to that same neutral bucket rather than
+/// claiming OpenAI. `None` when the server named no model: a fact cola does not
+/// have is never filled in from config (that would be `config/read`, a
+/// different read).
+fn thread_model(thread: &Thread) -> Option<(String, String)> {
+    let model = thread.model.as_deref().filter(|model| !model.trim().is_empty())?;
+    let provider = thread
+        .model_provider
+        .as_deref()
+        .filter(|provider| !provider.trim().is_empty())
+        .unwrap_or(MODEL_PROVIDER);
+    Some((provider.to_string(), model.to_string()))
+}
+
 /// Bound the `/model` catalog read. A server that keeps minting fresh cursors
 /// would otherwise hold the picker forever; past the bound the catalog is what
 /// was read so far, and the truncation is logged.
@@ -1465,7 +1514,7 @@ impl Backend for CodexClient {
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
         let thread = self.threads().start(cwd).await.map_err(client_error)?;
-        self.projections.set_cwd(&thread.id, &thread.cwd);
+        self.projections.remember(&thread);
         Ok(Session {
             id: thread.id.clone(),
             project_id: None,
@@ -1541,7 +1590,7 @@ impl Backend for CodexClient {
         // and a skill is then refused rather than taken from another project.
         if !skills.is_empty() && self.projections.cwd(session_id).is_none() {
             match tokio::time::timeout(SKILL_CWD_READ_TIMEOUT, self.threads().read(session_id, false)).await {
-                Ok(Ok(thread)) => self.projections.set_cwd(&thread.id, &thread.cwd),
+                Ok(Ok(thread)) => self.projections.remember(&thread),
                 Ok(Err(error)) => {
                     return Err(BridgeError::Client {
                         client: "codex",
@@ -1617,6 +1666,21 @@ impl Backend for CodexClient {
         // fold) binds that turn: it is the turn cola's message landed in, and
         // the card must settle on it. Never a second turn.
         self.authored.bind(session_id, &turn.id, message_id);
+        // A pick rides `turn/start` "for this turn and subsequent turns", so
+        // the thread now runs this model: record it here or the footer would
+        // keep naming the model from before the pick (issue #904). The
+        // response is the acceptance this waits for — a refused turn/start
+        // changed nothing.
+        if let Some(model) = model {
+            self.projections.set_model(
+                session_id,
+                &ModelIdentity {
+                    provider_id: model.provider_id.clone(),
+                    model_id: model.id.clone(),
+                    variant: None,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -1959,12 +2023,17 @@ impl Backend for CodexClient {
             .read(session_id, false)
             .await
             .map_err(client_error)?;
+        // The read is the freshest model fact cola has (a peer client may have
+        // switched it), so the footer's projection learns it too — the same
+        // read serves both surfaces (issue #904).
+        self.projections.remember(&thread);
+        let model = thread_model(&thread).map(|(provider_id, id)| SessionModel { provider_id, id });
         let title = (!thread.title().is_empty()).then(|| thread.title().to_string());
         Ok(SessionInfo {
             id: thread.id,
             parent_id: thread.parent_thread_id,
             title,
-            model: None,
+            model,
         })
     }
 
@@ -2243,6 +2312,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::backend::MessageRole;
     use crate::codex::client::CodexOptions;
     use crate::codex::schema::PinnedProbe;
     use crate::codex::test_server::{FakeServer, ScriptedThread};
@@ -2625,6 +2695,100 @@ mod tests {
             .expect("projection")
             .set_observed_status_at(Some(ThreadStatus::Active), 6);
         assert_eq!(projections.observed_status("thread-a"), None);
+    }
+
+    /// Issue #904: the thread is where Codex keeps the model fact (`model` +
+    /// `modelProvider`), and it is the only place — items carry none. Both the
+    /// card footer (through the transcript) and the `/model` current-model line
+    /// (through `session_info`) read it from there, so a session cola never
+    /// picked a model for still names the model it is actually running.
+    #[tokio::test]
+    async fn the_threads_model_reaches_the_transcript_and_the_session_info() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        let transcript = client.transcript("thread-1").await.expect("the transcript read");
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the turn's assistant message");
+        let model = answering.model.as_ref().expect("the model the thread runs with");
+        assert_eq!(model.model_id, "gpt-6-luna");
+        assert_eq!(model.provider_id, "opencode-go");
+
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        let model = info.model.expect("the session names its model");
+        assert_eq!(model.id, "gpt-6-luna");
+        assert_eq!(model.provider_id, "opencode-go");
+    }
+
+    /// The wire's `modelProvider` is nullable, and cola must not turn "the
+    /// server named no provider" into a false one: the neutral `codex` bucket
+    /// is the documented fallback (`model/list` names no provider either), and
+    /// a thread the server reports no model for stays modelless.
+    #[tokio::test]
+    async fn a_thread_without_a_reported_provider_or_model_shows_no_invented_one() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = None;
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        let info = client
+            .session_info("thread-1", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        assert_eq!(
+            info.model.map(|model| model.provider_id),
+            Some("codex".to_string()),
+            "an absent provider falls back to the neutral bucket"
+        );
+
+        let (bare_server, bare_url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut bare = ScriptedThread::adopted("thread-2", "session-two", "/work/cola", "bare");
+        bare.turns = vec![scripted_turn(
+            "turn-1",
+            "completed",
+            1_700_000_000,
+            "item-1",
+            "one",
+        )];
+        bare_server.seed_thread(bare);
+        let bare_client = connect(&bare_url).await;
+        let info = bare_client
+            .session_info("thread-2", Some("/work/cola"))
+            .await
+            .expect("the session read");
+        assert!(info.model.is_none(), "no model on the wire, none invented");
+        let transcript = bare_client.transcript("thread-2").await.expect("the read");
+        assert!(
+            transcript.messages.iter().all(|message| message.model.is_none()),
+            "the transcript invents no model either"
+        );
     }
 
     /// A bounded `thread/resume` page is never presented as the whole history:
@@ -4973,6 +5137,58 @@ mod tests {
             !client.keeps_session_selection(),
             "the pick is per-turn, not a durable session switch"
         );
+    }
+
+    /// The pick changes what the thread runs from then on ("for this turn and
+    /// subsequent turns"), so the footer must name the PICKED model after the
+    /// prompt, not the one the thread was adopted with (issue #904).
+    #[tokio::test]
+    async fn a_pick_moves_the_transcript_model_with_it() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-6-luna".into());
+        thread.model_provider = Some("opencode-go".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+
+        // The first read is the adoption, so the item pushed afterwards is
+        // delivered to a subscriber.
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        server.push_item("thread-1", "item-1", "one");
+        let transcript = wait_for_text(&client, "thread-1", "one").await;
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the assistant item");
+        assert_eq!(
+            answering.model.as_ref().map(|model| model.model_id.as_str()),
+            Some("gpt-6-luna"),
+            "adoption names the model the thread already runs"
+        );
+
+        let pick = ModelInfo {
+            id: "gpt-5.5".into(),
+            provider_id: "opencode-go".into(),
+            variant: None,
+        };
+        client
+            .prompt("thread-1", "run it", &[], &[], Some(&pick), None, None, None)
+            .await
+            .expect("the prompt");
+
+        let transcript = client.transcript("thread-1").await.expect("the read");
+        let answering = transcript
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::Assistant)
+            .expect("the assistant item");
+        let model = answering.model.as_ref().expect("the picked model");
+        assert_eq!(model.model_id, "gpt-5.5");
+        assert_eq!(model.provider_id, "opencode-go");
     }
 
     /// The provenance window (ADR-0092 decision 2): an item can reach the
