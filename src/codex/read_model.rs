@@ -34,8 +34,9 @@ use serde_json::{Value, json};
 
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, ContentBlock, FileContent, FinishReason, MessageId,
-    MessageRole, MessageTime, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish, TextPart,
-    TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnDiff, TurnDiffFile,
+    MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish,
+    TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnDiff,
+    TurnDiffFile,
 };
 
 /// `item/started`: the server's opening payload for one item.
@@ -165,6 +166,11 @@ pub(crate) struct ThreadProjection {
     /// is the only evidence a compaction was manual (`/compact`) rather than
     /// automatic; the next compaction item consumes it.
     manual_compaction: bool,
+    /// The model the **thread** runs with, learned from `thread/start`,
+    /// `thread/resume` or `thread/read` (issue #904). Codex items carry no
+    /// model of their own, so this is the only per-message model fact the
+    /// adapter has; `None` until the server named one.
+    model: Option<ModelIdentity>,
 }
 
 impl ThreadProjection {
@@ -188,6 +194,14 @@ impl ThreadProjection {
     /// finished turn would be a stale write.
     pub(crate) fn live_turn(&self) -> Option<&str> {
         self.live_turn.as_deref()
+    }
+
+    /// Remember the model the thread runs with (issue #904): `thread/start`,
+    /// `thread/resume` and `thread/read` report it, and no item does. The
+    /// transcript stamps it onto assistant messages, so the card footer and the
+    /// `/model` current-model line can name what actually ran.
+    pub(crate) fn set_model(&mut self, model: ModelIdentity) {
+        self.model = Some(model);
     }
 
     /// The turn an item belongs to, for the authorship record: Codex assigns
@@ -644,6 +658,11 @@ impl ThreadProjection {
             .or_else(|| self.turns.get(&item.turn_id).and_then(|turn| turn.started_ms))
             .unwrap_or(0);
         let (role, parts) = item.parts();
+        // Codex's items carry no model — the thread does (issue #904), and only
+        // an assistant message can honestly name the model that produced it.
+        let model = matches!(role, MessageRole::Assistant)
+            .then(|| self.model.clone())
+            .flatten();
         TranscriptMessage {
             id: MessageId::new(item.id.clone()),
             role,
@@ -651,7 +670,7 @@ impl ThreadProjection {
                 created,
                 completed: item.completed_at_ms,
             }),
-            model: None,
+            model,
             tokens: None,
             error: None,
             parts,
@@ -2448,6 +2467,46 @@ mod tests {
         let mut projection = ThreadProjection::new("thread-1");
         replay(&mut projection, &recording());
         projection
+    }
+
+    /// Issue #904: Codex items carry no model — the thread does — so the
+    /// projection stamps the thread's model onto the assistant messages the
+    /// card footer reads. With no thread model the read invents none, and a
+    /// user message never names one (it produced nothing).
+    #[test]
+    fn the_threads_model_stamps_assistant_messages_only() {
+        let mut projection = projected();
+        assert!(
+            projection
+                .transcript()
+                .messages
+                .iter()
+                .all(|message| message.model.is_none()),
+            "a projection that was told no model must not invent one"
+        );
+
+        projection.set_model(ModelIdentity {
+            provider_id: "opencode-go".into(),
+            model_id: "gpt-6-luna".into(),
+            variant: None,
+        });
+        let transcript = projection.transcript();
+        let mut assistants = 0;
+        for message in &transcript.messages {
+            match message.role {
+                crate::backend::MessageRole::Assistant => {
+                    assistants += 1;
+                    let model = message.model.as_ref().expect("the thread's model");
+                    assert_eq!(model.model_id, "gpt-6-luna");
+                    assert_eq!(model.provider_id, "opencode-go");
+                }
+                _ => assert!(
+                    message.model.is_none(),
+                    "only an assistant message names the model that produced it: {message:?}"
+                ),
+            }
+        }
+        assert!(assistants > 0, "the recording carries assistant messages");
     }
 
     /// Ticket #879 acceptance 1: the same recording replayed twice yields the

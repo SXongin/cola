@@ -264,8 +264,7 @@ message, and a broken record must not produce it.
 
 - A steered Supplement is recognised by its own item id, not by claiming the
   turn it joined; the resolved ids are a bounded recognition tail, so a TUI turn
-  can never be mistaken for cola's wholesale.
-- A cola turn is durable state, not a process-local guess; its file is bounded
+  can never be mistaken for cola's wholesale.- A cola turn is durable state, not a process-local guess; its file is bounded
   (the newest 128 turns, and 32 unresolved submissions, per thread) because
   authorship is only ever asked about the newest user message. A submission
   that never resolves leaves after an hour, so the cap cannot wedge a thread
@@ -289,3 +288,41 @@ message, and a broken record must not produce it.
 - `[bridge]`-owned docs gain the new file in the state table; `/model`,
   `/skill`, `/stop` and `/compact` stay the same Feishu commands, with the
   client owning their wire.
+
+## Amendment (2026-10-27, #904): the running model is a thread fact
+
+Decision 7 left the footer and the picker's current-model line with nothing to
+show on Codex, because all three neutral rungs were empty:
+`configured_default_model` returns `None`, `session_info` hard-coded
+`model: None`, and every transcript message carried `model: None`. The protocol
+does carry the fact — at the **thread** level: `thread/list` and `thread/read`
+report `model` + `modelProvider` (+ `reasoningEffort`), and `thread/start`
+accepts them. `TurnStartParams.model` is *"for this turn and subsequent turns"*,
+so the thread's model is both what the last turn ran and what the next one will
+run: one source for both surfaces.
+
+The adapter now reads it: `Thread` decodes `model`/`modelProvider`;
+`ThreadProjection` stamps it onto **assistant** messages (the footer's existing
+`capture_footer_model` path, so no bridge change); `session_info` reports it (the
+`effective_selection` ladder's third rung, so `/model`'s current-model line
+works). Three consequences of that shape:
+
+- The picker's **button values** stay the neutral `codex/<model>`, because that
+  is the reference cola sends back; only the *display* uses the real provider —
+  which is what `/model`'s current-model line and the footer show. An absent
+  `modelProvider` falls back to the same neutral bucket, never to "openai".
+- The projection's model moves only where the protocol says it moves: a thread
+  read / start / resume, and cola's own `turn/start` carrying a pick (its
+  response is the acceptance — a refused turn changed nothing). A peer client
+  switching the model mid-thread stays unseen by the footer until the next
+  thread read; the picker reads the thread each time, so it is always current.
+  `model/rerouted` is the notification that would close that gap if it ever
+  matters; not adopted here.
+- With no thread model on the wire, nothing is shown. Filling it from
+  `~/.codex/config.toml` would be a different read (`config/read`) and is left
+  out: a fact cola does not have must not be presented as the server's.
+
+Also out of scope: offering `[model_providers.*]` models in the picker.
+`model/list` is a flat, provider-less catalog compiled into the CLI (it names no
+provider and does not include custom providers' models), so cola cannot offer
+choices its own pick path could not send.

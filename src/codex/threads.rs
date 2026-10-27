@@ -84,6 +84,15 @@ pub(crate) struct Thread {
     #[serde(default)]
     pub(crate) preview: String,
     pub(crate) cwd: String,
+    /// The model this thread runs with, as `thread/list` / `thread/read`
+    /// report it (issue #904). Nullable on the wire, and the only model fact
+    /// Codex offers: its items carry none.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    /// The provider beside it (`modelProvider`), nullable too. cola shows it as
+    /// the real source of the model rather than claiming OpenAI.
+    #[serde(default)]
+    pub(crate) model_provider: Option<String>,
     #[serde(default)]
     pub(crate) created_at: i64,
     #[serde(default)]
