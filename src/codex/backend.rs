@@ -2083,7 +2083,10 @@ impl Backend for CodexClient {
         // response alone (the picker must not show a name the picker's own pick
         // superseded).
         self.projections.remember_thread_metadata(&thread, observed_stamp);
-        let model = self.projections.model(session_id).map(|model| SessionModel {
+        // Keyed by the id the response names, the same id the metadata was
+        // remembered under: a response that named another thread must not report
+        // this session's cached model for it.
+        let model = self.projections.model(&thread.id).map(|model| SessionModel {
             provider_id: model.provider_id,
             id: model.model_id,
         });
