@@ -300,12 +300,10 @@ pub(crate) struct ThreadSettings {
 }
 
 impl ThreadSettings {
-    /// Merge the pair into a request's params. `adopt` is true for
-    /// `thread/resume`, the opt-in path.
-    fn merge(self, params: &mut Value, adopt: bool) {
-        if adopt && !self.apply_on_adopt {
-            return;
-        }
+    /// Merge the pair into a request's params. The caller decides whether the
+    /// request may carry them: `thread/start` always may, `thread/resume` only
+    /// for a client that set `apply_on_adopt`.
+    fn add_overrides(self, params: &mut Value) {
         if let Some(sandbox) = self.sandbox {
             params["sandbox"] = json!(sandbox.as_str());
         }
@@ -508,7 +506,7 @@ impl Threads {
         if let Some(cwd) = cwd {
             params["cwd"] = json!(cwd);
         }
-        self.settings.merge(&mut params, false);
+        self.settings.add_overrides(&mut params);
         let result = self.connection.request("thread/start", params).await?;
         let response: ReadResponse = decode("thread/start", result)?;
         Ok(response.thread)
@@ -535,7 +533,11 @@ impl Threads {
         };
         let events = self.registry.subscribe(thread_id);
         let mut params = json!({ "threadId": thread_id });
-        self.settings.merge(&mut params, true);
+        // Opt-in: adopting a thread the user's own client may share must not
+        // silently reconfigure it (issue #898).
+        if self.settings.apply_on_adopt {
+            self.settings.add_overrides(&mut params);
+        }
         let result = self.connection.request("thread/resume", params).await;
 
         match result {
