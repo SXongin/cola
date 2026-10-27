@@ -318,6 +318,79 @@ async fn model_picker_back_button_returns_to_providers() {
     );
 }
 
+/// A drilled provider page never resolves the running selection: `current` is
+/// a root-page fact, and the ladder's server-recorded rung can take longer than
+/// the card-ack budget (a provider click must only fetch the catalog, as the
+/// hand-built flow did). The root page still resolves it.
+#[tokio::test]
+async fn drilled_model_page_does_not_resolve_the_current_selection() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: "opencode".into(),
+        models: vec![model_option("gpt-4o", &[])],
+    }]);
+    // Only the ladder's last rung can answer, so resolving it would make a
+    // `session_info` read — the one this test forbids on a drilled page.
+    backend.with_session_model(crate::backend::types::SessionModel {
+        provider_id: "opencode".into(),
+        id: "gpt-4o".into(),
+    });
+    let session_info_calls = backend.session_info_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: None,
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let handles = app.command_handles();
+    let root = crate::feishu::card::command::model_surface(&handles, &key, None, None).await;
+    assert!(
+        root.current.is_some(),
+        "the root page still shows the resolved current model"
+    );
+    assert_eq!(
+        session_info_calls.lock().await.len(),
+        1,
+        "the root page's ladder read the server-recorded rung"
+    );
+
+    session_info_calls.lock().await.clear();
+    let drilled =
+        crate::feishu::card::command::model_surface(&handles, &key, Some("provider"), Some("opencode")).await;
+    assert!(
+        drilled.current.is_none(),
+        "a drilled page carries no current selection"
+    );
+    assert!(
+        session_info_calls.lock().await.is_empty(),
+        "a drilled page must not spend the ack budget on the session-info rung"
+    );
+    assert_eq!(
+        drilled.scopes[0].id, "model",
+        "the drilled page still lists models"
+    );
+    assert!(
+        drilled.scopes[0].options.iter().any(|o| o.id == "gpt-4o"),
+        "the catalog is still fetched"
+    );
+}
+
 /// A client that declares a flat model surface (Codex's shape) gets a flat
 /// `/model` card: the "current model" line, one 「模型（每轮可换）」 scope, and
 /// the hand-write hint — no provider pseudo-level. Tapping a model records the
