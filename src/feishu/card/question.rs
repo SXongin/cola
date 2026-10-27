@@ -174,14 +174,22 @@ pub(crate) fn question_target(questions: &[crate::backend::types::QuestionInfo])
     )
 }
 
-/// One question's display label for a residue: the question it asked, clipped,
-/// with its short header as the fallback when the text is empty.
+/// One question's display label for a residue: the question it asked, with its
+/// short header as the fallback when the text is empty.
+///
+/// A receipt is ONE markdown line, so the model-authored text is flattened
+/// (newlines collapsed) and its backticks become apostrophes before clipping:
+/// a raw multiline question or an unmatched backtick would otherwise break the
+/// residue's formatting.
 pub(crate) fn question_label(question: &crate::backend::types::QuestionInfo, max_chars: usize) -> String {
-    if !question.question.is_empty() {
-        super::truncate_md(&question.question, max_chars)
+    let text = if question.question.is_empty() {
+        &question.header
     } else {
-        super::truncate_md(&question.header, max_chars)
-    }
+        &question.question
+    };
+    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let safe = flattened.replace('`', "'");
+    super::truncate_md(&safe, max_chars)
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.
@@ -1631,5 +1639,31 @@ mod tests {
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 苹果")
             .expect("selected option button missing");
         assert_eq!(option["value"]["answer"], "apple");
+    }
+
+    /// A receipt is ONE markdown line built from model text: newlines collapse
+    /// and backticks are flattened, so a multiline or code-quoting question
+    /// cannot break the residue. The header is only the fallback for a field
+    /// whose question text is empty.
+    #[test]
+    fn a_receipt_label_is_one_safe_line() {
+        let question = |text: &str, header: &str| crate::backend::types::QuestionInfo {
+            question: text.into(),
+            header: header.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            question_label(&question("Which\ncolor?", "Color"), 40),
+            "Which color?"
+        );
+        assert_eq!(
+            question_label(&question("Use `red` or `blue`?", "Color"), 40),
+            "Use 'red' or 'blue'?"
+        );
+        assert_eq!(question_label(&question("", "Color"), 40), "Color");
+        assert_eq!(
+            question_target(&[question("Which color?", "Color"), question("", "Size")]),
+            "Which color?、Size"
+        );
     }
 }
