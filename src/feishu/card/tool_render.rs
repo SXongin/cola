@@ -2725,7 +2725,12 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 .and_then(|changes| {
                     changes
                         .iter()
-                        .map(|change| change.get("path").and_then(|path| path.as_str()))
+                        .map(|change| {
+                            change
+                                .get("path")
+                                .and_then(|path| path.as_str())
+                                .filter(|path| !path.trim().is_empty())
+                        })
                         .collect()
                 });
             match paths.as_deref() {
@@ -7341,6 +7346,14 @@ Index: /a/one.rs
         assert!(
             partial.starts_with("- changes:"),
             "a malformed entry takes the generic shape, not a partial list: {partial}"
+        );
+        let blank = format_tool_input(
+            "file_change",
+            &json!({"changes": [{"path": "a.rs"}, {"path": "  "}]}),
+        );
+        assert!(
+            blank.starts_with("- changes:"),
+            "a blank path is malformed too: {blank}"
         );
     }
 
