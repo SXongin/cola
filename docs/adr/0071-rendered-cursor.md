@@ -592,10 +592,11 @@ Two guards keep the exception narrow:
 
 - **Only refused content is dropped.** The build fingerprints its slice's
   content (a hash of the entries' values, not their lengths); if a streaming
-  text/reasoning part or an updated compaction row changed while the refused
-  write was in flight, the slice is NOT skipped: the boundary is kept and the
-  grown slice is attempted on the next flush. A slice is abandoned only when it
-  is byte-for-byte what Feishu refused.
+  text/reasoning part, an updated compaction row, or a settled tool panel's
+  asynchronous file delivery changed while the refused write was in flight, the
+  slice is NOT skipped: the boundary is kept and the changed slice is attempted
+  on the next flush. A slice is abandoned only when it is exactly what Feishu
+  refused.
 - **Bounded.** At most two consecutive abandonments per Turn without a
   delivered write; a delivered write clears the budget. A card whose SHELL is
   refused has nothing to skip, keeps the conservative refusal, and retries on

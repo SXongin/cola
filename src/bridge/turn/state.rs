@@ -542,12 +542,12 @@ pub(super) struct SliceFingerprint {
 }
 
 impl SliceFingerprint {
-    fn of(items: &[TimelineItem]) -> Self {
+    fn of(items: &[TimelineItem], tools: &IndexMap<String, ToolPanel>) -> Self {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for item in items {
             item.seq.hash(&mut hasher);
-            hash_slice_content(&item.kind, &mut hasher);
+            hash_slice_content(&item.kind, tools, &mut hasher);
             item.lead.hash(&mut hasher);
         }
         Self {
@@ -563,14 +563,28 @@ impl SliceFingerprint {
 /// summary swapping one sentence for another) is still detected. A settled tool
 /// panel is immutable and lives in `tools`, so its entry only carries the call
 /// id.
-fn hash_slice_content(kind: &TimelineKind, hasher: &mut impl std::hash::Hasher) {
+fn hash_slice_content(
+    kind: &TimelineKind,
+    tools: &IndexMap<String, ToolPanel>,
+    hasher: &mut impl std::hash::Hasher,
+) {
     use std::hash::Hash;
     match kind {
         TimelineKind::Text(text)
         | TimelineKind::Reasoning(text)
         | TimelineKind::Receipt(text)
         | TimelineKind::UserMessage(text) => text.hash(hasher),
-        TimelineKind::Tool(call_id) => call_id.hash(hasher),
+        TimelineKind::Tool(call_id) => {
+            call_id.hash(hasher);
+            // A settled panel is otherwise immutable, but its File Delivery is
+            // resolved ASYNCHRONOUSLY after it settles (ADR-0076): an
+            // Unresolved -> Embedded change while the refused write is in
+            // flight must be visible to the fingerprint, or the continuation
+            // would skip the new image.
+            if let Some(panel) = tools.get(call_id) {
+                hash_tool_panel(panel, hasher);
+            }
+        }
         TimelineKind::LedgerEntry(entry, ending) => {
             entry.label.hash(hasher);
             entry.id.hash(hasher);
@@ -603,6 +617,43 @@ fn hash_slice_content(kind: &TimelineKind, hasher: &mut impl std::hash::Hasher) 
                 }
                 None => 0u8.hash(hasher),
             }
+        }
+    }
+}
+
+/// Hash the parts of a settled tool panel a card renders and that can change
+/// after it settles (ADR-0076's asynchronous file delivery). The panel's
+/// input/output/metadata are final by the time the call joins the timeline; a
+/// running panel rides the tail, which every continuation re-renders.
+fn hash_tool_panel(panel: &ToolPanel, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    panel.name().hash(hasher);
+    match panel.status() {
+        crate::backend::ToolStatus::Pending => 0u8.hash(hasher),
+        crate::backend::ToolStatus::Running => 1u8.hash(hasher),
+        crate::backend::ToolStatus::Completed => 2u8.hash(hasher),
+        crate::backend::ToolStatus::Error => 3u8.hash(hasher),
+        crate::backend::ToolStatus::Other(other) => {
+            4u8.hash(hasher);
+            other.hash(hasher);
+        }
+        crate::backend::ToolStatus::Unknown => 5u8.hash(hasher),
+    }
+    for file in panel.files() {
+        file.content.uri.hash(hasher);
+        file.content.mime.hash(hasher);
+        file.content.name.hash(hasher);
+        file.content.size.hash(hasher);
+        match &file.delivery {
+            FileDelivery::Unresolved => 0u8.hash(hasher),
+            FileDelivery::Embedded { image_key } => {
+                1u8.hash(hasher);
+                image_key.hash(hasher);
+            }
+            FileDelivery::SentAsFile => 2u8.hash(hasher),
+            FileDelivery::FileSendOutcomeUnknown => 3u8.hash(hasher),
+            FileDelivery::SentAsRichText => 4u8.hash(hasher),
+            FileDelivery::Undelivered => 5u8.hash(hasher),
         }
     }
 }
@@ -4389,7 +4440,7 @@ impl StreamAccumulator {
     /// payload's [`BuiltCard::slice`] is compared against before the flush
     /// skips it.
     pub(super) fn slice_fingerprint(&self, start: usize, end: usize) -> SliceFingerprint {
-        SliceFingerprint::of(&self.timeline[start..end])
+        SliceFingerprint::of(&self.timeline[start..end], &self.tools)
     }
 
     /// Rewind the render boundary to `from` when the build still left it at
@@ -5537,6 +5588,38 @@ mod tests {
         acc.push_compaction_at(Some(1_000), source(), &with_usage);
         let after_usage = acc.slice_fingerprint(0, acc.timeline_len());
         assert_ne!(after, after_usage, "the row's usage changes the fingerprint too");
+    }
+
+    /// A settled tool panel's File Delivery resolves asynchronously (ADR-0076);
+    /// a change during the refused write must change the fingerprint, or the
+    /// continuation would skip the newly embedded image (issue #886 review).
+    #[test]
+    fn a_tool_panels_async_file_delivery_changes_the_slice_fingerprint() {
+        let item = TimelineItem {
+            key: 1,
+            shown_at: None,
+            seq: 1,
+            kind: TimelineKind::Tool("call_1".into()),
+            source: None,
+            lead: None,
+        };
+        let mut tools = indexmap::IndexMap::new();
+        tools.insert(
+            "call_1".to_string(),
+            crate::feishu::card::tool_render::ToolPanel::for_test_with_files("read", &[("shot.png", b"ABC")]),
+        );
+        let before = SliceFingerprint::of(std::slice::from_ref(&item), &tools);
+        tools.get_mut("call_1").unwrap().set_file_delivery(
+            0,
+            crate::feishu::card::tool_render::FileDelivery::Embedded {
+                image_key: "img_1".into(),
+            },
+        );
+        let after = SliceFingerprint::of(std::slice::from_ref(&item), &tools);
+        assert_ne!(
+            before, after,
+            "the resolved image must be visible to the fingerprint"
+        );
     }
 
     #[test]
