@@ -176,33 +176,37 @@ pub(crate) fn question_target(questions: &[crate::backend::types::QuestionInfo])
 
 /// One question's display label for a residue: the question it asked, with its
 /// short header as the fallback when the text is empty.
-///
-/// A receipt is ONE markdown line, so the model-authored text is flattened
-/// (newlines collapsed) and its backticks become apostrophes before clipping:
-/// a raw multiline question or an unmatched backtick would otherwise break the
-/// residue's formatting.
 pub(crate) fn question_label(question: &crate::backend::types::QuestionInfo, max_chars: usize) -> String {
     let text = if question.question.is_empty() {
         &question.header
     } else {
         &question.question
     };
-    // A receipt is built on a card callback, which must stay cheap and
-    // bounded: skip leading whitespace and cap the scan before flattening, so
-    // a model-sized question never walks its whole body for a one-line residue.
-    // `max_chars * 4` leaves room for whitespace runs that collapse away.
-    let trimmed = text.trim_start();
-    let capped: String = trimmed.chars().take(max_chars.saturating_mul(4)).collect();
-    let flattened = capped.split_whitespace().collect::<Vec<_>>().join(" ");
-    let safe = flattened.replace('`', "'");
-    let label = super::truncate_md(&safe, max_chars);
+    let label = one_line_label(text, max_chars);
     if label.is_empty() {
-        // Only whitespace inside the capped window: the header is still a
-        // usable one-word target.
-        super::truncate_md(&question.header, max_chars)
+        // The capped window held only whitespace: the header is still a usable
+        // one-word target, through the same sanitizer.
+        one_line_label(&question.header, max_chars)
     } else {
         label
     }
+}
+
+/// The most input characters a receipt label scans. A card callback must stay
+/// cheap and bounded, and a residue is at most `max_chars`; this window leaves
+/// room for a whitespace run or markdown decoration without ever walking a
+/// model-sized question. A question (or header) longer than it is clipped to
+/// the window, which is far past the visible budget's needs.
+const LABEL_SCAN_CHARS: usize = 512;
+
+/// One markdown line from model-authored text: a window-bounded scan, newlines
+/// collapsed, backticks flattened to apostrophes (an unmatched one would break
+/// the residue's inline formatting), then clipped to the visible budget.
+fn one_line_label(text: &str, max_chars: usize) -> String {
+    let window: String = text.chars().take(LABEL_SCAN_CHARS).collect();
+    let flattened = window.split_whitespace().collect::<Vec<_>>().join(" ");
+    let safe = flattened.replace('`', "'");
+    super::truncate_md(&safe, max_chars)
 }
 
 /// A one-line-per-question summary of a `question` request, for the stale card.
@@ -1691,5 +1695,9 @@ mod tests {
         // leave the receipt with no question at all.
         let padded = question_label(&question(&format!("{}  问什么？", " ".repeat(400)), "选择"), 40);
         assert_eq!(padded, "问什么？");
+        // Past the bounded window there is nothing left to flatten: the header
+        // answers, through the same one-line sanitizer.
+        let buried = question_label(&question(&format!("{}问什么？", " ".repeat(600)), "`选择`"), 40);
+        assert_eq!(buried, "'选择'");
     }
 }
