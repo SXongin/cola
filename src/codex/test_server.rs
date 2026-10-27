@@ -422,6 +422,9 @@ struct State {
     hide_live_turns: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// One-shot: leave the next `thread/read` unanswered (a stalled read).
     silent_thread_read: std::sync::atomic::AtomicBool,
+    /// Answer the next `thread/read` with THIS thread instead of the requested
+    /// one, modelling a response that names another thread.
+    read_returns: std::sync::Mutex<Option<String>>,
     /// `model/list` calls received, so a paged catalog is proved by its pages.
     model_list_calls: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
@@ -485,6 +488,7 @@ impl Default for State {
             drop_on_compact: std::sync::atomic::AtomicBool::new(false),
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
+            read_returns: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
             page_size: 2,
             start_params: std::sync::Mutex::new(Vec::new()),
@@ -1050,6 +1054,12 @@ impl FakeServer {
         self.state.silent_thread_read.store(true, Ordering::SeqCst);
     }
 
+    /// Answer the next `thread/read` with `thread_id`'s payload whatever was
+    /// asked for: a response that names another thread than the request.
+    pub(crate) fn answer_next_thread_read_with(&self, thread_id: &str) {
+        *self.state.read_returns.lock().expect("read returns") = Some(thread_id.to_string());
+    }
+
     /// Hide a thread's in-progress turns from the next `reads` `thread/read`
     /// answers, modelling `/stop` landing before the server persisted the turn.
     pub(crate) fn hide_live_turn_for(&self, thread_id: &str, reads: usize) {
@@ -1268,7 +1278,9 @@ where
             if state.silent_thread_read.swap(false, Ordering::SeqCst) {
                 return true;
             }
-            let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            let requested = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+            let substituted = state.read_returns.lock().expect("read returns").take();
+            let thread_id = substituted.as_deref().unwrap_or(requested);
             let hide_live = {
                 let mut hidden = state.hide_live_turns.lock().expect("hidden live turns");
                 match hidden.get_mut(thread_id) {
