@@ -2490,6 +2490,35 @@ mod tests {
         );
     }
 
+    /// The adapter's item kinds reach the card **namespaced** (ADR-0042's
+    /// amendment), so the card's exact-id mapping cannot collide with a
+    /// third-party tool. A bare id leaking out would silently lose the display
+    /// mapping, and this is the only test that holds the adapter side of it.
+    #[test]
+    fn item_kinds_become_namespaced_tool_ids() {
+        let transcript = projected().transcript();
+        let names: Vec<&str> = transcript
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                Part::Tool(call) => Some(call.identity.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for expected in [
+            "codex/command_execution",
+            "codex/file_change",
+            "codex/web_search",
+            "codex/image",
+        ] {
+            assert!(names.contains(&expected), "{expected} missing from {names:?}");
+        }
+        for bare in ["command_execution", "file_change", "web_search", "image"] {
+            assert!(!names.contains(&bare), "bare id leaked: {names:?}");
+        }
+    }
+
     /// Acceptance 2: a mid-turn read is the cache's current state — the applied
     /// delta is there, the turn is live, and a later read keeps it.
     #[test]
