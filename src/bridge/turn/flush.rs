@@ -8,12 +8,17 @@
 
 use std::sync::Arc;
 
+use super::state::CardFallback;
 use super::wake::record_landed_rendered;
 use super::{MAX_CARD_CHAIN, SplitKind, Turn};
 
 use crate::bridge::card_handles::RenderedBlock;
 use crate::bridge::chain::{EndingKey, RenderedCursor, release_spent};
 use crate::bridge::handles::CardsHandle;
+
+/// The visible marker a twice-refused payload leaves on its continuation card
+/// (issue #886): the user must never see a card silently stop updating.
+const CARD_CONTENT_SKIPPED: &str = "⚠️ 部分内容未能显示（飞书拒绝了卡片内容）";
 
 /// A one-shot test gate inside the staged-cursor drain reconcile (spec #561,
 /// review #569): awaited between the delivery check and the confirmation, so a
@@ -30,6 +35,87 @@ pub(crate) struct ReconcileGate {
 /// The same card JSON fails on every retry, so the flush degrades instead.
 fn is_card_content_rejected(e: &crate::error::BridgeError) -> bool {
     matches!(e, crate::error::BridgeError::CardContentRejected { .. })
+}
+
+/// The serialized size and element count of a card body — the two numbers
+/// Feishu's `230099` / `11310` refusal is about (issue #886; #279).
+fn card_payload_metrics(card: &serde_json::Value) -> (usize, usize) {
+    let bytes = serde_json::to_string(card).map(|json| json.len()).unwrap_or(0);
+    (bytes, count_card_components(card))
+}
+
+/// Count every tagged element in a card body, recursively: the component count
+/// Feishu's `11310` guards, measured on the REAL payload rather than the
+/// splitter's estimate.
+fn count_card_components(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            usize::from(map.contains_key("tag")) + map.values().map(count_card_components).sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_card_components).sum(),
+        _ => 0,
+    }
+}
+
+/// Log a rejected payload with the facts the next diagnosis needs (issue
+/// #886): the transition, the exact size and component count, and the slice.
+fn log_card_rejection(
+    session_id: &str,
+    error: &crate::error::BridgeError,
+    transition: &str,
+    card: &serde_json::Value,
+    from: usize,
+    to: usize,
+) {
+    let (bytes, components) = card_payload_metrics(card);
+    tracing::warn!(
+        "Card update failed: {error} ({transition}; session {session_id}; {bytes} bytes, {components} components, slice {from}..{to})"
+    );
+}
+
+/// Abandon a payload Feishu refused twice (plain and fenced) instead of
+/// suspending the card for the rest of the Turn (issue #886): skip the refused
+/// slice, leave one visible marker on the next card, reset the fallback and let
+/// the chain continue on a NEW card. The tracked card keeps its last delivered
+/// body — the refused PATCH never changed it.
+///
+/// Returns `false` when the payload carried no timeline content and nothing new
+/// arrived: the card shell itself was refused, so a new card cannot help. The
+/// caller keeps the conservative refusal, and the next flush retries from a
+/// clean fallback rather than staying suspended forever.
+async fn abandon_rejected_payload(
+    cards: &CardsHandle,
+    session_id: &str,
+    slice_from: usize,
+    slice_end: usize,
+) -> bool {
+    let mut live = cards.cards.lock().await;
+    let Some(card) = live.get_mut(session_id) else {
+        return false;
+    };
+    let dropped = slice_end > slice_from;
+    let newer = card.acc.timeline_len() > slice_end;
+    if !dropped && !newer {
+        return false;
+    }
+    if !card.acc.note_card_abandonment() {
+        return false;
+    }
+    card.acc.skip_rejected_slice(slice_end);
+    card.acc.push_receipt_at(None, CARD_CONTENT_SKIPPED);
+    card.acc.reset_card_fallback();
+    card.card_is_live = false;
+    true
+}
+
+/// Return a delivered write's card to the plain renderer (issue #886): the
+/// fenced fallback covers the payload Feishu refused, never the ones after it.
+async fn reset_card_fallback(cards: &CardsHandle, session_id: &str) {
+    let mut live = cards.cards.lock().await;
+    if let Some(card) = live.get_mut(session_id) {
+        card.acc.reset_card_fallback();
+        card.acc.clear_card_abandonments();
+    }
 }
 
 /// The card-handle registry record of `span`'s block, or `None` for a resolved
@@ -520,16 +606,28 @@ pub(super) async fn flush_card_locked(
         (
             card.pending_split.clone(),
             card.card_is_live,
-            card.acc.card_fallback() == crate::bridge::turn::state::CardFallback::Suspended,
+            card.acc.card_fallback() == CardFallback::Suspended,
         )
     };
     if suspended {
-        // The fenced fallback was rejected too: the card cannot be delivered,
-        // and re-PATCHing it on every poll would only hammer the API. Nothing
-        // will ever be written for its payloads — a permanent refusal for the
-        // caller's record gate (review, PR #595) and for the notice (#607).
-        set_ending_write(cards, session_id, super::state::EndingWrite::Failed).await;
-        return FlushOutcome::Refused;
+        // A yielded card's ledger-only refresh (`Forbid`, ADR-0060) must never
+        // post a new card, so a payload it cannot land stays suspended: the
+        // Session Sync pass would otherwise re-PATCH it every tick. The latch
+        // is scoped to this path — the live card (`Allow`) recovers below.
+        if matches!(split_policy, SplitPolicy::Forbid) {
+            set_ending_write(cards, session_id, super::state::EndingWrite::Failed).await;
+            return FlushOutcome::Refused;
+        }
+        // A card left `Suspended` by an earlier flush is not dead (issue #886):
+        // its payload was refused, but the content since then is new, and the
+        // tail that may have caused the refusal can have changed too. Retry
+        // from a clean fallback instead of refusing every later write for the
+        // rest of the Turn.
+        let mut cards = cards.cards.lock().await;
+        if let Some(card) = cards.get_mut(session_id) {
+            tracing::info!("Card fallback recovered after a suspended payload: {session_id}");
+            card.acc.reset_card_fallback();
+        }
     }
     // The writes this flush issues, tracked for its answer (review, PR #595):
     // `wrote` is any delivered or owed write, `refused` any permanent refusal.
@@ -634,7 +732,14 @@ pub(super) async fn flush_card_locked(
                         true
                     }
                     Err(e) => {
-                        tracing::warn!("Card update failed: {}", e);
+                        log_card_rejection(
+                            session_id,
+                            &e,
+                            "update refused",
+                            &built.card,
+                            slice_from,
+                            built.end,
+                        );
                         if is_card_content_rejected(&e) {
                             match advance_card_fallback(cards, session_id).await {
                                 // Feishu refused the content: rebuild the SAME
@@ -648,13 +753,15 @@ pub(super) async fn flush_card_locked(
                                     discard_staged_cursor(cards, session_id, stage).await;
                                     continue;
                                 }
-                                // The fenced retry was rejected too — the card is
-                                // suspended; stop instead of PATCHing forever.
+                                // The fenced retry was rejected too. Abandon the
+                                // PAYLOAD, not the card (issue #886): skip the
+                                // refused slice, leave a visible marker and
+                                // continue the chain on a NEW card, so the rest
+                                // of the Turn stays visible and its ending has a
+                                // card to land on.
                                 FallbackAdvance::Stop => {
-                                    // A suspended ending can never deliver, so a
-                                    // terminal record is spent (never retried).
-                                    // The staged cursor is dropped with it: no
-                                    // later write can carry this body.
+                                    // This body can never confirm: drop its
+                                    // staged cursor (issue #671, ticket #672).
                                     note_cursor_write_failure(
                                         cards,
                                         session_id,
@@ -665,6 +772,25 @@ pub(super) async fn flush_card_locked(
                                         &built.rendered_endings,
                                     )
                                     .await;
+                                    tracing::warn!(
+                                        "Card content fallback: fenced retry refused too; abandoning slice {slice_from}..{} for {session_id}",
+                                        built.end
+                                    );
+                                    if matches!(split_policy, SplitPolicy::Allow)
+                                        && abandon_rejected_payload(cards, session_id, slice_from, built.end)
+                                            .await
+                                    {
+                                        // The tracked card keeps its last
+                                        // delivered body; the chain continues
+                                        // from after the refused slice.
+                                        release_spent(cards, session_id).await;
+                                        card_is_live = false;
+                                        continue;
+                                    }
+                                    // Nothing to skip: the card shell itself was
+                                    // refused. Keep the conservative refusal;
+                                    // the next flush retries from a clean
+                                    // fallback instead of staying suspended.
                                     release_spent(cards, session_id).await;
                                     set_ending_write(cards, session_id, super::state::EndingWrite::Failed)
                                         .await;
@@ -703,6 +829,10 @@ pub(super) async fn flush_card_locked(
                     .await
                     .record(&card_id, &built.card, rendered);
                 if delivered {
+                    // The fenced fallback covered THIS payload only (issue
+                    // #886): a later slice starts from the plain renderer again,
+                    // so one transient rejection cannot fence the whole Turn.
+                    reset_card_fallback(cards, session_id).await;
                     // The confirmed PATCH carries this body's Rendered Cursor
                     // (spec #561): advance the chain's record — only while the
                     // exact stage this write carried is still the staged one.
@@ -835,7 +965,14 @@ pub(super) async fn flush_card_locked(
                         true
                     }
                     Err(e) => {
-                        tracing::warn!("Card update failed: {}", e);
+                        log_card_rejection(
+                            session_id,
+                            &e,
+                            "finalized update refused",
+                            &finalized.card,
+                            slice_from,
+                            finalized.end,
+                        );
                         if is_card_content_rejected(&e) {
                             if matches!(
                                 advance_card_fallback(cards, session_id).await,
@@ -860,12 +997,12 @@ pub(super) async fn flush_card_locked(
                                 discard_staged_cursor(cards, session_id, stage).await;
                                 continue;
                             }
-                            // The fenced retry was rejected too: the card is
-                            // suspended, so stop the chain instead of building the
-                            // next card out of content the platform may refuse too.
-                            // A suspended ending can never deliver, so a terminal
-                            // record is spent (never retried), and its staged
-                            // cursor is dropped with it.
+                            // The fenced retry was rejected too. Abandon the
+                            // finalized slice, not the chain (issue #886): the
+                            // outgoing card keeps its last delivered body, and
+                            // the continuation carries later content (and the
+                            // visible marker) instead of the rest of the Turn
+                            // going dark. A terminal ending still lands there.
                             note_cursor_write_failure(
                                 cards,
                                 session_id,
@@ -876,7 +1013,19 @@ pub(super) async fn flush_card_locked(
                                 &finalized.rendered_endings,
                             )
                             .await;
+                            tracing::warn!(
+                                "Card content fallback: fenced retry refused too; abandoning finalized slice {slice_from}..{} for {session_id}",
+                                finalized.end
+                            );
                             release_spent(cards, session_id).await;
+                            if matches!(split_policy, SplitPolicy::Allow)
+                                && abandon_rejected_payload(cards, session_id, slice_from, finalized.end)
+                                    .await
+                            {
+                                continue;
+                            }
+                            // Nothing to skip: the card shell itself was
+                            // refused. Keep the conservative refusal.
                             cards
                                 .card_handles
                                 .lock()
@@ -918,6 +1067,8 @@ pub(super) async fn flush_card_locked(
                 .await
                 .record(&card_id, &finalized.card, Vec::new());
             if delivered {
+                // The fenced fallback covered THIS payload only (issue #886).
+                reset_card_fallback(cards, session_id).await;
                 // The confirmed PATCH carries this body's Rendered Cursor
                 // (spec #561): advance the chain's record — only while the
                 // exact stage this write carried is still the staged one.
@@ -1029,6 +1180,12 @@ pub(super) async fn flush_card_locked(
                             super::state::EndingWrite::Delivered
                         });
                         card.card_message_id = Some(new_id.clone());
+                        // A new card starts from the plain renderer: the fenced
+                        // fallback covered the outgoing card's payload, not
+                        // this one (issue #886). Its delivery also clears the
+                        // abandonment budget.
+                        card.acc.reset_card_fallback();
+                        card.acc.clear_card_abandonments();
                         // A continuation that fits becomes the live card; one
                         // that is itself over the budget stays finalized and
                         // loops for the next slice.
@@ -1073,7 +1230,14 @@ pub(super) async fn flush_card_locked(
                 // next slice's card.
             }
             Err(e) => {
-                tracing::warn!("Card continuation send failed: {}", e);
+                log_card_rejection(
+                    session_id,
+                    &e,
+                    "continuation create refused",
+                    &built.card,
+                    slice_from,
+                    built.end,
+                );
                 // The create reached no card and is never retried: its staged
                 // cursor is dropped (a fenced retry rebuilds and re-stages).
                 note_cursor_write_failure(
@@ -1086,38 +1250,53 @@ pub(super) async fn flush_card_locked(
                     &built.rendered_endings,
                 )
                 .await;
-                let retry_fenced = is_card_content_rejected(&e)
+                let content_rejected = is_card_content_rejected(&e);
+                let retry_fenced = content_rejected
                     && matches!(
                         advance_card_fallback(cards, session_id).await,
                         FallbackAdvance::RetryFenced
                     );
-                // The failed send's slice reached no card, but its build
-                // already advanced `render_from` past it: restore the
-                // boundary so the retry re-renders the SAME slice instead of
-                // silently skipping it. The equality check keeps a boundary
-                // moved elsewhere (defensive; the card-write lock serializes
-                // flushes) from being rewound.
-                let mut live = cards.cards.lock().await;
-                if let Some(card) = live.get_mut(session_id) {
-                    // The continuation create reached no card: the terminal
-                    // slice never landed, so the notice must be suppressed
-                    // (#607). A fenced retry overwrites this on its next send.
-                    card.acc.set_ending_write(super::state::EndingWrite::Failed);
-                    card.acc.restore_render_boundary(slice_from, slice_to);
-                }
-                drop(live);
                 if retry_fenced {
-                    // Retry the same slice once, fenced; a second rejection
-                    // falls through to the plain retry-next-flush path. This
-                    // failed create's stage can never confirm — the fenced
+                    // The failed send's slice reached no card, but its build
+                    // already advanced `render_from` past it: restore the
+                    // boundary so the retry re-renders the SAME slice instead
+                    // of silently skipping it. The equality check keeps a
+                    // boundary moved elsewhere (defensive; the card-write lock
+                    // serializes flushes) from being rewound. The retry
+                    // overwrites the Failed mark on its next send.
+                    let mut live = cards.cards.lock().await;
+                    if let Some(card) = live.get_mut(session_id) {
+                        card.acc.set_ending_write(super::state::EndingWrite::Failed);
+                        card.acc.restore_render_boundary(slice_from, slice_to);
+                    }
+                    drop(live);
+                    // This failed create's stage can never confirm — the fenced
                     // rebuild stages its own — so drop it (issue #671, ticket
                     // #672).
                     discard_staged_cursor(cards, session_id, stage).await;
                     continue;
                 }
+                if content_rejected
+                    && matches!(split_policy, SplitPolicy::Allow)
+                    && abandon_rejected_payload(cards, session_id, slice_from, built.end).await
+                {
+                    // The fenced retry was refused too: abandon the slice and
+                    // let the chain continue on the next slice's card (issue
+                    // #886) instead of leaving the rest of the Turn invisible.
+                    continue;
+                }
                 // A create is never outbox-retried (ADR-0067), so a failed one
                 // proves no write landed here: the slice stays owed to a later
                 // flush, never accepted (review, PR #595).
+                let mut live = cards.cards.lock().await;
+                if let Some(card) = live.get_mut(session_id) {
+                    // The continuation create reached no card: the terminal
+                    // slice never landed, so the notice must be suppressed
+                    // (#607).
+                    card.acc.set_ending_write(super::state::EndingWrite::Failed);
+                    card.acc.restore_render_boundary(slice_from, slice_to);
+                }
+                drop(live);
                 return flush_outcome(wrote, refused);
             }
         }
@@ -1370,8 +1549,8 @@ mod tests {
         let cards = app.cards.lock().await;
         assert_eq!(
             cards.get("ses_test").unwrap().acc.card_fallback(),
-            CardFallback::Fenced,
-            "the fallback is sticky for the turn"
+            CardFallback::None,
+            "a delivered fenced write resets the fallback: it covered ONE payload, not the turn (#886)"
         );
     }
 
@@ -1471,26 +1650,25 @@ mod tests {
                 .unwrap()
                 .acc
                 .card_fallback(),
-            CardFallback::Fenced
+            CardFallback::None,
+            "the delivered create resets the fallback for the new card (#886)"
         );
     }
 
-    /// A terminal card whose ending Feishu permanently refuses — rejected
-    /// plain, then rejected fenced — can never deliver, so its durable record
-    /// is spent there and then: nothing is owed a reap, and the suspended card
-    /// is never PATCHed again. This is the suspended-ending half of ADR-0067's
-    /// release rule (the recoverable-failure half keeps the record until the
-    /// outbox drains).
+    /// A terminal ending Feishu refuses twice is abandoned with its slice, not
+    /// suppressed (issue #886): the chain continues on a NEW card that carries
+    /// the ending, so the completion notice still has a delivered terminal
+    /// write to gate on. The old record is re-pointed to the continuation.
     #[tokio::test]
-    async fn a_suspended_terminal_ending_spends_the_record() {
+    async fn a_refused_terminal_ending_continues_on_a_new_card() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         {
             let mut cards = app.cards.lock().await;
-            cards
-                .get_mut("ses_test")
-                .unwrap()
-                .acc
-                .set_card_state(CardState::Done);
+            let acc = &mut cards.get_mut("ses_test").unwrap().acc;
+            acc.set_card_state(CardState::Done);
+            // The Turn's own message scopes the durable record a continuation
+            // re-points (`track_continuation_card`).
+            acc.set_cola_message_id("msg_1");
         }
         app.cards_handle().chains.track(
             "ses_test",
@@ -1511,26 +1689,46 @@ mod tests {
             2,
             "the plain attempt and the fenced one only"
         );
-        assert_eq!(
-            app.cards
-                .lock()
-                .await
-                .get("ses_test")
-                .unwrap()
-                .acc
-                .card_fallback(),
-            CardFallback::Suspended
+        // The ending is not suppressed: the continuation carries it, so the
+        // completion notice has a delivered terminal write to gate on.
+        let continuation = sent_cards(&platform)
+            .await
+            .pop()
+            .expect("the refused ending continues on a new card");
+        assert!(
+            card_text(&continuation).contains("部分内容未能显示"),
+            "the continuation names the dropped content: {continuation}"
         );
         assert!(
-            app.cards_handle().chains.get("ses_test").is_none(),
-            "a permanently refused ending spends the record"
+            app.cards_handle().chains.get("ses_test").is_some(),
+            "the ending's record follows the continuation"
+        );
+        let cards = app.cards.lock().await;
+        let card = cards.get("ses_test").unwrap();
+        assert_eq!(
+            card.card_message_id.as_deref(),
+            Some("msg_reply"),
+            "the continuation is the tracked card"
+        );
+        assert_eq!(
+            card.acc.ending_write(),
+            EndingWrite::Delivered,
+            "the continuation delivered the terminal slice"
+        );
+        assert_eq!(
+            card.acc.card_fallback(),
+            CardFallback::None,
+            "the new card starts from the plain renderer"
         );
     }
 
-    /// A second rejection means fencing cannot help: the card is suspended, and a
-    /// later flush makes no further PATCH attempts (no API hammering).
+    /// Two rejections in one flush abandon the PAYLOAD, not the card (issue
+    /// #886): the refused slice is skipped with a visible marker and the chain
+    /// continues on a NEW card, so the rest of the Turn stays visible and its
+    /// ending has a card to land on. The tracked card keeps its last delivered
+    /// body, and a later flush writes the new card, not the refused one.
     #[tokio::test]
-    async fn a_second_rejection_suspends_the_card() {
+    async fn a_second_rejection_continues_on_a_new_card() {
         let (app, platform) = app_with_live_card("回答 <number_tag> 里。").await;
         platform
             .fail_update_card_content_count
@@ -1542,23 +1740,122 @@ mod tests {
             2,
             "the plain attempt and the fenced one only"
         );
-        assert_eq!(
-            app.cards
-                .lock()
-                .await
-                .get("ses_test")
-                .unwrap()
-                .acc
-                .card_fallback(),
-            CardFallback::Suspended
+        let continuation = sent_cards(&platform)
+            .await
+            .pop()
+            .expect("the refused payload continues on a new card");
+        assert!(
+            card_text(&continuation).contains("部分内容未能显示"),
+            "the continuation names the dropped content: {continuation}"
+        );
+        {
+            let cards = app.cards.lock().await;
+            let card = cards.get("ses_test").unwrap();
+            assert_eq!(
+                card.card_message_id.as_deref(),
+                Some("msg_reply"),
+                "the continuation is the tracked card"
+            );
+            assert_eq!(
+                card.acc.card_fallback(),
+                CardFallback::None,
+                "the new card starts from the plain renderer"
+            );
+        }
+        assert!(
+            !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+            "a refused payload never suspends the turn's card"
         );
 
-        // A later poll must not PATCH the suspended card again.
+        // A later flush writes the continuation; the refused card is left as
+        // it was, with its last delivered body.
         Turn::flush_card(&app.cards_handle(), "ses_test").await;
         assert_eq!(
             patches_to(&platform, "om_live").await.len(),
             2,
-            "a suspended card is not retried on later flushes"
+            "the refused card is not PATCHed again"
+        );
+        assert_eq!(
+            patches_to(&platform, "msg_reply").await.len(),
+            1,
+            "the continuation receives the later flush"
+        );
+    }
+
+    /// A card whose SHELL is refused has nothing to skip, so it keeps the
+    /// conservative refusal — but not permanently (issue #886): the next flush
+    /// retries from a clean fallback instead of staying suspended forever.
+    #[tokio::test]
+    async fn a_shell_refusal_is_retried_on_a_later_flush() {
+        let (app, platform) = app_with_session().await;
+        {
+            let mut acc = StreamAccumulator::new("回合");
+            acc.set_card_state(CardState::Streaming);
+            acc.set_reply_target(Some("msg_1".into()));
+            app.cards
+                .lock()
+                .await
+                .insert("ses_test".into(), CardSession::new(acc, Some("om_live".into())));
+        }
+        platform
+            .fail_update_card_content_count
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+        assert_eq!(
+            patches_to(&platform, "om_live").await.len(),
+            2,
+            "the plain attempt and the fenced one only"
+        );
+        assert!(
+            Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+            "nothing was skipped, so the card keeps the conservative refusal"
+        );
+
+        // The next flush starts from `None` and tries again (the refusal
+        // counter is spent): the card is not dead for the rest of the Turn.
+        Turn::flush_card(&app.cards_handle(), "ses_test").await;
+        assert_eq!(
+            patches_to(&platform, "om_live").await.len(),
+            3,
+            "a suspended card is retried, never refused forever"
+        );
+    }
+
+    /// The rejection log's metrics are measured on the REAL payload (issue
+    /// #886): nested panels, buttons and images all count.
+    #[test]
+    fn the_rejection_metrics_count_every_nested_element() {
+        let card = serde_json::json!({
+            "header": { "title": { "tag": "markdown", "content": "hi" } },
+            "body": { "elements": [
+                { "tag": "collapsible_panel", "elements": [
+                    { "tag": "markdown", "content": "a" },
+                    { "tag": "img", "img_key": "k" }
+                ]},
+                { "tag": "button" }
+            ]}
+        });
+        let (bytes, components) = super::card_payload_metrics(&card);
+        assert_eq!(components, 5, "every tagged element counts: {card}");
+        assert_eq!(bytes, serde_json::to_string(&card).unwrap().len());
+    }
+
+    /// The abandonment budget bounds the continuation cards a broken card can
+    /// post (issue #886); a delivered write restores it.
+    #[test]
+    fn the_abandonment_budget_bounds_the_continuation_cards() {
+        let mut acc = StreamAccumulator::new("回合");
+        assert!(acc.note_card_abandonment());
+        assert!(acc.note_card_abandonment());
+        assert!(
+            !acc.note_card_abandonment(),
+            "a broken shell cannot spam a new card every flush"
+        );
+        acc.clear_card_abandonments();
+        assert!(
+            acc.note_card_abandonment(),
+            "a delivered write restores the budget"
         );
     }
 

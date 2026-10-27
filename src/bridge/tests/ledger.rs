@@ -1812,22 +1812,21 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
             completed_at: Some(now - 1_000),
         },
     )];
-    // Feishu refuses the content of both the plain write and the fenced retry.
-    platform.fail_update_card_content_count.store(2, Ordering::SeqCst);
+    // Feishu permanently refuses every write (a semantic refusal, not a
+    // content rejection): the carrier never lands, so the entry stays owed.
+    platform.fail_update_count.store(100, Ordering::SeqCst);
 
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
         .unwrap();
 
-    // The card is suspended exactly as before: two attempts, then no more.
     assert!(
-        Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
-        "the doubly-refused card suspends"
+        !Turn::card_is_suspended(&app.cards_handle(), "ses_test").await,
+        "a refused payload never suspends the turn's card"
     );
-    assert_eq!(
-        patches_to(&platform, "msg_reply").await.len(),
-        2,
-        "the plain attempt and the fenced one only"
+    assert!(
+        !patches_to(&platform, "msg_reply").await.is_empty(),
+        "the carrier was attempted (and refused)"
     );
     // The process-local overlay and the ending's shown bit keep the accepted-
     // write gate (ADR-0073, PR #595): the entry never reached a card, so the bit
@@ -1874,7 +1873,7 @@ async fn a_permanently_refused_retirement_write_leaves_the_entry_owed() {
     // ... and the next card that CAN render it claims it exactly once: a new
     // Turn on the same session still reads the live task, the runtime still
     // confirms the end, and this accepted write lands the entry.
-    platform.fail_update_card_content_count.store(0, Ordering::SeqCst);
+    platform.fail_update_count.store(0, Ordering::SeqCst);
     // Name the refused card, so its updates cannot be confused with the
     // successor's (the harness serves one id per send).
     Turn::set_card_message_id(&app.cards_handle(), "ses_test", "om_refused").await;
@@ -6824,9 +6823,9 @@ async fn a_restart_renders_the_owed_ending_the_read_no_longer_derives() {
     let now = chrono::Utc::now().timestamp_millis();
     let live = waiting_shell(now - 5_000);
     let (dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
-    // Life 1: the runtime confirms the shell ended, but both the plain write
-    // and its fenced retry are refused — the card suspends and the entry never
-    // lands. The ending is recorded at derivation all the same.
+    // Life 1: the runtime confirms the shell ended, but the write is
+    // permanently refused — the entry never lands. The ending is recorded at
+    // derivation all the same.
     backend.task_runtime.lock().unwrap().shells = vec![(
         "sh_call_bg".into(),
         ShellRuntime::Ended {
@@ -6834,7 +6833,7 @@ async fn a_restart_renders_the_owed_ending_the_read_no_longer_derives() {
             completed_at: Some(now - 1_000),
         },
     )];
-    platform.fail_update_card_content_count.store(2, Ordering::SeqCst);
+    platform.fail_update_count.store(100, Ordering::SeqCst);
     Turn::run(&app.turn_handles(), ctx("ses_test", "跑一下构建并审阅"))
         .await
         .unwrap();

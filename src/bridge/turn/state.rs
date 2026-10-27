@@ -503,6 +503,11 @@ pub(super) enum TimelineKind {
 pub(super) struct BuiltCard {
     pub(super) card: serde_json::Value,
     pub(super) full: bool,
+    /// The timeline index this body rendered up to (exclusive). A content
+    /// rejection skips exactly this slice before the chain continues on a new
+    /// card (issue #886), so the flush never re-renders content Feishu already
+    /// refused.
+    pub(super) end: usize,
     pub(super) spans: Vec<crate::bridge::card_handles::BlockSpan>,
     /// The Rendered Cursor this body delivers (spec #561): the frontier of the
     /// newest text/reasoning part it renders and the tool ids whose delivered
@@ -927,9 +932,11 @@ pub(super) enum HeaderPhase {
 
 /// How a turn's card handles a Feishu content rejection (`230099`).
 ///
-/// A rejected card fails on every retry — the platform refuses the same JSON
+/// A rejected PAYLOAD fails on every retry — the platform refuses the same JSON
 /// forever — so the flush escalates through these states instead of
-/// re-PATCHing the rejected content.
+/// re-PATCHing the rejected content. The state covers ONE payload, not the
+/// whole Turn (issue #886): a delivered write resets it to [`Self::None`], so
+/// a later slice with different content starts from the plain renderer again.
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum CardFallback {
     /// Normal rendering: model markdown is sanitized for the card parser.
@@ -938,9 +945,12 @@ pub(super) enum CardFallback {
     /// Feishu rejected the card once: every model-markdown element renders as
     /// a fenced code block — the one form the parser accepts unconditionally.
     Fenced,
-    /// The fenced card was rejected too: the same content cannot start
-    /// succeeding, so the flush stops PATCHing this card instead of retrying
-    /// it on every poll.
+    /// The fenced card was rejected too. The payload is abandoned rather than
+    /// the card: a live flush skips the refused slice (with a visible marker)
+    /// and continues on a new card, and the next flush starts from
+    /// [`Self::None`]. A yielded card's ledger-only refresh (`Forbid`, ADR-0060)
+    /// must never post a new card, so it keeps the latch and the projection
+    /// path keeps it to stop its own retry loop.
     Suspended,
 }
 
@@ -950,6 +960,13 @@ impl CardFallback {
         matches!(self, Self::Fenced | Self::Suspended)
     }
 }
+
+/// How many consecutive payloads one Turn may abandon after Feishu refused
+/// them twice (issue #886). A card whose SHELL is refused would otherwise post
+/// a fresh warning card on every flush; two gives a transient tail a second
+/// chance without turning a broken card into a card-spam loop. A delivered
+/// write clears the budget.
+const MAX_CARD_ABANDONMENTS: u8 = 2;
 
 /// A retry's render baseline (#387, restated by spec #391 and the
 /// generation-aware correction). It keeps the failed attempt's messages out of
@@ -1121,6 +1138,11 @@ pub(super) struct StreamAccumulator {
     /// advanced by [`Self::advance_card_fallback`] and reset to `None` by
     /// [`Self::continue_on_new_card`]; read through [`Self::card_fallback`].
     card_fallback: CardFallback,
+    /// How many payloads this Turn has abandoned after Feishu refused them
+    /// twice (issue #886). Bounds the continuation cards one Turn can post when
+    /// the refusal is the card's own shell rather than its content: cleared by
+    /// any delivered write, never by an abandonment.
+    card_abandonments: u8,
     /// The fate of the write carrying this card's flush's **terminal slice**
     /// (spec #602, ticket #607). The Completion Notice reads it: [`EndingWrite::Delivered`]
     /// announces at once, [`EndingWrite::Owed`] arms against that exact
@@ -2501,7 +2523,12 @@ impl StreamAccumulator {
     /// Advance the fallback after Feishu refused a body, returning whether the
     /// retry should be attempted: a card not yet fenced goes `None → Fenced`
     /// (`true`, retry the same body fenced); an already-fenced or suspended card
-    /// goes to `Suspended` (`false`, stop).
+    /// goes to `Suspended` (`false`, stop retrying THIS body).
+    ///
+    /// `false` is not a verdict on the card: a live flush abandons the refused
+    /// slice and continues on a new card, and the next delivered write (or the
+    /// next live flush) resets the state to [`CardFallback::None`] (issue #886).
+    /// The `Forbid` refresh and the projection path keep it as their stop.
     pub(super) fn advance_card_fallback(&mut self) -> bool {
         match self.card_fallback {
             CardFallback::None => {
@@ -2513,6 +2540,47 @@ impl StreamAccumulator {
                 false
             }
         }
+    }
+
+    /// Return the fallback to the plain renderer: the payload that needed the
+    /// fenced form is behind us (a delivered write), or the chain is starting
+    /// over on a new card after a refused one (issue #886). Private to this
+    /// module: the flush is the only writer.
+    pub(super) fn reset_card_fallback(&mut self) {
+        self.card_fallback = CardFallback::None;
+    }
+
+    /// Whether this Turn may abandon another refused payload (issue #886): at
+    /// most [`MAX_CARD_ABANDONMENTS`] consecutive continuations without a
+    /// delivered write. A card whose SHELL is refused would otherwise post a
+    /// fresh warning card on every flush.
+    pub(super) fn note_card_abandonment(&mut self) -> bool {
+        if self.card_abandonments >= MAX_CARD_ABANDONMENTS {
+            return false;
+        }
+        self.card_abandonments = self.card_abandonments.saturating_add(1);
+        true
+    }
+
+    /// A delivered write clears the abandonment budget (issue #886): the card
+    /// the chain is on now accepts content, so a later refusal is a new fact.
+    pub(super) fn clear_card_abandonments(&mut self) {
+        self.card_abandonments = 0;
+    }
+
+    /// Skip the timeline slice `end` past the refused content (issue #886): the
+    /// next build starts after it, so the same refused payload is never
+    /// re-rendered on this card. Never rewinds a boundary already advanced.
+    pub(super) fn skip_rejected_slice(&mut self, end: usize) {
+        if end > self.render_from {
+            self.render_from = end;
+        }
+    }
+
+    /// How many timeline entries the accumulator holds — the flush's
+    /// "did anything arrive while the refused write was in flight" probe.
+    pub(super) fn timeline_len(&self) -> usize {
+        self.timeline.len()
     }
 
     /// The fate of the write carrying this flush's terminal slice (spec #602).
@@ -2564,6 +2632,7 @@ impl StreamAccumulator {
         self.release_recovery_claim();
         self.mark_wake_continuation();
         self.card_fallback = CardFallback::None;
+        self.card_abandonments = 0;
         self.card_state = CardState::Loading;
         // The previous phase ended with the card; `refresh_phase` only resets
         // on a change, so clear first for a fresh timer.
@@ -4142,6 +4211,7 @@ impl StreamAccumulator {
         BuiltCard {
             card,
             full,
+            end: split,
             spans,
             cursor,
             gap,
@@ -4171,6 +4241,7 @@ impl StreamAccumulator {
         BuiltCard {
             card,
             full: false,
+            end,
             spans,
             cursor,
             gap,
@@ -4201,6 +4272,7 @@ impl StreamAccumulator {
         BuiltCard {
             card: built.0,
             full: false,
+            end,
             spans: built.1,
             cursor: built.2,
             gap: built.3,
