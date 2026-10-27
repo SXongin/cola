@@ -319,7 +319,15 @@ works). Three consequences of that shape:
   thread read; the picker reads the thread each time, so it is always current.
   `model/rerouted` is the notification that would close that gap if it ever
   matters; not adopted here.
-- With no thread model on the wire, nothing is shown. Filling it from
+- **What silence means depends on where the fact came from**, and the
+  projection stores the source for exactly that reason. An absent (or null —
+  indistinguishable on the wire) `model` is not evidence that the model
+  changed: it drops a name the server itself gave earlier, because an old name
+  would claim the wrong model answered, but it never erases a model cola sent
+  on an accepted `turn/start` — a server that omits the field must not undo
+  the user's own pick. A reported model always wins over either, so a peer's
+  switch lands on the next read.
+- With no thread model ever named, nothing is shown. Filling it from
   `~/.codex/config.toml` would be a different read (`config/read`) and is left
   out: a fact cola does not have must not be presented as the server's.
 
