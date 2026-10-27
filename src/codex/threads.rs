@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::backend::types::{SessionListInfo, SessionTime};
+use crate::config::{ApprovalPolicy, SandboxMode};
 
 use super::error::{CodexError, Result};
 use super::transport::{Inbound, RpcConnection};
@@ -271,6 +272,61 @@ struct UnsubscribeResponse {
     status: UnsubscribeStatus,
 }
 
+/// The per-thread sandbox and approval policy cola asks the daemon to apply
+/// (issue #898). Both are optional: an unset one sends nothing, so the daemon's
+/// own default stays in force — the behaviour before this existed.
+///
+/// This is the **only** lever in the released schema: named permission profiles
+/// (`[permissions.<name>]`, defined in the daemon's own config — the middle
+/// ground where `.git`/`.codex` are writable while the rest stays sandboxed) are
+/// not client-schema fields, so cola cannot select one. Mutating the daemon's
+/// config instead is not cola's to do: the daemon is shared, may be started by
+/// the user's own client, and carries their provider tokens.
+///
+/// Both fields are in the **pinned** 0.163 `ThreadStartParams` and
+/// `ThreadResumeParams` (checked with `codex-cli 0.163.0 app-server
+/// generate-json-schema`), with the same value sets, so no version gate guards
+/// them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ThreadSettings {
+    /// `thread/start`'s `sandbox`.
+    pub(crate) sandbox: Option<SandboxMode>,
+    /// `thread/start`'s `approvalPolicy`.
+    pub(crate) approval_policy: Option<ApprovalPolicy>,
+    /// Whether `thread/resume` carries them too (`apply_on_adopt`). Off by
+    /// default: an adopted thread may be shared with the user's own
+    /// TUI/VSCode, and a silent override would change their session as well.
+    pub(crate) apply_on_adopt: bool,
+}
+
+impl ThreadSettings {
+    /// Merge the pair into a request's params. `adopt` is true for
+    /// `thread/resume`, the opt-in path.
+    fn merge(self, params: &mut Value, adopt: bool) {
+        if adopt && !self.apply_on_adopt {
+            return;
+        }
+        if let Some(sandbox) = self.sandbox {
+            params["sandbox"] = json!(sandbox.as_str());
+        }
+        if let Some(policy) = self.approval_policy {
+            params["approvalPolicy"] = json!(policy.as_str());
+        }
+    }
+}
+
+impl From<&crate::config::CodexConfig> for ThreadSettings {
+    /// The active client's options are the source: the same three keys the
+    /// file spells are the ones the thread requests carry.
+    fn from(config: &crate::config::CodexConfig) -> Self {
+        Self {
+            sandbox: config.sandbox,
+            approval_policy: config.approval_policy,
+            apply_on_adopt: config.apply_on_adopt,
+        }
+    }
+}
+
 /// The thread surface over one attached connection.
 #[derive(Clone)]
 pub(crate) struct Threads {
@@ -279,6 +335,9 @@ pub(crate) struct Threads {
     /// not by [`Threads`], so a subscription taken from a client that is later
     /// dropped still receives its stream.
     registry: Arc<Registry>,
+    /// The sandbox/approval overrides this client's threads are asked to run
+    /// under (issue #898); `Default` sends nothing.
+    settings: ThreadSettings,
 }
 
 impl std::fmt::Debug for Threads {
@@ -290,9 +349,13 @@ impl std::fmt::Debug for Threads {
 impl Threads {
     /// Start the dispatcher over an attached connection. One per
     /// [`super::CodexClient`]; the client owns it for its lifetime.
-    pub(crate) fn new(connection: RpcConnection) -> Self {
+    pub(crate) fn new(connection: RpcConnection, settings: ThreadSettings) -> Self {
         let registry = Registry::start(connection.clone());
-        Self { connection, registry }
+        Self {
+            connection,
+            registry,
+            settings,
+        }
     }
 
     /// The connection's newest inbound notification sequence — the page
@@ -437,11 +500,15 @@ impl Threads {
     /// Start a new thread (`thread/start`). The server assigns the thread id;
     /// `cwd` scopes it to the session's directory when the caller has one.
     /// The response is the same [`Thread`] `thread/read` returns.
+    ///
+    /// The configured `sandbox`/`approvalPolicy` ride along: cola creates this
+    /// thread, so it owns the choice (issue #898). Unset sends nothing.
     pub(crate) async fn start(&self, cwd: Option<&str>) -> Result<Thread> {
         let mut params = json!({});
         if let Some(cwd) = cwd {
             params["cwd"] = json!(cwd);
         }
+        self.settings.merge(&mut params, false);
         let result = self.connection.request("thread/start", params).await?;
         let response: ReadResponse = decode("thread/start", result)?;
         Ok(response.thread)
@@ -450,6 +517,10 @@ impl Threads {
     /// Adopt a thread: `thread/resume` is the subscription (ADR-0090's
     /// amendment, question 2). The receiver is registered **before** the call,
     /// so a turn that starts while the response is in flight is not lost.
+    ///
+    /// The sandbox/approval overrides ride along only when the client opted in
+    /// (`apply_on_adopt`): a resumed thread may be shared with the user's own
+    /// client, so adopting alone must not change their session (issue #898).
     pub(crate) async fn adopt(&self, thread_id: &str) -> Result<Adoption> {
         // The holder is counted before the await and released by `guard`'s
         // `Drop` on every exit that does not hand it to a returned
@@ -463,10 +534,9 @@ impl Threads {
             released: false,
         };
         let events = self.registry.subscribe(thread_id);
-        let result = self
-            .connection
-            .request("thread/resume", json!({ "threadId": thread_id }))
-            .await;
+        let mut params = json!({ "threadId": thread_id });
+        self.settings.merge(&mut params, true);
+        let result = self.connection.request("thread/resume", params).await;
 
         match result {
             Ok(result) => {
@@ -763,6 +833,99 @@ mod tests {
         CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
             .await
             .expect("attach to the scripted app-server")
+    }
+
+    async fn connect_with(url: &str, settings: ThreadSettings) -> CodexClient {
+        let endpoint = Endpoint::parse(url).expect("endpoint");
+        CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(settings),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach to the scripted app-server")
+    }
+
+    /// Issue #898: cola creates the thread, so the configured pair rides on
+    /// `thread/start` — exactly the values the file spelled, not a default.
+    #[tokio::test]
+    async fn thread_start_carries_the_configured_sandbox_and_approval_policy() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let client = connect_with(
+            &url,
+            ThreadSettings {
+                sandbox: Some(SandboxMode::DangerFullAccess),
+                approval_policy: Some(ApprovalPolicy::OnRequest),
+                apply_on_adopt: false,
+            },
+        )
+        .await;
+
+        let thread = client.threads().start(Some("/work/cola")).await.expect("start");
+
+        assert_eq!(thread.cwd, "/work/cola");
+        let params = server.start_params();
+        assert_eq!(params.len(), 1, "one thread/start: {params:?}");
+        assert_eq!(params[0]["cwd"], "/work/cola");
+        assert_eq!(params[0]["sandbox"], "danger-full-access");
+        assert_eq!(params[0]["approvalPolicy"], "on-request");
+    }
+
+    /// Unset means "send nothing": the daemon's own default stays in force, so
+    /// a client that did not opt in behaves exactly as before #898.
+    #[tokio::test]
+    async fn thread_start_sends_no_overrides_when_they_are_unset() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let client = connect(&url).await;
+
+        client.threads().start(Some("/work/cola")).await.expect("start");
+
+        let params = server.start_params();
+        assert_eq!(params.len(), 1, "one thread/start: {params:?}");
+        assert_eq!(params[0], json!({ "cwd": "/work/cola" }));
+    }
+
+    /// Adopting a thread may take it away from the user's own client, so the
+    /// overrides are opt-in on `thread/resume` (issue #898): off means the
+    /// request carries only the thread id.
+    #[tokio::test]
+    async fn thread_resume_carries_the_overrides_only_when_opted_in() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+
+        let overrides = ThreadSettings {
+            sandbox: Some(SandboxMode::DangerFullAccess),
+            approval_policy: Some(ApprovalPolicy::Never),
+            apply_on_adopt: false,
+        };
+        let client = connect_with(&url, overrides).await;
+        let Adoption::Subscribed(_first) = client.threads().adopt("thread-1").await.expect("adopt") else {
+            panic!("must subscribe");
+        };
+        assert_eq!(
+            server.resume_params(),
+            vec![json!({ "threadId": "thread-1" })],
+            "adopting alone must not reconfigure a shared thread"
+        );
+
+        // A second connection with the opt-in sends the same pair.
+        let opted_in = ThreadSettings {
+            apply_on_adopt: true,
+            ..overrides
+        };
+        let second = connect_with(&url, opted_in).await;
+        let Adoption::Subscribed(_second) = second.threads().adopt("thread-1").await.expect("adopt") else {
+            panic!("must subscribe");
+        };
+        let params = server.resume_params();
+        assert_eq!(params.len(), 2, "two resumes: {params:?}");
+        assert_eq!(params[1]["threadId"], "thread-1");
+        assert_eq!(params[1]["sandbox"], "danger-full-access");
+        assert_eq!(params[1]["approvalPolicy"], "never");
     }
 
     /// Ticket #878 acceptance 1: the list is scoped to the directory, shows

@@ -419,6 +419,10 @@ struct State {
     model_list_calls: AtomicUsize,
     /// The page size `thread/list` uses when the caller sends no `limit`.
     page_size: usize,
+    /// Every `thread/start` request's params, in send order (issue #898).
+    start_params: std::sync::Mutex<Vec<Value>>,
+    /// Every `thread/resume` request's params, in send order.
+    resume_params: std::sync::Mutex<Vec<Value>>,
     /// Server-initiated requests the fake server broadcast, in send order.
     server_requests: std::sync::Mutex<Vec<ServerRequest>>,
     /// Every answer a client sent to one of them.
@@ -476,6 +480,8 @@ impl Default for State {
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             model_list_calls: AtomicUsize::new(0),
             page_size: 2,
+            start_params: std::sync::Mutex::new(Vec::new()),
+            resume_params: std::sync::Mutex::new(Vec::new()),
             server_requests: std::sync::Mutex::new(Vec::new()),
             server_request_replies: std::sync::Mutex::new(Vec::new()),
             next_server_request: AtomicUsize::new(1000),
@@ -752,6 +758,16 @@ impl FakeServer {
     /// Every `thread/list` params object, in call order.
     pub(crate) fn list_params(&self) -> Vec<Value> {
         self.state.list_params.lock().expect("list params").clone()
+    }
+
+    /// Every `thread/start` params object, in call order (issue #898).
+    pub(crate) fn start_params(&self) -> Vec<Value> {
+        self.state.start_params.lock().expect("start params").clone()
+    }
+
+    /// Every `thread/resume` params object, in call order.
+    pub(crate) fn resume_params(&self) -> Vec<Value> {
+        self.state.resume_params.lock().expect("resume params").clone()
     }
 
     /// Leave the next `thread/resume` unanswered (the connection stays open),
@@ -1191,6 +1207,11 @@ where
             replying(sink, id, list_threads(state, &params)).await
         }
         Some("thread/start") => {
+            state
+                .start_params
+                .lock()
+                .expect("start params")
+                .push(params.clone());
             let cwd = params
                 .get("cwd")
                 .and_then(Value::as_str)
@@ -1623,6 +1644,11 @@ where
         }
         Some("thread/resume") => {
             state.resume_calls.fetch_add(1, Ordering::SeqCst);
+            state
+                .resume_params
+                .lock()
+                .expect("resume params")
+                .push(params.clone());
             if state.silent_resume.swap(false, Ordering::SeqCst) {
                 return true;
             }

@@ -227,6 +227,9 @@ start_server = "auto"            # auto (default) | never | eager
 # `[opencode]` is already the implicit Agent Client `default` — leave its name alone.
 [clients.ada]
 kind = "codex"                   # required: opencode | codex
+# sandbox = "danger-full-access" # optional: read-only | workspace-write | danger-full-access
+# approval_policy = "on-request" # optional: untrusted | on-request | never
+# apply_on_adopt = false         # optional: also send the pair on thread/resume
 
 [bridge]
 default_client = "ada"           # which Agent Client is active (default: "default")
@@ -247,7 +250,40 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   `[opencode]` does. A `codex` Agent Client accepts `start_server`
   (`auto`/`never`/`eager`): `never` is attach-only, while the others may start
   the shared daemon through `codex app-server daemon start` — cola never owns
-  or reaps it. A named Agent Client does not inherit `[opencode]`'s values.
+  or reaps it. It also accepts `sandbox`, `approval_policy` and `apply_on_adopt`
+  (next). A named Agent Client does not inherit `[opencode]`'s values.
+- **`sandbox` / `approval_policy` / `apply_on_adopt` (codex only)** — what a
+  Codex thread runs under. cola sends the pair on `thread/start`, so a thread it
+  creates can develop in this repo: `sandbox = "danger-full-access"` removes the
+  sandbox and its network restriction, which is what makes `git commit`, `gh`
+  and edits to `.codex/` work (the desktop app's “full access” is exactly this
+  mode). The other modes are `workspace-write` and `read-only`; `workspace-write`
+  keeps Codex's protected paths (`.git`, `.agents`, `.codex`, `.aws`) read-only
+  and its command network restricted, so it does not unblock a commit or `gh`.
+  `approval_policy` takes `untrusted`, `on-request` or `never`. The trade-off is
+  real: with no sandbox there is nothing to approve, so **permission cards stop
+  arriving for that session**, and everything it runs has the daemon user's
+  access (running cola as root means the thread can write wherever root can).
+  `apply_on_adopt`
+  (default `false`) extends the pair to `thread/resume`: a resumed thread may be
+  shared with your TUI/VSCode, so cola only adopts, never reconfigures, unless
+  you opt in. Unset keys send nothing and the daemon's own default applies;
+  `cola config show` prints what the file spelled. These are **thread**
+  settings: a thread created before the change keeps the policy it was created
+  with, and a thread your TUI created and cola adopted keeps it too unless
+  `apply_on_adopt = true`.
+- **A full-access default for your other clients is Codex's config, not cola's.**
+  If your own TUI/VSCode threads should also default to full access, set
+  `default_permissions = ":danger-full-access"` in the `~/.codex/config.toml` of
+  the daemon's `$CODEX_HOME` (or pass `-s danger-full-access` per run), restart
+  the daemon, and create a new thread — existing threads re-apply the settings
+  they were created with. cola never writes that file: it carries your provider
+  tokens and is shared with the daemon. Two consequences matter. The key only
+  affects clients sharing that `$CODEX_HOME`, and under a Codex profile
+  (`:workspace`) a `[sandbox_workspace_write] network_access = true` is ignored —
+  the profile's restricted network wins, which is why `gh` cannot reach
+  `api.github.com` there. Prefer per-run `-s` if only occasional full access is
+  needed.
 - **Only a kind's own keys are accepted.** Any other key — a typo such as
   `model_typo`, or a nested `[clients.ada.opencode]` table — is a config error
   naming `clients.<id>.<key>`, and so is an option on a kind that ignores it

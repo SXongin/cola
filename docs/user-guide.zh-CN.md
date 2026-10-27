@@ -160,6 +160,9 @@ start_server = "auto"            # auto (default) | never | eager
 # `[opencode]` 已经是隐式 Agent Client `default`——不要改名。
 [clients.ada]
 kind = "codex"                   # 必填：opencode | codex
+# sandbox = "danger-full-access" # 可选：read-only | workspace-write | danger-full-access
+# approval_policy = "on-request" # 可选：untrusted | on-request | never
+# apply_on_adopt = false         # 可选：在 thread/resume 上也发送这一对
 
 [bridge]
 default_client = "ada"           # 哪个 Agent Client 处于活动状态（默认 "default"）
@@ -178,8 +181,35 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `start_server`、`generation` 与 `model`，和 `[opencode]` 完全一样；
   `codex` 的 Agent Client 接受 `start_server`（`auto`/`never`/`eager`）：
   `never` 只附加，其余取值允许通过 `codex app-server daemon start` 启动共享
-  守护进程——cola 从不拥有、也从不回收它。具名的 Agent Client 不会继承
-  `[opencode]` 的取值。
+  守护进程——cola 从不拥有、也从不回收它。它还接受 `sandbox`、
+  `approval_policy` 与 `apply_on_adopt`（下一条）。具名的 Agent Client 不会
+  继承 `[opencode]` 的取值。
+- **`sandbox` / `approval_policy` / `apply_on_adopt`（仅 codex）** —— Codex
+  线程运行在什么策略下。cola 在 `thread/start` 上发送这一对，因此它创建的
+  线程可以在这个仓库里开发：`sandbox = "danger-full-access"` 去掉沙箱及其
+  网络限制，这正是 `git commit`、`gh` 以及修改 `.codex/` 能工作的原因
+  （桌面端的“完全放行”就是这个模式）。另外两个模式是 `workspace-write` 与
+  `read-only`；`workspace-write` 会保留 Codex 的受保护路径（`.git`、`.agents`、
+  `.codex`、`.aws`）只读，且其命令网络受限，所以它并不能让 `git commit` 或
+  `gh` 变得可用。`approval_policy` 取 `untrusted`、`on-request` 或 `never`。
+  代价是真实的：没有沙箱就没有可批准的东西，所以**该会话不再收到权限卡片**，
+  而且它运行的一切都拥有守护进程用户的权限（以 root 运行 cola 时，线程就能
+  写 root 能写的任何位置）。`apply_on_adopt`（默认 `false`）把这一对也带到
+  `thread/resume`：被接管的线程可能与你的 TUI/VSCode 共享，所以除非你显式
+  选择，cola 只接管、从不重新配置。未设置的键不发送任何字段，由守护进程自己
+  的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
+  改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
+  也一样——除非 `apply_on_adopt = true`。
+- **给其他客户端一个全放行默认值是 Codex 自己的配置，不是 cola 的事。** 如果
+  你自己的 TUI/VSCode 线程也应默认全放行，请在守护进程所用 `$CODEX_HOME` 的
+  `~/.codex/config.toml` 中设置 `default_permissions = ":danger-full-access"`，
+  或者每次运行加 `-s danger-full-access`；然后重启守护进程并新建线程——已有
+  线程会重新应用它们创建时的设置。cola 从不写这个文件：它带有你的 provider
+  token，并与守护进程共享。两点后果值得注意。该键只影响共享同一个
+  `$CODEX_HOME` 的客户端；而在 Codex 的 profile 下（`:workspace`），
+  `[sandbox_workspace_write] network_access = true` 会被忽略——profile 的受限
+  网络优先，这正是那里 `gh` 连不上 `api.github.com` 的原因。只需要偶尔全放行
+  时，优先用每次运行的 `-s`。
 - **只接受该 kind 自己的键。** 其他任何键——例如拼错的 `model_typo`，或嵌套的
   `[clients.ada.opencode]` 表——都是配置错误，并会指出
   `clients.<id>.<key>`；写在该 kind 会忽略的键上（例如 `kind = "codex"` 配
