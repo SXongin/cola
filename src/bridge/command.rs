@@ -1373,49 +1373,132 @@ pub(crate) async fn handle_command(
         }
         Command::Model(name) => {
             // `/model` records the per-session override and — on a generation
-            // whose selection is durable (V2) — switches the session's model,
-            // so the next turn uses it with nothing re-sent; V1 sends it as a
+            // whose selection is durable (V2) — switches the session's model, so
+            // the next turn uses it with nothing re-sent; V1 sends it as a
             // per-prompt model. Validate the shape up front so a typo gets
-            // immediate feedback instead of a silent no-op. On a Pending
-            // Session the override is recorded on the pending and lands on the
-            // created session at materialisation (ADR-0041).
-            if crate::backend::parsing::parse_model(&name).is_none() {
-                handles.flow.platform
-                        .reply_text(
-                            message_id,
-                            &format!(
-                                "⚠️ 模型格式应为 `<provider>/<model>`，例如 `/model opencode-go/deepseek-v4-flash`。\n收到：`{}`",
-                                name
-                            ),
-                        )
-                        .await?;
+            // immediate feedback instead of a silent no-op.
+            //
+            // The text form obeys the same rule as the card (issue #910): a
+            // provider change on a live thread is **never recorded silently** —
+            // with the gate off it is refused without recording, with it on the
+            // same confirmation card asks for the click. A Pending Session takes
+            // the pair at creation.
+            let Some(parsed) = crate::backend::parsing::parse_model(&name) else {
+                handles
+                    .flow
+                    .platform
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ 模型格式应为 `<provider>/<model>`，例如 `/model opencode-go/deepseek-v4-flash`。\n收到：`{}`",
+                            name
+                        ),
+                    )
+                    .await?;
                 return Ok(());
-            }
-            let outcome = handles
-                .flow
-                .sessions
-                .pick_model(&handles.flow.backend, &thread_key, &name)
-                .await;
-            match classify_pick(
-                outcome,
-                "模型",
-                crate::bridge::display::feishu_side_label(&thread_key),
-            ) {
-                PickReply::Applied { cleared_variant } => {
-                    let extra = cleared_variant
-                        .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
-                        .unwrap_or_default();
+            };
+            let Some(settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+                handles
+                    .flow
+                    .platform
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                            crate::bridge::display::feishu_side_label(&thread_key)
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            };
+            if settings.session_id.is_none() {
+                // A Pending Session's pair rides `thread/start`.
+                match classify_pick(
                     handles
                         .flow
-                        .platform
-                        .reply_text(
-                            message_id,
-                            &format!("Model: {}（下一条消息开始生效）{}", name, extra),
-                        )
-                        .await?;
+                        .sessions
+                        .pick_pending_pair(&handles.flow.backend, &thread_key, &parsed.provider_id, &name)
+                        .await,
+                    "模型",
+                    crate::bridge::display::feishu_side_label(&thread_key),
+                ) {
+                    PickReply::Applied { cleared_variant } => {
+                        let extra = cleared_variant
+                            .map(|v| format!("（已清除思考等级 `{v}`）"))
+                            .unwrap_or_default();
+                        handles
+                            .flow
+                            .platform
+                            .reply_text(
+                                message_id,
+                                &format!(
+                                    "Provider: {}（模型 {name}，新线程创建时生效）{extra}",
+                                    parsed.provider_id
+                                ),
+                            )
+                            .await?;
+                    }
+                    PickReply::Failed(text) => {
+                        handles.flow.platform.reply_text(message_id, &text).await?;
+                    }
                 }
-                PickReply::Failed(text) => {
+                return Ok(());
+            }
+            match handles
+                .flow
+                .sessions
+                .model_pick_decision(
+                    &handles.flow.backend,
+                    &thread_key,
+                    &parsed.provider_id,
+                    &parsed.id,
+                )
+                .await
+            {
+                crate::bridge::handles::ModelPickDecision::Confirm {
+                    session_id,
+                    provider,
+                    model,
+                } => {
+                    let card = crate::feishu::card::picker::build_provider_confirm_card(
+                        &thread_key,
+                        &session_id,
+                        &provider,
+                        &model,
+                    );
+                    handles.flow.platform.reply_card(message_id, &card).await?;
+                }
+                crate::bridge::handles::ModelPickDecision::Refuse(text) => {
                     handles.flow.platform.reply_text(message_id, &text).await?;
+                }
+                crate::bridge::handles::ModelPickDecision::Record => {
+                    let outcome = handles
+                        .flow
+                        .sessions
+                        .pick_model(&handles.flow.backend, &thread_key, &name)
+                        .await;
+                    match classify_pick(
+                        outcome,
+                        "模型",
+                        crate::bridge::display::feishu_side_label(&thread_key),
+                    ) {
+                        PickReply::Applied { cleared_variant } => {
+                            let extra = cleared_variant
+                                .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
+                                .unwrap_or_default();
+                            handles
+                                .flow
+                                .platform
+                                .reply_text(
+                                    message_id,
+                                    &format!("Model: {}（下一条消息开始生效）{}", name, extra),
+                                )
+                                .await?;
+                        }
+                        PickReply::Failed(text) => {
+                            handles.flow.platform.reply_text(message_id, &text).await?;
+                        }
+                    }
                 }
             }
         }

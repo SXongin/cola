@@ -727,8 +727,22 @@ impl SharedCore {
         &self,
         entry: SessionEntry,
         generation: u64,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<bool> {
         self.sessions_handle().activate_created(entry, generation).await
+    }
+
+    /// Apply a `/model` pick only while `expected_session` is still the thread's
+    /// target (issue #910): a remap between the caller's check and the write is
+    /// a named no-op.
+    pub(crate) async fn pick_model_expecting(
+        &self,
+        thread_key: &ThreadKey,
+        expected_session: Option<&str>,
+        model_spec: &str,
+    ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
+        self.sessions_handle()
+            .pick_model_expecting(&self.client, thread_key, expected_session, model_spec)
+            .await
     }
 
     /// The settings the conversation's next prompt will use (ADR-0041): the

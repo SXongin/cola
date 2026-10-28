@@ -2667,6 +2667,17 @@ impl App {
                 .and_then(crate::backend::parsing::parse_model);
         }
         let session = self.client.create_session(&input).await?;
+        // A thread forgotten or re-declared while `thread/start` ran is stale:
+        // apply nothing to the created session and never map it (issue #910).
+        if !self
+            .sessions_handle()
+            .creation_is_current(&pending.thread_key, generation)
+            .await
+        {
+            return Err(crate::error::BridgeError::State(
+                "the thread moved on while its session was being created".to_string(),
+            ));
+        }
         // ADR-0041 + V2's durable selection: the pending's picks become
         // session switches now that a session exists (and on V1 the same
         // helper's switch is a no-op, leaving the first prompt to carry them).
@@ -2702,9 +2713,13 @@ impl App {
         let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
         // invalidated: `/switch` must see the just-created session. Scoped to
-        // this creation's generation (issue #910): a replacement pending
-        // declared while we ran is not resolved by this activation.
-        self.activate_created(entry, generation).await?;
+        // this creation's generation (issue #910): a thread that moved on while
+        // we ran is not overwritten, and a replacement pending survives.
+        if !self.activate_created(entry, generation).await? {
+            return Err(crate::error::BridgeError::State(
+                "the thread moved on while its session was being created".to_string(),
+            ));
+        }
         // ADR-0041 + ADR-0023: a pending topic's cover still says
         // 「下一条消息创建」. Move its record onto the new session and re-render
         // now — a real Session exists, so the brief (title/id) belongs on the
@@ -4834,46 +4849,36 @@ impl App {
         if settings.session_id.is_none() {
             return self.save_pending_pair(core, thread_key, provider, &spec).await;
         }
-        let session_id = settings.session_id.unwrap_or_default();
-        let info = crate::backend::types::ModelInfo {
-            id: model.to_string(),
-            provider_id: provider.to_string(),
-            variant: settings.variant.clone(),
-        };
-        let route = match core.client.model_pick_route(&session_id, &info).await {
-            Ok(route) => route,
-            // Unknown is not "safe to skip": the prompt path would then send a
-            // pair the thread may not run. Say so instead of guessing.
-            Err(error) => {
-                tracing::warn!("could not classify the model pick for {session_id}: {error}");
-                return CardActionResult {
-                    card: None,
-                    toast: Some(format!("⚠️ 无法确认这条线程的 provider：{error}")),
-                };
-            }
-        };
-        if route == crate::backend::types::ModelPickRoute::PerTurn {
-            // Same provider (or a client whose provider rides each turn): the
-            // ordinary per-session model path, with no thread-level request.
-            return self.pick_model_ref(core, thread_key, &spec).await;
-        }
-        if core.client.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
-            return CardActionResult {
-                card: None,
-                toast: Some("provider 只能在新线程切换".to_string()),
-            };
-        }
-        // Idle or mid-turn makes no difference: the pair is **recorded**, and the
-        // next prompt's pre-flight applies it before submitting (the owner's
-        // 「下一轮生效」). Nothing is applied here.
-        CardActionResult {
-            card: Some(crate::feishu::card::picker::build_provider_confirm_card(
-                thread_key,
-                &session_id,
+        // The rule is shared with the `/model` text form: a model-only pick is
+        // recorded; a provider change needs the gate and a confirmation; nothing
+        // unclassifiable is recorded.
+        use crate::bridge::handles::ModelPickDecision;
+        match core
+            .sessions_handle()
+            .model_pick_decision(&core.client, thread_key, provider, model)
+            .await
+        {
+            ModelPickDecision::Record => self.pick_model_ref(core, thread_key, &spec).await,
+            ModelPickDecision::Confirm {
+                session_id,
                 provider,
                 model,
-            )),
-            toast: None,
+            } => CardActionResult {
+                // Idle or mid-turn makes no difference: the pair is **recorded**
+                // by the confirmation, and the next prompt's pre-flight applies
+                // it before submitting (the owner's 「下一轮生效」).
+                card: Some(crate::feishu::card::picker::build_provider_confirm_card(
+                    thread_key,
+                    &session_id,
+                    &provider,
+                    &model,
+                )),
+                toast: None,
+            },
+            ModelPickDecision::Refuse(text) => CardActionResult {
+                card: None,
+                toast: Some(text),
+            },
         }
     }
 
@@ -4994,7 +4999,11 @@ impl App {
         // compare-and-set write a `/model` pick uses, so a concurrent pick (or a
         // remap, or a materialising session) is an honest refusal, never an
         // overwrite.
-        let saved = core.pick_model(&thread_key, &pair).await;
+        // The card named a session: if `/switch` remapped the chat in between,
+        // this is a no-op instead of a record on the new session (issue #910).
+        let saved = core
+            .pick_model_expecting(&thread_key, Some(&session_id), &pair)
+            .await;
         match classify_pick(
             saved,
             "Provider",

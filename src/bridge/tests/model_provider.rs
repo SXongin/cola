@@ -934,3 +934,276 @@ async fn an_agent_pick_keeps_the_recorded_pair() {
     );
     assert_eq!(stored.variant.as_deref(), Some("low"));
 }
+
+/// Final round, item 1: a thread forgotten while its session is being created
+/// must not be re-mapped by the finished creation.
+#[tokio::test]
+async fn a_forget_during_a_parked_creation_is_not_undone() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_create_session();
+    let entered = backend.create_session_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the creation never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The user forgets the thread while `thread/start` is in flight.
+    send_command(&app, "/switch forget", "msg_forget").await;
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "the forget removed the pending"
+    );
+
+    gate.add_permits(1);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let store = app.sessions.lock().await;
+    assert!(
+        store.get_active(&key()).is_none(),
+        "the finished creation must not re-map a forgotten thread"
+    );
+    assert!(
+        store.entry_for_session("ses_test").is_none(),
+        "and the created session stays unmapped"
+    );
+}
+
+/// Final round, item 1: a newer selection during a parked creation wins; the
+/// stale creation does not overwrite it.
+#[tokio::test]
+async fn a_newer_selection_during_a_parked_creation_wins() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_create_session();
+    let entered = backend.create_session_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the creation never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The user selects another session while `thread/start` is in flight.
+    app.activate_session(crate::config::SessionEntry::new(
+        key(),
+        "ses_new",
+        "/work/elsewhere",
+    ))
+    .await
+    .expect("the newer selection activates");
+    assert_eq!(
+        app.sessions.lock().await.get_active(&key()).unwrap().session_id,
+        "ses_new"
+    );
+
+    gate.add_permits(1);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let store = app.sessions.lock().await;
+    assert_eq!(
+        store.get_active(&key()).unwrap().session_id,
+        "ses_new",
+        "the stale creation must not overwrite the newer selection"
+    );
+    assert!(store.entry_for_session("ses_test").is_none());
+}
+
+/// Final round, item 3: the `/model <provider>/<model>` text form obeys the
+/// card's rule — with the gate off it refuses **without recording**.
+#[tokio::test]
+async fn the_model_text_form_refuses_a_provider_change_with_the_gate_off() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_model_pick_route(ModelPickRoute::ThreadModel);
+    let applies = backend.thread_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("只能在新线程切换"), "{text}");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the text form must not record the provider change"
+    );
+    assert!(
+        !text.contains("Model:"),
+        "no success reply for a refused provider change: {text}"
+    );
+    assert!(applies.lock().await.is_empty());
+}
+
+/// Final round, item 3: with the gate open the text form replies the same
+/// confirmation card, and only the confirmation records.
+#[tokio::test]
+async fn the_model_text_form_confirms_a_provider_change() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let card = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .find_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
+            _ => None,
+        })
+        .expect("the confirmation card is the reply");
+    assert!(
+        card_buttons(&card)
+            .iter()
+            .any(|button| button["value"]["action"] == "model_provider_confirm"),
+        "{card}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the text form itself records nothing"
+    );
+
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the confirmation records the pair"
+    );
+}
+
+/// Final round, item 4: a `/switch` between the confirmation's check and the
+/// record makes the record a no-op instead of landing on the new session.
+#[tokio::test]
+async fn a_remap_before_the_record_lands_writes_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    let confirm = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The chat switches while the confirm's catalog lookup is parked.
+    app.command_handles()
+        .flow
+        .unmap("ses_test")
+        .await
+        .expect("the old mapping is dropped");
+    let mut other = crate::config::SessionEntry::new(key(), "ses_new", "/work/cola");
+    other.model = Some("openai/gpt-5.1".into());
+    app.activate_session(other)
+        .await
+        .expect("the new mapping activates");
+    gate.add_permits(1);
+
+    let step = confirm.await.expect("the confirm joins").expect("a result");
+    let text = format!("{:?}{:?}", step.card, step.toast);
+    assert!(
+        text.contains("状态已变化") || text.contains("过期"),
+        "the record is refused honestly: {text}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the new session's mirror is untouched"
+    );
+}
