@@ -860,14 +860,23 @@ impl SessionStore {
     /// (issue #910): a whole settings snapshot could restore a stale
     /// model/variant over a recorded switch while the approval sweep it waits
     /// on runs.
+    ///
+    /// `expected_epoch` identifies a Pending Session target: a `/new` that
+    /// replaced it is a refusal (`false`), never a flag written onto the
+    /// replacement (`session_id` is `None` exactly when the target is the
+    /// pending).
     pub(crate) fn set_auto_accept(
         &mut self,
         key: &ThreadKey,
         session_id: Option<&str>,
+        expected_epoch: u64,
         on: bool,
     ) -> crate::error::Result<bool> {
         let applied = match session_id {
             None => {
+                if self.pending_epoch_for(key) != expected_epoch {
+                    return Ok(false);
+                }
                 let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
                     return Ok(false);
                 };
@@ -901,6 +910,12 @@ impl SessionStore {
     /// Session. A snapshot taken while pending whose session materialises
     /// before this write lands on the new active entry — the settings still
     /// configure the conversation (ADR-0041). `false` when the target is gone.
+    ///
+    /// **Test-only** since issue #910: every production write is field-scoped
+    /// ([`Self::set_agent`], [`Self::set_auto_accept`], the model mirror), so a
+    /// stale snapshot can never restore a recorded pair. It stays as the seeding
+    /// helper the round-trip tests describe.
+    #[cfg(test)]
     pub fn set_settings(&mut self, key: &ThreadKey, settings: SessionSettings) -> crate::error::Result<bool> {
         let client_id = self.client_id.clone();
         let overrides = (
@@ -969,8 +984,12 @@ impl SessionStore {
     fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
         let client_id = self.client_id.clone();
         self.creating.remove(key);
-        *self.pending_epoch.entry(key.clone()).or_default() += 1;
+        // A removed thread keeps no epoch entry (issue #910): the bump
+        // invalidates any in-flight creation or pick, and with neither a claim
+        // nor a pending left there is nothing to compare against.
+        self.bump_pending_epoch(key);
         self.pending_mut().retain(|p| &p.thread_key != key);
+        self.prune_pending_epoch(key);
         let removed: Vec<SessionEntry> = self
             .entries
             .iter()
@@ -1984,6 +2003,23 @@ mod tests {
         assert_eq!(store.pending_epochs(), 1);
         store.clear_pending(&key).unwrap();
         assert_eq!(store.pending_epochs(), 0);
+
+        // Removing the thread (`/switch forget`) prunes it too, and the next
+        // declaration takes a fresh identity — never the removed thread's.
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/third"))
+            .unwrap();
+        let removed_epoch = store.pending_epoch_for(&key);
+        store.remove_thread_persist(&key).unwrap();
+        assert_eq!(store.pending_epochs(), 0, "a removed thread keeps no epoch entry");
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/fourth"))
+            .unwrap();
+        assert!(
+            store.pending_epoch_for(&key) > removed_epoch,
+            "the identity is never reused"
+        );
+        assert_eq!(store.pending_epochs(), 1);
     }
 
     /// Issue #910 (extra finding): a `/agent` write touches only its own field —

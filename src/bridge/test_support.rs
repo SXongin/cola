@@ -1706,6 +1706,10 @@ pub struct MockBackend {
     /// Counts `switch_session_model` calls that reached
     /// [`Self::switch_model_gate`].
     pub switch_model_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Hangs the next `switch_session_model` calls forever (a server that
+    /// accepted the call and then stopped answering); the bridge's own total
+    /// bound must release the switch point (issue #910).
+    pub hang_switch: std::sync::atomic::AtomicUsize,
     /// Holds the next `create_session` calls (lazy creation / materialisation)
     /// until released, so a test can interleave a pair write with the creation
     /// window (issue #910).
@@ -2056,6 +2060,7 @@ impl MockBackend {
             model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             switch_model_gate: std::sync::Mutex::new(None),
             switch_model_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hang_switch: std::sync::atomic::AtomicUsize::new(0),
             create_session_gate: std::sync::Mutex::new(None),
             create_session_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
@@ -2522,6 +2527,13 @@ impl MockBackend {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.reply_permission_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// Scenario: the next `switch_session_model` call never answers — the
+    /// request is accepted and the server goes silent (issue #910).
+    pub(crate) fn hang_next_switch(&self) -> &Self {
+        self.hang_switch.store(1, std::sync::atomic::Ordering::SeqCst);
+        self
     }
 
     /// Hold every durable `switch_session_model` call until the returned
@@ -3659,6 +3671,7 @@ impl crate::backend::Backend for MockBackend {
         if let Some(error) = &self.switch_error {
             return Err(crate::error::BridgeError::OpenCode(error.clone()));
         }
+        hang_if_scripted(&self.hang_switch).await;
         let gate = self
             .switch_model_gate
             .lock()

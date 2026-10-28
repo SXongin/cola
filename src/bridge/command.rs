@@ -1171,18 +1171,33 @@ pub(crate) async fn handle_command(
                     return Ok(());
                 }
                 crate::bridge::command::AutoAcceptAction::Set(on) => {
-                    let settings = handles.flow.sessions.session_settings(&thread_key).await;
+                    let Some((settings, pending_epoch)) = handles
+                        .flow
+                        .sessions
+                        .settings_and_pending_epoch(&thread_key)
+                        .await
+                    else {
+                        handles
+                            .flow
+                            .platform
+                            .reply_text(
+                                message_id,
+                                &format!(
+                                    "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                                    crate::bridge::display::feishu_side_label(&thread_key)
+                                ),
+                            )
+                            .await?;
+                        return Ok(());
+                    };
                     let mut approved = Vec::new();
-                    if on
-                        && let Some(s) = settings.as_ref()
-                        && let Some(id) = s.session_id.as_deref()
-                    {
+                    if on && let Some(id) = settings.session_id.as_deref() {
                         approved = crate::bridge::request::kind::approve_pending_for_session(
                             &handles.flow.sessions,
                             &handles.flow.requests,
                             &handles.flow.backend,
                             id,
-                            &s.directory,
+                            &settings.directory,
                         )
                         .await;
                         if !approved.is_empty() {
@@ -1208,16 +1223,33 @@ pub(crate) async fn handle_command(
                             .await;
                         }
                     }
-                    if let Some(s) = settings.as_ref() {
-                        // Field-only (issue #910): the approval sweep above can
-                        // run for a while, and writing the whole snapshot back
-                        // would restore the model/variant it read before a
-                        // concurrent confirmation recorded a new pair.
+                    // Field-only (issue #910): the approval sweep above can
+                    // run for a while, and writing the whole snapshot back
+                    // would restore the model/variant it read before a
+                    // concurrent confirmation recorded a new pair. The epoch
+                    // identifies a Pending Session target, so a `/new` that
+                    // replaced it is a refusal instead of a flag on the
+                    // replacement.
+                    if !handles
+                        .flow
+                        .sessions
+                        .set_auto_accept(
+                            &thread_key,
+                            settings.session_id.as_deref(),
+                            pending_epoch.unwrap_or_default(),
+                            on,
+                        )
+                        .await?
+                    {
                         handles
                             .flow
-                            .sessions
-                            .set_auto_accept(&thread_key, s.session_id.as_deref(), on)
+                            .platform
+                            .reply_text(
+                                message_id,
+                                "⚠️ 会话状态已变化（可能刚切换/创建），这次操作没有生效。",
+                            )
                             .await?;
+                        return Ok(());
                     }
                     let state = if on { "开" } else { "关" };
                     let extra = if on && !approved.is_empty() {

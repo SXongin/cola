@@ -2212,3 +2212,319 @@ async fn a_delayed_autoaccept_keeps_a_recorded_pair() {
     );
     assert!(active.auto_accept, "the command's own field was written");
 }
+
+/// Issue #910, item 1: a durable switch the server accepts and then never
+/// answers must fail by name inside the bridge's total bound, releasing the
+/// switch point — so the next prompt still goes through instead of hanging.
+#[tokio::test]
+async fn an_unanswered_durable_switch_fails_by_name_and_releases_the_point() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    backend.hang_next_switch();
+    let prompt_models = backend.prompt_models.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/model-b",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("没有得到服务器回答"),
+        "the switch fails by name: {reply}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the failed switch claims nothing"
+    );
+
+    // The point is released: the next prompt is submitted normally.
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_models.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the next prompt was wedged behind the dead switch"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        prompt_models.lock().await.last().cloned().flatten(),
+        Some("openai/gpt-5.1-codex".to_string()),
+        "it runs the selection that is still there"
+    );
+}
+
+/// Issue #910, item 1 (the other branch): a switch point held longer than the
+/// pre-flight's bound stops the prompt **by name** and sends nothing. The pick
+/// is parked in its catalog clear, an unbounded step *inside* the point.
+#[tokio::test]
+async fn a_wedged_switch_point_stops_the_prompt_by_name() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: Some("high".into()),
+                }),
+                agent: None,
+            },
+        )
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: "openai".into(),
+            models: vec![model_option("model-b", &["low"])],
+        }])
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    let surface_gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let prompt_calls = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    let pick = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/model openai/model-b",
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pick's catalog clear never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The pick holds the switch point in its catalog read; the prompt must not
+    // wait forever on it.
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let text = all_cards(&platform).await;
+        if text.contains("本条消息没有发送") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never refused by name: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        prompt_calls.lock().await.is_empty(),
+        "the prompt is not sent while the switch point is wedged"
+    );
+
+    surface_gate.add_permits(1);
+    pick.await.expect("the pick joins");
+}
+
+/// Issue #910, item 2: the switch point is held across the submit itself, so a
+/// durable switch that starts after the pre-flight's snapshot waits for the
+/// prompt and cannot change the selection it runs with.
+#[tokio::test]
+async fn a_switch_starting_after_the_snapshot_waits_for_the_submit() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    let prompt_gate = backend.hold_prompts();
+    let prompt_models = backend.prompt_models.clone();
+    let switch_calls = backend.switch_model_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    // The prompt reaches the submit (holding the switch point) and parks there.
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_models.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never reached the submit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // A switch starts now: it must wait for the submit, not land underneath it.
+    let pick = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/model openai/model-b",
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let switch = app.session_gates.gate("ses_test");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while switch.switch_waiting() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the switch never queued behind the submit"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        switch_calls.lock().await.is_empty(),
+        "the switch did not reach the server while the submit was in flight"
+    );
+
+    prompt_gate.add_permits(1);
+    pick.await.expect("the pick joins");
+    assert_eq!(
+        prompt_models.lock().await.last().cloned().flatten(),
+        Some("openai/gpt-5.1-codex".to_string()),
+        "the prompt submits the selection it captured"
+    );
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let model = app
+            .sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model;
+        if model.as_deref() == Some("openai/model-b") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the switch landed after the submit: {model:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+/// Issue #910, item 3: `/autoaccept` with a Pending Session target carries the
+/// epoch it read, so a `/new` that replaces the pending is a refusal instead of
+/// a flag on the replacement.
+#[tokio::test]
+async fn autoaccept_on_a_replaced_pending_is_refused() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    let (_, epoch) = app
+        .sessions_handle()
+        .settings_and_pending_epoch(&key())
+        .await
+        .expect("the pending is the target");
+    let epoch = epoch.expect("a pending carries its epoch");
+
+    // `/new` replaces the pending while the command's write is on its way.
+    seed_pending(&app, PendingEntry::new(key(), "/work/other")).await;
+    let applied = app
+        .sessions_handle()
+        .set_auto_accept(&key(), None, epoch, true)
+        .await
+        .expect("the write runs");
+    assert!(!applied, "the displaced pending is refused");
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the replacement survives");
+    assert!(!pending.auto_accept, "the replacement is untouched");
+
+    // The replacement's own identity applies.
+    let (_, epoch) = app
+        .sessions_handle()
+        .settings_and_pending_epoch(&key())
+        .await
+        .expect("the replacement is the target");
+    assert!(
+        app.sessions_handle()
+            .set_auto_accept(&key(), None, epoch.expect("an epoch"), true)
+            .await
+            .expect("the write runs")
+    );
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending survives");
+    assert!(pending.auto_accept);
+}

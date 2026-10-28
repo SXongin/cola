@@ -2669,11 +2669,10 @@ async fn a_silent_catalog_does_not_wedge_a_model_pick() {
         .expect("the seeded settings");
     settings.variant = Some("high".into());
     assert!(
-        handles
-            .flow
-            .sessions
-            .set_session_settings(&key, settings)
+        app.sessions
+            .lock()
             .await
+            .set_settings(&key, settings)
             .expect("persist the variant")
     );
 
