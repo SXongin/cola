@@ -839,7 +839,7 @@ async fn a_confirmation_during_a_turn_is_deferred() {
     let applies = backend.thread_model_calls.clone();
     let prompt_calls = backend.prompt_calls.clone();
     let gate = backend.hold_prompts();
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, platform) = build_app(cfg, backend).await;
     seed_entry(&app, entry()).await;
 
     // The card is rendered while idle...
@@ -874,11 +874,18 @@ async fn a_confirmation_during_a_turn_is_deferred() {
         .host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
         .await
         .expect("confirm");
-    let ack = step.card.expect("a deferred card");
     assert!(
-        ack.to_string().contains("已记录"),
-        "the confirmation says it was recorded, not switched: {ack}"
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("正在切换")),
+        "the click is acknowledged before the switch decides"
     );
+    // The spawned switch sees the running turn and repaints the card as
+    // recorded — never touching the thread.
+    wait_for_card_update(&platform, "the deferred outcome", CardUpdates::Any, |card| {
+        card_header(card).contains("已记录")
+    })
+    .await;
     assert!(
         applies.lock().await.is_empty(),
         "the thread is not touched while the turn runs"
@@ -1058,4 +1065,192 @@ async fn a_provider_match_with_another_model_is_not_already() {
         card_header(card).contains("模型下一轮生效")
     })
     .await;
+}
+
+/// Review round 3, finding 1: the in-flight decision is taken under the same
+/// gate turn admission uses, so a turn registered in the window between the
+/// confirmation and the switch task's gate acquisition always wins — the switch
+/// defers instead of racing it, and never releases/resumes the thread.
+#[tokio::test]
+async fn a_turn_admitted_before_the_switch_gate_defers_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let applies = backend.thread_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+
+    // Hold the admission gate, then confirm: the switch task parks on it.
+    let mut admission = app.inflight.lock().await;
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    // A turn's admission lands in that window (exactly what `Turn::start`
+    // inserts while holding this gate).
+    admission.insert("ses_test".to_string());
+    assert!(
+        applies.lock().await.is_empty(),
+        "the parked switch has not touched the thread yet"
+    );
+    drop(admission);
+
+    wait_for_card_update(&platform, "the deferred outcome", CardUpdates::Any, |card| {
+        card_header(card).contains("已记录")
+    })
+    .await;
+    assert!(
+        applies.lock().await.is_empty(),
+        "a turn admitted before the gate release defers the switch: no release/resume"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the pair is recorded for the next prompt"
+    );
+}
+
+/// Review round 3, finding 2: the rollback is a compare-and-set under one store
+/// lock. A newer `/think` variant that landed during the slow switch is not
+/// overwritten (and the model is left alone too, because the pair's variant no
+/// longer matches what the attempt wrote).
+#[tokio::test]
+async fn a_newer_think_survives_the_failed_switch_rollback() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_thread_model_delay(std::time::Duration::from_millis(600))
+        .fail_provider_switch("另一个客户端仍持有这条线程");
+    // The attempted model declares no `mid`, so the attempt clears whatever
+    // variant was set before it.
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: PROVIDER.into(),
+        models: vec![crate::backend::types::ModelOption {
+            id: MODEL.into(),
+            variants: vec!["low".into()],
+            ..Default::default()
+        }],
+    }]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+
+    // A newer `/think` lands while the slow switch runs.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut settings = app.sessions.lock().await.settings(&key()).unwrap();
+    assert!(
+        settings.model.as_deref() == Some("deepseek/deepseek-v4-pro"),
+        "the attempt's pair is in the mirror: {settings:?}"
+    );
+    settings.variant = Some("mid".into());
+    app.sessions
+        .lock()
+        .await
+        .set_settings(&key(), settings)
+        .expect("the newer /think saves");
+
+    wait_for_card_update(&platform, "the refusal", CardUpdates::Any, |card| {
+        card_header(card).contains("切换失败")
+    })
+    .await;
+    let settings = app.sessions.lock().await.settings(&key()).unwrap();
+    assert_eq!(
+        settings.variant.as_deref(),
+        Some("mid"),
+        "the rollback must not overwrite a newer /think"
+    );
+}
+
+/// Review round 3, finding 3: the pending pair is a pending-only store write.
+/// If the session materialises while the variant lookup is in flight, nothing
+/// is written to the live entry and the click reports a failure — it never
+/// claims a pair the thread was not created with.
+#[tokio::test]
+async fn a_pending_that_materialises_is_not_reported_saved() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    // A live entry exists, and a pending supersedes it; the pending carries a
+    // `/think` variant, so the pick's catalog lookup really runs.
+    let mut live = entry();
+    live.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, live).await;
+    let mut pending = PendingEntry::new(key(), "/work/cola");
+    pending.variant = Some("high".into());
+    seed_pending(&app, pending).await;
+
+    let app_for_pick = app.clone();
+    let pick = tokio::spawn(async move { app_for_pick.host_action(paired_pick(PROVIDER, MODEL)).await });
+    // Park inside the lookup, then let the pending materialise (the live entry
+    // becomes the thread's target) and release.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    app.sessions
+        .lock()
+        .await
+        .clear_pending(&key())
+        .expect("the pending materialises");
+    gate.add_permits(1);
+
+    let step = pick.await.expect("the pick joins").expect("a pick result");
+    let toast = step.toast.unwrap_or_default();
+    assert!(
+        toast.contains("保存失败"),
+        "a vanished pending is an honest failure, not success: {toast}"
+    );
+    assert!(
+        !toast.contains("新线程创建时生效"),
+        "no success copy for a pair that never reached the store: {toast}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the pair never falls through to the live entry"
+    );
 }
