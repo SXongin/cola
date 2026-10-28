@@ -14,6 +14,8 @@ struct PickerOption {
     label: String,
     value: String,
     provider: Option<String>,
+    /// Listed, but not selectable (no valid pair to pick): a text row.
+    disabled: bool,
 }
 
 impl From<(String, String)> for PickerOption {
@@ -22,6 +24,7 @@ impl From<(String, String)> for PickerOption {
             label,
             value,
             provider: None,
+            disabled: false,
         }
     }
 }
@@ -32,6 +35,7 @@ fn picker_option(option: &crate::backend::types::ModelOption) -> PickerOption {
         label: option.display_label().to_string(),
         value: option.callback_value().to_string(),
         provider: option.provider.clone(),
+        disabled: option.disabled,
     }
 }
 
@@ -143,7 +147,13 @@ fn picker_card(
         }));
     }
     for option in options {
-        elements.push(option_button(thread_key, action, option, level, callback_fields));
+        if option.disabled {
+            // A listed-but-unpickable row (a configured provider with no known
+            // model): text, never a button that cannot work (#910).
+            elements.push(markdown_element(&format!("· {}", option.label)));
+        } else {
+            elements.push(option_button(thread_key, action, option, level, callback_fields));
+        }
     }
     if let Some(note) = note {
         elements.push(markdown_element(note));
@@ -1042,6 +1052,60 @@ mod tests {
             free_text: None,
             intro: None,
         }
+    }
+
+    /// Issue #910: a listed-but-unpickable row (a configured Codex provider
+    /// with no known model) is rendered as text, never as a button — while a
+    /// selectable pair in the same scope still is one.
+    #[test]
+    fn a_disabled_option_is_a_text_row_not_a_button() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let surface = surface(
+            None,
+            vec![provider_scope(
+                "provider",
+                "Provider（线程级：新线程 / resume）",
+                vec![
+                    ModelOption {
+                        id: "openai-fake".into(),
+                        label: Some("OpenAI Fake：gpt-5".into()),
+                        value: Some("gpt-5".into()),
+                        provider: Some("openai-fake".into()),
+                        ..Default::default()
+                    },
+                    ModelOption {
+                        id: "opencode-go".into(),
+                        label: Some("OpenCode Go：没有已知模型".into()),
+                        disabled: true,
+                        ..Default::default()
+                    },
+                ],
+            )],
+        );
+        let cards = build_model_surface_cards(&key, &surface, false);
+        let mut buttons = Vec::new();
+        let mut markdown = String::new();
+        for card in &cards {
+            for element in card["body"]["elements"].as_array().unwrap() {
+                match element["tag"].as_str() {
+                    Some("button") => buttons.push(element.to_string()),
+                    Some("markdown") => markdown.push_str(element["content"].as_str().unwrap_or_default()),
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            !buttons.iter().any(|button| button.contains("没有已知模型")),
+            "a row with no known model is never a button: {buttons:?}"
+        );
+        assert!(
+            buttons.iter().any(|button| button.contains("OpenAI Fake：gpt-5")),
+            "a real pair still is: {buttons:?}"
+        );
+        assert!(
+            markdown.contains("没有已知模型"),
+            "the disabled row is text: {markdown}"
+        );
     }
 
     /// The OpenCode root page: a `provider` scope whose pick drills into that
