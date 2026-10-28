@@ -717,53 +717,63 @@ impl Turn {
     /// the post-prompt drain observes the run it scheduled.
     async fn attempt(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
         let render = render::RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
-        // Capture the variant actually sent this turn AT SEND TIME, not at
+        // The variant actually sent this turn is captured AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
         // card of a turn that was sent without it (same "capture at turn start"
         // rule as the work-context 📁 half, ADR-0019). On a durable generation
         // (V2) the session's own selection is the source of truth — another
         // client may have changed it — so a stale mirror cannot tag the turn.
-        self.turn_variant = handles
-            .sessions
-            .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
-            .await;
+        // It is read **under the session gate** below (issue #910), after any
+        // switch intent has resolved.
         // The per-prompt axes: V1 sends these with the message, while a
         // generation that keeps a durable selection (V2) deliberately drops
         // them inside its strategy — the pick already lives on the session as
         // a switch. Do NOT "fix" a V2 pick by making the strategy re-send them.
         // Issue #910: the pair this prompt runs with is decided HERE, under the
         // session's serialization point, and only then is the prompt submitted
-        // (see `crate::bridge::session_gates` for the invariant). A provider
-        // switch holds the same gate, so:
-        //
-        // - a switch that completed left the pair durable — this read sees it;
-        // - a switch that deferred recorded the pair under the same gate — this
-        //   read sees it and applies it now;
-        // - a switch still running makes this prompt **wait** for its verdict,
-        //   never submit on a half-changed pair.
+        // (see `crate::bridge::session_gates` for the invariant). A switch
+        // registers its intent under the same gate **before its first await**, so
+        // a prompt that arrives mid-switch waits for the verdict; the model
+        // **and** the `/think` variant are then read under the gate, so a switch
+        // that cleared an unsupported variant cannot be overtaken by a stale
+        // snapshot.
         //
         // A deferred pair that cannot be applied (a peer holds the thread, the
         // read-back did not change, or the gate is off) stops the prompt here:
         // running it on the old provider would be a silent lie.
         let model = {
             let gate = handles.session_gates.gate(&self.session_id);
-            let _held = gate.lock().await;
-            let model = handles.sessions.model_override(&self.session_id).await;
-            if let Some(model) = model.as_ref() {
-                match handles.backend.model_pick_route(&self.session_id, model).await {
-                    Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
-                        handles
-                            .backend
-                            .apply_thread_model(&self.session_id, model)
-                            .await?;
-                    }
-                    Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
-                    // Unknown is not "safe to skip": a failed classification must
-                    // not let the prompt run on a pair the thread may not hold.
-                    Err(error) => return Err(error),
+            loop {
+                let held = gate.enter().await;
+                if let Some(mut finished) = gate.intent_signal() {
+                    // A switch (or a deferred record) is in flight: wait for its
+                    // verdict, then read the now-final pair.
+                    drop(held);
+                    let _ = finished.changed().await;
+                    continue;
                 }
+                let model = handles.sessions.model_override(&self.session_id).await;
+                self.turn_variant = handles
+                    .sessions
+                    .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
+                    .await;
+                if let Some(model) = model.as_ref() {
+                    match handles.backend.model_pick_route(&self.session_id, model).await {
+                        Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
+                            handles
+                                .backend
+                                .apply_thread_model(&self.session_id, model)
+                                .await?;
+                        }
+                        Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
+                        // Unknown is not "safe to skip": a failed classification
+                        // must not let the prompt run on a pair the thread may
+                        // not hold.
+                        Err(error) => return Err(error),
+                    }
+                }
+                break model;
             }
-            model
         };
         let agent = handles.sessions.agent_override(&self.session_id).await;
         let prompt_resp = handles

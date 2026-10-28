@@ -1443,6 +1443,33 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
     })
 }
 
+/// Restore the local view and the subscription after a release whose outcome is
+/// unknown (a failure or a timeout): re-read the thread as the truth, record it,
+/// then re-subscribe. Bounded and best-effort — the caller reports the release
+/// failure itself (issue #910).
+impl CodexClient {
+    async fn restore_after_release(&self, session_id: &str) {
+        if let Ok(Ok(read)) =
+            tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false)).await
+        {
+            self.projections
+                .remember_thread_metadata(&read, self.projections.next_model_stamp());
+        }
+        match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.ensure_subscription(session_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
+                thread = %session_id,
+                "could not re-subscribe after a failed release: {error}"
+            ),
+            Err(_) => tracing::warn!(
+                thread = %session_id,
+                "re-subscribing after a failed release did not answer within \
+                 {SWITCH_RPC_TIMEOUT:?}"
+            ),
+        }
+    }
+}
+
 /// The named failure of one bounded switch step (issue #910). The copy says what
 /// is known — never that the switch succeeded — and names the likely holders.
 fn switch_step_timeout(step: &str, what: &str) -> BridgeError {
@@ -1955,17 +1982,24 @@ impl Backend for CodexClient {
                     .to_string(),
             });
         }
-        // Step 1: release, bounded. A release that does not answer means the
-        // thread was never unloaded, so nothing has moved yet: abort before the
-        // switch state changes (the local projection heals on the next read).
-        match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread(session_id)).await {
-            Ok(result) => result.map_err(client_error)?,
-            Err(_) => {
-                return Err(switch_step_timeout(
+        // Step 1: release, bounded. `release_thread` takes the release handle and
+        // forgets the projection **before** it awaits the unsubscribe, so a
+        // failed or timed-out release may already have left this connection's
+        // consumer ended and the local view forgotten: the read-back and the
+        // re-subscribe below must run either way (issue #910). A release that
+        // did not land means the thread is still loaded, so the resume is not
+        // attempted — nothing has moved.
+        let released = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread(session_id)).await;
+        if !matches!(released, Ok(Ok(()))) {
+            self.restore_after_release(session_id).await;
+            return match released {
+                Ok(Err(error)) => Err(client_error(error)),
+                Ok(Ok(())) => unreachable!("guarded above"),
+                Err(_) => Err(switch_step_timeout(
                     "thread/unsubscribe",
-                    "线程没有被释放，因此没有开始切换",
-                ));
-            }
+                    "线程没有在期限内确认释放，因此没有开始切换",
+                )),
+            };
         }
         // Step 2: the pair, never the provider alone, bounded on its own.
         let resumed = tokio::time::timeout(
@@ -7388,6 +7422,63 @@ mod tests {
             client.projections.model("thread-1").map(|model| model.model_id),
             Some("gpt-5.1-codex".to_string()),
         );
+    }
+
+    /// Issue #910 (item 5): a **stalled unsubscribe** takes the release handle
+    /// and forgets the projection before its ack, so the timeout must still
+    /// restore the local view and re-subscribe. The switch is reported by name
+    /// and the thread keeps its pair.
+    #[tokio::test]
+    async fn a_stalled_release_still_restores_the_subscription() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        server.silence_next_unsubscribe();
+        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
+        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
+            .await
+            .expect_err("the release timed out");
+        assert!(
+            error.to_string().contains("thread/unsubscribe"),
+            "the timed-out step is named: {error}"
+        );
+
+        // The cleanup restored both the subscription and the projection.
+        server.wait_for_subscribers("thread-1", 1).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id)
+                == Some("openai".to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the projection was not restored after the stalled release"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Design pass, symptom 6: each switch step is bounded on its own, with no

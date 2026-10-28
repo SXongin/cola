@@ -1693,6 +1693,9 @@ pub struct MockBackend {
     pub model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// Counts `model_surface` calls that reached [`Self::model_surface_gate`].
     pub model_surface_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// When set, [`Self::model_surface_gate`] is a one-shot gate: the next call
+    /// takes it (and clears it) and every later call proceeds.
+    pub model_surface_gate_once: std::sync::atomic::AtomicBool,
     /// Holds the next `create_session` calls (lazy creation / materialisation)
     /// until released, so a test can interleave a pair write with the creation
     /// window (issue #910).
@@ -2036,6 +2039,7 @@ impl MockBackend {
             transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             model_surface_gate: std::sync::Mutex::new(None),
             model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            model_surface_gate_once: std::sync::atomic::AtomicBool::new(false),
             create_session_gate: std::sync::Mutex::new(None),
             create_session_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
@@ -2490,6 +2494,19 @@ impl MockBackend {
     pub(crate) fn hold_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        self.model_surface_gate_once
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        gate
+    }
+
+    /// Hold only the **next** `model_surface` call: the one-shot lets a test park
+    /// one caller (e.g. a switch's lookup) while a later caller (a pick's own
+    /// lookup) proceeds.
+    pub(crate) fn hold_next_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        self.model_surface_gate_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         gate
     }
 
@@ -3392,11 +3409,20 @@ impl crate::backend::Backend for MockBackend {
                 catalog_only: query.catalog_only,
                 ack_budget: query.ack_budget,
             });
-        let gate = self
-            .model_surface_gate
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let gate = {
+            let mut slot = self
+                .model_surface_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self
+                .model_surface_gate_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                slot.take()
+            } else {
+                slot.clone()
+            }
+        };
         if let Some(gate) = gate {
             self.model_surface_gate_entered
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

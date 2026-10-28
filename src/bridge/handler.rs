@@ -2657,9 +2657,9 @@ impl App {
             .claim_pending_for_creation(thread_key)
             .await
         {
-            crate::bridge::session::PendingClaim::Claimed(pending) => {
+            crate::bridge::session::PendingClaim::Claimed(pending, generation) => {
                 let directory = pending.directory.clone();
-                return match self.materialise_pending(*pending, message_id).await {
+                return match self.materialise_pending(*pending, generation, message_id).await {
                     Ok(id) => Ok((id, false)),
                     Err(e) => {
                         // A create failure leaves the pending intact (and gives
@@ -2708,6 +2708,7 @@ impl App {
     async fn materialise_pending(
         &self,
         mut pending: PendingEntry,
+        generation: u64,
         message_id: &str,
     ) -> crate::error::Result<String> {
         let mut input = self.client.new_session_input(Some(&pending.directory));
@@ -2758,8 +2759,10 @@ impl App {
         let entry = pending.into_entry(session.id.clone());
         let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
-        // invalidated: `/switch` must see the just-created session.
-        self.activate_session(entry).await?;
+        // invalidated: `/switch` must see the just-created session. Scoped to
+        // this creation's generation (issue #910): a replacement pending
+        // declared while we ran is not resolved by this activation.
+        self.activate_created(entry, generation).await?;
         // ADR-0041 + ADR-0023: a pending topic's cover still says
         // 「下一条消息创建」. Move its record onto the new session and re-render
         // now — a real Session exists, so the brief (title/id) belongs on the
@@ -4995,11 +4998,13 @@ impl App {
     }
 
     /// Record a pair as the next prompt's intent while a turn is running (issue
-    /// #910). The catalog/variant lookup runs **before** the session gate; the
-    /// write inside it is a compare-and-set against the state read before the
-    /// lookup, so a newer `/model`/`/think` is an honest failure, never
-    /// overwritten — and a prompt's pre-flight (which takes the same gate)
-    /// cannot be admitted between the read and the write.
+    /// #910).
+    ///
+    /// Intent-first: the intent is registered under the session gate **before
+    /// any await**, so a prompt that starts in the window waits for the record
+    /// instead of reading the old pair. The catalog lookup then runs outside the
+    /// gate, and the write is a compare-and-set against the snapshot the intent
+    /// was registered with.
     async fn defer_pair(
         &self,
         core: &Arc<SharedCore>,
@@ -5007,28 +5012,43 @@ impl App {
         session_id: &str,
         pair: &str,
     ) -> DeferredSave {
-        let Some(snapshot) = core.session_settings(thread_key).await else {
-            return DeferredSave::Failed("⚠️ 会话已不存在，这次切换没有记录".to_string());
+        use crate::bridge::session::MirrorWrite;
+        let gate = core.session_gates.gate(session_id);
+        // 1. Intent first, under the gate.
+        let (intent, snapshot) = {
+            let _held = gate.enter().await;
+            let (generation, _signal) = gate.begin_intent(pair);
+            let snapshot = core
+                .session_settings(thread_key)
+                .await
+                .filter(|settings| settings.session_id.as_deref() == Some(session_id));
+            (
+                crate::bridge::session_gates::IntentGuard::new(Arc::clone(&gate), generation),
+                snapshot,
+            )
         };
-        if snapshot.session_id.as_deref() != Some(session_id) {
+        let Some(snapshot) = snapshot else {
             return DeferredSave::Failed("⚠️ 会话已切换，这次切换没有记录".to_string());
-        }
+        };
+        // 2. The catalog lookup, outside the gate.
         let mut variant = snapshot.variant.clone();
         let cleared = core
             .sessions_handle()
             .clear_variant_for_model(&core.client, &mut variant, pair)
             .await;
-        let gate = core.session_gates.gate(session_id);
-        let _held = gate.lock().await;
-        match core
+        // 3. Re-acquire, write, resolve — a waiter always wakes to the record.
+        let _held = gate.enter().await;
+        let result = match core
             .sessions_handle()
-            .set_live_pair(
+            .set_live_mirror(
                 thread_key,
                 session_id,
-                pair,
                 snapshot.model.as_deref(),
                 snapshot.variant.as_deref(),
-                cleared.as_deref(),
+                MirrorWrite::Model {
+                    model: pair,
+                    clear_variant: cleared.as_deref(),
+                },
             )
             .await
         {
@@ -5039,7 +5059,9 @@ impl App {
             // must not act on a record this click never really made.
             Ok(_) => DeferredSave::Failed("⚠️ 保存失败：会话状态已变化，这次切换没有记录".to_string()),
             Err(error) => DeferredSave::Failed(format!("⚠️ 保存失败：{error}")),
-        }
+        };
+        intent.resolve();
+        result
     }
 
     /// The confirmation card's 确认 click (issue #910). The target is resolved
@@ -5142,25 +5164,25 @@ impl App {
     /// Run a confirmed provider switch off the card-ack path and repaint the
     /// card with the outcome (issue #910).
     ///
-    /// The whole decision is taken under **one per-session serialization point**
-    /// (see `crate::bridge::session_gates` for the invariant):
+    /// **Intent first.** The switch's intent — the target pair and its
+    /// generation — is registered under the session gate before any await, so
+    /// from that moment a prompt for this session waits for the switch's verdict
+    /// and never reads/submits the old pair:
     ///
-    /// 1. Outside the gate: the snapshot the compare-and-set will require and
-    ///    the `/think` catalog lookup ("no async work under a lock others wait
-    ///    on").
-    /// 2. Inside the gate: a brief read of the global turn set decides
-    ///    defer-vs-switch, then the pair is written with a CAS against the
-    ///    snapshot. A prompt's pre-flight takes the same gate, so the pair is
-    ///    decided and durable before that prompt can be submitted; other
-    ///    sessions never wait (the gate is per session, and the global turn set
-    ///    is only read, never held across an RPC).
-    /// 3. A turn was running → the pair is the **deferred record** (the next
-    ///    prompt applies it); otherwise the three steps run under the gate, and
-    ///    a failure rolls the mirror back (also inside it, before any prompt can
-    ///    observe the attempted pair) with the store's compare-and-set.
+    /// 1. Under the gate: register the intent, take the snapshot the CAS will
+    ///    require, release.
+    /// 2. Outside the gate: the `/think` catalog lookup ("no async work under a
+    ///    lock others wait on").
+    /// 3. Under the gate: a brief read of the global turn set decides
+    ///    defer-vs-switch, then the mirror write is a CAS against the snapshot;
+    ///    a turn was running → the pair is the deferred record, otherwise the
+    ///    three steps run and a failure rolls back inside the gate. Resolve the
+    ///    intent before releasing, so a waiting prompt wakes to the final state.
     ///
-    /// The adapter bounds each RPC itself, so no outer cancellation can skip the
-    /// read-back/re-subscribe cleanup.
+    /// Other sessions never wait (the gate is per session, and the global turn
+    /// set is only read, never held across an RPC). The adapter bounds each RPC
+    /// itself, so no outer cancellation can skip the read-back/re-subscribe
+    /// cleanup.
     async fn run_provider_switch(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -5171,35 +5193,46 @@ impl App {
         claim: ProviderSwitchGuard,
     ) {
         use crate::backend::types::ThreadModelChange;
-        use crate::bridge::session::PairWrite;
+        use crate::bridge::session::{MirrorWrite, PairWrite};
         let pair = format!("{provider}/{model}");
         let info = crate::backend::types::ModelInfo {
             id: model.clone(),
             provider_id: provider.clone(),
             variant: None,
         };
-        // 1. Outside the gate: the state the CAS must still see, and the variant
-        //    lookup that decides the clear (a catalog read of its own).
-        let snapshot = self
-            .core
-            .session_settings(&thread_key)
-            .await
-            .map(|settings| PreviousPair {
-                model: settings.model,
-                variant: settings.variant,
-                session_id: settings.session_id,
-            });
-        let Some(snapshot) = snapshot.filter(|snapshot| snapshot.session_id.as_deref() == Some(&session_id))
-        else {
+        let gate = self.core.session_gates.gate(&session_id);
+        // 1. Intent first, under the gate: a prompt arriving from here on waits
+        //    for this switch's verdict instead of reading the old pair.
+        let (intent, snapshot) = {
+            let _held = gate.enter().await;
+            let (generation, _signal) = gate.begin_intent(&pair);
+            let snapshot = self
+                .core
+                .session_settings(&thread_key)
+                .await
+                .map(|settings| PreviousPair {
+                    model: settings.model,
+                    variant: settings.variant,
+                    session_id: settings.session_id,
+                })
+                .filter(|snapshot| snapshot.session_id.as_deref() == Some(&session_id));
+            (
+                crate::bridge::session_gates::IntentGuard::new(Arc::clone(&gate), generation),
+                snapshot,
+            )
+        };
+        let Some(snapshot) = snapshot else {
             let card = crate::feishu::card::picker::build_provider_switch_error_card(
                 &provider,
                 &model,
                 "这张确认卡已过期（会话已切换或不存在），没有做任何改动。",
             );
+            intent.resolve();
             self.finish_provider_switch(message_id, card, &pair).await;
             drop(claim);
             return;
         };
+        // 2. The catalog lookup, outside the gate.
         let mut variant = snapshot.variant.clone();
         let cleared = self
             .core
@@ -5207,25 +5240,25 @@ impl App {
             .clear_variant_for_model(&self.core.client, &mut variant, &pair)
             .await;
 
-        // 2./3. Inside the per-session gate: decide, write, and (when no turn is
-        // running) switch. Nothing here holds the global turn set across an RPC.
+        // 3. Re-acquire: decide, write, and (when no turn is running) switch.
         let card = {
-            let gate = self.core.session_gates.gate(&session_id);
-            let _held = gate.lock().await;
+            let _held = gate.enter().await;
             let turn_running = self.core.inflight.lock().await.contains(&session_id);
             let written = self
                 .core
                 .sessions_handle()
-                .set_live_pair(
+                .set_live_mirror(
                     &thread_key,
                     &session_id,
-                    &pair,
                     snapshot.model.as_deref(),
                     snapshot.variant.as_deref(),
-                    cleared.as_deref(),
+                    MirrorWrite::Model {
+                        model: &pair,
+                        clear_variant: cleared.as_deref(),
+                    },
                 )
                 .await;
-            match written {
+            let card = match written {
                 Ok(PairWrite::Applied {
                     variant: attempted_variant,
                     ..
@@ -5290,7 +5323,10 @@ impl App {
                 Err(error) => {
                     crate::feishu::card::picker::build_provider_save_blocked_card(&pair, &error.to_string())
                 }
-            }
+            };
+            // Resolved under the gate: a waiter re-reads the final state.
+            intent.resolve();
+            card
         };
         // Released only after the outcome is on screen: a replay that beats the
         // card update is still answered as in progress.
