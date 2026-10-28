@@ -91,7 +91,10 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let backend = MockBackend::new(realistic_parts());
+    let mut backend = MockBackend::new(realistic_parts());
+    // A Pending Session's pair only exists on a client with a provider axis
+    // (Codex's shape); the mock defaults to OpenCode's, which has none.
+    backend.with_thread_provider(true);
     let picks = backend.created_session_picks.clone();
     let prompt_models = backend.prompt_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
@@ -672,8 +675,9 @@ async fn cancelling_the_provider_confirmation_changes_nothing() {
 }
 
 /// The recorded variant clear is what the next prompt reads (issue #910): a
-/// `/think` the new model does not declare is cleared at record time, and the
-/// prompt submits no variant.
+/// `/think` the new model does not declare is cleared by the **pre-flight** —
+/// the confirmation records from a store write only (it must ack inside the
+/// card budget) — and the prompt submits no variant.
 #[tokio::test]
 async fn a_recorded_switch_clears_an_unsupported_variant() {
     let _wd = test_work_dir();
@@ -714,8 +718,8 @@ async fn a_recorded_switch_clears_an_unsupported_variant() {
             .cloned()
             .unwrap()
             .variant,
-        None,
-        "the recorded clear lands at record time"
+        Some("high".to_string()),
+        "the confirmation records only: the clear waits for the pre-flight"
     );
 
     app.handle_message(incoming(
@@ -732,6 +736,17 @@ async fn a_recorded_switch_clears_an_unsupported_variant() {
         None,
         "the prompt submits no cleared variant"
     );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant,
+        None,
+        "the pre-flight recorded the clear before switching"
+    );
 }
 
 /// Issue #910, item 6: a Pending Session's pair is one store write.
@@ -741,7 +756,8 @@ async fn a_pending_pair_is_saved_in_one_write() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions.json");
     let cfg = test_config(&sessions);
-    let backend = MockBackend::new(realistic_parts());
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
@@ -1140,9 +1156,304 @@ async fn the_model_text_form_confirms_a_provider_change() {
 }
 
 /// Final round, item 4: a `/switch` between the confirmation's check and the
-/// record makes the record a no-op instead of landing on the new session.
+/// record makes the record a no-op instead of landing on the new session. The
+/// record is a store write only, so the test parks it on the session's write
+/// gate — its classification point — rather than on a catalog read.
 #[tokio::test]
 async fn a_remap_before_the_record_lands_writes_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    // Hold the session's serialization point so the confirm's write is parked
+    // after its classification and before its compare-and-set.
+    let gate = app.session_gates.gate("ses_test");
+    let held = gate.enter().await;
+    let confirm = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while gate.waiting() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the record never parked");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The chat switches while the record is parked.
+    app.command_handles()
+        .flow
+        .unmap("ses_test")
+        .await
+        .expect("the old mapping is dropped");
+    let mut other = crate::config::SessionEntry::new(key(), "ses_new", "/work/cola");
+    other.model = Some("openai/gpt-5.1".into());
+    app.activate_session(other)
+        .await
+        .expect("the new mapping activates");
+    drop(held);
+
+    let step = confirm.await.expect("the confirm joins").expect("a result");
+    let text = format!("{:?}{:?}", step.card, step.toast);
+    assert!(
+        text.contains("状态已变化") || text.contains("过期"),
+        "the record is refused honestly: {text}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the new session's mirror is untouched"
+    );
+}
+
+/// Issue #910, item 2: the `Record` decision carries the session it classified,
+/// so a `/switch` during the pick's own catalog read cannot record the model on
+/// the new session (whose next prompt would then switch provider unconfirmed).
+#[tokio::test]
+async fn a_record_decision_is_bound_to_the_session_it_classified() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: "openai".into(),
+            models: vec![model_option("gpt-5.1", &["low"])],
+        }])
+        .with_model_pick_route(ModelPickRoute::PerTurn)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    // Same provider as the thread: a `Record`, whose variant clear reads the
+    // catalog — the parking point between the classification and the write.
+    let command = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/model openai/gpt-5.1",
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the catalog lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The chat switches while the Record's catalog read is parked.
+    app.command_handles()
+        .flow
+        .unmap("ses_test")
+        .await
+        .expect("the old mapping is dropped");
+    let mut other = crate::config::SessionEntry::new(key(), "ses_new", "/work/cola");
+    other.model = Some("openai/gpt-5.1-mini".into());
+    app.activate_session(other)
+        .await
+        .expect("the new mapping activates");
+    gate.add_permits(1);
+    command.await.expect("the command joins");
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("状态已变化") || reply.contains("过期"),
+        "the Record is refused honestly: {reply}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1-mini"),
+        "the new session's mirror is untouched"
+    );
+}
+
+/// Issue #910, item 1: a client without a thread-level provider axis (OpenCode)
+/// records **no** provider on a Pending Session — the pair is the model ref
+/// alone — so the creation body it sends is unchanged.
+#[tokio::test]
+async fn a_pending_pick_records_no_provider_without_the_axis() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // OpenCode's shape: the provider rides each prompt, not the thread.
+    backend.with_thread_provider(false);
+    let picks = backend.created_session_picks.clone();
+    let prompt_models = backend.prompt_models.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending survives");
+    assert_eq!(pending.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+    assert_eq!(
+        pending.provider, None,
+        "a client without the axis records no thread-level provider"
+    );
+
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    let picks = picks.lock().await.clone();
+    assert_eq!(picks.len(), 1, "one creation: {picks:?}");
+    assert_eq!(
+        picks[0].0, None,
+        "no thread-level provider reaches the creation input: {picks:?}"
+    );
+    // The model never rode the creation body on this client (main's shape):
+    // it is applied to the created session and the first turn carries it.
+    assert_eq!(
+        prompt_models.lock().await.as_slice(),
+        &[Some("deepseek/deepseek-v4-pro".to_string())],
+        "the pick still reaches the first turn"
+    );
+}
+
+/// Issue #910, item 3: a durable generation's session switch is a backend RPC,
+/// so it runs **outside** the session gate — a stalled server must not wedge
+/// this session's next prompt. The pick is parked inside `switch_session_model`
+/// here, and the prompt still goes through.
+#[tokio::test]
+async fn a_model_pick_switches_the_session_outside_the_gate() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: Some("high".into()),
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    let gate = backend.hold_session_switch();
+    let entered = backend.switch_model_gate_entered.clone();
+    let prompt_models = backend.prompt_models.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let pick = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/model openai/gpt-5.1",
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the switch never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The pick is parked in its RPC; the session gate must still be free, so
+    // the next prompt's pre-flight reaches `prompt` without waiting for it.
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_models.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt was blocked by the pick's RPC"
+        );
+        assert!(
+            !pick.is_finished(),
+            "the pick was not parked when the prompt went through"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    gate.add_permits(1);
+    pick.await.expect("the pick joins");
+}
+
+/// Issue #910, item 4: a confirmation acks from a store write only — it never
+/// waits on a catalog read, whose slowest case would blow the card budget.
+#[tokio::test]
+async fn a_confirmation_acks_without_a_catalog_read() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -1163,36 +1474,23 @@ async fn a_remap_before_the_record_lands_writes_nothing() {
         .await
         .expect("provider pick");
     let card = step.card.expect("a confirmation card");
-    let confirm = tokio::spawn({
-        let app = app.clone();
-        async move {
-            app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
-                .await
-        }
-    });
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    // The chat switches while the confirm's catalog lookup is parked.
-    app.command_handles()
-        .flow
-        .unmap("ses_test")
-        .await
-        .expect("the old mapping is dropped");
-    let mut other = crate::config::SessionEntry::new(key(), "ses_new", "/work/cola");
-    other.model = Some("openai/gpt-5.1".into());
-    app.activate_session(other)
-        .await
-        .expect("the new mapping activates");
-    gate.add_permits(1);
-
-    let step = confirm.await.expect("the confirm joins").expect("a result");
-    let text = format!("{:?}{:?}", step.card, step.toast);
+    let step = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm"),
+    )
+    .await
+    .expect("the confirmation acks inside the card budget")
+    .expect("a result");
+    assert_eq!(
+        entered.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the confirmation read no catalog"
+    );
     assert!(
-        text.contains("状态已变化") || text.contains("过期"),
-        "the record is refused honestly: {text}"
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("已记录")),
+        "the recorded card is the ack"
     );
     assert_eq!(
         app.sessions
@@ -1203,7 +1501,62 @@ async fn a_remap_before_the_record_lands_writes_nothing() {
             .unwrap()
             .model
             .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the pair is the store write"
+    );
+    gate.add_permits(1);
+}
+
+/// Issue #910, item 5 (the allowed half): with the gate off but the cache
+/// knowing the thread's provider, a **same-provider** pick is still an ordinary
+/// model pick — the cache-only hedge refuses only what it cannot prove.
+#[tokio::test]
+async fn a_same_provider_pick_is_recorded_with_the_gate_off_when_the_cache_knows_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_known_thread_provider(Some("openai"))
+        .with_model_pick_route(ModelPickRoute::PerTurn)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(reply.contains("Model: openai/gpt-5.1"), "{reply}");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
         Some("openai/gpt-5.1"),
-        "the new session's mirror is untouched"
+        "the same-provider pick is recorded"
     );
 }

@@ -35,6 +35,10 @@ use std::sync::{Arc, Weak};
 #[derive(Default)]
 pub(crate) struct SessionGate {
     lock: tokio::sync::Mutex<()>,
+    /// Callers queued on [`Self::lock`] (test-only): lets a test park a writer
+    /// deterministically instead of sleeping.
+    #[cfg(test)]
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for SessionGate {
@@ -47,7 +51,25 @@ impl SessionGate {
     /// Take the session's serialization point. Hold it across the read, the
     /// decision and the write; never across a catalog lookup or an RPC.
     pub(crate) async fn enter(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.lock.lock().await
+        #[cfg(test)]
+        {
+            self.waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = self.lock.lock().await;
+            self.waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            guard
+        }
+        #[cfg(not(test))]
+        {
+            self.lock.lock().await
+        }
+    }
+
+    /// How many callers are queued on this gate (test-only): a test can wait
+    /// until the writer it spawned is parked on the session's serialization
+    /// point.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

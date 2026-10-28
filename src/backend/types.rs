@@ -827,6 +827,28 @@ mod tests {
         assert!(SessionStatus::Retry.is_live());
     }
 
+    /// Issue #910: a client without a thread-level provider axis (OpenCode)
+    /// sends the creation body it always did. The `provider` field is **absent**
+    /// — not `null` — so the payload is byte-identical to before the field
+    /// existed, while the model's own `providerID` still travels inside the ref.
+    #[test]
+    fn a_create_session_input_without_a_provider_has_no_provider_key() {
+        let body = serde_json::to_value(CreateSessionInput {
+            id: None,
+            agent: None,
+            model: Some(ModelInfo {
+                id: "gpt-5.1".into(),
+                provider_id: "openai".into(),
+                variant: None,
+            }),
+            provider: None,
+            location: None,
+        })
+        .unwrap();
+        assert!(body.get("provider").is_none(), "{body}");
+        assert_eq!(body["model"]["providerID"], "openai", "{body}");
+    }
+
     #[test]
     fn parses_session_list_info_camelcase_fixture() {
         // A real `GET /session` entry (Session.Info, camelCase). ParentID/time

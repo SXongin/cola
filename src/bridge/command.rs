@@ -1471,11 +1471,18 @@ pub(crate) async fn handle_command(
                 crate::bridge::handles::ModelPickDecision::Refuse(text) => {
                     handles.flow.platform.reply_text(message_id, &text).await?;
                 }
-                crate::bridge::handles::ModelPickDecision::Record => {
+                crate::bridge::handles::ModelPickDecision::Record { session_id } => {
+                    // Bound to the session the decision classified: a `/switch`
+                    // since then is a no-op, never a record on the new session.
                     let outcome = handles
                         .flow
                         .sessions
-                        .pick_model(&handles.flow.backend, &thread_key, &name)
+                        .pick_model_expecting(
+                            &handles.flow.backend,
+                            &thread_key,
+                            session_id.as_deref(),
+                            &name,
+                        )
                         .await;
                     match classify_pick(
                         outcome,

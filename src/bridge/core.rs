@@ -646,14 +646,17 @@ impl SharedCore {
             .await
     }
 
-    /// Apply a `/model` pick (ADR-0020 + V2's durable switch).
-    pub async fn pick_model(
+    /// Record a `/model` spec **without a catalog read** (issue #910): the
+    /// confirmation acks from a store write only, and the turn pre-flight
+    /// resolves the `/think` clear.
+    pub(crate) async fn record_pair_expecting(
         &self,
         thread_key: &ThreadKey,
+        expected_session: Option<&str>,
         model_spec: &str,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .pick_model(&self.client, thread_key, model_spec)
+            .record_pair_expecting(thread_key, expected_session, model_spec)
             .await
     }
 

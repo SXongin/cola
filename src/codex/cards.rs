@@ -2681,7 +2681,7 @@ async fn a_silent_catalog_does_not_wedge_a_model_pick() {
     let outcome = handles
         .flow
         .sessions
-        .pick_model(&handles.flow.backend, &key, "codex/new-model")
+        .pick_model_expecting(&handles.flow.backend, &key, None, "codex/new-model")
         .await;
     let elapsed = started.elapsed();
 

@@ -1952,6 +1952,20 @@ impl Backend for CodexClient {
         }
     }
 
+    fn has_thread_provider(&self) -> bool {
+        true
+    }
+
+    /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
+    /// bucket is not a channel, so it reads as unknown. A cold projection is
+    /// unknown — deciding "is the gate relevant" must not cost a request.
+    fn known_thread_provider(&self, session_id: &str) -> Option<String> {
+        self.projections
+            .model(session_id)
+            .map(|model| model.provider_id)
+            .filter(|provider| provider != MODEL_PROVIDER)
+    }
+
     /// Where a Codex model pick lands (issue #910): the neutral `codex` bucket
     /// means "no provider named" and rides the turn; a real provider that is
     /// the thread's own needs no thread action either (only the model changes,
