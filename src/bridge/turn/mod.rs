@@ -742,14 +742,29 @@ impl Turn {
         // apply (a peer holds the thread, the read-back did not change, or the
         // gate is off), the prompt is not sent — running it on the old provider
         // would be a silent lie, and the old model name would 404.
+        // A durable generation's variant is the session's own, and resolving it
+        // may read the backend — never under the gate (its contract is "no RPC
+        // under it"). All other clients read the `/think` mirror under the gate,
+        // which keeps the stale-variant guarantee for the client whose provider
+        // switch this is.
+        let durable_variant = if handles.backend.keeps_session_selection() {
+            Some(
+                handles
+                    .sessions
+                    .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
+                    .await,
+            )
+        } else {
+            None
+        };
         let (model, variant) = {
             let gate = handles.session_gates.gate(&self.session_id);
             let _held = gate.enter().await;
             let model = handles.sessions.model_override(&self.session_id).await;
-            let variant = handles
-                .sessions
-                .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
-                .await;
+            let variant = match durable_variant {
+                Some(variant) => variant,
+                None => handles.sessions.variant_override(&self.session_id).await,
+            };
             (model, variant)
         };
         self.turn_variant = variant;

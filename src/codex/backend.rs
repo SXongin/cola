@@ -86,11 +86,15 @@ pub(crate) struct Projections {
     /// name.
     model_stamps: std::sync::atomic::AtomicU64,
     states: Mutex<HashMap<String, SubscriptionState>>,
-    /// One epoch per thread's subscriber task (issue #910): every new task bumps
-    /// it, and a release ack only evicts the live state while its epoch still
-    /// matches — a late ack from a subscription a restore already replaced must
-    /// not evict the fresh projection.
+    /// One epoch per thread's subscriber task (issue #910): every new task takes
+    /// the next value of a **process-wide, never-reset** counter, and a release
+    /// ack only evicts the live state while its epoch still matches. A late ack
+    /// from a subscription a restore already replaced must not evict the fresh
+    /// projection — and because the counter never restarts, a thread that was
+    /// evicted and re-created cannot mint an epoch an old ack still owns.
     epochs: Mutex<HashMap<String, u64>>,
+    /// The monotonically increasing source of the epochs above.
+    next_epoch: std::sync::atomic::AtomicU64,
     /// One adoption lock per thread. Two concurrent reads of the same new
     /// thread must not both send `thread/resume`, but an unrelated thread (a
     /// repeatedly polled never-run thread included) must never block another's
@@ -736,9 +740,11 @@ impl Projections {
     /// release whose ack arrives after a restore re-adopted the thread must not
     /// evict the fresh projection.
     fn begin_subscription(&self, thread_id: &str) -> u64 {
-        let mut epochs = self.epochs.lock().expect("codex subscription epochs");
-        let epoch = epochs.get(thread_id).copied().unwrap_or_default() + 1;
-        epochs.insert(thread_id.to_string(), epoch);
+        let epoch = self.next_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        self.epochs
+            .lock()
+            .expect("codex subscription epochs")
+            .insert(thread_id.to_string(), epoch);
         epoch
     }
 
@@ -7462,6 +7468,31 @@ mod tests {
         assert_eq!(
             client.projections.model("thread-1").map(|model| model.model_id),
             Some("gpt-5.1-codex".to_string()),
+        );
+    }
+
+    /// Issue #910 (extra finding): the subscription epoch counter never restarts,
+    /// so a thread that was evicted and re-created cannot mint an epoch an old
+    /// ack still owns.
+    #[tokio::test]
+    async fn subscription_epochs_are_monotonic_across_eviction() {
+        let projections = Projections::default();
+        let first = projections.begin_subscription("thread-1");
+        projections.set_state("thread-1", SubscriptionState::Live);
+        projections.evict("thread-1", true);
+        let second = projections.begin_subscription("thread-1");
+        assert!(
+            second > first,
+            "a re-created subscription must not reuse an evicted epoch"
+        );
+        projections.set_state("thread-1", SubscriptionState::Live);
+
+        // A late ack from the evicted subscription is ignored.
+        projections.released("thread-1", first);
+        assert_eq!(
+            projections.state("thread-1"),
+            Some(SubscriptionState::Live),
+            "an old epoch cannot evict the re-created subscription"
         );
     }
 

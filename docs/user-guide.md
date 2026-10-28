@@ -302,7 +302,7 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   runs another model is not reloaded (the model rides that message). The click
   itself is answered synchronously; no release, resume or read-back ever runs
   from the card.
-- **`reasoning_summary` (codex only, default `auto`)**- **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
+- **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the
   result as a folded 💭 推理过程 panel; the values are `auto`, `concise`,

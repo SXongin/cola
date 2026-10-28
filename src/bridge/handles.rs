@@ -148,6 +148,22 @@ fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome
     }
 }
 
+/// What a `/model` pick needs before it is recorded (issue #910): the card form
+/// and the text form (`/model <provider>/<model>`) obey one rule.
+pub(crate) enum ModelPickDecision {
+    /// A model-only pick (the provider is the thread's own): record it.
+    Record,
+    /// A thread-level provider change: confirm it with a card first.
+    Confirm {
+        session_id: String,
+        provider: String,
+        model: String,
+    },
+    /// Not permitted (the gate is off) or not classifiable: say why, record
+    /// nothing.
+    Refuse(String),
+}
+
 impl SessionsHandle {
     pub(crate) fn new(
         store: Arc<Mutex<SessionStore>>,
@@ -772,7 +788,7 @@ impl SessionsHandle {
             },
         )?;
         Ok(match written {
-            crate::bridge::session::PairWrite::Applied { cleared_variant, .. } => {
+            crate::bridge::session::PairWrite::Applied { cleared_variant } => {
                 PickOutcome::Applied { cleared_variant }
             }
             // A materialising pending, a vanished one, or a newer pick: honest
@@ -811,11 +827,21 @@ impl SessionsHandle {
         &self,
         entry: SessionEntry,
         generation: u64,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<bool> {
         let mut store = self.store.lock().await;
-        store.activate_created(entry, generation)?;
+        let activated = store.activate_created(entry, generation)?;
         *self.cache.lock().await = None;
-        Ok(())
+        Ok(activated)
+    }
+
+    /// Whether this generation still owns its materialisation claim (issue
+    /// #910): a thread forgotten or re-declared while `thread/start` ran gets no
+    /// title, picks or mapping.
+    pub(crate) async fn creation_is_current(&self, thread_key: &ThreadKey, generation: u64) -> bool {
+        self.store
+            .lock()
+            .await
+            .creation_is_current(thread_key, generation)
     }
 
     /// Write one conversation's `/agent` override, touching only that field
@@ -828,6 +854,47 @@ impl SessionsHandle {
         agent: Option<&str>,
     ) -> crate::error::Result<bool> {
         self.store.lock().await.set_agent(thread_key, session_id, agent)
+    }
+
+    /// The rule both `/model` forms share (issue #910): a model-only pick is
+    /// recorded directly; a provider change on a live thread needs the gate and
+    /// a confirmation; anything unclassifiable is refused by name. A Pending
+    /// Session is `Record` (the pair rides `thread/start`).
+    pub(crate) async fn model_pick_decision(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        thread_key: &ThreadKey,
+        provider: &str,
+        model: &str,
+    ) -> ModelPickDecision {
+        let Some(settings) = self.session_settings(thread_key).await else {
+            return ModelPickDecision::Record;
+        };
+        let Some(session_id) = settings.session_id.clone() else {
+            return ModelPickDecision::Record;
+        };
+        let info = crate::backend::types::ModelInfo {
+            id: model.to_string(),
+            provider_id: provider.to_string(),
+            variant: settings.variant.clone(),
+        };
+        match backend.model_pick_route(&session_id, &info).await {
+            Ok(crate::backend::types::ModelPickRoute::PerTurn) => ModelPickDecision::Record,
+            Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
+                if backend.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
+                    ModelPickDecision::Refuse("provider 只能在新线程切换".to_string())
+                } else {
+                    ModelPickDecision::Confirm {
+                        session_id,
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                    }
+                }
+            }
+            // Unknown is not "safe to skip": the prompt path would then send a
+            // pair the thread may not run. Say so instead of guessing.
+            Err(error) => ModelPickDecision::Refuse(format!("⚠️ 无法确认这条线程的 provider：{error}")),
+        }
     }
 
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the
@@ -846,10 +913,31 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
+        self.pick_model_expecting(backend, thread_key, None, model_spec)
+            .await
+    }
+
+    /// [`Self::pick_model`] that only lands while `expected_session` is still the
+    /// thread's target (issue #910): a `/switch` between the caller's check and
+    /// this write is a named no-op instead of a record on the new session.
+    pub(crate) async fn pick_model_expecting(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        thread_key: &ThreadKey,
+        expected_session: Option<&str>,
+        model_spec: &str,
+    ) -> crate::error::Result<PickOutcome> {
         use crate::bridge::session::MirrorWrite;
         let Some(snapshot) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
+        // The card named a session: a `/switch` since then makes this a no-op,
+        // never a record on the new session (issue #910).
+        if let Some(expected) = expected_session
+            && snapshot.session_id.as_deref() != Some(expected)
+        {
+            return Ok(PickOutcome::StateChanged);
+        }
         // The catalog lookup that decides the `/think` clear is its own await:
         // it runs before the gate, never inside it.
         let mut probe = snapshot.variant.clone();

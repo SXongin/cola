@@ -223,7 +223,7 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `thread/fork` 带上 provider 与模型。一轮正在跑时做出的选择同样只是记录，由下一条
   消息应用；如果线程已经在目标 provider 上、只是模型不同，cola 不会重新加载线程
   （模型随那条消息生效）。点击本身同步应答，卡片回调里绝不执行释放、resume 或回读。
-- **`reasoning_summary`（仅 codex，默认 `auto`）**- **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
+- **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
   过程面板；取值有 `auto`、`concise`、`detailed` 与 `none`。Codex 在固定版本
