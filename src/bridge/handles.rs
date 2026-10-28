@@ -722,21 +722,68 @@ impl SessionsHandle {
         provider: &str,
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
-        let Some(mut settings) = self.session_settings(thread_key).await else {
+        // The snapshot only decides whether a variant must be cleared; the
+        // write below re-finds the **pending entry** under its own lock, so a
+        // session that materialised while the (awaited) catalog lookup ran is
+        // `NoTarget` — the pair must never land on the live entry, whose thread
+        // was created with the old provider.
+        let Some(settings) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
         if settings.session_id.is_some() {
             return Ok(PickOutcome::NoTarget);
         }
-        let cleared_variant = self
-            .clear_variant_for_model(backend, &mut settings.variant, model_spec)
+        let mut variant = settings.variant.clone();
+        let cleared = self
+            .clear_variant_for_model(backend, &mut variant, model_spec)
             .await;
-        settings.model = Some(model_spec.to_string());
-        settings.provider = Some(provider.to_string());
-        if !self.set_session_settings(thread_key, settings).await? {
-            return Ok(PickOutcome::NoTarget);
+        let written =
+            self.store
+                .lock()
+                .await
+                .set_pending_pair(thread_key, model_spec, provider, cleared.as_deref())?;
+        match written {
+            crate::bridge::session::PendingPairWrite::Applied { cleared_variant } => {
+                Ok(PickOutcome::Applied { cleared_variant })
+            }
+            crate::bridge::session::PendingPairWrite::NoPending => Ok(PickOutcome::NoTarget),
         }
-        Ok(PickOutcome::Applied { cleared_variant })
+    }
+
+    /// Write a provider+model pair onto the conversation's **live** entry in one
+    /// lock (issue #910), with the `/think` clear the caller computed from its
+    /// snapshot. `None` when the conversation is now pending or gone; otherwise
+    /// the state the rollback's compare-and-swap must match.
+    pub(crate) async fn set_live_pair(
+        &self,
+        thread_key: &ThreadKey,
+        model_spec: &str,
+        clear_variant: Option<&str>,
+    ) -> crate::error::Result<Option<crate::bridge::session::LivePairWrite>> {
+        self.store
+            .lock()
+            .await
+            .set_live_pair(thread_key, model_spec, clear_variant)
+    }
+
+    /// Compare-and-restore a failed provider pair in ONE store lock (issue
+    /// #910): the previous mirror goes back only while the entry still holds the
+    /// model **and** variant the attempt wrote.
+    pub(crate) async fn rollback_pair(
+        &self,
+        thread_key: &ThreadKey,
+        attempted_model: &str,
+        attempted_variant: Option<&str>,
+        previous_model: Option<String>,
+        previous_variant: Option<String>,
+    ) -> crate::error::Result<bool> {
+        self.store.lock().await.rollback_pair(
+            thread_key,
+            attempted_model,
+            attempted_variant,
+            previous_model,
+            previous_variant,
+        )
     }
 
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the

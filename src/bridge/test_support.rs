@@ -1687,6 +1687,12 @@ pub struct MockBackend {
     /// Counts `transcript` reads that reached [`Self::transcript_gate`] — the
     /// test's "the reader is now parked" signal.
     pub transcript_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Holds the next `model_surface` calls (a card page, or the variant lookup a
+    /// pick makes) until the returned semaphore is released, so a test can
+    /// interleave a store change with the awaited catalog read.
+    pub model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `model_surface` calls that reached [`Self::model_surface_gate`].
+    pub model_surface_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// The session id `create_session` returns.
     pub session_id: String,
     /// Every `create_session` call's requested directory (ADR-0041: asserts
@@ -2021,6 +2027,8 @@ impl MockBackend {
             prompt_gate: None,
             transcript_gate: std::sync::Mutex::new(None),
             transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            model_surface_gate: std::sync::Mutex::new(None),
+            model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
             created_session_dirs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_create_session_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2464,6 +2472,15 @@ impl MockBackend {
     pub(crate) fn hold_transcripts(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.transcript_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Hold every `model_surface` call until the returned semaphore is released,
+    /// counting the calls that reached the gate. Lets a test park the variant
+    /// lookup a pick makes and change the store underneath it (issue #910).
+    pub(crate) fn hold_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -3347,6 +3364,16 @@ impl crate::backend::Backend for MockBackend {
                 catalog_only: query.catalog_only,
                 ack_budget: query.ack_budget,
             });
+        let gate = self
+            .model_surface_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            self.model_surface_gate_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _permit = gate.acquire().await;
+        }
         if let Some(surface) = &self.model_surface {
             // A client's declared shape, with the caller's current selection
             // filled in the way both real adapters do.
