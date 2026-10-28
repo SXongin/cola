@@ -791,7 +791,9 @@ pub fn build_think_card(
     current: Option<&str>,
     variants: &[String],
 ) -> serde_json::Value {
-    let label = format!("{provider}/{model}");
+    // The display ref, built from the two fields so a provider id containing
+    // `/` stays readable (issue #908).
+    let label = crate::backend::parsing::join_model(provider, model);
     let current_label = current
         .map(|v| format!("`{v}`"))
         .unwrap_or_else(|| "默认".to_string());

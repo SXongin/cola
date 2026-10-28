@@ -2798,3 +2798,60 @@ async fn an_unobserved_previous_and_a_model_less_read_are_unknown() {
     );
     assert_eq!(active.variant, None);
 }
+
+/// Issue #908: a provider id may itself contain `/` (a quoted TOML key). The
+/// card's pair carries the provider and model as separate fields, so the pair
+/// is built from them and round-trips to (`foo/bar`, `gpt`) — never `foo` +
+/// `bar/gpt`.
+#[tokio::test]
+async fn a_slashed_provider_id_round_trips_through_a_card_pair() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    let picks = backend.created_session_picks.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    let step = app
+        .host_action(serde_json::json!({
+            "action": "model",
+            "level": "model",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "provider": "foo/bar",
+            "value": "gpt",
+        }))
+        .await
+        .expect("paired pick");
+    assert!(step.card.is_none(), "a pending pick is toast-only");
+
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pair is recorded");
+    assert_eq!(pending.provider.as_deref(), Some("foo/bar"));
+    let reference = pending.model.clone().expect("the model ref");
+    let parsed = crate::backend::parsing::parse_model(&reference).expect("the ref parses");
+    assert_eq!(parsed.provider_id, "foo/bar", "the whole provider id survives");
+    assert_eq!(parsed.id, "gpt", "and the model is not `bar/gpt`");
+
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        picks.lock().await.as_slice(),
+        &[(Some("foo/bar".to_string()), Some("gpt".to_string()))],
+        "the creation carries the same pair"
+    );
+}

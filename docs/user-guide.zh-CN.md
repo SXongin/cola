@@ -729,6 +729,11 @@ Codex 的模型轴不是 provider → model 树：provider 是**线程级**事�
 - **同一 provider 内的点选只是一次模型变更。** `model_provider` 等于线程当前
   provider 的 `[profiles.*]` 预设，或任意 `codex/<id>` 点选，都只记录模型并
   随下一条消息生效——不释放、不 resume、不重新加载。
+- **`codex` 是保留名。** 内置目录的引用是 `codex/<id>`——一个共享的中性命名
+  空间，永远不是一个渠道——所以 `[model_providers.codex]` 不能被选中：Provider
+  一栏把它列成「`codex` 是内置目录的保留名，不能在这里选择」，不提供任何组合
+  （组合值会和目录自身的引用撞车）；命名它的 `[profiles.*]` 会退化成中性目录
+  引用。分类是纯字面的，因此目录点选从不读取你的配置。
 
 `provider_switch_on_resume` 同样管着文本形式：对不同 provider 的
 `/model <provider>/<model>` 会打开同一张确认卡片（开关关闭时被拒绝），绝不会

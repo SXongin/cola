@@ -4378,7 +4378,11 @@ pub(crate) enum CardUpdates {
 /// handler, a recorded card, a continuation. Generous on purpose: every wait
 /// polls the fact it needs, so this bounds a genuine regression instead of
 /// turning a loaded parallel suite into a flake.
-pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// 180 s, not 60: a loaded macOS CI runner can take minutes to schedule a
+/// spawned handler's continuation, and the wait exists to catch a genuine
+/// regression, not to time a busy machine. It costs nothing when the outcome
+/// lands (the waits poll, so they return immediately).
+pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Await a spawned handler by polling `is_finished`, not by racing a fixed
 /// timeout: the very next poll after the work lands sees it, so the wait cannot

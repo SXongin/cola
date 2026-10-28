@@ -122,66 +122,6 @@ const NOTE_MAX_CHARS: usize = 64;
 /// The neutral provider bucket the picker's `codex/<id>` callback value uses.
 const MODEL_PROVIDER: &str = "codex";
 
-/// How long the configured-provider knowledge is trusted for the **pick path**
-/// (issue #910). The `/model` surface refreshes it on every open; the
-/// synchronous neutral-bucket predicate only ever consults this cache, so a
-/// pick never costs a `config/read`.
-const CONFIGURED_PROVIDERS_TTL: Duration = Duration::from_secs(60);
-
-/// The provider ids `config/read` last declared (issue #910).
-///
-/// `codex` is cola's neutral catalog bucket **only** when the user's config
-/// declares no real `[model_providers.codex]`. Deciding that must not cost a
-/// request on a pick (a card callback has a tight ack budget, and the text form
-/// has no budget at all), so the surface records what it read here and the
-/// synchronous predicate only consults this cache. A cold or failed read is
-/// "not known", which keeps the conservative neutral behaviour (the pick rides
-/// the turn, as #910's AC3 requires).
-pub(crate) struct ConfiguredProviders {
-    seen: std::sync::Mutex<Option<(std::time::Instant, std::collections::BTreeSet<String>)>>,
-}
-
-impl ConfiguredProviders {
-    pub(crate) fn new() -> Self {
-        Self {
-            seen: std::sync::Mutex::new(None),
-        }
-    }
-
-    /// Record a successful `config/read`. A failed read records nothing: the
-    /// previous knowledge (if any) is still the best there is.
-    pub(crate) fn note(&self, config: &CodexModelConfig) {
-        if config.read_failed {
-            return;
-        }
-        let ids = config
-            .providers
-            .iter()
-            .map(|provider| provider.id.clone())
-            .collect();
-        *self.seen.lock().expect("codex configured providers") = Some((std::time::Instant::now(), ids));
-    }
-
-    /// Whether `config/read` (within the TTL) declared a provider with this id.
-    /// `false` also covers "not known yet", never "definitely absent" — the
-    /// neutral fallback is the safe one.
-    pub(crate) fn declares(&self, id: &str) -> bool {
-        let seen = self.seen.lock().expect("codex configured providers");
-        match seen.as_ref() {
-            Some((at, ids)) if at.elapsed() < CONFIGURED_PROVIDERS_TTL => ids.contains(id),
-            _ => false,
-        }
-    }
-}
-
-impl std::fmt::Debug for ConfiguredProviders {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ConfiguredProviders")
-            .finish_non_exhaustive()
-    }
-}
-
 /// One configured provider's probe-relevant fields. The bearer token is the
 /// only secret here; nothing else in this module formats it.
 #[derive(Clone, PartialEq, Eq)]
@@ -744,12 +684,13 @@ pub(crate) fn build_surface(
     provider_switch_on_resume: bool,
     query: &ModelSurfaceQuery<'_>,
 ) -> ModelSurface {
+    // Parsed, not string-split: a provider id may itself contain `/` (issue
+    // #908), and the parser knows the quoted form.
     let query_provider = query
         .current
         .as_ref()
-        .and_then(|current| current.reference.split_once('/'))
-        .map(|(provider, _)| provider.to_string())
-        .filter(|provider| !provider.is_empty());
+        .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
+        .map(|model| model.provider_id);
     // A picker pick records the neutral `codex` bucket, so a thread fact of
     // `codex` is not a channel: the caller's resolved provider is the honest
     // marker then. A real thread provider outranks it.
@@ -781,7 +722,13 @@ pub(crate) fn build_surface(
     }
     for profile in &config.profiles {
         let mut label = format!("{}：{}", profile.name, profile.model);
-        if let Some(provider) = profile.provider.as_deref() {
+        // `codex` is reserved for the neutral namespace (ADR-0092): a profile
+        // naming it cannot be a real pair, so it is offered as the neutral
+        // catalog ref (a model-only pick) and labelled as such.
+        let reserved = profile.provider.as_deref() == Some(MODEL_PROVIDER);
+        if reserved {
+            label.push_str("（`codex` 保留名，按内置目录处理）");
+        } else if let Some(provider) = profile.provider.as_deref() {
             label.push_str(&format!("（{provider}）"));
         }
         // A profile is Codex's own "model + provider" declaration: the pick is a
@@ -789,7 +736,7 @@ pub(crate) fn build_surface(
         // field and the value stays the bare model id, so the bridge composes
         // `provider/model` and the path is decided by whether the provider
         // changes. A profile without `model_provider` is model-only.
-        let paired = profile.provider.is_some();
+        let paired = profile.provider.is_some() && !reserved;
         options.push(ModelOption {
             id: profile.model.clone(),
             label: Some(clip(&label, 48)),
@@ -799,11 +746,16 @@ pub(crate) fn build_surface(
                 codex_ref(&profile.model)
             }),
             group: Some(PROFILE_GROUP.to_string()),
-            provider: profile.provider.clone(),
+            provider: if paired { profile.provider.clone() } else { None },
             ..ModelOption::default()
         });
     }
     for provider in &config.providers {
+        // The reserved id's probe is the configured channel's, not the neutral
+        // catalog's: offering its models as `codex/<id>` would be a lie.
+        if provider.id == MODEL_PROVIDER {
+            continue;
+        }
         let Some(ProbeOutcome::Models(models)) = probes.get(&provider.id) else {
             continue;
         };
@@ -845,8 +797,8 @@ pub(crate) fn build_surface(
     let current_model = query
         .current
         .as_ref()
-        .and_then(|current| current.reference.split_once('/'))
-        .map(|(_, model)| model.to_string());
+        .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
+        .map(|model| model.id);
 
     // A provider is only half a model: the old model name sent to a new provider
     // is a 404 (issue #910), so **every provider row is a pair**. The known
@@ -856,6 +808,22 @@ pub(crate) fn build_surface(
     let mut provider_options: Vec<ModelOption> = Vec::new();
     let mut paired_providers: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for provider in &config.providers {
+        if provider.id == MODEL_PROVIDER {
+            // `codex` is reserved for the neutral catalog namespace (ADR-0092):
+            // a pair through it would carry the catalog's own value and could
+            // never address the configured channel. Listed, never selectable.
+            paired_providers.insert(provider.id.as_str());
+            provider_options.push(ModelOption {
+                id: provider.id.clone(),
+                label: Some(clip(
+                    &format!("{}：`codex` 是内置目录的保留名，不能在这里选择", provider.name),
+                    48,
+                )),
+                disabled: true,
+                ..ModelOption::default()
+            });
+            continue;
+        }
         let mut models: Vec<(String, Option<String>)> = Vec::new();
         for profile in config
             .profiles
@@ -882,8 +850,13 @@ pub(crate) fn build_surface(
                 Some(name) => format!("{}：{model}（{name}）", provider.name),
                 None => format!("{}：{model}", provider.name),
             };
+            // The 「当前」 marker is the **provider** fact (#908 AC1): a thread
+            // whose model is not among this provider's known pairs still must
+            // see which provider it is on.
             if same_pair {
                 label.push_str("（当前）");
+            } else if same_provider {
+                label.push_str("（当前 provider）");
             }
             // The annotation says what a pick of **this** row does: a row on the
             // thread's own provider is an ordinary model pick, only a different
@@ -1428,6 +1401,86 @@ mod tests {
             ModelProbes::cache_key(&env_a),
             ModelProbes::cache_key(&env_b),
             "the env_key identity is part of the key"
+        );
+    }
+
+    /// Issue #908/#910: `codex` is reserved for the neutral catalog namespace.
+    /// A configured `[model_providers.codex]` is listed as a reserved,
+    /// non-selectable row, its probe contributes no `codex/<id>` pairs, and a
+    /// profile naming it degrades to the neutral catalog ref.
+    #[test]
+    fn a_configured_codex_provider_is_reserved() {
+        let mut config = CodexModelConfig::default();
+        config.providers.push(provider(
+            "codex",
+            Some("http://127.0.0.1:1/v1".into()),
+            Some(TOKEN),
+            None,
+        ));
+        config.providers.push(provider(
+            "deepseek",
+            Some("http://127.0.0.1:1/v1".into()),
+            Some(TOKEN),
+            None,
+        ));
+        config.profiles.push(ProfilePreset {
+            name: "via-codex".into(),
+            model: "gpt-custom".into(),
+            provider: Some("codex".into()),
+        });
+        let mut probes = HashMap::new();
+        probes.insert("codex".into(), ProbeOutcome::Models(vec!["gpt-probed".into()]));
+
+        let surface = build_surface(&[], &config, &probes, Some("openai"), false, &query());
+        let provider_scope = &surface.scopes[1];
+        let reserved = provider_scope
+            .options
+            .iter()
+            .find(|option| option.id == "codex")
+            .expect("the configured id is listed");
+        assert!(reserved.disabled, "never a selectable pair");
+        assert!(
+            reserved.display_label().contains("保留名"),
+            "the row explains the reservation: {}",
+            reserved.display_label()
+        );
+        assert!(
+            !provider_scope
+                .options
+                .iter()
+                .any(|option| !option.disabled && option.provider.as_deref() == Some("codex")),
+            "no pair is offered through the reserved id"
+        );
+
+        // The codex profile degrades to a neutral catalog ref (model-only).
+        let preset = surface.scopes[0]
+            .options
+            .iter()
+            .find(|option| option.id == "gpt-custom")
+            .expect("the profile stays reachable");
+        assert_eq!(preset.value.as_deref(), Some("codex/gpt-custom"));
+        assert_eq!(preset.provider, None, "it is not a pair");
+    }
+
+    /// Issue #908 AC1: the 「当前」 marker is the **provider** fact — a thread
+    /// whose model is not among the provider's known pairs still sees its
+    /// provider marked.
+    #[test]
+    fn the_current_provider_marker_does_not_require_the_exact_pair() {
+        let mut config = CodexModelConfig::default();
+        config
+            .providers
+            .push(provider("deepseek", None, Some(TOKEN), None));
+        config.profiles.push(ProfilePreset {
+            name: "fast".into(),
+            model: "deepseek-flash".into(),
+            provider: Some("deepseek".into()),
+        });
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), false, &query());
+        let label = surface.scopes[1].options[0].display_label();
+        assert!(
+            label.contains("当前"),
+            "the provider is marked even when the model differs: {label}"
         );
     }
 

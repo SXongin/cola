@@ -1031,7 +1031,7 @@ impl CodexClient {
     async fn thread_provider(&self, session_id: &str) -> Option<String> {
         if let Some(held) = self.projections.model(session_id) {
             let provider = held.provider_id;
-            if !self.is_neutral_provider(&provider) {
+            if provider != MODEL_PROVIDER {
                 return Some(provider);
             }
         }
@@ -1956,13 +1956,13 @@ impl Backend for CodexClient {
         true
     }
 
-    /// `codex` is the neutral bucket **only** when the user's config declares no
-    /// real `[model_providers.codex]` (issue #910): a configured provider with
-    /// that id is a real channel, so a pick through it is an existing-thread
-    /// provider change, never a per-turn model send. The knowledge comes from
-    /// the `/model` surface's `config/read` cache — never a request here.
+    /// `codex` is **reserved** for cola's neutral catalog namespace: the ref
+    /// `codex/<id>` is the flat `model/list` catalog's value, so it must never
+    /// address a configured channel. A `[model_providers.codex]` therefore
+    /// cannot be selected as a pair (the card says so); the classification
+    /// stays lexical, with no config read on the pick path (ADR-0092).
     fn is_neutral_provider(&self, provider: &str) -> bool {
-        provider == MODEL_PROVIDER && !self.configured_providers.declares(provider)
+        provider == MODEL_PROVIDER
     }
 
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
@@ -1972,7 +1972,7 @@ impl Backend for CodexClient {
         self.projections
             .model(session_id)
             .map(|model| model.provider_id)
-            .filter(|provider| !self.is_neutral_provider(provider))
+            .filter(|provider| provider != MODEL_PROVIDER)
     }
 
     /// Where a Codex model pick lands (issue #910): the neutral `codex` bucket
@@ -1986,7 +1986,7 @@ impl Backend for CodexClient {
         session_id: &str,
         model: &ModelInfo,
     ) -> Result<crate::backend::types::ModelPickRoute> {
-        if self.is_neutral_provider(&model.provider_id) {
+        if model.provider_id == MODEL_PROVIDER {
             return Ok(crate::backend::types::ModelPickRoute::PerTurn);
         }
         Ok(match self.thread_provider(session_id).await {
@@ -2019,7 +2019,7 @@ impl Backend for CodexClient {
         model: &ModelInfo,
     ) -> Result<crate::backend::types::ThreadModelChange> {
         use crate::backend::types::ThreadModelChange;
-        if self.is_neutral_provider(&model.provider_id) {
+        if model.provider_id == MODEL_PROVIDER {
             return Ok(ThreadModelChange::Unchanged);
         }
         // The read is the authority: a peer may have moved the thread since this
@@ -2620,12 +2620,6 @@ impl Backend for CodexClient {
             });
             (catalog, config)
         };
-        if !fast {
-            // What the config declared feeds the synchronous neutral-bucket
-            // predicate (issue #910): it is recorded here, where the read
-            // already happens, so a pick never costs a `config/read`.
-            self.configured_providers.note(&config);
-        }
         let probes = if fast {
             Default::default()
         } else if callback {
@@ -5167,11 +5161,15 @@ mod tests {
         );
         assert_eq!(provider.options[0].provider.as_deref(), Some("opencode-go"));
         assert_eq!(provider.options[0].callback_value(), "gpt-5.1-codex");
-        assert_eq!(
-            provider.options[0].label.as_deref(),
-            Some("OpenCode Go：gpt-5.1-codex（fast）"),
-            "the row names the pair; it is the thread's own provider, so a pick \
-             needs no thread action and carries no confirmation suffix"
+        let label = provider.options[0].display_label();
+        assert!(
+            label.contains("OpenCode Go：gpt-5.1-codex（fast）"),
+            "the row names the pair: {label}"
+        );
+        assert!(
+            label.contains("当前") && !label.contains("需确认"),
+            "the thread's own provider is marked — even though the current model \
+             is another of its rows — so a pick needs no thread action: {label}"
         );
     }
 
