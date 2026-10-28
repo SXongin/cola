@@ -35,10 +35,21 @@ use std::sync::{Arc, Weak};
 #[derive(Default)]
 pub(crate) struct SessionGate {
     lock: tokio::sync::Mutex<()>,
+    /// The session's **durable-switch point** (issue #910): a generation whose
+    /// model selection lives on the session (V2) changes it with an RPC, and
+    /// that RPC plus the mirror write must be one ordered step. Held across
+    /// them so an older switch cannot land after a newer one while the mirror
+    /// keeps the newer one (server ≠ mirror). It is deliberately **not** the
+    /// state gate: settings reads and the next prompt's pre-flight never wait
+    /// on a backend call.
+    switch: tokio::sync::Mutex<()>,
     /// Callers queued on [`Self::lock`] (test-only): lets a test park a writer
     /// deterministically instead of sleeping.
     #[cfg(test)]
     waiting: std::sync::atomic::AtomicUsize,
+    /// Callers queued on [`Self::switch`] (test-only).
+    #[cfg(test)]
+    switch_waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for SessionGate {
@@ -70,6 +81,31 @@ impl SessionGate {
     #[cfg(test)]
     pub(crate) fn waiting(&self) -> usize {
         self.waiting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Take the session's durable-switch point. Hold it across the model
+    /// selection's RPC **and** the mirror write that follows; never across
+    /// anything else. Lock order is switch → state gate, never the reverse.
+    pub(crate) async fn enter_switch(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        #[cfg(test)]
+        {
+            self.switch_waiting
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let guard = self.switch.lock().await;
+            self.switch_waiting
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            guard
+        }
+        #[cfg(not(test))]
+        {
+            self.switch.lock().await
+        }
+    }
+
+    /// How many callers are queued on the switch point (test-only).
+    #[cfg(test)]
+    pub(crate) fn switch_waiting(&self) -> usize {
+        self.switch_waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 

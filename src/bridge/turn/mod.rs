@@ -771,38 +771,8 @@ impl Turn {
         if let Some(model) = model.as_ref() {
             match handles.backend.model_pick_route(&self.session_id, model).await {
                 Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
-                    // The recorded pair may carry a `/think` variant the new
-                    // model's catalog does not declare (ADR-0020), and the
-                    // confirmation that recorded it deliberately deferred the
-                    // clear to here (a card callback acks from a store write
-                    // only, issue #910). Resolve it now — a catalog read, never
-                    // under the gate — and record the clear before the switch,
-                    // so this prompt cannot send a variant the new model lacks.
                     let pair = format!("{}/{}", model.provider_id, model.id);
-                    let mut cleared = self.turn_variant.clone();
-                    if handles
-                        .sessions
-                        .clear_variant_for_model(&handles.backend, &mut cleared, &pair)
-                        .await
-                        .is_some()
-                    {
-                        // Compare-and-set on the pair the pre-flight read: a
-                        // pick landing since is the newer record and keeps its
-                        // own variant; this prompt still runs the pair it read,
-                        // whose variant it validated above.
-                        if handles
-                            .sessions
-                            .clear_variant_for_pair(
-                                &self.thread_key,
-                                &self.session_id,
-                                &pair,
-                                self.turn_variant.as_deref(),
-                            )
-                            .await
-                        {
-                            self.turn_variant = cleared;
-                        }
-                    }
+                    self.settle_switch_variant(handles, &pair).await?;
                     handles
                         .backend
                         .apply_thread_model(&self.session_id, model)
@@ -835,6 +805,65 @@ impl Turn {
         // bound for a run that was never scheduled.
         self.submit_failed = prompt_resp.is_err();
         prompt_resp
+    }
+
+    /// Resolve the `/think` variant of a recorded pair before the provider
+    /// switch (issue #910). The confirmation that recorded the pair acks from a
+    /// store write only, so it defers this clear; ADR-0020 still says a variant
+    /// the new model does not declare must not be sent.
+    ///
+    /// The clear is a catalog read (never under the state gate) followed by a
+    /// compare-and-set on the pair the pre-flight read. If a concurrent
+    /// `/think` (or a newer pick) moved the mirror in between, that value is the
+    /// truth — but the value just identified as unsupported is never sent: it is
+    /// re-validated against the pair, and if it is unsupported too the prompt
+    /// stops by name rather than lying to the model.
+    async fn settle_switch_variant(&mut self, handles: &TurnHandles, pair: &str) -> crate::error::Result<()> {
+        let mut cleared = self.turn_variant.clone();
+        if handles
+            .sessions
+            .clear_variant_for_model(&handles.backend, &mut cleared, pair)
+            .await
+            .is_none()
+        {
+            // The new model declares the variant: nothing to clear.
+            return Ok(());
+        }
+        if handles
+            .sessions
+            .clear_variant_for_pair(
+                &self.thread_key,
+                &self.session_id,
+                pair,
+                self.turn_variant.as_deref(),
+            )
+            .await
+        {
+            self.turn_variant = cleared;
+            return Ok(());
+        }
+        // The compare-and-set lost: another writer moved the mirror between the
+        // pre-flight's read and the clear. Take what it left, re-validated
+        // against the pair this prompt is about to run.
+        let fresh = {
+            let gate = handles.session_gates.gate(&self.session_id);
+            let _held = gate.enter().await;
+            handles.sessions.variant_override(&self.session_id).await
+        };
+        let mut candidate = fresh.clone();
+        if handles
+            .sessions
+            .clear_variant_for_model(&handles.backend, &mut candidate, pair)
+            .await
+            .is_some()
+        {
+            return Err(crate::error::BridgeError::State(format!(
+                "思考等级 `{}` 与模型 {pair} 不兼容，且这次清除被另一条命令改写；本条消息没有发送，请先 `/think` 一个受支持的等级后重试。",
+                fresh.unwrap_or_default()
+            )));
+        }
+        self.turn_variant = candidate;
+        Ok(())
     }
 
     /// Replace the dead mapping with a fresh session on the current server —

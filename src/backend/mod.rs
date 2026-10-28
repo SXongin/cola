@@ -473,6 +473,15 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         false
     }
 
+    /// Whether `provider` is this client's **neutral bucket** — a selection
+    /// that names no thread-level channel (Codex's `codex`), so a pick using it
+    /// is a model-only pick no matter what the thread currently runs. The
+    /// bridge must not compare such a pick to the thread's real provider
+    /// (issue #910).
+    fn is_neutral_provider(&self, _provider: &str) -> bool {
+        false
+    }
+
     /// The thread-level provider this client's **own cache** holds for the
     /// session, when it knows one (Codex's ordered thread fact). Cache-only: no
     /// RPC, so a card callback can decide "is the gate even relevant here"

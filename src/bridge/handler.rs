@@ -4854,16 +4854,22 @@ impl App {
         // The rule is shared with the `/model` text form: a model-only pick is
         // recorded; a provider change needs the gate and a confirmation; nothing
         // unclassifiable is recorded.
-        use crate::bridge::handles::ModelPickDecision;
+        use crate::bridge::handles::{ModelPickDecision, PickTarget};
         match core
             .sessions_handle()
             .model_pick_decision(&core.client, thread_key, provider, model)
             .await
         {
-            ModelPickDecision::Record { session_id } => {
-                self.pick_model_ref(core, thread_key, session_id.as_deref(), &spec)
-                    .await
-            }
+            ModelPickDecision::Record { target } => match target {
+                PickTarget::Live(session_id) => {
+                    self.pick_model_ref(core, thread_key, Some(&session_id), &spec)
+                        .await
+                }
+                // The thread became a Pending Session while the pick was
+                // classified: record the pair (its provider is a creation
+                // fact), never a model-only write that drops it.
+                PickTarget::Pending => self.save_pending_pair(core, thread_key, provider, &spec).await,
+            },
             ModelPickDecision::Confirm {
                 session_id,
                 provider,
