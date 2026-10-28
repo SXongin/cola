@@ -33,21 +33,77 @@ pub(crate) fn is_cola_message_id(id: &str) -> bool {
     id.starts_with(COLA_MESSAGE_ID_PREFIX)
 }
 
+/// Join a provider id and a model id into the one ref cola stores and shows
+/// (`provider/model`).
+///
+/// A provider id is an opaque TOML key and may itself contain `/`; the plain
+/// convention would then split it wrongly (`foo/bar` + `gpt` reads back as
+/// `foo` + `bar/gpt`). Such a provider is **quoted** — `"foo/bar"/gpt` — and
+/// [`parse_model`] reads the quoted form too, so a pair built from two known
+/// fields always round-trips. Model ids stay unquoted (they may contain
+/// slashes, and the parser keeps the whole remainder).
+pub(crate) fn join_model(provider: &str, model: &str) -> String {
+    if provider.contains('/') || provider.contains('"') || provider.contains('\\') {
+        let escaped = provider.replace('\\', "\\\\").replace('"', "\\\"");
+        return format!("\"{escaped}\"/{model}");
+    }
+    format!("{provider}/{model}")
+}
+
 /// Parse "provider/model" into ModelInfo. A two-part split: model IDs may
 /// themselves contain slashes (gateway models like `openrouter/openai/o3`), so
 /// the provider is only the FIRST segment and the whole remainder is the model
 /// id. The variant is never part of this string — it lives in a separate
-/// SessionEntry field (ADR-0020) to keep the text form unambiguous.
+/// SessionEntry field (ADR-0020) to keep the text form unambiguous. A provider
+/// that itself contains `/` is written quoted ([`join_model`]) and read here.
 pub(crate) fn parse_model(spec: &str) -> Option<ModelInfo> {
-    let (provider, id) = spec.split_once('/')?;
+    let (provider, id) = if spec.starts_with('"') {
+        quoted_provider(spec)?
+    } else {
+        let (provider, id) = spec.split_once('/')?;
+        if provider.is_empty() || id.is_empty() {
+            return None;
+        }
+        (provider.to_string(), id)
+    };
     if provider.is_empty() || id.is_empty() {
         return None;
     }
     Some(ModelInfo {
         id: id.to_string(),
-        provider_id: provider.to_string(),
+        provider_id: provider,
         variant: None,
     })
+}
+
+/// The quoted-provider form of [`join_model`]: `"foo/bar"/gpt`. `\\` and `\"`
+/// are the only escapes (a provider id is a config key, not free text).
+fn quoted_provider(spec: &str) -> Option<(String, &str)> {
+    let mut chars = spec.char_indices();
+    let (_, quote) = chars.next()?;
+    debug_assert_eq!(quote, '"');
+    let mut provider = String::new();
+    let mut escaped = false;
+    for (index, ch) in chars {
+        if escaped {
+            provider.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => {
+                let rest = &spec[index + ch.len_utf8()..];
+                let model = rest.strip_prefix('/')?;
+                if provider.is_empty() || model.is_empty() {
+                    return None;
+                }
+                return Some((provider, model));
+            }
+            other => provider.push(other),
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -71,6 +127,32 @@ mod tests {
 
         assert!(parse_model("no-slash").is_none());
         assert!(parse_model("").is_none());
+    }
+
+    /// A provider id may itself contain `/` (a quoted TOML key): the pair built
+    /// from the two known fields round-trips instead of splitting into
+    /// `foo` + `bar/gpt`.
+    #[test]
+    fn join_and_parse_round_trip_a_slashed_provider() {
+        let joined = join_model("foo/bar", "gpt");
+        assert_eq!(joined, "\"foo/bar\"/gpt");
+        let parsed = parse_model(&joined).expect("the quoted provider parses");
+        assert_eq!(parsed.provider_id, "foo/bar");
+        assert_eq!(parsed.id, "gpt");
+
+        // The plain convention is untouched, and so is a slashed model id.
+        assert_eq!(join_model("openai", "gpt-5"), "openai/gpt-5");
+        let plain = parse_model(&join_model("openrouter", "openai/o3")).unwrap();
+        assert_eq!(plain.provider_id, "openrouter");
+        assert_eq!(plain.id, "openai/o3");
+
+        // A quote or a backslash in the id is escaped, not lost.
+        let odd = join_model("a\"b", "m");
+        let parsed = parse_model(&odd).expect("an escaped quote parses");
+        assert_eq!(parsed.provider_id, "a\"b");
+
+        assert!(parse_model("\"unterminated/x").is_none());
+        assert!(parse_model("\"/x").is_none());
     }
 
     #[test]

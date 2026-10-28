@@ -2688,33 +2688,10 @@ async fn a_neutral_bucket_pick_is_model_only_with_the_gate_off() {
         "a shared thread",
     ));
     server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-    // `codex` is **not** configured as a real provider: only another channel is,
-    // so the bucket stays the neutral catalog one (issue #910).
-    server.set_config_read(serde_json::json!({
-        "config": {},
-        "layers": [{
-            "name": { "type": "user" },
-            "version": "v1",
-            "config": {
-                "model_providers": { "deepseek": { "name": "DeepSeek" } }
-            }
-        }]
-    }));
     // The default options leave the provider gate shut.
     let client = codex_client(&url).await;
     client.transcript("thread-1").await.expect("adopt the thread");
     server.wait_for_subscribers("thread-1", 1).await;
-    // The picker warms the configured-provider cache; the pick itself must not
-    // read config (issue #910).
-    let _ = crate::backend::Backend::model_surface(
-        &client,
-        crate::backend::types::ModelSurfaceQuery {
-            session_id: Some("thread-1"),
-            directory: Some("/work/cola"),
-            ..Default::default()
-        },
-    )
-    .await;
 
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
@@ -2766,12 +2743,13 @@ async fn a_neutral_bucket_pick_is_model_only_with_the_gate_off() {
     );
 }
 
-/// Issue #910 (blocking, the other half): with a real `[model_providers.codex]`
-/// configured and the gate open, a pick through it gets the **confirmation** a
-/// provider change requires — the pair rides `thread/resume`, never
-/// `turn/start.model`.
+/// Issue #910/#908 (blocking): `codex` is **reserved** for the neutral catalog
+/// namespace, whatever the config declares. A `[model_providers.codex]` cannot
+/// change that: a catalog pick stays a per-turn model send (the bare id with the
+/// thread's provider untouched), and the card lists the configured id only as a
+/// reserved, non-selectable row.
 #[tokio::test]
-async fn a_configured_codex_provider_pick_confirms_the_switch() {
+async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2795,98 +2773,12 @@ async fn a_configured_codex_provider_pick_confirms_the_switch() {
             }
         }]
     }));
-    let endpoint = crate::codex::Endpoint::parse(&url).expect("endpoint");
-    let client = crate::codex::CodexClient::connect(
-        &crate::codex::CodexOptions::new(endpoint).with_thread_settings(crate::codex::ThreadSettings {
-            provider_switch_on_resume: true,
-            ..Default::default()
-        }),
-        &crate::codex::PinnedProbe,
-    )
-    .await
-    .expect("attach");
-    client.transcript("thread-1").await.expect("adopt the thread");
-    server.wait_for_subscribers("thread-1", 1).await;
-    let _ = crate::backend::Backend::model_surface(
-        &client,
-        crate::backend::types::ModelSurfaceQuery {
-            session_id: Some("thread-1"),
-            directory: Some("/work/cola"),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
-    let mut entry = codex_entry("thread-1");
-    entry.model = Some("openai/gpt-5.1-codex".into());
-    seed_entry(&app, entry).await;
-
-    send_command_in(
-        &app,
-        "/model codex/gpt-5.1-codex",
-        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
-        "msg_model",
-        crate::config::ConversationKind::P2p,
-    )
-    .await;
-
-    let card = platform
-        .calls
-        .lock()
-        .await
-        .iter()
-        .find_map(|call| match call {
-            PlatformCall::ReplyCard { card, .. } => Some(card.clone()),
-            _ => None,
-        })
-        .expect("a confirmation card, not a per-turn model reply");
-    let confirm = crate::bridge::test_support::card_buttons(&card)
-        .into_iter()
-        .find(|button| button["value"]["action"] == "model_provider_confirm")
-        .expect("the confirm button");
-    assert_eq!(confirm["value"]["provider"], "codex");
-    assert_eq!(confirm["value"]["value"], "gpt-5.1-codex");
-}
-
-/// Issue #910 (blocking): `codex` is the neutral catalog bucket **only** when
-/// the user's config declares no real `[model_providers.codex]`. With one
-/// configured, a pick through it is an existing-thread provider change — the
-/// gate rule applies, never a per-turn model send (and still no request on the
-/// pick path: the knowledge comes from the picker's `config/read` cache).
-#[tokio::test]
-async fn a_configured_codex_provider_is_a_provider_change_not_the_neutral_bucket() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
-        "thread-1",
-        "session-root",
-        "/work/cola",
-        "a shared thread",
-    ));
-    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-    server.set_config_read(serde_json::json!({
-        "config": {},
-        "layers": [{
-            "name": { "type": "user" },
-            "version": "v1",
-            "config": {
-                "model_providers": {
-                    "codex": { "name": "Real Codex", "base_url": "http://127.0.0.1:9/v1" }
-                }
-            }
-        }]
-    }));
-    // The default options leave the provider gate shut.
     let client = codex_client(&url).await;
     client.transcript("thread-1").await.expect("adopt the thread");
     server.wait_for_subscribers("thread-1", 1).await;
-    // The picker's read is what records the configured provider ids; the pick
-    // below must not read config.
-    let _ = crate::backend::Backend::model_surface(
+    // The user opens `/model` first: the surface must list the configured id as
+    // reserved, never as a selectable pair.
+    let surface = crate::backend::Backend::model_surface(
         &client,
         crate::backend::types::ModelSurfaceQuery {
             session_id: Some("thread-1"),
@@ -2895,6 +2787,17 @@ async fn a_configured_codex_provider_is_a_provider_change_not_the_neutral_bucket
         },
     )
     .await;
+    let reserved = surface.scopes[1]
+        .options
+        .iter()
+        .find(|option| option.id == "codex")
+        .expect("the configured id is listed");
+    assert!(reserved.disabled, "but never selectable: {reserved:?}");
+    assert!(
+        reserved.display_label().contains("保留名"),
+        "the row explains the reservation: {}",
+        reserved.display_label()
+    );
 
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
@@ -2905,7 +2808,7 @@ async fn a_configured_codex_provider_is_a_provider_change_not_the_neutral_bucket
     server.clear_calls();
     send_command_in(
         &app,
-        "/model codex/gpt-5.1-codex",
+        "/model codex/gpt-5.1",
         crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
         "msg_model",
         crate::config::ConversationKind::P2p,
@@ -2922,17 +2825,10 @@ async fn a_configured_codex_provider_is_a_provider_change_not_the_neutral_bucket
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join(
-            "
-",
-        );
+        .join("\n");
     assert!(
-        reply.contains("provider 只能在新线程切换"),
-        "a configured `codex` provider is a real channel, so the gate rule applies: {reply}"
-    );
-    assert!(
-        !reply.contains("Model: codex/"),
-        "never recorded as a per-turn model send: {reply}"
+        reply.contains("Model: codex/gpt-5.1"),
+        "the catalog ref stays neutral: {reply}"
     );
     assert_eq!(
         app.sessions
@@ -2943,12 +2839,12 @@ async fn a_configured_codex_provider_is_a_provider_change_not_the_neutral_bucket
             .unwrap()
             .model
             .as_deref(),
-        Some("openai/gpt-5.1-codex"),
-        "nothing was recorded"
+        Some("codex/gpt-5.1"),
+        "recorded as a per-turn model"
     );
     assert_eq!(
         server.call_log(),
         Vec::<String>::new(),
-        "the refusal still costs no request"
+        "and it sends no request / touches no thread provider"
     );
 }

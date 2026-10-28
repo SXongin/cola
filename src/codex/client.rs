@@ -265,9 +265,6 @@ pub(crate) struct CodexClient {
     /// clones so re-opening `/model` on one connection reuses what it already
     /// learned, including failures.
     pub(crate) model_probes: Arc<super::model_surface::ModelProbes>,
-    /// The provider ids `config/read` last declared (issue #910): the
-    /// synchronous neutral-bucket predicate reads this instead of a request.
-    pub(crate) configured_providers: Arc<super::model_surface::ConfiguredProviders>,
     server: ServerInfo,
 }
 
@@ -359,7 +356,6 @@ impl CodexClient {
             authored: options.authored.clone(),
             skills: Arc::new(SkillCatalog::default()),
             model_probes: Arc::new(super::model_surface::ModelProbes::new()),
-            configured_providers: Arc::new(super::model_surface::ConfiguredProviders::new()),
             server: ServerInfo {
                 user_agent,
                 version,

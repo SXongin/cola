@@ -501,3 +501,23 @@ Where #906's prose and the code disagree, the code is the record: #906 sketched
 the provider scope as "the config's provider keys" and the confirmation as the
 moment of change; a bare provider key is not selectable (the 404 above), and the
 confirmation only records — the pre-flight is where the thread is touched.
+
+## Amendment (#910, #908): `codex` is a reserved namespace
+
+The neutral catalog ref is `codex/<id>` (decision 3), and that ref is what the
+`model` scope's catalog rows and the profile presets carry back. The id is
+therefore **reserved**: `codex` can never name a real channel, whatever
+`config/read` declares. A `[model_providers.codex]` is still visible in the
+provider scope — a reserved, non-selectable row saying
+「`codex` 是内置目录的保留名，不能在这里选择」 — but it offers no pair: the pair
+value would collide with the catalog's own, so a pick through it could never
+address the configured channel. Its probe contributes no `codex/<id>` entries,
+and a `[profiles.*]` naming it degrades to the neutral catalog ref (a model-only
+pick).
+
+The classification is lexical, so it needs **no** `config/read` on the pick
+path: a card callback has an ack budget and the text form has none, and a
+cached config read would also let one directory's config decide another
+directory's classification. Deciding "is `codex` configured?" from such a cache
+made a catalog pick on another provider look like a thread-level switch — the
+ambiguity this amendment removes.

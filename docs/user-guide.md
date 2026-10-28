@@ -914,6 +914,12 @@ model name on a new provider is a 404. So:
 - **A same-provider pick is just a model change.** A `[profiles.*]` preset whose
   `model_provider` is the thread's current provider, or any `codex/<id>` pick,
   is recorded and rides the next message — no release, no resume, no reload.
+- **`codex` is a reserved name.** The built-in catalog's ref is `codex/<id>` —
+  a shared neutral namespace, never a channel — so a `[model_providers.codex]`
+  cannot be selected: the provider section lists it as 「`codex` 是内置目录的保留名，
+  不能在这里选择」 and offers no pair (the pair value would collide with the
+  catalog's own), and a `[profiles.*]` naming it degrades to the neutral catalog
+  ref. The classification is lexical, so a catalog pick never reads your config.
 
 `provider_switch_on_resume` gates the text form too: `/model
 <provider>/<model>` for a different provider opens the same confirmation card (or

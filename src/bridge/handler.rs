@@ -4836,7 +4836,9 @@ impl App {
                 )),
             };
         }
-        let spec = format!("{provider}/{model}");
+        // Built from the two known fields, never re-parsed from a joined
+        // string: a provider id may itself contain `/` (issue #908).
+        let spec = crate::backend::parsing::join_model(provider, model);
         let Some((settings, pending_epoch)) = core
             .sessions_handle()
             .settings_and_pending_epoch(thread_key)
@@ -5021,7 +5023,7 @@ impl App {
                 toast: Some("provider 只能在新线程切换".to_string()),
             });
         }
-        let pair = format!("{provider}/{model}");
+        let pair = crate::backend::parsing::join_model(&provider, &model);
         // Record the pair as the session's next-turn model. The same gated,
         // compare-and-set write a `/model` pick uses, so a concurrent pick (or a
         // remap, or a materialising session) is an honest refusal, never an
