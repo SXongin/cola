@@ -141,6 +141,11 @@ pub struct ModelOption {
     /// provider scope: the built-in catalog must not render under a
     /// provider). `None` leaves the option ungrouped.
     pub group: Option<String>,
+    /// A row that is **listed but cannot be picked** — a configured provider
+    /// with no known model has no valid pair to offer (#908 AC1 lists the
+    /// providers; #910 makes a bare provider unswitchable). The card renders it
+    /// as text, never a button.
+    pub disabled: bool,
 }
 
 impl ModelOption {

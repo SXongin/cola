@@ -1031,7 +1031,7 @@ impl CodexClient {
     async fn thread_provider(&self, session_id: &str) -> Option<String> {
         if let Some(held) = self.projections.model(session_id) {
             let provider = held.provider_id;
-            if provider != MODEL_PROVIDER {
+            if !self.is_neutral_provider(&provider) {
                 return Some(provider);
             }
         }
@@ -1956,10 +1956,13 @@ impl Backend for CodexClient {
         true
     }
 
-    /// `codex` is the neutral bucket: it names no channel, so a pick using it
-    /// rides the turn no matter which provider the thread runs (issue #910).
+    /// `codex` is the neutral bucket **only** when the user's config declares no
+    /// real `[model_providers.codex]` (issue #910): a configured provider with
+    /// that id is a real channel, so a pick through it is an existing-thread
+    /// provider change, never a per-turn model send. The knowledge comes from
+    /// the `/model` surface's `config/read` cache — never a request here.
     fn is_neutral_provider(&self, provider: &str) -> bool {
-        provider == MODEL_PROVIDER
+        provider == MODEL_PROVIDER && !self.configured_providers.declares(provider)
     }
 
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
@@ -1969,7 +1972,7 @@ impl Backend for CodexClient {
         self.projections
             .model(session_id)
             .map(|model| model.provider_id)
-            .filter(|provider| provider != MODEL_PROVIDER)
+            .filter(|provider| !self.is_neutral_provider(provider))
     }
 
     /// Where a Codex model pick lands (issue #910): the neutral `codex` bucket
@@ -1983,7 +1986,7 @@ impl Backend for CodexClient {
         session_id: &str,
         model: &ModelInfo,
     ) -> Result<crate::backend::types::ModelPickRoute> {
-        if model.provider_id == MODEL_PROVIDER {
+        if self.is_neutral_provider(&model.provider_id) {
             return Ok(crate::backend::types::ModelPickRoute::PerTurn);
         }
         Ok(match self.thread_provider(session_id).await {
@@ -2016,7 +2019,7 @@ impl Backend for CodexClient {
         model: &ModelInfo,
     ) -> Result<crate::backend::types::ThreadModelChange> {
         use crate::backend::types::ThreadModelChange;
-        if model.provider_id == MODEL_PROVIDER {
+        if self.is_neutral_provider(&model.provider_id) {
             return Ok(ThreadModelChange::Unchanged);
         }
         // The read is the authority: a peer may have moved the thread since this
@@ -2617,6 +2620,12 @@ impl Backend for CodexClient {
             });
             (catalog, config)
         };
+        if !fast {
+            // What the config declared feeds the synchronous neutral-bucket
+            // predicate (issue #910): it is recorded here, where the read
+            // already happens, so a pick never costs a `config/read`.
+            self.configured_providers.note(&config);
+        }
         let probes = if fast {
             Default::default()
         } else if callback {
@@ -5289,12 +5298,14 @@ mod tests {
         );
         // The provider scope is the same pairs, read by provider: the probed
         // model and the profile are there, and `opencode-go` (env_key, no known
-        // model) has no bare row — only the note.
+        // model) is listed as a disabled row — visible (#908 AC1), never a bare
+        // provider button (#910).
         let provider_scope = &surface.scopes[1];
         assert_eq!(provider_scope.changeable, ChangeScope::NewThread);
         let pairs: Vec<&str> = provider_scope
             .options
             .iter()
+            .filter(|option| !option.disabled)
             .map(|option| option.provider.as_deref().unwrap_or_default())
             .collect();
         assert_eq!(pairs, ["deepseek", "deepseek"]);
@@ -5302,17 +5313,19 @@ mod tests {
             !provider_scope
                 .options
                 .iter()
-                .any(|option| option.provider.as_deref() == Some("opencode-go")),
+                .any(|option| !option.disabled && option.provider.as_deref() == Some("opencode-go")),
             "a provider with no known model is not selectable"
         );
+        let listed = provider_scope
+            .options
+            .iter()
+            .find(|option| option.id == "opencode-go")
+            .expect("but it is still listed");
+        assert!(listed.disabled);
         assert!(
-            provider_scope
-                .note
-                .as_deref()
-                .unwrap_or_default()
-                .contains("OpenCode Go"),
-            "and the note names it: {:?}",
-            provider_scope.note
+            listed.display_label().contains("没有已知模型"),
+            "the row says why: {}",
+            listed.display_label()
         );
 
         // A second open within the cache TTL: another `config/read` and
@@ -5438,6 +5451,7 @@ mod tests {
         let pairs: Vec<(&str, &str)> = surface.scopes[1]
             .options
             .iter()
+            .filter(|option| !option.disabled)
             .map(|option| {
                 (
                     option.provider.as_deref().unwrap_or_default(),
@@ -5448,17 +5462,18 @@ mod tests {
         assert_eq!(
             pairs,
             [("deepseek", "deepseek-v4-pro")],
-            "the declared pair survives a cold callback cache; a provider without \
-             a known model has no row"
+            "the declared pair survives a cold callback cache"
         );
+        let listed = surface.scopes[1]
+            .options
+            .iter()
+            .find(|option| option.id == "opencode-go")
+            .expect("a provider without a known model is still listed");
+        assert!(listed.disabled, "but it is not a button");
         assert!(
-            surface.scopes[1]
-                .note
-                .as_deref()
-                .unwrap_or_default()
-                .contains("OpenCode Go"),
-            "the pairless provider is named in the note: {:?}",
-            surface.scopes[1].note
+            listed.display_label().contains("没有已知模型"),
+            "the row says why: {}",
+            listed.display_label()
         );
         assert!(
             !surface.scopes[0]

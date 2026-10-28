@@ -49,7 +49,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::backend::types::{ChangeScope, ModelOption, ModelScope, ModelSurface, ModelSurfaceQuery};
+use crate::backend::types::{
+    ChangeScope, ModelOption, ModelScope, ModelSelection, ModelSurface, ModelSurfaceQuery,
+};
 
 use super::error::Result as CodexResult;
 use super::transport::RpcConnection;
@@ -119,6 +121,66 @@ const NOTE_MAX_CHARS: usize = 64;
 
 /// The neutral provider bucket the picker's `codex/<id>` callback value uses.
 const MODEL_PROVIDER: &str = "codex";
+
+/// How long the configured-provider knowledge is trusted for the **pick path**
+/// (issue #910). The `/model` surface refreshes it on every open; the
+/// synchronous neutral-bucket predicate only ever consults this cache, so a
+/// pick never costs a `config/read`.
+const CONFIGURED_PROVIDERS_TTL: Duration = Duration::from_secs(60);
+
+/// The provider ids `config/read` last declared (issue #910).
+///
+/// `codex` is cola's neutral catalog bucket **only** when the user's config
+/// declares no real `[model_providers.codex]`. Deciding that must not cost a
+/// request on a pick (a card callback has a tight ack budget, and the text form
+/// has no budget at all), so the surface records what it read here and the
+/// synchronous predicate only consults this cache. A cold or failed read is
+/// "not known", which keeps the conservative neutral behaviour (the pick rides
+/// the turn, as #910's AC3 requires).
+pub(crate) struct ConfiguredProviders {
+    seen: std::sync::Mutex<Option<(std::time::Instant, std::collections::BTreeSet<String>)>>,
+}
+
+impl ConfiguredProviders {
+    pub(crate) fn new() -> Self {
+        Self {
+            seen: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Record a successful `config/read`. A failed read records nothing: the
+    /// previous knowledge (if any) is still the best there is.
+    pub(crate) fn note(&self, config: &CodexModelConfig) {
+        if config.read_failed {
+            return;
+        }
+        let ids = config
+            .providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect();
+        *self.seen.lock().expect("codex configured providers") = Some((std::time::Instant::now(), ids));
+    }
+
+    /// Whether `config/read` (within the TTL) declared a provider with this id.
+    /// `false` also covers "not known yet", never "definitely absent" — the
+    /// neutral fallback is the safe one.
+    pub(crate) fn declares(&self, id: &str) -> bool {
+        let seen = self.seen.lock().expect("codex configured providers");
+        match seen.as_ref() {
+            Some((at, ids)) if at.elapsed() < CONFIGURED_PROVIDERS_TTL => ids.contains(id),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for ConfiguredProviders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfiguredProviders")
+            .finish_non_exhaustive()
+    }
+}
 
 /// One configured provider's probe-relevant fields. The bearer token is the
 /// only secret here; nothing else in this module formats it.
@@ -401,11 +463,26 @@ struct ProbeEntry {
     outcome: ProbeOutcome,
 }
 
+/// The probe cache key: provider id, base URL, the `env_key` identity and a
+/// fingerprint of the token (issue #910). Never the token itself.
+type ProbeCacheKey = (String, Option<String>, Option<String>, Option<u64>);
+
+/// A non-reversible fingerprint of a bearer token for [`ProbeCacheKey`]. The
+/// token never enters the key, a log line or a `Debug` surface.
+fn token_fingerprint(token: Option<&str>) -> Option<u64> {
+    token.map(|token| {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        token.hash(&mut hasher);
+        hasher.finish()
+    })
+}
+
 /// Drop every entry past [`PROBE_TTL`]. Called under the cache lock before a
 /// lookup and on insert, so expired provider/base-URL pairs are removed rather
 /// than merely ignored — visiting projects with distinct endpoints cannot grow
 /// one connection's map without bound.
-fn prune_expired(entries: &mut HashMap<(String, Option<String>), ProbeEntry>) {
+fn prune_expired(entries: &mut HashMap<ProbeCacheKey, ProbeEntry>) {
     let now = Instant::now();
     entries.retain(|_, entry| now.saturating_duration_since(entry.at) < PROBE_TTL);
 }
@@ -413,7 +490,7 @@ fn prune_expired(entries: &mut HashMap<(String, Option<String>), ProbeEntry>) {
 /// Per-provider `/models` cache (one per attached connection). Clones of a
 /// [`super::client::CodexClient`] share it through an `Arc`.
 pub(crate) struct ModelProbes {
-    entries: Mutex<HashMap<(String, Option<String>), ProbeEntry>>,
+    entries: Mutex<HashMap<ProbeCacheKey, ProbeEntry>>,
     client: reqwest::Client,
 }
 
@@ -444,11 +521,17 @@ impl ModelProbes {
         probed.into_iter().collect()
     }
 
-    /// The cache key is the provider **and** its base URL: one provider id may
-    /// be overridden per project layer, and a cached answer for another
-    /// project's endpoint would be a lie about this one.
-    fn cache_key(provider: &ConfiguredProvider) -> (String, Option<String>) {
-        (provider.id.clone(), provider.base_url.clone())
+    /// The cache key is the provider, its base URL **and its credentials**: one
+    /// provider id may be overridden per project layer, and a cached 401 from a
+    /// stale token must not outlive the fix for a whole TTL (issue #910). The
+    /// token is folded to a fingerprint, never stored.
+    fn cache_key(provider: &ConfiguredProvider) -> ProbeCacheKey {
+        (
+            provider.id.clone(),
+            provider.base_url.clone(),
+            provider.env_key.clone(),
+            token_fingerprint(provider.token.as_deref()),
+        )
     }
 
     /// Serve this read from the cache only: a card-callback read runs on the
@@ -824,18 +907,28 @@ pub(crate) fn build_surface(
             });
         }
     }
-    let unpaired: Vec<&str> = config
-        .providers
-        .iter()
-        .filter(|provider| !paired_providers.contains(provider.id.as_str()))
-        .map(|provider| provider.name.as_str())
-        .collect();
-    let mut note = if provider_options.is_empty() {
-        if config.read_failed {
-            "_(读不到 config，provider / profile 未知)_".to_string()
-        } else {
-            "_(config 里没有可切换的 provider + model 组合：可在 `[profiles.*]` 声明一对)_".to_string()
+    // #908 AC1: every provider `config/read` declares stays visible, even when
+    // it has no profile and its `/models` listed nothing — as a listed row
+    // marked 「没有已知模型」, never a button (a bare provider has no valid pair
+    // to send, #910).
+    let mut unpaired_named = false;
+    for provider in &config.providers {
+        if paired_providers.contains(provider.id.as_str()) {
+            continue;
         }
+        unpaired_named = true;
+        provider_options.push(ModelOption {
+            id: provider.id.clone(),
+            label: Some(clip(&format!("{}：没有已知模型", provider.name), 48)),
+            disabled: true,
+            ..ModelOption::default()
+        });
+    }
+    let selectable = provider_options.iter().any(|option| !option.disabled);
+    let mut note = if config.read_failed {
+        "_(读不到 config，provider / profile 未知)_".to_string()
+    } else if !selectable {
+        "_(config 里没有可切换的 provider + model 组合：可在 `[profiles.*]` 声明一对)_".to_string()
     } else if pending {
         "选中的 provider+model 会随第一条消息应用到新线程（`thread/start`）。".to_string()
     } else if resumable {
@@ -847,11 +940,11 @@ pub(crate) fn build_surface(
          `provider_switch_on_resume`）。"
             .to_string()
     };
-    if !unpaired.is_empty() {
-        note.push_str(&format!(
-            " {} 没有已知模型：请在 `[profiles.*]` 里声明 model + model_provider，或让 `/models` 探测成功。",
-            unpaired.join("、")
-        ));
+    if unpaired_named {
+        note.push_str(
+            " 没有已知模型的 provider 已列在上面：请在 `[profiles.*]` 里声明 model + \\
+             model_provider，或让 `/models` 探测成功。",
+        );
     }
     let provider_scope = ModelScope {
         id: PROVIDER_SCOPE.into(),
@@ -872,9 +965,40 @@ pub(crate) fn build_surface(
     };
 
     ModelSurface {
-        current: query.current.clone(),
+        current: resolved_current(query.current.as_ref(), thread_provider, config),
         scopes: vec![model_scope, provider_scope],
     }
+}
+
+/// The current-model line the card shows (#910). A picker pick records the
+/// neutral `codex` bucket, so on a thread whose real provider is known **and
+/// configured**, the line must name that provider — the same fact the footer
+/// reads — instead of `codex/<id>`. Anything else is left exactly as the caller
+/// resolved it.
+fn resolved_current(
+    current: Option<&ModelSelection>,
+    thread_provider: Option<&str>,
+    config: &CodexModelConfig,
+) -> Option<ModelSelection> {
+    let current = current?;
+    let Some((provider, model)) = current.reference.split_once('/') else {
+        return Some(current.clone());
+    };
+    if provider != MODEL_PROVIDER {
+        return Some(current.clone());
+    }
+    let Some(real) = thread_provider else {
+        return Some(current.clone());
+    };
+    if real == MODEL_PROVIDER || !config.providers.iter().any(|configured| configured.id == real) {
+        return Some(current.clone());
+    }
+    let reference = format!("{real}/{model}");
+    let label = match current.label.strip_prefix(&format!("{MODEL_PROVIDER}/")) {
+        Some(rest) => format!("{real}/{rest}"),
+        None => reference.clone(),
+    };
+    Some(ModelSelection { label, reference })
 }
 
 /// The one-line probe note: why a provider contributes no model buttons. One
@@ -1266,6 +1390,47 @@ mod tests {
         assert_eq!(server.request_count(), 3, "failures are cached within the TTL");
     }
 
+    /// Issue #910: the probe cache key is the provider, its URL **and** its
+    /// credentials, so a cached 401 from a stale token cannot outlive the fix
+    /// for a whole TTL. The token itself never enters the key or its Debug.
+    #[tokio::test]
+    async fn a_changed_token_forces_a_new_probe() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route("GET", "/models", 200, r#"{"data":[{"id":"one"}]}"#);
+        let probes = ModelProbes::new();
+        let base = Some(server.base_url());
+        let stale = provider("p", base.clone(), Some("stale-token"), None);
+        let first = probes.probe_all(std::slice::from_ref(&stale)).await;
+        assert_eq!(first.get("p"), Some(&ProbeOutcome::Models(vec!["one".into()])));
+        assert_eq!(server.request_count(), 1);
+
+        // Same provider and base URL, a fixed token: a new probe.
+        let fixed = provider("p", base.clone(), Some("fixed-token"), None);
+        let second = probes.probe_all(std::slice::from_ref(&fixed)).await;
+        assert_eq!(second, first);
+        assert_eq!(
+            server.request_count(),
+            2,
+            "a changed token is a new probe, not the stale cached answer"
+        );
+
+        // The same fixed token is cached again.
+        probes.probe_all(std::slice::from_ref(&fixed)).await;
+        assert_eq!(server.request_count(), 2, "an unchanged token stays cached");
+
+        // The key itself never carries the credential.
+        assert_ne!(ModelProbes::cache_key(&stale), ModelProbes::cache_key(&fixed));
+        let debug = format!("{:?}", ModelProbes::cache_key(&stale));
+        assert!(!debug.contains("stale-token"), "token leaked: {debug}");
+        let env_a = provider("p", base.clone(), None, Some("KEY_A"));
+        let env_b = provider("p", base, None, Some("KEY_B"));
+        assert_ne!(
+            ModelProbes::cache_key(&env_a),
+            ModelProbes::cache_key(&env_b),
+            "the env_key identity is part of the key"
+        );
+    }
+
     /// The surface's shape: the built-in catalog is its own group (never under a
     /// provider), config profiles are `codex/<model>` presets, probed models
     /// group by provider, and the provider list marks the thread's provider.
@@ -1384,6 +1549,7 @@ mod tests {
         let pairs: Vec<(&str, &str)> = provider_scope
             .options
             .iter()
+            .filter(|option| !option.disabled)
             .map(|option| {
                 (
                     option.provider.as_deref().unwrap_or_default(),
@@ -1396,6 +1562,21 @@ mod tests {
             [("deepseek", "deepseek-flash"), ("deepseek", "deepseek-v4-pro")],
             "one row per known provider+model pair, deduplicated"
         );
+        // #908 AC1: the provider with no known model is still **listed**, as a
+        // row that is not a button (it has no valid pair to send, #910).
+        let listed = provider_scope
+            .options
+            .iter()
+            .find(|option| option.id == "opencode-go")
+            .expect("a configured provider stays visible");
+        assert!(listed.disabled, "it is listed, not selectable");
+        assert!(
+            listed.display_label().contains("没有已知模型"),
+            "the row says why: {}",
+            listed.display_label()
+        );
+        assert_eq!(listed.provider, None, "no pair button");
+        assert_eq!(listed.value, None);
         assert!(
             provider_scope.options[0].display_label().contains("fast"),
             "a profile pair names the profile: {:?}",
@@ -1403,15 +1584,15 @@ mod tests {
         );
         let note = provider_scope.note.as_deref().unwrap();
         assert!(
-            note.contains("OpenCode Go"),
-            "a provider with no known model is named in the note: {note}"
+            note.contains("没有已知模型") && note.contains("profiles"),
+            "the note says how to pair a listed provider: {note}"
         );
         assert!(
             !provider_scope
                 .options
                 .iter()
-                .any(|option| option.id.contains("opencode-go")),
-            "a bare provider is not selectable"
+                .any(|option| !option.disabled && option.id.contains("opencode-go")),
+            "a bare provider is never selectable"
         );
 
         // The token never reaches any surface field, a card, or a `{:?}`.
@@ -1477,6 +1658,54 @@ mod tests {
             !label.contains("需确认"),
             "a pair on the thread's own provider is an ordinary model pick: {label}"
         );
+        assert_eq!(
+            surface.current.as_ref().map(|current| current.reference.as_str()),
+            Some("deepseek/deepseek-flash"),
+            "a neutral thread fact does not rename the caller's selection"
+        );
+
+        // Issue #910: a picker pick records the neutral bucket, so the current
+        // line composes the thread's **real** provider (the same fact the footer
+        // shows) when that provider is configured.
+        let picker_pick = ModelSurfaceQuery {
+            current: Some(ModelSelection {
+                label: "codex/gpt-custom@high".into(),
+                reference: "codex/gpt-custom".into(),
+            }),
+            ..Default::default()
+        };
+        let surface = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            Some("deepseek"),
+            false,
+            &picker_pick,
+        );
+        let current = surface.current.expect("the current line stays");
+        assert_eq!(current.reference, "deepseek/gpt-custom");
+        assert_eq!(
+            current.label, "deepseek/gpt-custom@high",
+            "the label is composed with the real provider too"
+        );
+
+        // An **unconfigured** thread provider is not composed, and a neutral one
+        // is not a channel: the line stays what the caller resolved.
+        let surface = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            Some("unknown"),
+            false,
+            &picker_pick,
+        );
+        assert_eq!(
+            surface.current.unwrap().reference,
+            "codex/gpt-custom",
+            "an unknown provider is not claimed"
+        );
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), false, &picker_pick);
+        assert_eq!(surface.current.unwrap().reference, "codex/gpt-custom");
     }
 
     /// A failed probe is a note on the model scope and a short tag on the
@@ -1503,13 +1732,20 @@ mod tests {
         assert!(note.contains("opencode-go"), "note names the provider: {note}");
         assert!(!note.contains('\n'));
 
-        // The provider scope offers only pairs; with no profile and a failed
-        // probe this provider has none, so it is named in the note instead of
-        // being selectable as a bare provider (issue #910, item 2).
+        // The provider scope lists it (#908 AC1) but never as a selectable pair:
+        // with no profile and a failed probe there is no valid pair to send
+        // (issue #910), so the row is disabled and the note says how to pair it.
         let provider = &surface.scopes[1];
-        assert!(provider.options.is_empty(), "no bare provider row");
+        assert_eq!(provider.options.len(), 1, "the provider is listed");
+        assert!(provider.options[0].disabled, "never a bare provider button");
+        assert_eq!(provider.options[0].provider, None);
+        assert!(
+            provider.options[0].display_label().contains("opencode-go")
+                && provider.options[0].display_label().contains("没有已知模型"),
+            "the row names the provider and the gap: {}",
+            provider.options[0].display_label()
+        );
         let note = provider.note.as_deref().unwrap();
-        assert!(note.contains("opencode-go"), "note names it: {note}");
         assert!(note.contains("profiles"), "note says how to pair it: {note}");
     }
 
@@ -1555,7 +1791,12 @@ mod tests {
         // `PROBE_TTL` is minutes in production; expiry is simulated by moving
         // the instants, which is the same state a later read would see. The
         // unrelated key stands for an old project's endpoint.
-        let stale = ("old".to_string(), Some("http://old.example".to_string()));
+        let stale: ProbeCacheKey = (
+            "old".to_string(),
+            Some("http://old.example".to_string()),
+            None,
+            None,
+        );
         {
             let mut entries = probes.entries.lock().unwrap();
             entries.insert(
