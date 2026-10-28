@@ -21,6 +21,7 @@ pub(crate) mod leftovers;
 pub(crate) mod logs;
 pub(crate) mod message_pins;
 pub(crate) mod misc;
+pub(crate) mod model_provider;
 pub(crate) mod pending;
 pub(crate) mod permission;
 pub(crate) mod prompt_render;

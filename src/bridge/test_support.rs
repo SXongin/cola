@@ -1753,6 +1753,20 @@ pub struct MockBackend {
     /// The configured default model served by `configured_default_model` (the
     /// second rung of the `/think` effective-model resolution).
     pub default_model: Option<crate::backend::types::ModelInfo>,
+    /// What `provider_change_scope` answers (issue #910): the client's
+    /// `provider_switch_on_resume` policy. `NewThread` (the default) means a
+    /// live thread's provider pick is refused with a toast.
+    pub provider_change_scope: crate::backend::types::ChangeScope,
+    /// Every `switch_session_provider` call as `(session_id, provider)`, in
+    /// call order.
+    pub provider_switch_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// When set, `switch_session_provider` fails with this message and records
+    /// nothing — the refused resume of issue #910.
+    pub provider_switch_error: Option<String>,
+    /// Every `create_session` call's thread-level provider and model id (issue
+    /// #910): a Pending Session's creation picks.
+    #[allow(clippy::type_complexity)]
+    pub created_session_picks: Arc<tokio::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
     /// The context-window size `model_context_window` reports; `None`
     /// simulates a server that reports none (ADR-0044's used-only fallback).
     pub context_window: Option<i64>,
@@ -2018,6 +2032,10 @@ impl MockBackend {
             model_surface_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             model_surface: None,
             default_model: None,
+            provider_change_scope: crate::backend::types::ChangeScope::NewThread,
+            provider_switch_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            provider_switch_error: None,
+            created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
@@ -2174,6 +2192,23 @@ impl MockBackend {
     /// scopes — a client shape other than OpenCode's provider tree.
     pub(crate) fn with_model_surface(&mut self, surface: crate::backend::types::ModelSurface) -> &mut Self {
         self.model_surface = Some(surface);
+        self
+    }
+
+    /// Scenario: the client allows (or refuses) a confirmed provider switch on
+    /// an existing thread (issue #910).
+    pub(crate) fn with_provider_change_scope(
+        &mut self,
+        scope: crate::backend::types::ChangeScope,
+    ) -> &mut Self {
+        self.provider_change_scope = scope;
+        self
+    }
+
+    /// Scenario: `switch_session_provider` fails with `message` and records no
+    /// switch — a server that refused the resume.
+    pub(crate) fn fail_provider_switch(&mut self, message: &str) -> &mut Self {
+        self.provider_switch_error = Some(message.to_string());
         self
     }
 
@@ -2807,6 +2842,7 @@ impl crate::backend::Backend for MockBackend {
                 provider_id: "p".into(),
                 variant: None,
             }),
+            provider: None,
             location: directory.map(|d| crate::backend::types::Location {
                 directory: d.to_string(),
             }),
@@ -2821,6 +2857,10 @@ impl crate::backend::Backend for MockBackend {
             .lock()
             .await
             .push(input.location.as_ref().map(|l| l.directory.clone()));
+        self.created_session_picks.lock().await.push((
+            input.provider.clone(),
+            input.model.as_ref().map(|model| model.id.clone()),
+        ));
         if self
             .fail_create_session_count
             .load(std::sync::atomic::Ordering::SeqCst)
@@ -2886,6 +2926,21 @@ impl crate::backend::Backend for MockBackend {
                 "Simulated release failure".into(),
             ));
         }
+        Ok(())
+    }
+
+    fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
+        self.provider_change_scope
+    }
+
+    async fn switch_session_provider(&self, session_id: &str, provider: &str) -> crate::error::Result<()> {
+        if let Some(message) = &self.provider_switch_error {
+            return Err(crate::error::BridgeError::OpenCode(message.clone()));
+        }
+        self.provider_switch_calls
+            .lock()
+            .await
+            .push((session_id.to_string(), provider.to_string()));
         Ok(())
     }
 
@@ -3251,6 +3306,7 @@ impl crate::backend::Backend for MockBackend {
                     id: "model".into(),
                     title: provider.to_string(),
                     changeable: crate::backend::types::ChangeScope::ThisTurn,
+                    pick: crate::backend::types::PickKind::Model,
                     options: options.clone(),
                     note: None,
                     free_text: None,
@@ -3277,6 +3333,7 @@ impl crate::backend::Backend for MockBackend {
                 id: "provider".into(),
                 title: "选择模型".into(),
                 changeable: crate::backend::types::ChangeScope::ThisTurn,
+                pick: crate::backend::types::PickKind::DrillDown,
                 options,
                 note: None,
                 free_text: None,

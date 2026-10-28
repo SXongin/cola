@@ -2630,10 +2630,20 @@ impl App {
         mut pending: PendingEntry,
         message_id: &str,
     ) -> crate::error::Result<String> {
-        let session = self
-            .client
-            .create_session(&self.client.new_session_input(Some(&pending.directory)))
-            .await?;
+        let mut input = self.client.new_session_input(Some(&pending.directory));
+        // A provider pick is a **creation** fact (issue #910): a Codex thread's
+        // provider can only be chosen by `thread/start` (or by a confirmed
+        // resume), and it pairs with the model chosen beside it — a profile
+        // preset names both. `input.provider` stays `None` for a client with no
+        // provider axis, so OpenCode's create body is byte-identical.
+        if pending.provider.is_some() {
+            input.provider = pending.provider.clone();
+            input.model = pending
+                .model
+                .as_deref()
+                .and_then(crate::backend::parsing::parse_model);
+        }
+        let session = self.client.create_session(&input).await?;
         // ADR-0041 + V2's durable selection: the pending's picks become
         // session switches now that a session exists (and on V1 the same
         // helper's switch is a no-op, leaving the first prompt to carry them).
@@ -2855,6 +2865,14 @@ impl App {
                     self.handle_model_card_action(&self.core, &value, callback_started)
                         .await
                 }
+                // A provider switch is a two-step click (issue #910): the
+                // confirmation card's own tags land here. 取消 is a no-op — it
+                // answers the ack and leaves the thread exactly as it was.
+                "model_provider_confirm" => self.handle_provider_switch_confirm(&self.core, &value).await,
+                "model_provider_cancel" => Some(CardActionResult {
+                    card: None,
+                    toast: None,
+                }),
                 "think" => self.handle_think_card_action(&self.core, &value, false).await,
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
@@ -4673,12 +4691,16 @@ impl App {
             .unwrap_or("")
             .to_string();
 
-        // Level 1: provider navigation — ask the client for the next surface
-        // page and swap it in. The bridge never assumes the provider tree: it
-        // only names the scope (`provider`) and the option that was tapped.
-        if value.get("level").and_then(|v| v.as_str())
-            == Some(crate::feishu::card::picker::PICKER_LEVEL_PROVIDER)
-        {
+        // A scope states what its pick does (`PickKind`): navigation asks the
+        // client for the next page, a provider selection switches a thread-level
+        // channel, and everything else is a concrete model ref. The bridge never
+        // infers the action from a scope id (OpenCode's and Codex's provider
+        // scopes are both named `provider` but do opposite things — #910).
+        let level = value.get("level").and_then(|v| v.as_str()).unwrap_or("");
+        if level == crate::feishu::card::picker::PICKER_LEVEL_PROVIDER_PICK {
+            return Some(self.handle_provider_pick(core, &thread_key, &picked).await);
+        }
+        if level == crate::feishu::card::picker::PICKER_LEVEL_PROVIDER {
             let back = picked != crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS;
             let (scope, selected) = if back {
                 (Some("provider"), Some(picked.as_str()))
@@ -4723,10 +4745,130 @@ impl App {
         let extra = cleared_variant
             .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
             .unwrap_or_default();
+        // A profile preset is Codex's own "model + provider" declaration: on a
+        // Pending Session the pair is recorded so `thread/start` applies both.
+        // A live session keeps its provider (#908) — only a confirmed resume
+        // changes that — so the paired provider is not recorded there.
+        let paired = value
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .filter(|provider| !provider.is_empty());
+        if let Some(provider) = paired
+            && let Err(error) = core.pick_pending_provider(&thread_key, provider).await
+        {
+            tracing::warn!("could not record the paired provider `{provider}` on the pending: {error}");
+        }
         Some(CardActionResult {
             card: None,
             toast: Some(format!("Model: {picked}（下一条消息开始生效）{}", extra)),
         })
+    }
+
+    /// A pick on a **thread-level provider** scope (issue #910). A provider is
+    /// not a per-turn fact: a Pending Session records it for `thread/start`,
+    /// while an existing thread can only change it by resuming — behind a
+    /// confirmation, and only when the client opened that door
+    /// (`provider_switch_on_resume`). Otherwise the click changes nothing and
+    /// says why.
+    async fn handle_provider_pick(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        provider: &str,
+    ) -> CardActionResult {
+        if provider.is_empty() {
+            return CardActionResult {
+                card: None,
+                toast: Some("provider 为空，未做任何改动".to_string()),
+            };
+        }
+        let Some(settings) = core.session_settings(thread_key).await else {
+            return CardActionResult {
+                card: None,
+                toast: Some(format!(
+                    "{}还没有会话",
+                    crate::bridge::display::feishu_side_label(thread_key)
+                )),
+            };
+        };
+        if settings.session_id.is_none() {
+            return match core.pick_pending_provider(thread_key, provider).await {
+                Ok(true) => CardActionResult {
+                    card: None,
+                    toast: Some(format!("Provider: {provider}（新线程创建时生效）")),
+                },
+                Ok(false) => CardActionResult {
+                    card: None,
+                    toast: Some("还没有可配置的会话".to_string()),
+                },
+                Err(error) => CardActionResult {
+                    card: None,
+                    toast: Some(format!("⚠️ 记录 provider 失败：{error}")),
+                },
+            };
+        }
+        if core.client.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
+            return CardActionResult {
+                card: None,
+                toast: Some("provider 只能在新线程切换".to_string()),
+            };
+        }
+        CardActionResult {
+            card: Some(crate::feishu::card::picker::build_provider_confirm_card(
+                thread_key, provider,
+            )),
+            toast: None,
+        }
+    }
+
+    /// The confirmation card's 确认 click: resume the thread with the chosen
+    /// provider. A failure names itself and leaves every mirror alone — the
+    /// adapter records nothing on a refused resume, so the footer and the next
+    /// `/model` still show the previous provider.
+    async fn handle_provider_switch_confirm(
+        self: &Arc<Self>,
+        core: &Arc<SharedCore>,
+        value: &serde_json::Value,
+    ) -> Option<CardActionResult> {
+        let provider = value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let thread_key = thread_key_from_value(value);
+        let Some(settings) = core.session_settings(&thread_key).await else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(format!(
+                    "{}还没有会话",
+                    crate::bridge::display::feishu_side_label(&thread_key)
+                )),
+            });
+        };
+        let Some(session_id) = settings.session_id.clone() else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("新线程不需要 resume：provider 会随创建生效".to_string()),
+            });
+        };
+        match core.client.switch_session_provider(&session_id, &provider).await {
+            Ok(()) => Some(CardActionResult {
+                card: Some(crate::feishu::card::picker::build_provider_switched_card(
+                    &provider,
+                )),
+                toast: Some(format!("Provider: {provider}")),
+            }),
+            Err(error) => {
+                tracing::warn!("provider switch to `{provider}` failed for {session_id}: {error}");
+                Some(CardActionResult {
+                    card: Some(crate::feishu::card::picker::build_provider_switch_error_card(
+                        &provider,
+                        &error.to_string(),
+                    )),
+                    toast: Some(format!("⚠️ provider 切换失败：{provider}")),
+                })
+            }
+        }
     }
 
     /// Handle a `/think` card button: record the chosen variant (action

@@ -119,6 +119,11 @@ pub struct ModelOption {
     /// The option's identity in its scope — a model id on a model page, a
     /// provider id on a provider page.
     pub id: String,
+    /// The provider this option applies **together with** its model, when the
+    /// client declares such a pair (Codex's `[profiles.*]` preset carries
+    /// `model` + `model_provider`). `None` means "the model only" — the pick
+    /// leaves the thread's provider as it is (issue #910).
+    pub provider: Option<String>,
     /// The model's declared variants (e.g. `["low", "medium", "high"]`),
     /// empty when it declares none. `GET /provider` serializes each model's
     /// variants as a Record keyed by variant id (`model.variants` →
@@ -158,19 +163,45 @@ impl ModelOption {
     }
 }
 
+/// What a pick on a scope's options does when the bridge receives it.
+///
+/// It is stated by the surface rather than inferred from the scope id: Codex's
+/// `provider` scope is a **selection** (a thread-level provider), while
+/// OpenCode's is **navigation** (drill into that provider's models), and both
+/// are legitimately named `provider` (issues #908, #910). The card carries the
+/// distinction as the button's callback `level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickKind {
+    /// A concrete model ref (`provider/model`) for the next turn — the default,
+    /// and every scope whose options are model refs.
+    #[default]
+    Model,
+    /// Another surface page: the bridge asks the client for the drilled
+    /// surface, naming this scope and the tapped option (OpenCode's provider →
+    /// model flow).
+    DrillDown,
+    /// A thread-level provider id (Codex's `modelProvider`): applied when a
+    /// thread is created, or by resuming it — never per turn.
+    Provider,
+}
+
 /// What one axis of a client's model surface can offer, and where it may
 /// change. A scope is one titled section of the `/model` card: a provider
 /// list (OpenCode), a provider's models, or Codex's flat catalog.
 #[derive(Debug, Clone, Default)]
 pub struct ModelScope {
-    /// The scope's identity. It is the callback's `level` for every option in
-    /// the scope and the drill-down key a card sends back
-    /// (`"provider"` / `"model"` / `"catalog"` …).
+    /// The scope's identity: the drill-down key a card sends back and the
+    /// callback `level` of its options where they are model picks
+    /// (`"provider"` / `"model"` / `"catalog"` …). [`Self::pick`] decides what
+    /// a click does, never this name.
     pub id: String,
     /// The section's title, also the card's header when it is the only scope.
     pub title: String,
     /// Where a pick on this scope takes effect.
     pub changeable: ChangeScope,
+    /// What a pick on this scope does — navigation or a selection — so the
+    /// bridge routes it without reading a scope's name as a command.
+    pub pick: PickKind,
     /// The options, possibly empty.
     pub options: Vec<ModelOption>,
     /// A markdown note shown with the scope (why a list is empty, what a
@@ -237,8 +268,8 @@ pub struct ModelSurfaceQuery<'a> {
     pub selected: Option<&'a str>,
     /// Ask for the bare catalog only, with no config read and no provider
     /// probe. Set **only** by `/think`'s context-free variant lookup, which runs
-    /// on a card callback's short ack budget; every card page — including a
-    /// Pending Session's drilled provider page — leaves it false.
+    /// on a card callback's short ack budget; every card page — a Pending
+    /// Session's included — leaves it false.
     pub catalog_only: bool,
     /// When this read answers a card callback, that callback's total budget
     /// (Feishu's 2 s ack budget). An adapter must fit callback-originated
@@ -323,6 +354,14 @@ pub struct CreateSessionInput {
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelInfo>,
+    /// The thread-level provider the new session must start on, when a client
+    /// has that axis (Codex's `thread/start.modelProvider`). It is paired with
+    /// [`Self::model`] — a Pending Session's provider pick rides the thread's
+    /// creation together with the model chosen beside it (issue #910). `None`
+    /// means the client's configured default; a client without the axis
+    /// (OpenCode) never sets it, so its create body is byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
 }

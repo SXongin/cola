@@ -47,9 +47,9 @@ use async_trait::async_trait;
 use crate::error::Result;
 
 use types::{
-    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery, PermissionRequest,
-    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
-    SessionStatus,
+    AgentInfo, ChangeScope, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery,
+    PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo,
+    SessionSelection, SessionStatus,
 };
 
 /// One skill a caller attaches to a prompt (spec #652): a small generation-neutral
@@ -406,6 +406,34 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// answers `Err` when the write fails.
     async fn switch_session_agent(&self, _session_id: &str, _agent: &str) -> Result<()> {
         Ok(())
+    }
+
+    /// How a pick on the `/model` provider scope takes effect on a session of
+    /// this client (issue #910): `NewThread` means only a session created
+    /// later can use it, `ResumeOnly` means resuming the session may — the
+    /// bridge then asks for confirmation first. A `ThisTurn` answer is not
+    /// meaningful for a provider (no client's `turn/start` has the field).
+    ///
+    /// The default answers [`ChangeScope::NewThread`]: the conservative cell,
+    /// and the only one a client without a provider axis can mean. Codex
+    /// derives it from `[clients.<id>] provider_switch_on_resume`.
+    fn provider_change_scope(&self) -> ChangeScope {
+        ChangeScope::NewThread
+    }
+
+    /// Change the session's **thread-level** provider (Codex's
+    /// `thread/resume` `modelProvider`, issue #910). It is not a model pick:
+    /// the thread keeps its model, and the change may be visible to every
+    /// other client attached to that thread (ADR-0090's peer attachment), which
+    /// is why the caller asks for confirmation first.
+    ///
+    /// The default answers `Err`: a client that has not implemented this must
+    /// not report a switch that never happened.
+    async fn switch_session_provider(&self, _session_id: &str, _provider: &str) -> Result<()> {
+        Err(crate::error::BridgeError::Client {
+            client: "backend",
+            detail: "this client cannot change a thread's provider".to_string(),
+        })
     }
 
     /// Whether this generation keeps model/agent choices as durable session
@@ -783,6 +811,7 @@ mod core_only_client {
                 id: None,
                 agent: None,
                 model: None,
+                provider: None,
                 location: directory.map(|directory| crate::backend::types::Location {
                     directory: directory.to_string(),
                 }),

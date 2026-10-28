@@ -599,6 +599,7 @@ async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
             id: "model".into(),
             title: "模型（每轮可换）".into(),
             changeable: crate::backend::types::ChangeScope::ThisTurn,
+            pick: crate::backend::types::PickKind::Model,
             options: vec![
                 crate::backend::types::ModelOption {
                     id: "gpt-5.1-codex".into(),

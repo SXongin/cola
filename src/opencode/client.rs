@@ -316,6 +316,7 @@ impl OpenCodeBackend {
             id: None,
             agent: None,
             model: self.model.clone(),
+            provider: None,
             location: directory.map(|d| Location {
                 directory: d.to_string(),
             }),
@@ -709,6 +710,7 @@ pub(crate) fn model_surface_from_providers(
                 id: "model".into(),
                 title: provider.to_string(),
                 changeable: ChangeScope::ThisTurn,
+                pick: crate::backend::types::PickKind::Model,
                 options,
                 note: None,
                 free_text: None,
@@ -731,6 +733,10 @@ pub(crate) fn model_surface_from_providers(
             id: "provider".into(),
             title: "选择模型".into(),
             changeable: ChangeScope::ThisTurn,
+            // Navigation, not a selection: the pick opens this provider's
+            // models. Codex's `provider` scope is the opposite (issue #910), so
+            // the surface states it instead of letting the name decide.
+            pick: crate::backend::types::PickKind::DrillDown,
             options,
             note: None,
             free_text: None,
