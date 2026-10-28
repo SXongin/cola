@@ -5429,21 +5429,50 @@ impl App {
     ) -> Option<CardActionResult> {
         let on = value.get("value").and_then(|v| v.as_str()) == Some("on");
         let thread_key = thread_key_from_value(value);
-        let settings = core.session_settings(&thread_key).await;
+        let Some((settings, pending_epoch)) = core
+            .sessions_handle()
+            .settings_and_pending_epoch(&thread_key)
+            .await
+        else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some(format!(
+                    "{}还没有会话",
+                    crate::bridge::display::feishu_side_label(&thread_key)
+                )),
+            });
+        };
         // Only a real session has requests to approve; a Pending Session has
         // none yet (ADR-0041).
         let active = settings
-            .as_ref()
-            .and_then(|s| s.session_id.clone().map(|id| (id, s.directory.clone())));
+            .session_id
+            .clone()
+            .map(|id| (id, settings.directory.clone()));
         let mut approved = Vec::new();
         if on && let Some((id, directory)) = &active {
             approved = core.approve_pending_for_session(id, directory).await;
         }
-        if let Some(mut s) = settings {
-            s.auto_accept = on;
-            if let Err(err) = core.set_session_settings(&thread_key, s).await {
-                tracing::warn!("autoaccept card: persist failed: {}", err);
+        // Field-only, with the pending's identity (issue #910): a snapshot
+        // write could restore a stale model, and a `/new` during the sweep must
+        // not take the flag meant for the displaced pending.
+        match core
+            .sessions_handle()
+            .set_auto_accept(
+                &thread_key,
+                settings.session_id.as_deref(),
+                pending_epoch.unwrap_or_default(),
+                on,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return Some(CardActionResult {
+                    card: None,
+                    toast: Some("会话状态已变化（可能刚切换/创建），这次操作没有生效。".to_string()),
+                });
             }
+            Err(err) => tracing::warn!("autoaccept card: persist failed: {}", err),
         }
         // The same residue the permission card's toggle and `/autoaccept on`
         // leave: ONE mode receipt and the approved blocks dismissed. Without it

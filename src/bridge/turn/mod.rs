@@ -716,7 +716,19 @@ impl Turn {
     /// submit itself does not wait for the turn (ADR-0056's submit+observe):
     /// the post-prompt drain observes the run it scheduled.
     async fn attempt(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
+        // The renderer is spawned for the whole attempt and stopped on **every**
+        // exit — including a pre-flight refusal, which returns before the
+        // submit. A leaked poll would keep repainting `⏳ 思考中` on a turn that
+        // was never sent, hiding the named error card (issue #910).
         let render = render::RenderPoll::spawn(handles, &self.session_id, &self.thread_key);
+        let result = self.pre_flight_and_submit(handles).await;
+        render.stop().await;
+        result
+    }
+
+    /// The body of one attempt: the pre-flight decision, the submit, and the
+    /// `submit_failed` bookkeeping ([`Self::attempt`] owns the renderer).
+    async fn pre_flight_and_submit(&mut self, handles: &TurnHandles) -> crate::error::Result<()> {
         // The variant actually sent this turn is captured AT SEND TIME, not at
         // finalization: a `/think` issued mid-generation must not retro-tag the
         // card of a turn that was sent without it (same "capture at turn start"
@@ -753,10 +765,27 @@ impl Turn {
         // durable switch. `switch_session_model` plus its mirror write are one
         // step, and a read landing between them would take the server's new
         // selection with the mirror's old one. A prompt is not an ack path, so
-        // waiting for that pick is fine — and bounded by it.
+        // waiting for that pick is fine — but only for a **bounded** time: a
+        // wedged switch must fail this prompt by name, never hang it (issue
+        // #910). The point stays held until the submit returns (below), so no
+        // switch can settle between this snapshot and the prompt it describes.
+        let switch = handles.session_gates.gate(&self.session_id);
+        let _switching = match tokio::time::timeout(
+            crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
+            switch.enter_switch(),
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(crate::error::BridgeError::State(format!(
+                    "另一条模型/思考等级切换在 {:?} 内没有完成，本条消息没有发送；\
+                     请稍后重试，或先 `/model` 确认当前模型。",
+                    crate::bridge::session_gates::SWITCH_SETTLE_BOUND
+                )));
+            }
+        };
         let (model, variant) = {
-            let switch = handles.session_gates.gate(&self.session_id);
-            let _switching = switch.enter_switch().await;
             let durable_variant = if handles.backend.keeps_session_selection() {
                 Some(
                     handles
@@ -793,6 +822,9 @@ impl Turn {
             }
         }
         let agent = handles.sessions.agent_override(&self.session_id).await;
+        // Submitted while the switch point is still held (issue #910): a
+        // durable switch that started after the snapshot waits for this call,
+        // so the prompt always submits the selection it captured.
         let prompt_resp = handles
             .backend
             .prompt(
@@ -806,7 +838,7 @@ impl Turn {
                 Some(&self.cola_message_id),
             )
             .await;
-        render.stop().await;
+        drop(_switching);
         // The poll runs only while the submit is in flight; the post-prompt
         // drain observes the submitted run from here on (ADR-0056, ADR-0043).
         // A rejected submit is recorded so the drain does not wait out its

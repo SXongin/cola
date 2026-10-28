@@ -757,19 +757,6 @@ impl SharedCore {
         self.sessions_handle().session_settings(thread_key).await
     }
 
-    /// Write a [`SessionSettings`] snapshot back to its target (a real session
-    /// by id, else the thread's Pending Session) and persist. `false` when the
-    /// target is gone.
-    pub(crate) async fn set_session_settings(
-        &self,
-        thread_key: &ThreadKey,
-        settings: SessionSettings,
-    ) -> crate::error::Result<bool> {
-        self.sessions_handle()
-            .set_session_settings(thread_key, settings)
-            .await
-    }
-
     /// After `/autoaccept on`: answer every permission request that is ALREADY
     /// pending for `session_id` (or one of its sub-task child sessions) with
     /// "once". The permission poller's `seen` set skips requests it has already

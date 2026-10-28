@@ -29,6 +29,27 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+/// The **total** bound on one durable switch RPC (issue #910). The transport
+/// only bounds the *connect*, so a server that accepts `switch_session_model`
+/// and then stops answering would hold the session's switch point — and every
+/// prompt queued behind it — for as long as the process runs. A switch is a
+/// small, single-call operation; past this it failed by name and the point is
+/// released. Test builds use a short value so the wedge itself is testable.
+#[cfg(not(test))]
+pub(crate) const SWITCH_RPC_BOUND: Duration = Duration::from_secs(10);
+#[cfg(test)]
+pub(crate) const SWITCH_RPC_BOUND: Duration = Duration::from_millis(600);
+
+/// The hard backstop on a caller's wait for the switch point: the switch RPC
+/// above is bounded, so this covers a point held by a pick's read + catalog +
+/// switch and still lets a prompt refuse by name instead of waiting forever.
+/// A prompt that hits it is **not** sent.
+#[cfg(not(test))]
+pub(crate) const SWITCH_SETTLE_BOUND: Duration = Duration::from_secs(30);
+#[cfg(test)]
+pub(crate) const SWITCH_SETTLE_BOUND: Duration = Duration::from_millis(1_000);
 
 /// One session's serialization point, taken around every read-decide-write of
 /// its model/provider mirror.
@@ -146,6 +167,24 @@ impl SessionGates {
         gates.retain(|_, gate| gate.strong_count() > 0);
         gates.len()
     }
+}
+
+/// Take one session's switch point under `bound`, or refuse **by name** (issue
+/// #910): the point can be held across a backend call (a durable switch, a
+/// prompt submit), and every caller of it is a path a user is waiting on, so
+/// none of them may wait forever.
+pub(crate) async fn acquire_switch_bounded<'a>(
+    gate: &'a SessionGate,
+    bound: Duration,
+) -> crate::error::Result<tokio::sync::MutexGuard<'a, ()>> {
+    tokio::time::timeout(bound, gate.enter_switch())
+        .await
+        .map_err(|_| {
+            crate::error::BridgeError::State(format!(
+                "另一条模型/思考等级切换在 {bound:?} 内没有完成，这次操作没有生效；\
+                 请稍后重试，或先 `/model` 确认当前模型。"
+            ))
+        })
 }
 
 impl std::fmt::Debug for SessionGates {

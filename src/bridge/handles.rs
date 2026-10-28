@@ -267,14 +267,6 @@ impl SessionsHandle {
 
     /// Write a [`SessionSettings`] snapshot back to its target and persist.
     /// `false` when the target is gone.
-    pub(crate) async fn set_session_settings(
-        &self,
-        thread_key: &ThreadKey,
-        settings: SessionSettings,
-    ) -> crate::error::Result<bool> {
-        self.store.lock().await.set_settings(thread_key, settings)
-    }
-
     /// Mutate the mapped session in place and persist, returning the updated
     /// entry (`None` when `session_id` is not mapped). The session-list cache
     /// is untouched: per-session overrides are not server-list state.
@@ -970,12 +962,43 @@ impl SessionsHandle {
         session_id: &str,
         directory: &str,
     ) -> Option<String> {
-        match self.durable_selection(backend, session_id, Some(directory)).await {
-            Ok(Some(selection)) => selection.model.and_then(|model| model.variant),
-            // Unknown: the switch rewrites the ref wholesale, so dropping the
-            // variant is the one honest outcome.
-            Ok(None) | Err(_) => None,
+        // Bounded like the switch it precedes (issue #910): this read runs
+        // inside the session's switch point, so a silent server must not hold
+        // the point (and every prompt behind it) open.
+        let selection = tokio::time::timeout(
+            crate::bridge::session_gates::SWITCH_RPC_BOUND,
+            self.durable_selection(backend, session_id, Some(directory)),
+        )
+        .await;
+        match selection {
+            Ok(Ok(Some(selection))) => selection.model.and_then(|model| model.variant),
+            // Unknown (an error, no selection, or no answer in time): the
+            // switch rewrites the ref wholesale, so dropping the variant is the
+            // one honest outcome.
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
         }
+    }
+
+    /// Switch a durable session's selection under its **total** bound (issue
+    /// #910): the transport only bounds the connect, and a server that stops
+    /// answering must fail by name rather than hold the switch point forever.
+    async fn switch_session_model_bounded(
+        backend: &Arc<dyn crate::backend::Backend>,
+        session_id: &str,
+        model: &crate::backend::types::ModelInfo,
+    ) -> crate::error::Result<()> {
+        tokio::time::timeout(
+            crate::bridge::session_gates::SWITCH_RPC_BOUND,
+            backend.switch_session_model(session_id, model),
+        )
+        .await
+        .map_err(|_| {
+            crate::error::BridgeError::State(format!(
+                "切换模型在 {:?} 内没有得到服务器回答；这条会话的选择可能没有生效，\
+                 请稍后重试或重新 `/model` 确认。",
+                crate::bridge::session_gates::SWITCH_RPC_BOUND
+            ))
+        })?
     }
 
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches) for
@@ -1079,8 +1102,14 @@ impl SessionsHandle {
         // the other. A pick that had to wait builds on what the previous one
         // left (`base` is read inside the step), so a pick queued behind an
         // in-flight one applies after it — the newer pick wins.
+        // The pre-flight holds this point across its submit, so a pick — an ack
+        // path — takes it with a bound too (issue #910).
         let switch = self.session_gates.gate(&session_id);
-        let _switching = switch.enter_switch().await;
+        let _switching = crate::bridge::session_gates::acquire_switch_bounded(
+            &switch,
+            crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
+        )
+        .await?;
         let Some(base) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
@@ -1096,16 +1125,16 @@ impl SessionsHandle {
         let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
             crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
         })?;
-        backend
-            .switch_session_model(
-                &session_id,
-                &crate::backend::types::ModelInfo {
-                    id: model.id,
-                    provider_id: model.provider_id,
-                    variant: variant.clone(),
-                },
-            )
-            .await?;
+        Self::switch_session_model_bounded(
+            backend,
+            &session_id,
+            &crate::backend::types::ModelInfo {
+                id: model.id,
+                provider_id: model.provider_id,
+                variant: variant.clone(),
+            },
+        )
+        .await?;
         // The mirror write is inside the same step, compare-and-set against the
         // state this pick read when it took the point.
         let written = {
@@ -1160,12 +1189,13 @@ impl SessionsHandle {
         &self,
         thread_key: &ThreadKey,
         session_id: Option<&str>,
+        expected_epoch: u64,
         on: bool,
     ) -> crate::error::Result<bool> {
         self.store
             .lock()
             .await
-            .set_auto_accept(thread_key, session_id, on)
+            .set_auto_accept(thread_key, session_id, expected_epoch, on)
     }
 
     /// Record a `/model` spec as the session's next-turn model **without any
@@ -1288,7 +1318,11 @@ impl SessionsHandle {
             // (issue #910). Ordering `/think` behind a `/model` (and back) is
             // what keeps the server and the mirror agreeing on the last pick.
             let switch = self.session_gates.gate(&session_id);
-            let _switching = switch.enter_switch().await;
+            let _switching = crate::bridge::session_gates::acquire_switch_bounded(
+                &switch,
+                crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
+            )
+            .await?;
             let Some(base) = self.session_settings(thread_key).await else {
                 return Ok(PickOutcome::NoTarget);
             };
@@ -1298,16 +1332,16 @@ impl SessionsHandle {
             let Some(model) = self.effective_selection(backend, &base).await else {
                 return Ok(PickOutcome::NoModel);
             };
-            backend
-                .switch_session_model(
-                    &session_id,
-                    &crate::backend::types::ModelInfo {
-                        id: model.id,
-                        provider_id: model.provider_id,
-                        variant: variant.clone(),
-                    },
-                )
-                .await?;
+            Self::switch_session_model_bounded(
+                backend,
+                &session_id,
+                &crate::backend::types::ModelInfo {
+                    id: model.id,
+                    provider_id: model.provider_id,
+                    variant: variant.clone(),
+                },
+            )
+            .await?;
             let written = {
                 let _held = switch.enter().await;
                 self.store.lock().await.set_mirror_live(
