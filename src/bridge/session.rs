@@ -233,6 +233,10 @@ pub(crate) enum MirrorWrite<'a> {
     },
     /// A `/think` pick: the variant, or `None` to clear it.
     Variant(Option<&'a str>),
+    /// Forget the mirror's selection (issue #910): a durable switch whose
+    /// outcome the server never confirmed. `None` claims nothing, so the next
+    /// prompt runs the server's authoritative selection instead of a guess.
+    Forget,
 }
 
 /// Apply `write` to a mirror's model/variant slots, returning the variant after
@@ -273,6 +277,11 @@ fn apply_mirror_write(
         }
         MirrorWrite::Variant(new_variant) => {
             *variant = new_variant.map(str::to_string);
+            None
+        }
+        MirrorWrite::Forget => {
+            *model = None;
+            *variant = None;
             None
         }
     }

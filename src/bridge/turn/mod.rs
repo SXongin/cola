@@ -789,11 +789,21 @@ impl Turn {
         };
         let (model, variant) = {
             let durable_variant = if handles.backend.keeps_session_selection() {
+                // Bounded like every other read under the point (issue #910):
+                // a silent server degrades to "unknown variant", never to a
+                // point held open.
                 Some(
-                    handles
-                        .sessions
-                        .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
-                        .await,
+                    tokio::time::timeout(
+                        crate::bridge::session_gates::SWITCH_RPC_BOUND,
+                        handles.sessions.effective_variant(
+                            &handles.backend,
+                            &self.session_id,
+                            Some(&self.directory),
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .flatten(),
                 )
             } else {
                 None

@@ -1710,6 +1710,14 @@ pub struct MockBackend {
     /// accepted the call and then stopped answering); the bridge's own total
     /// bound must release the switch point (issue #910).
     pub hang_switch: std::sync::atomic::AtomicUsize,
+    /// Applies the next `switch_session_model` to the mock's selection and then
+    /// never answers — the response was lost (issue #910). The bridge must
+    /// reconcile instead of assuming nothing happened.
+    pub hang_after_apply: std::sync::atomic::AtomicUsize,
+    /// When set, the next applied-then-lost switch leaves a **different**
+    /// selection behind (another client moved it): the reconcile must report
+    /// "unknown" rather than guess.
+    pub after_switch_selection: std::sync::Mutex<Option<crate::backend::types::ModelInfo>>,
     /// Holds the next `create_session` calls (lazy creation / materialisation)
     /// until released, so a test can interleave a pair write with the creation
     /// window (issue #910).
@@ -2061,6 +2069,8 @@ impl MockBackend {
             switch_model_gate: std::sync::Mutex::new(None),
             switch_model_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_switch: std::sync::atomic::AtomicUsize::new(0),
+            hang_after_apply: std::sync::atomic::AtomicUsize::new(0),
+            after_switch_selection: std::sync::Mutex::new(None),
             create_session_gate: std::sync::Mutex::new(None),
             create_session_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
@@ -2527,6 +2537,25 @@ impl MockBackend {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.reply_permission_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// Scenario: the next `switch_session_model` **applies** the change and then
+    /// never answers — the response was lost (issue #910).
+    pub(crate) fn hang_after_apply(&self) -> &Self {
+        self.hang_after_apply
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        self
+    }
+
+    /// Scenario: the applied-then-lost switch is followed by another client
+    /// moving the selection to `model`, so the reconcile cannot attribute the
+    /// server state to either the attempt or the previous selection.
+    pub(crate) fn then_the_selection_becomes(&self, model: crate::backend::types::ModelInfo) -> &Self {
+        *self
+            .after_switch_selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(model);
+        self
     }
 
     /// Scenario: the next `switch_session_model` call never answers — the
@@ -3692,6 +3721,24 @@ impl crate::backend::Backend for MockBackend {
             .entry(session_id.to_string())
             .or_default()
             .model = Some(model.clone());
+        // The applied-then-lost scenario (issue #910): the change landed, but
+        // the answer never does (and a peer may have moved it again).
+        let moved = self
+            .after_switch_selection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(moved) = moved {
+            self.session_selections
+                .lock()
+                .await
+                .entry(session_id.to_string())
+                .or_default()
+                .model = Some(moved);
+        }
+        if self.hang_after_apply.swap(0, std::sync::atomic::Ordering::SeqCst) > 0 {
+            std::future::pending::<()>().await;
+        }
         Ok(())
     }
 
