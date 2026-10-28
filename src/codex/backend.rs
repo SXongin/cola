@@ -86,6 +86,11 @@ pub(crate) struct Projections {
     /// name.
     model_stamps: std::sync::atomic::AtomicU64,
     states: Mutex<HashMap<String, SubscriptionState>>,
+    /// One epoch per thread's subscriber task (issue #910): every new task bumps
+    /// it, and a release ack only evicts the live state while its epoch still
+    /// matches — a late ack from a subscription a restore already replaced must
+    /// not evict the fresh projection.
+    epochs: Mutex<HashMap<String, u64>>,
     /// One adoption lock per thread. Two concurrent reads of the same new
     /// thread must not both send `thread/resume`, but an unrelated thread (a
     /// repeatedly polled never-run thread included) must never block another's
@@ -704,6 +709,8 @@ impl Projections {
     /// Register the consumer that owns `thread_id`'s subscription. A re-adopt
     /// replaces any previous sender (which by then belongs to a task that has
     /// already ended or is about to).
+    /// Per-thread subscription epochs (issue #910): bumped by every new
+    /// subscriber task, so a late release ack can be recognised as stale.
     fn watch_release(&self, thread_id: &str, sender: tokio::sync::mpsc::UnboundedSender<ReleaseCommand>) {
         self.releases
             .lock()
@@ -724,13 +731,43 @@ impl Projections {
     /// Drop a released thread's live state and evict its transcript. Only the
     /// small Turn Diff snapshot survives, so an in-flight diff card can still
     /// resolve; re-adoption pages the history again.
-    fn released(&self, thread_id: &str) {
+    /// Mint the epoch of a new subscriber task (issue #910). It orders a late
+    /// `thread/unsubscribe` ack against the subscription that replaced it: a
+    /// release whose ack arrives after a restore re-adopted the thread must not
+    /// evict the fresh projection.
+    fn begin_subscription(&self, thread_id: &str) -> u64 {
+        let mut epochs = self.epochs.lock().expect("codex subscription epochs");
+        let epoch = epochs.get(thread_id).copied().unwrap_or_default() + 1;
+        epochs.insert(thread_id.to_string(), epoch);
+        epoch
+    }
+
+    /// A subscription's release ack: evict the live state only while it still
+    /// belongs to that subscription's epoch (issue #910).
+    fn released(&self, thread_id: &str, epoch: u64) {
+        let current = self
+            .epochs
+            .lock()
+            .expect("codex subscription epochs")
+            .get(thread_id)
+            .copied();
+        if current != Some(epoch) {
+            tracing::debug!(
+                thread = %thread_id,
+                "a late release ack belongs to a superseded subscription; keeping the live state"
+            );
+            return;
+        }
         self.evict(thread_id, true);
     }
 
     /// Remove a thread's live state and projection. `keep_diffs` retains the
     /// small Turn Diff snapshot (release); a deleted thread keeps nothing.
     fn evict(&self, thread_id: &str, keep_diffs: bool) {
+        self.epochs
+            .lock()
+            .expect("codex subscription epochs")
+            .remove(thread_id);
         self.states
             .lock()
             .expect("codex subscription states")
@@ -1060,12 +1097,14 @@ impl CodexClient {
                 let (release, releases) = tokio::sync::mpsc::unbounded_channel();
                 self.projections.watch_release(thread_id, release);
                 self.projections.set_state(thread_id, SubscriptionState::Adopting);
+                let epoch = self.projections.begin_subscription(thread_id);
                 let task = tokio::spawn(run_thread(
                     self.threads().clone(),
                     Arc::downgrade(&self.projections),
                     thread_id.to_string(),
                     self.projections.resync_signal(thread_id),
                     releases,
+                    epoch,
                 ));
                 self.projections.track(task);
             }
@@ -1105,6 +1144,7 @@ async fn run_thread(
     thread_id: String,
     signal: Arc<tokio::sync::Notify>,
     releases: tokio::sync::mpsc::UnboundedReceiver<ReleaseCommand>,
+    epoch: u64,
 ) {
     // The model the resume reports describes the thread as it was when the
     // read started; stamp it BEFORE asking so an accepted pick cannot be
@@ -1237,7 +1277,7 @@ async fn run_thread(
         );
     }
     drop(cache);
-    consume(subscription, threads, projections, signal, releases).await;
+    consume(subscription, threads, projections, signal, releases, epoch).await;
 }
 
 /// Fold one subscription's events into the cache. Notifications are applied
@@ -1251,6 +1291,7 @@ async fn consume(
     projections: std::sync::Weak<Projections>,
     signal: Arc<tokio::sync::Notify>,
     mut releases: tokio::sync::mpsc::UnboundedReceiver<ReleaseCommand>,
+    epoch: u64,
 ) {
     let thread_id = subscription.thread().id.clone();
     let command = loop {
@@ -1318,7 +1359,7 @@ async fn consume(
     // `thread/unsubscribe` is sent.
     let result = subscription.release().await.map(|_| ());
     if let Some(projections) = projections.upgrade() {
-        projections.released(&thread_id);
+        projections.released(&thread_id, epoch);
     }
     // The caller may have bounded its wait and gone (a slow server, a
     // cancelled command): the release still happened, so a dropped ack is not
@@ -7422,6 +7463,71 @@ mod tests {
             client.projections.model("thread-1").map(|model| model.model_id),
             Some("gpt-5.1-codex".to_string()),
         );
+    }
+
+    /// Issue #910 (extra finding): a **late** unsubscribe ack must not evict the
+    /// projection a restore already re-adopted. The release handle is taken and
+    /// the projection forgotten before the ack; if the ack arrives after the
+    /// timeout's restore, it belongs to a superseded subscription epoch and is
+    /// ignored.
+    #[tokio::test]
+    async fn a_late_unsubscribe_ack_does_not_evict_the_restored_projection() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // The ack lands after the step bound: the switch times out, the cleanup
+        // re-subscribes, and only then does the old task's ack arrive.
+        server.set_unsubscribe_delay(Duration::from_millis(2_500));
+        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
+        let _ = Backend::apply_thread_model(&client, "thread-1", &pair).await;
+        // The restore re-adopted within the bound; the old ack is still pending.
+        assert_eq!(
+            client.projections.state("thread-1"),
+            Some(SubscriptionState::Live),
+            "the restore re-subscribed"
+        );
+
+        // Past the late ack: the fresh projection must still be there.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            client.projections.state("thread-1"),
+            Some(SubscriptionState::Live),
+            "a late ack from the superseded subscription must not evict the restore"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id)
+                == Some("openai".to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the restored projection lost its model fact"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Issue #910 (item 5): a **stalled unsubscribe** takes the release handle

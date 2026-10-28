@@ -634,96 +634,18 @@ pub fn build_provider_confirm_card(
     )
 }
 
-/// The acknowledgement a confirmed switch returns before the RPC starts: the
-/// release + resume + read-back runs off the card-ack path, and this card is
-/// replaced by the outcome when it lands (issue #910).
-pub fn build_provider_switching_card(provider: &str, model: &str) -> serde_json::Value {
+/// The confirmation's synchronous answer: the pair is **recorded**, and the next
+/// message's pre-flight applies it before submitting (issue #910). It replaces
+/// the confirmation card, so its buttons cannot record twice.
+pub fn build_provider_recorded_card(provider: &str, model: &str) -> serde_json::Value {
     card_shell(
-        "🎯 正在切换 Provider",
-        "blue",
-        vec![markdown_element(&format!(
-            "正在把这条线程切换到 `{provider}/{model}`：释放订阅 → `thread/resume` → 回读校验。\n\
-             结果会替换这张卡片。"
-        ))],
-    )
-}
-
-/// The card a confirmed provider/model switch ends on. It replaces the
-/// confirmation card, so the (now stale) buttons cannot be pressed again.
-pub fn build_provider_switched_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "🎯 Provider 已切换",
+        "🎯 已记录：下一条消息前切换",
         "green",
         vec![markdown_element(&format!(
-            "**当前**：`{provider}/{model}`（已由 `thread/read` 回读确认）\n\
-             这条线程的模型随 provider 一起换掉了；同一个线程上的其他客户端现在也会使用它。\n\
-             再次发送 `/model` 可查看最新状态。"
-        ))],
-    )
-}
-
-/// A confirmation that found a running turn: the pair is recorded and applied
-/// after that turn, before the next message (issue #910). It replaces the
-/// confirmation card, so its buttons cannot start a second attempt.
-pub fn build_provider_deferred_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "🎯 已记录，等本轮结束",
-        "blue",
-        vec![markdown_element(&format!(
-            "已记录 `{provider}/{model}`：当前这一轮结束后、下一条消息发出前切换。\n\
-             如果那时仍无法切换（别的客户端或另一个 cola 实例还持有线程），那条消息不会被发送，             并会说明原因。\n再次发送 `/model` 可查看当前状态。"
-        ))],
-    )
-}
-
-/// The thread's provider is already the target and only the model differs: no
-/// reload happened (a same-provider model change is the per-turn path), so the
-/// model lands on the next turn (issue #910).
-pub fn build_provider_model_pending_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "🎯 Provider 已经是目标，模型下一轮生效",
-        "green",
-        vec![markdown_element(&format!(
-            "这条线程的 provider 已经是 `{provider}`；模型会随下一轮 `turn/start.model` 换成 \
-             `{model}`，不需要重新加载线程。"
-        ))],
-    )
-}
-
-/// A second confirmation for the same session while the first switch is still
-/// running: answered, not started (issue #910). The claim ends when the first
-/// outcome card lands.
-pub fn build_provider_busy_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "🎯 切换还在进行中",
-        "blue",
-        vec![markdown_element(&format!(
-            "上一次对 `{provider}/{model}` 的切换还没有结果；等结果卡出现后再操作。"
-        ))],
-    )
-}
-
-/// The thread already ran the pair: the switch was a no-op (a peer had already
-/// moved it, or the read-back agrees). Success, but nothing changed.
-pub fn build_provider_already_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "🎯 Provider 已经是这个值",
-        "green",
-        vec![markdown_element(&format!(
-            "这条线程已经在 `{provider}/{model}` 上（`thread/read` 回读确认），不需要切换。"
-        ))],
-    )
-}
-
-/// A failed provider switch: the thread keeps its previous provider/model (no
-/// silent fallback), and both the target and the failure are named.
-pub fn build_provider_switch_error_card(provider: &str, model: &str, error: &str) -> serde_json::Value {
-    card_shell(
-        "⚠️ Provider 切换失败",
-        "red",
-        vec![markdown_element(&format!(
-            "线程保持原来的 provider/model，本地记录也没有改动。\n\n\
-             **目标**：`{provider}/{model}`\n**错误**：{error}"
+            "已记录 `{provider}/{model}`：这条线程保持原样，**下一条消息发出前**会先切换到它\
+             （释放订阅 → `thread/resume` → 回读校验）。\n\
+             如果切换无法生效（别的客户端或另一个共用同一 `CODEX_HOME` 的 cola 实例还持有这条线程），\
+             那条消息不会被发送，并会说明原因。"
         ))],
     )
 }
@@ -2351,36 +2273,26 @@ mod tests {
         );
     }
 
-    /// Issue #910, item 8: the ack is a "switching" card, and the outcome
-    /// (success, unchanged, refusal or a failed local save) is a card of its
-    /// own — never the ack claiming success.
+    /// The recorded answer names the pair and says when it takes effect — the
+    /// next message, never "switched now" (issue #910's record-first shape).
     #[test]
-    fn the_switch_outcome_cards_name_their_state() {
-        let switching = build_provider_switching_card("deepseek", "deepseek-v4-pro");
-        assert!(switching.to_string().contains("正在"), "{switching}");
+    fn the_recorded_card_says_the_next_message_applies_it() {
+        let card = build_provider_recorded_card("deepseek", "deepseek-v4-pro");
+        let text = card.to_string();
+        assert!(text.contains("已记录"), "{text}");
+        assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
+        assert!(text.contains("下一条消息"), "{text}");
+        assert!(text.contains("回读"), "the read-back is promised: {text}");
+        assert!(text.contains("CODEX_HOME"), "the holder kinds stay named: {text}");
 
-        let switched = build_provider_switched_card("deepseek", "deepseek-v4-pro");
-        assert!(switched.to_string().contains("已切换"), "{switched}");
-        assert!(switched.to_string().contains("thread/read"), "{switched}");
-
-        let already = build_provider_already_card("deepseek", "deepseek-v4-pro");
-        assert!(already.to_string().contains("已经在"), "{already}");
-
-        let failed = build_provider_switch_error_card(
-            "deepseek",
-            "deepseek-v4-pro",
-            "thread/resume 之后这条线程仍是 `openai/gpt-5.1-codex`",
-        );
-        assert!(failed.to_string().contains("切换失败"), "{failed}");
-        assert!(failed.to_string().contains("openai/gpt-5.1-codex"), "{failed}");
-
+        // A failed *record* is never a success: it names the reason and says
+        // nothing switched.
         let save = build_provider_save_blocked_card("deepseek/deepseek-v4-pro", "disk full");
         let text = save.to_string();
         assert!(text.contains("无法记录"), "{text}");
-        assert!(text.contains("disk full"), "{text}");
         assert!(
             text.contains("没有开始") && text.contains("原来的 provider/model"),
-            "a failed save never claims the switch happened: {text}"
+            "{text}"
         );
     }
 }

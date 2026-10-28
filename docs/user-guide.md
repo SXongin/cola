@@ -287,25 +287,22 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   reason: the thread may be shared with your TUI/VSCode, and every attached
   client sees the new provider. Off, a provider pick only says 「provider 只能
   在新线程切换」 and sends nothing — a new thread still takes the pair chosen on
-  a Pending Session at creation. On, cola asks for confirmation, then changes the
-  thread with the protocol's three steps: release its own subscription
+  a Pending Session at creation. On, the confirmation **records** the pair: the
+  thread is untouched, and the **next message** applies it before being sent —
+  the three protocol steps, release its own subscription
   (`thread/unsubscribe`; a resume on an already-loaded thread is a silent
   no-op), `thread/resume` with `modelProvider` **and** `model`, then
-  `thread/read` to verify — success is only the read-back. If another client
+  `thread/read` to verify. Success is only the read-back. If another client
   (a Codex TUI, VS Code, the desktop app) or another cola instance sharing the
-  same `CODEX_HOME` still holds the thread, the change does not land: the card
-  names both possibilities, the thread keeps its old pair, and nothing is
-  recorded locally — close the other client, or use `thread/fork` with the
-  pair. A pick made while a turn is running is recorded and applied after that
-  turn, before the next message; if it still cannot apply then, that message is
-  not sent (cola never runs it on the old provider silently). A thread that is
-  already on the target provider but runs another model is not reloaded: the
-  model rides the next turn. The click is acknowledged before the switch runs,
-  so a slow daemon cannot freeze the card. A message for that session waits
-  for the switch's verdict before it is sent (other chats are not held up);
-  the wait is bounded per protocol step, and a timed-out step still restores
-  the local view and the subscription.
-- **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
+  same `CODEX_HOME` still holds the thread, the change does not land: the
+  message is **not sent**, the card names both possibilities, and the recorded
+  pair stays for a retry — close the other client, or use `thread/fork` with the
+  pair. A pick made while a turn is running is recorded the same way and applied
+  by the next message, and a thread that is already on the target provider but
+  runs another model is not reloaded (the model rides that message). The click
+  itself is answered synchronously; no release, resume or read-back ever runs
+  from the card.
+- **`reasoning_summary` (codex only, default `auto`)**- **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the
   result as a folded 💭 推理过程 panel; the values are `auto`, `concise`,
