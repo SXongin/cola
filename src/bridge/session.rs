@@ -163,10 +163,15 @@ pub struct SessionStore {
     /// finishes (activation resolves its own generation) or is released by the
     /// failure path, so a restart leaves an ordinary pending to retry.
     creating: std::collections::HashMap<ThreadKey, CreationClaim>,
-    /// A per-thread counter bumped whenever the pending declaration changes, so
-    /// a creation that started on an older pending cannot resolve a replacement
-    /// (`activate_created` compares the epochs).
+    /// The identity of each thread's Pending Session, bumped whenever its
+    /// declaration changes, so a creation or a pick that started on an older
+    /// pending cannot resolve a replacement (`activate_created` and the pending
+    /// mirror write compare the epochs).
     pending_epoch: std::collections::HashMap<ThreadKey, u64>,
+    /// Monotonic, process-wide counter behind [`Self::pending_epoch`]: every
+    /// declaration takes the next value, so an epoch is never reused even after
+    /// its map entry is pruned (issue #910).
+    next_pending_epoch: u64,
     /// Monotonic generation for materialisation claims.
     next_creation: u64,
 }
@@ -348,6 +353,7 @@ impl SessionStore {
             writer,
             creating: std::collections::HashMap::new(),
             pending_epoch: std::collections::HashMap::new(),
+            next_pending_epoch: 0,
             next_creation: 0,
         };
         if legacy {
@@ -390,12 +396,12 @@ impl SessionStore {
 
     /// Declare (or replace) the conversation's Pending Session and persist.
     pub fn set_pending(&mut self, pending: PendingEntry) -> crate::error::Result<()> {
-        // A replacement pending bumps the thread's epoch (issue #910): the
-        // creation that started on the old pending must not resolve this one,
-        // and its later `activate_created` sees the mismatch. The claim itself is
-        // kept until then, so no second creation starts concurrently.
+        // A replacement pending takes a new identity (issue #910): the
+        // creation or pick that started on the old pending must not resolve
+        // this one, and its later compare sees the mismatch. The claim itself
+        // is kept until then, so no second creation starts concurrently.
         let key = pending.thread_key.clone();
-        *self.pending_epoch.entry(key).or_default() += 1;
+        self.bump_pending_epoch(&key);
         self.pending_mut().retain(|p| p.thread_key != pending.thread_key);
         self.pending_mut().push(pending);
         self.write_to_disk()
@@ -405,7 +411,7 @@ impl SessionStore {
     #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) clear pendings
     pub fn clear_pending(&mut self, key: &ThreadKey) -> crate::error::Result<()> {
         self.creating.remove(key);
-        *self.pending_epoch.entry(key.clone()).or_default() += 1;
+        self.bump_pending_epoch(key);
         self.pending_mut().retain(|p| &p.thread_key != key);
         self.prune_pending_epoch(key);
         self.write_to_disk()
@@ -533,6 +539,33 @@ impl SessionStore {
         self.creating
             .get(key)
             .is_some_and(|claim| claim.generation == generation)
+    }
+
+    /// The thread's current Pending Session identity (issue #910): `0` when it
+    /// has none and none was ever declared since load.
+    pub(crate) fn pending_epoch_for(&self, key: &ThreadKey) -> u64 {
+        self.pending_epoch.get(key).copied().unwrap_or_default()
+    }
+
+    /// Take the next identity for `key`'s Pending Session. Never reuses a
+    /// value, so a stale pick or creation can never match a later pending.
+    fn bump_pending_epoch(&mut self, key: &ThreadKey) -> u64 {
+        self.next_pending_epoch += 1;
+        let epoch = self.next_pending_epoch;
+        self.pending_epoch.insert(key.clone(), epoch);
+        epoch
+    }
+
+    /// The conversation's settings plus the identity of the Pending Session
+    /// they describe (issue #910), read under one lock so a replacement cannot
+    /// slip between the two. The epoch is `None` for a live session.
+    pub(crate) fn settings_with_pending_epoch(
+        &self,
+        key: &ThreadKey,
+    ) -> Option<(SessionSettings, Option<u64>)> {
+        let settings = self.settings(key)?;
+        let epoch = settings.session_id.is_none().then(|| self.pending_epoch_for(key));
+        Some((settings, epoch))
     }
 
     /// Drop a thread's pending-epoch entry once no claim and no pending need it
@@ -675,6 +708,7 @@ impl SessionStore {
     pub(crate) fn set_mirror_pending(
         &mut self,
         key: &ThreadKey,
+        expected_epoch: u64,
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
         write: MirrorWrite<'_>,
@@ -684,12 +718,20 @@ impl SessionStore {
         if self.creating.contains_key(key) {
             return Ok(PairWrite::Creating);
         }
+        let epoch_now = self.pending_epoch_for(key);
         let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
             // Materialised (or cleared) while the caller awaited its lookup:
             // never fall through to the live entry, whose thread was created
             // with the state the write could not reach.
             return Ok(PairWrite::Moved);
         };
+        // The pick classified a **specific** pending: `/new` (or another
+        // declaration) has a different identity, and a stale pair must never
+        // land on it — even when its model/variant happen to match, which they
+        // commonly do on a fresh pending (issue #910).
+        if epoch_now != expected_epoch {
+            return Ok(PairWrite::Changed);
+        }
         if pending.model.as_deref() != expected_model || pending.variant.as_deref() != expected_variant {
             return Ok(PairWrite::Changed);
         }
@@ -805,6 +847,46 @@ impl SessionStore {
                     return Ok(false);
                 }
                 entry.agent = agent;
+                true
+            }
+        };
+        if applied {
+            self.write_to_disk()?;
+        }
+        Ok(applied)
+    }
+
+    /// Write one conversation's `/autoaccept` flag, touching only that field
+    /// (issue #910): a whole settings snapshot could restore a stale
+    /// model/variant over a recorded switch while the approval sweep it waits
+    /// on runs.
+    pub(crate) fn set_auto_accept(
+        &mut self,
+        key: &ThreadKey,
+        session_id: Option<&str>,
+        on: bool,
+    ) -> crate::error::Result<bool> {
+        let applied = match session_id {
+            None => {
+                let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
+                    return Ok(false);
+                };
+                pending.auto_accept = on;
+                true
+            }
+            Some(session_id) => {
+                let client_id = self.client_id.clone();
+                let Some(entry) = self
+                    .entries_mut()
+                    .iter_mut()
+                    .find(|e| e.client_id == client_id && e.session_id == session_id)
+                else {
+                    return Ok(false);
+                };
+                if &entry.thread_key != key {
+                    return Ok(false);
+                }
+                entry.auto_accept = on;
                 true
             }
         };
@@ -1017,6 +1099,7 @@ impl SessionStore {
         // Replace in place and remember what was displaced, so an overrun can
         // be undone without holding a second handle to the vector up front —
         // that would force the copy-on-write below to copy every time.
+        let key = pending.thread_key.clone();
         let index = self
             .pending
             .iter()
@@ -1030,6 +1113,10 @@ impl SessionStore {
             }
             return Ok(None);
         }
+        // The replacement is visible in memory from here on (a failed save still
+        // leaves it), so it takes a new identity: a pick or creation classified
+        // against the displaced pending must refuse rather than land on it.
+        self.bump_pending_epoch(&key);
         self.write_to_disk_deferred().map(Some)
     }
 
@@ -1696,11 +1783,13 @@ mod tests {
         pending.variant = Some("high".into());
         store.set_pending(pending).unwrap();
 
+        let epoch = store.pending_epoch_for(&key);
         // A newer pick landed since the caller's snapshot: nothing is written.
         assert_eq!(
             store
                 .set_mirror_pending(
                     &key,
+                    epoch,
                     Some("stale"),
                     None,
                     MirrorWrite::Pair {
@@ -1716,6 +1805,7 @@ mod tests {
         let written = store
             .set_mirror_pending(
                 &key,
+                epoch,
                 None,
                 Some("high"),
                 MirrorWrite::Pair {
@@ -1746,6 +1836,7 @@ mod tests {
             store
                 .set_mirror_pending(
                     &key,
+                    epoch,
                     Some("deepseek/pro"),
                     None,
                     MirrorWrite::Model {
@@ -1769,6 +1860,7 @@ mod tests {
             store
                 .set_mirror_pending(
                     &key,
+                    epoch,
                     None,
                     None,
                     MirrorWrite::Model {

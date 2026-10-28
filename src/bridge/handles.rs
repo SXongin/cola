@@ -155,9 +155,11 @@ fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome
 pub(crate) enum PickTarget {
     /// The thread's live session, by id.
     Live(String),
-    /// The thread's Pending Session: no live session exists yet, and a pick
-    /// there records the **pair** (its provider is a creation fact).
-    Pending,
+    /// The thread's Pending Session, identified by the store's pending epoch
+    /// ([`crate::bridge::session::SessionStore::pending_epoch_for`]): a pick
+    /// there records the **pair** (its provider is a creation fact), and the
+    /// write refuses if `/new` replaced the pending in the meantime.
+    Pending(u64),
 }
 
 /// What a `/model` pick needs before it is recorded (issue #910): the card form
@@ -771,20 +773,29 @@ impl SessionsHandle {
     /// pair would be applied at thread creation, and the model is the half that
     /// makes the provider safe. `NoTarget` for a live session: its provider
     /// changes only through the adapter's thread-level switch, never this mirror.
+    ///
+    /// `expected_epoch` is the pending the caller classified: a replacement
+    /// pending (`/new`, `/dir`, the new-thread card) is an honest refusal, never
+    /// a pair written onto the replacement (issue #910).
     pub(crate) async fn pick_pending_pair(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
+        expected_epoch: u64,
         provider: &str,
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
         // The snapshot is only the **compare-and-set** precondition and the
         // input to the variant lookup; no state is written from it.
-        let Some(settings) = self.session_settings(thread_key).await else {
+        let Some((settings, epoch)) = self.settings_and_pending_epoch(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
         if settings.session_id.is_some() {
             return Ok(PickOutcome::NoTarget);
+        }
+        if epoch != Some(expected_epoch) {
+            // Replaced while this pick was classified (or awaited its lookup).
+            return Ok(PickOutcome::StateChanged);
         }
         let mut variant = settings.variant.clone();
         let cleared = self
@@ -807,6 +818,7 @@ impl SessionsHandle {
         };
         let written = self.store.lock().await.set_mirror_pending(
             thread_key,
+            expected_epoch,
             settings.model.as_deref(),
             settings.variant.as_deref(),
             write,
@@ -891,7 +903,7 @@ impl SessionsHandle {
         provider: &str,
         model: &str,
     ) -> ModelPickDecision {
-        let Some(settings) = self.session_settings(thread_key).await else {
+        let Some((settings, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
             // Neither a session nor a pending: the caller's own pre-check found
             // one a moment ago, so this is a state change, not "no session".
             return ModelPickDecision::Refuse(
@@ -900,9 +912,10 @@ impl SessionsHandle {
         };
         let Some(session_id) = settings.session_id.clone() else {
             // A Pending Session: its pair rides `thread/start`, so the provider
-            // is a creation fact and carries no live-thread gate.
+            // is a creation fact and carries no live-thread gate. Its epoch is
+            // what the write re-verifies.
             return ModelPickDecision::Record {
-                target: PickTarget::Pending,
+                target: PickTarget::Pending(pending_epoch.unwrap_or_default()),
             };
         };
         // Gate first (issue #910): on a client with a provider axis, a shut gate
@@ -992,7 +1005,7 @@ impl SessionsHandle {
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
         use crate::bridge::session::MirrorWrite;
-        let Some(snapshot) = self.session_settings(thread_key).await else {
+        let Some((snapshot, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
         // The card named a session: a `/switch` since then makes this a no-op,
@@ -1003,14 +1016,17 @@ impl SessionsHandle {
             return Ok(PickOutcome::StateChanged);
         }
         // A Pending Session has no session to switch: the `/think` clear (a
-        // catalog read, outside any gate) and one pending-only CAS.
+        // catalog read, outside any gate) and one pending-only CAS, bound to
+        // the pending this read saw.
         let Some(session_id) = snapshot.session_id.clone() else {
+            let expected_epoch = pending_epoch.unwrap_or_default();
             let mut probe = snapshot.variant.clone();
             let cleared = self
                 .clear_variant_for_model(backend, &mut probe, model_spec)
                 .await;
             let written = self.store.lock().await.set_mirror_pending(
                 thread_key,
+                expected_epoch,
                 snapshot.model.as_deref(),
                 snapshot.variant.as_deref(),
                 MirrorWrite::Model {
@@ -1126,6 +1142,32 @@ impl SessionsHandle {
         })
     }
 
+    /// The conversation's settings plus the identity of the Pending Session
+    /// they describe (issue #910), read under one store lock: a `/new` cannot
+    /// slip between the two, so a classified pending can be re-verified by
+    /// identity at the write. The epoch is `None` for a live session.
+    pub(crate) async fn settings_and_pending_epoch(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Option<(crate::bridge::session::SessionSettings, Option<u64>)> {
+        self.store.lock().await.settings_with_pending_epoch(thread_key)
+    }
+
+    /// Write one conversation's `/autoaccept` flag, touching only that field
+    /// (issue #910): a whole settings snapshot could restore a stale
+    /// model/variant over a recorded switch.
+    pub(crate) async fn set_auto_accept(
+        &self,
+        thread_key: &ThreadKey,
+        session_id: Option<&str>,
+        on: bool,
+    ) -> crate::error::Result<bool> {
+        self.store
+            .lock()
+            .await
+            .set_auto_accept(thread_key, session_id, on)
+    }
+
     /// Record a `/model` spec as the session's next-turn model **without any
     /// catalog read** (issue #910): the confirmation must ack from a store write
     /// only, so the `/think` clear is deferred to the turn pre-flight. Same gate
@@ -1142,7 +1184,7 @@ impl SessionsHandle {
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
         use crate::bridge::session::MirrorWrite;
-        let Some(snapshot) = self.session_settings(thread_key).await else {
+        let Some((snapshot, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
         if let Some(expected) = expected_session
@@ -1153,6 +1195,7 @@ impl SessionsHandle {
         let Some(session_id) = snapshot.session_id.clone() else {
             let written = self.store.lock().await.set_mirror_pending(
                 thread_key,
+                pending_epoch.unwrap_or_default(),
                 snapshot.model.as_deref(),
                 snapshot.variant.as_deref(),
                 MirrorWrite::Model {
@@ -1224,12 +1267,13 @@ impl SessionsHandle {
         variant: Option<String>,
     ) -> crate::error::Result<PickOutcome> {
         use crate::bridge::session::MirrorWrite;
-        let Some(snapshot) = self.session_settings(thread_key).await else {
+        let Some((snapshot, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
         let Some(session_id) = snapshot.session_id.clone() else {
             let written = self.store.lock().await.set_mirror_pending(
                 thread_key,
+                pending_epoch.unwrap_or_default(),
                 snapshot.model.as_deref(),
                 snapshot.variant.as_deref(),
                 MirrorWrite::Variant(variant.as_deref()),

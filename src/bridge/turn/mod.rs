@@ -747,19 +747,27 @@ impl Turn {
         // under it"). All other clients read the `/think` mirror under the gate,
         // which keeps the stale-variant guarantee for the client whose provider
         // switch this is.
-        let durable_variant = if handles.backend.keeps_session_selection() {
-            Some(
-                handles
-                    .sessions
-                    .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
-                    .await,
-            )
-        } else {
-            None
-        };
+        // The read is the pair this prompt runs with, so it must see a
+        // **settled** selection: the session's switch point comes first (the
+        // established order, switch → state gate), waiting out any in-flight
+        // durable switch. `switch_session_model` plus its mirror write are one
+        // step, and a read landing between them would take the server's new
+        // selection with the mirror's old one. A prompt is not an ack path, so
+        // waiting for that pick is fine — and bounded by it.
         let (model, variant) = {
-            let gate = handles.session_gates.gate(&self.session_id);
-            let _held = gate.enter().await;
+            let switch = handles.session_gates.gate(&self.session_id);
+            let _switching = switch.enter_switch().await;
+            let durable_variant = if handles.backend.keeps_session_selection() {
+                Some(
+                    handles
+                        .sessions
+                        .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
+                        .await,
+                )
+            } else {
+                None
+            };
+            let _held = switch.enter().await;
             let model = handles.sessions.model_override(&self.session_id).await;
             let variant = match durable_variant {
                 Some(variant) => variant,
