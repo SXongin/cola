@@ -17,6 +17,7 @@ pub(crate) mod repo_diff;
 pub mod request;
 pub(crate) mod runtime;
 pub mod session;
+pub(crate) mod session_gates;
 pub(crate) mod sidecar;
 pub mod snapshot;
 pub mod snapshot_claims;

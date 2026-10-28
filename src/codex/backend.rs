@@ -1406,6 +1406,16 @@ const PROVIDER_READ_TIMEOUT: Duration = Duration::from_millis(800);
 #[cfg(test)]
 const PROVIDER_READ_TIMEOUT: Duration = Duration::from_millis(200);
 
+/// The bound on **each** step of a provider switch (issue #910). There is no
+/// outer timeout around the sequence: once the release landed, the read-back and
+/// the re-subscribe must still run, so a cancelled or timed-out outer wrapper
+/// cannot skip the cleanup. Written as per-call bounds, the sequence is finite
+/// without ever being dropped mid-flight by us.
+#[cfg(not(test))]
+const SWITCH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const SWITCH_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The provider bucket the `/model` picker shows for Codex. `model/list` names
 /// no provider: a Codex model is whatever the attached app-server resolves
 /// through its own `[model_providers.*]`, and the picker's `provider/model`
@@ -1431,6 +1441,19 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
         model_id: model_id.to_string(),
         variant: None,
     })
+}
+
+/// The named failure of one bounded switch step (issue #910). The copy says what
+/// is known — never that the switch succeeded — and names the likely holders.
+fn switch_step_timeout(step: &str, what: &str) -> BridgeError {
+    BridgeError::Client {
+        client: "codex",
+        detail: format!(
+            "provider 切换在 `{step}` 上超过 {SWITCH_RPC_TIMEOUT:?} 没有完成：{what}。\
+             可能有另一个客户端（Codex TUI / VS Code）或另一个共用同一个 `CODEX_HOME` 的 cola \
+             实例持有该线程；请关闭它，或改用 `thread/fork` 带上 provider/model。"
+        ),
+    }
 }
 
 /// Bound the `/model` catalog read. A server that keeps minting fresh cursors
@@ -1904,11 +1927,11 @@ impl Backend for CodexClient {
         }
         // The read is the authority: a peer may have moved the thread since this
         // connection last looked, and a success claim ("already" included) is
-        // only ever its answer about **both** halves of the pair.
-        let current = self
-            .threads()
-            .read(session_id, false)
+        // only ever its answer about **both** halves of the pair. Bounded like
+        // every other step of a switch.
+        let current = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false))
             .await
+            .map_err(|_| switch_step_timeout("thread/read", "无法确认线程当前的 provider/model"))?
             .map_err(client_error)?;
         self.projections
             .remember_thread_metadata(&current, self.projections.next_model_stamp());
@@ -1932,34 +1955,74 @@ impl Backend for CodexClient {
                     .to_string(),
             });
         }
-        self.release_thread(session_id).await.map_err(client_error)?;
-        // Step 2: the pair, never the provider alone.
-        let resumed = self
-            .threads()
-            .resume_with_model(session_id, &model.provider_id, &model.id)
-            .await;
-        // Step 3: the read is the verdict, and it is also how the local view is
-        // restored after the release on **every** path — a refused resume must
-        // not leave the mirror empty or claiming the new pair.
-        let read = self.threads().read(session_id, false).await;
-        if let Ok(read) = &read {
+        // Step 1: release, bounded. A release that does not answer means the
+        // thread was never unloaded, so nothing has moved yet: abort before the
+        // switch state changes (the local projection heals on the next read).
+        match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread(session_id)).await {
+            Ok(result) => result.map_err(client_error)?,
+            Err(_) => {
+                return Err(switch_step_timeout(
+                    "thread/unsubscribe",
+                    "线程没有被释放，因此没有开始切换",
+                ));
+            }
+        }
+        // Step 2: the pair, never the provider alone, bounded on its own.
+        let resumed = tokio::time::timeout(
+            SWITCH_RPC_TIMEOUT,
+            self.threads()
+                .resume_with_model(session_id, &model.provider_id, &model.id),
+        )
+        .await;
+        // Step 3: the read is the verdict **and** the cleanup — attempted on
+        // every path after the release, even when the resume failed or timed out,
+        // so the local view is never left forgotten.
+        let read = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false)).await;
+        if let Ok(Ok(read)) = &read {
             self.projections
                 .remember_thread_metadata(read, self.projections.next_model_stamp());
         }
         // Keep mirroring: the release above ended this connection's consumer.
         // On a failed switch this re-adopts with the thread's stored settings
-        // (no `modelProvider`), so it cannot apply the pair.
-        if let Err(error) = self.ensure_subscription(session_id).await {
-            tracing::warn!(
+        // (no `modelProvider`), so it cannot apply the pair. Bounded, best-effort.
+        match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.ensure_subscription(session_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
                 thread = %session_id,
                 "could not re-subscribe after a provider change: {error}"
-            );
+            ),
+            Err(_) => tracing::warn!(
+                thread = %session_id,
+                "re-subscribing after a provider change did not answer within \
+                 {SWITCH_RPC_TIMEOUT:?}"
+            ),
         }
-        resumed.map_err(client_error)?;
-        let read = read.map_err(client_error)?;
+        let read = match read {
+            Ok(result) => result.map_err(client_error)?,
+            Err(_) => {
+                return Err(switch_step_timeout(
+                    "thread/read",
+                    "无法确认线程是否已切换，本地记录按原样恢复",
+                ));
+            }
+        };
+
         let provider_ok = read.model_provider.as_deref() == Some(model.provider_id.as_str());
         let model_ok = read.model.as_deref() == Some(model.id.as_str());
         if !provider_ok || !model_ok {
+            // A resume that timed out may still have landed: the read decides,
+            // and a matching pair returns success above. A disagreeing read with
+            // a failed/timed-out resume reports that step's failure instead.
+            match resumed {
+                Ok(Err(error)) => return Err(client_error(error)),
+                Err(_) => {
+                    return Err(switch_step_timeout(
+                        "thread/resume",
+                        "回读仍是原来的 provider/model",
+                    ));
+                }
+                Ok(Ok(_)) => {}
+            }
             return Err(BridgeError::Client {
                 client: "codex",
                 detail: format!(
@@ -7325,6 +7388,67 @@ mod tests {
             client.projections.model("thread-1").map(|model| model.model_id),
             Some("gpt-5.1-codex".to_string()),
         );
+    }
+
+    /// Design pass, symptom 6: each switch step is bounded on its own, with no
+    /// outer timeout around the sequence — so a step that times out still runs
+    /// the read-back and the re-subscribe cleanup. The local view is restored
+    /// from the thread and this connection keeps mirroring it.
+    #[tokio::test]
+    async fn a_timed_out_switch_still_resubscribes() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // The thread is unloaded (the release runs), the resume never answers
+        // within its bound, and the thread keeps its pair — the read-back after
+        // the timeout must still run, and so must the re-subscribe.
+        server.keep_provider_on_resume();
+        server.set_resume_delay(Duration::from_millis(2_500));
+        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
+        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
+            .await
+            .expect_err("the resume timed out");
+        assert!(
+            error.to_string().contains("thread/resume"),
+            "the timed-out step is named: {error}"
+        );
+
+        // Cleanup: re-subscribed, and the projection speaks for the thread again.
+        server.wait_for_subscribers("thread-1", 1).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id)
+                == Some("openai".to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the projection was not restored by the re-adoption"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Review finding 3: "already switched" is decided by a read-back of **both**

@@ -89,6 +89,11 @@ pub(crate) enum PickOutcome {
     /// A durable session's agent reset found no default agent to switch to;
     /// nothing was written.
     NoDefaultAgent,
+    /// The write was refused because the target moved under the read: a newer
+    /// pick, a materialising session, a remapped chat or a pending that
+    /// vanished (issue #910). Nothing was written; the surface must say so and
+    /// never claim the pick.
+    StateChanged,
 }
 
 /// A pick result turned into what a surface renders: the applied payload, or
@@ -119,6 +124,9 @@ pub(crate) fn classify_pick(
         Ok(PickOutcome::NoDefaultAgent) => {
             PickReply::Failed("⚠️ 无法确定服务器默认 Agent；请用 `/agent <名字>` 从列表中选择。".to_string())
         }
+        Ok(PickOutcome::StateChanged) => PickReply::Failed(
+            "⚠️ 会话状态已变化（可能刚切换/创建或有了新的选择），这次操作没有生效，请重试。".to_string(),
+        ),
         Err(error) => PickReply::Failed(format!("⚠️ 切换{noun}失败：{error}")),
     }
 }
@@ -722,11 +730,8 @@ impl SessionsHandle {
         provider: &str,
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
-        // The snapshot only decides whether a variant must be cleared; the
-        // write below re-finds the **pending entry** under its own lock, so a
-        // session that materialised while the (awaited) catalog lookup ran is
-        // `NoTarget` — the pair must never land on the live entry, whose thread
-        // was created with the old provider.
+        // The snapshot is only the **compare-and-set** precondition and the
+        // input to the variant lookup; no state is written from it.
         let Some(settings) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
@@ -737,33 +742,46 @@ impl SessionsHandle {
         let cleared = self
             .clear_variant_for_model(backend, &mut variant, model_spec)
             .await;
-        let written =
-            self.store
-                .lock()
-                .await
-                .set_pending_pair(thread_key, model_spec, provider, cleared.as_deref())?;
-        match written {
-            crate::bridge::session::PendingPairWrite::Applied { cleared_variant } => {
-                Ok(PickOutcome::Applied { cleared_variant })
+        let written = self.store.lock().await.set_pending_pair(
+            thread_key,
+            model_spec,
+            provider,
+            settings.model.as_deref(),
+            settings.variant.as_deref(),
+            cleared.as_deref(),
+        )?;
+        Ok(match written {
+            crate::bridge::session::PairWrite::Applied { cleared_variant, .. } => {
+                PickOutcome::Applied { cleared_variant }
             }
-            crate::bridge::session::PendingPairWrite::NoPending => Ok(PickOutcome::NoTarget),
-        }
+            // A materialising pending, a vanished one, or a newer pick: honest
+            // "state changed" (never a claimed pair the creation cannot apply).
+            crate::bridge::session::PairWrite::Creating
+            | crate::bridge::session::PairWrite::Moved
+            | crate::bridge::session::PairWrite::Changed => PickOutcome::StateChanged,
+        })
     }
 
-    /// Write a provider+model pair onto the conversation's **live** entry in one
-    /// lock (issue #910), with the `/think` clear the caller computed from its
-    /// snapshot. `None` when the conversation is now pending or gone; otherwise
-    /// the state the rollback's compare-and-swap must match.
+    /// Write a provider+model pair onto a **live** entry in one lock (issue
+    /// #910), compare-and-set on the snapshot the caller read and re-verifying
+    /// that the thread still maps to that session.
     pub(crate) async fn set_live_pair(
         &self,
         thread_key: &ThreadKey,
+        session_id: &str,
         model_spec: &str,
+        expected_model: Option<&str>,
+        expected_variant: Option<&str>,
         clear_variant: Option<&str>,
-    ) -> crate::error::Result<Option<crate::bridge::session::LivePairWrite>> {
-        self.store
-            .lock()
-            .await
-            .set_live_pair(thread_key, model_spec, clear_variant)
+    ) -> crate::error::Result<crate::bridge::session::PairWrite> {
+        self.store.lock().await.set_live_pair(
+            thread_key,
+            session_id,
+            model_spec,
+            expected_model,
+            expected_variant,
+            clear_variant,
+        )
     }
 
     /// Compare-and-restore a failed provider pair in ONE store lock (issue
@@ -771,19 +789,35 @@ impl SessionsHandle {
     /// model **and** variant the attempt wrote.
     pub(crate) async fn rollback_pair(
         &self,
-        thread_key: &ThreadKey,
+        session_id: &str,
         attempted_model: &str,
         attempted_variant: Option<&str>,
         previous_model: Option<String>,
         previous_variant: Option<String>,
     ) -> crate::error::Result<bool> {
         self.store.lock().await.rollback_pair(
-            thread_key,
+            session_id,
             attempted_model,
             attempted_variant,
             previous_model,
             previous_variant,
         )
+    }
+
+    /// Claim a Pending Session for materialisation (issue #910): the snapshot
+    /// and the claim are taken under one lock, so a pair write in the window
+    /// before `thread/start` cannot claim a pair the creation will not apply.
+    pub(crate) async fn claim_pending_for_creation(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> crate::bridge::session::PendingClaim {
+        self.store.lock().await.claim_pending_for_creation(thread_key)
+    }
+
+    /// Release a materialisation claim whose creation failed (the pending
+    /// stays, so the next message retries).
+    pub(crate) async fn unclaim_pending_creation(&self, thread_key: &ThreadKey) {
+        self.store.lock().await.unclaim_pending_creation(thread_key);
     }
 
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the
@@ -1631,6 +1665,10 @@ pub(crate) struct TurnHandles {
     /// The one owner of the on-disk layout (ADR-0090 §6). A Turn's flows reach
     /// the pid record, the restart notice and the Terminal Log root through it.
     pub(crate) layout: crate::state::StateLayout,
+    /// The per-session model/provider serialization points (issue #910): the
+    /// pre-flight takes its session's gate before deciding the pair the prompt
+    /// will run with.
+    pub(crate) session_gates: crate::bridge::session_gates::SessionGates,
 }
 
 impl TurnHandles {
