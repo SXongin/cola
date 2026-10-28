@@ -767,8 +767,10 @@ impl Turn {
         // selection with the mirror's old one. A prompt is not an ack path, so
         // waiting for that pick is fine — but only for a **bounded** time: a
         // wedged switch must fail this prompt by name, never hang it (issue
-        // #910). The point stays held until the submit returns (below), so no
-        // switch can settle between this snapshot and the prompt it describes.
+        // #910). The point is held across this snapshot and released just
+        // before the submit: on V2 the server is the authority, so a switch
+        // that lands while the turn is being submitted applies from the **next**
+        // turn, and this snapshot governs this turn's variant.
         let switch = handles.session_gates.gate(&self.session_id);
         let _switching = match tokio::time::timeout(
             crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
@@ -822,9 +824,17 @@ impl Turn {
             }
         }
         let agent = handles.sessions.agent_override(&self.session_id).await;
-        // Submitted while the switch point is still held (issue #910): a
-        // durable switch that started after the snapshot waits for this call,
-        // so the prompt always submits the selection it captured.
+        // Released immediately before the submit (issue #910): `Backend::prompt`
+        // has no total response bound, and holding the point across it would let
+        // one slow submit wedge every `/model` and `/think` behind it.
+        //
+        // The trade is deliberate, and on V2 the server is the authority: a
+        // durable switch that lands while this turn is being submitted is a
+        // **user action**, not a mirror/mirror disagreement — it applies from
+        // the next turn, while the snapshot above governs this turn's variant.
+        // (Server and mirror still move together: the switch writes both
+        // inside the point.)
+        drop(_switching);
         let prompt_resp = handles
             .backend
             .prompt(
@@ -838,7 +848,6 @@ impl Turn {
                 Some(&self.cola_message_id),
             )
             .await;
-        drop(_switching);
         // The poll runs only while the submit is in flight; the post-prompt
         // drain observes the submitted run from here on (ADR-0056, ADR-0043).
         // A rejected submit is recorded so the drain does not wait out its
