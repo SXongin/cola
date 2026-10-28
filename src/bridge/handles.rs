@@ -1235,8 +1235,10 @@ impl SessionsHandle {
         // the other. A pick that had to wait builds on what the previous one
         // left (`base` is read inside the step), so a pick queued behind an
         // in-flight one applies after it — the newer pick wins.
-        // The pre-flight holds this point across its submit, so a pick — an ack
-        // path — takes it with a bound too (issue #910).
+        // The pre-flight releases this point immediately before its submit
+        // (`Backend::prompt` has no total response bound), so a pick — an ack
+        // path — takes it with a bound instead of waiting behind a slow turn
+        // (issue #910).
         let switch = self.session_gates.gate(&session_id);
         let _switching = crate::bridge::session_gates::acquire_switch_bounded(
             &switch,
