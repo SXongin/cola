@@ -1208,9 +1208,16 @@ pub(crate) async fn handle_command(
                             .await;
                         }
                     }
-                    if let Some(mut s) = settings {
-                        s.auto_accept = on;
-                        handles.flow.sessions.set_session_settings(&thread_key, s).await?;
+                    if let Some(s) = settings.as_ref() {
+                        // Field-only (issue #910): the approval sweep above can
+                        // run for a while, and writing the whole snapshot back
+                        // would restore the model/variant it read before a
+                        // concurrent confirmation recorded a new pair.
+                        handles
+                            .flow
+                            .sessions
+                            .set_auto_accept(&thread_key, s.session_id.as_deref(), on)
+                            .await?;
                     }
                     let state = if on { "开" } else { "关" };
                     let extra = if on && !approved.is_empty() {
@@ -1446,7 +1453,7 @@ pub(crate) async fn handle_command(
                 }
                 crate::bridge::handles::ModelPickDecision::Record { target } => {
                     use crate::bridge::handles::PickTarget;
-                    let pending = matches!(target, PickTarget::Pending);
+                    let pending = matches!(target, PickTarget::Pending(_));
                     let outcome = match target {
                         // Bound to the session the decision classified: a
                         // `/switch` since then is a no-op, never a record on
@@ -1467,13 +1474,14 @@ pub(crate) async fn handle_command(
                         // was classified: the pair is a creation fact there, so
                         // record **both** halves — a model-only write would drop
                         // the provider.
-                        PickTarget::Pending => {
+                        PickTarget::Pending(epoch) => {
                             handles
                                 .flow
                                 .sessions
                                 .pick_pending_pair(
                                     &handles.flow.backend,
                                     &thread_key,
+                                    epoch,
                                     &parsed.provider_id,
                                     &name,
                                 )

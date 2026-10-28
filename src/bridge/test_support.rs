@@ -1541,6 +1541,12 @@ pub struct MockBackend {
     pub external_user_created: Arc<std::sync::Mutex<Option<i64>>>,
     /// Records every `reply_permission` call: (request_id, reply).
     pub reply_permission_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// Holds the next `reply_permission` calls until released, counting those
+    /// that reached the gate (issue #910): lets a test park the `/autoaccept`
+    /// approval sweep between the command's settings snapshot and its write.
+    pub reply_permission_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `reply_permission` calls that reached [`Self::reply_permission_gate`].
+    pub reply_permission_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// The session id each `reply_permission` was routed with, in call order —
     /// the child-session routing assertion (V2's reply is session-scoped).
     pub reply_permission_sessions: Arc<tokio::sync::Mutex<Vec<String>>>,
@@ -2003,6 +2009,8 @@ impl MockBackend {
             external_reply_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             external_user_created: Arc::new(std::sync::Mutex::new(None)),
             reply_permission_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            reply_permission_gate: std::sync::Mutex::new(None),
+            reply_permission_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reply_permission_sessions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             interrupt_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             compact_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2504,6 +2512,15 @@ impl MockBackend {
     pub(crate) fn hold_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Hold every `reply_permission` call until the returned semaphore is
+    /// released, counting those that reached the gate. Lets a test park the
+    /// `/autoaccept` approval sweep after its settings snapshot (issue #910).
+    pub(crate) fn hold_reply_permission(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.reply_permission_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -3545,6 +3562,16 @@ impl crate::backend::Backend for MockBackend {
         reply: &str,
         _d: Option<&str>,
     ) -> crate::error::Result<()> {
+        let gate = self
+            .reply_permission_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            self.reply_permission_gate_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _permit = gate.acquire().await;
+        }
         self.reply_permission_sessions
             .lock()
             .await

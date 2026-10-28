@@ -4837,7 +4837,11 @@ impl App {
             };
         }
         let spec = format!("{provider}/{model}");
-        let Some(settings) = core.session_settings(thread_key).await else {
+        let Some((settings, pending_epoch)) = core
+            .sessions_handle()
+            .settings_and_pending_epoch(thread_key)
+            .await
+        else {
             return CardActionResult {
                 card: None,
                 toast: Some(format!(
@@ -4849,7 +4853,15 @@ impl App {
         // A Pending Session takes both halves at creation: `thread/start` carries
         // `model` + `modelProvider` in one call.
         if settings.session_id.is_none() {
-            return self.save_pending_pair(core, thread_key, provider, &spec).await;
+            return self
+                .save_pending_pair(
+                    core,
+                    thread_key,
+                    pending_epoch.unwrap_or_default(),
+                    provider,
+                    &spec,
+                )
+                .await;
         }
         // The rule is shared with the `/model` text form: a model-only pick is
         // recorded; a provider change needs the gate and a confirmation; nothing
@@ -4868,7 +4880,10 @@ impl App {
                 // The thread became a Pending Session while the pick was
                 // classified: record the pair (its provider is a creation
                 // fact), never a model-only write that drops it.
-                PickTarget::Pending => self.save_pending_pair(core, thread_key, provider, &spec).await,
+                PickTarget::Pending(epoch) => {
+                    self.save_pending_pair(core, thread_key, epoch, provider, &spec)
+                        .await
+                }
             },
             ModelPickDecision::Confirm {
                 session_id,
@@ -4902,6 +4917,7 @@ impl App {
         &self,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
+        expected_epoch: u64,
         provider: &str,
         spec: &str,
     ) -> CardActionResult {
@@ -4909,7 +4925,7 @@ impl App {
         // creation, and the model is what makes the provider safe (issue #910).
         match core
             .sessions_handle()
-            .pick_pending_pair(&core.client, thread_key, provider, spec)
+            .pick_pending_pair(&core.client, thread_key, expected_epoch, provider, spec)
             .await
         {
             Ok(PickOutcome::Applied { cleared_variant }) => CardActionResult {

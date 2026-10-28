@@ -1380,10 +1380,11 @@ async fn a_pending_pick_records_no_provider_without_the_axis() {
     );
 }
 
-/// Issue #910, item 3: a durable generation's session switch is a backend RPC,
-/// so it runs **outside** the session gate — a stalled server must not wedge
-/// this session's next prompt. The pick is parked inside `switch_session_model`
-/// here, and the prompt still goes through.
+/// Issue #910, item 3 (standards): a durable generation's session switch is a
+/// backend RPC, so it runs **outside** the state gate — a stalled server must
+/// not wedge this session's settings writes. (The prompt is a deliberate
+/// exception: it waits at the switch point, see
+/// `a_prompt_waits_for_an_in_flight_durable_switch`.)
 #[tokio::test]
 async fn a_model_pick_switches_the_session_outside_the_gate() {
     let _wd = test_work_dir();
@@ -1405,7 +1406,6 @@ async fn a_model_pick_switches_the_session_outside_the_gate() {
         .with_model_pick_route(ModelPickRoute::PerTurn);
     let gate = backend.hold_session_switch();
     let entered = backend.switch_model_gate_entered.clone();
-    let prompt_models = backend.prompt_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
@@ -1431,23 +1431,35 @@ async fn a_model_pick_switches_the_session_outside_the_gate() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
-    // The pick is parked in its RPC; the session gate must still be free, so
-    // the next prompt's pre-flight reaches `prompt` without waiting for it.
-    prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt was blocked by the pick's RPC"
-        );
-        assert!(
-            !pick.is_finished(),
-            "the pick was not parked when the prompt went through"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    // The pick is parked in its RPC; the state gate must still be free, so a
+    // settings write on the same session completes instead of waiting for it.
+    let applied = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        app.sessions_handle()
+            .set_agent(&key(), Some("ses_test"), Some("build")),
+    )
+    .await
+    .expect("the settings write is not blocked by the pick's RPC")
+    .expect("the agent write runs");
+    assert!(applied, "the agent write landed");
+    assert!(
+        !pick.is_finished(),
+        "the pick was still parked when the settings write went through"
+    );
     gate.add_permits(1);
     pick.await.expect("the pick joins");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the pick lands afterwards"
+    );
 }
 
 /// Issue #910, item 4: a confirmation acks from a store write only — it never
@@ -1627,18 +1639,15 @@ async fn a_live_session_that_became_pending_before_the_record_refuses() {
         .sessions_handle()
         .model_pick_decision(&app.client, &key(), PROVIDER, MODEL)
         .await;
-    assert!(
-        matches!(
-            &decision,
-            crate::bridge::handles::ModelPickDecision::Record {
-                target: crate::bridge::handles::PickTarget::Pending
-            }
-        ),
-        "the pending target is carried"
-    );
+    let epoch = match decision {
+        crate::bridge::handles::ModelPickDecision::Record {
+            target: crate::bridge::handles::PickTarget::Pending(epoch),
+        } => epoch,
+        _ => panic!("the pending target is carried"),
+    };
     let outcome = app
         .sessions_handle()
-        .pick_pending_pair(&app.client, &key(), PROVIDER, &spec)
+        .pick_pending_pair(&app.client, &key(), epoch, PROVIDER, &spec)
         .await
         .expect("the pending write runs");
     assert_eq!(
@@ -1867,4 +1876,339 @@ async fn a_racing_think_replaces_the_cleared_variant_instead_of_sending_it() {
         Some("low"),
         "and the mirror is left alone"
     );
+}
+
+/// Issue #910, item 1: a pick classified against one Pending Session must not
+/// land on its **replacement**. `/new` (`set_pending`) takes a new identity,
+/// so a stale pair is refused even when the replacement's model/variant match
+/// the snapshot exactly (the case the model/variant compare-and-set cannot see).
+#[tokio::test]
+async fn a_pending_replaced_during_the_pick_is_not_overwritten() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: PROVIDER.into(),
+            models: vec![model_option(MODEL, &["low"])],
+        }]);
+    // The `/think` clear of the pick's catalog lookup is the parking point.
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+    {
+        let mut store = app.sessions.lock().await;
+        let pending = store.pending_for(&key()).cloned().expect("the pending is seeded");
+        let mut pending = pending;
+        pending.variant = Some("high".into());
+        store.set_pending(pending).expect("re-declare with a variant");
+    }
+    let epoch_before = app.sessions.lock().await.pending_epoch_for(&key());
+
+    let pick = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/model deepseek/deepseek-v4-pro",
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pick's catalog lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // `/new` replaces the pending with one that carries the same model/variant:
+    // only the identity tells them apart.
+    let mut replacement = PendingEntry::new(key(), "/work/cola");
+    replacement.variant = Some("high".into());
+    seed_pending(&app, replacement).await;
+    assert!(
+        app.sessions.lock().await.pending_epoch_for(&key()) != epoch_before,
+        "the replacement takes a new identity"
+    );
+    gate.add_permits(1);
+    pick.await.expect("the pick joins");
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(reply.contains("状态已变化"), "the stale pick is refused: {reply}");
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the replacement survives");
+    assert_eq!(pending.model, None, "the replacement keeps its model");
+    assert_eq!(pending.provider, None, "and its provider");
+    assert_eq!(
+        pending.variant.as_deref(),
+        Some("high"),
+        "and its thinking level (the stale clear did not run)"
+    );
+}
+
+/// Issue #910, item 2: on a durable generation the pre-flight takes the
+/// session's switch point before its read, so a prompt cannot submit while a
+/// `switch_session_model` is still in flight — it waits, then runs the settled
+/// selection.
+#[tokio::test]
+async fn a_prompt_waits_for_an_in_flight_durable_switch() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    let gate = backend.hold_session_switch();
+    let entered = backend.switch_model_gate_entered.clone();
+    let prompt_models = backend.prompt_models.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    let pick = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/model openai/model-b",
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the durable switch never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    prompt(&app, "msg_prompt", "hi");
+    let switch = app.session_gates.gate("ses_test");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while switch.switch_waiting() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pre-flight never queued at the switch point"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        prompt_models.lock().await.is_empty(),
+        "the prompt is not submitted while the switch is in flight"
+    );
+
+    gate.add_permits(1);
+    pick.await.expect("the pick joins");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_models.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt was never submitted after the switch settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        prompt_models.lock().await.last().cloned().flatten(),
+        Some("openai/model-b".to_string()),
+        "the prompt runs the settled selection"
+    );
+}
+
+/// Issue #910, item 4 (the other branch): when the clear loses its
+/// compare-and-set and the fresh variant is **also** unsupported, the prompt
+/// stops by name — the unsupported value is never submitted.
+#[tokio::test]
+async fn a_racing_unsupported_variant_stops_the_prompt_by_name() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: PROVIDER.into(),
+            models: vec![model_option(MODEL, &["low"])],
+        }]);
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let prompt_calls = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pre-flight's catalog lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The racing `/think` also picks a level this model does not declare.
+    app.sessions_handle()
+        .pick_think(&app.client, &key(), Some("max".to_string()))
+        .await
+        .expect("the think write runs");
+    gate.add_permits(2);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let text = all_cards(&platform).await;
+        if text.contains("本条消息没有发送") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never stopped by name: calls={} probes={} text={text}",
+            prompt_calls.lock().await.len(),
+            entered.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        prompt_calls.lock().await.is_empty(),
+        "nothing is submitted with a variant the model does not declare"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("max"),
+        "the racing `/think` keeps its write"
+    );
+}
+
+/// Issue #910, item 4 (standards): `/autoaccept` writes only its own field. A
+/// recorded pair lands while the command's approval sweep is parked, and the
+/// whole-snapshot write must not restore the model it read before that.
+#[tokio::test]
+async fn a_delayed_autoaccept_keeps_a_recorded_pair() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.ask_permissions(vec![crate::backend::types::PermissionRequest {
+        request_id: "per_pending".into(),
+        session_id: Some("ses_test".into()),
+        permission: Some("bash".into()),
+        patterns: vec!["ls -la".into()],
+        metadata: None,
+        always: Vec::new(),
+        always_supported: true,
+    }]);
+    let gate = backend.hold_reply_permission();
+    let entered = backend.reply_permission_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.directory = "/work/cola".into();
+    seed_entry(&app, entry).await;
+
+    let autoaccept = tokio::spawn({
+        let app = app.clone();
+        async move {
+            send_command_in(
+                &app,
+                "/autoaccept on",
+                key(),
+                "msg_cmd",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the approval sweep never reached the backend"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // A confirmation records a provider pair while the command waits.
+    let outcome = app
+        .sessions_handle()
+        .record_pair_expecting(&key(), Some("ses_test"), "deepseek/deepseek-v4-pro")
+        .await
+        .expect("the record runs");
+    assert_eq!(
+        outcome,
+        crate::bridge::handles::PickOutcome::Applied {
+            cleared_variant: None
+        }
+    );
+    gate.add_permits(1);
+    autoaccept.await.expect("the command joins");
+
+    let active = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key())
+        .cloned()
+        .expect("the session stays mapped");
+    assert_eq!(
+        active.model.as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the stale snapshot did not restore the old model"
+    );
+    assert!(active.auto_accept, "the command's own field was written");
 }
