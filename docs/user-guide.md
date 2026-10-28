@@ -230,6 +230,7 @@ kind = "codex"                   # required: opencode | codex
 # sandbox = "danger-full-access" # optional: read-only | workspace-write | danger-full-access
 # approval_policy = "on-request" # optional: untrusted | on-request | never
 # apply_on_adopt = false         # optional: also send the pair on thread/resume
+# provider_switch_on_resume = false  # optional: let /model switch a live thread's provider (confirmation first)
 # reasoning_summary = "auto"     # optional: auto | concise | detailed | none
 
 [bridge]
@@ -251,9 +252,9 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   `[opencode]` does. A `codex` Agent Client accepts `start_server`
   (`auto`/`never`/`eager`): `never` is attach-only, while the others may start
   the shared daemon through `codex app-server daemon start` — cola never owns
-  or reaps it. It also accepts `sandbox`, `approval_policy`, `apply_on_adopt` and
-  `reasoning_summary` (next two). A named Agent Client does not inherit
-  `[opencode]`'s values.
+  or reaps it. It also accepts `sandbox`, `approval_policy`, `apply_on_adopt`,
+  `provider_switch_on_resume` and `reasoning_summary` (each described below). A
+  named Agent Client does not inherit `[opencode]`'s values.
 - **`sandbox` / `approval_policy` / `apply_on_adopt` (codex only)** — what a
   Codex thread runs under. cola sends the pair on `thread/start`, so a thread it
   creates can develop in this repo: `sandbox = "danger-full-access"` removes the
@@ -276,6 +277,18 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   settings: a thread created before the change keeps the policy it was created
   with, and a thread your TUI created and cola adopted keeps it too unless
   `apply_on_adopt = true`.
+- **`provider_switch_on_resume` (codex only, default `false`)** — whether
+  `/model`'s provider pick may change an **existing** thread. A provider is a
+  thread-level fact (`thread/start`'s and `thread/resume`'s `modelProvider`;
+  `turn/start` has none), so a new thread takes the provider chosen on a Pending
+  Session at creation, and nothing else can change it — from the wire's point of
+  view a resume is the only door. Off by default, for `apply_on_adopt`'s reason:
+  the thread may be shared with your TUI/VSCode, and every attached client sees
+  the new provider. Off, the pick only says 「provider 只能在新线程切换」 and
+  sends nothing; on, cola asks for confirmation first, and the confirmation card
+  says the other clients on the thread will see the change. Either way the model
+  stays as it is, and a failed resume is reported by name (the thread keeps its
+  old provider).
 - **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the

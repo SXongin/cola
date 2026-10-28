@@ -163,6 +163,7 @@ kind = "codex"                   # 必填：opencode | codex
 # sandbox = "danger-full-access" # 可选：read-only | workspace-write | danger-full-access
 # approval_policy = "on-request" # 可选：untrusted | on-request | never
 # apply_on_adopt = false         # 可选：在 thread/resume 上也发送这一对
+# provider_switch_on_resume = false  # 可选：允许 /model 切换已有线程的 provider（先确认）
 # reasoning_summary = "auto"     # 可选：auto | concise | detailed | none
 
 [bridge]
@@ -183,8 +184,9 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `codex` 的 Agent Client 接受 `start_server`（`auto`/`never`/`eager`）：
   `never` 只附加，其余取值允许通过 `codex app-server daemon start` 启动共享
   守护进程——cola 从不拥有、也从不回收它。它还接受 `sandbox`、
-  `approval_policy`、`apply_on_adopt` 与 `reasoning_summary`（后两条）。具名的
-  Agent Client 不会继承 `[opencode]` 的取值。
+  `approval_policy`、`apply_on_adopt`、`provider_switch_on_resume` 与
+  `reasoning_summary`（下面逐项说明）。具名的 Agent Client 不会继承
+  `[opencode]` 的取值。
 - **`sandbox` / `approval_policy` / `apply_on_adopt`（仅 codex）** —— Codex
   线程运行在什么策略下。cola 在 `thread/start` 上发送这一对，因此它创建的
   线程可以在这个仓库里开发：`sandbox = "danger-full-access"` 去掉沙箱及其
@@ -203,6 +205,15 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
   改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
   也一样——除非 `apply_on_adopt = true`。
+- **`provider_switch_on_resume`（仅 codex，默认 `false`）** —— `/model` 的
+  provider 选择能否改动**已有**线程。provider 是线程级事实（`thread/start` 与
+  `thread/resume` 的 `modelProvider`，`turn/start` 没有这个字段），所以新线程
+  在创建时接受 Pending Session 上选好的 provider，除此之外协议里唯一的入口就是
+  resume。默认关闭，理由与 `apply_on_adopt` 相同：这条线程可能与你的
+  TUI/VSCode 共享，接在上面的每个客户端都会看到新的 provider。关闭时，点选只会
+  提示「provider 只能在新线程切换」，**不发送任何请求**；打开后 cola 先弹确认
+  卡，卡上写明同一线程上的其他客户端也会看到变化。无论开关如何，模型都保持不变；
+  resume 失败会具名报错（线程保留原来的 provider）。
 - **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
