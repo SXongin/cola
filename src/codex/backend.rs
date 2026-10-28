@@ -1956,6 +1956,12 @@ impl Backend for CodexClient {
         true
     }
 
+    /// `codex` is the neutral bucket: it names no channel, so a pick using it
+    /// rides the turn no matter which provider the thread runs (issue #910).
+    fn is_neutral_provider(&self, provider: &str) -> bool {
+        provider == MODEL_PROVIDER
+    }
+
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
     /// bucket is not a channel, so it reads as unknown. A cold projection is
     /// unknown — deciding "is the gate relevant" must not cost a request.

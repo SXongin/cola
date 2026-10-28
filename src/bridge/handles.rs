@@ -148,13 +148,24 @@ fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome
     }
 }
 
+/// What a `/model` pick's write must still find (issue #910). The decision
+/// classifies a target once; the write re-verifies it, so a `/switch` or a
+/// `/new` between the two is an honest refusal instead of a record on a target
+/// the pick was never classified against.
+pub(crate) enum PickTarget {
+    /// The thread's live session, by id.
+    Live(String),
+    /// The thread's Pending Session: no live session exists yet, and a pick
+    /// there records the **pair** (its provider is a creation fact).
+    Pending,
+}
+
 /// What a `/model` pick needs before it is recorded (issue #910): the card form
 /// and the text form (`/model <provider>/<model>`) obey one rule.
 pub(crate) enum ModelPickDecision {
     /// A model-only pick (the provider is the thread's own): record it for
-    /// `session_id` — the caller must only land while the thread still maps to
-    /// it (issue #910). `None` is a Pending Session (the pending path records).
-    Record { session_id: Option<String> },
+    /// `target`, re-verified at the write.
+    Record { target: PickTarget },
     /// A thread-level provider change: confirm it with a card first.
     Confirm {
         session_id: String,
@@ -881,21 +892,32 @@ impl SessionsHandle {
         model: &str,
     ) -> ModelPickDecision {
         let Some(settings) = self.session_settings(thread_key).await else {
-            return ModelPickDecision::Record { session_id: None };
+            // Neither a session nor a pending: the caller's own pre-check found
+            // one a moment ago, so this is a state change, not "no session".
+            return ModelPickDecision::Refuse(
+                "⚠️ 会话状态已变化（可能刚切换/创建），这次操作没有生效，请重试。".to_string(),
+            );
         };
         let Some(session_id) = settings.session_id.clone() else {
-            return ModelPickDecision::Record { session_id: None };
+            // A Pending Session: its pair rides `thread/start`, so the provider
+            // is a creation fact and carries no live-thread gate.
+            return ModelPickDecision::Record {
+                target: PickTarget::Pending,
+            };
         };
         // Gate first (issue #910): on a client with a provider axis, a shut gate
         // means only a same-provider pick is allowed — decided from the
         // **cache**, so a closed gate never sends a request (a cold projection
-        // is unknown, which refuses rather than probes).
+        // is unknown, which refuses rather than probes). A neutral-bucket pick
+        // (`codex/<model>`) names no channel at all, so it is model-only no
+        // matter what the thread runs: let the backend's route decide it.
         if backend.has_thread_provider()
+            && !backend.is_neutral_provider(provider)
             && backend.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly
         {
             return match backend.known_thread_provider(&session_id) {
                 Some(current) if current == provider => ModelPickDecision::Record {
-                    session_id: Some(session_id),
+                    target: PickTarget::Live(session_id),
                 },
                 _ => ModelPickDecision::Refuse("provider 只能在新线程切换".to_string()),
             };
@@ -907,7 +929,7 @@ impl SessionsHandle {
         };
         match backend.model_pick_route(&session_id, &info).await {
             Ok(crate::backend::types::ModelPickRoute::PerTurn) => ModelPickDecision::Record {
-                session_id: Some(session_id),
+                target: PickTarget::Live(session_id),
             },
             Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
                 if backend.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
@@ -948,21 +970,20 @@ impl SessionsHandle {
     /// this write is a named no-op instead of a record on the new session
     /// (issue #910).
     ///
-    /// The switch (`switch_session_model`) happens **before** the local
-    /// compare-and-set write, outside the session gate — the gate's contract is
-    /// "no backend call under it", and a stalled server must not wedge this
-    /// session's settings or next prompt. So a failed switch leaves the mirror
-    /// untouched rather than claiming a pick that never landed.
+    /// A durable generation (V2) keeps its selection on the session, so its
+    /// pick is an RPC (`switch_session_model`) plus the mirror write. Both run
+    /// inside the session's **switch point** — deliberately not the state gate,
+    /// whose contract is "no backend call under it" — so (a) a stalled server
+    /// never wedges this session's settings or next prompt, and (b) a pick that
+    /// had to wait builds on what the previous one left (`base` is read inside
+    /// the point), leaving the server and the mirror agreed on the last applied
+    /// pick. A failed switch leaves the mirror untouched rather than claiming a
+    /// pick that never landed.
     ///
-    /// On a durable generation (V2) the surviving variant is the SESSION's own
+    /// On a durable generation the surviving variant is the SESSION's own
     /// (another client may have changed it); a failed selection read means
     /// unknown, and since the switch replaces the whole ref, the variant is
-    /// dropped rather than revived from the mirror. That read is a backend RPC
-    /// (`session_selection`), so it **cannot** be repeated under the gate: the
-    /// variant written is the one observed immediately before the switch. A
-    /// `/think` racing that switch may therefore lose its slot in the durable
-    /// selection — the next pick or turn pre-flight re-reads it, and the mirror
-    /// compare-and-set below still refuses to overwrite a newer local pick.
+    /// dropped rather than revived from the mirror.
     pub(crate) async fn pick_model_expecting(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -981,16 +1002,13 @@ impl SessionsHandle {
         {
             return Ok(PickOutcome::StateChanged);
         }
-        // Outside the gate: the catalog lookup that decides the `/think` clear,
-        // and — on a durable generation — the session's own surviving variant and
-        // the durable switch. Both may be RPCs, and the gate never holds one
-        // (issue #910).
-        let mut probe = snapshot.variant.clone();
-        let mut cleared = self
-            .clear_variant_for_model(backend, &mut probe, model_spec)
-            .await;
-        // A Pending Session has no session to switch yet: one pending-only CAS.
+        // A Pending Session has no session to switch: the `/think` clear (a
+        // catalog read, outside any gate) and one pending-only CAS.
         let Some(session_id) = snapshot.session_id.clone() else {
+            let mut probe = snapshot.variant.clone();
+            let cleared = self
+                .clear_variant_for_model(backend, &mut probe, model_spec)
+                .await;
             let written = self.store.lock().await.set_mirror_pending(
                 thread_key,
                 snapshot.model.as_deref(),
@@ -1002,62 +1020,100 @@ impl SessionsHandle {
             )?;
             return Ok(pair_write_outcome(written));
         };
-        let durable_variant = if backend.keeps_session_selection() {
-            // The session's own selection is the authority (another client may
-            // have changed it): resolve it, clear against it, then switch.
-            let mut variant = self
-                .durable_variant(backend, &session_id, &snapshot.directory)
+        if !backend.keeps_session_selection() {
+            // V1: the mirror is the whole decision. The clear is a catalog read
+            // outside the gate; the state gate makes the write a
+            // compare-and-set on what the caller read.
+            let mut probe = snapshot.variant.clone();
+            let cleared = self
+                .clear_variant_for_model(backend, &mut probe, model_spec)
                 .await;
-            cleared = self
-                .clear_variant_for_model(backend, &mut variant, model_spec)
-                .await;
-            let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
-                crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
-            })?;
-            backend
-                .switch_session_model(
-                    &session_id,
-                    &crate::backend::types::ModelInfo {
-                        id: model.id,
-                        provider_id: model.provider_id,
-                        variant: variant.clone(),
-                    },
-                )
-                .await?;
-            Some(variant)
-        } else {
-            None
-        };
-        // Under the gate: re-read the mirror and compare-and-set the write.
-        let gate = self.session_gates.gate(&session_id);
-        let _held = gate.enter().await;
-        let Some(current) = self.session_settings(thread_key).await else {
+            let gate = self.session_gates.gate(&session_id);
+            let _held = gate.enter().await;
+            let Some(current) = self.session_settings(thread_key).await else {
+                return Ok(PickOutcome::NoTarget);
+            };
+            if current.session_id.as_deref() != Some(session_id.as_str())
+                || current.model != snapshot.model
+                || current.variant != snapshot.variant
+            {
+                return Ok(PickOutcome::StateChanged);
+            }
+            let written = self.store.lock().await.set_mirror_live(
+                thread_key,
+                &session_id,
+                snapshot.model.as_deref(),
+                snapshot.variant.as_deref(),
+                MirrorWrite::Model {
+                    model: model_spec,
+                    clear_variant: cleared.as_deref(),
+                },
+            )?;
+            return Ok(pair_write_outcome(written));
+        }
+        // A durable generation's selection is server state (V2): the selection
+        // read, the `/think` clear and `switch_session_model` are RPCs, and they
+        // plus the mirror write are ONE ordered step — the per-session **switch
+        // point**, deliberately not the state gate, so a stalled server never
+        // blocks this session's settings or next prompt (issue #910).
+        //
+        // Serialising the whole step is what keeps the server and the mirror
+        // agreeing: one pick's switch and mirror write cannot interleave with
+        // another's, so the server never ends on one pick while the mirror names
+        // the other. A pick that had to wait builds on what the previous one
+        // left (`base` is read inside the step), so a pick queued behind an
+        // in-flight one applies after it — the newer pick wins.
+        let switch = self.session_gates.gate(&session_id);
+        let _switching = switch.enter_switch().await;
+        let Some(base) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
-        if current.session_id.as_deref() != Some(session_id.as_str())
-            || current.model != snapshot.model
-            || current.variant != snapshot.variant
-        {
+        if base.session_id.as_deref() != Some(session_id.as_str()) {
             return Ok(PickOutcome::StateChanged);
         }
-        let write = if let Some(variant) = durable_variant.as_ref() {
-            MirrorWrite::ModelWithVariant {
-                model: model_spec,
-                variant: variant.as_deref(),
+        // The session's own selection is the authority (another client may have
+        // changed it): resolve it, clear against it, then switch.
+        let mut variant = self.durable_variant(backend, &session_id, &base.directory).await;
+        let cleared = self
+            .clear_variant_for_model(backend, &mut variant, model_spec)
+            .await;
+        let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
+            crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
+        })?;
+        backend
+            .switch_session_model(
+                &session_id,
+                &crate::backend::types::ModelInfo {
+                    id: model.id,
+                    provider_id: model.provider_id,
+                    variant: variant.clone(),
+                },
+            )
+            .await?;
+        // The mirror write is inside the same step, compare-and-set against the
+        // state this pick read when it took the point.
+        let written = {
+            let _held = switch.enter().await;
+            let Some(current) = self.session_settings(thread_key).await else {
+                return Ok(PickOutcome::NoTarget);
+            };
+            if current.session_id.as_deref() != Some(session_id.as_str())
+                || current.model != base.model
+                || current.variant != base.variant
+            {
+                return Ok(PickOutcome::StateChanged);
             }
-        } else {
-            MirrorWrite::Model {
-                model: model_spec,
-                clear_variant: cleared.as_deref(),
-            }
+            self.store.lock().await.set_mirror_live(
+                thread_key,
+                &session_id,
+                base.model.as_deref(),
+                base.variant.as_deref(),
+                MirrorWrite::ModelWithVariant {
+                    model: model_spec,
+                    variant: variant.as_deref(),
+                },
+            )?
         };
-        let written = self.store.lock().await.set_mirror_live(
-            thread_key,
-            &session_id,
-            snapshot.model.as_deref(),
-            snapshot.variant.as_deref(),
-            write,
-        )?;
         Ok(match pair_write_outcome(written) {
             // A durable generation's clear happens on the session (the write
             // carries only the surviving variant): report it from there.
@@ -1074,6 +1130,11 @@ impl SessionsHandle {
     /// catalog read** (issue #910): the confirmation must ack from a store write
     /// only, so the `/think` clear is deferred to the turn pre-flight. Same gate
     /// and compare-and-set discipline as [`Self::pick_model_expecting`].
+    ///
+    /// The confirmation exists only on a client with a thread-level provider
+    /// axis, whose pair is applied by the pre-flight's thread switch; such a
+    /// client keeps no durable session selection, so this never bypasses the
+    /// switch point.
     pub(crate) async fn record_pair_expecting(
         &self,
         thread_key: &ThreadKey,
@@ -1175,15 +1236,22 @@ impl SessionsHandle {
             )?;
             return Ok(pair_write_outcome(written));
         };
-        // A durable generation's selection is server state: resolving it (and
-        // switching it) are RPCs, so they run **before** the gate — the gate
-        // never holds a backend call (issue #910). The mirror write below is the
-        // compare-and-set that catches a `/model`/`/think` since the snapshot.
-        // A lost compare-and-set therefore leaves the durable switch in place
-        // (V2 writes are last-writer-wins); the caller reports the honest
-        // `StateChanged` and the next pre-flight re-reads the session.
         if backend.keeps_session_selection() {
-            let Some(model) = self.effective_selection(backend, &snapshot).await else {
+            // A durable generation's selection is server state: resolving it and
+            // switching it are RPCs, and they plus the mirror write are ONE
+            // ordered step under the session's **switch point** — not the state
+            // gate, so settings and the next prompt never wait on a server call
+            // (issue #910). Ordering `/think` behind a `/model` (and back) is
+            // what keeps the server and the mirror agreeing on the last pick.
+            let switch = self.session_gates.gate(&session_id);
+            let _switching = switch.enter_switch().await;
+            let Some(base) = self.session_settings(thread_key).await else {
+                return Ok(PickOutcome::NoTarget);
+            };
+            if base.session_id.as_deref() != Some(session_id.as_str()) {
+                return Ok(PickOutcome::StateChanged);
+            }
+            let Some(model) = self.effective_selection(backend, &base).await else {
                 return Ok(PickOutcome::NoModel);
             };
             backend
@@ -1196,6 +1264,17 @@ impl SessionsHandle {
                     },
                 )
                 .await?;
+            let written = {
+                let _held = switch.enter().await;
+                self.store.lock().await.set_mirror_live(
+                    thread_key,
+                    &session_id,
+                    base.model.as_deref(),
+                    base.variant.as_deref(),
+                    MirrorWrite::Variant(variant.as_deref()),
+                )?
+            };
+            return Ok(pair_write_outcome(written));
         }
         let gate = self.session_gates.gate(&session_id);
         let _held = gate.enter().await;

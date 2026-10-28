@@ -1560,3 +1560,311 @@ async fn a_same_provider_pick_is_recorded_with_the_gate_off_when_the_cache_knows
         "the same-provider pick is recorded"
     );
 }
+
+/// Issue #910, item 2: a target classified as **live** is re-verified at the
+/// write. If the chat became a Pending Session in between, the record refuses —
+/// it must never become a model-only write into the new pending (which would
+/// drop the provider the pick was classified with). And a decision taken on a
+/// pending carries `Pending`, whose write records both halves.
+#[tokio::test]
+async fn a_live_session_that_became_pending_before_the_record_refuses() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_known_thread_provider(Some(PROVIDER));
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    let spec = format!("{PROVIDER}/{MODEL}");
+    let decision = app
+        .sessions_handle()
+        .model_pick_decision(&app.client, &key(), PROVIDER, MODEL)
+        .await;
+    assert!(
+        matches!(
+            &decision,
+            crate::bridge::handles::ModelPickDecision::Record {
+                target: crate::bridge::handles::PickTarget::Live(id)
+            } if id == "ses_test"
+        ),
+        "the live session is the classified target"
+    );
+
+    // The chat becomes a Pending Session while the record is on its way.
+    app.command_handles()
+        .flow
+        .unmap("ses_test")
+        .await
+        .expect("the old mapping is dropped");
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    let outcome = app
+        .sessions_handle()
+        .pick_model_expecting(&app.client, &key(), Some("ses_test"), &spec)
+        .await
+        .expect("the write runs");
+    assert_eq!(
+        outcome,
+        crate::bridge::handles::PickOutcome::StateChanged,
+        "a live target that became pending is an honest refusal"
+    );
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending is there");
+    assert_eq!(pending.model, None, "nothing was written");
+    assert_eq!(pending.provider, None, "no half pair either");
+
+    // A decision that sees the pending carries it, and the write the caller
+    // performs for it records the pair.
+    let decision = app
+        .sessions_handle()
+        .model_pick_decision(&app.client, &key(), PROVIDER, MODEL)
+        .await;
+    assert!(
+        matches!(
+            &decision,
+            crate::bridge::handles::ModelPickDecision::Record {
+                target: crate::bridge::handles::PickTarget::Pending
+            }
+        ),
+        "the pending target is carried"
+    );
+    let outcome = app
+        .sessions_handle()
+        .pick_pending_pair(&app.client, &key(), PROVIDER, &spec)
+        .await
+        .expect("the pending write runs");
+    assert_eq!(
+        outcome,
+        crate::bridge::handles::PickOutcome::Applied {
+            cleared_variant: None
+        }
+    );
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending is still there");
+    assert_eq!(pending.model.as_deref(), Some(spec.as_str()));
+    assert_eq!(
+        pending.provider.as_deref(),
+        Some(PROVIDER),
+        "the pair is recorded, not a model-only write"
+    );
+}
+
+/// Issue #910, item 3: two competing durable picks. The first is slow (parked
+/// inside its `switch_session_model`), the second queues at the session's
+/// switch point — so the newer one applies **after** the older one, and both
+/// the server and the mirror end on it (never server = old, mirror = new).
+#[tokio::test]
+async fn two_competing_durable_picks_keep_the_server_and_mirror_in_step() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    let gate = backend.hold_session_switch();
+    let entered = backend.switch_model_gate_entered.clone();
+    let selections = backend.session_selections.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    let spawn_pick = |model: &'static str| {
+        let app = app.clone();
+        tokio::spawn(async move {
+            send_command_in(
+                &app,
+                model,
+                key(),
+                "msg_model",
+                crate::config::ConversationKind::P2p,
+            )
+            .await;
+        })
+    };
+    let first = spawn_pick("/model openai/model-a");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first switch never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let second = spawn_pick("/model openai/model-b");
+    let switch = app.session_gates.gate("ses_test");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while switch.switch_waiting() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second pick never queued at the switch point"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        entered.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the second pick does not enter the server while the first is in flight"
+    );
+
+    gate.add_permits(1);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the second switch never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    gate.add_permits(1);
+    first.await.expect("the first joins");
+    second.await.expect("the second joins");
+
+    assert_eq!(
+        selections
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|selection| selection.model.as_ref())
+            .map(|model| model.id.as_str()),
+        Some("model-b"),
+        "the newest pick is the server's selection"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/model-b"),
+        "and the mirror agrees with the server"
+    );
+}
+
+/// Issue #910, item 4: when the pre-flight's variant clear loses its
+/// compare-and-set to a racing `/think`, the prompt must not send the value it
+/// just identified as unsupported — it takes the fresh value instead (and only
+/// stops by name when that one is unsupported too).
+#[tokio::test]
+async fn a_racing_think_replaces_the_cleared_variant_instead_of_sending_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: PROVIDER.into(),
+            models: vec![model_option(MODEL, &["low"])],
+        }]);
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let prompt_variants = backend.prompt_variants.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pre-flight's catalog lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The `/think` write lands while the clear is in flight, so its
+    // compare-and-set (`high`) can no longer match. (The write is what races;
+    // the `/think` command's own catalog validation would park on the same
+    // gate the prompt holds, so it is driven directly here.)
+    let think = app
+        .sessions_handle()
+        .pick_think(&app.client, &key(), Some("low".to_string()))
+        .await
+        .expect("the think write runs");
+    assert_eq!(
+        think,
+        crate::bridge::handles::PickOutcome::Applied {
+            cleared_variant: None
+        },
+        "the racing `/think` lands on its own snapshot"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("low"),
+        "the `/think` owns the mirror now"
+    );
+    gate.add_permits(2);
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_variants.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt was never submitted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        prompt_variants.lock().await.last().cloned().flatten(),
+        Some("low".to_string()),
+        "the fresh value is sent, never the one just identified as unsupported"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("low"),
+        "and the mirror is left alone"
+    );
+}

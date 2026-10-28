@@ -1397,7 +1397,13 @@ pub(crate) async fn handle_command(
                     .await?;
                 return Ok(());
             };
-            let Some(settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+            if handles
+                .flow
+                .sessions
+                .session_settings(&thread_key)
+                .await
+                .is_none()
+            {
                 handles
                     .flow
                     .platform
@@ -1409,39 +1415,6 @@ pub(crate) async fn handle_command(
                         ),
                     )
                     .await?;
-                return Ok(());
-            };
-            if settings.session_id.is_none() {
-                // A Pending Session's pair rides `thread/start`.
-                match classify_pick(
-                    handles
-                        .flow
-                        .sessions
-                        .pick_pending_pair(&handles.flow.backend, &thread_key, &parsed.provider_id, &name)
-                        .await,
-                    "模型",
-                    crate::bridge::display::feishu_side_label(&thread_key),
-                ) {
-                    PickReply::Applied { cleared_variant } => {
-                        let extra = cleared_variant
-                            .map(|v| format!("（已清除思考等级 `{v}`）"))
-                            .unwrap_or_default();
-                        handles
-                            .flow
-                            .platform
-                            .reply_text(
-                                message_id,
-                                &format!(
-                                    "Provider: {}（模型 {name}，新线程创建时生效）{extra}",
-                                    parsed.provider_id
-                                ),
-                            )
-                            .await?;
-                    }
-                    PickReply::Failed(text) => {
-                        handles.flow.platform.reply_text(message_id, &text).await?;
-                    }
-                }
                 return Ok(());
             }
             match handles
@@ -1471,36 +1444,63 @@ pub(crate) async fn handle_command(
                 crate::bridge::handles::ModelPickDecision::Refuse(text) => {
                     handles.flow.platform.reply_text(message_id, &text).await?;
                 }
-                crate::bridge::handles::ModelPickDecision::Record { session_id } => {
-                    // Bound to the session the decision classified: a `/switch`
-                    // since then is a no-op, never a record on the new session.
-                    let outcome = handles
-                        .flow
-                        .sessions
-                        .pick_model_expecting(
-                            &handles.flow.backend,
-                            &thread_key,
-                            session_id.as_deref(),
-                            &name,
-                        )
-                        .await;
+                crate::bridge::handles::ModelPickDecision::Record { target } => {
+                    use crate::bridge::handles::PickTarget;
+                    let pending = matches!(target, PickTarget::Pending);
+                    let outcome = match target {
+                        // Bound to the session the decision classified: a
+                        // `/switch` since then is a no-op, never a record on
+                        // the new session.
+                        PickTarget::Live(session_id) => {
+                            handles
+                                .flow
+                                .sessions
+                                .pick_model_expecting(
+                                    &handles.flow.backend,
+                                    &thread_key,
+                                    Some(&session_id),
+                                    &name,
+                                )
+                                .await
+                        }
+                        // The thread became a Pending Session while the pick
+                        // was classified: the pair is a creation fact there, so
+                        // record **both** halves — a model-only write would drop
+                        // the provider.
+                        PickTarget::Pending => {
+                            handles
+                                .flow
+                                .sessions
+                                .pick_pending_pair(
+                                    &handles.flow.backend,
+                                    &thread_key,
+                                    &parsed.provider_id,
+                                    &name,
+                                )
+                                .await
+                        }
+                    };
                     match classify_pick(
                         outcome,
                         "模型",
                         crate::bridge::display::feishu_side_label(&thread_key),
                     ) {
                         PickReply::Applied { cleared_variant } => {
-                            let extra = cleared_variant
-                                .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
-                                .unwrap_or_default();
-                            handles
-                                .flow
-                                .platform
-                                .reply_text(
-                                    message_id,
-                                    &format!("Model: {}（下一条消息开始生效）{}", name, extra),
+                            let text = if pending {
+                                let extra = cleared_variant
+                                    .map(|v| format!("（已清除思考等级 `{v}`）"))
+                                    .unwrap_or_default();
+                                format!(
+                                    "Provider: {}（模型 {name}，新线程创建时生效）{extra}",
+                                    parsed.provider_id
                                 )
-                                .await?;
+                            } else {
+                                let extra = cleared_variant
+                                    .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
+                                    .unwrap_or_default();
+                                format!("Model: {}（下一条消息开始生效）{}", name, extra)
+                            };
+                            handles.flow.platform.reply_text(message_id, &text).await?;
                         }
                         PickReply::Failed(text) => {
                             handles.flow.platform.reply_text(message_id, &text).await?;

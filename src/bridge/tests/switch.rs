@@ -2670,3 +2670,75 @@ async fn a_gated_off_pick_on_a_cold_projection_sends_no_request() {
         "a gated-off pick on a cold projection sends no request"
     );
 }
+
+/// Issue #910, item 1: Codex's `codex` bucket is **neutral** (`codex/<model>`
+/// names no thread-level channel), so a pick using it is a model-only pick even
+/// with the gate off and the thread on a real provider. It must not be compared
+/// to the thread's provider and refused — and it needs no request either.
+#[tokio::test]
+async fn a_neutral_bucket_pick_is_model_only_with_the_gate_off() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a shared thread",
+    ));
+    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+    // The default options leave the provider gate shut.
+    let client = codex_client(&url).await;
+    client.transcript("thread-1").await.expect("adopt the thread");
+    server.wait_for_subscribers("thread-1", 1).await;
+
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
+    let mut entry = codex_entry("thread-1");
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    server.clear_calls();
+    send_command_in(
+        &app,
+        "/model codex/gpt-5.1",
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("Model: codex/gpt-5.1"),
+        "the neutral bucket is recorded as a model-only pick: {reply}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()))
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("codex/gpt-5.1"),
+        "the mirror holds the neutral model"
+    );
+    assert_eq!(
+        server.call_log(),
+        Vec::<String>::new(),
+        "the neutral pick needs no request"
+    );
+}
