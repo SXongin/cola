@@ -24,6 +24,12 @@ pub struct PendingEntry {
     /// Per-session model override ("provider/model", `/model`).
     #[serde(default)]
     pub model: Option<String>,
+    /// The thread-level provider this new thread should start on (issue #910).
+    /// It has no per-turn form — `turn/start` has no provider field — so a
+    /// Pending Session is the only place it can wait: the first message
+    /// materialises the session with it as `thread/start.modelProvider`.
+    #[serde(default)]
+    pub provider: Option<String>,
     /// Per-session thinking level (`/think`).
     #[serde(default)]
     pub variant: Option<String>,
@@ -49,6 +55,7 @@ impl PendingEntry {
             title: None,
             agent: None,
             model: None,
+            provider: None,
             variant: None,
             auto_accept: false,
             topic_anchor: None,
@@ -88,6 +95,13 @@ pub struct SessionSettings {
     pub agent: Option<String>,
     /// Per-session model override (`/model`, "provider/model").
     pub model: Option<String>,
+    /// The thread-level provider a Pending Session will start on (issue #910).
+    /// Only a creation can apply it, so this is `None` for a live session —
+    /// there the thread's own `modelProvider` (the adapter's projection) is the
+    /// fact, and its change goes through the confirmation path, not this
+    /// mirror. [`SessionStore::set_settings`] honours that: an entry ignores
+    /// this field.
+    pub provider: Option<String>,
     /// Per-session thinking level (`/think`).
     pub variant: Option<String>,
     /// `/autoaccept` state.
@@ -412,6 +426,7 @@ impl SessionStore {
                 session_id: None,
                 agent: p.agent.clone(),
                 model: p.model.clone(),
+                provider: p.provider.clone(),
                 variant: p.variant.clone(),
                 auto_accept: p.auto_accept,
             });
@@ -421,6 +436,9 @@ impl SessionStore {
             session_id: Some(e.session_id.clone()),
             agent: e.agent.clone(),
             model: e.model.clone(),
+            // A live session's provider is the thread's own fact, never a local
+            // choice: only a creation can take one (issue #910).
+            provider: None,
             variant: e.variant.clone(),
             auto_accept: e.auto_accept,
         })
@@ -439,6 +457,10 @@ impl SessionStore {
             settings.variant.clone(),
             settings.auto_accept,
         );
+        // The provider has no entry mirror (issue #910): it is a creation-time
+        // pick, so only a Pending Session stores it. A live thread's provider
+        // is read from the server and changed by the confirmed resume path.
+        let provider = settings.provider.clone();
         let applied = if let Some(id) = settings.session_id.as_deref() {
             match self
                 .entries_mut()
@@ -453,6 +475,7 @@ impl SessionStore {
             }
         } else if let Some(p) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
             (p.agent, p.model, p.variant, p.auto_accept) = overrides;
+            p.provider = provider;
             true
         } else if let Some(e) = self
             .entries_mut()
@@ -460,7 +483,8 @@ impl SessionStore {
             .find(|e| e.client_id == client_id && &e.thread_key == key)
         {
             // The pending materialised between the read and this write: the
-            // overrides belong on the session it created.
+            // overrides belong on the session it created. The provider does
+            // not — a live session has no such mirror.
             (e.agent, e.model, e.variant, e.auto_accept) = overrides;
             true
         } else {

@@ -1221,7 +1221,7 @@ impl ServerLifecycle for CodexLifecycle {
         let outcome = tokio::time::timeout(TURN_PROBE_TIMEOUT, async {
             let thread = client
                 .threads()
-                .start(Some(&cwd))
+                .start(Some(&cwd), crate::codex::threads::ThreadModel::default())
                 .await
                 .map_err(|error| format!("could not create a probe thread: {error}"))?;
             let thread_id = thread.id.clone();
@@ -2547,6 +2547,7 @@ mod tests {
             sandbox: Some(crate::config::SandboxMode::DangerFullAccess),
             approval_policy: Some(crate::config::ApprovalPolicy::OnRequest),
             apply_on_adopt: false,
+            provider_switch_on_resume: false,
             reasoning_summary: crate::config::ReasoningSummary::Detailed,
         });
         let never_busy = || false;
@@ -2561,7 +2562,7 @@ mod tests {
         let client = lifecycle.attached_client().await.expect("an attached client");
         client
             .threads()
-            .start(Some("/work/cola"))
+            .start(Some("/work/cola"), crate::codex::threads::ThreadModel::default())
             .await
             .expect("thread/start");
 

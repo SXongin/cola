@@ -2326,3 +2326,103 @@ async fn a_failed_release_does_not_fail_switch_forget() {
     let text = platform.texts().await.join("\n");
     assert!(text.contains("已解除"), "the confirmation still lands: {text}");
 }
+
+/// The provider switch (issue #910) end to end over the production adapter: the
+/// confirmation resumes the real thread with `modelProvider`, changes no model,
+/// and starts no turn. The default client (switch off) refuses the click before
+/// any request is made.
+#[tokio::test]
+async fn a_confirmed_provider_switch_resumes_the_real_codex_thread() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a shared thread",
+    ));
+    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+
+    // The client opted in (`[clients.ada] provider_switch_on_resume = true`).
+    let endpoint = crate::codex::Endpoint::parse(&url).expect("endpoint");
+    let client = crate::codex::CodexClient::connect(
+        &crate::codex::CodexOptions::new(endpoint).with_thread_settings(crate::codex::ThreadSettings {
+            provider_switch_on_resume: true,
+            ..Default::default()
+        }),
+        &crate::codex::PinnedProbe,
+    )
+    .await
+    .expect("attach to the scripted app-server");
+    client.transcript("thread-1").await.expect("adopt the thread");
+    server.wait_for_subscribers("thread-1", 1).await;
+
+    let app = Arc::new(App::new(cfg, Arc::new(client), Arc::new(RecordingPlatform::new())).unwrap());
+    seed_entry(&app, codex_entry("thread-1")).await;
+
+    let pick = serde_json::json!({
+        "action": "model",
+        "level": "provider_switch",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "deepseek",
+    });
+    let step = app.host_action(pick).await.expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    assert!(card.to_string().contains("其他客户端"), "{card}");
+    assert_eq!(server.resume_calls(), 1, "the pick itself sent nothing");
+
+    let confirm = serde_json::json!({
+        "action": "model_provider_confirm",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "deepseek",
+    });
+    let step = app.host_action(confirm).await.expect("confirm");
+    assert!(step.card.is_some(), "the result replaces the confirmation");
+
+    let params = server.resume_params();
+    assert_eq!(
+        params.last(),
+        Some(&serde_json::json!({ "threadId": "thread-1", "modelProvider": "deepseek" })),
+        "the confirmed click is the only resume that carries a provider: {params:?}"
+    );
+    assert_eq!(server.turn_starts(), 0, "a provider switch starts no turn");
+}
+
+/// With the gate at its default (off), a provider pick on a live Codex thread is
+/// a toast and **no** request — not even a `thread/resume`.
+#[tokio::test]
+async fn the_default_codex_client_refuses_a_live_provider_pick() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a shared thread",
+    ));
+    let client = codex_client(&url).await;
+    client.transcript("thread-1").await.expect("adopt the thread");
+    server.wait_for_subscribers("thread-1", 1).await;
+    assert_eq!(server.resume_calls(), 1, "only the adoption resumed");
+
+    let app = Arc::new(App::new(cfg, Arc::new(client), Arc::new(RecordingPlatform::new())).unwrap());
+    seed_entry(&app, codex_entry("thread-1")).await;
+
+    let pick = serde_json::json!({
+        "action": "model",
+        "level": "provider_switch",
+        "chat_id": "chat_1",
+        "thread_id": "chat_1",
+        "value": "deepseek",
+    });
+    let step = app.host_action(pick).await.expect("provider pick");
+    assert!(step.card.is_none(), "no confirmation when the gate is shut");
+    assert_eq!(step.toast.as_deref(), Some("provider 只能在新线程切换"));
+    assert_eq!(server.resume_calls(), 1, "the click sent no request at all");
+}

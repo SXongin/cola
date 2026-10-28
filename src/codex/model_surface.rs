@@ -465,7 +465,7 @@ impl ModelProbes {
         (provider.id.clone(), provider.base_url.clone())
     }
 
-    /// Serve this read from the cache only: a drilled card page runs on the
+    /// Serve this read from the cache only: a card-callback read runs on the
     /// card-ack budget and must never start a fresh probe. Expired entries are
     /// pruned here too, so a cold cache stays small rather than growing with
     /// every project that names a provider.
@@ -662,11 +662,17 @@ pub(crate) async fn read_config(
 /// (the projection's ordered model fact); it outranks `query.current`'s
 /// provider because a picker pick records the neutral `codex` bucket, not the
 /// channel the thread really runs on.
+///
+/// `provider_switch_on_resume` is the client's `[clients.<id>]` gate (issue
+/// #910): it decides whether an existing thread's provider scope says
+/// 「需确认」 (`thread/resume`, confirmation first) or 「仅新线程」. A Pending
+/// Session has no thread to resume, so its pick is always a new-thread one.
 pub(crate) fn build_surface(
     catalog: &[crate::backend::types::ProviderModels],
     config: &CodexModelConfig,
     probes: &HashMap<String, ProbeOutcome>,
     thread_provider: Option<&str>,
+    provider_switch_on_resume: bool,
     query: &ModelSurfaceQuery<'_>,
 ) -> ModelSurface {
     let query_provider = query
@@ -714,6 +720,10 @@ pub(crate) fn build_surface(
             label: Some(clip(&label, 48)),
             value: Some(codex_ref(&profile.model)),
             group: Some(PROFILE_GROUP.to_string()),
+            // A profile is Codex's own "model + provider" declaration: on a new
+            // thread the pick applies both (issue #910), while a live thread
+            // keeps its provider (a model pick never changes it).
+            provider: profile.provider.clone(),
             ..ModelOption::default()
         });
     }
@@ -739,6 +749,7 @@ pub(crate) fn build_surface(
         id: MODEL_SCOPE.into(),
         title: "模型（每轮可换）".into(),
         changeable: ChangeScope::ThisTurn,
+        pick: crate::backend::types::PickKind::Model,
         options,
         note,
         free_text: Some(format!(
@@ -747,6 +758,18 @@ pub(crate) fn build_surface(
         intro: None,
     };
 
+    // A Pending Session has no thread to resume: its pick is applied when the
+    // thread is created. A live thread can only take one through
+    // `thread/resume`, and only when the client opted in — the card says which.
+    let pending = query.session_id.is_none();
+    let resumable = !pending && provider_switch_on_resume;
+    let provider_suffix = if pending {
+        "（新线程生效）"
+    } else if resumable {
+        "（需确认）"
+    } else {
+        "（仅新线程）"
+    };
     let provider_options: Vec<ModelOption> = config
         .providers
         .iter()
@@ -759,9 +782,12 @@ pub(crate) fn build_surface(
                 label.push_str(" · ");
                 label.push_str(&tag);
             }
+            // Clip the name, never the annotation: 「需确认」/「仅新线程」 is the
+            // decision the row exists to communicate.
+            let room = 48usize.saturating_sub(provider_suffix.chars().count());
             ModelOption {
                 id: provider.id.clone(),
-                label: Some(clip(&label, 48)),
+                label: Some(format!("{}{provider_suffix}", clip(&label, room))),
                 value: Some(provider.id.clone()),
                 ..ModelOption::default()
             }
@@ -770,15 +796,27 @@ pub(crate) fn build_surface(
     let provider_scope = ModelScope {
         id: PROVIDER_SCOPE.into(),
         title: "Provider（线程级：新线程 / resume）".into(),
-        changeable: ChangeScope::NewThread,
+        changeable: if resumable {
+            ChangeScope::ResumeOnly
+        } else {
+            ChangeScope::NewThread
+        },
+        // A thread-level provider id, never a drill-down: the bridge routes it
+        // to its switch path (issue #910), where OpenCode's same-named scope
+        // opens another surface page.
+        pick: crate::backend::types::PickKind::Provider,
         note: Some(if provider_options.is_empty() {
             if config.read_failed {
                 "_(读不到 config，provider / profile 未知)_".to_string()
             } else {
                 "_(config 里没有 provider)_".to_string()
             }
+        } else if pending {
+            "选中的 provider 会随第一条消息应用到新线程（`thread/start`），模型可同时选。".to_string()
+        } else if resumable {
+            "切换会 resume 这条线程：**其他客户端（TUI / VS Code / 桌面端）也会看到新的 provider**，所以需要确认；模型不变。".to_string()
         } else {
-            "provider 切换需新线程 / resume；本版本仅列出。".to_string()
+            "provider 只能在新线程切换；想换渠道请先 `/new`（或在 `[clients.<id>]` 打开 `provider_switch_on_resume`）。".to_string()
         }),
         options: provider_options,
         free_text: None,
@@ -874,6 +912,11 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// A root read for a live thread: the provider scope is a resume then.
+    fn live_query() -> ModelSurfaceQuery<'static> {
+        query()
     }
 
     /// Layers arrive highest-precedence first (project → user → system). The
@@ -1226,7 +1269,7 @@ mod tests {
         );
         probes.insert("opencode-go".into(), ProbeOutcome::EnvKey);
 
-        let surface = build_surface(&catalog, &config, &probes, Some("opencode-go"), &query());
+        let surface = build_surface(&catalog, &config, &probes, Some("opencode-go"), false, &query());
 
         assert_eq!(surface.scopes.len(), 2);
         let model = &surface.scopes[0];
@@ -1340,7 +1383,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), &query);
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), false, &query);
         let label = surface.scopes[1].options[0].display_label();
         assert!(label.contains("当前"), "label: {label}");
     }
@@ -1361,7 +1404,7 @@ mod tests {
         let mut probes = HashMap::new();
         probes.insert("opencode-go".into(), ProbeOutcome::Forbidden);
 
-        let surface = build_surface(&[], &config, &probes, Some("opencode-go"), &query());
+        let surface = build_surface(&[], &config, &probes, Some("opencode-go"), false, &query());
         let model = &surface.scopes[0];
         assert!(model.options.is_empty(), "no provider models on a 403");
         let note = model.note.as_deref().unwrap();
@@ -1387,7 +1430,14 @@ mod tests {
             read_failed: true,
             ..Default::default()
         };
-        let surface = build_surface(&[], &config, &HashMap::new(), None, &ModelSurfaceQuery::default());
+        let surface = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            None,
+            false,
+            &ModelSurfaceQuery::default(),
+        );
         let provider = &surface.scopes[1];
         let note = provider.note.as_deref().unwrap();
         assert!(note.contains("读不到 config"), "note: {note}");
@@ -1442,5 +1492,107 @@ mod tests {
         let entries = probes.entries.lock().unwrap();
         assert!(entries.contains_key(&key), "the re-probed entry is fresh");
         assert_eq!(entries.len(), 1, "nothing expired survives the insert");
+    }
+
+    /// Issue #910 acceptance 1: where a provider pick can take effect is on the
+    /// card. A Pending Session applies it when the thread is created; a live
+    /// thread only through a confirmed resume — and with the gate shut, not at
+    /// all.
+    #[test]
+    fn the_provider_scope_says_where_a_pick_takes_effect() {
+        let mut config = CodexModelConfig::default();
+        config.providers.push(provider("deepseek", None, None, None));
+
+        let pending = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            None,
+            true,
+            &ModelSurfaceQuery::default(),
+        );
+        let scope = &pending.scopes[1];
+        assert_eq!(scope.changeable, ChangeScope::NewThread, "nothing to resume");
+        let label = scope.options[0].display_label();
+        assert!(label.contains("新线程生效"), "{label}");
+        assert!(
+            scope.note.as_deref().unwrap().contains("thread/start"),
+            "the note names the creation call: {:?}",
+            scope.note
+        );
+
+        let live = live_query();
+        let resumable = build_surface(&[], &config, &HashMap::new(), None, true, &live);
+        let scope = &resumable.scopes[1];
+        assert_eq!(scope.changeable, ChangeScope::ResumeOnly);
+        assert!(
+            scope.options[0].display_label().contains("需确认"),
+            "{:?}",
+            scope.options[0].label
+        );
+        let note = scope.note.as_deref().unwrap();
+        assert!(
+            note.contains("其他客户端"),
+            "the peer effect is spelled out (ADR-0090): {note}"
+        );
+
+        let locked = build_surface(&[], &config, &HashMap::new(), None, false, &live);
+        let scope = &locked.scopes[1];
+        assert_eq!(scope.changeable, ChangeScope::NewThread, "the gate is shut");
+        assert!(
+            scope.options[0].display_label().contains("仅新线程"),
+            "{:?}",
+            scope.options[0].label
+        );
+        assert!(scope.note.as_deref().unwrap().contains("只能在新线程切换"));
+    }
+
+    /// Issue #910: a profile preset is Codex's own model + provider declaration,
+    /// so the option carries the provider it pairs with — the card forwards it,
+    /// which is how a Pending Session applies both at `thread/start`.
+    #[test]
+    fn a_profile_preset_carries_its_paired_provider() {
+        let mut config = CodexModelConfig::default();
+        config.profiles.push(ProfilePreset {
+            name: "fast".into(),
+            model: "deepseek-flash".into(),
+            provider: Some("deepseek".into()),
+        });
+        let surface = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            None,
+            false,
+            &ModelSurfaceQuery::default(),
+        );
+        let profile = surface.scopes[0]
+            .options
+            .iter()
+            .find(|option| option.group.as_deref() == Some(PROFILE_GROUP))
+            .expect("the preset is offered");
+        assert_eq!(profile.provider.as_deref(), Some("deepseek"));
+
+        // A preset without `model_provider` pairs with nothing.
+        config.profiles.push(ProfilePreset {
+            name: "plain".into(),
+            model: "gpt-5.1".into(),
+            provider: None,
+        });
+        let surface = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            None,
+            false,
+            &ModelSurfaceQuery::default(),
+        );
+        assert!(
+            surface.scopes[0]
+                .options
+                .iter()
+                .filter(|option| option.group.as_deref() == Some(PROFILE_GROUP))
+                .any(|option| option.provider.is_none())
+        );
     }
 }

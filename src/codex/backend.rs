@@ -522,6 +522,17 @@ impl Projections {
             .record_sent_model(model, sent);
     }
 
+    /// Record a thread-level provider the server accepted (issue #910). A
+    /// provider switch changes only that axis: the model the thread runs and
+    /// the `/think` variant stay put, so this updates the held identity in place
+    /// instead of replacing it with what a thread read would report.
+    pub(crate) fn record_thread_provider(&self, thread_id: &str, provider: &str, accepted: u64) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .record_thread_provider(provider, accepted);
+    }
+
     /// The model the ordered store holds for a thread (issue #904), which is
     /// what both surfaces must report: a read whose answer an accepted pick
     /// superseded is not shown, even to the caller that made the read.
@@ -1375,6 +1386,8 @@ fn model_surface_from_catalog(providers: &[ProviderModels], query: &ModelSurface
         &super::model_surface::CodexModelConfig::default(),
         &std::collections::HashMap::new(),
         None,
+        // No config read, so no gate to open: the conservative cell.
+        false,
         query,
     )
 }
@@ -1546,6 +1559,7 @@ fn neutral_session_input(directory: Option<&str>) -> CreateSessionInput {
         id: None,
         agent: None,
         model: None,
+        provider: None,
         location: directory.map(|directory| Location {
             directory: directory.to_string(),
         }),
@@ -1684,7 +1698,18 @@ impl Backend for CodexClient {
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
         let observed_stamp = self.projections.next_model_stamp();
-        let thread = self.threads().start(cwd).await.map_err(client_error)?;
+        // A Pending Session's provider/model pair is a creation fact (issue
+        // #910): `thread/start` takes both, and the provider has no other
+        // creation path.
+        let thread_model = super::threads::ThreadModel {
+            model: input.model.as_ref().map(|model| model.id.as_str()),
+            provider: input.provider.as_deref(),
+        };
+        let thread = self
+            .threads()
+            .start(cwd, thread_model)
+            .await
+            .map_err(client_error)?;
         self.projections.remember_thread_metadata(&thread, observed_stamp);
         Ok(Session {
             id: thread.id.clone(),
@@ -1735,6 +1760,34 @@ impl Backend for CodexClient {
 
     async fn release_session(&self, session_id: &str) -> Result<()> {
         self.release_thread(session_id).await.map_err(client_error)
+    }
+
+    /// Codex's provider axis is thread-level (issue #910): a new thread takes
+    /// one at creation, and an existing thread only through `thread/resume`,
+    /// which every client attached to it observes (ADR-0090). The config key
+    /// `provider_switch_on_resume` decides whether that second door is open.
+    fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
+        if self.threads().provider_switch_on_resume() {
+            crate::backend::types::ChangeScope::ResumeOnly
+        } else {
+            crate::backend::types::ChangeScope::NewThread
+        }
+    }
+
+    /// Change the thread's provider by resuming it with `modelProvider`. The
+    /// model is untouched, and so is the local projection on failure: only an
+    /// accepted switch is recorded, so a refused one cannot leave the footer
+    /// claiming a channel the thread never ran on.
+    async fn switch_session_provider(&self, session_id: &str, provider: &str) -> Result<()> {
+        self.threads()
+            .resume_with_provider(session_id, provider)
+            .await
+            .map_err(client_error)?;
+        // The acceptance, not the send, is what the fact is ordered by — a
+        // read that started later sees the new provider and outranks it.
+        self.projections
+            .record_thread_provider(session_id, provider, self.projections.next_model_stamp());
+        Ok(())
     }
 
     async fn prompt(
@@ -2144,10 +2197,12 @@ impl Backend for CodexClient {
     /// config default and `[profiles.*]` presets (one-click model picks), every
     /// successfully probed provider's models (per-provider groups), and the
     /// configured providers as a thread-level scope. Every model pick keeps the
-    /// `codex/<id>` callback value the text form records; the provider scope is
-    /// listing only — switching is a later ticket, so a provider click falls
-    /// back to this same page (with the bridge's back button) rather than
-    /// pretending to change the thread's channel.
+    /// `codex/<id>` callback value the text form records, and a `[profiles.*]`
+    /// preset also carries its `model_provider` (issue #910). The provider scope
+    /// is a **selection**, not OpenCode's drill-down: a Pending Session applies
+    /// the pick at `thread/start`, while an existing thread can only take one
+    /// through the bridge's confirmed `thread/resume` — and only when the client
+    /// set `provider_switch_on_resume`. `turn/start` never carries a provider.
     ///
     /// # Read budgets
     ///
@@ -2157,22 +2212,21 @@ impl Backend for CodexClient {
     /// catalog read bounded by [`CATALOG_READ_TIMEOUT`] in total (2 s per
     /// request), with fresh probes.
     ///
-    /// A **drilled** page is a card callback and arrives with `ack_budget =
-    /// Some(budget)`. It cannot chain those two waits, so **both** its config
-    /// read and its catalog read get `budget - 1.4 s` (600 ms out of a 2 s
-    /// budget) — they run concurrently, so the surface returns by about that
-    /// slice — probes are served **cache-only** (zero network), and the rest of
-    /// the budget is left for the card build and the ack response. A stalled
-    /// `model/list` yields the pages read so far (or an empty catalog) plus the
-    /// normal note and hand-write hint, never a hung card. A cold drilled click
-    /// therefore shows the providers without their probed models; the next root
-    /// open fills them.
+    /// A **card-callback** read arrives with `ack_budget = Some(budget)`. It
+    /// cannot chain those two waits, so **both** its config read and its catalog
+    /// read get `budget - 1.4 s` (600 ms out of a 2 s budget) — they run
+    /// concurrently, so the surface returns by about that slice — probes are
+    /// served **cache-only** (zero network), and the rest of the budget is left
+    /// for the card build and the ack response. A stalled `model/list` yields
+    /// the pages read so far (or an empty catalog) plus the normal note and
+    /// hand-write hint, never a hung card. A cold callback read therefore shows
+    /// the providers without their probed models; the next root open fills them.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
         // `/think`'s variant lookup is the one caller that asks for the bare
         // catalog (`catalog_only`): it runs on a card callback's short ack
-        // budget and needs only the advertised variants. Every card page —
-        // a root page or a Pending Session's drilled provider read — keeps the
-        // full config/provider shape.
+        // budget and needs only the advertised variants. Every card page — the
+        // root page, a Pending Session's page included — keeps the full
+        // config/provider shape.
         let fast = query.catalog_only;
         // A callback-originated read carries its budget; a command's page does
         // not. `catalog_only` never reaches the config/probe path.
@@ -2230,7 +2284,14 @@ impl Backend for CodexClient {
             .session_id
             .and_then(|session_id| self.projections.model(session_id))
             .map(|model| model.provider_id);
-        super::model_surface::build_surface(&catalog, &config, &probes, thread_provider.as_deref(), &query)
+        super::model_surface::build_surface(
+            &catalog,
+            &config,
+            &probes,
+            thread_provider.as_deref(),
+            self.threads().provider_switch_on_resume(),
+            &query,
+        )
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
@@ -4695,6 +4756,7 @@ mod tests {
             &config,
             &std::collections::HashMap::new(),
             Some("opencode-go"),
+            false,
             &query,
         );
 
@@ -4722,9 +4784,22 @@ mod tests {
 
         let provider = &surface.scopes[1];
         assert_eq!(provider.id, "provider");
-        assert_eq!(provider.changeable, ChangeScope::NewThread);
+        assert_eq!(
+            provider.pick,
+            crate::backend::types::PickKind::Provider,
+            "a thread-level provider selection, not OpenCode's drill-down"
+        );
+        assert_eq!(
+            provider.changeable,
+            ChangeScope::NewThread,
+            "the gate is off, so an existing thread cannot take one"
+        );
         assert_eq!(provider.options[0].id, "opencode-go");
-        assert_eq!(provider.options[0].label.as_deref(), Some("OpenCode Go（当前）"));
+        assert_eq!(
+            provider.options[0].label.as_deref(),
+            Some("OpenCode Go（当前）（仅新线程）"),
+            "the option names where the pick can take effect"
+        );
         assert_eq!(provider.options[0].callback_value(), "opencode-go");
     }
 
@@ -4904,13 +4979,13 @@ mod tests {
         assert_eq!(probed.request_count(), 0, "and never probes a provider");
     }
 
-    /// A Pending Session's drilled provider read has a directory but no session
-    /// id. Only `/think`'s explicit `catalog_only` read skips config — this page
-    /// is a card page, so the provider options survive the click. It is a card
-    /// callback, so a cold cache must not start a probe: the page is bounded to
-    /// config + catalog, and the provider list still renders.
+    /// A Pending Session's card read has a directory but no session id, so the
+    /// provider scope must still render: that is where its provider pick lives
+    /// (issue #910), and a pick is applied at creation. Only `/think`'s explicit
+    /// `catalog_only` read skips config; a card read keeps it, and a cold cache
+    /// must not start a probe on a callback.
     #[tokio::test]
-    async fn a_pending_sessions_drilled_provider_read_keeps_its_options() {
+    async fn a_pending_sessions_card_read_keeps_its_provider_options() {
         let probed = crate::test_http::TestHttpServer::start().await;
         probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
@@ -4939,11 +5014,9 @@ mod tests {
         let surface = Backend::model_surface(
             &client,
             crate::backend::types::ModelSurfaceQuery {
-                scope: Some("provider"),
-                selected: Some("deepseek"),
                 directory: Some("/work/cola"),
-                // A provider click is a card callback; 2 s mirrors the
-                // bridge's ack budget without naming the Feishu layer here.
+                // A card callback; 2 s mirrors the bridge's ack budget without
+                // naming the Feishu layer here.
                 ack_budget: Some(Duration::from_secs(2)),
                 ..Default::default()
             },
@@ -4958,7 +5031,12 @@ mod tests {
         assert_eq!(
             probed.request_count(),
             0,
-            "a drilled callback never starts a probe on a cold cache"
+            "a callback read never starts a probe on a cold cache"
+        );
+        assert_eq!(
+            surface.scopes[1].changeable,
+            crate::backend::types::ChangeScope::NewThread,
+            "a pending session's provider is a creation pick, not a resume"
         );
         let providers: Vec<&str> = surface.scopes[1]
             .options
@@ -4971,19 +5049,19 @@ mod tests {
                 .options
                 .iter()
                 .any(|option| option.callback_value() == "codex/one"),
-            "a cold drilled read omits the probed models rather than probing"
+            "a cold callback read omits the probed models rather than probing"
         );
         let params = server.config_read_params();
         assert_eq!(params[0]["includeLayers"], true);
         assert_eq!(params[0]["cwd"], "/work/cola");
     }
 
-    /// A drilled page is a card callback: a stalled config read is abandoned at
-    /// the drilled slice of `CARD_ACK_BUDGET` (600 ms), not at the root page's
-    /// 2 s, and probes are not started. The provider scope then says config was
-    /// unreadable instead of hanging the ack.
+    /// A card-callback read (`ack_budget = Some`) is bounded: a stalled config
+    /// read is abandoned at the callback slice of `CARD_ACK_BUDGET` (600 ms),
+    /// not at the root page's 2 s, and probes are not started. The provider
+    /// scope then says config was unreadable instead of hanging the ack.
     #[tokio::test]
-    async fn a_drilled_config_read_is_bounded_by_the_ack_budget() {
+    async fn a_callback_config_read_is_bounded_by_the_ack_budget() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.set_config_read_delay(Duration::from_secs(5));
         let client = connect(&url).await;
@@ -4992,11 +5070,9 @@ mod tests {
         let surface = Backend::model_surface(
             &client,
             crate::backend::types::ModelSurfaceQuery {
-                scope: Some("provider"),
-                selected: Some("deepseek"),
                 directory: Some("/work/cola"),
-                // A provider click is a card callback; 2 s mirrors the
-                // bridge's ack budget without naming the Feishu layer here.
+                // A card callback; 2 s mirrors the bridge's ack budget without
+                // naming the Feishu layer here.
                 ack_budget: Some(Duration::from_secs(2)),
                 ..Default::default()
             },
@@ -6733,5 +6809,195 @@ mod tests {
         client.transcript("thread-1").await.expect("re-adopt");
         assert_eq!(server.resume_calls(), 2);
         server.wait_for_subscribers("thread-1", 1).await;
+    }
+
+    /// Issue #910 acceptance 2: a Pending Session's provider + model pair is a
+    /// `thread/start` fact. `create_session` is the one path that carries it,
+    /// so a new thread starts on the chosen channel with the chosen model.
+    #[tokio::test]
+    async fn create_session_sends_the_chosen_model_and_provider() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let client = connect(&url).await;
+
+        let input = crate::backend::types::CreateSessionInput {
+            id: None,
+            agent: None,
+            model: crate::backend::parsing::parse_model("codex/deepseek-v4-pro"),
+            provider: Some("deepseek".into()),
+            location: Some(crate::backend::types::Location {
+                directory: "/work/cola".into(),
+            }),
+        };
+        let session = Backend::create_session(&client, &input).await.expect("create");
+
+        let params = server.start_params();
+        assert_eq!(params.len(), 1, "one thread/start: {params:?}");
+        assert_eq!(params[0]["cwd"], "/work/cola");
+        assert_eq!(
+            params[0]["modelProvider"], "deepseek",
+            "the provider is a creation fact: {params:?}"
+        );
+        assert_eq!(
+            params[0]["model"], "deepseek-v4-pro",
+            "the paired model rides the same call: {params:?}"
+        );
+        assert_eq!(
+            client
+                .projections
+                .model(&session.id)
+                .map(|model| model.provider_id),
+            Some("deepseek".to_string()),
+            "the created thread's ordered fact names the chosen provider"
+        );
+
+        // A provider pick alone sends only the provider: the thread keeps the
+        // server's model until a turn names one.
+        let input = crate::backend::types::CreateSessionInput {
+            id: None,
+            agent: None,
+            model: None,
+            provider: Some("openai".into()),
+            location: None,
+        };
+        Backend::create_session(&client, &input).await.expect("create");
+        let params = server.start_params();
+        assert_eq!(params[1], json!({ "modelProvider": "openai" }));
+    }
+
+    /// Issue #910 acceptance 4: a confirmed provider switch resumes the thread
+    /// with `modelProvider` and nothing else, and the local projection moves the
+    /// provider axis only — the model stays what the thread already ran.
+    #[tokio::test]
+    async fn a_provider_switch_resumes_the_thread_and_keeps_the_model() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        assert_eq!(
+            Backend::provider_change_scope(&client),
+            crate::backend::types::ChangeScope::ResumeOnly,
+            "the opt-in opens the resume door"
+        );
+        client.transcript("thread-1").await.expect("adopt");
+
+        Backend::switch_session_provider(&client, "thread-1", "deepseek")
+            .await
+            .expect("switch");
+
+        let params = server.resume_params();
+        let last = params.last().expect("a resume");
+        assert_eq!(
+            last,
+            &json!({ "threadId": "thread-1", "modelProvider": "deepseek" }),
+            "only the provider is sent: model/variant stay put ({params:?})"
+        );
+        let held = client.projections.model("thread-1").expect("a model fact");
+        assert_eq!(held.provider_id, "deepseek");
+        assert_eq!(
+            held.model_id, "gpt-5.1-codex",
+            "a provider switch does not change the model"
+        );
+    }
+
+    /// Issue #910 acceptance 6: a refused switch is an error and leaves the
+    /// local mirror on the previous provider — never a silent fallback.
+    #[tokio::test]
+    async fn a_failed_provider_switch_keeps_the_previous_provider() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt");
+
+        for refusal in ["unknown provider: nope", "the server kept provider `openai`"] {
+            if refusal.starts_with("the server kept") {
+                server.keep_provider_on_resume();
+            } else {
+                server.reject_next_resume(refusal);
+            }
+            let error = Backend::switch_session_provider(&client, "thread-1", "nope")
+                .await
+                .expect_err("the switch is refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains(if refusal.starts_with("the server kept") {
+                        "openai"
+                    } else {
+                        "unknown provider"
+                    }),
+                "the failure is named: {error}"
+            );
+            assert_eq!(
+                client
+                    .projections
+                    .model("thread-1")
+                    .map(|model| model.provider_id),
+                Some("openai".to_string()),
+                "a refused switch must not move the local mirror"
+            );
+        }
+    }
+
+    /// Issue #910 acceptance 5: no turn path ever carries a provider — the
+    /// protocol has no such field on `turn/start`, and a picker's provider is
+    /// a thread fact. Asserted over every recorded turn request.
+    #[tokio::test]
+    async fn turn_start_never_carries_a_provider() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+
+        let model = crate::backend::parsing::parse_model("openai/gpt-5.1-codex");
+        Backend::prompt(
+            &client,
+            "thread-1",
+            "hello",
+            &[],
+            &[],
+            model.as_ref(),
+            Some("high"),
+            None,
+            None,
+        )
+        .await
+        .expect("prompt");
+
+        let params = server.turn_params("thread-1");
+        assert!(!params.is_empty(), "the prompt really reached turn/start");
+        for params in &params {
+            for field in ["modelProvider", "provider", "model_provider"] {
+                assert!(
+                    params.get(field).is_none(),
+                    "turn/start must never carry `{field}`: {params}"
+                );
+            }
+        }
+        assert_eq!(params[0]["model"], "gpt-5.1-codex");
+        assert_eq!(params[0]["effort"], "high");
     }
 }

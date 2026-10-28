@@ -248,6 +248,24 @@ impl ThreadProjection {
         };
     }
 
+    /// Record a thread-level provider a resume accepted (issue #910). Only the
+    /// provider axis of the held model fact moves — the model and the variant
+    /// stay — and the acceptance is stamped so a read that started earlier
+    /// cannot overwrite it with the provider it saw before the switch. With no
+    /// model fact yet there is nothing to re-provider: the next read supplies
+    /// both.
+    pub(crate) fn record_thread_provider(&mut self, provider: &str, accepted: u64) {
+        if self.model.as_ref().is_some_and(|fact| fact.stamp > accepted) {
+            return;
+        }
+        let Some(fact) = self.model.as_mut() else {
+            return;
+        };
+        fact.model.provider_id = provider.to_string();
+        fact.source = ModelSource::Thread;
+        fact.stamp = accepted;
+    }
+
     /// Record the model cola itself asked for on an accepted `turn/start`: the
     /// protocol's model is "for this turn and subsequent turns", so the thread
     /// now runs it (issue #904). `sent` is stamped at the acceptance; a read

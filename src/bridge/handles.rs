@@ -708,6 +708,23 @@ impl SessionsHandle {
         Ok(cleared)
     }
 
+    /// Record a thread-level provider on the conversation's Pending Session
+    /// (issue #910). A provider has no per-turn form (`turn/start` has none), so
+    /// a session that does not exist yet is the only place it can wait: the
+    /// first message carries it into `thread/start.modelProvider`. `false` when
+    /// the thread has no pending — a live thread's provider changes only through
+    /// the adapter's confirmed resume path, never through this mirror.
+    pub(crate) async fn pick_pending_provider(
+        &self,
+        thread_key: &ThreadKey,
+        provider: &str,
+    ) -> crate::error::Result<bool> {
+        self.update_pending(thread_key, |pending| {
+            pending.provider = Some(provider.to_string());
+        })
+        .await
+    }
+
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the
     /// pick, carry or clear the variant, and switch the session's model where
     /// the generation keeps a durable selection. The switch happens BEFORE the

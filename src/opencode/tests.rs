@@ -89,6 +89,7 @@ async fn create_session_posts_the_input_and_parses_the_data_envelope() {
         id: None,
         agent: Some("build".to_string()),
         model: parse_model("opencode-go/deepseek-v4-flash"),
+        provider: None,
         location: Some(Location {
             directory: "/work/cola".to_string(),
         }),

@@ -53,8 +53,8 @@ pub(crate) use lifecycle::{CodexLifecycle, ManagedProbe, ProbeSource};
 pub(crate) use schema::{AutoProbe, PinnedProbe, Surface, SurfaceProbe};
 #[allow(unused_imports)]
 pub(crate) use threads::{
-    Adoption, INTERACTIVE_SOURCE_KINDS, Thread, ThreadEvent, ThreadPage, ThreadSubscription, Threads,
-    UnsubscribeStatus,
+    Adoption, INTERACTIVE_SOURCE_KINDS, Thread, ThreadEvent, ThreadModel, ThreadPage, ThreadSettings,
+    ThreadSubscription, Threads, UnsubscribeStatus,
 };
 #[allow(unused_imports)]
 pub(crate) use transport::{Endpoint, Inbound, RpcConnection};

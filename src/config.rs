@@ -439,6 +439,15 @@ pub struct CodexConfig {
     /// it was created with.
     #[serde(default)]
     pub apply_on_adopt: bool,
+    /// Whether a `/model` provider pick may change an **existing** thread's
+    /// provider through `thread/resume` (issue #910), behind a Feishu
+    /// confirmation card. Off by default, for the same reason as
+    /// `apply_on_adopt`: the provider is a thread-level fact every client
+    /// attached to that thread (a TUI, VS Code, the desktop app) sees. Off means
+    /// a provider pick on an existing thread only says 「provider 只能在新线程
+    /// 切换」 and sends nothing; a new thread still takes one at creation.
+    #[serde(default)]
+    pub provider_switch_on_resume: bool,
     /// How much of the model's reasoning is summarised into this client's
     /// **new** threads (issue #900), sent as `thread/start`'s
     /// `config.model_reasoning_summary`. `auto` by default: the daemon's own
@@ -614,6 +623,7 @@ const CODEX_CLIENT_KEYS: &[&str] = &[
     "sandbox",
     "approval_policy",
     "apply_on_adopt",
+    "provider_switch_on_resume",
     "reasoning_summary",
 ];
 
@@ -855,8 +865,8 @@ pub enum ClientConfigError {
     #[error(
         "`clients.{id}.{key}` is not a recognised Agent Client setting; `[clients.{id}]` takes `kind` \
          plus that kind's option keys (`url`, `model`, `start_server`, `generation` for `opencode`; \
-         `start_server`, `sandbox`, `approval_policy`, `apply_on_adopt` for `codex`), never a nested \
-         table"
+         `start_server`, `sandbox`, `approval_policy`, `apply_on_adopt`, `provider_switch_on_resume`, \
+         `reasoning_summary` for `codex`), never a nested table"
     )]
     UnknownSetting { id: String, key: String },
     /// `[clients.<id>]` carries an option another kind owns.
@@ -1779,6 +1789,7 @@ mod tests {
             sandbox: Some(SandboxMode::DangerFullAccess),
             approval_policy: Some(ApprovalPolicy::OnRequest),
             apply_on_adopt: true,
+            provider_switch_on_resume: true,
             reasoning_summary: ReasoningSummary::Detailed,
         };
         let toml::Value::Table(serialised) = toml::Value::try_from(&full).unwrap() else {
@@ -1879,12 +1890,55 @@ mod tests {
         assert!(!settings.apply_on_adopt);
 
         let dumped = masked_config_toml(&cfg).unwrap();
-        for absent in ["sandbox", "approval_policy", "apply_on_adopt"] {
+        for absent in [
+            "sandbox",
+            "approval_policy",
+            "apply_on_adopt",
+            "provider_switch_on_resume",
+        ] {
             assert!(
                 !dumped.contains(absent),
                 "an unset override must not be invented by config show: {absent} in {dumped}"
             );
         }
+        assert!(
+            !settings.provider_switch_on_resume,
+            "the provider switch is off unless the file opens it (issue #910)"
+        );
+    }
+
+    /// The provider switch (issue #910): `provider_switch_on_resume` is the gate
+    /// a `/model` provider pick on an **existing** thread needs, off by default
+    /// like `apply_on_adopt` (a resume changes what every attached client sees),
+    /// and `config show` prints it only when the file spells it.
+    #[test]
+    fn a_codex_client_reads_its_provider_switch_gate() {
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"codex\"\n\
+             provider_switch_on_resume = true\n",
+            minimal()
+        ))
+        .unwrap();
+        let settings = cfg.active_client().unwrap().codex().cloned().unwrap();
+        assert!(settings.provider_switch_on_resume);
+        let dumped = masked_config_toml(&cfg).unwrap();
+        assert!(
+            dumped.contains("provider_switch_on_resume = true"),
+            "config show must print the gate the file spelled: {dumped}"
+        );
+
+        // An `opencode` client does not own the key: a setting a kind ignores is
+        // rejected, never silently dropped.
+        let cfg: Config = toml::from_str(&format!(
+            "{}\n[bridge]\ndefault_client = \"ada\"\n\n[clients.ada]\nkind = \"opencode\"\n\
+             provider_switch_on_resume = true\n",
+            minimal()
+        ))
+        .unwrap();
+        assert!(matches!(
+            cfg.active_client(),
+            Err(ClientConfigError::OptionForAnotherKind { .. })
+        ));
     }
 
     /// The reasoning summary (#900): the key parses into its protocol value,

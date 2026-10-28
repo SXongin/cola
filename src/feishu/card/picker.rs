@@ -5,6 +5,36 @@ use super::shell::card_shell;
 use super::truncate_md;
 use super::with_callback_field;
 
+/// One picker option: the button's label, the callback value a click sends, and
+/// the provider a **model preset** pairs with (issue #910). The provider is an
+/// extra callback field, emitted only when set, so every other card's bytes are
+/// unchanged.
+#[derive(Clone, Debug, Default)]
+struct PickerOption {
+    label: String,
+    value: String,
+    provider: Option<String>,
+}
+
+impl From<(String, String)> for PickerOption {
+    fn from((label, value): (String, String)) -> Self {
+        Self {
+            label,
+            value,
+            provider: None,
+        }
+    }
+}
+
+/// The picker row for one client-declared model option.
+fn picker_option(option: &crate::backend::types::ModelOption) -> PickerOption {
+    PickerOption {
+        label: option.display_label().to_string(),
+        value: option.callback_value().to_string(),
+        provider: option.provider.clone(),
+    }
+}
+
 /// A generic option-picker card: one button per option. Shared by the
 /// `/agent`, `/model` and `/autoaccept` dual-form cards. Each button carries
 /// the given `action` tag + the routing payload (thread_key) + the option
@@ -16,6 +46,7 @@ fn option_picker_card(
     action: &str,
     options: &[(String, String)],
 ) -> serde_json::Value {
+    let options: Vec<PickerOption> = options.iter().cloned().map(PickerOption::from).collect();
     picker_card(
         header,
         intro,
@@ -24,7 +55,7 @@ fn option_picker_card(
         None,
         false,
         None,
-        options,
+        &options,
         &[],
         None,
         None,
@@ -38,11 +69,35 @@ fn option_picker_card(
 pub(crate) const PICKER_BACK_TO_PROVIDERS: &str = "__providers__";
 
 /// The callback `level` of the `/model` root page's provider buttons (and of
-/// the back button that returns to it). A model page's level is its scope id
-/// (`"model"` on OpenCode, `"model"` on Codex). A named constant (not a bare
-/// string literal) so the handler's comparison cannot typo-silently break
-/// navigation.
+/// the back button that returns to it) — a **navigation** click: the handler
+/// asks the client for the drilled surface. A model page's level is
+/// [`PICKER_LEVEL_MODEL`]. A named constant (not a bare string literal) so the
+/// handler's comparison cannot typo-silently break navigation.
 pub(crate) const PICKER_LEVEL_PROVIDER: &str = "provider";
+
+/// The callback `level` of a **provider selection** button (Codex's
+/// thread-level `modelProvider`, issue #910). It is deliberately not
+/// [`PICKER_LEVEL_PROVIDER`]: a click here switches a thread's channel, while
+/// that one drills into a provider's models — the same scope *name*, two
+/// different actions.
+pub(crate) const PICKER_LEVEL_PROVIDER_PICK: &str = "provider_switch";
+
+/// The callback `level` of a concrete model-ref button. A fixed tag, never the
+/// scope id: a scope's name is its identity, not a command, so no client's
+/// naming can turn a model pick into navigation.
+pub(crate) const PICKER_LEVEL_MODEL: &str = "model";
+
+/// The callback `level` a scope's option buttons carry. The surface states what
+/// a pick does ([`crate::backend::types::PickKind`]); the card maps it to the
+/// wire tag the bridge branches on, so a scope id never doubles as a command.
+fn scope_level(scope: &crate::backend::types::ModelScope) -> &str {
+    use crate::backend::types::PickKind;
+    match scope.pick {
+        PickKind::DrillDown => PICKER_LEVEL_PROVIDER,
+        PickKind::Provider => PICKER_LEVEL_PROVIDER_PICK,
+        PickKind::Model => PICKER_LEVEL_MODEL,
+    }
+}
 
 /// A picker card whose buttons carry an optional `level` (two-step navigation
 /// for the `/model` provider → model flow) and an optional leading "back"
@@ -61,7 +116,7 @@ fn picker_card(
     level: Option<&str>,
     back: bool,
     clear: Option<(&str, &str)>,
-    options: &[(String, String)],
+    options: &[PickerOption],
     callback_fields: &[(&str, &str)],
     note: Option<&str>,
     free_text: Option<&str>,
@@ -87,15 +142,8 @@ fn picker_card(
             }), callback_fields),
         }));
     }
-    for (label, value) in options {
-        elements.push(option_button(
-            thread_key,
-            action,
-            label,
-            value,
-            level,
-            callback_fields,
-        ));
+    for option in options {
+        elements.push(option_button(thread_key, action, option, level, callback_fields));
     }
     if let Some(note) = note {
         elements.push(markdown_element(note));
@@ -127,13 +175,14 @@ fn back_button(
     })
 }
 
-/// One option button: its label, its callback value, and the `level` the
-/// handler dispatches on.
+/// One option button: its label, its callback value, the `level` the handler
+/// dispatches on, and — for a model preset that pairs a model with a provider
+/// (#910) — that provider as an extra `provider` field. The field is omitted
+/// when unset, so every card without a pairing keeps its exact bytes.
 fn option_button(
     thread_key: &crate::config::ThreadKey,
     action: &str,
-    label: &str,
-    value: &str,
+    option: &PickerOption,
     level: Option<&str>,
     callback_fields: &[(&str, &str)],
 ) -> serde_json::Value {
@@ -141,14 +190,17 @@ fn option_button(
         "action": action,
         "chat_id": thread_key.chat_id,
         "thread_id": thread_key.thread_id,
-        "value": value,
+        "value": option.value,
     });
     if let Some(l) = level {
         payload["level"] = json!(l);
     }
+    if let Some(provider) = &option.provider {
+        payload["provider"] = json!(provider);
+    }
     json!({
         "tag": "button",
-        "text": { "tag": "plain_text", "content": label },
+        "text": { "tag": "plain_text", "content": option.label },
         "type": "default",
         "width": "fill",
         "value": with_callback_field(payload, callback_fields),
@@ -208,7 +260,11 @@ pub fn build_agent_card(
         } else {
             Some(("默认（清除）", "agent_clear"))
         },
-        &options,
+        &options
+            .iter()
+            .cloned()
+            .map(PickerOption::from)
+            .collect::<Vec<_>>(),
         &[],
         None,
         None,
@@ -290,23 +346,14 @@ fn scope_cards(
     if let Some(scope_intro) = &scope.intro {
         intro.push_str(scope_intro);
     }
-    let options: Vec<(String, String)> = scope
-        .options
-        .iter()
-        .map(|option| {
-            (
-                option.display_label().to_string(),
-                option.callback_value().to_string(),
-            )
-        })
-        .collect();
+    let options: Vec<PickerOption> = scope.options.iter().map(picker_option).collect();
     if options.is_empty() {
         return vec![picker_card(
             &header,
             &intro,
             thread_key,
             "model",
-            Some(scope.id.as_str()),
+            Some(scope_level(scope)),
             back,
             None,
             &[],
@@ -326,7 +373,7 @@ fn scope_cards(
         &intro,
         thread_key,
         "model",
-        Some(scope.id.as_str()),
+        Some(scope_level(scope)),
         back,
         None,
         &options,
@@ -371,9 +418,8 @@ fn combined_surface_card(
             elements.push(option_button(
                 thread_key,
                 "model",
-                option.display_label(),
-                option.callback_value(),
-                Some(scope.id.as_str()),
+                &picker_option(option),
+                Some(scope_level(scope)),
                 &[],
             ));
         }
@@ -417,7 +463,7 @@ fn grouped_scope_cards(
                 &header,
                 &intro_text,
                 thread_key,
-                Some(scope.id.as_str()),
+                Some(scope_level(scope)),
                 back,
                 &page,
                 scope.note.as_deref(),
@@ -443,7 +489,10 @@ fn grouped_page_windows<'a>(
     let mut rows = 0usize;
     let mut current_group: Option<&str> = None;
     for option in &scope.options {
-        let option_bytes = 200 + option.display_label().len() * 2 + option.callback_value().len();
+        let option_bytes = 200
+            + option.display_label().len() * 2
+            + option.callback_value().len()
+            + option.provider.as_deref().map_or(0, str::len);
         let mut group_changed = option.group.as_deref() != current_group;
         let mut heading_bytes = if group_changed {
             option.group.as_deref().map_or(0, |group| 100 + group.len())
@@ -512,8 +561,7 @@ fn grouped_picker_card(
         elements.push(option_button(
             thread_key,
             "model",
-            option.display_label(),
-            option.callback_value(),
+            &picker_option(option),
             level,
             &[],
         ));
@@ -525,6 +573,68 @@ fn grouped_picker_card(
         elements.push(markdown_element(free_text));
     }
     card_shell(header, "blue", elements)
+}
+
+/// The confirmation card for a **thread-level provider switch** (issue #910):
+/// the click resumes the thread with the new `modelProvider`, which every other
+/// client attached to that thread sees too (ADR-0090's peer attachment), so the
+/// copy says it and the user confirms once. 确认 carries the provider id as its
+/// value under its own action tag; 取消 is [`picker_card`]'s clear button, which
+/// changes nothing.
+pub fn build_provider_confirm_card(
+    thread_key: &crate::config::ThreadKey,
+    provider: &str,
+) -> serde_json::Value {
+    let intro = format!(
+        "**切换 provider 为 `{provider}`？**\n\
+         这会用 `thread/resume` 改动这条线程的 provider：**同一个线程上的其他客户端\
+         （Codex TUI / VS Code / 桌面端）也会看到这次变化**，之后的新轮次会走这个渠道。\n\
+         模型保持不变。"
+    );
+    picker_card(
+        "🎯 确认切换 Provider",
+        &intro,
+        thread_key,
+        "model_provider_confirm",
+        None,
+        false,
+        Some(("取消", "model_provider_cancel")),
+        &[PickerOption {
+            label: "✅ 确认切换".to_string(),
+            value: provider.to_string(),
+            provider: None,
+        }],
+        &[],
+        Some("取消不会发出任何请求，线程保持原样。"),
+        None,
+    )
+}
+
+/// The card a confirmed provider switch ends on. It replaces the confirmation
+/// card, so the (now stale) buttons cannot be pressed again.
+pub fn build_provider_switched_card(provider: &str) -> serde_json::Value {
+    card_shell(
+        "🎯 Provider 已切换",
+        "green",
+        vec![markdown_element(&format!(
+            "**当前 Provider**：`{provider}`\n\
+             这条线程的模型没有改变；同一个线程上的其他客户端现在也会使用这个 provider。\n\
+             再次发送 `/model` 可查看最新状态。"
+        ))],
+    )
+}
+
+/// A failed provider switch: the thread keeps its previous provider (no silent
+/// fallback), and both the target and the failure are named.
+pub fn build_provider_switch_error_card(provider: &str, error: &str) -> serde_json::Value {
+    card_shell(
+        "⚠️ Provider 切换失败",
+        "red",
+        vec![markdown_element(&format!(
+            "线程保持原来的 provider，本地记录也没有改动。\n\n\
+             **目标**：`{provider}`\n**错误**：{error}"
+        ))],
+    )
 }
 
 /// The leading "current model" line shared by the `/model` picker cards.
@@ -555,19 +665,23 @@ fn chunk_picker_cards(
     level: Option<&str>,
     back: bool,
     clear: Option<(&str, &str)>,
-    options: &[(String, String)],
+    options: &[PickerOption],
     callback_fields: &[(&str, &str)],
     note: Option<&str>,
     free_text: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    let mut pages: Vec<&[(String, String)]> = Vec::new();
+    let mut pages: Vec<&[PickerOption]> = Vec::new();
     let mut start = 0usize;
     // One button's estimated serialized bytes: ~200 of structure (tags, the
     // routing callback fields) + the label's UTF-8 (shown twice in the button
     // JSON) + the callback VALUE, which for a `/skill` row is the skill's exact
     // id — an unbudgeted id would let the card exceed Feishu's limit (spec #652,
     // ticket #655).
-    let button_bytes = |option: &(String, String)| 200 + option.0.len() * 2 + option.1.len();
+    let button_bytes = |option: &PickerOption| {
+        200 + option.label.len() * 2
+            + option.value.len()
+            + option.provider.as_deref().map_or(0, |provider| provider.len())
+    };
     while start < options.len() {
         // Estimate JSON bytes like the streaming splitter; bound the button
         // COUNT by the picker budget, not the streaming 150-component constant —
@@ -654,7 +768,11 @@ pub fn build_think_card(
         None,
         false,
         Some(("默认（清除）", "think_clear")),
-        &options,
+        &options
+            .iter()
+            .cloned()
+            .map(PickerOption::from)
+            .collect::<Vec<_>>(),
         &[],
         None,
         None,
@@ -890,10 +1008,20 @@ mod tests {
             id: id.into(),
             title: title.into(),
             changeable: ChangeScope::ThisTurn,
+            pick: Default::default(),
             options,
             note: None,
             free_text: None,
             intro: None,
+        }
+    }
+
+    /// The OpenCode root page: a `provider` scope whose pick drills into that
+    /// provider's models (issue #910's explicit routing, not a name match).
+    fn provider_scope(id: &str, title: &str, options: Vec<ModelOption>) -> ModelScope {
+        ModelScope {
+            pick: crate::backend::types::PickKind::DrillDown,
+            ..scope(id, title, options)
         }
     }
 
@@ -906,7 +1034,7 @@ mod tests {
         let providers: Vec<ModelOption> = (0..212)
             .map(|p| ModelOption::new(format!("provider-{p}")))
             .collect();
-        let mut provider_scope = scope("provider", "选择模型", providers.clone());
+        let mut provider_scope = provider_scope("provider", "选择模型", providers.clone());
         provider_scope.intro = Some(format!("**选择 provider**（共 {} 个）：", providers.len()));
         let surface = surface(
             Some(ModelSelection {
@@ -1719,13 +1847,21 @@ mod tests {
         serde_json::from_str(json).expect("the pinned card JSON parses")
     }
 
+    /// Every button element of one card, in render order.
+    fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()
+            .map(|elements| elements.iter().filter(|e| e["tag"] == "button").collect())
+            .unwrap_or_default()
+    }
+
     /// The OpenCode provider page is pinned byte-for-byte: any drift in the
     /// header, the current-model line, the intro or a button's callback payload
     /// fails, not just the fields one assertion happens to name.
     #[test]
     fn opencode_provider_page_is_pixel_identical() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut provider = scope(
+        let mut provider = provider_scope(
             "provider",
             "选择模型",
             vec![ModelOption::new("opencode"), ModelOption::new("openrouter")],
@@ -1888,7 +2024,7 @@ mod tests {
     fn opencode_empty_pages_are_pixel_identical() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
 
-        let mut empty = scope("provider", "选择模型", Vec::new());
+        let mut empty = provider_scope("provider", "选择模型", Vec::new());
         empty.intro = Some("_(没有可用模型)_".into());
         let empty_root = surface(
             Some(ModelSelection {
@@ -2009,5 +2145,91 @@ mod tests {
             );
         }
         assert_eq!(total_buttons, 90, "every option keeps a button");
+    }
+
+    /// Issue #910: the callback tag follows the surface's declared pick kind,
+    /// not the scope id — a provider *selection* is not OpenCode's drill-down,
+    /// even though both scopes are named `provider`.
+    #[test]
+    fn a_provider_selection_is_not_a_provider_drill_down() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut pick = scope(
+            "provider",
+            "Provider（线程级：新线程 / resume）",
+            vec![ModelOption::new("deepseek")],
+        );
+        pick.pick = crate::backend::types::PickKind::Provider;
+        let cards = build_model_surface_cards(&key, &surface(None, vec![pick]), false);
+        let button = card_buttons(&cards[0]);
+        assert_eq!(button.len(), 1);
+        assert_eq!(button[0]["value"]["level"], PICKER_LEVEL_PROVIDER_PICK);
+        assert_eq!(button[0]["value"]["value"], "deepseek");
+
+        // The drill-down tag is unchanged, so OpenCode's navigation still works.
+        let drill = provider_scope("provider", "选择模型", vec![ModelOption::new("opencode")]);
+        let cards = build_model_surface_cards(&key, &surface(None, vec![drill]), false);
+        assert_eq!(
+            card_buttons(&cards[0])[0]["value"]["level"],
+            PICKER_LEVEL_PROVIDER
+        );
+    }
+
+    /// Issue #910: a profile preset's paired provider rides the callback, and
+    /// only there — a model option without a pairing emits no such field, so
+    /// every other card's bytes stay identical.
+    #[test]
+    fn a_paired_provider_rides_the_model_button() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let model = scope(
+            "model",
+            "模型（每轮可换）",
+            vec![
+                ModelOption {
+                    id: "deepseek-flash".into(),
+                    value: Some("codex/deepseek-flash".into()),
+                    provider: Some("deepseek".into()),
+                    ..Default::default()
+                },
+                ModelOption {
+                    id: "gpt-5.1".into(),
+                    value: Some("codex/gpt-5.1".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        let cards = build_model_surface_cards(&key, &surface(None, vec![model]), false);
+        let buttons = card_buttons(&cards[0]);
+        assert_eq!(buttons[0]["value"]["provider"], "deepseek");
+        assert!(
+            buttons[1]["value"].get("provider").is_none(),
+            "an unpaired model pick carries no provider field"
+        );
+    }
+
+    /// Issue #910 acceptance 7: the confirmation copy says other clients on the
+    /// thread see the change, and its buttons are the two the bridge routes.
+    #[test]
+    fn the_provider_confirmation_names_the_peer_effect() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let card = build_provider_confirm_card(&key, "deepseek");
+        let text = card.to_string();
+        assert!(text.contains("其他客户端"), "peer effect missing: {text}");
+        assert!(text.contains("deepseek"), "the target is named: {text}");
+        let buttons = card_buttons(&card);
+        let confirm = buttons
+            .iter()
+            .find(|button| button["value"]["action"] == "model_provider_confirm")
+            .expect("the confirm button");
+        assert_eq!(confirm["value"]["value"], "deepseek");
+        assert!(
+            buttons
+                .iter()
+                .any(|button| button["value"]["action"] == "model_provider_cancel"),
+            "the cancel button keeps its own action tag (a mechanism, not a value)"
+        );
+        assert!(
+            card.to_string().len() <= MAX_CARD_JSON_CHARS,
+            "the confirmation stays inside the card budget"
+        );
     }
 }
