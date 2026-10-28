@@ -356,3 +356,148 @@ Also out of scope: offering `[model_providers.*]` models in the picker.
 `model/list` is a flat, provider-less catalog compiled into the CLI (it names no
 provider and does not include custom providers' models), so cola cannot offer
 choices its own pick path could not send.
+
+## Amendment (2026-10-29, #906): the model surface is the client's to declare
+
+Decision 7 and the first amendment both stopped at the same edge: `/model`
+showed `model/list` under one neutral `codex` bucket, and `[model_providers.*]`
+stayed out of scope because the catalog "cannot offer choices its own pick path
+could not send". Spec #906 measured what was actually on the other side and
+found the **shape** was the defect: the card rendered OpenCode's
+provider → model tree over a client that has no such tree, which is where
+「选择 provider（共 1 个）→ codex」 came from. The surface now belongs to the
+client, the card only renders it, and the first amendment's closing
+out-of-scope line is superseded.
+
+**1. `Backend::model_surface` is the one source, and it is a list of scopes.**
+`ModelSurface { current, scopes }` (`src/backend/types.rs`) answers what a
+client can offer and where each axis may change. A `ModelScope` carries a
+`title`, a `ChangeScope` (`ThisTurn` / `NewThread` / `ResumeOnly`), a `PickKind`
+(`Model` / `Provider` / `DrillDown`), its options, an optional note and an
+optional hand-write hint. The pick kind — not the scope's id — says what a click
+does, because both clients legitimately name a scope `provider` and mean
+different things by it (OpenCode drills down into another page, Codex selects a
+thread-level fact). OpenCode maps its existing `GET /provider` tree onto two
+levels unchanged, pixels included; a third client (ACP) only has to answer this
+description.
+
+**2. Codex's model axis is three facts, not a tree.** A provider is
+**thread-level** (`thread/start` and `thread/resume` take `modelProvider`;
+`turn/start` has no such field), a model is **per turn**
+(`turn/start.model`, *"for this turn and subsequent turns"*), and the catalog is
+**global**. The Codex surface therefore declares exactly two scopes —
+「模型（每轮可换）」 (`ThisTurn`) and 「Provider（线程级：新线程 / resume）」
+(`NewThread`, or `ResumeOnly` when `[clients.<id>] provider_switch_on_resume` is
+on) — plus the hand-write hint `/model codex/<id>` for an id no list carries.
+
+**3. `GET <base_url>/models` is not part of the Responses API.** `wire_api =
+"responses"` promises the response shape, not the platform's model-listing
+endpoint. Measured on the development machine: `opencode-go` — a
+`wire_api = "responses"` provider — answers **403** on `/models`, while
+`api.deepseek.com/v1/models` answers and lists only its own ids
+(`deepseek-flash`, `deepseek-v4-pro`; not `deepseek-chat`). OpenCode itself asks
+that endpoint only for a handful of provider plugins (copilot, modal, chatgpt,
+azure) and otherwise relies on models.dev or the user's own declaration. The
+adapter therefore treats a provider's `/models` as **best effort**: it probes
+each configured provider once, with that provider's `experimental_bearer_token`,
+2 s per probe, and caches the answer per provider and base URL for three minutes
+**including failures** (a 403 must not cost 2 s on every open). A provider that
+declares only `env_key` is skipped by name — the daemon's environment is not
+cola's, so that credential cannot be read. 401, 403, 404, a timeout, an
+unreachable host and an undecodable body are distinct one-line notes, never an
+error and never a blank section. A card-callback read answers from that cache
+only (the callback budget is 2 s; a fresh probe does not fit), so a cold click
+shows the providers without their probed models and the next root `/model` open
+fills them. The URL comes from the user's own config — Codex's trust domain — but
+its scheme is restricted to http(s), only the host is logged, and the token lives
+solely in the outbound `Authorization` header: no note, log line, card value or
+`Debug` rendering carries it.
+
+**4. The catalog is global and belongs to no provider.** `model/list` names no
+provider, and one of its ids may run through whichever `model_providers` entry
+the thread names. It is rendered as its own group 「内置目录（任何 provider
+可试）」, never under the current provider. That is also why a picker value stays
+the neutral `codex/<id>`: it is the reference cola records, not a claim about
+which channel runs the model.
+
+**5. A provider is never selected without a model.** `[profiles.*]` is Codex's
+native place to declare a **pair** — `model` + `model_provider` — and cola reads
+exactly those two keys as a one-click preset; a profile's other keys are neither
+applied nor shown. A profile is a *declaration source*, never a protocol field:
+app-server has no "pick a profile", so cola applies the pair through
+`thread/start` or the switch below. The rule the pair follows is measured, not
+stylistic: moving a thread from `opencode-go` to `deepseek` while its model stays
+`gpt-6-luna` sends that name to DeepSeek and gets a 404, so **every selectable
+provider row is a pair** — a `[profiles.*]` preset, or a model that provider's
+`/models` endpoint happened to list (a best-effort read, not a declaration). A
+configured provider with neither is not offered as a dead option; the note names
+it and says how to declare one. cola keeps no second model list of its own
+(cc-connect's `ProviderConfig.Models` was considered as the default and
+rejected); the catalog, the config's `model`, the `[profiles.*]` presets, a
+provider's `/models` answer and a hand-typed id are the sources, in that order of
+reliability.
+
+**6. A provider change is recorded, then applied by the next prompt's
+pre-flight.** Measured on the pinned daemon (#910's owner notes, two
+connections):
+
+```text
+A resume(deepseek)                  → deepseek      ← a fresh load applies
+A resume(opencode-go)  again        → deepseek      ← silently ignored (still loaded)
+A unsubscribe + resume(opencode-go) → opencode-go   ← released, then reloaded
+B also resumes (a peer holds it)
+A unsubscribe + resume(deepseek)    → opencode-go   ← still ignored: the server keeps it loaded
+```
+
+Three conclusions make up the mechanism. A `thread/resume` that names a provider
+only takes effect when the thread **reloads**, so a change is
+`thread/unsubscribe` (every local subscription for that thread id, not one
+mapping's) → `thread/resume { modelProvider, model }` → `thread/read` — and
+success is **only** the read-back of both halves, never the RPC's `ok`. A peer
+holding the thread makes the provider genuinely unchangeable, so the failure is
+named by its two holder kinds — another client (a Codex TUI, VS Code, the
+desktop app), or another cola instance sharing the same `CODEX_HOME` — and
+`thread/fork` with the pair is the escape hatch. And a prompt must not run on a
+pair the thread does not hold, so the change cannot be applied from a card: the
+confirmation **records** the pair (a gated compare-and-set on the session
+mirror), answers synchronously, and the turn's pre-flight applies it before
+submitting — the same three steps, each bounded — and on any failure **does not
+send the prompt**. A click made mid-turn therefore means "next message", which
+is what the owner asked for. The pre-flight's own read is the authority: if it
+proves the thread already runs that provider, only the model changes and no
+reload is made. `turn/start` never carries a provider, and a same-provider pick
+(a `/model` model change, or a profile preset on the current provider) is
+recorded and rides the next turn with **no** unsubscribe, resume or reload.
+
+The switch is off by default (`provider_switch_on_resume = false`), for
+`apply_on_adopt`'s reason: the thread is shared, and the change is what every
+attached client then sees. Off, a provider pick on a live thread says
+「provider 只能在新线程切换」, records nothing and sends nothing; a **new**
+thread still takes the pair at `thread/start` with no confirmation, because
+there is no other client to surprise.
+
+**7. The symmetric cost is a documented trade.** Because the release must land
+for the resume to reload, cola holding a subscription for a live thread makes
+*another* client's provider change a silent no-op in exactly the same way — the
+TUI's request succeeds and the thread does not move. That is peer attachment's
+price, not a defect to fix here: neither side can tell it apart from success on
+the wire, so the user guide states it where `/model` is used.
+
+**8. Reads stay primary; the broadcast is a bonus.** `thread/settings/updated`
+is consumed — the projection folds its `model`/`modelProvider` into the ordered
+fact — but the pinned daemon does not send it for a resume-over-provider to a
+connection that has just re-subscribed, so no switch depends on it: the read-back
+remains the verdict, `effort` is left out of the fold (the surface never renders
+it), and a failed `config/read` degrades to the catalog plus a named note
+(「读不到 config，provider / profile 未知」) instead of an empty section.
+
+Decision 7's `keeps_session_selection = false` and the trait's
+`switch_session_model` no-op stand unchanged: what this amendment adds is a
+**thread-level provider** operation, not a durable session-model switch. The
+per-turn model is still the honest shape, and the thread's provider is the only
+fact that ever needed a reload.
+
+Where #906's prose and the code disagree, the code is the record: #906 sketched
+the provider scope as "the config's provider keys" and the confirmation as the
+moment of change; a bare provider key is not selectable (the 404 above), and the
+confirmation only records — the pre-flight is where the thread is touched.
