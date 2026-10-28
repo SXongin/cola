@@ -333,6 +333,22 @@ The Feishu `post` message carrying an `md` tag that cola posts when a card struc
 _UI label_: none — it renders as an ordinary chat message.
 _Avoid_: post message (that is the platform's `msg_type`), markdown message, format message
 
+**Provider Id**:
+The key a client's configuration gives an endpoint **channel**, and nothing about what models exist behind it. For Codex it is `[model_providers.<id>]`'s `<id>`, whose entry carries `name`, `base_url`, `wire_api` and credentials (`experimental_bearer_token`, `env_key`, `http_headers`, `query_params`, `requires_openai_auth`) — there is no `models` field, and `GET <base_url>/models` is an optional endpoint, not a declaration (the measured `opencode-go` answers 403). OpenCode's `GET /provider` does return a provider → model tree, but that is the server's **Catalog** organised by provider, not a list the provider supplied. A provider is a **thread-level** fact on Codex (`thread/start` / `thread/resume`'s `modelProvider`; `turn/start` has none) and a per-prompt one on OpenCode, which is why the two clients change it by different means.
+_Avoid_: Provider (bare, when the model is meant), provider's model list, channel tree
+
+**Model Id**:
+The string a request carries as `"model"`, sent to the provider **verbatim**; its meaning is the provider's. Only a **Catalog** entry has client-side metadata (Codex holds display name, supported reasoning efforts and context window for its eight ids); an id outside the catalog — `deepseek-v4-pro` through a `[model_providers.deepseek]` channel — is sent unvalidated, so a typo surfaces as the provider's own error on the next turn rather than as a picker rejection. `provider/model` is the spelling a pick records and a card shows; the `codex` bucket in a picker value is neutral (it names no channel) and means "this id rides the turn".
+_Avoid_: Model (the run's identity is provider + id + **Variant**), model name
+
+**Catalog**:
+A client's built-in list of model ids: Codex's `model/list` (eight entries compiled into the CLI, no provider field on any entry) and OpenCode's models.dev snapshot. A catalog is **global and belongs to no provider** — an id from it may run through whichever provider a thread or prompt names — so cola renders it as its own group, never under the current provider. It is also not everything selectable: the config default, `[profiles.*]` presets, a provider's probed `/models` ids and a hand-typed id sit beside it on Codex, as `provider.<id>.models` sits beside OpenCode's snapshot.
+_Avoid_: Model list, the provider's catalog (the catalog is the client's)
+
+**Model Surface** (`ModelSurface`):
+What an **Agent Client** declares for `/model`, and where each axis may change: the running selection (`current`) plus a list of `ModelScope`s, each with a title, a `ChangeScope` (`ThisTurn` / `NewThread` / `ResumeOnly`), a `PickKind` (`Model` / `Provider` / `DrillDown` — a pick's behaviour, independent of the scope's name), its options, an optional note and an optional hand-write hint. The bridge renders scopes and assumes no shape: OpenCode maps its provider → model tree onto two levels (visually unchanged), Codex declares a per-turn `model` scope and a thread-level `provider` scope of **provider + model pairs**, and a further client only has to answer this description. A scope with no options renders its note and hint, never an empty button group.
+_Avoid_: Model card (that is the rendering), model picker (the card component), provider tree (OpenCode's projection of its catalog, not a domain fact)
+
 **Variant**:
 A model-declared reasoning-effort setting (e.g. "low"/"high"/"minimal"), selectable per session via the `/think` command. Each model declares its own variant set — there is no universal scale across models — and "unset" means the server's default for that model. Selecting a model that doesn't declare the current session's variant clears it. How it reaches the backend is generation-specific: V1 sends `PromptInput.variant` per prompt, while V2 carries it inside the session's durable model ref (a session switch, not a prompt field). The user-facing label on cards is "思考等级"/thinking; "variant" is the backend protocol term, never a command name.
 _Avoid_: Thinking level as the domain term (it's the presentation label); calling the command `/variant`
@@ -585,6 +601,7 @@ _Avoid_: Notification, message, signal
 - The **Bridge** reads the **Session Transcript** from a **Backend** and renders **Card** updates on the **Platform**
 - A prompt's **Quoted Context** and **Prompt Attachment**s enrich the **Session** the reply belongs to
 - A **Command** is parsed by the **Bridge** from message text before routing to the **Backend**
+- `/model` renders the **Model Surface** its **Agent Client** declares: a **Provider Id** names the channel, a **Model Id** is the string a request carries, and a **Catalog** is the client's built-in id list — global, owned by no provider
 - Every **Cola-Authored Message** carries a `msg_cola_` id chosen by the **Bridge**; Session Sync treats only user messages newer than the **Sync Watermark** that are NOT **Cola-Authored Message**s as **External Message**s
 - A **Distribution Channel** publishes builds; a machine's **Install Channel** records which one it got them from
 - A **Cargo Receipt** for the running binary flips its **Update Channel** from GitHub Releases to crates.io; the **Install Channel** decides, never the other way around (ADR-0030)
