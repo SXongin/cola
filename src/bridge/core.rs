@@ -121,8 +121,15 @@ pub struct SharedCore {
     /// so the sweep can finish the request instead of suppressing it forever.
     pub settling_requests: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Session ids with a prompt currently in flight (serializes prompts per
-    /// session so concurrent messages don't clobber each other's cards).
+    /// session so concurrent messages don't clobber each other's cards). This is
+    /// turn-admission **bookkeeping**: the model/provider state has its own
+    /// per-session point ([`SessionGates`]), so a thread-level switch never
+    /// holds this set across an app-server call (issue #910).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// The per-session model/provider serialization points (issue #910). One
+    /// async mutex per session; see [`crate::bridge::session_gates`] for the
+    /// invariant it enforces.
+    pub session_gates: crate::bridge::session_gates::SessionGates,
     /// Session ids with an inbound user message being routed to them (#424):
     /// set at admission, cleared when the message is taken or merged. See
     /// [`crate::bridge::handles::WaitsHandle`].
@@ -382,6 +389,7 @@ impl SharedCore {
             answered_requests: Arc::new(Mutex::new(HashSet::new())),
             settling_requests: Arc::new(Mutex::new(HashMap::new())),
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            session_gates: crate::bridge::session_gates::SessionGates::default(),
             inbound: Arc::new(Mutex::new(HashMap::new())),
             stopped_sessions: Arc::new(Mutex::new(HashSet::new())),
             turn_render_poll_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_500)),
@@ -472,6 +480,7 @@ impl SharedCore {
             config: self.turn_config(),
             runtime_reconcile: Arc::clone(&self.runtime_reconcile),
             layout: self.layout.clone(),
+            session_gates: self.session_gates.clone(),
         }
     }
 

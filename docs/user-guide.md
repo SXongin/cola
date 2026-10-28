@@ -301,7 +301,10 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   not sent (cola never runs it on the old provider silently). A thread that is
   already on the target provider but runs another model is not reloaded: the
   model rides the next turn. The click is acknowledged before the switch runs,
-  so a slow daemon cannot freeze the card.
+  so a slow daemon cannot freeze the card. A message for that session waits
+  for the switch's verdict before it is sent (other chats are not held up);
+  the wait is bounded per protocol step, and a timed-out step still restores
+  the local view and the subscription.
 - **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the

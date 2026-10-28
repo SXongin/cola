@@ -731,27 +731,40 @@ impl Turn {
         // generation that keeps a durable selection (V2) deliberately drops
         // them inside its strategy — the pick already lives on the session as
         // a switch. Do NOT "fix" a V2 pick by making the strategy re-send them.
-        let model = handles.sessions.model_override(&self.session_id).await;
-        // Issue #910: a provider change decided while the previous turn was
-        // running — or one recorded for the next turn — is applied HERE, after
-        // that turn ended and BEFORE this prompt. If it cannot (a peer holds the
-        // thread, the read-back did not change, or the gate is off), the prompt
-        // is not sent at all: running it on the old provider would be a silent
-        // lie, and the old model name on a new provider is a 404.
-        if let Some(model) = model.as_ref() {
-            match handles.backend.model_pick_route(&self.session_id, model).await {
-                Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
-                    handles
-                        .backend
-                        .apply_thread_model(&self.session_id, model)
-                        .await?;
+        // Issue #910: the pair this prompt runs with is decided HERE, under the
+        // session's serialization point, and only then is the prompt submitted
+        // (see `crate::bridge::session_gates` for the invariant). A provider
+        // switch holds the same gate, so:
+        //
+        // - a switch that completed left the pair durable — this read sees it;
+        // - a switch that deferred recorded the pair under the same gate — this
+        //   read sees it and applies it now;
+        // - a switch still running makes this prompt **wait** for its verdict,
+        //   never submit on a half-changed pair.
+        //
+        // A deferred pair that cannot be applied (a peer holds the thread, the
+        // read-back did not change, or the gate is off) stops the prompt here:
+        // running it on the old provider would be a silent lie.
+        let model = {
+            let gate = handles.session_gates.gate(&self.session_id);
+            let _held = gate.lock().await;
+            let model = handles.sessions.model_override(&self.session_id).await;
+            if let Some(model) = model.as_ref() {
+                match handles.backend.model_pick_route(&self.session_id, model).await {
+                    Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
+                        handles
+                            .backend
+                            .apply_thread_model(&self.session_id, model)
+                            .await?;
+                    }
+                    Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
+                    // Unknown is not "safe to skip": a failed classification must
+                    // not let the prompt run on a pair the thread may not hold.
+                    Err(error) => return Err(error),
                 }
-                Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
-                // Unknown is not "safe to skip": a failed classification must
-                // not let the prompt run on a pair the thread may not hold.
-                Err(error) => return Err(error),
             }
-        }
+            model
+        };
         let agent = handles.sessions.agent_override(&self.session_id).await;
         let prompt_resp = handles
             .backend

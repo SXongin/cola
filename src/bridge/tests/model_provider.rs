@@ -1254,3 +1254,367 @@ async fn a_pending_that_materialises_is_not_reported_saved() {
         "the pair never falls through to the live entry"
     );
 }
+
+/// Design pass, symptom 1: the switch holds only the **session's** gate, never
+/// the global turn-admission set across an RPC — a prompt in another chat is
+/// admitted while a slow switch is still running.
+#[tokio::test]
+async fn a_slow_switch_does_not_hold_another_sessions_admission() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_thread_model_delay(std::time::Duration::from_millis(1_000));
+    let prompt_calls = backend.prompt_calls.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+    let other = crate::config::SessionEntry::new(
+        crate::config::ThreadKey::new("chat_2".into(), "chat_2".into()),
+        "ses_other",
+        "/work/cola",
+    );
+    seed_entry(&app, other).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+
+    // The switch is now running on chat_1 (1 s). A message in chat_2 must be
+    // admitted and submitted right away — its own turn drain may take longer,
+    // so the measurement is the prompt submission, not the turn's end.
+    let other = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_other".into(),
+                "chat_2".into(),
+                "p2p".into(),
+                None,
+                "other-chat".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
+    loop {
+        if prompt_calls.lock().await.iter().any(|text| text == "other-chat") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "another session's prompt waited for the switch"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    other.await.expect("the other turn ends");
+}
+
+/// Design pass, symptom 2: the deferred pair is recorded **under the session
+/// gate**, so a prompt admitted in the gap waits for it and applies the pair
+/// before it is submitted — the thread is never changed under the running turn,
+/// and the next turn is not sent on the old provider.
+#[tokio::test]
+async fn a_prompt_admitted_after_the_deferral_sees_the_pair() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let applies = backend.thread_model_calls.clone();
+    let prompt_calls = backend.prompt_calls.clone();
+    let prompt_models = backend.prompt_models.clone();
+    let gate = backend.hold_prompts();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+    // The confirmation card is rendered while idle...
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+
+    // ...then turn 1 starts, and the confirmation arrives while it runs.
+    let first = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_prompt_1".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "first".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_calls.lock().await.is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "turn 1 never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Freeze the store writer: the deferred record blocks inside the gate, which
+    // is exactly the gap the design closes.
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the writer is running");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    // The switch has taken the gate and is blocked in the deferred record.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Turn 1 ends; turn 2 is admitted in the gap and its pre-flight parks on the
+    // session gate.
+    gate.add_permits(1);
+    first.await.expect("turn 1 ends");
+    let second = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_prompt_2".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "second".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Release the writer: the deferred record lands, the gate opens, and turn 2
+    // applies the pair before submitting.
+    drop(pause);
+    second.await.expect("turn 2 ends");
+
+    wait_for_card_update(&platform, "the deferred record", CardUpdates::Any, |card| {
+        card_header(card).contains("已记录")
+    })
+    .await;
+    assert_eq!(
+        applies.lock().await.as_slice(),
+        &[("ses_test".to_string(), "deepseek/deepseek-v4-pro".to_string())],
+        "the next prompt applied the deferred pair exactly once"
+    );
+    assert_eq!(
+        prompt_models.lock().await.last().cloned().flatten().as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "turn 2 was submitted with the pair, not the old model"
+    );
+}
+
+/// Design pass, symptom 3: a newer `/model` that lands while the switch awaits
+/// its catalog lookup is not overwritten — the compare-and-set refuses and the
+/// click reports the state change.
+#[tokio::test]
+async fn a_newer_model_during_the_lookup_is_not_overwritten() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let applies = backend.thread_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    // Park the switch inside its catalog lookup, then land a newer /model.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let mut settings = app.sessions.lock().await.settings(&key()).unwrap();
+    settings.model = Some("openai/gpt-5.1".into());
+    app.sessions
+        .lock()
+        .await
+        .set_settings(&key(), settings)
+        .expect("the newer /model saves");
+    gate.add_permits(1);
+
+    wait_for_card_update(&platform, "the refused write", CardUpdates::Any, |card| {
+        card.to_string().contains("没有做任何改动")
+    })
+    .await;
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .settings(&key())
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the newer /model survives the stale switch"
+    );
+    assert!(
+        applies.lock().await.is_empty(),
+        "the switch never touched the thread"
+    );
+}
+
+/// Design pass, symptom 4: materialisation claims the pending before
+/// `thread/start`, so a pair write in that window fails honestly instead of
+/// claiming a pair the already-built creation cannot apply.
+#[tokio::test]
+async fn a_pair_write_during_materialisation_fails_honestly() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_create_session();
+    let entered = backend.create_session_gate_entered.clone();
+    let picks = backend.created_session_picks.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut live = entry();
+    live.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, live).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    // The first message claims the pending and parks in `create_session`.
+    let first = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_prompt".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "hi".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the creation never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("paired pick during creation");
+    let toast = step.toast.unwrap_or_default();
+    assert!(
+        toast.contains("正在创建") || toast.contains("状态已变化"),
+        "the click reports the creation honestly: {toast}"
+    );
+    assert!(
+        !toast.contains("新线程创建时生效"),
+        "it must not claim the pair will apply at creation: {toast}"
+    );
+
+    gate.add_permits(1);
+    first.await.expect("the creation completes");
+    assert_eq!(
+        picks.lock().await.as_slice(),
+        &[(None, Some("m".to_string()))],
+        "the thread was created without the provider the click could not save"
+    );
+}
+
+/// Design pass, symptom 5: a remap while the switch awaits its lookup makes the
+/// switch a no-op — the target session is re-verified in the same lock as the
+/// write, so nothing lands on the new mapping's entry and the old thread is not
+/// switched.
+#[tokio::test]
+async fn a_remap_during_the_lookup_writes_nothing() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let gate = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let applies = backend.thread_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    // A `/think` variant makes the switch's catalog lookup really run (the clear
+    // rule only asks the catalog when there is a variant to check).
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The chat switches to another session while the switch is parked: the old
+    // session's mapping is dropped, so the pair write has nowhere to land.
+    app.command_handles()
+        .flow
+        .unmap("ses_test")
+        .await
+        .expect("the old mapping is dropped");
+    let mut other = crate::config::SessionEntry::new(key(), "ses_new", "/work/cola");
+    other.model = Some("openai/gpt-5.1".into());
+    seed_entry(&app, other).await;
+    gate.add_permits(1);
+
+    wait_for_card_update(&platform, "the remapped switch", CardUpdates::Any, |card| {
+        card.to_string().contains("没有做任何改动")
+    })
+    .await;
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the new mapping's entry is untouched"
+    );
+    assert!(
+        applies.lock().await.is_empty(),
+        "a remapped chat never switches the captured thread"
+    );
+}

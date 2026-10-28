@@ -1835,7 +1835,11 @@ where
                 .lock()
                 .expect("resume params")
                 .push(params.clone());
-            let delay = *state.resume_delay.lock().expect("resume delay");
+            // One-shot: the delay models a slow switch, not every later resume.
+            let delay = {
+                let mut delay = state.resume_delay.lock().expect("resume delay");
+                std::mem::take(&mut *delay)
+            };
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }

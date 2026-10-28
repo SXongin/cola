@@ -1693,6 +1693,13 @@ pub struct MockBackend {
     pub model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// Counts `model_surface` calls that reached [`Self::model_surface_gate`].
     pub model_surface_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Holds the next `create_session` calls (lazy creation / materialisation)
+    /// until released, so a test can interleave a pair write with the creation
+    /// window (issue #910).
+    pub create_session_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `create_session` calls that reached
+    /// [`Self::create_session_gate`].
+    pub create_session_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// The session id `create_session` returns.
     pub session_id: String,
     /// Every `create_session` call's requested directory (ADR-0041: asserts
@@ -2029,6 +2036,8 @@ impl MockBackend {
             transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             model_surface_gate: std::sync::Mutex::new(None),
             model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            create_session_gate: std::sync::Mutex::new(None),
+            create_session_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
             created_session_dirs: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             fail_create_session_count: std::sync::atomic::AtomicUsize::new(0).into(),
@@ -2484,6 +2493,15 @@ impl MockBackend {
         gate
     }
 
+    /// Hold every `create_session` call until the returned semaphore is
+    /// released, counting the calls that reached the gate. Lets a test interleave
+    /// a pair write with a materialisation (issue #910).
+    pub(crate) fn hold_create_session(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.create_session_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
     /// Scenario: the addressed permission was resolved elsewhere — a reply
     /// reports it gone (404) instead of succeeding.
     pub(crate) fn permission_resolved_elsewhere(&mut self) -> &mut Self {
@@ -2931,6 +2949,16 @@ impl crate::backend::Backend for MockBackend {
             input.provider.clone(),
             input.model.as_ref().map(|model| model.id.clone()),
         ));
+        let gate = self
+            .create_session_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            self.create_session_gate_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _permit = gate.acquire().await;
+        }
         if self
             .fail_create_session_count
             .load(std::sync::atomic::Ordering::SeqCst)

@@ -158,24 +158,49 @@ pub struct SessionStore {
     /// The one thread that writes `sessions.json` (ADR-0089); `None` only when
     /// the thread could not be started, in which case writes stay synchronous.
     writer: Option<crate::bridge::store_writer::StoreWriter>,
+    /// Thread keys whose Pending Session is being materialised right now (issue
+    /// #910). In memory only: a claim either finishes (activation removes the
+    /// pending) or is unclaimed by the failure path, so a restart leaves an
+    /// ordinary pending to retry.
+    creating: std::collections::HashSet<ThreadKey>,
 }
 
-/// The live entry's state after a pair write (issue #910): the variant the
-/// failed-switch rollback must still see for its compare-and-swap to be exact,
-/// even when a concurrent `/think` changed it between the caller's snapshot and
-/// the write.
-pub(crate) struct LivePairWrite {
-    pub(crate) variant: Option<String>,
+/// What a model/provider pair write did (issue #910).
+///
+/// Only [`Self::Applied`] means the pair is durable. Every other arm means
+/// **nothing was written**: the caller must say so, never claim the pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PairWrite {
+    /// Written. `variant` is the variant the target holds afterwards — the value
+    /// a failed switch's rollback must match — and `cleared_variant` is the
+    /// `/think` variant this write actually cleared (a CAS: a newer `/think`
+    /// wins and nothing is cleared).
+    Applied {
+        variant: Option<String>,
+        cleared_variant: Option<String>,
+    },
+    /// The thread no longer maps to that session (a `/switch` remap, a delete, a
+    /// recreate, or a pending declared since): nothing written.
+    Moved,
+    /// The target's mirror no longer holds the state the caller read (a newer
+    /// `/model` or `/think` landed while the caller awaited its catalog lookup):
+    /// nothing written.
+    Changed,
+    /// The conversation's session is being created right now: `thread/start`
+    /// already snapshotted the pending, so a pair written now would be claimed
+    /// but never applied.
+    Creating,
 }
 
-/// What writing a Pending Session's provider+model pair did (issue #910).
-pub(crate) enum PendingPairWrite {
-    /// The pending entry was still there: the pair landed, and the `/think`
-    /// variant was cleared only while it still equaled the caller's snapshot.
-    Applied { cleared_variant: Option<String> },
-    /// The thread has no Pending Session any more (it materialised or was
-    /// cleared): nothing was written, and the caller must not claim success.
-    NoPending,
+/// What claiming a thread's Pending Session for materialisation found.
+pub(crate) enum PendingClaim {
+    /// Claimed, with the snapshot the creation will use. No pair write can land
+    /// on the pending until the claim is released (activation or a failure).
+    Claimed(Box<PendingEntry>),
+    /// Another message is materialising this pending right now.
+    Creating,
+    /// This thread has no Pending Session.
+    None,
 }
 
 impl SessionStore {
@@ -239,6 +264,7 @@ impl SessionStore {
             entries: Arc::new(entries),
             pending: Arc::new(pending),
             writer,
+            creating: std::collections::HashSet::new(),
         };
         if legacy {
             // ADR-0091: the one eager rewrite. A later process reads version 1
@@ -280,6 +306,9 @@ impl SessionStore {
 
     /// Declare (or replace) the conversation's Pending Session and persist.
     pub fn set_pending(&mut self, pending: PendingEntry) -> crate::error::Result<()> {
+        // A pending declared afresh is not mid-creation (issue #910): drop any
+        // stale claim left by a creation that never returned.
+        self.creating.remove(&pending.thread_key);
         self.pending_mut().retain(|p| p.thread_key != pending.thread_key);
         self.pending_mut().push(pending);
         self.write_to_disk()
@@ -288,6 +317,7 @@ impl SessionStore {
     /// Drop the conversation's Pending Session and persist.
     #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) clear pendings
     pub fn clear_pending(&mut self, key: &ThreadKey) -> crate::error::Result<()> {
+        self.creating.remove(key);
         self.pending_mut().retain(|p| &p.thread_key != key);
         self.write_to_disk()
     }
@@ -346,6 +376,7 @@ impl SessionStore {
     /// (a pending and an active session are mutually exclusive, ADR-0041) —
     /// materialisation is exactly this operation, in one write.
     pub fn activate(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
+        self.creating.remove(&entry.thread_key);
         self.promote(entry);
         self.write_to_disk()
     }
@@ -475,93 +506,132 @@ impl SessionStore {
         key: &ThreadKey,
         model: &str,
         provider: &str,
+        expected_model: Option<&str>,
+        expected_variant: Option<&str>,
         clear_variant: Option<&str>,
-    ) -> crate::error::Result<PendingPairWrite> {
+    ) -> crate::error::Result<PairWrite> {
+        // A claimed (materialising) pending cannot take a pair: the creation
+        // already snapshotted it, so claiming success here would lie.
+        if self.creating.contains(key) {
+            return Ok(PairWrite::Creating);
+        }
         let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
-            return Ok(PendingPairWrite::NoPending);
+            // Materialised (or cleared) while the caller awaited its lookup:
+            // never fall through to the live entry, whose thread was created
+            // with the provider the pair could not reach.
+            return Ok(PairWrite::Moved);
         };
+        if pending.model.as_deref() != expected_model || pending.variant.as_deref() != expected_variant {
+            return Ok(PairWrite::Changed);
+        }
         pending.model = Some(model.to_string());
         pending.provider = Some(provider.to_string());
-        let mut cleared = None;
+        let mut cleared_variant = None;
         if let Some(candidate) = clear_variant
             && pending.variant.as_deref() == Some(candidate)
         {
             pending.variant = None;
-            cleared = Some(candidate.to_string());
+            cleared_variant = Some(candidate.to_string());
         }
+        let variant = pending.variant.clone();
         self.write_to_disk()?;
-        Ok(PendingPairWrite::Applied {
-            cleared_variant: cleared,
+        Ok(PairWrite::Applied {
+            variant,
+            cleared_variant,
         })
     }
 
-    /// Write a provider+model pair onto the conversation's **live** entry
-    /// (issue #910), targeted in one lock. The `/think` variant is cleared only
-    /// if it still equals `clear_variant`, so a concurrent `/think` survives;
-    /// `agent` and `auto_accept` are not touched at all. `false` when the
-    /// conversation has no live entry (a pending, or nothing).
+    /// Write a provider+model pair onto a **live** entry (issue #910), in one
+    /// lock that also re-verifies the mapping: the entry is found by
+    /// `session_id`, and only when it is still the thread's target. A `/switch`
+    /// remap, a delete/recreate or a newly declared pending is
+    /// [`PairWrite::Moved`] — the write never lands on the new mapping's entry.
+    /// The write is a compare-and-set on the state the caller read, so a newer
+    /// `/model` or `/think` is [`PairWrite::Changed`], never overwritten.
     pub(crate) fn set_live_pair(
         &mut self,
         key: &ThreadKey,
+        session_id: &str,
         model: &str,
+        expected_model: Option<&str>,
+        expected_variant: Option<&str>,
         clear_variant: Option<&str>,
-    ) -> crate::error::Result<Option<LivePairWrite>> {
+    ) -> crate::error::Result<PairWrite> {
         let client_id = self.client_id.clone();
         if self.pending_for(key).is_some() {
-            return Ok(None);
+            return Ok(PairWrite::Moved);
         }
         let Some(entry) = self
             .entries_mut()
             .iter_mut()
-            .find(|e| e.client_id == client_id && &e.thread_key == key)
+            .find(|e| e.client_id == client_id && e.session_id == session_id)
         else {
-            return Ok(None);
+            return Ok(PairWrite::Moved);
         };
+        if &entry.thread_key != key {
+            return Ok(PairWrite::Moved);
+        }
+        if entry.model.as_deref() != expected_model || entry.variant.as_deref() != expected_variant {
+            return Ok(PairWrite::Changed);
+        }
         entry.model = Some(model.to_string());
+        let mut cleared_variant = None;
         if let Some(candidate) = clear_variant
             && entry.variant.as_deref() == Some(candidate)
         {
             entry.variant = None;
+            cleared_variant = Some(candidate.to_string());
         }
-        let state = LivePairWrite {
-            variant: entry.variant.clone(),
-        };
+        let variant = entry.variant.clone();
         self.write_to_disk()?;
-        Ok(Some(state))
+        Ok(PairWrite::Applied {
+            variant,
+            cleared_variant,
+        })
+    }
+
+    /// Claim the thread's Pending Session for materialisation, taking the
+    /// snapshot the creation will use **under the same lock** (issue #910). A
+    /// pair write arriving in the window before `thread/start` then sees
+    /// [`PairWrite::Creating`] instead of claiming a pair the creation cannot
+    /// apply. Released by [`Self::activate`] (success) or
+    /// [`Self::unclaim_pending_creation`] (failure, so the next message retries).
+    pub(crate) fn claim_pending_for_creation(&mut self, key: &ThreadKey) -> PendingClaim {
+        if self.creating.contains(key) {
+            return PendingClaim::Creating;
+        }
+        let Some(pending) = self.pending_for(key).cloned() else {
+            return PendingClaim::None;
+        };
+        self.creating.insert(key.clone());
+        PendingClaim::Claimed(Box::new(pending))
+    }
+
+    /// Release a materialisation claim without creating the session (the
+    /// pending stays, so the next message retries).
+    pub(crate) fn unclaim_pending_creation(&mut self, key: &ThreadKey) {
+        self.creating.remove(key);
     }
 
     /// Compare-and-restore a failed provider pair (issue #910), in ONE lock: the
-    /// previous model+variant go back only while the target still holds exactly
+    /// previous model+variant go back only while the entry still holds exactly
     /// the model **and** variant the attempt wrote. A newer `/model` or `/think`
     /// that landed while the slow RPC ran is the user's latest intent and is
-    /// never overwritten. Returns whether anything was restored.
+    /// never overwritten. Targeted by `session_id`, so a remap cannot make it
+    /// restore the wrong thread. Returns whether anything was restored.
     pub(crate) fn rollback_pair(
         &mut self,
-        key: &ThreadKey,
+        session_id: &str,
         attempted_model: &str,
         attempted_variant: Option<&str>,
         previous_model: Option<String>,
         previous_variant: Option<String>,
     ) -> crate::error::Result<bool> {
         let client_id = self.client_id.clone();
-        // The target the pair was written to: the pending when one exists (a
-        // confirmed switch is a live-session action, but keep the one targeting
-        // rule), else the thread's live entry.
-        if let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
-            if pending.model.as_deref() != Some(attempted_model)
-                || pending.variant.as_deref() != attempted_variant
-            {
-                return Ok(false);
-            }
-            pending.model = previous_model;
-            pending.variant = previous_variant;
-            self.write_to_disk()?;
-            return Ok(true);
-        }
         let Some(entry) = self
             .entries_mut()
             .iter_mut()
-            .find(|e| e.client_id == client_id && &e.thread_key == key)
+            .find(|e| e.client_id == client_id && e.session_id == session_id)
         else {
             return Ok(false);
         };
@@ -646,6 +716,7 @@ impl SessionStore {
     /// Pending Session (ADR-0041: forget clears both in the same write).
     fn remove_thread(&mut self, key: &ThreadKey) -> Vec<SessionEntry> {
         let client_id = self.client_id.clone();
+        self.creating.remove(key);
         self.pending_mut().retain(|p| &p.thread_key != key);
         let removed: Vec<SessionEntry> = self
             .entries
@@ -1436,26 +1507,26 @@ mod tests {
         );
     }
 
-    /// Review round 3, finding 2: the rollback is a compare-and-swap under one
-    /// lock — the previous mirror is restored only while the entry still holds
-    /// **both** the model and the variant the attempt wrote. A newer `/think`
-    /// (same model, different variant) is never overwritten.
+    /// Issue #910: the rollback is a compare-and-swap under one lock — the
+    /// previous mirror is restored only while the entry still holds **both** the
+    /// model and the variant the attempt wrote, and only while the session is
+    /// still mapped. A newer `/think` (same model, different variant) is never
+    /// overwritten.
     #[test]
     fn rollback_pair_refuses_when_a_newer_variant_landed() {
         let dir = tempdir().unwrap();
         let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
-        let key = ThreadKey::new("chat1".into(), "root1".into());
         let mut entry = make_entry("chat1", "root1", "ses_1", "/tmp/one");
         entry.model = Some("deepseek/pro".into());
         entry.variant = Some("mid".into());
         store.activate(entry).unwrap();
 
         // The attempt wrote `deepseek/pro` with no variant; a `/think` then set
-        // `mid`. The pair's variant no longer matches, so nothing is restored.
+        // `mid`. The variant no longer matches, so nothing is restored.
         assert!(
             !store
                 .rollback_pair(
-                    &key,
+                    "ses_1",
                     "deepseek/pro",
                     None,
                     Some("old/model".into()),
@@ -1468,14 +1539,16 @@ mod tests {
         assert_eq!(entry.variant.as_deref(), Some("mid"), "the newer /think survives");
 
         // With both halves still as the attempt wrote them, the restore lands.
-        let mut entry = store.entry_for_session("ses_1").unwrap().clone();
-        entry.model = Some("deepseek/pro".into());
-        entry.variant = None;
-        store.update("ses_1", |e| *e = entry).unwrap();
+        store
+            .update("ses_1", |e| {
+                e.model = Some("deepseek/pro".into());
+                e.variant = None;
+            })
+            .unwrap();
         assert!(
             store
                 .rollback_pair(
-                    &key,
+                    "ses_1",
                     "deepseek/pro",
                     None,
                     Some("old/model".into()),
@@ -1488,12 +1561,12 @@ mod tests {
         assert_eq!(entry.variant.as_deref(), Some("high"));
     }
 
-    /// Review round 3, finding 3: the pending pair write targets the **pending**
-    /// entry only. Once the session has materialised it is `NoPending` — the
-    /// pair never falls through to the live entry, whose thread was created with
-    /// the old provider.
+    /// Issue #910: the pending pair write is a pending-only compare-and-set. It
+    /// never falls through to the live entry once the session materialised, a
+    /// claimed (materialising) pending refuses with `Creating`, and a newer pick
+    /// on the pending is `Changed` rather than overwritten.
     #[test]
-    fn set_pending_pair_never_falls_through_to_the_live_entry() {
+    fn set_pending_pair_never_falls_through_and_cas_guards_the_pending() {
         let dir = tempdir().unwrap();
         let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
         let key = ThreadKey::new("chat1".into(), "root1".into());
@@ -1504,27 +1577,49 @@ mod tests {
         pending.variant = Some("high".into());
         store.set_pending(pending).unwrap();
 
-        // While the pending exists, the pair lands on it and the clear applies.
+        // A newer pick landed since the caller's snapshot: nothing is written.
+        assert_eq!(
+            store
+                .set_pending_pair(&key, "deepseek/pro", "deepseek", Some("stale"), None, None)
+                .unwrap(),
+            PairWrite::Changed
+        );
+        // While the pending exists, the pair lands and the CAS clear applies.
         let written = store
-            .set_pending_pair(&key, "deepseek/pro", "deepseek", Some("high"))
+            .set_pending_pair(&key, "deepseek/pro", "deepseek", None, Some("high"), Some("high"))
             .unwrap();
-        assert!(matches!(
+        assert_eq!(
             written,
-            PendingPairWrite::Applied {
-                cleared_variant: Some(ref cleared)
-            } if cleared == "high"
-        ));
+            PairWrite::Applied {
+                variant: None,
+                cleared_variant: Some("high".into())
+            }
+        );
         let pending = store.pending_for(&key).unwrap();
         assert_eq!(pending.model.as_deref(), Some("deepseek/pro"));
         assert_eq!(pending.provider.as_deref(), Some("deepseek"));
-        assert_eq!(pending.variant, None, "the cleared variant is gone");
+
+        // A claimed (materialising) pending refuses: the creation snapshotted it.
+        match store.claim_pending_for_creation(&key) {
+            PendingClaim::Claimed(pending) => assert_eq!(pending.model.as_deref(), Some("deepseek/pro")),
+            _ => panic!("the pending must be claimable"),
+        }
+        assert_eq!(
+            store
+                .set_pending_pair(&key, "openai/x", "openai", Some("deepseek/pro"), None, None)
+                .unwrap(),
+            PairWrite::Creating
+        );
+        store.unclaim_pending_creation(&key);
 
         // Materialised (pending cleared, live entry active): no fallthrough.
         store.clear_pending(&key).unwrap();
-        let written = store
-            .set_pending_pair(&key, "deepseek/pro", "deepseek", None)
-            .unwrap();
-        assert!(matches!(written, PendingPairWrite::NoPending));
+        assert_eq!(
+            store
+                .set_pending_pair(&key, "deepseek/pro", "deepseek", None, None, None)
+                .unwrap(),
+            PairWrite::Moved
+        );
         assert_eq!(
             store.entry_for_session("ses_1").and_then(|e| e.model.as_deref()),
             Some("old/model"),
