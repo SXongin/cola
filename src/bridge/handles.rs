@@ -135,6 +135,35 @@ pub(crate) fn classify_pick(
     }
 }
 
+/// What a failed durable switch actually left on the server (issue #910).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwitchOutcome {
+    /// The server holds the attempted selection: the switch landed, only its
+    /// answer was lost. Record it as applied.
+    Applied,
+    /// The server still holds the selection read before the attempt: the
+    /// failure is the whole truth.
+    Unchanged,
+    /// Neither the attempt nor the previous selection (another client moved it,
+    /// or the read failed): nothing can be claimed as truth.
+    Unknown,
+}
+
+/// Whether two selections name the same provider/model/`/think` level;
+/// `None` is "no selection" and equals only itself.
+fn same_selection(
+    left: Option<&crate::backend::types::ModelInfo>,
+    right: Option<&crate::backend::types::ModelInfo>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            left.provider_id == right.provider_id && left.id == right.id && left.variant == right.variant
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// A mirror write's outcome as the surface's pick result (issue #910): only an
 /// applied write is a pick; every refused arm says the state moved.
 fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome {
@@ -953,30 +982,85 @@ impl SessionsHandle {
         }
     }
 
-    /// The variant of a durable generation's session selection (V2): the
-    /// session's own, so a peer's `/think` is not overwritten by a stale mirror.
-    /// An RPC read — callers run it **outside** the session gate.
-    async fn durable_variant(
+    /// A durable generation's own session selection (V2): the session's model
+    /// (with its variant), so a peer's change is not overwritten by a stale
+    /// mirror. An RPC read — callers run it **outside** the state gate, and it
+    /// is bounded like the switch it precedes (issue #910): this read runs
+    /// inside the session's switch point, so a silent server must not hold the
+    /// point (and every prompt behind it) open.
+    async fn durable_model(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: &str,
-    ) -> Option<String> {
-        // Bounded like the switch it precedes (issue #910): this read runs
-        // inside the session's switch point, so a silent server must not hold
-        // the point (and every prompt behind it) open.
+    ) -> Option<crate::backend::types::ModelInfo> {
         let selection = tokio::time::timeout(
             crate::bridge::session_gates::SWITCH_RPC_BOUND,
             self.durable_selection(backend, session_id, Some(directory)),
         )
         .await;
         match selection {
-            Ok(Ok(Some(selection))) => selection.model.and_then(|model| model.variant),
+            Ok(Ok(Some(selection))) => selection.model,
             // Unknown (an error, no selection, or no answer in time): the
             // switch rewrites the ref wholesale, so dropping the variant is the
             // one honest outcome.
             Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
         }
+    }
+
+    /// What a durable switch's failure actually left on the server (issue
+    /// #910). A transport timeout or error is **ambiguous**: the server may
+    /// have applied the change before its answer was lost, and cola cannot undo
+    /// it. Only a bounded read of the server's authoritative selection can say.
+    async fn reconcile_switch(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        session_id: &str,
+        directory: &str,
+        attempted: &crate::backend::types::ModelInfo,
+        previous: Option<&crate::backend::types::ModelInfo>,
+    ) -> SwitchOutcome {
+        let read = tokio::time::timeout(
+            crate::bridge::session_gates::SWITCH_RPC_BOUND,
+            backend.session_selection(session_id, Some(directory)),
+        )
+        .await;
+        let Ok(Ok(Some(selection))) = read else {
+            return SwitchOutcome::Unknown;
+        };
+        let current = selection.model.as_ref();
+        if current.is_some_and(|current| same_selection(Some(current), Some(attempted))) {
+            SwitchOutcome::Applied
+        } else if same_selection(current, previous) {
+            // Both sides are the same selection, `None` included: the server is
+            // where it was, so the failure is the whole truth.
+            SwitchOutcome::Unchanged
+        } else {
+            SwitchOutcome::Unknown
+        }
+    }
+
+    /// Forget the session's mirror selection after an unconfirmed switch (issue
+    /// #910): `None` claims nothing, so the next prompt runs the server's
+    /// authoritative selection instead of a possibly stale mirror. A newer pick
+    /// that moved the mirror in the meantime keeps its own record.
+    async fn forget_mirror_selection(
+        &self,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        expected_model: Option<&str>,
+        expected_variant: Option<&str>,
+    ) -> crate::error::Result<()> {
+        let gate = self.session_gates.gate(session_id);
+        let _held = gate.enter().await;
+        self.store.lock().await.set_mirror_live(
+            thread_key,
+            session_id,
+            expected_model,
+            expected_variant,
+            crate::bridge::session::MirrorWrite::Forget,
+        )?;
+        Ok(())
     }
 
     /// The `/think` clear for a pick whose catalog read runs **inside** the
@@ -1138,7 +1222,8 @@ impl SessionsHandle {
         }
         // The session's own selection is the authority (another client may have
         // changed it): resolve it, clear against it, then switch.
-        let mut variant = self.durable_variant(backend, &session_id, &base.directory).await;
+        let previous = self.durable_model(backend, &session_id, &base.directory).await;
+        let mut variant = previous.as_ref().and_then(|model| model.variant.clone());
         let cleared = self
             .clear_variant_for_model_bounded(
                 backend,
@@ -1150,16 +1235,45 @@ impl SessionsHandle {
         let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
             crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
         })?;
-        Self::switch_session_model_bounded(
-            backend,
-            &session_id,
-            &crate::backend::types::ModelInfo {
-                id: model.id,
-                provider_id: model.provider_id,
-                variant: variant.clone(),
-            },
-        )
-        .await?;
+        let attempted = crate::backend::types::ModelInfo {
+            id: model.id,
+            provider_id: model.provider_id,
+            variant: variant.clone(),
+        };
+        if let Err(error) = Self::switch_session_model_bounded(backend, &session_id, &attempted).await {
+            // Ambiguous, not "nothing happened": the server may have applied the
+            // change before the answer was lost (issue #910). Reconcile against
+            // its authoritative selection under the same bound.
+            match self
+                .reconcile_switch(
+                    backend,
+                    &session_id,
+                    &base.directory,
+                    &attempted,
+                    previous.as_ref(),
+                )
+                .await
+            {
+                // The server holds the pick: record it as the success it is.
+                SwitchOutcome::Applied => {}
+                SwitchOutcome::Unchanged => return Err(error),
+                SwitchOutcome::Unknown => {
+                    // Never keep a stale mirror as truth: forget it and say the
+                    // outcome is unknown.
+                    self.forget_mirror_selection(
+                        thread_key,
+                        &session_id,
+                        base.model.as_deref(),
+                        base.variant.as_deref(),
+                    )
+                    .await?;
+                    return Err(crate::error::BridgeError::State(format!(
+                        "`{model_spec}` 的切换结果未知：服务器没有回答，也没有读回目标选择。\
+                         下一条消息会按服务器当前的选择运行；请用 `/model` 重新确认。"
+                    )));
+                }
+            }
+        }
         // The mirror write is inside the same step, compare-and-set against the
         // state this pick read when it took the point.
         let written = {
@@ -1354,19 +1468,47 @@ impl SessionsHandle {
             if base.session_id.as_deref() != Some(session_id.as_str()) {
                 return Ok(PickOutcome::StateChanged);
             }
-            let Some(model) = self.effective_selection(backend, &base).await else {
+            // Bounded like every other read under the point (issue #910): a
+            // silent server must not hold it open for a `/think`.
+            let Some(previous) = tokio::time::timeout(
+                crate::bridge::session_gates::SWITCH_RPC_BOUND,
+                self.effective_selection(backend, &base),
+            )
+            .await
+            .ok()
+            .flatten() else {
                 return Ok(PickOutcome::NoModel);
             };
-            Self::switch_session_model_bounded(
-                backend,
-                &session_id,
-                &crate::backend::types::ModelInfo {
-                    id: model.id,
-                    provider_id: model.provider_id,
-                    variant: variant.clone(),
-                },
-            )
-            .await?;
+            let attempted = crate::backend::types::ModelInfo {
+                id: previous.id.clone(),
+                provider_id: previous.provider_id.clone(),
+                variant: variant.clone(),
+            };
+            if let Err(error) = Self::switch_session_model_bounded(backend, &session_id, &attempted).await {
+                // Ambiguous (issue #910): the server may hold the new level
+                // already. Reconcile, exactly as a `/model` pick does.
+                match self
+                    .reconcile_switch(backend, &session_id, &base.directory, &attempted, Some(&previous))
+                    .await
+                {
+                    SwitchOutcome::Applied => {}
+                    SwitchOutcome::Unchanged => return Err(error),
+                    SwitchOutcome::Unknown => {
+                        self.forget_mirror_selection(
+                            thread_key,
+                            &session_id,
+                            base.model.as_deref(),
+                            base.variant.as_deref(),
+                        )
+                        .await?;
+                        return Err(crate::error::BridgeError::State(
+                            "思考等级的切换结果未知：服务器没有回答，也没有读回目标选择。\
+                             下一条消息会按服务器当前的选择运行；请用 `/think` 重新确认。"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
             let written = {
                 let _held = switch.enter().await;
                 self.store.lock().await.set_mirror_live(

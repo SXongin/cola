@@ -2516,3 +2516,229 @@ async fn autoaccept_on_a_replaced_pending_is_refused() {
         .expect("the pending survives");
     assert!(pending.auto_accept);
 }
+
+/// Issue #910 (adversarial): a V2 switch the server **applied** before its
+/// answer was lost is ambiguous, not a failure. The bounded reconciliation read
+/// finds the attempted selection and records the pick as applied — server and
+/// mirror agree.
+#[tokio::test]
+async fn an_applied_switch_whose_response_is_lost_is_reconciled() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    backend.hang_after_apply();
+    let selections = backend.session_selections.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/model-b",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("Model: openai/model-b"),
+        "the reconciled pick is reported as applied: {reply}"
+    );
+    assert_eq!(
+        selections
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|selection| selection.model.as_ref())
+            .map(|model| model.id.as_str()),
+        Some("model-b"),
+        "the server holds the change"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/model-b"),
+        "the mirror was reconciled to the server"
+    );
+}
+
+/// Issue #910 (adversarial): when the reconcile read shows neither the attempt
+/// nor the previous selection (a peer moved it, or the read failed), the mirror
+/// is **forgotten** and the failure is named — never a stale mirror claimed as
+/// truth, never a success.
+#[tokio::test]
+async fn an_unknown_switch_outcome_forgets_the_mirror() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    backend.hang_after_apply();
+    backend.then_the_selection_becomes(crate::backend::types::ModelInfo {
+        id: "third-model".into(),
+        provider_id: "other".into(),
+        variant: None,
+    });
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/model-b",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("切换结果未知"),
+        "the failure names the unknown outcome: {reply}"
+    );
+    let active = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(
+        active.model, None,
+        "the mirror claims nothing after an unconfirmed switch"
+    );
+    assert_eq!(
+        active.variant, None,
+        "nor a variant that belonged to the old model"
+    );
+}
+
+/// Issue #910 (adversarial), the `/think` side of the same ambiguity: the
+/// server applied the new level before the answer was lost, and the reconcile
+/// records it instead of reporting a failure.
+#[tokio::test]
+async fn an_applied_think_whose_response_is_lost_is_reconciled() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_session_selection(
+            "ses_test",
+            crate::backend::types::SessionSelection {
+                model: Some(crate::backend::types::ModelInfo {
+                    id: "gpt-5.1-codex".into(),
+                    provider_id: "openai".into(),
+                    variant: None,
+                }),
+                agent: None,
+            },
+        )
+        .with_model_pick_route(ModelPickRoute::PerTurn);
+    let selections = backend.session_selections.clone();
+    // The mock applies the switch (the new level) and then goes silent.
+    backend.hang_after_apply();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/think high",
+        key(),
+        "msg_think",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("Thinking: high"),
+        "the reconciled level is reported as applied: {reply}"
+    );
+    assert_eq!(
+        selections
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|selection| selection.model.as_ref())
+            .and_then(|model| model.variant.as_deref()),
+        Some("high"),
+        "the server holds the level"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("high"),
+        "the mirror was reconciled"
+    );
+}
