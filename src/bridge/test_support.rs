@@ -2258,6 +2258,13 @@ impl MockBackend {
         self
     }
 
+    /// Scenario: the thread is already on the target provider and only the model
+    /// differs, so the model lands on the next turn (issue #910).
+    pub(crate) fn with_thread_model_next_turn(&mut self) -> &mut Self {
+        self.thread_model_change = crate::backend::types::ThreadModelChange::ModelNextTurn;
+        self
+    }
+
     /// Scenario: the client answers `id` as cola-authored through the
     /// authorship seam (a client that assigns its own ids, ADR-0090).
     pub(crate) fn with_authored_id(&mut self, id: &str) -> &mut Self {

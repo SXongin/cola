@@ -1902,8 +1902,28 @@ impl Backend for CodexClient {
         if model.provider_id == MODEL_PROVIDER {
             return Ok(ThreadModelChange::Unchanged);
         }
-        // The gate is re-checked here, at the moment of the request: a card
-        // that sat in Feishu across a config change must not switch.
+        // The read is the authority: a peer may have moved the thread since this
+        // connection last looked, and a success claim ("already" included) is
+        // only ever its answer about **both** halves of the pair.
+        let current = self
+            .threads()
+            .read(session_id, false)
+            .await
+            .map_err(client_error)?;
+        self.projections
+            .remember_thread_metadata(&current, self.projections.next_model_stamp());
+        let provider_matches = current.model_provider.as_deref() == Some(model.provider_id.as_str());
+        let model_matches = current.model.as_deref() == Some(model.id.as_str());
+        match (provider_matches, model_matches) {
+            (true, true) => return Ok(ThreadModelChange::Unchanged),
+            // Same provider, different model: a model change is the per-turn
+            // path, so no reload is made — the model rides the next turn.
+            (true, false) => return Ok(ThreadModelChange::ModelNextTurn),
+            (false, _) => {}
+        }
+        // A real provider change needs the opt-in, re-checked at the moment of
+        // the request: a card that sat in Feishu across a config change must
+        // not switch.
         if !self.threads().provider_switch_on_resume() {
             return Err(BridgeError::Client {
                 client: "codex",
@@ -1911,11 +1931,6 @@ impl Backend for CodexClient {
                          provider 只能在新线程切换"
                     .to_string(),
             });
-        }
-        if self.thread_provider(session_id).await.as_deref() == Some(model.provider_id.as_str()) {
-            // Same provider: the model rides the next `turn/start`, and no
-            // thread-level request is made at all.
-            return Ok(ThreadModelChange::Unchanged);
         }
         self.release_thread(session_id).await.map_err(client_error)?;
         // Step 2: the pair, never the provider alone.
@@ -7238,8 +7253,8 @@ mod tests {
             Backend::apply_thread_model(&client, "thread-1", &same)
                 .await
                 .expect("apply"),
-            crate::backend::types::ThreadModelChange::Unchanged,
-            "the model rides the next turn, so nothing thread-level happened"
+            crate::backend::types::ThreadModelChange::ModelNextTurn,
+            "the provider matches but the model does not: the model rides the next turn"
         );
         let calls = server.call_log();
         for forbidden in ["thread/unsubscribe", "thread/resume"] {
@@ -7309,6 +7324,78 @@ mod tests {
         assert_eq!(
             client.projections.model("thread-1").map(|model| model.model_id),
             Some("gpt-5.1-codex".to_string()),
+        );
+    }
+
+    /// Review finding 3: "already switched" is decided by a read-back of **both**
+    /// halves. A thread already on the target provider but a different model is
+    /// not done — the model rides the next turn (no reload), and the outcome says
+    /// so instead of claiming the pair. The exact pair answers `Unchanged`.
+    #[tokio::test]
+    async fn a_provider_match_with_another_model_is_not_already_done() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        // The thread is already on `deepseek`, but runs `gpt-5.1-codex`.
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("deepseek"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        server.clear_calls();
+        let change = Backend::apply_thread_model(
+            &client,
+            "thread-1",
+            &crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap(),
+        )
+        .await
+        .expect("apply");
+        assert_eq!(
+            change,
+            crate::backend::types::ThreadModelChange::ModelNextTurn,
+            "a provider match alone is not the pair"
+        );
+        let calls = server.call_log();
+        for forbidden in ["thread/unsubscribe", "thread/resume"] {
+            assert!(
+                !calls.iter().any(|method| method == forbidden),
+                "a same-provider model change must not reload the thread: {calls:?}"
+            );
+        }
+        // The mirror keeps the thread's truth; the requested model rides the
+        // next `turn/start`.
+        let held = client.projections.model("thread-1").expect("a model fact");
+        assert_eq!(held.provider_id, "deepseek");
+        assert_eq!(held.model_id, "gpt-5.1-codex");
+
+        // The exact pair is the only "already" answer.
+        server.clear_calls();
+        assert_eq!(
+            Backend::apply_thread_model(
+                &client,
+                "thread-1",
+                &crate::backend::parsing::parse_model("deepseek/gpt-5.1-codex").unwrap(),
+            )
+            .await
+            .expect("apply"),
+            crate::backend::types::ThreadModelChange::Unchanged
+        );
+        assert!(
+            !server.call_log().iter().any(|method| method == "thread/resume"),
+            "an exactly-matching pair sends no resume"
         );
     }
 

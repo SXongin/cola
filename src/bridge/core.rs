@@ -647,18 +647,6 @@ impl SharedCore {
             .await
     }
 
-    /// Record a thread-level provider on a Pending Session (issue #910): it
-    /// rides the eventual `thread/start`, never a turn.
-    pub async fn pick_pending_provider(
-        &self,
-        thread_key: &ThreadKey,
-        provider: &str,
-    ) -> crate::error::Result<bool> {
-        self.sessions_handle()
-            .pick_pending_provider(thread_key, provider)
-            .await
-    }
-
     /// Apply a `/think` pick (`variant: None` clears).
     pub async fn pick_think(
         &self,

@@ -298,8 +298,10 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   recorded locally — close the other client, or use `thread/fork` with the
   pair. A pick made while a turn is running is recorded and applied after that
   turn, before the next message; if it still cannot apply then, that message is
-  not sent (cola never runs it on the old provider silently). The click is
-  acknowledged before the switch runs, so a slow daemon cannot freeze the card.
+  not sent (cola never runs it on the old provider silently). A thread that is
+  already on the target provider but runs another model is not reloaded: the
+  model rides the next turn. The click is acknowledged before the switch runs,
+  so a slow daemon cannot freeze the card.
 - **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the
