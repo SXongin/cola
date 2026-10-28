@@ -664,12 +664,75 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
   `/model` 的值必须在 cola 连接的服务器上存在。不带参数的 `/model` 打开
   provider → model 选择卡片，其说明会显示下一条消息实际将运行的模型（会话
   自身的选择，否则 `[opencode] model`，否则服务器记录的值）。`/compact` 与
-  `/stop` 需要真实会话，对待建状态保持它们的「还没有会话」回复。
+  `/stop` 需要真实会话，对待建状态保持它们的「还没有会话」回复。Codex 的
+  Agent Client 读取 `/model` 的方式不同——见下文「Codex 客户端上的 `/model`」。
 - `/restart-opencode` 会重启 Owned Server 或 V2 Shared Service（`opencode service
   restart`）；由其他工具启动的服务器不会被动（`NotOwned`）。
 - 话题规则：在已绑定会话的话题里，`/switch`、`/new`、`/dir` 与 `/sub attach`
   会被拒绝——请回到主聊天操作。从未绑定过会话的话题（包括 `/topic` 打开、
   仍在等待第一条消息的话题）可以用它们来绑定它唯一的会话。
+
+### Codex 客户端上的 `/model`
+
+Codex 的模型轴不是 provider → model 树：provider 是**线程级**事实，模型是
+**每轮**事实，内置目录是**全局**的。因此不带参数的 `/model` 只有一行当前
+模型与两个分区，不会出现「选择 provider（共 1 个）」这种伪层级：
+
+- **当前模型来自线程，cola 自己的选择排在它前面。** 卡片的 当前模型 行按
+  顺序取：会话记录的所选值（你做过选择时），再用 `thread/read` 读到的线程
+  自身 `model` 与 `modelProvider`——所以其他客户端改过这条线程后，再打开
+  卡片就能看到那次变化，footer 与选择卡片不会各说一套。
+- **「模型（每轮可换）」** 列出四类来源，各自标注：`model/list` 的内置目录
+  （分组为「内置目录（任何 provider 可试）」——这些 id 不属于任何 provider，
+  可以经任意一个运行）、配置顶层 `model`（配置默认）、每个
+  `[profiles.<name>]` 预设（`model` + `model_provider`，显示为
+  `profile：model（provider）`），以及某个 provider 的 `/models` 返回的 id
+  （按 provider 分组）。点选后，下一条消息的 `turn/start.model` 就是该 id，
+  线程后续轮次也继续使用它。
+- **任何清单之外的 id 用文本输入。** `/model codex/<id>` 记录一个 id，
+  `/model <provider>/<model>` 记录一对。Codex 对两者都不校验：只有内置目录
+  的条目带显示名、上下文窗口与思考等级，所以拼错会在下一条消息上以 provider
+  自身的报错出现。
+
+**`/models` 探测是尽力而为，它被拒绝也不算错误。** `GET <base_url>/models`
+不属于 Responses API——`wire_api = "responses"` 并不保证它存在。cola 用各
+`[model_providers.<id>]` 自己的 `experimental_bearer_token` 去问，每次探测
+2 秒，并把结果（包括失败）缓存三分钟。拿不到可用答案时，卡片用一行说明代替
+按钮：403「拒绝访问 /models（403）」、404「没有 /models（404）」、401、超时、
+网络不可达、响应无法解析，或凭据只写在 `env_key` 里——这种 provider 会被
+点名跳过，因为守护进程的环境不是 cola 的。内置目录、配置默认与 profile 始终
+在，而卡片回调只从缓存作答，所以第一次冷点击可能只显示 provider、没有探测到的
+模型，下一次从根页打开 `/model` 时补齐。token 只出现在请求的 `Authorization`
+头里：卡片、日志行与错误信息中都不会出现。
+
+**provider 是线程级的，所以换 provider 是另一种操作。** 卡片的第二个分区
+「Provider（线程级：新线程 / resume）」就是这些行。provider 在
+`thread/start` 或 `thread/resume` 时确定；`turn/start` 没有 provider 字段，
+而且 provider 永远不能单独选——把旧模型名留在新 provider 上会 404。因此：
+
+- **新线程直接带走这一对。** 在待建会话（第一条消息之前）上点 provider 行，
+  这一对随 `thread/start` 发送。无需确认：没有别的客户端会被影响。
+- **已有线程先记录，再在下一条消息前切换。** 打开
+  `provider_switch_on_resume = true`（位于 `[clients.<id>]`，默认 `false`）时，
+  点 provider 会弹出确认卡片。确认 只记录这一对并立即返回——线程本身不动。
+  下一条消息的预检随后释放 cola 对该线程的订阅，用 provider **和** 模型调用
+  `thread/resume`，再回读该线程；成功只认回读，不认 RPC 的 `ok`。轮次运行中
+  做的选择同样被记录，并作用于下一条消息。开关关闭时，对已有线程点 provider
+  只回答「provider 只能在新线程切换」，既不记录也不发送。
+- **对端可能持有该线程。** 如果另一个客户端（Codex TUI、VS Code、桌面端）
+  或另一个共用同一 `CODEX_HOME` 的 cola 实例仍持有这条线程，服务器不会重新
+  加载它，切换无法落地：那条消息**不会发送**，错误会点名这两种可能，已记录的
+  这一对保留以便重试——先关掉另一个客户端，或带上这一对 fork 线程
+  （`thread/fork`）。代价是对称的：cola 持有某条活动线程的订阅期间，你在 TUI
+  里改的 provider 同样会被静默忽略。线上这两者无法与成功区分，所以换 provider
+  前请关掉另一端。
+- **同一 provider 内的点选只是一次模型变更。** `model_provider` 等于线程当前
+  provider 的 `[profiles.*]` 预设，或任意 `codex/<id>` 点选，都只记录模型并
+  随下一条消息生效——不释放、不 resume、不重新加载。
+
+`provider_switch_on_resume` 同样管着文本形式：对不同 provider 的
+`/model <provider>/<model>` 会打开同一张确认卡片（开关关闭时被拒绝），绝不会
+静默改动线程。该开关的完整说明见上文 `[clients.<id>]` 小节。
 
 ## FAQ / 故障排查
 
