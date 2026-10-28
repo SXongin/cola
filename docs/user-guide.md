@@ -278,17 +278,28 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   with, and a thread your TUI created and cola adopted keeps it too unless
   `apply_on_adopt = true`.
 - **`provider_switch_on_resume` (codex only, default `false`)** — whether
-  `/model`'s provider pick may change an **existing** thread. A provider is a
+  `/model` may change an **existing** thread's provider. A provider is a
   thread-level fact (`thread/start`'s and `thread/resume`'s `modelProvider`;
-  `turn/start` has none), so a new thread takes the provider chosen on a Pending
-  Session at creation, and nothing else can change it — from the wire's point of
-  view a resume is the only door. Off by default, for `apply_on_adopt`'s reason:
-  the thread may be shared with your TUI/VSCode, and every attached client sees
-  the new provider. Off, the pick only says 「provider 只能在新线程切换」 and
-  sends nothing; on, cola asks for confirmation first, and the confirmation card
-  says the other clients on the thread will see the change. Either way the model
-  stays as it is, and a failed resume is reported by name (the thread keeps its
-  old provider).
+  `turn/start` has none), so it is always chosen as a **pair** with a model: a
+  `[profiles.*]` preset (`model` + `model_provider`) or a model a provider's
+  `/models` listed. A bare provider is not selectable — leaving the old model
+  name on a new provider is a 404. Off by default, for `apply_on_adopt`'s
+  reason: the thread may be shared with your TUI/VSCode, and every attached
+  client sees the new provider. Off, a provider pick only says 「provider 只能
+  在新线程切换」 and sends nothing — a new thread still takes the pair chosen on
+  a Pending Session at creation. On, cola asks for confirmation, then changes the
+  thread with the protocol's three steps: release its own subscription
+  (`thread/unsubscribe`; a resume on an already-loaded thread is a silent
+  no-op), `thread/resume` with `modelProvider` **and** `model`, then
+  `thread/read` to verify — success is only the read-back. If another client
+  (a Codex TUI, VS Code, the desktop app) or another cola instance sharing the
+  same `CODEX_HOME` still holds the thread, the change does not land: the card
+  names both possibilities, the thread keeps its old pair, and nothing is
+  recorded locally — close the other client, or use `thread/fork` with the
+  pair. A pick made while a turn is running is recorded and applied after that
+  turn, before the next message; if it still cannot apply then, that message is
+  not sent (cola never runs it on the old provider silently). The click is
+  acknowledged before the switch runs, so a slow daemon cannot freeze the card.
 - **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the

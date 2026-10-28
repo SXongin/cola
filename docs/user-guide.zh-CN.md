@@ -205,15 +205,24 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
   改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
   也一样——除非 `apply_on_adopt = true`。
-- **`provider_switch_on_resume`（仅 codex，默认 `false`）** —— `/model` 的
-  provider 选择能否改动**已有**线程。provider 是线程级事实（`thread/start` 与
-  `thread/resume` 的 `modelProvider`，`turn/start` 没有这个字段），所以新线程
-  在创建时接受 Pending Session 上选好的 provider，除此之外协议里唯一的入口就是
-  resume。默认关闭，理由与 `apply_on_adopt` 相同：这条线程可能与你的
+- **`provider_switch_on_resume`（仅 codex，默认 `false`）** —— `/model` 能否改动
+  **已有**线程的 provider。provider 是线程级事实（`thread/start` 与
+  `thread/resume` 的 `modelProvider`，`turn/start` 没有这个字段），所以它永远与
+  模型**成对**选择：`[profiles.*]` 预设（`model` + `model_provider`），或某个
+  provider 的 `/models` 列出的模型。单独的 provider 不可选——把旧模型名留在新
+  provider 上会 404。默认关闭，理由与 `apply_on_adopt` 相同：这条线程可能与你的
   TUI/VSCode 共享，接在上面的每个客户端都会看到新的 provider。关闭时，点选只会
-  提示「provider 只能在新线程切换」，**不发送任何请求**；打开后 cola 先弹确认
-  卡，卡上写明同一线程上的其他客户端也会看到变化。无论开关如何，模型都保持不变；
-  resume 失败会具名报错（线程保留原来的 provider）。
+  提示「provider 只能在新线程切换」，**不发送任何请求**——新线程仍然在创建时接受
+  Pending Session 上选好的那一对。打开后 cola 先弹确认卡，再用协议规定的三步改动
+  线程：先释放自己的订阅（`thread/unsubscribe`；对已加载的线程直接 resume 是静默
+  no-op），然后 `thread/resume` 同时带上 `modelProvider` 与 `model`，最后用
+  `thread/read` 回读校验——只有回读才算成功。如果有别的客户端（Codex TUI、
+  VS Code、桌面端）或另一个共用同一 `CODEX_HOME` 的 cola 实例仍持有这条线程，
+  改动不会落地：确认卡/结果卡会点名这两种可能，线程保留原来的一对，本地也不写任何
+  记录——关掉那个客户端，或用 `thread/fork` 带上 provider 与模型。一轮正在跑时
+  做出的选择会被记录，在该轮结束后、下一条消息发出前应用；如果那时仍无法应用，
+  这条消息不会被发送（cola 绝不会悄悄用旧 provider 跑一轮）。点击会先被确认，
+  切换在后台进行，慢的守护进程不会卡住卡片。
 - **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
