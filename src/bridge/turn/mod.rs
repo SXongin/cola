@@ -771,6 +771,38 @@ impl Turn {
         if let Some(model) = model.as_ref() {
             match handles.backend.model_pick_route(&self.session_id, model).await {
                 Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
+                    // The recorded pair may carry a `/think` variant the new
+                    // model's catalog does not declare (ADR-0020), and the
+                    // confirmation that recorded it deliberately deferred the
+                    // clear to here (a card callback acks from a store write
+                    // only, issue #910). Resolve it now — a catalog read, never
+                    // under the gate — and record the clear before the switch,
+                    // so this prompt cannot send a variant the new model lacks.
+                    let pair = format!("{}/{}", model.provider_id, model.id);
+                    let mut cleared = self.turn_variant.clone();
+                    if handles
+                        .sessions
+                        .clear_variant_for_model(&handles.backend, &mut cleared, &pair)
+                        .await
+                        .is_some()
+                    {
+                        // Compare-and-set on the pair the pre-flight read: a
+                        // pick landing since is the newer record and keeps its
+                        // own variant; this prompt still runs the pair it read,
+                        // whose variant it validated above.
+                        if handles
+                            .sessions
+                            .clear_variant_for_pair(
+                                &self.thread_key,
+                                &self.session_id,
+                                &pair,
+                                self.turn_variant.as_deref(),
+                            )
+                            .await
+                        {
+                            self.turn_variant = cleared;
+                        }
+                    }
                     handles
                         .backend
                         .apply_thread_model(&self.session_id, model)

@@ -464,6 +464,23 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         Ok(crate::backend::types::ThreadModelChange::Unchanged)
     }
 
+    /// Whether this client has a **thread-level provider axis** (Codex's
+    /// `modelProvider`): only such a client can carry a provider into
+    /// `thread/start` or switch one by resuming. The default answers `false` —
+    /// a client whose provider rides each prompt (OpenCode) has nothing to
+    /// record, and its create body must stay exactly as it was.
+    fn has_thread_provider(&self) -> bool {
+        false
+    }
+
+    /// The thread-level provider this client's **own cache** holds for the
+    /// session, when it knows one (Codex's ordered thread fact). Cache-only: no
+    /// RPC, so a card callback can decide "is the gate even relevant here"
+    /// without a request. `None` means unknown.
+    fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     /// Whether this generation keeps model/agent choices as durable session
     /// state (V2's session switches) rather than sending them with each prompt
     /// (V1). A caller uses this to know a server-side switch is REQUIRED for a

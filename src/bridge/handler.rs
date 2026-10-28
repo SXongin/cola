@@ -4770,7 +4770,7 @@ impl App {
             return Some(self.pick_paired_model(core, &thread_key, provider, &picked).await);
         }
 
-        Some(self.pick_model_ref(core, &thread_key, &picked).await)
+        Some(self.pick_model_ref(core, &thread_key, None, &picked).await)
     }
 
     /// A concrete **model-only** pick: record the override (and on a durable
@@ -4781,6 +4781,7 @@ impl App {
         &self,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
+        expected_session: Option<&str>,
         picked: &str,
     ) -> CardActionResult {
         if crate::backend::parsing::parse_model(picked).is_none() {
@@ -4790,7 +4791,8 @@ impl App {
             };
         }
         let cleared_variant = match classify_pick(
-            core.pick_model(thread_key, picked).await,
+            core.pick_model_expecting(thread_key, expected_session, picked)
+                .await,
             "模型",
             crate::bridge::display::feishu_side_label(thread_key),
         ) {
@@ -4858,7 +4860,10 @@ impl App {
             .model_pick_decision(&core.client, thread_key, provider, model)
             .await
         {
-            ModelPickDecision::Record => self.pick_model_ref(core, thread_key, &spec).await,
+            ModelPickDecision::Record { session_id } => {
+                self.pick_model_ref(core, thread_key, session_id.as_deref(), &spec)
+                    .await
+            }
             ModelPickDecision::Confirm {
                 session_id,
                 provider,
@@ -5001,8 +5006,10 @@ impl App {
         // overwrite.
         // The card named a session: if `/switch` remapped the chat in between,
         // this is a no-op instead of a record on the new session (issue #910).
+        // A store write only: no catalog read on the ack path (issue #910). The
+        // turn pre-flight resolves the `/think` clear for the recorded pair.
         let saved = core
-            .pick_model_expecting(&thread_key, Some(&session_id), &pair)
+            .record_pair_expecting(&thread_key, Some(&session_id), &pair)
             .await;
         match classify_pick(
             saved,

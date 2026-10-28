@@ -1693,6 +1693,13 @@ pub struct MockBackend {
     pub model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// Counts `model_surface` calls that reached [`Self::model_surface_gate`].
     pub model_surface_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Holds the next durable `switch_session_model` calls (V2 semantics)
+    /// until released, so a test can prove a pick runs its RPCs outside the
+    /// session gate (issue #910).
+    pub switch_model_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `switch_session_model` calls that reached
+    /// [`Self::switch_model_gate`].
+    pub switch_model_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// Holds the next `create_session` calls (lazy creation / materialisation)
     /// until released, so a test can interleave a pair write with the creation
     /// window (issue #910).
@@ -1771,6 +1778,12 @@ pub struct MockBackend {
     /// live thread's provider pick is refused with a toast. Shared so a test can
     /// turn the gate off *after* a confirmation card was rendered.
     pub provider_change_scope: Arc<std::sync::Mutex<crate::backend::types::ChangeScope>>,
+    /// Whether this client has a thread-level provider axis (issue #910): the
+    /// mock defaults to OpenCode's shape, so a Pending Session records no
+    /// provider and the create payload stays provider-free.
+    pub thread_provider: bool,
+    /// What `known_thread_provider` answers (the cache-only provider fact).
+    pub known_thread_provider: Option<String>,
     /// What `model_pick_route` answers: `PerTurn` (the default) is the
     /// same-provider path; `ThreadModel` needs the thread-level switch.
     pub model_pick_route: crate::backend::types::ModelPickRoute,
@@ -2033,6 +2046,8 @@ impl MockBackend {
             transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             model_surface_gate: std::sync::Mutex::new(None),
             model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            switch_model_gate: std::sync::Mutex::new(None),
+            switch_model_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             create_session_gate: std::sync::Mutex::new(None),
             create_session_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
@@ -2060,6 +2075,8 @@ impl MockBackend {
             provider_change_scope: Arc::new(std::sync::Mutex::new(
                 crate::backend::types::ChangeScope::NewThread,
             )),
+            thread_provider: false,
+            known_thread_provider: None,
             model_pick_route: crate::backend::types::ModelPickRoute::PerTurn,
             model_pick_route_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             thread_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
@@ -2245,6 +2262,18 @@ impl MockBackend {
     /// records nothing — a peer that still holds the thread.
     pub(crate) fn fail_provider_switch(&mut self, message: &str) -> &mut Self {
         self.thread_model_error = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the client has a thread-level provider axis (Codex's shape).
+    pub(crate) fn with_thread_provider(&mut self, provider: bool) -> &mut Self {
+        self.thread_provider = provider;
+        self
+    }
+
+    /// Scenario: the client's cache-only thread provider fact.
+    pub(crate) fn with_known_thread_provider(&mut self, provider: Option<&str>) -> &mut Self {
+        self.known_thread_provider = provider.map(str::to_string);
         self
     }
 
@@ -2475,6 +2504,16 @@ impl MockBackend {
     pub(crate) fn hold_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Hold every durable `switch_session_model` call until the returned
+    /// semaphore is released, counting the calls that reached the gate. Lets a
+    /// test prove the pick is parked in a backend RPC while the session gate is
+    /// free (issue #910).
+    pub(crate) fn hold_session_switch(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.switch_model_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -3001,6 +3040,14 @@ impl crate::backend::Backend for MockBackend {
             ));
         }
         Ok(())
+    }
+
+    fn has_thread_provider(&self) -> bool {
+        self.thread_provider
+    }
+
+    fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
+        self.known_thread_provider.clone()
     }
 
     fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
@@ -3584,6 +3631,16 @@ impl crate::backend::Backend for MockBackend {
     ) -> crate::error::Result<()> {
         if let Some(error) = &self.switch_error {
             return Err(crate::error::BridgeError::OpenCode(error.clone()));
+        }
+        let gate = self
+            .switch_model_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(gate) = gate {
+            self.switch_model_gate_entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _permit = gate.acquire().await;
         }
         self.switch_model_calls
             .lock()

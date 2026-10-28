@@ -2613,3 +2613,60 @@ async fn the_default_codex_client_refuses_a_live_provider_pick() {
     assert_eq!(step.toast.as_deref(), Some("provider 只能在新线程切换"));
     assert_eq!(server.resume_calls(), 1, "the click sent no request at all");
 }
+
+/// Issue #910, item 5: with the gate off, a provider pick on a live Codex
+/// thread whose projection is **cold** is still decided from the cache — the
+/// refusal toast needs no request at all, not even the `thread/read` that
+/// classifying the pick would have issued (an ack path must not probe).
+#[tokio::test]
+async fn a_gated_off_pick_on_a_cold_projection_sends_no_request() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a shared thread",
+    ));
+    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+    // The default options leave the provider gate shut; nothing adopts the
+    // thread, so the adapter's projection holds no provider fact for it.
+    let client = codex_client(&url).await;
+
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
+    seed_entry(&app, codex_entry("thread-1")).await;
+
+    server.clear_calls();
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("provider 只能在新线程切换"),
+        "the refusal names the gate: {reply}"
+    );
+    assert_eq!(
+        server.call_log(),
+        Vec::<String>::new(),
+        "a gated-off pick on a cold projection sends no request"
+    );
+}
