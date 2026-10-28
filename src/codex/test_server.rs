@@ -374,6 +374,9 @@ struct State {
     /// One-shot: leave the next `thread/unsubscribe` unanswered, so a stalled
     /// release's cleanup is exercised (issue #910).
     silent_unsubscribe: std::sync::atomic::AtomicBool,
+    /// One-shot: delay the next `thread/unsubscribe` reply, so a *late* ack can
+    /// race a restore (issue #910).
+    unsubscribe_delay: std::sync::Mutex<std::time::Duration>,
     /// Fail this many `thread/turns/list` calls before answering normally.
     fail_turns_pages: AtomicUsize,
     /// Scripted notifications a `turn/start` emits to the thread's subscribers:
@@ -496,6 +499,7 @@ impl Default for State {
             calls: std::sync::Mutex::new(Vec::new()),
             resume_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             silent_unsubscribe: std::sync::atomic::AtomicBool::new(false),
+            unsubscribe_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             fail_turns_pages: AtomicUsize::new(0),
             scripted_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             turn_starts: AtomicUsize::new(0),
@@ -897,6 +901,12 @@ impl FakeServer {
     /// open), so a stalled release's cleanup path is exercised (issue #910).
     pub(crate) fn silence_next_unsubscribe(&self) {
         self.state.silent_unsubscribe.store(true, Ordering::SeqCst);
+    }
+
+    /// Delay the next `thread/unsubscribe` reply by `delay` (one-shot): lets a
+    /// test prove a **late** ack cannot evict a restored subscription.
+    pub(crate) fn set_unsubscribe_delay(&self, delay: std::time::Duration) {
+        *self.state.unsubscribe_delay.lock().expect("unsubscribe delay") = delay;
     }
 
     /// `thread/resume` calls received so far.
@@ -1927,6 +1937,13 @@ where
             state.unsubscribe_calls.fetch_add(1, Ordering::SeqCst);
             if state.silent_unsubscribe.swap(false, Ordering::SeqCst) {
                 return true;
+            }
+            let delay = {
+                let mut delay = state.unsubscribe_delay.lock().expect("unsubscribe delay");
+                std::mem::take(&mut *delay)
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             if state.reject_unsubscribe.load(Ordering::SeqCst) > 0 {
                 state.reject_unsubscribe.fetch_sub(1, Ordering::SeqCst);

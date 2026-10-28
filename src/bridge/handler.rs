@@ -473,11 +473,6 @@ pub struct App {
     /// either a confirmed send or an ambiguous timeout.
     viewer_file_transfers_sent:
         Arc<std::sync::Mutex<indexmap::IndexMap<ViewerFileTransferKey, ViewerFileTransferStatus>>>,
-    /// Provider switches in flight, keyed by session id (issue #910): the
-    /// confirmation card is not single-flight by itself, so the claim is taken
-    /// atomically before the release/resume/read sequence starts and held until
-    /// its outcome lands. Same pattern as [`Self::viewer_actions_in_flight`].
-    provider_switches_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Turn Diff deliveries, keyed by `(session_id, from)` and bounded like the
     /// File Message guard (#801): one artifact per Turn per process, with the
     /// `Sending` claim making concurrent clicks a no-op.
@@ -1158,42 +1153,6 @@ impl Drop for ViewerActionGuard {
     }
 }
 
-/// One in-flight provider switch's claim (issue #910). Released on drop, so
-/// every exit of the switched task — success, refusal, panic — frees the
-/// session for the next confirmation.
-struct ProviderSwitchGuard {
-    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
-    session_id: String,
-}
-
-impl Drop for ProviderSwitchGuard {
-    fn drop(&mut self) {
-        let mut in_flight = self
-            .in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        in_flight.remove(&self.session_id);
-    }
-}
-
-/// The local state a failed switch must restore: the model mirror **and** the
-/// `/think` variant, because writing the pair can clear a variant the new model
-/// does not declare (ADR-0020). Both halves are restored together.
-struct PreviousPair {
-    model: Option<String>,
-    variant: Option<String>,
-    /// The session the snapshot was taken for: the write only lands while the
-    /// thread still maps to it.
-    session_id: Option<String>,
-}
-
-/// What recording a deferred pair concluded. The caller composes the surface: a
-/// pick stays a toast, a confirmation gets a card that retires its buttons.
-enum DeferredSave {
-    Saved { cleared_variant: Option<String> },
-    Failed(String),
-}
-
 /// Blocking filesystem reads cannot be cancelled by their async timeout. Keep
 /// only this many outstanding viewer reads; a timed-out closure holds its slot
 /// until the OS call returns, and later taps fail fast instead of queueing more.
@@ -1595,7 +1554,6 @@ impl App {
             core,
             access,
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            provider_switches_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             turn_diff_sends: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             #[cfg(test)]
@@ -1618,24 +1576,6 @@ impl App {
         Some(ViewerActionGuard {
             in_flight: Arc::clone(&self.viewer_actions_in_flight),
             key,
-        })
-    }
-
-    /// Claim the session's provider switch until the returned guard drops. A
-    /// second confirmation for the same session in that window gets no guard —
-    /// the caller answers it as already in progress instead of starting a
-    /// second release/resume/read sequence.
-    fn claim_provider_switch(&self, session_id: &str) -> Option<ProviderSwitchGuard> {
-        let mut in_flight = self
-            .provider_switches_in_flight
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !in_flight.insert(session_id.to_string()) {
-            return None;
-        }
-        Some(ProviderSwitchGuard {
-            in_flight: Arc::clone(&self.provider_switches_in_flight),
-            session_id: session_id.to_string(),
         })
     }
 
@@ -2665,7 +2605,9 @@ impl App {
                         // A create failure leaves the pending intact (and gives
                         // the claim back): surface the error here and let the
                         // next message retry.
-                        self.sessions_handle().unclaim_pending_creation(thread_key).await;
+                        self.sessions_handle()
+                            .unclaim_pending_creation(thread_key, generation)
+                            .await;
                         let _ = self
                             .feishu
                             .reply_text(
@@ -4921,25 +4863,9 @@ impl App {
                 toast: Some("provider 只能在新线程切换".to_string()),
             };
         }
-        if core.inflight.lock().await.contains(&session_id) {
-            // A turn is running: record the pair and let the next prompt apply
-            // it (issue #910) — never fail at pick time for this.
-            return match self.defer_pair(core, thread_key, &session_id, &spec).await {
-                DeferredSave::Saved { cleared_variant } => CardActionResult {
-                    card: None,
-                    toast: Some(format!(
-                        "已记录 `{spec}`：本轮结束后、下一条消息发出前切换{}",
-                        cleared_variant
-                            .map(|v| format!("（已清除思考等级 `{v}`）"))
-                            .unwrap_or_default()
-                    )),
-                },
-                DeferredSave::Failed(text) => CardActionResult {
-                    card: None,
-                    toast: Some(text),
-                },
-            };
-        }
+        // Idle or mid-turn makes no difference: the pair is **recorded**, and the
+        // next prompt's pre-flight applies it before submitting (the owner's
+        // 「下一轮生效」). Nothing is applied here.
         CardActionResult {
             card: Some(crate::feishu::card::picker::build_provider_confirm_card(
                 thread_key,
@@ -4997,85 +4923,17 @@ impl App {
         }
     }
 
-    /// Record a pair as the next prompt's intent while a turn is running (issue
-    /// #910).
-    ///
-    /// Intent-first: the intent is registered under the session gate **before
-    /// any await**, so a prompt that starts in the window waits for the record
-    /// instead of reading the old pair. The catalog lookup then runs outside the
-    /// gate, and the write is a compare-and-set against the snapshot the intent
-    /// was registered with.
-    async fn defer_pair(
-        &self,
-        core: &Arc<SharedCore>,
-        thread_key: &ThreadKey,
-        session_id: &str,
-        pair: &str,
-    ) -> DeferredSave {
-        use crate::bridge::session::MirrorWrite;
-        let gate = core.session_gates.gate(session_id);
-        // 1. Intent first, under the gate.
-        let (intent, snapshot) = {
-            let _held = gate.enter().await;
-            let (generation, _signal) = gate.begin_intent(pair);
-            let snapshot = core
-                .session_settings(thread_key)
-                .await
-                .filter(|settings| settings.session_id.as_deref() == Some(session_id));
-            (
-                crate::bridge::session_gates::IntentGuard::new(Arc::clone(&gate), generation),
-                snapshot,
-            )
-        };
-        let Some(snapshot) = snapshot else {
-            return DeferredSave::Failed("⚠️ 会话已切换，这次切换没有记录".to_string());
-        };
-        // 2. The catalog lookup, outside the gate.
-        let mut variant = snapshot.variant.clone();
-        let cleared = core
-            .sessions_handle()
-            .clear_variant_for_model(&core.client, &mut variant, pair)
-            .await;
-        // 3. Re-acquire, write, resolve — a waiter always wakes to the record.
-        let _held = gate.enter().await;
-        let result = match core
-            .sessions_handle()
-            .set_live_mirror(
-                thread_key,
-                session_id,
-                snapshot.model.as_deref(),
-                snapshot.variant.as_deref(),
-                MirrorWrite::Model {
-                    model: pair,
-                    clear_variant: cleared.as_deref(),
-                },
-            )
-            .await
-        {
-            Ok(crate::bridge::session::PairWrite::Applied { cleared_variant, .. }) => {
-                DeferredSave::Saved { cleared_variant }
-            }
-            // The pair must not be claimed when the state moved: a later prompt
-            // must not act on a record this click never really made.
-            Ok(_) => DeferredSave::Failed("⚠️ 保存失败：会话状态已变化，这次切换没有记录".to_string()),
-            Err(error) => DeferredSave::Failed(format!("⚠️ 保存失败：{error}")),
-        };
-        intent.resolve();
-        result
-    }
-
     /// The confirmation card's 确认 click (issue #910). The target is resolved
     /// **here**, so a card that outlived a `/switch`, a delete or a recreate
     /// does nothing; the gate is re-read, so a card sitting in Feishu cannot
-    /// switch a thread after `provider_switch_on_resume` was turned off.
+    /// record a switch after `provider_switch_on_resume` was turned off.
     ///
-    /// Two more guards apply before anything is spawned: one atomic claim per
-    /// session (a double-click or a redelivered callback must not start a second
-    /// release/resume sequence), and — because a prompt may have started after
-    /// the card was rendered — the same mid-turn deferral a pick gets, so the
-    /// thread is never changed under a running turn.
+    /// This only **records** the pair: the thread is not touched. The next
+    /// prompt's pre-flight (`Turn::attempt`) applies it before submitting — the
+    /// owner's 「下一轮生效」 — so the click answers synchronously and no work runs
+    /// off the ack.
     async fn handle_provider_switch_confirm(
-        self: &Arc<Self>,
+        &self,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
@@ -5122,265 +4980,43 @@ impl App {
                 toast: Some("这张确认卡已过期（会话已切换），没有做任何改动".to_string()),
             });
         }
-        // Re-checked at confirmation: the config may have been turned off
-        // while the card sat in the chat.
+        // Re-checked at confirmation: the config may have been turned off while
+        // the card sat in the chat. The pre-flight enforces it again before the
+        // thread is ever touched.
         if core.client.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
             return Some(CardActionResult {
                 card: None,
                 toast: Some("provider 只能在新线程切换".to_string()),
             });
         }
-        // One switch per session at a time: the claim is atomic, so a replay
-        // that beats the card update is answered, not started twice.
-        let Some(claim) = self.claim_provider_switch(&session_id) else {
-            return Some(CardActionResult {
-                card: Some(crate::feishu::card::picker::build_provider_busy_card(
-                    &provider, &model,
-                )),
-                toast: Some("上一次 provider 切换还在进行中".to_string()),
-            });
-        };
-        let message_id = value
-            .get("open_message_id")
-            .and_then(|v| v.as_str())
-            .filter(|message_id| !message_id.is_empty())
-            .map(str::to_string);
-        // Acknowledge with the in-progress card BEFORE the RPC starts: the
-        // resume + read-back must not ride the ack (issue #910) — a slow daemon
-        // would otherwise lose the outcome and leave the buttons live.
-        let switching = crate::feishu::card::picker::build_provider_switching_card(&provider, &model);
-        let app = Arc::clone(self);
-        tokio::spawn(async move {
-            // The claim lives as long as the task: every exit path releases it.
-            app.run_provider_switch(thread_key, session_id, provider, model, message_id, claim)
-                .await;
-        });
-        Some(CardActionResult {
-            card: Some(switching),
-            toast: Some("正在切换 provider…".to_string()),
-        })
-    }
-
-    /// Run a confirmed provider switch off the card-ack path and repaint the
-    /// card with the outcome (issue #910).
-    ///
-    /// **Intent first.** The switch's intent — the target pair and its
-    /// generation — is registered under the session gate before any await, so
-    /// from that moment a prompt for this session waits for the switch's verdict
-    /// and never reads/submits the old pair:
-    ///
-    /// 1. Under the gate: register the intent, take the snapshot the CAS will
-    ///    require, release.
-    /// 2. Outside the gate: the `/think` catalog lookup ("no async work under a
-    ///    lock others wait on").
-    /// 3. Under the gate: a brief read of the global turn set decides
-    ///    defer-vs-switch, then the mirror write is a CAS against the snapshot;
-    ///    a turn was running → the pair is the deferred record, otherwise the
-    ///    three steps run and a failure rolls back inside the gate. Resolve the
-    ///    intent before releasing, so a waiting prompt wakes to the final state.
-    ///
-    /// Other sessions never wait (the gate is per session, and the global turn
-    /// set is only read, never held across an RPC). The adapter bounds each RPC
-    /// itself, so no outer cancellation can skip the read-back/re-subscribe
-    /// cleanup.
-    async fn run_provider_switch(
-        self: &Arc<Self>,
-        thread_key: ThreadKey,
-        session_id: String,
-        provider: String,
-        model: String,
-        message_id: Option<String>,
-        claim: ProviderSwitchGuard,
-    ) {
-        use crate::backend::types::ThreadModelChange;
-        use crate::bridge::session::{MirrorWrite, PairWrite};
         let pair = format!("{provider}/{model}");
-        let info = crate::backend::types::ModelInfo {
-            id: model.clone(),
-            provider_id: provider.clone(),
-            variant: None,
-        };
-        let gate = self.core.session_gates.gate(&session_id);
-        // 1. Intent first, under the gate: a prompt arriving from here on waits
-        //    for this switch's verdict instead of reading the old pair.
-        let (intent, snapshot) = {
-            let _held = gate.enter().await;
-            let (generation, _signal) = gate.begin_intent(&pair);
-            let snapshot = self
-                .core
-                .session_settings(&thread_key)
-                .await
-                .map(|settings| PreviousPair {
-                    model: settings.model,
-                    variant: settings.variant,
-                    session_id: settings.session_id,
+        // Record the pair as the session's next-turn model. The same gated,
+        // compare-and-set write a `/model` pick uses, so a concurrent pick (or a
+        // remap, or a materialising session) is an honest refusal, never an
+        // overwrite.
+        let saved = core.pick_model(&thread_key, &pair).await;
+        match classify_pick(
+            saved,
+            "Provider",
+            crate::bridge::display::feishu_side_label(&thread_key),
+        ) {
+            PickReply::Applied { cleared_variant } => {
+                let extra = cleared_variant
+                    .map(|v| format!("（已清除思考等级 `{v}`）"))
+                    .unwrap_or_default();
+                Some(CardActionResult {
+                    card: Some(crate::feishu::card::picker::build_provider_recorded_card(
+                        &provider, &model,
+                    )),
+                    toast: Some(format!("已记录：下一条消息发出前切换{extra}")),
                 })
-                .filter(|snapshot| snapshot.session_id.as_deref() == Some(&session_id));
-            (
-                crate::bridge::session_gates::IntentGuard::new(Arc::clone(&gate), generation),
-                snapshot,
-            )
-        };
-        let Some(snapshot) = snapshot else {
-            let card = crate::feishu::card::picker::build_provider_switch_error_card(
-                &provider,
-                &model,
-                "这张确认卡已过期（会话已切换或不存在），没有做任何改动。",
-            );
-            intent.resolve();
-            self.finish_provider_switch(message_id, card, &pair).await;
-            drop(claim);
-            return;
-        };
-        // 2. The catalog lookup, outside the gate.
-        let mut variant = snapshot.variant.clone();
-        let cleared = self
-            .core
-            .sessions_handle()
-            .clear_variant_for_model(&self.core.client, &mut variant, &pair)
-            .await;
-
-        // 3. Re-acquire: decide, write, and (when no turn is running) switch.
-        let card = {
-            let _held = gate.enter().await;
-            let turn_running = self.core.inflight.lock().await.contains(&session_id);
-            let written = self
-                .core
-                .sessions_handle()
-                .set_live_mirror(
-                    &thread_key,
-                    &session_id,
-                    snapshot.model.as_deref(),
-                    snapshot.variant.as_deref(),
-                    MirrorWrite::Model {
-                        model: &pair,
-                        clear_variant: cleared.as_deref(),
-                    },
-                )
-                .await;
-            let card = match written {
-                Ok(PairWrite::Applied {
-                    variant: attempted_variant,
-                    ..
-                }) => {
-                    if turn_running {
-                        // The pair is the deferred record: the next prompt's
-                        // pre-flight (same gate) applies it before submitting.
-                        crate::feishu::card::picker::build_provider_deferred_card(&provider, &model)
-                    } else {
-                        match self.core.client.apply_thread_model(&session_id, &info).await {
-                            Ok(change) => match change {
-                                ThreadModelChange::Changed => {
-                                    crate::feishu::card::picker::build_provider_switched_card(
-                                        &provider, &model,
-                                    )
-                                }
-                                ThreadModelChange::Unchanged => {
-                                    crate::feishu::card::picker::build_provider_already_card(
-                                        &provider, &model,
-                                    )
-                                }
-                                // The provider was already right and only the
-                                // model differs: no reload happened, and the
-                                // model lands on the next turn.
-                                ThreadModelChange::ModelNextTurn => {
-                                    crate::feishu::card::picker::build_provider_model_pending_card(
-                                        &provider, &model,
-                                    )
-                                }
-                            },
-                            Err(error) => {
-                                tracing::warn!(
-                                    "provider switch to `{pair}` failed for {session_id}: {error}"
-                                );
-                                // Rolled back inside the gate: no prompt can
-                                // observe the attempted pair before it is undone.
-                                self.roll_back_provider_pair(
-                                    &session_id,
-                                    &pair,
-                                    attempted_variant.as_deref(),
-                                    snapshot.model,
-                                    snapshot.variant,
-                                )
-                                .await;
-                                crate::feishu::card::picker::build_provider_switch_error_card(
-                                    &provider,
-                                    &model,
-                                    &error.to_string(),
-                                )
-                            }
-                        }
-                    }
-                }
-                Ok(PairWrite::Creating) => crate::feishu::card::picker::build_provider_save_blocked_card(
-                    &pair,
-                    "会话正在创建中，请稍后在会话里重选",
-                ),
-                Ok(_) => crate::feishu::card::picker::build_provider_save_blocked_card(
-                    &pair,
-                    "会话状态已变化（可能刚切换或有新的选择），没有做任何改动",
-                ),
-                Err(error) => {
-                    crate::feishu::card::picker::build_provider_save_blocked_card(&pair, &error.to_string())
-                }
-            };
-            // Resolved under the gate: a waiter re-reads the final state.
-            intent.resolve();
-            card
-        };
-        // Released only after the outcome is on screen: a replay that beats the
-        // card update is still answered as in progress.
-        self.finish_provider_switch(message_id, card, &pair).await;
-        drop(claim);
-    }
-
-    /// Compare-and-restore the pending pair a failed switch wrote — one store
-    /// lock, targeted by session, and only while the entry still holds **both**
-    /// the model and the variant the attempt wrote. A newer `/model` or `/think`
-    /// that landed while the slow RPC ran is the user's latest intent and must
-    /// survive a stale rollback.
-    async fn roll_back_provider_pair(
-        &self,
-        session_id: &str,
-        attempted: &str,
-        attempted_variant: Option<&str>,
-        previous_model: Option<String>,
-        previous_variant: Option<String>,
-    ) {
-        match self
-            .core
-            .sessions_handle()
-            .rollback_pair(
-                session_id,
-                attempted,
-                attempted_variant,
-                previous_model,
-                previous_variant,
-            )
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!("provider switch rollback skipped: the mirror moved on from `{attempted}`")
             }
-            Err(error) => tracing::warn!("could not restore the previous model mirror: {error}"),
-        }
-    }
-
-    /// Repaint the clicked card with a switch's outcome (issue #910). A click
-    /// without the card's id cannot be answered that way; the outcome is still
-    /// logged so the switch is not invisible.
-    async fn finish_provider_switch(&self, message_id: Option<String>, card: serde_json::Value, pair: &str) {
-        match message_id {
-            Some(message_id) => {
-                if let Err(error) = self.feishu.update_message(&message_id, &card).await {
-                    tracing::warn!("the provider switch's outcome card did not land: {error}");
-                }
-            }
-            None => tracing::warn!(
-                "provider switch to `{pair}` finished without the clicked card's message id; \
-                 its outcome could not be shown"
-            ),
+            PickReply::Failed(text) => Some(CardActionResult {
+                card: Some(crate::feishu::card::picker::build_provider_save_blocked_card(
+                    &pair, &text,
+                )),
+                toast: Some(text),
+            }),
         }
     }
 

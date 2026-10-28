@@ -783,49 +783,27 @@ impl SessionsHandle {
         })
     }
 
-    /// Write a model/provider mirror change onto a **live** entry in one lock
-    /// (issue #910), compare-and-set on the snapshot the caller read and
-    /// re-verifying that the thread still maps to that session.
-    pub(crate) async fn set_live_mirror(
+    /// Claim the thread's Pending Session for materialisation (issue #910): the
+    /// snapshot and the claim are taken under one lock, so a pair write in the
+    /// window before `thread/start` cannot claim a pair the creation will not
+    /// apply.
+    pub(crate) async fn claim_pending_for_creation(
         &self,
         thread_key: &ThreadKey,
-        session_id: &str,
-        expected_model: Option<&str>,
-        expected_variant: Option<&str>,
-        write: crate::bridge::session::MirrorWrite<'_>,
-    ) -> crate::error::Result<crate::bridge::session::PairWrite> {
-        self.store.lock().await.set_mirror_live(
-            thread_key,
-            session_id,
-            expected_model,
-            expected_variant,
-            write,
-        )
+    ) -> crate::bridge::session::PendingClaim {
+        self.store.lock().await.claim_pending_for_creation(thread_key)
     }
 
-    /// Compare-and-restore a failed provider pair in ONE store lock (issue
-    /// #910): the previous mirror goes back only while the entry still holds the
-    /// model **and** variant the attempt wrote.
-    pub(crate) async fn rollback_pair(
-        &self,
-        session_id: &str,
-        attempted_model: &str,
-        attempted_variant: Option<&str>,
-        previous_model: Option<String>,
-        previous_variant: Option<String>,
-    ) -> crate::error::Result<bool> {
-        self.store.lock().await.rollback_pair(
-            session_id,
-            attempted_model,
-            attempted_variant,
-            previous_model,
-            previous_variant,
-        )
+    /// Release **this generation's** materialisation claim after a failed
+    /// creation (the pending stays, so the next message retries); a newer claim
+    /// on the thread is left alone (issue #910).
+    pub(crate) async fn unclaim_pending_creation(&self, thread_key: &ThreadKey, generation: u64) {
+        self.store
+            .lock()
+            .await
+            .unclaim_pending_creation(thread_key, generation);
     }
 
-    /// Claim a Pending Session for materialisation (issue #910): the snapshot
-    /// and the claim are taken under one lock, so a pair write in the window
-    /// before `thread/start` cannot claim a pair the creation will not apply.
     /// Activate the session a materialisation created, scoped to its claim's
     /// generation (issue #910): a replacement pending declared while the
     /// creation ran is left alone.
@@ -840,17 +818,16 @@ impl SessionsHandle {
         Ok(())
     }
 
-    pub(crate) async fn claim_pending_for_creation(
+    /// Write one conversation's `/agent` override, touching only that field
+    /// (issue #910): a whole settings snapshot could restore a stale
+    /// model/variant over a recorded switch.
+    pub(crate) async fn set_agent(
         &self,
         thread_key: &ThreadKey,
-    ) -> crate::bridge::session::PendingClaim {
-        self.store.lock().await.claim_pending_for_creation(thread_key)
-    }
-
-    /// Release a materialisation claim whose creation failed (the pending
-    /// stays, so the next message retries).
-    pub(crate) async fn unclaim_pending_creation(&self, thread_key: &ThreadKey) {
-        self.store.lock().await.unclaim_pending_creation(thread_key);
+        session_id: Option<&str>,
+        agent: Option<&str>,
+    ) -> crate::error::Result<bool> {
+        self.store.lock().await.set_agent(thread_key, session_id, agent)
     }
 
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the
@@ -896,11 +873,6 @@ impl SessionsHandle {
         // the session gate, compare-and-set against what the caller read.
         let gate = self.session_gates.gate(&session_id);
         let _held = gate.enter().await;
-        if gate.has_intent() {
-            // A provider switch owns the pair until it resolves; a pick that
-            // waited for it would land on a state the user did not see.
-            return Ok(PickOutcome::StateChanged);
-        }
         let Some(current) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
@@ -1013,9 +985,6 @@ impl SessionsHandle {
         };
         let gate = self.session_gates.gate(&session_id);
         let _held = gate.enter().await;
-        if gate.has_intent() {
-            return Ok(PickOutcome::StateChanged);
-        }
         let Some(current) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
@@ -1062,26 +1031,32 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         agent: Option<String>,
     ) -> crate::error::Result<PickOutcome> {
-        let Some(mut settings) = self.session_settings(thread_key).await else {
+        let Some(settings) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
-        if let Some(session_id) = settings.session_id.clone()
+        let session_id = settings.session_id.clone();
+        if let Some(session_id) = session_id.as_deref()
             && backend.keeps_session_selection()
         {
             match &agent {
-                Some(picked) => backend.switch_session_agent(&session_id, picked).await?,
+                Some(picked) => backend.switch_session_agent(session_id, picked).await?,
                 None => {
                     let Some(default) =
                         crate::backend::types::AgentInfo::default_agent(&backend.list_agents().await)
                     else {
                         return Ok(PickOutcome::NoDefaultAgent);
                     };
-                    backend.switch_session_agent(&session_id, &default).await?;
+                    backend.switch_session_agent(session_id, &default).await?;
                 }
             }
         }
-        settings.agent = agent;
-        if !self.set_session_settings(thread_key, settings).await? {
+        // Only the agent field is written (issue #910): a whole snapshot could
+        // restore the model/variant another writer changed meanwhile — a switch
+        // recorded since this read, for instance.
+        if !self
+            .set_agent(thread_key, session_id.as_deref(), agent.as_deref())
+            .await?
+        {
             return Ok(PickOutcome::NoTarget);
         }
         Ok(PickOutcome::Applied {

@@ -412,6 +412,7 @@ impl SessionStore {
         self.creating.remove(key);
         *self.pending_epoch.entry(key.clone()).or_default() += 1;
         self.pending_mut().retain(|p| &p.thread_key != key);
+        self.prune_pending_epoch(key);
         self.write_to_disk()
     }
 
@@ -521,7 +522,25 @@ impl SessionStore {
         } else {
             self.promote(entry);
         }
+        self.prune_pending_epoch(&key);
         self.write_to_disk()
+    }
+
+    /// Drop a thread's pending-epoch entry once no claim and no pending need it
+    /// (issue #910): the map must not grow with every `/new` the process ever
+    /// saw. Removed only when nothing can compare against it — a live claim keeps
+    /// its epoch, and a pending keeps the epoch its next claim will take.
+    fn prune_pending_epoch(&mut self, key: &ThreadKey) {
+        if !self.creating.contains_key(key) && self.pending_for(key).is_none() {
+            self.pending_epoch.remove(key);
+        }
+    }
+
+    /// How many pending-epoch entries the store retains (test-only: proves the
+    /// map does not grow with every `/new`).
+    #[cfg(test)]
+    pub(crate) fn pending_epochs(&self) -> usize {
+        self.pending_epoch.len()
     }
 
     /// Test-only in-memory promote (seed a store without writing a file); the
@@ -738,41 +757,58 @@ impl SessionStore {
         PendingClaim::Claimed(Box::new(pending), claim.generation)
     }
 
-    /// Release a materialisation claim without creating the session (the
-    /// pending stays, so the next message retries).
-    pub(crate) fn unclaim_pending_creation(&mut self, key: &ThreadKey) {
-        self.creating.remove(key);
+    /// Release **this generation's** materialisation claim without creating the
+    /// session (the pending stays, so the next message retries). A newer claim on
+    /// the same thread is left alone (issue #910).
+    pub(crate) fn unclaim_pending_creation(&mut self, key: &ThreadKey, generation: u64) {
+        if self
+            .creating
+            .get(key)
+            .is_some_and(|claim| claim.generation == generation)
+        {
+            self.creating.remove(key);
+        }
     }
 
-    /// Compare-and-restore a failed provider pair (issue #910), in ONE lock: the
-    /// previous model+variant go back only while the entry still holds exactly
-    /// the model **and** variant the attempt wrote. A newer `/model` or `/think`
-    /// that landed while the slow RPC ran is the user's latest intent and is
-    /// never overwritten. Targeted by `session_id`, so a remap cannot make it
-    /// restore the wrong thread. Returns whether anything was restored.
-    pub(crate) fn rollback_pair(
+    /// Write one conversation's `/agent` override, touching **only** that field
+    /// (issue #910): a whole [`SessionSettings`] snapshot write could restore a
+    /// stale model/variant over a switch recorded meanwhile. Targets the pending
+    /// when one exists, else the live entry by session id (mapping re-verified).
+    pub(crate) fn set_agent(
         &mut self,
-        session_id: &str,
-        attempted_model: &str,
-        attempted_variant: Option<&str>,
-        previous_model: Option<String>,
-        previous_variant: Option<String>,
+        key: &ThreadKey,
+        session_id: Option<&str>,
+        agent: Option<&str>,
     ) -> crate::error::Result<bool> {
-        let client_id = self.client_id.clone();
-        let Some(entry) = self
-            .entries_mut()
-            .iter_mut()
-            .find(|e| e.client_id == client_id && e.session_id == session_id)
-        else {
-            return Ok(false);
+        let agent = agent.map(str::to_string);
+        let applied = match session_id {
+            None => {
+                let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
+                    return Ok(false);
+                };
+                pending.agent = agent;
+                true
+            }
+            Some(session_id) => {
+                let client_id = self.client_id.clone();
+                let Some(entry) = self
+                    .entries_mut()
+                    .iter_mut()
+                    .find(|e| e.client_id == client_id && e.session_id == session_id)
+                else {
+                    return Ok(false);
+                };
+                if &entry.thread_key != key {
+                    return Ok(false);
+                }
+                entry.agent = agent;
+                true
+            }
         };
-        if entry.model.as_deref() != Some(attempted_model) || entry.variant.as_deref() != attempted_variant {
-            return Ok(false);
+        if applied {
+            self.write_to_disk()?;
         }
-        entry.model = previous_model;
-        entry.variant = previous_variant;
-        self.write_to_disk()?;
-        Ok(true)
+        Ok(applied)
     }
 
     /// Write a [`SessionSettings`] snapshot back to the target it came from and
@@ -1639,60 +1675,6 @@ mod tests {
         );
     }
 
-    /// Issue #910: the rollback is a compare-and-swap under one lock — the
-    /// previous mirror is restored only while the entry still holds **both** the
-    /// model and the variant the attempt wrote, and only while the session is
-    /// still mapped. A newer `/think` (same model, different variant) is never
-    /// overwritten.
-    #[test]
-    fn rollback_pair_refuses_when_a_newer_variant_landed() {
-        let dir = tempdir().unwrap();
-        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
-        let mut entry = make_entry("chat1", "root1", "ses_1", "/tmp/one");
-        entry.model = Some("deepseek/pro".into());
-        entry.variant = Some("mid".into());
-        store.activate(entry).unwrap();
-
-        // The attempt wrote `deepseek/pro` with no variant; a `/think` then set
-        // `mid`. The variant no longer matches, so nothing is restored.
-        assert!(
-            !store
-                .rollback_pair(
-                    "ses_1",
-                    "deepseek/pro",
-                    None,
-                    Some("old/model".into()),
-                    Some("high".into())
-                )
-                .unwrap()
-        );
-        let entry = store.entry_for_session("ses_1").unwrap();
-        assert_eq!(entry.model.as_deref(), Some("deepseek/pro"));
-        assert_eq!(entry.variant.as_deref(), Some("mid"), "the newer /think survives");
-
-        // With both halves still as the attempt wrote them, the restore lands.
-        store
-            .update("ses_1", |e| {
-                e.model = Some("deepseek/pro".into());
-                e.variant = None;
-            })
-            .unwrap();
-        assert!(
-            store
-                .rollback_pair(
-                    "ses_1",
-                    "deepseek/pro",
-                    None,
-                    Some("old/model".into()),
-                    Some("high".into())
-                )
-                .unwrap()
-        );
-        let entry = store.entry_for_session("ses_1").unwrap();
-        assert_eq!(entry.model.as_deref(), Some("old/model"));
-        assert_eq!(entry.variant.as_deref(), Some("high"));
-    }
-
     /// Issue #910: the pending mirror write is a pending-only compare-and-set. It
     /// never falls through to the live entry once the session materialised, a
     /// claimed (materialising) pending refuses with `Creating`, and a newer pick
@@ -1772,7 +1754,12 @@ mod tests {
                 .unwrap(),
             PairWrite::Creating
         );
-        store.unclaim_pending_creation(&key);
+        let claim = store
+            .creating
+            .get(&key)
+            .map(|claim| claim.generation)
+            .expect("claimed");
+        store.unclaim_pending_creation(&key, claim);
 
         // Materialised (pending cleared, live entry active): no fallthrough.
         store.clear_pending(&key).unwrap();
@@ -1837,6 +1824,103 @@ mod tests {
             store.claim_pending_for_creation(&key),
             PendingClaim::Claimed(_, _)
         ));
+    }
+
+    /// Issue #910 (extra finding): releasing a materialisation claim is scoped to
+    /// its generation — an older creation's failure must not release a newer
+    /// claim on the same thread.
+    #[test]
+    fn unclaim_pending_creation_is_generation_scoped() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/first"))
+            .unwrap();
+        let PendingClaim::Claimed(_, first) = store.claim_pending_for_creation(&key) else {
+            panic!("claimable");
+        };
+        // The pending is cleared (removing the claim) and replaced, then claimed
+        // again: a new generation.
+        store.clear_pending(&key).unwrap();
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/second"))
+            .unwrap();
+        let PendingClaim::Claimed(_, second) = store.claim_pending_for_creation(&key) else {
+            panic!("claimable again");
+        };
+        assert_ne!(first, second);
+
+        // The older creation's failure releases nothing.
+        store.unclaim_pending_creation(&key, first);
+        assert!(
+            matches!(store.claim_pending_for_creation(&key), PendingClaim::Creating),
+            "the newer claim survives the older failure"
+        );
+        store.unclaim_pending_creation(&key, second);
+        assert!(matches!(
+            store.claim_pending_for_creation(&key),
+            PendingClaim::Claimed(_, _)
+        ));
+    }
+
+    /// Issue #910 (extra finding): the pending-epoch map is pruned once a thread
+    /// has neither a pending nor a claim, so it does not grow with every /new.
+    #[test]
+    fn pending_epochs_are_pruned() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/first"))
+            .unwrap();
+        assert_eq!(store.pending_epochs(), 1);
+        let PendingClaim::Claimed(_, generation) = store.claim_pending_for_creation(&key) else {
+            panic!("claimable");
+        };
+        let mut entry = make_entry("chat1", "root1", "ses_created", "/tmp/first");
+        entry.client_id = store.client_id.clone();
+        store.activate_created(entry, generation).unwrap();
+        assert_eq!(store.pending_epochs(), 0, "no pending and no claim: pruned");
+
+        // A replacement declared mid-creation keeps its epoch until it resolves.
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/second"))
+            .unwrap();
+        assert_eq!(store.pending_epochs(), 1);
+        store.clear_pending(&key).unwrap();
+        assert_eq!(store.pending_epochs(), 0);
+    }
+
+    /// Issue #910 (extra finding): a `/agent` write touches only its own field —
+    /// never the model/variant a recorded switch put there.
+    #[test]
+    fn set_agent_touches_only_its_field() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let mut entry = make_entry("chat1", "root1", "ses_1", "/tmp/one");
+        entry.model = Some("deepseek/pro".into());
+        entry.variant = Some("low".into());
+        entry.auto_accept = true;
+        store.activate(entry).unwrap();
+
+        assert!(store.set_agent(&key, Some("ses_1"), Some("build")).unwrap());
+        let entry = store.entry_for_session("ses_1").unwrap();
+        assert_eq!(entry.agent.as_deref(), Some("build"));
+        assert_eq!(entry.model.as_deref(), Some("deepseek/pro"));
+        assert_eq!(entry.variant.as_deref(), Some("low"));
+        assert!(entry.auto_accept);
+
+        // The pending target works the same way (it has no session id).
+        store.clear_pending(&key).unwrap();
+        let mut pending = make_pending("chat1", "root1", "/tmp/pending");
+        pending.model = Some("deepseek/pro".into());
+        store.set_pending(pending).unwrap();
+        assert!(store.set_agent(&key, None, Some("plan")).unwrap());
+        let pending = store.pending_for(&key).unwrap();
+        assert_eq!(pending.agent.as_deref(), Some("plan"));
+        assert_eq!(pending.model.as_deref(), Some("deepseek/pro"));
     }
 
     /// Without a pending, the snapshot comes from the active entry and writes

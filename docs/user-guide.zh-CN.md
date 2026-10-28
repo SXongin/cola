@@ -213,20 +213,17 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   provider 上会 404。默认关闭，理由与 `apply_on_adopt` 相同：这条线程可能与你的
   TUI/VSCode 共享，接在上面的每个客户端都会看到新的 provider。关闭时，点选只会
   提示「provider 只能在新线程切换」，**不发送任何请求**——新线程仍然在创建时接受
-  Pending Session 上选好的那一对。打开后 cola 先弹确认卡，再用协议规定的三步改动
-  线程：先释放自己的订阅（`thread/unsubscribe`；对已加载的线程直接 resume 是静默
-  no-op），然后 `thread/resume` 同时带上 `modelProvider` 与 `model`，最后用
-  `thread/read` 回读校验——只有回读才算成功。如果有别的客户端（Codex TUI、
-  VS Code、桌面端）或另一个共用同一 `CODEX_HOME` 的 cola 实例仍持有这条线程，
-  改动不会落地：确认卡/结果卡会点名这两种可能，线程保留原来的一对，本地也不写任何
-  记录——关掉那个客户端，或用 `thread/fork` 带上 provider 与模型。一轮正在跑时
-  做出的选择会被记录，在该轮结束后、下一条消息发出前应用；如果那时仍无法应用，
-  这条消息不会被发送（cola 绝不会悄悄用旧 provider 跑一轮）。如果线程已经在目标
-  provider 上、只是模型不同，cola 不会重新加载线程：模型随下一轮生效。点击会先被
-  确认，切换在后台进行，慢的守护进程不会卡住卡片。同一会话的下一条消息会等这次切换给出
-  结果后再发送（其他会话不受影响）；每一步都有超时上界，某一步超时也会恢复本地视图与
-  订阅。
-- **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
+  Pending Session 上选好的那一对。打开后，确认卡只**记录**这一对：线程保持原样，
+  **下一条消息**发出前才应用——协议规定的三步：先释放自己的订阅
+  （`thread/unsubscribe`；对已加载的线程直接 resume 是静默 no-op），然后
+  `thread/resume` 同时带上 `modelProvider` 与 `model`，最后用 `thread/read` 回读
+  校验。只有回读才算成功。如果有别的客户端（Codex TUI、VS Code、桌面端）或另一个
+  共用同一 `CODEX_HOME` 的 cola 实例仍持有这条线程，改动不会落地：**那条消息不会
+  被发送**，卡片会点名这两种可能，记录下的一对保留以便重试——关掉那个客户端，或用
+  `thread/fork` 带上 provider 与模型。一轮正在跑时做出的选择同样只是记录，由下一条
+  消息应用；如果线程已经在目标 provider 上、只是模型不同，cola 不会重新加载线程
+  （模型随那条消息生效）。点击本身同步应答，卡片回调里绝不执行释放、resume 或回读。
+- **`reasoning_summary`（仅 codex，默认 `auto`）**- **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
   过程面板；取值有 `auto`、`concise`、`detailed` 与 `none`。Codex 在固定版本

@@ -10,68 +10,31 @@
 //! > previous state intact — under **one per-session serialization point**, with
 //! > no app-server RPC held under a global lock.
 //!
-//! # The one rule: intent first
+//! # The shape: record first, apply at pre-flight
 //!
-//! Every decision that will change the pair registers an **intent** under the
-//! session gate *before its first await*. An intent is the pair it is about to
-//! apply (or record) plus a generation. It makes the window between "I am about
-//! to change the pair" and "the change is durable" impossible for a prompt to
-//! observe:
+//! A confirmed provider change is *recorded* — the pair goes into the session
+//! mirror — and applied by the next prompt's pre-flight (`Turn::attempt`), which
+//! runs the three steps and reports the outcome. Nothing is applied from a card
+//! callback, so this gate is only the **write** serialization point: it makes
+//! every mirror write a read-decide-write that cannot interleave with another
+//! writer (a `/model` pick, a `/think` pick, the recorded switch) or with the
+//! pre-flight's read of the pair.
 //!
-//! - `Turn::attempt` takes the gate, sees a live intent, and **waits** for its
-//!   verdict before deciding the pair and submitting the prompt. It never
-//!   submits the old pair while a switch is in flight.
-//! - The switch (`App::run_provider_switch`) and a deferred-pair record
-//!   (`App::defer_pair`) register their intent under the gate, release it for the
-//!   catalog lookup ("no async work under a lock others wait on"), re-acquire,
-//!   compare-and-set the mirror, and resolve the intent **before** releasing the
-//!   gate — so a waiter always wakes to the final state.
-//! - A `/model`/`/think` write (`SessionsHandle::pick_model`/`pick_think`) takes
-//!   the same gate and re-reads before writing; a live intent makes it an honest
-//!   "state changed" no-op instead of a stale overwrite.
-//!
-//! An intent that is never resolved (a cancelled task) is resolved by its drop
-//! guard, so a warped switch cannot wedge the session's prompts forever.
-//!
-//! # What the gate protects
-//!
-//! The same [`SessionGates::gate`] is held by every read-decide-write of the
-//! session's mirror, the deferred record and the switch state. It is deliberately
-//! **per session**: a switch in one chat never holds up prompt admission in
-//! another, and it never holds the global turn-admission set
-//! ([`super::core::SharedCore::inflight`]) — that set stays the bookkeeping of
-//! which sessions have a turn, read briefly and never held across an RPC.
+//! The gate is deliberately **per session**: a write or a pre-flight in one chat
+//! never holds up another, and it never holds the global turn-admission set
+//! ([`super::core::SharedCore::inflight`]).
 //!
 //! The registry holds **weak** references, so only sessions with a live gate
-//! (a prompt in flight, a switch running, or a pick writing) keep an entry; a
-//! dead entry is pruned when the next gate is created.
+//! keep an entry; a dead entry is pruned when the next gate is created.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
-/// One session's serialization point.
+/// One session's serialization point, taken around every read-decide-write of
+/// its model/provider mirror.
 #[derive(Default)]
 pub(crate) struct SessionGate {
-    /// The async mutex every read-decide-write of this session's model/provider
-    /// state takes.
     lock: tokio::sync::Mutex<()>,
-    /// The live intent, if any. A `std` mutex so reading it cannot await; only a
-    /// holder of `lock` touches it (the drop guard is the one exception, and a
-    /// generation check keeps it from clearing a newer intent).
-    intent: std::sync::Mutex<Option<ModelIntent>>,
-    /// Intent generations, so a stale resolver cannot clear a newer intent.
-    next_generation: std::sync::atomic::AtomicU64,
-}
-
-/// The intent a switch or a deferred record registered under the gate.
-struct ModelIntent {
-    generation: u64,
-    /// The pair the intent will apply (or record). Kept for diagnostics and so
-    /// a future reader can tell *what* is in flight.
-    #[allow(dead_code)]
-    pair: String,
-    /// Fires (once) when the intent resolves — applied, deferred or failed.
-    finished: tokio::sync::watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for SessionGate {
@@ -82,100 +45,9 @@ impl std::fmt::Debug for SessionGate {
 
 impl SessionGate {
     /// Take the session's serialization point. Hold it across the read, the
-    /// decision and the write; never across a catalog lookup.
+    /// decision and the write; never across a catalog lookup or an RPC.
     pub(crate) async fn enter(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.lock.lock().await
-    }
-
-    /// Register the intent for `pair` (the caller holds [`Self::enter`]).
-    /// Returns the intent's generation and the signal its waiters use.
-    pub(crate) fn begin_intent(&self, pair: &str) -> (u64, tokio::sync::watch::Receiver<bool>) {
-        let generation = self
-            .next_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        let (finished, signal) = tokio::sync::watch::channel(false);
-        *self
-            .intent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ModelIntent {
-            generation,
-            pair: pair.to_string(),
-            finished,
-        });
-        (generation, signal)
-    }
-
-    /// Resolve the intent of `generation` and wake its waiters. A newer intent
-    /// is untouched. The normal path calls this while still holding the gate, so
-    /// a woken prompt always re-reads the final state.
-    pub(crate) fn resolve_intent(&self, generation: u64) {
-        let mut intent = self
-            .intent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !intent
-            .as_ref()
-            .is_some_and(|intent| intent.generation == generation)
-        {
-            return;
-        }
-        if let Some(intent) = intent.take() {
-            // `watch` keeps the value, so a receiver created before this send
-            // always observes the change (no lost wakeup).
-            let _ = intent.finished.send(true);
-        }
-    }
-
-    /// The signal a prompt must wait on before reading the pair (the caller
-    /// holds the gate).
-    pub(crate) fn intent_signal(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.intent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .map(|intent| intent.finished.subscribe())
-    }
-
-    /// Whether a switch/deferred record is in flight (test-only introspection
-    /// and the gated writers' honest refusal).
-    pub(crate) fn has_intent(&self) -> bool {
-        self.intent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-}
-
-/// Registers an intent and resolves it on every exit, including a cancelled
-/// task: a switch that never finishes cannot wedge the session's prompts.
-pub(crate) struct IntentGuard {
-    gate: Arc<SessionGate>,
-    generation: u64,
-    resolved: bool,
-}
-
-impl IntentGuard {
-    pub(crate) fn new(gate: Arc<SessionGate>, generation: u64) -> Self {
-        Self {
-            gate,
-            generation,
-            resolved: false,
-        }
-    }
-
-    /// Resolve now (the normal path, under the gate). Idempotent.
-    pub(crate) fn resolve(mut self) {
-        self.resolved = true;
-        self.gate.resolve_intent(self.generation);
-    }
-}
-
-impl Drop for IntentGuard {
-    fn drop(&mut self) {
-        if !self.resolved {
-            self.gate.resolve_intent(self.generation);
-        }
     }
 }
 
@@ -197,8 +69,8 @@ impl SessionGates {
         if let Some(gate) = gates.get(session_id).and_then(Weak::upgrade) {
             return gate;
         }
-        // Only live gates are retained: a session with no prompt, switch or pick
-        // in flight contributes nothing.
+        // Only live gates are retained: a session with no write or pre-flight in
+        // flight contributes nothing.
         gates.retain(|_, gate| gate.strong_count() > 0);
         let gate = Arc::new(SessionGate::default());
         gates.insert(session_id.to_string(), Arc::downgrade(&gate));
@@ -239,23 +111,5 @@ mod tests {
         drop(first);
         let _second = gates.gate("ses_b");
         assert_eq!(gates.tracked(), 1, "the dead `ses_a` entry was pruned");
-    }
-
-    /// An intent resolves exactly once and only for its own generation: a stale
-    /// resolver cannot clear a newer switch's intent.
-    #[tokio::test]
-    async fn only_the_owning_generation_resolves_an_intent() {
-        let gate = SessionGate::default();
-        let _held = gate.enter().await;
-        let (generation, mut signal) = gate.begin_intent("deepseek/x");
-        assert!(gate.has_intent());
-        assert!(signal.has_changed().is_ok());
-        // A stale generation is a no-op.
-        gate.resolve_intent(generation + 7);
-        assert!(gate.has_intent());
-        gate.resolve_intent(generation);
-        assert!(!gate.has_intent());
-        // The sender was dropped by the resolve: the waiter returns.
-        assert!(signal.changed().await.is_ok());
     }
 }

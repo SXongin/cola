@@ -1693,9 +1693,6 @@ pub struct MockBackend {
     pub model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// Counts `model_surface` calls that reached [`Self::model_surface_gate`].
     pub model_surface_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
-    /// When set, [`Self::model_surface_gate`] is a one-shot gate: the next call
-    /// takes it (and clears it) and every later call proceeds.
-    pub model_surface_gate_once: std::sync::atomic::AtomicBool,
     /// Holds the next `create_session` calls (lazy creation / materialisation)
     /// until released, so a test can interleave a pair write with the creation
     /// window (issue #910).
@@ -1785,9 +1782,6 @@ pub struct MockBackend {
     /// When set, `apply_thread_model` fails with this message and records
     /// nothing — a refused switch (a peer holds the thread).
     pub thread_model_error: Option<String>,
-    /// How long `apply_thread_model` waits before answering, so a test can prove
-    /// the card-ack path does not wait for it (issue #910).
-    pub thread_model_delay: std::time::Duration,
     /// What a successful `apply_thread_model` reports.
     pub thread_model_change: crate::backend::types::ThreadModelChange,
     /// Every `create_session` call's thread-level provider and model id (issue
@@ -2039,7 +2033,6 @@ impl MockBackend {
             transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             model_surface_gate: std::sync::Mutex::new(None),
             model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            model_surface_gate_once: std::sync::atomic::AtomicBool::new(false),
             create_session_gate: std::sync::Mutex::new(None),
             create_session_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_id: "ses_test".into(),
@@ -2071,7 +2064,6 @@ impl MockBackend {
             model_pick_route_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             thread_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             thread_model_error: None,
-            thread_model_delay: std::time::Duration::ZERO,
             thread_model_change: crate::backend::types::ThreadModelChange::Changed,
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
@@ -2256,13 +2248,6 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: how long the thread-level switch takes (issue #910's off-ack
-    /// test).
-    pub(crate) fn with_thread_model_delay(&mut self, delay: std::time::Duration) -> &mut Self {
-        self.thread_model_delay = delay;
-        self
-    }
-
     /// Scenario: a pick's route — `PerTurn` for the same provider, `ThreadModel`
     /// for a switch (issue #910).
     pub(crate) fn with_model_pick_route(
@@ -2270,19 +2255,6 @@ impl MockBackend {
         route: crate::backend::types::ModelPickRoute,
     ) -> &mut Self {
         self.model_pick_route = route;
-        self
-    }
-
-    /// Scenario: the thread already ran the pair, so the switch is a no-op.
-    pub(crate) fn with_thread_model_unchanged(&mut self) -> &mut Self {
-        self.thread_model_change = crate::backend::types::ThreadModelChange::Unchanged;
-        self
-    }
-
-    /// Scenario: the thread is already on the target provider and only the model
-    /// differs, so the model lands on the next turn (issue #910).
-    pub(crate) fn with_thread_model_next_turn(&mut self) -> &mut Self {
-        self.thread_model_change = crate::backend::types::ThreadModelChange::ModelNextTurn;
         self
     }
 
@@ -2294,6 +2266,15 @@ impl MockBackend {
             .expect("authored ids")
             .insert(id.to_string());
         self
+    }
+
+    /// Hold every `create_session` call until the returned semaphore is
+    /// released, counting the calls that reached the gate. Lets a test interleave
+    /// a pair write with a materialisation (issue #910).
+    pub(crate) fn hold_create_session(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.create_session_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
     }
 
     /// Scenario: `list_agents` serves `agents`.
@@ -2494,28 +2475,6 @@ impl MockBackend {
     pub(crate) fn hold_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
-        self.model_surface_gate_once
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        gate
-    }
-
-    /// Hold only the **next** `model_surface` call: the one-shot lets a test park
-    /// one caller (e.g. a switch's lookup) while a later caller (a pick's own
-    /// lookup) proceeds.
-    pub(crate) fn hold_next_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
-        self.model_surface_gate_once
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        gate
-    }
-
-    /// Hold every `create_session` call until the returned semaphore is
-    /// released, counting the calls that reached the gate. Lets a test interleave
-    /// a pair write with a materialisation (issue #910).
-    pub(crate) fn hold_create_session(&self) -> Arc<tokio::sync::Semaphore> {
-        let gate = Arc::new(tokio::sync::Semaphore::new(0));
-        *self.create_session_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -3071,8 +3030,14 @@ impl crate::backend::Backend for MockBackend {
             session_id.to_string(),
             format!("{}/{}", model.provider_id, model.id),
         ));
-        if !self.thread_model_delay.is_zero() {
-            tokio::time::sleep(self.thread_model_delay).await;
+        // A real client enforces its own gate at the moment of the request; the
+        // mock mirrors that contract so a test can turn it off after a record.
+        if self.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
+            return Err(crate::error::BridgeError::OpenCode(
+                "provider 切换被关闭（`[clients.<id>] provider_switch_on_resume = false`）：\
+                 provider 只能在新线程切换"
+                    .to_string(),
+            ));
         }
         if let Some(message) = &self.thread_model_error {
             return Err(crate::error::BridgeError::OpenCode(message.clone()));
@@ -3409,20 +3374,11 @@ impl crate::backend::Backend for MockBackend {
                 catalog_only: query.catalog_only,
                 ack_budget: query.ack_budget,
             });
-        let gate = {
-            let mut slot = self
-                .model_surface_gate
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if self
-                .model_surface_gate_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                slot.take()
-            } else {
-                slot.clone()
-            }
-        };
+        let gate = self
+            .model_surface_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(gate) = gate {
             self.model_surface_gate_entered
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

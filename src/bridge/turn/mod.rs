@@ -730,51 +730,43 @@ impl Turn {
         // them inside its strategy — the pick already lives on the session as
         // a switch. Do NOT "fix" a V2 pick by making the strategy re-send them.
         // Issue #910: the pair this prompt runs with is decided HERE, under the
-        // session's serialization point, and only then is the prompt submitted
-        // (see `crate::bridge::session_gates` for the invariant). A switch
-        // registers its intent under the same gate **before its first await**, so
-        // a prompt that arrives mid-switch waits for the verdict; the model
-        // **and** the `/think` variant are then read under the gate, so a switch
-        // that cleared an unsupported variant cannot be overtaken by a stale
-        // snapshot.
+        // session's write serialization point, and only then is the prompt
+        // submitted (see `crate::bridge::session_gates` for the invariant). The
+        // model **and** the `/think` variant are read together, so a switch
+        // recorded by the previous turn is what this turn applies — and a
+        // `/think` write racing this read cannot split the pair.
         //
-        // A deferred pair that cannot be applied (a peer holds the thread, the
-        // read-back did not change, or the gate is off) stops the prompt here:
-        // running it on the old provider would be a silent lie.
-        let model = {
+        // A recorded pair whose provider differs is applied **now**: release the
+        // thread's subscriptions → `thread/resume` with `modelProvider` + `model`
+        // → `thread/read` read-back. The read-back is the verdict; if it cannot
+        // apply (a peer holds the thread, the read-back did not change, or the
+        // gate is off), the prompt is not sent — running it on the old provider
+        // would be a silent lie, and the old model name would 404.
+        let (model, variant) = {
             let gate = handles.session_gates.gate(&self.session_id);
-            loop {
-                let held = gate.enter().await;
-                if let Some(mut finished) = gate.intent_signal() {
-                    // A switch (or a deferred record) is in flight: wait for its
-                    // verdict, then read the now-final pair.
-                    drop(held);
-                    let _ = finished.changed().await;
-                    continue;
-                }
-                let model = handles.sessions.model_override(&self.session_id).await;
-                self.turn_variant = handles
-                    .sessions
-                    .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
-                    .await;
-                if let Some(model) = model.as_ref() {
-                    match handles.backend.model_pick_route(&self.session_id, model).await {
-                        Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
-                            handles
-                                .backend
-                                .apply_thread_model(&self.session_id, model)
-                                .await?;
-                        }
-                        Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
-                        // Unknown is not "safe to skip": a failed classification
-                        // must not let the prompt run on a pair the thread may
-                        // not hold.
-                        Err(error) => return Err(error),
-                    }
-                }
-                break model;
-            }
+            let _held = gate.enter().await;
+            let model = handles.sessions.model_override(&self.session_id).await;
+            let variant = handles
+                .sessions
+                .effective_variant(&handles.backend, &self.session_id, Some(&self.directory))
+                .await;
+            (model, variant)
         };
+        self.turn_variant = variant;
+        if let Some(model) = model.as_ref() {
+            match handles.backend.model_pick_route(&self.session_id, model).await {
+                Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
+                    handles
+                        .backend
+                        .apply_thread_model(&self.session_id, model)
+                        .await?;
+                }
+                Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
+                // Unknown is not "safe to skip": a failed classification must
+                // not let the prompt run on a pair the thread may not hold.
+                Err(error) => return Err(error),
+            }
+        }
         let agent = handles.sessions.agent_override(&self.session_id).await;
         let prompt_resp = handles
             .backend
