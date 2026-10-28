@@ -365,6 +365,12 @@ struct State {
     /// Ignore a resume's `modelProvider` (answer with the thread's old one), so
     /// cola's "no silent fallback" check has something to catch.
     keep_provider_on_resume: std::sync::atomic::AtomicBool,
+    /// Every client→server method, in arrival order (issue #910's sequence
+    /// assertions: unsubscribe → resume → read).
+    calls: std::sync::Mutex<Vec<String>>,
+    /// How long the next `thread/resume` waits before replying, so a test can
+    /// prove the card-ack path does not wait for it.
+    resume_delay: std::sync::Mutex<std::time::Duration>,
     /// Fail this many `thread/turns/list` calls before answering normally.
     fail_turns_pages: AtomicUsize,
     /// Scripted notifications a `turn/start` emits to the thread's subscribers:
@@ -484,6 +490,8 @@ impl Default for State {
             silent_resume: std::sync::atomic::AtomicBool::new(false),
             reject_resume: std::sync::Mutex::new(None),
             keep_provider_on_resume: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::Mutex::new(Vec::new()),
+            resume_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             fail_turns_pages: AtomicUsize::new(0),
             scripted_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             turn_starts: AtomicUsize::new(0),
@@ -841,6 +849,44 @@ impl FakeServer {
     /// the answer — a server that did not apply the switch.
     pub(crate) fn keep_provider_on_resume(&self) {
         self.state.keep_provider_on_resume.store(true, Ordering::SeqCst);
+    }
+
+    /// Delay the next `thread/resume` reply by `delay` (issue #910's off-ack
+    /// test: the click must be acknowledged before the switch finishes).
+    pub(crate) fn set_resume_delay(&self, delay: std::time::Duration) {
+        *self.state.resume_delay.lock().expect("resume delay") = delay;
+    }
+
+    /// Every client→server method, in arrival order. Empty it with
+    /// [`Self::clear_calls`] right before the traffic a test wants to order.
+    pub(crate) fn call_log(&self) -> Vec<String> {
+        self.state.calls.lock().expect("calls").clone()
+    }
+
+    /// Forget the methods received so far, so a sequence assertion starts at
+    /// the operation under test.
+    pub(crate) fn clear_calls(&self) {
+        self.state.calls.lock().expect("calls").clear();
+    }
+
+    /// Push a `thread/settings/updated` broadcast to the thread's subscribers:
+    /// the server telling every client the thread moved (issue #910).
+    pub(crate) fn push_thread_settings(
+        &self,
+        thread_id: &str,
+        model: &str,
+        provider: &str,
+        effort: Option<&str>,
+    ) -> usize {
+        let mut settings = json!({ "model": model, "modelProvider": provider });
+        if let Some(effort) = effort {
+            settings["effort"] = json!(effort);
+        }
+        self.push_to_thread(
+            thread_id,
+            "thread/settings/updated",
+            json!({ "threadId": thread_id, "threadSettings": settings }),
+        )
     }
 
     /// `thread/resume` calls received so far.
@@ -1274,6 +1320,9 @@ where
     }
     let id = value.get("id").cloned().unwrap_or(Value::Null);
     let params = value.get("params").cloned().unwrap_or(Value::Null);
+    if let Some(method) = value.get("method").and_then(Value::as_str) {
+        state.calls.lock().expect("calls").push(method.to_string());
+    }
     match value.get("method").and_then(Value::as_str) {
         Some("initialize") => {
             if let Some(reject) = &state.reject_initialize {
@@ -1786,6 +1835,10 @@ where
                 .lock()
                 .expect("resume params")
                 .push(params.clone());
+            let delay = *state.resume_delay.lock().expect("resume delay");
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             if state.silent_resume.swap(false, Ordering::SeqCst) {
                 return true;
             }
@@ -1797,16 +1850,33 @@ where
             let Some(mut thread) = find_thread(state, thread_id) else {
                 return reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await;
             };
-            // A provider switch is `thread/resume`'s `modelProvider` (issue
-            // #910); the thread keeps its model. The knob models a server that
+            // A provider switch is `thread/resume`'s `modelProvider` **and**
+            // `model` (issue #910). The measured behaviour: it only lands when
+            // the thread is reloaded, i.e. when **no** connection (this one
+            // included, or a peer) still subscribes; otherwise the resume
+            // answers ok and changes nothing. The knob models a server that
             // accepted the call but did not apply it.
+            let loaded = state
+                .subscribers
+                .lock()
+                .expect("subscribers")
+                .get(thread_id)
+                .is_some_and(|streams| !streams.is_empty());
             if let Some(provider) = params.get("modelProvider").and_then(Value::as_str)
+                && !loaded
                 && !state.keep_provider_on_resume.load(Ordering::SeqCst)
             {
+                let model = params.get("model").and_then(Value::as_str);
                 thread.model_provider = Some(provider.to_string());
+                if let Some(model) = model {
+                    thread.model = Some(model.to_string());
+                }
                 let mut threads = state.threads.lock().expect("scripted threads");
                 if let Some(stored) = threads.iter_mut().find(|thread| thread.id == thread_id) {
                     stored.model_provider = Some(provider.to_string());
+                    if let Some(model) = model {
+                        stored.model = Some(model.to_string());
+                    }
                 }
             }
             if !thread.has_history {

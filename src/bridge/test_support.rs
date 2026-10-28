@@ -1755,14 +1755,25 @@ pub struct MockBackend {
     pub default_model: Option<crate::backend::types::ModelInfo>,
     /// What `provider_change_scope` answers (issue #910): the client's
     /// `provider_switch_on_resume` policy. `NewThread` (the default) means a
-    /// live thread's provider pick is refused with a toast.
-    pub provider_change_scope: crate::backend::types::ChangeScope,
-    /// Every `switch_session_provider` call as `(session_id, provider)`, in
-    /// call order.
-    pub provider_switch_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
-    /// When set, `switch_session_provider` fails with this message and records
-    /// nothing — the refused resume of issue #910.
-    pub provider_switch_error: Option<String>,
+    /// live thread's provider pick is refused with a toast. Shared so a test can
+    /// turn the gate off *after* a confirmation card was rendered.
+    pub provider_change_scope: Arc<std::sync::Mutex<crate::backend::types::ChangeScope>>,
+    /// What `model_pick_route` answers: `PerTurn` (the default) is the
+    /// same-provider path; `ThreadModel` needs the thread-level switch.
+    pub model_pick_route: crate::backend::types::ModelPickRoute,
+    /// Every `model_pick_route` call as `(session_id, provider/model)`, in order.
+    pub model_pick_route_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// Every `apply_thread_model` call as `(session_id, provider/model)`, in
+    /// order — the three-step switch the fake adapter stands in for.
+    pub thread_model_calls: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+    /// When set, `apply_thread_model` fails with this message and records
+    /// nothing — a refused switch (a peer holds the thread).
+    pub thread_model_error: Option<String>,
+    /// How long `apply_thread_model` waits before answering, so a test can prove
+    /// the card-ack path does not wait for it (issue #910).
+    pub thread_model_delay: std::time::Duration,
+    /// What a successful `apply_thread_model` reports.
+    pub thread_model_change: crate::backend::types::ThreadModelChange,
     /// Every `create_session` call's thread-level provider and model id (issue
     /// #910): a Pending Session's creation picks.
     #[allow(clippy::type_complexity)]
@@ -2032,9 +2043,15 @@ impl MockBackend {
             model_surface_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             model_surface: None,
             default_model: None,
-            provider_change_scope: crate::backend::types::ChangeScope::NewThread,
-            provider_switch_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-            provider_switch_error: None,
+            provider_change_scope: Arc::new(std::sync::Mutex::new(
+                crate::backend::types::ChangeScope::NewThread,
+            )),
+            model_pick_route: crate::backend::types::ModelPickRoute::PerTurn,
+            model_pick_route_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            thread_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            thread_model_error: None,
+            thread_model_delay: std::time::Duration::ZERO,
+            thread_model_change: crate::backend::types::ThreadModelChange::Changed,
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2201,14 +2218,43 @@ impl MockBackend {
         &mut self,
         scope: crate::backend::types::ChangeScope,
     ) -> &mut Self {
-        self.provider_change_scope = scope;
+        *self.provider_change_scope.lock().expect("provider change scope") = scope;
         self
     }
 
-    /// Scenario: `switch_session_provider` fails with `message` and records no
-    /// switch — a server that refused the resume.
+    /// The shared gate, so a test can flip it while a card is already in the
+    /// chat (issue #910's confirm-time recheck).
+    pub(crate) fn provider_scope_handle(&self) -> Arc<std::sync::Mutex<crate::backend::types::ChangeScope>> {
+        Arc::clone(&self.provider_change_scope)
+    }
+
+    /// Scenario: the next thread-level provider switch fails with `message` and
+    /// records nothing — a peer that still holds the thread.
     pub(crate) fn fail_provider_switch(&mut self, message: &str) -> &mut Self {
-        self.provider_switch_error = Some(message.to_string());
+        self.thread_model_error = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: how long the thread-level switch takes (issue #910's off-ack
+    /// test).
+    pub(crate) fn with_thread_model_delay(&mut self, delay: std::time::Duration) -> &mut Self {
+        self.thread_model_delay = delay;
+        self
+    }
+
+    /// Scenario: a pick's route — `PerTurn` for the same provider, `ThreadModel`
+    /// for a switch (issue #910).
+    pub(crate) fn with_model_pick_route(
+        &mut self,
+        route: crate::backend::types::ModelPickRoute,
+    ) -> &mut Self {
+        self.model_pick_route = route;
+        self
+    }
+
+    /// Scenario: the thread already ran the pair, so the switch is a no-op.
+    pub(crate) fn with_thread_model_unchanged(&mut self) -> &mut Self {
+        self.thread_model_change = crate::backend::types::ThreadModelChange::Unchanged;
         self
     }
 
@@ -2930,18 +2976,39 @@ impl crate::backend::Backend for MockBackend {
     }
 
     fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
-        self.provider_change_scope
+        *self.provider_change_scope.lock().expect("provider change scope")
     }
 
-    async fn switch_session_provider(&self, session_id: &str, provider: &str) -> crate::error::Result<()> {
-        if let Some(message) = &self.provider_switch_error {
+    async fn model_pick_route(
+        &self,
+        session_id: &str,
+        model: &crate::backend::types::ModelInfo,
+    ) -> crate::error::Result<crate::backend::types::ModelPickRoute> {
+        self.model_pick_route_calls.lock().await.push((
+            session_id.to_string(),
+            format!("{}/{}", model.provider_id, model.id),
+        ));
+        Ok(self.model_pick_route)
+    }
+
+    async fn apply_thread_model(
+        &self,
+        session_id: &str,
+        model: &crate::backend::types::ModelInfo,
+    ) -> crate::error::Result<crate::backend::types::ThreadModelChange> {
+        // Recorded up front: the call was attempted even when the fake adapter
+        // then refuses it (a peer holding the thread).
+        self.thread_model_calls.lock().await.push((
+            session_id.to_string(),
+            format!("{}/{}", model.provider_id, model.id),
+        ));
+        if !self.thread_model_delay.is_zero() {
+            tokio::time::sleep(self.thread_model_delay).await;
+        }
+        if let Some(message) = &self.thread_model_error {
             return Err(crate::error::BridgeError::OpenCode(message.clone()));
         }
-        self.provider_switch_calls
-            .lock()
-            .await
-            .push((session_id.to_string(), provider.to_string()));
-        Ok(())
+        Ok(self.thread_model_change)
     }
 
     async fn prompt(

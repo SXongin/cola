@@ -8,7 +8,7 @@ use crate::backend::{PromptSkill, SkillInfo, TaskRetirementEnding};
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
-use crate::bridge::handles::{PickReply, classify_pick};
+use crate::bridge::handles::{PickOutcome, PickReply, classify_pick};
 use crate::bridge::session::PendingEntry;
 use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
@@ -4692,14 +4692,11 @@ impl App {
             .to_string();
 
         // A scope states what its pick does (`PickKind`): navigation asks the
-        // client for the next page, a provider selection switches a thread-level
-        // channel, and everything else is a concrete model ref. The bridge never
-        // infers the action from a scope id (OpenCode's and Codex's provider
-        // scopes are both named `provider` but do opposite things — #910).
+        // client for the next page; every other scope is a concrete pick. The
+        // bridge never infers the action from a scope id (OpenCode's and
+        // Codex's provider scopes are both named `provider` but do opposite
+        // things — #910).
         let level = value.get("level").and_then(|v| v.as_str()).unwrap_or("");
-        if level == crate::feishu::card::picker::PICKER_LEVEL_PROVIDER_PICK {
-            return Some(self.handle_provider_pick(core, &thread_key, &picked).await);
-        }
         if level == crate::feishu::card::picker::PICKER_LEVEL_PROVIDER {
             let back = picked != crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS;
             let (scope, selected) = if back {
@@ -4720,68 +4717,84 @@ impl App {
             return Some(Self::picker_pages_result(core, &thread_key, cards).await);
         }
 
-        // Level 2: a concrete model — record the override (and on a durable
-        // generation switch the session's model), carrying or clearing the
-        // `/think` variant (ADR-0020), same as the `/model` text form.
-        if crate::backend::parsing::parse_model(&picked).is_none() {
-            return Some(CardActionResult {
+        // A **paired** pick names a provider *and* the model it must run
+        // (issue #910): a `[profiles.*]` preset, a probed provider model, or a
+        // row of the provider scope. The path is decided by whether that
+        // provider differs from the thread's, never by which scope the row came
+        // from — a bare provider is not a valid pick.
+        let paired = value
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .filter(|provider| !provider.is_empty());
+        if let Some(provider) = paired {
+            return Some(self.pick_paired_model(core, &thread_key, provider, &picked).await);
+        }
+
+        Some(self.pick_model_ref(core, &thread_key, &picked).await)
+    }
+
+    /// A concrete **model-only** pick: record the override (and on a durable
+    /// generation switch the session's model), carrying or clearing the
+    /// `/think` variant (ADR-0020), same as the `/model` text form. Nothing
+    /// thread-level happens: this is the same-provider path of issue #910.
+    async fn pick_model_ref(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        picked: &str,
+    ) -> CardActionResult {
+        if crate::backend::parsing::parse_model(picked).is_none() {
+            return CardActionResult {
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
-            });
+            };
         }
         let cleared_variant = match classify_pick(
-            core.pick_model(&thread_key, &picked).await,
+            core.pick_model(thread_key, picked).await,
             "模型",
-            crate::bridge::display::feishu_side_label(&thread_key),
+            crate::bridge::display::feishu_side_label(thread_key),
         ) {
             PickReply::Applied { cleared_variant } => cleared_variant,
             PickReply::Failed(text) => {
-                return Some(CardActionResult {
+                return CardActionResult {
                     card: None,
                     toast: Some(text),
-                });
+                };
             }
         };
         let extra = cleared_variant
             .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
             .unwrap_or_default();
-        // A profile preset is Codex's own "model + provider" declaration: on a
-        // Pending Session the pair is recorded so `thread/start` applies both.
-        // A live session keeps its provider (#908) — only a confirmed resume
-        // changes that — so the paired provider is not recorded there.
-        let paired = value
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .filter(|provider| !provider.is_empty());
-        if let Some(provider) = paired
-            && let Err(error) = core.pick_pending_provider(&thread_key, provider).await
-        {
-            tracing::warn!("could not record the paired provider `{provider}` on the pending: {error}");
-        }
-        Some(CardActionResult {
+        CardActionResult {
             card: None,
-            toast: Some(format!("Model: {picked}（下一条消息开始生效）{}", extra)),
-        })
+            toast: Some(format!("Model: {picked}（下一条消息开始生效）{extra}")),
+        }
     }
 
-    /// A pick on a **thread-level provider** scope (issue #910). A provider is
-    /// not a per-turn fact: a Pending Session records it for `thread/start`,
-    /// while an existing thread can only change it by resuming — behind a
-    /// confirmation, and only when the client opened that door
-    /// (`provider_switch_on_resume`). Otherwise the click changes nothing and
-    /// says why.
-    async fn handle_provider_pick(
+    /// A **provider + model pair** (issue #910). A provider is a thread-level
+    /// fact with no per-turn field, so a pick that changes it must re-open the
+    /// thread — while a pick whose provider is the thread's own is an ordinary
+    /// model pick (no resume, no unsubscribe). A running turn defers the switch
+    /// to the next prompt instead of failing now; an existing idle thread asks
+    /// for confirmation first.
+    async fn pick_paired_model(
         &self,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         provider: &str,
+        model: &str,
     ) -> CardActionResult {
-        if provider.is_empty() {
+        if model.trim().is_empty() {
+            // The pair is what makes the switch safe: the old model name on a
+            // new provider is a 404.
             return CardActionResult {
                 card: None,
-                toast: Some("provider 为空，未做任何改动".to_string()),
+                toast: Some(format!(
+                    "provider `{provider}` 需要同时选择模型（可点同一行的 model，或在 `[profiles.*]` 里声明一对）"
+                )),
             };
         }
+        let spec = format!("{provider}/{model}");
         let Some(settings) = core.session_settings(thread_key).await else {
             return CardActionResult {
                 card: None,
@@ -4791,21 +4804,33 @@ impl App {
                 )),
             };
         };
+        // A Pending Session takes both halves at creation: `thread/start` carries
+        // `model` + `modelProvider` in one call.
         if settings.session_id.is_none() {
-            return match core.pick_pending_provider(thread_key, provider).await {
-                Ok(true) => CardActionResult {
+            return self.save_pending_pair(core, thread_key, provider, &spec).await;
+        }
+        let session_id = settings.session_id.unwrap_or_default();
+        let info = crate::backend::types::ModelInfo {
+            id: model.to_string(),
+            provider_id: provider.to_string(),
+            variant: settings.variant.clone(),
+        };
+        let route = match core.client.model_pick_route(&session_id, &info).await {
+            Ok(route) => route,
+            // Unknown is not "safe to skip": the prompt path would then send a
+            // pair the thread may not run. Say so instead of guessing.
+            Err(error) => {
+                tracing::warn!("could not classify the model pick for {session_id}: {error}");
+                return CardActionResult {
                     card: None,
-                    toast: Some(format!("Provider: {provider}（新线程创建时生效）")),
-                },
-                Ok(false) => CardActionResult {
-                    card: None,
-                    toast: Some("还没有可配置的会话".to_string()),
-                },
-                Err(error) => CardActionResult {
-                    card: None,
-                    toast: Some(format!("⚠️ 记录 provider 失败：{error}")),
-                },
-            };
+                    toast: Some(format!("⚠️ 无法确认这条线程的 provider：{error}")),
+                };
+            }
+        };
+        if route == crate::backend::types::ModelPickRoute::PerTurn {
+            // Same provider (or a client whose provider rides each turn): the
+            // ordinary per-session model path, with no thread-level request.
+            return self.pick_model_ref(core, thread_key, &spec).await;
         }
         if core.client.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
             return CardActionResult {
@@ -4813,29 +4838,135 @@ impl App {
                 toast: Some("provider 只能在新线程切换".to_string()),
             };
         }
+        if core.inflight.lock().await.contains(&session_id) {
+            // A turn is running: record the pair and let the next prompt apply
+            // it (issue #910) — never fail at pick time for this.
+            return self.save_deferred_pair(core, thread_key, &spec).await;
+        }
         CardActionResult {
             card: Some(crate::feishu::card::picker::build_provider_confirm_card(
-                thread_key, provider,
+                thread_key,
+                &session_id,
+                provider,
+                model,
             )),
             toast: None,
         }
     }
 
-    /// The confirmation card's 确认 click: resume the thread with the chosen
-    /// provider. A failure names itself and leaves every mirror alone — the
-    /// adapter records nothing on a refused resume, so the footer and the next
-    /// `/model` still show the previous provider.
+    /// Record a Pending Session's provider + model pair (issue #910). Both
+    /// halves are stored — the model mirror names the pair, the pending carries
+    /// the provider for `thread/start` — and a write that did **not** land is
+    /// reported as a failure: a click that could not be saved must never answer
+    /// "Applied".
+    async fn save_pending_pair(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        provider: &str,
+        spec: &str,
+    ) -> CardActionResult {
+        let saved = core.pick_model(thread_key, spec).await;
+        let provider_saved = core.pick_pending_provider(thread_key, provider).await;
+        match saved {
+            Ok(PickOutcome::Applied { cleared_variant }) => {
+                let extra = cleared_variant
+                    .map(|v| format!("（已清除思考等级 `{v}`）"))
+                    .unwrap_or_default();
+                match provider_saved {
+                    Ok(true) => CardActionResult {
+                        card: None,
+                        toast: Some(format!(
+                            "Provider: {provider}（模型 {spec}，新线程创建时生效）{extra}"
+                        )),
+                    },
+                    Ok(false) => CardActionResult {
+                        card: None,
+                        toast: Some("⚠️ 模型已记录，但 provider 没有保存（会话状态已变化）".to_string()),
+                    },
+                    Err(error) => CardActionResult {
+                        card: None,
+                        toast: Some(format!("⚠️ 模型已记录，但 provider 保存失败：{error}")),
+                    },
+                }
+            }
+            Ok(_) => CardActionResult {
+                card: None,
+                toast: Some("⚠️ 保存失败：会话已不存在，这次选择没有生效".to_string()),
+            },
+            Err(error) => CardActionResult {
+                card: None,
+                toast: Some(format!("⚠️ 保存失败：{error}")),
+            },
+        }
+    }
+
+    /// Record a pair whose thread-level switch must wait for the running turn
+    /// to end (issue #910). The mirror IS the pending record: the prompt path
+    /// compares it to the thread before sending and applies the switch there,
+    /// so it survives a restart of the wait.
+    async fn save_deferred_pair(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        spec: &str,
+    ) -> CardActionResult {
+        match core.pick_model(thread_key, spec).await {
+            Ok(PickOutcome::Applied { cleared_variant }) => {
+                let extra = cleared_variant
+                    .map(|v| format!("（已清除思考等级 `{v}`）"))
+                    .unwrap_or_default();
+                CardActionResult {
+                    card: None,
+                    toast: Some(format!(
+                        "已记录 `{spec}`：本轮结束后、下一条消息发出前切换{extra}"
+                    )),
+                }
+            }
+            Ok(_) => CardActionResult {
+                card: None,
+                toast: Some("⚠️ 保存失败：会话已不存在，这次切换没有记录".to_string()),
+            },
+            Err(error) => CardActionResult {
+                card: None,
+                toast: Some(format!("⚠️ 保存失败：{error}")),
+            },
+        }
+    }
+
+    /// The confirmation card's 确认 click (issue #910). The target is resolved
+    /// **here**, so a card that outlived a `/switch`, a delete or a recreate
+    /// does nothing; the gate is re-read, so a card sitting in Feishu cannot
+    /// switch a thread after `provider_switch_on_resume` was turned off. The
+    /// switch itself (release → resume → read back) runs off the ack path and
+    /// repaints the card when it lands.
     async fn handle_provider_switch_confirm(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
         let provider = value
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let model = value
             .get("value")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let card_session = value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let thread_key = thread_key_from_value(value);
+        if provider.is_empty() || model.is_empty() {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("这张确认卡缺少 provider/model，没有做任何改动".to_string()),
+            });
+        }
         let Some(settings) = core.session_settings(&thread_key).await else {
             return Some(CardActionResult {
                 card: None,
@@ -4848,26 +4979,138 @@ impl App {
         let Some(session_id) = settings.session_id.clone() else {
             return Some(CardActionResult {
                 card: None,
-                toast: Some("新线程不需要 resume：provider 会随创建生效".to_string()),
+                toast: Some("这张确认卡已过期：会话已切换或尚未创建，没有做任何改动".to_string()),
             });
         };
-        match core.client.switch_session_provider(&session_id, &provider).await {
-            Ok(()) => Some(CardActionResult {
-                card: Some(crate::feishu::card::picker::build_provider_switched_card(
-                    &provider,
-                )),
-                toast: Some(format!("Provider: {provider}")),
-            }),
-            Err(error) => {
-                tracing::warn!("provider switch to `{provider}` failed for {session_id}: {error}");
-                Some(CardActionResult {
-                    card: Some(crate::feishu::card::picker::build_provider_switch_error_card(
-                        &provider,
-                        &error.to_string(),
-                    )),
-                    toast: Some(format!("⚠️ provider 切换失败：{provider}")),
-                })
+        if card_session.is_empty() || card_session != session_id {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("这张确认卡已过期（会话已切换），没有做任何改动".to_string()),
+            });
+        }
+        // Re-checked at confirmation: the config may have been turned off
+        // while the card sat in the chat.
+        if core.client.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("provider 只能在新线程切换".to_string()),
+            });
+        }
+        let message_id = value
+            .get("open_message_id")
+            .and_then(|v| v.as_str())
+            .filter(|message_id| !message_id.is_empty())
+            .map(str::to_string);
+        // Acknowledge with the in-progress card BEFORE the RPC starts: the
+        // resume + read-back must not ride the ack (issue #910) — a slow daemon
+        // would otherwise lose the outcome and leave the buttons live.
+        let switching = crate::feishu::card::picker::build_provider_switching_card(&provider, &model);
+        let app = Arc::clone(self);
+        tokio::spawn(async move {
+            app.run_provider_switch(thread_key, session_id, provider, model, message_id)
+                .await;
+        });
+        Some(CardActionResult {
+            card: Some(switching),
+            toast: Some("正在切换 provider…".to_string()),
+        })
+    }
+
+    /// Run a confirmed provider switch off the card-ack path and repaint the
+    /// card with the outcome (issue #910). The three protocol steps take as long
+    /// as the daemon needs; the click was already answered with 「切换中…」.
+    async fn run_provider_switch(
+        self: &Arc<Self>,
+        thread_key: ThreadKey,
+        session_id: String,
+        provider: String,
+        model: String,
+        message_id: Option<String>,
+    ) {
+        use crate::backend::types::ThreadModelChange;
+        let pair = format!("{provider}/{model}");
+        let info = crate::backend::types::ModelInfo {
+            id: model.clone(),
+            provider_id: provider.clone(),
+            variant: None,
+        };
+        // The pair is saved BEFORE the RPC: a prompt that races this switch sees
+        // the target pair in the mirror, and its own pre-flight then re-applies
+        // idempotently — without this it could send the old model name on the
+        // new provider (a 404). A save that does not land stops here: the thread
+        // was not touched and nothing may claim otherwise (issue #910).
+        let previous = self
+            .core
+            .session_settings(&thread_key)
+            .await
+            .map(|settings| settings.model);
+        match self.core.pick_model(&thread_key, &pair).await {
+            Ok(PickOutcome::Applied { .. }) => {}
+            Ok(_) => {
+                let card = crate::feishu::card::picker::build_provider_save_blocked_card(
+                    &pair,
+                    "会话状态已变化，无法写入",
+                );
+                self.finish_provider_switch(message_id, card, &pair).await;
+                return;
             }
+            Err(error) => {
+                let card =
+                    crate::feishu::card::picker::build_provider_save_blocked_card(&pair, &error.to_string());
+                self.finish_provider_switch(message_id, card, &pair).await;
+                return;
+            }
+        }
+        let card = match self.core.client.apply_thread_model(&session_id, &info).await {
+            Ok(change) => match change {
+                ThreadModelChange::Changed => {
+                    crate::feishu::card::picker::build_provider_switched_card(&provider, &model)
+                }
+                ThreadModelChange::Unchanged => {
+                    crate::feishu::card::picker::build_provider_already_card(&provider, &model)
+                }
+            },
+            Err(error) => {
+                tracing::warn!("provider switch to `{pair}` failed for {session_id}: {error}");
+                // A failed switch leaves the local mirror alone: restore what it
+                // named before the pending record was written.
+                if let Some(previous) = previous
+                    && let Some(mut settings) = self.core.session_settings(&thread_key).await
+                {
+                    settings.model = previous;
+                    if let Err(error) = self
+                        .core
+                        .sessions_handle()
+                        .set_session_settings(&thread_key, settings)
+                        .await
+                    {
+                        tracing::warn!("could not restore the previous model mirror: {error}");
+                    }
+                }
+                crate::feishu::card::picker::build_provider_switch_error_card(
+                    &provider,
+                    &model,
+                    &error.to_string(),
+                )
+            }
+        };
+        self.finish_provider_switch(message_id, card, &pair).await;
+    }
+
+    /// Repaint the clicked card with a switch's outcome (issue #910). A click
+    /// without the card's id cannot be answered that way; the outcome is still
+    /// logged so the switch is not invisible.
+    async fn finish_provider_switch(&self, message_id: Option<String>, card: serde_json::Value, pair: &str) {
+        match message_id {
+            Some(message_id) => {
+                if let Err(error) = self.feishu.update_message(&message_id, &card).await {
+                    tracing::warn!("the provider switch's outcome card did not land: {error}");
+                }
+            }
+            None => tracing::warn!(
+                "provider switch to `{pair}` finished without the clicked card's message id; \
+                 its outcome could not be shown"
+            ),
         }
     }
 

@@ -2328,11 +2328,11 @@ async fn a_failed_release_does_not_fail_switch_forget() {
 }
 
 /// The provider switch (issue #910) end to end over the production adapter: the
-/// confirmation resumes the real thread with `modelProvider`, changes no model,
-/// and starts no turn. The default client (switch off) refuses the click before
-/// any request is made.
+/// confirmation releases the thread, resumes it with the **pair**, and the
+/// `thread/read` read-back (not the resume's ok) is what makes it a success. The
+/// old model is never left on the new provider.
 #[tokio::test]
-async fn a_confirmed_provider_switch_resumes_the_real_codex_thread() {
+async fn a_confirmed_provider_switch_releases_resumes_and_verifies() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2359,37 +2359,171 @@ async fn a_confirmed_provider_switch_resumes_the_real_codex_thread() {
     client.transcript("thread-1").await.expect("adopt the thread");
     server.wait_for_subscribers("thread-1", 1).await;
 
-    let app = Arc::new(App::new(cfg, Arc::new(client), Arc::new(RecordingPlatform::new())).unwrap());
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
     seed_entry(&app, codex_entry("thread-1")).await;
 
     let pick = serde_json::json!({
         "action": "model",
-        "level": "provider_switch",
+        "level": "model",
         "chat_id": "chat_1",
         "thread_id": "chat_1",
-        "value": "deepseek",
+        "provider": "deepseek",
+        "value": "deepseek-v4-pro",
     });
     let step = app.host_action(pick).await.expect("provider pick");
     let card = step.card.expect("a confirmation card");
-    assert!(card.to_string().contains("其他客户端"), "{card}");
+    let text = card.to_string();
+    assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
+    assert!(text.contains("其他客户端"), "{text}");
     assert_eq!(server.resume_calls(), 1, "the pick itself sent nothing");
 
-    let confirm = serde_json::json!({
-        "action": "model_provider_confirm",
-        "chat_id": "chat_1",
-        "thread_id": "chat_1",
-        "value": "deepseek",
-    });
-    let step = app.host_action(confirm).await.expect("confirm");
-    assert!(step.card.is_some(), "the result replaces the confirmation");
+    let confirm = crate::bridge::test_support::card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "model_provider_confirm")
+        .expect("the confirm button")["value"]
+        .clone();
+    // A deliberately slow `thread/resume`: the click must still be answered
+    // before the switch finishes (issue #910, item 8).
+    server.set_resume_delay(std::time::Duration::from_millis(600));
+    server.clear_calls();
+    let started = std::time::Instant::now();
+    let step = app
+        .host_action_on_message(confirm, "om_confirm")
+        .await
+        .expect("confirm");
+    let acked = started.elapsed();
+    assert!(
+        acked < std::time::Duration::from_millis(600),
+        "the ack must not wait for the resume: {acked:?}"
+    );
+    assert!(
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("正在切换")),
+        "the ack is the in-progress card, off the RPC's path"
+    );
 
-    let params = server.resume_params();
-    assert_eq!(
-        params.last(),
-        Some(&serde_json::json!({ "threadId": "thread-1", "modelProvider": "deepseek" })),
-        "the confirmed click is the only resume that carries a provider: {params:?}"
+    wait_for_card_update(&platform, "the switched thread", CardUpdates::Any, |card| {
+        card_header(card).contains("已切换")
+    })
+    .await;
+
+    // The measured order: release first (a resume on a loaded thread is a
+    // silent no-op), then the pair, then the read that is the verdict.
+    let calls = server.call_log();
+    let release = calls
+        .iter()
+        .position(|method| method == "thread/unsubscribe")
+        .unwrap_or_else(|| panic!("no release in {calls:?}"));
+    let resume = calls
+        .iter()
+        .skip(release + 1)
+        .position(|method| method == "thread/resume")
+        .unwrap_or_else(|| panic!("no resume after the release in {calls:?}"))
+        + release
+        + 1;
+    let read = calls
+        .iter()
+        .skip(resume + 1)
+        .position(|method| method == "thread/read")
+        .unwrap_or_else(|| panic!("no read after the resume in {calls:?}"))
+        + resume
+        + 1;
+    assert!(release < resume && resume < read, "order: {calls:?}");
+    assert!(
+        server.resume_params().iter().any(|params| params
+            == &serde_json::json!({
+                "threadId": "thread-1",
+                "modelProvider": "deepseek",
+                "model": "deepseek-v4-pro",
+            })),
+        "the resume carries the pair: {:?}",
+        server.resume_params()
     );
     assert_eq!(server.turn_starts(), 0, "a provider switch starts no turn");
+}
+
+/// Issue #910: a peer (another client, or another cola sharing `CODEX_HOME`)
+/// holds the thread, so the read-back keeps the old pair — the switch fails by
+/// name and the local record does not move.
+#[tokio::test]
+async fn a_peer_held_real_codex_thread_refuses_the_switch() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a shared thread",
+    ));
+    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+
+    let endpoint = crate::codex::Endpoint::parse(&url).expect("endpoint");
+    let client = crate::codex::CodexClient::connect(
+        &crate::codex::CodexOptions::new(endpoint).with_thread_settings(crate::codex::ThreadSettings {
+            provider_switch_on_resume: true,
+            ..Default::default()
+        }),
+        &crate::codex::PinnedProbe,
+    )
+    .await
+    .expect("attach");
+    // A peer holds the same thread (a TUI, or a second cola on this CODEX_HOME).
+    let peer = codex_client(&url).await;
+    peer.transcript("thread-1").await.expect("the peer adopts");
+    client.transcript("thread-1").await.expect("cola adopts");
+    server.wait_for_subscribers("thread-1", 2).await;
+
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
+    let mut entry = codex_entry("thread-1");
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(serde_json::json!({
+            "action": "model",
+            "level": "model",
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "provider": "deepseek",
+            "value": "deepseek-v4-pro",
+        }))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    let confirm = crate::bridge::test_support::card_buttons(&card)
+        .into_iter()
+        .find(|button| button["value"]["action"] == "model_provider_confirm")
+        .expect("the confirm button")["value"]
+        .clone();
+    app.host_action_on_message(confirm, "om_confirm")
+        .await
+        .expect("confirm");
+
+    wait_for_card_update(&platform, "the refusal", CardUpdates::Any, |card| {
+        card_header(card).contains("切换失败")
+    })
+    .await;
+    let updated = platform.updated_cards().await;
+    let text = updated.last().unwrap().to_string();
+    assert!(text.contains("TUI"), "{text}");
+    assert!(text.contains("CODEX_HOME"), "{text}");
+    let stored = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()))
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        stored.model.as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the local record keeps the previous pair"
+    );
 }
 
 /// With the gate at its default (off), a provider pick on a live Codex thread is
@@ -2406,6 +2540,7 @@ async fn the_default_codex_client_refuses_a_live_provider_pick() {
         "/work/cola",
         "a shared thread",
     ));
+    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
     let client = codex_client(&url).await;
     client.transcript("thread-1").await.expect("adopt the thread");
     server.wait_for_subscribers("thread-1", 1).await;
@@ -2416,10 +2551,11 @@ async fn the_default_codex_client_refuses_a_live_provider_pick() {
 
     let pick = serde_json::json!({
         "action": "model",
-        "level": "provider_switch",
+        "level": "model",
         "chat_id": "chat_1",
         "thread_id": "chat_1",
-        "value": "deepseek",
+        "provider": "deepseek",
+        "value": "deepseek-v4-pro",
     });
     let step = app.host_action(pick).await.expect("provider pick");
     assert!(step.card.is_none(), "no confirmation when the gate is shut");

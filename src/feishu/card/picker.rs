@@ -575,64 +575,129 @@ fn grouped_picker_card(
     card_shell(header, "blue", elements)
 }
 
-/// The confirmation card for a **thread-level provider switch** (issue #910):
-/// the click resumes the thread with the new `modelProvider`, which every other
-/// client attached to that thread sees too (ADR-0090's peer attachment), so the
-/// copy says it and the user confirms once. 确认 carries the provider id as its
-/// value under its own action tag; 取消 is [`picker_card`]'s clear button, which
-/// changes nothing.
+/// The confirmation card for a **thread-level provider switch** (issue #910).
+///
+/// A provider is only half a model — the old model name sent to a new provider
+/// is a 404 — so the card always names the **pair**, and its 确认 button carries
+/// it together with the target **session**, so a card that outlived a
+/// `/switch`, a delete or a recreate is refused instead of switching a
+/// different thread. 取消 carries its own action tag and changes nothing.
 pub fn build_provider_confirm_card(
     thread_key: &crate::config::ThreadKey,
+    session_id: &str,
     provider: &str,
+    model: &str,
 ) -> serde_json::Value {
     let intro = format!(
-        "**切换 provider 为 `{provider}`？**\n\
-         这会用 `thread/resume` 改动这条线程的 provider：**同一个线程上的其他客户端\
-         （Codex TUI / VS Code / 桌面端）也会看到这次变化**，之后的新轮次会走这个渠道。\n\
-         模型保持不变。"
+        "**切换为 `{provider}/{model}`？**\n\
+         这会释放并重新加载这条线程（`thread/unsubscribe` → `thread/resume` → `thread/read`），\
+         把 provider 和模型一起换掉：旧模型名在新 provider 上会 404。\n\
+         **同一个线程上的其他客户端（Codex TUI / VS Code / 桌面端），以及另一个共用同一个 \
+         `CODEX_HOME` 的 cola 实例，也会看到这次变化**；如果它们仍持有该线程，切换不会生效，\
+         cola 会报错而不会假装成功。"
     );
-    picker_card(
+    let cancel = json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "取消" },
+        "type": "default",
+        "width": "fill",
+        "value": {
+            "action": "model_provider_cancel",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+            "value": "",
+        },
+    });
+    let confirm = json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "✅ 确认切换" },
+        "type": "default",
+        "width": "fill",
+        "value": {
+            "action": "model_provider_confirm",
+            "chat_id": thread_key.chat_id,
+            "thread_id": thread_key.thread_id,
+            "session_id": session_id,
+            "provider": provider,
+            "value": model,
+        },
+    });
+    card_shell(
         "🎯 确认切换 Provider",
-        &intro,
-        thread_key,
-        "model_provider_confirm",
-        None,
-        false,
-        Some(("取消", "model_provider_cancel")),
-        &[PickerOption {
-            label: "✅ 确认切换".to_string(),
-            value: provider.to_string(),
-            provider: None,
-        }],
-        &[],
-        Some("取消不会发出任何请求，线程保持原样。"),
-        None,
+        "blue",
+        vec![
+            markdown_element(&intro),
+            cancel,
+            confirm,
+            markdown_element("取消不会发出任何请求，线程保持原样。"),
+        ],
     )
 }
 
-/// The card a confirmed provider switch ends on. It replaces the confirmation
-/// card, so the (now stale) buttons cannot be pressed again.
-pub fn build_provider_switched_card(provider: &str) -> serde_json::Value {
+/// The acknowledgement a confirmed switch returns before the RPC starts: the
+/// release + resume + read-back runs off the card-ack path, and this card is
+/// replaced by the outcome when it lands (issue #910).
+pub fn build_provider_switching_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "🎯 正在切换 Provider",
+        "blue",
+        vec![markdown_element(&format!(
+            "正在把这条线程切换到 `{provider}/{model}`：释放订阅 → `thread/resume` → 回读校验。\n\
+             结果会替换这张卡片。"
+        ))],
+    )
+}
+
+/// The card a confirmed provider/model switch ends on. It replaces the
+/// confirmation card, so the (now stale) buttons cannot be pressed again.
+pub fn build_provider_switched_card(provider: &str, model: &str) -> serde_json::Value {
     card_shell(
         "🎯 Provider 已切换",
         "green",
         vec![markdown_element(&format!(
-            "**当前 Provider**：`{provider}`\n\
-             这条线程的模型没有改变；同一个线程上的其他客户端现在也会使用这个 provider。\n\
+            "**当前**：`{provider}/{model}`（已由 `thread/read` 回读确认）\n\
+             这条线程的模型随 provider 一起换掉了；同一个线程上的其他客户端现在也会使用它。\n\
              再次发送 `/model` 可查看最新状态。"
         ))],
     )
 }
 
-/// A failed provider switch: the thread keeps its previous provider (no silent
-/// fallback), and both the target and the failure are named.
-pub fn build_provider_switch_error_card(provider: &str, error: &str) -> serde_json::Value {
+/// The thread already ran the pair: the switch was a no-op (a peer had already
+/// moved it, or the read-back agrees). Success, but nothing changed.
+pub fn build_provider_already_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "🎯 Provider 已经是这个值",
+        "green",
+        vec![markdown_element(&format!(
+            "这条线程已经在 `{provider}/{model}` 上（`thread/read` 回读确认），不需要切换。"
+        ))],
+    )
+}
+
+/// A failed provider switch: the thread keeps its previous provider/model (no
+/// silent fallback), and both the target and the failure are named.
+pub fn build_provider_switch_error_card(provider: &str, model: &str, error: &str) -> serde_json::Value {
     card_shell(
         "⚠️ Provider 切换失败",
         "red",
         vec![markdown_element(&format!(
-            "线程保持原来的 provider，本地记录也没有改动。\n\n\
-             **目标**：`{provider}`\n**错误**：{error}"
+            "线程保持原来的 provider/model，本地记录也没有改动。\n\n\
+             **目标**：`{provider}/{model}`\n**错误**：{error}"
+        ))],
+    )
+}
+
+/// The pair could not be recorded, so the switch never started: a click that
+/// cannot be saved must not claim success, and the thread is untouched (issue
+/// #910). The pair is written **before** the RPC precisely so a prompt racing
+/// the switch cannot send the old model name on the new provider.
+pub fn build_provider_save_blocked_card(pair: &str, error: &str) -> serde_json::Value {
+    card_shell(
+        "⚠️ Provider 切换没有开始",
+        "orange",
+        vec![markdown_element(&format!(
+            "无法记录这次选择（`{pair}`）：{error}。\n\
+             线程保持原来的 provider/model，也没有发出任何切换请求。"
         ))],
     )
 }
@@ -2206,21 +2271,33 @@ mod tests {
         );
     }
 
-    /// Issue #910 acceptance 7: the confirmation copy says other clients on the
-    /// thread see the change, and its buttons are the two the bridge routes.
+    /// Issue #910 acceptance 7: the confirmation copy names the **pair**, says
+    /// every attached client (and a second cola sharing `CODEX_HOME`) sees the
+    /// change, and its buttons carry the pair + target session the bridge
+    /// re-checks.
     #[test]
-    fn the_provider_confirmation_names_the_peer_effect() {
+    fn the_provider_confirmation_names_the_pair_peers_and_target() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_provider_confirm_card(&key, "deepseek");
+        let card = build_provider_confirm_card(&key, "ses_1", "deepseek", "deepseek-v4-pro");
         let text = card.to_string();
-        assert!(text.contains("其他客户端"), "peer effect missing: {text}");
-        assert!(text.contains("deepseek"), "the target is named: {text}");
+        for expected in [
+            "deepseek/deepseek-v4-pro",
+            "其他客户端",
+            "TUI",
+            "VS Code",
+            "CODEX_HOME",
+            "cola",
+        ] {
+            assert!(text.contains(expected), "{expected} missing: {text}");
+        }
         let buttons = card_buttons(&card);
         let confirm = buttons
             .iter()
             .find(|button| button["value"]["action"] == "model_provider_confirm")
             .expect("the confirm button");
-        assert_eq!(confirm["value"]["value"], "deepseek");
+        assert_eq!(confirm["value"]["value"], "deepseek-v4-pro");
+        assert_eq!(confirm["value"]["provider"], "deepseek");
+        assert_eq!(confirm["value"]["session_id"], "ses_1");
         assert!(
             buttons
                 .iter()
@@ -2230,6 +2307,39 @@ mod tests {
         assert!(
             card.to_string().len() <= MAX_CARD_JSON_CHARS,
             "the confirmation stays inside the card budget"
+        );
+    }
+
+    /// Issue #910, item 8: the ack is a "switching" card, and the outcome
+    /// (success, unchanged, refusal or a failed local save) is a card of its
+    /// own — never the ack claiming success.
+    #[test]
+    fn the_switch_outcome_cards_name_their_state() {
+        let switching = build_provider_switching_card("deepseek", "deepseek-v4-pro");
+        assert!(switching.to_string().contains("正在"), "{switching}");
+
+        let switched = build_provider_switched_card("deepseek", "deepseek-v4-pro");
+        assert!(switched.to_string().contains("已切换"), "{switched}");
+        assert!(switched.to_string().contains("thread/read"), "{switched}");
+
+        let already = build_provider_already_card("deepseek", "deepseek-v4-pro");
+        assert!(already.to_string().contains("已经在"), "{already}");
+
+        let failed = build_provider_switch_error_card(
+            "deepseek",
+            "deepseek-v4-pro",
+            "thread/resume 之后这条线程仍是 `openai/gpt-5.1-codex`",
+        );
+        assert!(failed.to_string().contains("切换失败"), "{failed}");
+        assert!(failed.to_string().contains("openai/gpt-5.1-codex"), "{failed}");
+
+        let save = build_provider_save_blocked_card("deepseek/deepseek-v4-pro", "disk full");
+        let text = save.to_string();
+        assert!(text.contains("无法记录"), "{text}");
+        assert!(text.contains("disk full"), "{text}");
+        assert!(
+            text.contains("没有开始") && text.contains("原来的 provider/model"),
+            "a failed save never claims the switch happened: {text}"
         );
     }
 }

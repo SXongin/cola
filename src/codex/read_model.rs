@@ -57,6 +57,13 @@ const TURN_COMPLETED: &str = "turn/completed";
 const TURN_DIFF_UPDATED: &str = "turn/diff/updated";
 const TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
 const ERROR_NOTIFICATION: &str = "error";
+/// The server's own thread-level settings broadcast (issue #910): `ThreadSettings
+/// { model, modelProvider, effort, … }`. It is the server telling every
+/// subscriber that the thread moved, so the projection can follow without a
+/// read. The pinned 0.163 server does not send it for a resume-over-provider to
+/// a connection that was just resubscribed (measured); consuming it is still
+/// correct, and the read-back after a switch never depends on it.
+pub(crate) const SETTINGS_UPDATED: &str = "thread/settings/updated";
 
 /// The live-turn state a `thread/status/changed` broadcast reports. The
 /// neutral [`crate::backend::types::SessionStatus`] is derived from it at the
@@ -246,24 +253,6 @@ impl ThreadProjection {
             (None, Some(ModelSource::Thread)) => None,
             (None, _) => self.model.take(),
         };
-    }
-
-    /// Record a thread-level provider a resume accepted (issue #910). Only the
-    /// provider axis of the held model fact moves — the model and the variant
-    /// stay — and the acceptance is stamped so a read that started earlier
-    /// cannot overwrite it with the provider it saw before the switch. With no
-    /// model fact yet there is nothing to re-provider: the next read supplies
-    /// both.
-    pub(crate) fn record_thread_provider(&mut self, provider: &str, accepted: u64) {
-        if self.model.as_ref().is_some_and(|fact| fact.stamp > accepted) {
-            return;
-        }
-        let Some(fact) = self.model.as_mut() else {
-            return;
-        };
-        fact.model.provider_id = provider.to_string();
-        fact.source = ModelSource::Thread;
-        fact.stamp = accepted;
     }
 
     /// Record the model cola itself asked for on an accepted `turn/start`: the

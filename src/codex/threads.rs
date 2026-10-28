@@ -623,32 +623,33 @@ impl Threads {
         }
     }
 
-    /// Override a thread's provider by resuming it (issue #910). This is the
-    /// **only** way an existing thread's channel changes — `turn/start` has no
-    /// provider field — and it is deliberately *not* [`Self::adopt`]: the caller
-    /// already holds this thread's subscription, so re-resuming must not add a
-    /// second local holder (which would leave the server subscribed for good).
+    /// Resume a thread with a new **provider + model pair** (issue #910).
     ///
-    /// No silent fallback: a server that answers with a **different** provider
-    /// did not apply the switch, and that is a named error. A response that
-    /// omits the field is accepted (it is nullable on the wire).
-    pub(crate) async fn resume_with_provider(&self, thread_id: &str, provider: &str) -> Result<Thread> {
+    /// This is the protocol's only door to a thread-level provider change —
+    /// `turn/start` has no provider field — and it only takes effect when the
+    /// thread is **reloaded**: a resume on a thread this connection (or a peer)
+    /// already has loaded returns ok and changes nothing. The caller therefore
+    /// releases the thread first; this method never does (the subscription
+    /// bookkeeping lives with the adapter's projections).
+    ///
+    /// It deliberately *is not* [`Self::adopt`]: the caller is not taking a
+    /// subscription here, and a second local holder would leave the server
+    /// subscribed forever. The response proves nothing — the caller verifies
+    /// with a `thread/read` (a resume can return ok and keep the old pair).
+    pub(crate) async fn resume_with_model(
+        &self,
+        thread_id: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<Thread> {
         let mut params = json!({ "threadId": thread_id });
         ThreadModel {
-            model: None,
+            model: Some(model),
             provider: Some(provider),
         }
         .add_params(&mut params);
         let result = self.connection.request("thread/resume", params).await?;
         let response: ResumeResponse = decode("thread/resume", result)?;
-        if let Some(observed) = response.thread.model_provider.as_deref()
-            && observed != provider
-        {
-            return Err(CodexError::Protocol {
-                method: "thread/resume".to_string(),
-                detail: format!("the server kept provider `{observed}` instead of `{provider}`"),
-            });
-        }
         Ok(response.thread)
     }
 
@@ -1132,12 +1133,12 @@ mod tests {
         );
     }
 
-    /// Issue #910: an existing thread's provider changes through
-    /// `thread/resume`, and that request carries **only** the provider — the
-    /// model and the thread's other overrides are not re-sent, so a provider
-    /// switch cannot change the model.
+    /// Issue #910: a provider switch is `thread/resume` with the **pair**
+    /// (`modelProvider` + `model`) — the old model name on the new provider is a
+    /// 404 — and nothing else: the thread's sandbox/approval overrides are not
+    /// re-sent, and the resume is not a second local subscription.
     #[tokio::test]
-    async fn resume_with_provider_sends_only_the_provider() {
+    async fn resume_with_model_sends_the_pair_and_nothing_else() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
@@ -1158,36 +1159,31 @@ mod tests {
         )
         .await;
 
-        // The thread is already subscribed by this connection: the switch must
-        // not add a second local holder (that would strand the server's
-        // subscription forever).
         let Adoption::Subscribed(subscription) = client.threads().adopt("thread-1").await.expect("adopt")
         else {
             panic!("must subscribe");
         };
         assert_eq!(client.threads().local_holders("thread-1"), 1);
 
-        let thread = client
+        // The thread is loaded (this connection subscribes), so the measured
+        // server answers this resume without applying it: the response proves
+        // nothing, and the caller releases first.
+        client
             .threads()
-            .resume_with_provider("thread-1", "deepseek")
+            .resume_with_model("thread-1", "deepseek", "deepseek-v4-pro")
             .await
-            .expect("switch the provider");
+            .expect("the resume is accepted");
 
-        assert_eq!(
-            thread.model_provider.as_deref(),
-            Some("deepseek"),
-            "the server's answer names the new provider"
-        );
-        assert_eq!(
-            thread.model.as_deref(),
-            Some("gpt-5.1-codex"),
-            "a provider switch leaves the thread's model alone"
-        );
         let params = server.resume_params();
         assert_eq!(params.len(), 2, "the adopt, then the switch: {params:?}");
         assert_eq!(
             params[1],
-            json!({ "threadId": "thread-1", "modelProvider": "deepseek" })
+            json!({
+                "threadId": "thread-1",
+                "modelProvider": "deepseek",
+                "model": "deepseek-v4-pro",
+            }),
+            "the pair, and none of the thread's other overrides"
         );
         assert_eq!(
             client.threads().local_holders("thread-1"),
@@ -1197,11 +1193,11 @@ mod tests {
         drop(subscription);
     }
 
-    /// Issue #910: no silent fallback. A server that accepted `thread/resume`
-    /// but kept the old provider is a named protocol error, and a refused one
-    /// is the server's own error — neither reports success.
+    /// Issue #910, item 1 (the measurement the switch is built on): a resume on
+    /// a thread this connection already has loaded answers ok and changes
+    /// **nothing**; only after `thread/unsubscribe` does the same resume land.
     #[tokio::test]
-    async fn resume_with_provider_refuses_a_server_that_kept_another_provider() {
+    async fn a_resume_without_a_release_is_a_silent_no_op() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
@@ -1211,30 +1207,36 @@ mod tests {
         ));
         server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
         let client = connect(&url).await;
+        let Adoption::Subscribed(subscription) = client.threads().adopt("thread-1").await.expect("adopt")
+        else {
+            panic!("must subscribe");
+        };
 
-        server.keep_provider_on_resume();
-        let error = client
+        // Loaded thread: the resume is accepted but the pair does not move.
+        client
             .threads()
-            .resume_with_provider("thread-1", "deepseek")
+            .resume_with_model("thread-1", "deepseek", "deepseek-v4-pro")
             .await
-            .expect_err("a server that kept `openai` did not switch");
-        let message = error.to_string();
-        assert!(
-            message.contains("openai"),
-            "names what the server kept: {message}"
+            .expect("accepted");
+        let read = client.threads().read("thread-1", false).await.expect("read");
+        assert_eq!(
+            read.model_provider.as_deref(),
+            Some("openai"),
+            "a resume on a loaded thread is a silent no-op"
         );
-        assert!(message.contains("deepseek"), "names what was asked: {message}");
+        assert_eq!(read.model.as_deref(), Some("gpt-5.1-codex"));
 
-        server.reject_next_resume("unknown provider: nope");
-        let error = client
+        // Released first, the same request takes effect.
+        subscription.release().await.expect("release");
+        assert_eq!(server.subscribers("thread-1"), 0);
+        client
             .threads()
-            .resume_with_provider("thread-1", "nope")
+            .resume_with_model("thread-1", "deepseek", "deepseek-v4-pro")
             .await
-            .expect_err("the server refused the provider");
-        assert!(
-            error.to_string().contains("unknown provider"),
-            "the server's reason survives: {error}"
-        );
+            .expect("accepted");
+        let read = client.threads().read("thread-1", false).await.expect("read");
+        assert_eq!(read.model_provider.as_deref(), Some("deepseek"));
+        assert_eq!(read.model.as_deref(), Some("deepseek-v4-pro"));
     }
 
     /// Ticket #878 acceptance 1: the list is scoped to the directory, shows
