@@ -5604,10 +5604,13 @@ mod tests {
             calls < 100,
             "the deadline stopped the 100-page catalog after {calls} pages"
         );
+        // The page-count bound above is the load-independent assertion (an
+        // uncapped read would take ~15 s here). The wall-clock bound is only a
+        // sanity net: a loaded full-suite run can delay the sliced read well
+        // past 600 ms, so it must not be tight enough to flake.
         assert!(
-            elapsed < Duration::from_millis(600) + Duration::from_secs(3),
-            "a paginated catalog took {elapsed:?}; the 600ms slice plus \
-             test-runner scheduling exceeded it"
+            elapsed < Duration::from_secs(10),
+            "a paginated catalog took {elapsed:?}; the deadline did not cap it"
         );
         assert!(
             surface
