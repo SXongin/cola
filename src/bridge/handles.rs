@@ -979,6 +979,26 @@ impl SessionsHandle {
         }
     }
 
+    /// The `/think` clear for a pick whose catalog read runs **inside** the
+    /// session's switch point (issue #910): the read is bounded like the switch
+    /// itself, so a silent catalog cannot hold the point open and wedge the
+    /// prompts queued behind it. A timeout is "unknown" — the variant is kept,
+    /// exactly as a failed catalog read is treated elsewhere.
+    async fn clear_variant_for_model_bounded(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        variant: &mut Option<String>,
+        model_spec: &str,
+        bound: std::time::Duration,
+    ) -> Option<String> {
+        // A timeout is "unknown": no clear is recorded, and `variant` is
+        // untouched (the timed-out future never reached its mutation), exactly
+        // as a failed catalog read is treated.
+        tokio::time::timeout(bound, self.clear_variant_for_model(backend, variant, model_spec))
+            .await
+            .unwrap_or_default()
+    }
+
     /// Switch a durable session's selection under its **total** bound (issue
     /// #910): the transport only bounds the connect, and a server that stops
     /// answering must fail by name rather than hold the switch point forever.
@@ -1120,7 +1140,12 @@ impl SessionsHandle {
         // changed it): resolve it, clear against it, then switch.
         let mut variant = self.durable_variant(backend, &session_id, &base.directory).await;
         let cleared = self
-            .clear_variant_for_model(backend, &mut variant, model_spec)
+            .clear_variant_for_model_bounded(
+                backend,
+                &mut variant,
+                model_spec,
+                crate::bridge::session_gates::SWITCH_RPC_BOUND,
+            )
             .await;
         let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
             crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))

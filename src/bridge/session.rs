@@ -479,12 +479,17 @@ impl SessionStore {
     /// (a pending and an active session are mutually exclusive, ADR-0041) —
     /// materialisation is exactly this operation, in one write.
     pub fn activate(&mut self, entry: SessionEntry) -> crate::error::Result<()> {
+        let key = entry.thread_key.clone();
         // An adoption/creation that is not a materialisation of the thread's
         // pending (a `/switch`, a recreate) resolves any claim: the thread's
         // active session is this one now. A materialisation must use
         // [`Self::activate_created`], which resolves only its own generation.
         self.creating.remove(&entry.thread_key);
         self.promote(entry);
+        // With the claim resolved and the pending consumed, nothing can compare
+        // against the thread's epoch any more (issue #910, the same rule as
+        // `remove_thread`).
+        self.prune_pending_epoch(&key);
         self.write_to_disk()
     }
 
@@ -2020,6 +2025,19 @@ mod tests {
             "the identity is never reused"
         );
         assert_eq!(store.pending_epochs(), 1);
+
+        // `activate` (an adoption or a `/switch`) prunes it too once the pending
+        // is consumed and no claim is left.
+        let mut adopted = make_entry("chat1", "root1", "ses_adopted", "/tmp/fourth");
+        adopted.client_id = store.client_id.clone();
+        store.activate(adopted).unwrap();
+        assert_eq!(
+            store.pending_epochs(),
+            0,
+            "an activated thread keeps no epoch entry"
+        );
+        assert_eq!(store.pending_epoch_for(&key), 0);
+        assert!(store.pending_for(&key).is_none(), "the pending was consumed");
     }
 
     /// Issue #910 (extra finding): a `/agent` write touches only its own field —

@@ -24,6 +24,24 @@
 //! never holds up another, and it never holds the global turn-admission set
 //! ([`super::core::SharedCore::inflight`]).
 //!
+//! # What a switch that races a submit means
+//!
+//! The pre-flight holds the switch point across its snapshot and releases it
+//! immediately before `Backend::prompt` (a submit has no total response bound).
+//! On a generation whose selection is durable (V2) the **server** is the
+//! authority: a switch that lands while the turn is being submitted is a user
+//! action applied from the next turn, while the snapshot governs this turn's
+//! variant. It is not a mirror/mirror disagreement — the switch writes the
+//! server and the mirror inside the point, so those two never diverge.
+//!
+//! # Waits are bounded
+//!
+//! Every caller takes the point with a bound ([`SWITCH_SETTLE_BOUND`]), and the
+//! work inside it is bounded too ([`SWITCH_RPC_BOUND`]): the durable switch RPC,
+//! the session read that precedes it, and the `/think` catalog clear. A server
+//! that stops answering fails the caller **by name** instead of holding the
+//! point, and therefore every prompt queued behind it, forever.
+//!
 //! The registry holds **weak** references, so only sessions with a live gate
 //! keep an entry; a dead entry is pruned when the next gate is created.
 
@@ -79,6 +97,19 @@ impl std::fmt::Debug for SessionGate {
     }
 }
 
+/// Test-only: keeps a waiter count honest even when the acquire is cancelled
+/// (a bounded acquire that times out), so a phantom waiter cannot make a later
+/// test believe the point is still contended (issue #910).
+#[cfg(test)]
+struct WaitingGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(test)]
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl SessionGate {
     /// Take the session's serialization point. Hold it across the read, the
     /// decision and the write; never across a catalog lookup or an RPC.
@@ -86,9 +117,10 @@ impl SessionGate {
         #[cfg(test)]
         {
             self.waiting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let guard = self.lock.lock().await;
-            self.waiting.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            guard
+            // The guard decrements on **drop**, so a cancelled acquire (a
+            // bounded `timeout`) leaves no phantom waiter behind.
+            let _queued = WaitingGuard(&self.waiting);
+            self.lock.lock().await
         }
         #[cfg(not(test))]
         {
@@ -112,10 +144,8 @@ impl SessionGate {
         {
             self.switch_waiting
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let guard = self.switch.lock().await;
-            self.switch_waiting
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            guard
+            let _queued = WaitingGuard(&self.switch_waiting);
+            self.switch.lock().await
         }
         #[cfg(not(test))]
         {
@@ -196,6 +226,34 @@ impl std::fmt::Debug for SessionGates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #910, items 1 and 3: every holder of the switch point is bounded
+    /// now, so the pre-flight's acquire bound is the backstop for a future
+    /// unbounded step. It refuses **by name**, and a cancelled acquire leaves
+    /// no phantom waiter behind (the test-only counter is drop-guarded).
+    #[tokio::test]
+    async fn a_bounded_acquire_refuses_by_name_and_leaves_no_waiter() {
+        let gates = SessionGates::default();
+        let gate = gates.gate("ses_a");
+        let held = gate.enter_switch().await;
+        let started = std::time::Instant::now();
+        let error = acquire_switch_bounded(&gate, Duration::from_millis(50))
+            .await
+            .expect_err("the point is held");
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert!(error.to_string().contains("没有完成"), "{error}");
+        assert_eq!(
+            gate.switch_waiting(),
+            0,
+            "a cancelled acquire leaves no phantom waiter"
+        );
+        drop(held);
+        assert!(
+            acquire_switch_bounded(&gate, Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+    }
 
     /// The registry keeps only live gates: a session whose gate nobody holds is
     /// reclaimed by the next creation, so a long-lived process does not retain a
