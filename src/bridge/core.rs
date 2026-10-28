@@ -541,6 +541,7 @@ impl SharedCore {
             Arc::clone(&self.sessions),
             Arc::clone(&self.session_list_cache),
             self.default_auto_accept,
+            self.session_gates.clone(),
         )
     }
 
@@ -717,6 +718,17 @@ impl SharedCore {
     /// a card on 「⏳ 等待后台任务」.
     pub(crate) async fn activate_session(&self, entry: SessionEntry) -> crate::error::Result<()> {
         self.flow_handles().activate(entry).await
+    }
+
+    /// Activate the session a **materialisation** created, scoped to its claim's
+    /// generation (issue #910): only that generation resolves the thread's
+    /// pending, so a replacement pending declared meanwhile survives.
+    pub(crate) async fn activate_created(
+        &self,
+        entry: SessionEntry,
+        generation: u64,
+    ) -> crate::error::Result<()> {
+        self.sessions_handle().activate_created(entry, generation).await
     }
 
     /// The settings the conversation's next prompt will use (ADR-0041): the

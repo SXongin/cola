@@ -60,6 +60,10 @@ use crate::feishu;
 #[derive(Clone)]
 pub(crate) struct SessionsHandle {
     pub(crate) store: Arc<Mutex<SessionStore>>,
+    /// The per-session model/provider serialization points (issue #910): the
+    /// `/model` and `/think` writes take their session's gate and re-read before
+    /// writing, so a delayed pick cannot overwrite a switch's pair.
+    pub(crate) session_gates: crate::bridge::session_gates::SessionGates,
     /// The 30 s session-list cache (`/switch`/`/attach`), invalidated by
     /// the write paths below. Private: [`Self::cached_session_list`] and
     /// [`Self::invalidate_cache`] are the accessors.
@@ -131,16 +135,31 @@ pub(crate) fn classify_pick(
     }
 }
 
+/// A mirror write's outcome as the surface's pick result (issue #910): only an
+/// applied write is a pick; every refused arm says the state moved.
+fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome {
+    match written {
+        crate::bridge::session::PairWrite::Applied { cleared_variant, .. } => {
+            PickOutcome::Applied { cleared_variant }
+        }
+        crate::bridge::session::PairWrite::Creating
+        | crate::bridge::session::PairWrite::Moved
+        | crate::bridge::session::PairWrite::Changed => PickOutcome::StateChanged,
+    }
+}
+
 impl SessionsHandle {
     pub(crate) fn new(
         store: Arc<Mutex<SessionStore>>,
         cache: Arc<Mutex<Option<SessionListCache>>>,
         default_auto_accept: bool,
+        session_gates: crate::bridge::session_gates::SessionGates,
     ) -> Self {
         Self {
             store,
             cache,
             default_auto_accept,
+            session_gates,
         }
     }
 
@@ -742,13 +761,15 @@ impl SessionsHandle {
         let cleared = self
             .clear_variant_for_model(backend, &mut variant, model_spec)
             .await;
-        let written = self.store.lock().await.set_pending_pair(
+        let written = self.store.lock().await.set_mirror_pending(
             thread_key,
-            model_spec,
-            provider,
             settings.model.as_deref(),
             settings.variant.as_deref(),
-            cleared.as_deref(),
+            crate::bridge::session::MirrorWrite::Pair {
+                model: model_spec,
+                provider,
+                clear_variant: cleared.as_deref(),
+            },
         )?;
         Ok(match written {
             crate::bridge::session::PairWrite::Applied { cleared_variant, .. } => {
@@ -762,25 +783,23 @@ impl SessionsHandle {
         })
     }
 
-    /// Write a provider+model pair onto a **live** entry in one lock (issue
-    /// #910), compare-and-set on the snapshot the caller read and re-verifying
-    /// that the thread still maps to that session.
-    pub(crate) async fn set_live_pair(
+    /// Write a model/provider mirror change onto a **live** entry in one lock
+    /// (issue #910), compare-and-set on the snapshot the caller read and
+    /// re-verifying that the thread still maps to that session.
+    pub(crate) async fn set_live_mirror(
         &self,
         thread_key: &ThreadKey,
         session_id: &str,
-        model_spec: &str,
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
-        clear_variant: Option<&str>,
+        write: crate::bridge::session::MirrorWrite<'_>,
     ) -> crate::error::Result<crate::bridge::session::PairWrite> {
-        self.store.lock().await.set_live_pair(
+        self.store.lock().await.set_mirror_live(
             thread_key,
             session_id,
-            model_spec,
             expected_model,
             expected_variant,
-            clear_variant,
+            write,
         )
     }
 
@@ -807,6 +826,20 @@ impl SessionsHandle {
     /// Claim a Pending Session for materialisation (issue #910): the snapshot
     /// and the claim are taken under one lock, so a pair write in the window
     /// before `thread/start` cannot claim a pair the creation will not apply.
+    /// Activate the session a materialisation created, scoped to its claim's
+    /// generation (issue #910): a replacement pending declared while the
+    /// creation ran is left alone.
+    pub(crate) async fn activate_created(
+        &self,
+        entry: SessionEntry,
+        generation: u64,
+    ) -> crate::error::Result<()> {
+        let mut store = self.store.lock().await;
+        store.activate_created(entry, generation)?;
+        *self.cache.lock().await = None;
+        Ok(())
+    }
+
     pub(crate) async fn claim_pending_for_creation(
         &self,
         thread_key: &ThreadKey,
@@ -836,37 +869,121 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         model_spec: &str,
     ) -> crate::error::Result<PickOutcome> {
-        let Some(mut settings) = self.session_settings(thread_key).await else {
+        use crate::bridge::session::MirrorWrite;
+        let Some(snapshot) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
-        settings.model = Some(model_spec.to_string());
-        let cleared_variant = match settings.session_id.clone() {
-            Some(session_id) => {
-                if backend.keeps_session_selection() {
-                    settings.variant = match self
-                        .durable_selection(backend, &session_id, Some(&settings.directory))
-                        .await
-                    {
-                        Ok(Some(selection)) => selection.model.and_then(|model| model.variant),
-                        // Unknown: the switch rewrites the ref wholesale, so
-                        // dropping it is the one honest outcome.
-                        Ok(None) | Err(_) => None,
-                    };
-                }
-                self.apply_model_selection(backend, &session_id, model_spec, &mut settings.variant)
-                    .await?
-            }
-            None => {
-                // A Pending Session has no session to switch yet; the clear
-                // rule is recorded and applied when the session materialises.
-                self.clear_variant_for_model(backend, &mut settings.variant, model_spec)
-                    .await
-            }
+        // The catalog lookup that decides the `/think` clear is its own await:
+        // it runs before the gate, never inside it.
+        let mut probe = snapshot.variant.clone();
+        let pre_gate_clear = self
+            .clear_variant_for_model(backend, &mut probe, model_spec)
+            .await;
+        // A Pending Session has no session to switch yet: one pending-only CAS.
+        let Some(session_id) = snapshot.session_id.clone() else {
+            let written = self.store.lock().await.set_mirror_pending(
+                thread_key,
+                snapshot.model.as_deref(),
+                snapshot.variant.as_deref(),
+                MirrorWrite::Model {
+                    model: model_spec,
+                    clear_variant: pre_gate_clear.as_deref(),
+                },
+            )?;
+            return Ok(pair_write_outcome(written));
         };
-        if !self.set_session_settings(thread_key, settings).await? {
-            return Ok(PickOutcome::NoTarget);
+        // A live session: re-read, switch (durable generations) and write under
+        // the session gate, compare-and-set against what the caller read.
+        let gate = self.session_gates.gate(&session_id);
+        let _held = gate.enter().await;
+        if gate.has_intent() {
+            // A provider switch owns the pair until it resolves; a pick that
+            // waited for it would land on a state the user did not see.
+            return Ok(PickOutcome::StateChanged);
         }
-        Ok(PickOutcome::Applied { cleared_variant })
+        let Some(current) = self.session_settings(thread_key).await else {
+            return Ok(PickOutcome::NoTarget);
+        };
+        if current.session_id.as_deref() != Some(session_id.as_str())
+            || current.model != snapshot.model
+            || current.variant != snapshot.variant
+        {
+            return Ok(PickOutcome::StateChanged);
+        }
+        let mut variant = current.variant.clone();
+        let cleared = if backend.keeps_session_selection() {
+            // The session's own selection may have moved (another client):
+            // resolve it under the gate and clear against it.
+            variant = self
+                .durable_variant(backend, &session_id, &current.directory)
+                .await;
+            self.clear_variant_for_model(backend, &mut variant, model_spec)
+                .await
+        } else {
+            pre_gate_clear
+        };
+        if backend.keeps_session_selection() {
+            let model = crate::backend::parsing::parse_model(model_spec).ok_or_else(|| {
+                crate::error::BridgeError::OpenCode(format!("invalid model reference `{model_spec}`"))
+            })?;
+            backend
+                .switch_session_model(
+                    &session_id,
+                    &crate::backend::types::ModelInfo {
+                        id: model.id,
+                        provider_id: model.provider_id,
+                        variant: variant.clone(),
+                    },
+                )
+                .await?;
+        }
+        // A durable generation's session is the authority on the surviving
+        // variant (the switch above rewrote it): the mirror follows it. On V1 the
+        // variant only ever *clears*, exactly as before.
+        let write = if backend.keeps_session_selection() {
+            MirrorWrite::ModelWithVariant {
+                model: model_spec,
+                variant: variant.as_deref(),
+            }
+        } else {
+            MirrorWrite::Model {
+                model: model_spec,
+                clear_variant: cleared.as_deref(),
+            }
+        };
+        let written = self.store.lock().await.set_mirror_live(
+            thread_key,
+            &session_id,
+            snapshot.model.as_deref(),
+            snapshot.variant.as_deref(),
+            write,
+        )?;
+        Ok(match pair_write_outcome(written) {
+            // A durable generation's clear happens on the session (the write
+            // carries only the surviving variant): report it from there.
+            PickOutcome::Applied {
+                cleared_variant: None,
+            } if cleared.is_some() => PickOutcome::Applied {
+                cleared_variant: cleared,
+            },
+            other => other,
+        })
+    }
+
+    /// The variant of a durable generation's session selection (V2): the
+    /// session's own, so a peer's `/think` is not overwritten by a stale mirror.
+    async fn durable_variant(
+        &self,
+        backend: &Arc<dyn crate::backend::Backend>,
+        session_id: &str,
+        directory: &str,
+    ) -> Option<String> {
+        match self.durable_selection(backend, session_id, Some(directory)).await {
+            Ok(Some(selection)) => selection.model.and_then(|model| model.variant),
+            // Unknown: the switch rewrites the ref wholesale, so dropping the
+            // variant is the one honest outcome.
+            Ok(None) | Err(_) => None,
+        }
     }
 
     /// Apply a `/think` pick: `variant: None` clears it (the model's own
@@ -874,21 +991,42 @@ impl SessionsHandle {
     /// session's model ref — the effective model is resolved first, so
     /// [`PickOutcome::NoModel`] reports a session that cannot carry one (never
     /// a mirror-only write the server would ignore) — and on V1 it stays the
-    /// per-prompt mirror.
+    /// per-prompt mirror. The write is gated and a compare-and-set (issue #910).
     pub(crate) async fn pick_think(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         variant: Option<String>,
     ) -> crate::error::Result<PickOutcome> {
-        let Some(mut settings) = self.session_settings(thread_key).await else {
+        use crate::bridge::session::MirrorWrite;
+        let Some(snapshot) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
-        settings.variant = variant;
-        if let Some(session_id) = settings.session_id.clone()
-            && backend.keeps_session_selection()
+        let Some(session_id) = snapshot.session_id.clone() else {
+            let written = self.store.lock().await.set_mirror_pending(
+                thread_key,
+                snapshot.model.as_deref(),
+                snapshot.variant.as_deref(),
+                MirrorWrite::Variant(variant.as_deref()),
+            )?;
+            return Ok(pair_write_outcome(written));
+        };
+        let gate = self.session_gates.gate(&session_id);
+        let _held = gate.enter().await;
+        if gate.has_intent() {
+            return Ok(PickOutcome::StateChanged);
+        }
+        let Some(current) = self.session_settings(thread_key).await else {
+            return Ok(PickOutcome::NoTarget);
+        };
+        if current.session_id.as_deref() != Some(session_id.as_str())
+            || current.model != snapshot.model
+            || current.variant != snapshot.variant
         {
-            let Some(model) = self.effective_selection(backend, &settings).await else {
+            return Ok(PickOutcome::StateChanged);
+        }
+        if backend.keeps_session_selection() {
+            let Some(model) = self.effective_selection(backend, &current).await else {
                 return Ok(PickOutcome::NoModel);
             };
             backend
@@ -897,17 +1035,19 @@ impl SessionsHandle {
                     &crate::backend::types::ModelInfo {
                         id: model.id,
                         provider_id: model.provider_id,
-                        variant: settings.variant.clone(),
+                        variant: variant.clone(),
                     },
                 )
                 .await?;
         }
-        if !self.set_session_settings(thread_key, settings).await? {
-            return Ok(PickOutcome::NoTarget);
-        }
-        Ok(PickOutcome::Applied {
-            cleared_variant: None,
-        })
+        let written = self.store.lock().await.set_mirror_live(
+            thread_key,
+            &session_id,
+            snapshot.model.as_deref(),
+            snapshot.variant.as_deref(),
+            MirrorWrite::Variant(variant.as_deref()),
+        )?;
+        Ok(pair_write_outcome(written))
     }
 
     /// Apply an `/agent` pick: `agent: None` clears it (back to the server's

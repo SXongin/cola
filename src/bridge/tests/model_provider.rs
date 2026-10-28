@@ -1618,3 +1618,281 @@ async fn a_remap_during_the_lookup_writes_nothing() {
         "a remapped chat never switches the captured thread"
     );
 }
+
+/// Final round, item 1: the switch registers its intent **before any await**, so
+/// a prompt that arrives while the switch is still doing its catalog lookup
+/// waits for the verdict — it never submits the old pair. Since that prompt is
+/// admitted before the switch writes, the switch defers, and the prompt's
+/// pre-flight applies the pair itself.
+#[tokio::test]
+async fn a_prompt_arriving_before_the_switch_gate_waits_for_the_verdict() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    // The switch's catalog lookup is parked: the pre-gate window.
+    let lookup = backend.hold_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let applies = backend.thread_model_calls.clone();
+    let prompt_calls = backend.prompt_calls.clone();
+    let prompt_models = backend.prompt_models.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // A prompt arrives inside the pre-gate window: it is admitted, but its
+    // pre-flight must wait for the switch's verdict instead of reading the old
+    // pair.
+    let prompt = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_prompt".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "hi".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        prompt_calls.lock().await.is_empty(),
+        "the prompt must not be submitted while the switch's intent is live"
+    );
+
+    lookup.add_permits(1);
+    prompt.await.expect("the prompt finishes");
+
+    wait_for_card_update(&platform, "the deferred record", CardUpdates::Any, |card| {
+        card_header(card).contains("已记录")
+    })
+    .await;
+    assert_eq!(
+        prompt_models.lock().await.last().cloned().flatten().as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the prompt submitted the pair, never the old model"
+    );
+    assert_eq!(
+        applies.lock().await.len(),
+        1,
+        "the prompt's pre-flight applied the deferred pair once"
+    );
+}
+
+/// Final round, item 2: the `/think` variant is read **under the gate**, so a
+/// prompt that was waiting for a switch cannot submit a variant the switch
+/// cleared as unsupported.
+#[tokio::test]
+async fn a_prompt_reads_the_variant_after_the_switch_gate() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_thread_model_delay(std::time::Duration::from_millis(600));
+    // The target model declares only `low`: the attempt clears `high`.
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: PROVIDER.into(),
+        models: vec![crate::backend::types::ModelOption {
+            id: MODEL.into(),
+            variants: vec!["low".into()],
+            ..Default::default()
+        }],
+    }]);
+    let prompt_variants = backend.prompt_variants.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    // The switch now holds the gate for its 600 ms apply; the prompt's
+    // pre-flight waits there. It must read the variant *after* the switch.
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        prompt_variants.lock().await.last().cloned().flatten(),
+        None,
+        "the cleared variant must not be submitted from a pre-gate snapshot"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant,
+        None,
+        "and the mirror records the clear"
+    );
+}
+
+/// Final round, item 3: an ordinary `/model` pick is gated and compare-and-set
+/// like every other mirror write — a pick that lands while the switch's intent
+/// is live is refused honestly instead of overwriting the pair.
+#[tokio::test]
+async fn a_model_pick_during_a_switch_is_refused_by_the_intent() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    // One-shot: parks only the switch's lookup, so the pick's own catalog
+    // lookup below can proceed.
+    let lookup = backend.hold_next_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // A plain `/model` pick while the switch's intent is live: refused, with the
+    // state-changed copy — never a write over the switch's pair.
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains("状态已变化"),
+        "the pick is refused honestly: {texts}"
+    );
+
+    lookup.add_permits(1);
+    wait_for_card_update(&platform, "the switch outcome", CardUpdates::Any, |card| {
+        card_header(card).contains("已切换")
+    })
+    .await;
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the switch's pair survives the refused pick"
+    );
+}
+
+/// Final round, item 4: a replacement pending declared while a creation is in
+/// flight is not resolved by that creation's activation, and its pair survives.
+#[tokio::test]
+async fn a_replacement_pending_survives_the_older_creation() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let gate = backend.hold_create_session();
+    let entered = backend.create_session_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/first")).await;
+
+    let first = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_prompt".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "hi".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the creation never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // A replacement pending is declared while the first is being created.
+    let mut replacement = PendingEntry::new(key(), "/work/second");
+    replacement.model = Some("deepseek/deepseek-v4-pro".into());
+    replacement.provider = Some(PROVIDER.into());
+    app.sessions
+        .lock()
+        .await
+        .set_pending(replacement)
+        .expect("the replacement is declared");
+
+    gate.add_permits(1);
+    first.await.expect("the first creation completes");
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the older creation must not resolve the replacement");
+    assert_eq!(pending.directory, "/work/second");
+    assert_eq!(pending.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+}
