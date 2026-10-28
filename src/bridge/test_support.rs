@@ -1710,6 +1710,10 @@ pub struct MockBackend {
     /// accepted the call and then stopped answering); the bridge's own total
     /// bound must release the switch point (issue #910).
     pub hang_switch: std::sync::atomic::AtomicUsize,
+    /// Hangs the next `session_selection` read forever — the initial selection
+    /// read of a durable pick never answers (issue #910): its observation state
+    /// is "unknown", not "no selection".
+    pub hang_session_selection: std::sync::atomic::AtomicUsize,
     /// Applies the next `switch_session_model` to the mock's selection and then
     /// never answers — the response was lost (issue #910). The bridge must
     /// reconcile instead of assuming nothing happened.
@@ -2069,6 +2073,7 @@ impl MockBackend {
             switch_model_gate: std::sync::Mutex::new(None),
             switch_model_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hang_switch: std::sync::atomic::AtomicUsize::new(0),
+            hang_session_selection: std::sync::atomic::AtomicUsize::new(0),
             hang_after_apply: std::sync::atomic::AtomicUsize::new(0),
             after_switch_selection: std::sync::Mutex::new(None),
             create_session_gate: std::sync::Mutex::new(None),
@@ -2537,6 +2542,14 @@ impl MockBackend {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.reply_permission_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// Scenario: the next `session_selection` read never answers (the initial
+    /// read of a durable pick), so nothing about the previous state is known.
+    pub(crate) fn hang_next_session_selection(&self) -> &Self {
+        self.hang_session_selection
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        self
     }
 
     /// Scenario: the next `switch_session_model` **applies** the change and then
@@ -3663,6 +3676,7 @@ impl crate::backend::Backend for MockBackend {
         if let Some(error) = &self.session_selection_error {
             return Err(crate::error::BridgeError::OpenCode(error.clone()));
         }
+        hang_if_scripted(&self.hang_session_selection).await;
         if !self.durable_selection {
             return Ok(None);
         }

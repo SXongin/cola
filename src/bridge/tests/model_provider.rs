@@ -2742,3 +2742,59 @@ async fn an_applied_think_whose_response_is_lost_is_reconciled() {
         "the mirror was reconciled"
     );
 }
+
+/// Issue #910 (adversarial, precise): the initial selection read times out, so
+/// the previous state was **never observed**. The switch then times out, and the
+/// reconciliation read answers "no model" — which must be `Unknown`, never
+/// "unchanged" (a lost read is not the same fact as a model-less selection).
+/// The mirror is forgotten, and the outcome is named unknown.
+#[tokio::test]
+async fn an_unobserved_previous_and_a_model_less_read_are_unknown() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    // The server has a selection, but no model: the reconciliation answer.
+    backend.with_session_selection("ses_test", crate::backend::types::SessionSelection::default());
+    backend.with_model_pick_route(ModelPickRoute::PerTurn);
+    // The initial read never answers …
+    backend.hang_next_session_selection();
+    // … and the switch never answers either; neither state is known.
+    backend.hang_next_switch();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/model-b",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyText { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        reply.contains("切换结果未知"),
+        "an unobserved previous + a model-less answer is unknown: {reply}"
+    );
+    let active = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(
+        active.model, None,
+        "the mirror is forgotten, never left claiming the old model"
+    );
+    assert_eq!(active.variant, None);
+}

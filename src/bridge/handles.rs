@@ -149,6 +149,27 @@ enum SwitchOutcome {
     Unknown,
 }
 
+/// What a bounded read of the server's own selection established (issue #910):
+/// "the server has no model" and "the server did not answer" are different
+/// facts, and conflating them would let a lost read pass for an unchanged
+/// selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedSelection {
+    /// The server answered: this is its selection (`None` = no model).
+    Observed(Option<crate::backend::types::ModelInfo>),
+    /// The read failed or timed out: nothing was established.
+    Unknown,
+}
+
+impl ObservedSelection {
+    fn model(&self) -> Option<&crate::backend::types::ModelInfo> {
+        match self {
+            ObservedSelection::Observed(model) => model.as_ref(),
+            ObservedSelection::Unknown => None,
+        }
+    }
+}
+
 /// Whether two selections name the same provider/model/`/think` level;
 /// `None` is "no selection" and equals only itself.
 fn same_selection(
@@ -988,23 +1009,23 @@ impl SessionsHandle {
     /// is bounded like the switch it precedes (issue #910): this read runs
     /// inside the session's switch point, so a silent server must not hold the
     /// point (and every prompt behind it) open.
-    async fn durable_model(
+    async fn observed_selection(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         session_id: &str,
         directory: &str,
-    ) -> Option<crate::backend::types::ModelInfo> {
-        let selection = tokio::time::timeout(
+    ) -> ObservedSelection {
+        let read = tokio::time::timeout(
             crate::bridge::session_gates::SWITCH_RPC_BOUND,
             self.durable_selection(backend, session_id, Some(directory)),
         )
         .await;
-        match selection {
-            Ok(Ok(Some(selection))) => selection.model,
-            // Unknown (an error, no selection, or no answer in time): the
-            // switch rewrites the ref wholesale, so dropping the variant is the
-            // one honest outcome.
-            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => None,
+        match read {
+            Ok(Ok(Some(selection))) => ObservedSelection::Observed(selection.model),
+            // Answered "no selection": an observation, not an absence of one.
+            Ok(Ok(None)) => ObservedSelection::Observed(None),
+            // An error or a timeout established nothing (issue #910).
+            Ok(Err(_)) | Err(_) => ObservedSelection::Unknown,
         }
     }
 
@@ -1018,25 +1039,33 @@ impl SessionsHandle {
         session_id: &str,
         directory: &str,
         attempted: &crate::backend::types::ModelInfo,
-        previous: Option<&crate::backend::types::ModelInfo>,
+        previous: &ObservedSelection,
     ) -> SwitchOutcome {
         let read = tokio::time::timeout(
             crate::bridge::session_gates::SWITCH_RPC_BOUND,
             backend.session_selection(session_id, Some(directory)),
         )
         .await;
-        let Ok(Ok(Some(selection))) = read else {
-            return SwitchOutcome::Unknown;
+        let current = match read {
+            Ok(Ok(Some(selection))) => ObservedSelection::Observed(selection.model),
+            Ok(Ok(None)) => ObservedSelection::Observed(None),
+            Ok(Err(_)) | Err(_) => ObservedSelection::Unknown,
         };
-        let current = selection.model.as_ref();
-        if current.is_some_and(|current| same_selection(Some(current), Some(attempted))) {
-            SwitchOutcome::Applied
-        } else if same_selection(current, previous) {
-            // Both sides are the same selection, `None` included: the server is
-            // where it was, so the failure is the whole truth.
-            SwitchOutcome::Unchanged
-        } else {
-            SwitchOutcome::Unknown
+        match (&current, previous) {
+            (ObservedSelection::Observed(Some(current)), _)
+                if same_selection(Some(current), Some(attempted)) =>
+            {
+                SwitchOutcome::Applied
+            }
+            // Only an **observed** previous selection can prove "unchanged": an
+            // unobserved one plus a model-less answer means the previous state
+            // was never established, so the outcome stays unknown (issue #910).
+            (ObservedSelection::Observed(current), ObservedSelection::Observed(previous))
+                if same_selection(current.as_ref(), previous.as_ref()) =>
+            {
+                SwitchOutcome::Unchanged
+            }
+            _ => SwitchOutcome::Unknown,
         }
     }
 
@@ -1222,8 +1251,10 @@ impl SessionsHandle {
         }
         // The session's own selection is the authority (another client may have
         // changed it): resolve it, clear against it, then switch.
-        let previous = self.durable_model(backend, &session_id, &base.directory).await;
-        let mut variant = previous.as_ref().and_then(|model| model.variant.clone());
+        let previous = self
+            .observed_selection(backend, &session_id, &base.directory)
+            .await;
+        let mut variant = previous.model().and_then(|model| model.variant.clone());
         let cleared = self
             .clear_variant_for_model_bounded(
                 backend,
@@ -1245,13 +1276,7 @@ impl SessionsHandle {
             // change before the answer was lost (issue #910). Reconcile against
             // its authoritative selection under the same bound.
             match self
-                .reconcile_switch(
-                    backend,
-                    &session_id,
-                    &base.directory,
-                    &attempted,
-                    previous.as_ref(),
-                )
+                .reconcile_switch(backend, &session_id, &base.directory, &attempted, &previous)
                 .await
             {
                 // The server holds the pick: record it as the success it is.
@@ -1468,6 +1493,12 @@ impl SessionsHandle {
             if base.session_id.as_deref() != Some(session_id.as_str()) {
                 return Ok(PickOutcome::StateChanged);
             }
+            // What the session's own selection was before the attempt, with its
+            // observation state (issue #910): the reconcile may only call a
+            // failure "unchanged" when the previous state was actually read.
+            let observed = self
+                .observed_selection(backend, &session_id, &base.directory)
+                .await;
             // Bounded like every other read under the point (issue #910): a
             // silent server must not hold it open for a `/think`.
             let Some(previous) = tokio::time::timeout(
@@ -1488,7 +1519,7 @@ impl SessionsHandle {
                 // Ambiguous (issue #910): the server may hold the new level
                 // already. Reconcile, exactly as a `/model` pick does.
                 match self
-                    .reconcile_switch(backend, &session_id, &base.directory, &attempted, Some(&previous))
+                    .reconcile_switch(backend, &session_id, &base.directory, &attempted, &observed)
                     .await
                 {
                     SwitchOutcome::Applied => {}
