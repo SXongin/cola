@@ -708,21 +708,35 @@ impl SessionsHandle {
         Ok(cleared)
     }
 
-    /// Record a thread-level provider on the conversation's Pending Session
-    /// (issue #910). A provider has no per-turn form (`turn/start` has none), so
-    /// a session that does not exist yet is the only place it can wait: the
-    /// first message carries it into `thread/start.modelProvider`. `false` when
-    /// the thread has no pending — a live thread's provider changes only through
-    /// the adapter's confirmed resume path, never through this mirror.
-    pub(crate) async fn pick_pending_provider(
+    /// Apply a provider + model **pair** to a Pending Session in ONE store write
+    /// (issue #910): the model mirror (which names the pair), the thread-level
+    /// provider `thread/start` will carry, and the `/think` clear rule
+    /// (ADR-0020). The two halves must never be split across writes — a partial
+    /// pair would be applied at thread creation, and the model is the half that
+    /// makes the provider safe. `NoTarget` for a live session: its provider
+    /// changes only through the adapter's thread-level switch, never this mirror.
+    pub(crate) async fn pick_pending_pair(
         &self,
+        backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         provider: &str,
-    ) -> crate::error::Result<bool> {
-        self.update_pending(thread_key, |pending| {
-            pending.provider = Some(provider.to_string());
-        })
-        .await
+        model_spec: &str,
+    ) -> crate::error::Result<PickOutcome> {
+        let Some(mut settings) = self.session_settings(thread_key).await else {
+            return Ok(PickOutcome::NoTarget);
+        };
+        if settings.session_id.is_some() {
+            return Ok(PickOutcome::NoTarget);
+        }
+        let cleared_variant = self
+            .clear_variant_for_model(backend, &mut settings.variant, model_spec)
+            .await;
+        settings.model = Some(model_spec.to_string());
+        settings.provider = Some(provider.to_string());
+        if !self.set_session_settings(thread_key, settings).await? {
+            return Ok(PickOutcome::NoTarget);
+        }
+        Ok(PickOutcome::Applied { cleared_variant })
     }
 
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches): mirror the

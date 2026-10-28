@@ -662,6 +662,47 @@ pub fn build_provider_switched_card(provider: &str, model: &str) -> serde_json::
     )
 }
 
+/// A confirmation that found a running turn: the pair is recorded and applied
+/// after that turn, before the next message (issue #910). It replaces the
+/// confirmation card, so its buttons cannot start a second attempt.
+pub fn build_provider_deferred_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "🎯 已记录，等本轮结束",
+        "blue",
+        vec![markdown_element(&format!(
+            "已记录 `{provider}/{model}`：当前这一轮结束后、下一条消息发出前切换。\n\
+             如果那时仍无法切换（别的客户端或另一个 cola 实例还持有线程），那条消息不会被发送，             并会说明原因。\n再次发送 `/model` 可查看当前状态。"
+        ))],
+    )
+}
+
+/// The thread's provider is already the target and only the model differs: no
+/// reload happened (a same-provider model change is the per-turn path), so the
+/// model lands on the next turn (issue #910).
+pub fn build_provider_model_pending_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "🎯 Provider 已经是目标，模型下一轮生效",
+        "green",
+        vec![markdown_element(&format!(
+            "这条线程的 provider 已经是 `{provider}`；模型会随下一轮 `turn/start.model` 换成 \
+             `{model}`，不需要重新加载线程。"
+        ))],
+    )
+}
+
+/// A second confirmation for the same session while the first switch is still
+/// running: answered, not started (issue #910). The claim ends when the first
+/// outcome card lands.
+pub fn build_provider_busy_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "🎯 切换还在进行中",
+        "blue",
+        vec![markdown_element(&format!(
+            "上一次对 `{provider}/{model}` 的切换还没有结果；等结果卡出现后再操作。"
+        ))],
+    )
+}
+
 /// The thread already ran the pair: the switch was a no-op (a peer had already
 /// moved it, or the read-back agrees). Success, but nothing changed.
 pub fn build_provider_already_card(provider: &str, model: &str) -> serde_json::Value {

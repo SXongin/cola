@@ -473,6 +473,11 @@ pub struct App {
     /// either a confirmed send or an ambiguous timeout.
     viewer_file_transfers_sent:
         Arc<std::sync::Mutex<indexmap::IndexMap<ViewerFileTransferKey, ViewerFileTransferStatus>>>,
+    /// Provider switches in flight, keyed by session id (issue #910): the
+    /// confirmation card is not single-flight by itself, so the claim is taken
+    /// atomically before the release/resume/read sequence starts and held until
+    /// its outcome lands. Same pattern as [`Self::viewer_actions_in_flight`].
+    provider_switches_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Turn Diff deliveries, keyed by `(session_id, from)` and bounded like the
     /// File Message guard (#801): one artifact per Turn per process, with the
     /// `Sending` claim making concurrent clicks a no-op.
@@ -1153,6 +1158,39 @@ impl Drop for ViewerActionGuard {
     }
 }
 
+/// One in-flight provider switch's claim (issue #910). Released on drop, so
+/// every exit of the switched task — success, refusal, panic — frees the
+/// session for the next confirmation.
+struct ProviderSwitchGuard {
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ProviderSwitchGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        in_flight.remove(&self.session_id);
+    }
+}
+
+/// The local state a failed switch must restore: the model mirror **and** the
+/// `/think` variant, because writing the pair can clear a variant the new model
+/// does not declare (ADR-0020). Both halves are restored together.
+struct PreviousPair {
+    model: Option<String>,
+    variant: Option<String>,
+}
+
+/// What recording a deferred pair concluded. The caller composes the surface: a
+/// pick stays a toast, a confirmation gets a card that retires its buttons.
+enum DeferredSave {
+    Saved { cleared_variant: Option<String> },
+    Failed(String),
+}
+
 /// Blocking filesystem reads cannot be cancelled by their async timeout. Keep
 /// only this many outstanding viewer reads; a timed-out closure holds its slot
 /// until the OS call returns, and later taps fail fast instead of queueing more.
@@ -1554,6 +1592,7 @@ impl App {
             core,
             access,
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            provider_switches_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             turn_diff_sends: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             #[cfg(test)]
@@ -1576,6 +1615,24 @@ impl App {
         Some(ViewerActionGuard {
             in_flight: Arc::clone(&self.viewer_actions_in_flight),
             key,
+        })
+    }
+
+    /// Claim the session's provider switch until the returned guard drops. A
+    /// second confirmation for the same session in that window gets no guard —
+    /// the caller answers it as already in progress instead of starting a
+    /// second release/resume/read sequence.
+    fn claim_provider_switch(&self, session_id: &str) -> Option<ProviderSwitchGuard> {
+        let mut in_flight = self
+            .provider_switches_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !in_flight.insert(session_id.to_string()) {
+            return None;
+        }
+        Some(ProviderSwitchGuard {
+            in_flight: Arc::clone(&self.provider_switches_in_flight),
+            session_id: session_id.to_string(),
         })
     }
 
@@ -4841,7 +4898,21 @@ impl App {
         if core.inflight.lock().await.contains(&session_id) {
             // A turn is running: record the pair and let the next prompt apply
             // it (issue #910) — never fail at pick time for this.
-            return self.save_deferred_pair(core, thread_key, &spec).await;
+            return match self.save_deferred_pair(core, thread_key, &spec).await {
+                DeferredSave::Saved { cleared_variant } => CardActionResult {
+                    card: None,
+                    toast: Some(format!(
+                        "已记录 `{spec}`：本轮结束后、下一条消息发出前切换{}",
+                        cleared_variant
+                            .map(|v| format!("（已清除思考等级 `{v}`）"))
+                            .unwrap_or_default()
+                    )),
+                },
+                DeferredSave::Failed(text) => CardActionResult {
+                    card: None,
+                    toast: Some(text),
+                },
+            };
         }
         CardActionResult {
             card: Some(crate::feishu::card::picker::build_provider_confirm_card(
@@ -4866,33 +4937,25 @@ impl App {
         provider: &str,
         spec: &str,
     ) -> CardActionResult {
-        let saved = core.pick_model(thread_key, spec).await;
-        let provider_saved = core.pick_pending_provider(thread_key, provider).await;
-        match saved {
-            Ok(PickOutcome::Applied { cleared_variant }) => {
-                let extra = cleared_variant
-                    .map(|v| format!("（已清除思考等级 `{v}`）"))
-                    .unwrap_or_default();
-                match provider_saved {
-                    Ok(true) => CardActionResult {
-                        card: None,
-                        toast: Some(format!(
-                            "Provider: {provider}（模型 {spec}，新线程创建时生效）{extra}"
-                        )),
-                    },
-                    Ok(false) => CardActionResult {
-                        card: None,
-                        toast: Some("⚠️ 模型已记录，但 provider 没有保存（会话状态已变化）".to_string()),
-                    },
-                    Err(error) => CardActionResult {
-                        card: None,
-                        toast: Some(format!("⚠️ 模型已记录，但 provider 保存失败：{error}")),
-                    },
-                }
-            }
+        // One write for both halves: a partial pair would be applied at thread
+        // creation, and the model is what makes the provider safe (issue #910).
+        match core
+            .sessions_handle()
+            .pick_pending_pair(&core.client, thread_key, provider, spec)
+            .await
+        {
+            Ok(PickOutcome::Applied { cleared_variant }) => CardActionResult {
+                card: None,
+                toast: Some(format!(
+                    "Provider: {provider}（模型 {spec}，新线程创建时生效）{}",
+                    cleared_variant
+                        .map(|v| format!("（已清除思考等级 `{v}`）"))
+                        .unwrap_or_default()
+                )),
+            },
             Ok(_) => CardActionResult {
                 card: None,
-                toast: Some("⚠️ 保存失败：会话已不存在，这次选择没有生效".to_string()),
+                toast: Some("⚠️ 保存失败：会话状态已变化（可能已创建），这次选择没有生效".to_string()),
             },
             Err(error) => CardActionResult {
                 card: None,
@@ -4910,36 +4973,24 @@ impl App {
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
         spec: &str,
-    ) -> CardActionResult {
+    ) -> DeferredSave {
         match core.pick_model(thread_key, spec).await {
-            Ok(PickOutcome::Applied { cleared_variant }) => {
-                let extra = cleared_variant
-                    .map(|v| format!("（已清除思考等级 `{v}`）"))
-                    .unwrap_or_default();
-                CardActionResult {
-                    card: None,
-                    toast: Some(format!(
-                        "已记录 `{spec}`：本轮结束后、下一条消息发出前切换{extra}"
-                    )),
-                }
-            }
-            Ok(_) => CardActionResult {
-                card: None,
-                toast: Some("⚠️ 保存失败：会话已不存在，这次切换没有记录".to_string()),
-            },
-            Err(error) => CardActionResult {
-                card: None,
-                toast: Some(format!("⚠️ 保存失败：{error}")),
-            },
+            Ok(PickOutcome::Applied { cleared_variant }) => DeferredSave::Saved { cleared_variant },
+            Ok(_) => DeferredSave::Failed("⚠️ 保存失败：会话状态已变化，这次切换没有记录".to_string()),
+            Err(error) => DeferredSave::Failed(format!("⚠️ 保存失败：{error}")),
         }
     }
 
     /// The confirmation card's 确认 click (issue #910). The target is resolved
     /// **here**, so a card that outlived a `/switch`, a delete or a recreate
     /// does nothing; the gate is re-read, so a card sitting in Feishu cannot
-    /// switch a thread after `provider_switch_on_resume` was turned off. The
-    /// switch itself (release → resume → read back) runs off the ack path and
-    /// repaints the card when it lands.
+    /// switch a thread after `provider_switch_on_resume` was turned off.
+    ///
+    /// Two more guards apply before anything is spawned: one atomic claim per
+    /// session (a double-click or a redelivered callback must not start a second
+    /// release/resume sequence), and — because a prompt may have started after
+    /// the card was rendered — the same mid-turn deferral a pick gets, so the
+    /// thread is never changed under a running turn.
     async fn handle_provider_switch_confirm(
         self: &Arc<Self>,
         core: &Arc<SharedCore>,
@@ -4996,6 +5047,29 @@ impl App {
                 toast: Some("provider 只能在新线程切换".to_string()),
             });
         }
+        // One switch per session at a time: the claim is atomic, so a replay
+        // that beats the card update is answered, not started twice.
+        let Some(claim) = self.claim_provider_switch(&session_id) else {
+            return Some(CardActionResult {
+                card: Some(crate::feishu::card::picker::build_provider_busy_card(
+                    &provider, &model,
+                )),
+                toast: Some("上一次 provider 切换还在进行中".to_string()),
+            });
+        };
+        // A prompt may have started after the card was rendered: changing the
+        // thread under a running turn is exactly what a pick defers, so do the
+        // same here instead of racing the turn.
+        let pair = format!("{provider}/{model}");
+        if core.inflight.lock().await.contains(&session_id) {
+            // The claim is held through the recording too: a replay during the
+            // save must not start a second attempt.
+            let deferred = self
+                .deferred_pair_result(core, &thread_key, &pair, &provider, &model)
+                .await;
+            drop(claim);
+            return Some(deferred);
+        }
         let message_id = value
             .get("open_message_id")
             .and_then(|v| v.as_str())
@@ -5007,7 +5081,8 @@ impl App {
         let switching = crate::feishu::card::picker::build_provider_switching_card(&provider, &model);
         let app = Arc::clone(self);
         tokio::spawn(async move {
-            app.run_provider_switch(thread_key, session_id, provider, model, message_id)
+            // The claim lives as long as the task: every exit path releases it.
+            app.run_provider_switch(thread_key, session_id, provider, model, message_id, claim)
                 .await;
         });
         Some(CardActionResult {
@@ -5016,9 +5091,43 @@ impl App {
         })
     }
 
+    /// The result of a confirmation that found a running turn: the pair is
+    /// recorded (the prompt path applies it) and the card says so, so the
+    /// confirmation buttons cannot be pressed again.
+    async fn deferred_pair_result(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        spec: &str,
+        provider: &str,
+        model: &str,
+    ) -> CardActionResult {
+        let saved = self.save_deferred_pair(core, thread_key, spec).await;
+        match saved {
+            DeferredSave::Saved { cleared_variant } => {
+                let extra = cleared_variant
+                    .map(|v| format!("（已清除思考等级 `{v}`）"))
+                    .unwrap_or_default();
+                CardActionResult {
+                    card: Some(crate::feishu::card::picker::build_provider_deferred_card(
+                        provider, model,
+                    )),
+                    toast: Some(format!(
+                        "已记录 `{spec}`：本轮结束后、下一条消息发出前切换{extra}"
+                    )),
+                }
+            }
+            DeferredSave::Failed(text) => CardActionResult {
+                card: None,
+                toast: Some(text),
+            },
+        }
+    }
+
     /// Run a confirmed provider switch off the card-ack path and repaint the
     /// card with the outcome (issue #910). The three protocol steps take as long
-    /// as the daemon needs; the click was already answered with 「切换中…」.
+    /// as the daemon needs; the click was already answered with 「切换中…」. The
+    /// claim is held for the whole task, so a replay cannot overlap it.
     async fn run_provider_switch(
         self: &Arc<Self>,
         thread_key: ThreadKey,
@@ -5026,6 +5135,7 @@ impl App {
         provider: String,
         model: String,
         message_id: Option<String>,
+        claim: ProviderSwitchGuard,
     ) {
         use crate::backend::types::ThreadModelChange;
         let pair = format!("{provider}/{model}");
@@ -5039,11 +5149,18 @@ impl App {
         // idempotently — without this it could send the old model name on the
         // new provider (a 404). A save that does not land stops here: the thread
         // was not touched and nothing may claim otherwise (issue #910).
+        //
+        // The whole prior state is kept, not just the model: `pick_model` can
+        // clear a variant the new model does not declare, and a failed switch
+        // must restore that too.
         let previous = self
             .core
             .session_settings(&thread_key)
             .await
-            .map(|settings| settings.model);
+            .map(|settings| PreviousPair {
+                model: settings.model,
+                variant: settings.variant,
+            });
         match self.core.pick_model(&thread_key, &pair).await {
             Ok(PickOutcome::Applied { .. }) => {}
             Ok(_) => {
@@ -5069,24 +5186,15 @@ impl App {
                 ThreadModelChange::Unchanged => {
                     crate::feishu::card::picker::build_provider_already_card(&provider, &model)
                 }
+                // The provider was already right and only the model differs: no
+                // reload happened, and the model lands on the next turn.
+                ThreadModelChange::ModelNextTurn => {
+                    crate::feishu::card::picker::build_provider_model_pending_card(&provider, &model)
+                }
             },
             Err(error) => {
                 tracing::warn!("provider switch to `{pair}` failed for {session_id}: {error}");
-                // A failed switch leaves the local mirror alone: restore what it
-                // named before the pending record was written.
-                if let Some(previous) = previous
-                    && let Some(mut settings) = self.core.session_settings(&thread_key).await
-                {
-                    settings.model = previous;
-                    if let Err(error) = self
-                        .core
-                        .sessions_handle()
-                        .set_session_settings(&thread_key, settings)
-                        .await
-                    {
-                        tracing::warn!("could not restore the previous model mirror: {error}");
-                    }
-                }
+                self.roll_back_provider_pair(&thread_key, &pair, previous).await;
                 crate::feishu::card::picker::build_provider_switch_error_card(
                     &provider,
                     &model,
@@ -5094,7 +5202,41 @@ impl App {
                 )
             }
         };
+        // Released only after the outcome is on screen: a replay that beats the
+        // card update is still answered as in progress.
         self.finish_provider_switch(message_id, card, &pair).await;
+        drop(claim);
+    }
+
+    /// Undo the pending pair a failed switch wrote — but only if the mirror
+    /// still holds **that** pair: a newer pick that landed while the slow RPC
+    /// ran is the user's latest intent and must survive a stale rollback.
+    async fn roll_back_provider_pair(
+        &self,
+        thread_key: &ThreadKey,
+        attempted: &str,
+        previous: Option<PreviousPair>,
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let Some(mut settings) = self.core.session_settings(thread_key).await else {
+            return;
+        };
+        if settings.model.as_deref() != Some(attempted) {
+            tracing::debug!("provider switch rollback skipped: the mirror no longer holds `{attempted}`");
+            return;
+        }
+        settings.model = previous.model;
+        settings.variant = previous.variant;
+        if let Err(error) = self
+            .core
+            .sessions_handle()
+            .set_session_settings(thread_key, settings)
+            .await
+        {
+            tracing::warn!("could not restore the previous model mirror: {error}");
+        }
     }
 
     /// Repaint the clicked card with a switch's outcome (issue #910). A click

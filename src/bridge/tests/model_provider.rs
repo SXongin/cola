@@ -723,3 +723,339 @@ async fn a_failed_paired_save_does_not_report_success() {
         "a failed save must not claim the pick applies: {toast}"
     );
 }
+
+/// Review round, finding 1: a failed switch must put the mirror back exactly —
+/// including "there was no model override" — instead of leaving the attempted
+/// pair to be retried forever.
+#[tokio::test]
+async fn a_failed_switch_restores_a_mirror_that_had_no_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .fail_provider_switch("另一个客户端仍持有这条线程");
+    let (app, platform) = build_app(cfg, backend).await;
+    // No model override at all: the mirror starts empty.
+    seed_entry(&app, entry()).await;
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .settings(&key())
+            .unwrap()
+            .model
+            .is_none()
+    );
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    wait_for_card_update(&platform, "the refusal", CardUpdates::Any, |card| {
+        card_header(card).contains("切换失败")
+    })
+    .await;
+
+    assert_eq!(
+        app.sessions.lock().await.settings(&key()).unwrap().model,
+        None,
+        "the failed attempt is not left in the mirror"
+    );
+}
+
+/// Review round, finding 1 (variant half): writing the pair can clear a
+/// `/think` variant the new model does not declare; a failed switch restores it
+/// together with the model.
+#[tokio::test]
+async fn a_failed_switch_restores_a_cleared_variant() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .fail_provider_switch("另一个客户端仍持有这条线程");
+    // The attempted model declares only `low`, so the `high` variant is cleared
+    // by the pending write (ADR-0020).
+    backend.with_models(vec![crate::backend::types::ProviderModels {
+        provider: PROVIDER.into(),
+        models: vec![crate::backend::types::ModelOption {
+            id: MODEL.into(),
+            variants: vec!["low".into()],
+            ..Default::default()
+        }],
+    }]);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    wait_for_card_update(&platform, "the refusal", CardUpdates::Any, |card| {
+        card_header(card).contains("切换失败")
+    })
+    .await;
+
+    let settings = app.sessions.lock().await.settings(&key()).unwrap();
+    assert_eq!(
+        settings.model.as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the model is restored"
+    );
+    assert_eq!(
+        settings.variant.as_deref(),
+        Some("high"),
+        "the variant the attempt cleared is restored too"
+    );
+}
+
+/// Review round, finding 2: a confirmation that arrives while a turn is running
+/// defers exactly like a pick — the thread is never changed under the turn.
+#[tokio::test]
+async fn a_confirmation_during_a_turn_is_deferred() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let applies = backend.thread_model_calls.clone();
+    let prompt_calls = backend.prompt_calls.clone();
+    let gate = backend.hold_prompts();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    // The card is rendered while idle...
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+
+    // ...then a prompt starts before the user confirms.
+    let first = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.handle_message(incoming(
+                "msg_prompt_1".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "first".into(),
+                None,
+            ))
+            .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_calls.lock().await.is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "the turn never started");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let step = app
+        .host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    let ack = step.card.expect("a deferred card");
+    assert!(
+        ack.to_string().contains("已记录"),
+        "the confirmation says it was recorded, not switched: {ack}"
+    );
+    assert!(
+        applies.lock().await.is_empty(),
+        "the thread is not touched while the turn runs"
+    );
+
+    gate.add_permits(1);
+    first.await.expect("the turn ends");
+    // The next prompt applies the recorded pair before it is sent.
+    app.handle_message(incoming(
+        "msg_prompt_2".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "second".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        applies.lock().await.as_slice(),
+        &[("ses_test".to_string(), "deepseek/deepseek-v4-pro".to_string())],
+        "the deferred pair is applied by the next prompt"
+    );
+}
+
+/// Review round, finding 4: one switch per session at a time — a replay while
+/// the first is running is answered, not started.
+#[tokio::test]
+async fn a_replayed_confirmation_starts_one_switch() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_thread_model_delay(std::time::Duration::from_millis(600));
+    let applies = backend.thread_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    let confirm = button_value(&card, "model_provider_confirm");
+    app.host_action_on_message(confirm.clone(), "om_confirm")
+        .await
+        .expect("first confirm");
+    let step = app
+        .host_action_on_message(confirm, "om_confirm")
+        .await
+        .expect("replayed confirm");
+    assert!(
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("还在进行中")),
+        "a replay while the switch runs is answered as in progress: {step:?}",
+        step = step.card
+    );
+
+    wait_for_card_update(&platform, "the switch outcome", CardUpdates::Any, |card| {
+        card_header(card).contains("已切换")
+    })
+    .await;
+    assert_eq!(
+        applies.lock().await.len(),
+        1,
+        "the replayed click started no second release/resume sequence"
+    );
+}
+
+/// Review round, finding 5: a slow failed switch must not roll back over a
+/// newer pick that landed while it ran.
+#[tokio::test]
+async fn a_stale_rollback_does_not_undo_a_newer_pick() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_thread_model_delay(std::time::Duration::from_millis(600))
+        .fail_provider_switch("另一个客户端仍持有这条线程");
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+
+    // A newer pick lands while the slow switch is still running.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut settings = app.sessions.lock().await.settings(&key()).unwrap();
+    settings.model = Some("openai/gpt-5.1".into());
+    app.sessions
+        .lock()
+        .await
+        .set_settings(&key(), settings)
+        .expect("the newer pick saves");
+
+    wait_for_card_update(&platform, "the refusal", CardUpdates::Any, |card| {
+        card_header(card).contains("切换失败")
+    })
+    .await;
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .settings(&key())
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the stale rollback did not overwrite the newer pick"
+    );
+}
+
+/// Review round, finding 6: a Pending Session's pair is one store write, so the
+/// two halves cannot be split on disk.
+#[tokio::test]
+async fn a_pending_pair_is_saved_in_one_write() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    app.host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("paired pick");
+
+    // Read the sidecar back: both halves are there, from one write.
+    let reloaded =
+        crate::bridge::session::SessionStore::for_client(sessions.clone(), crate::config::DEFAULT_CLIENT_ID)
+            .expect("the store reloads");
+    let pending = reloaded.pending_for(&key()).expect("the pending is on disk");
+    assert_eq!(pending.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
+    assert_eq!(pending.provider.as_deref(), Some(PROVIDER));
+}
+
+/// Review round, finding 3 (the surface half): a thread that already runs the
+/// target provider with another model is not "already switched" — the model
+/// lands on the next turn, and the card says so.
+#[tokio::test]
+async fn a_provider_match_with_another_model_is_not_already() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .with_thread_model_next_turn();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("confirm");
+    wait_for_card_update(&platform, "the model-pending outcome", CardUpdates::Any, |card| {
+        card_header(card).contains("模型下一轮生效")
+    })
+    .await;
+}

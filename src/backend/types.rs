@@ -232,13 +232,21 @@ pub enum ModelPickRoute {
 }
 
 /// What making a thread run a model/provider pair concluded (issue #910).
+///
+/// Every variant that claims success is decided by a read-back of **both**
+/// halves — the provider alone is not the pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThreadModelChange {
-    /// The thread already ran the pair: no thread-level request was needed.
+    /// The thread already ran the exact pair: no thread-level request was
+    /// needed.
     #[default]
     Unchanged,
     /// The thread now runs the pair, verified by a read-back.
     Changed,
+    /// The thread was already on this provider and only the model differs: no
+    /// thread-level request is made (a same-provider model change is the
+    /// per-turn path), and the model rides the next turn.
+    ModelNextTurn,
 }
 
 /// Where changing a model selection takes effect.
