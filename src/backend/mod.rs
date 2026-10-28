@@ -421,19 +421,47 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         ChangeScope::NewThread
     }
 
-    /// Change the session's **thread-level** provider (Codex's
-    /// `thread/resume` `modelProvider`, issue #910). It is not a model pick:
-    /// the thread keeps its model, and the change may be visible to every
-    /// other client attached to that thread (ADR-0090's peer attachment), which
-    /// is why the caller asks for confirmation first.
+    /// Where a pick of `model` (a provider + model pair) lands on this
+    /// client's session (issue #910).
     ///
-    /// The default answers `Err`: a client that has not implemented this must
-    /// not report a switch that never happened.
-    async fn switch_session_provider(&self, _session_id: &str, _provider: &str) -> Result<()> {
-        Err(crate::error::BridgeError::Client {
-            client: "backend",
-            detail: "this client cannot change a thread's provider".to_string(),
-        })
+    /// [`ModelPickRoute::PerTurn`] is the default because a client whose
+    /// provider rides each prompt (OpenCode) has no thread-level provider: a
+    /// picked provider is just part of the per-turn model ref. Codex answers
+    /// [`ModelPickRoute::ThreadModel`] when the pair's provider differs from
+    /// the thread's own — the pick then has to change a thread fact, which is
+    /// a release + resume + read-back, never a turn field.
+    ///
+    /// The answer may need a bounded session read when the client has not
+    /// observed the thread yet; it is read on a card callback and must stay
+    /// cheap.
+    async fn model_pick_route(
+        &self,
+        _session_id: &str,
+        _model: &ModelInfo,
+    ) -> Result<crate::backend::types::ModelPickRoute> {
+        Ok(crate::backend::types::ModelPickRoute::PerTurn)
+    }
+
+    /// Make the session's thread run `model` (provider + model), switching it
+    /// if it does not (issue #910).
+    ///
+    /// Codex's implementation releases this connection's subscriptions for the
+    /// thread, resumes it with `modelProvider` + `model`, and verifies the
+    /// change with a `thread/read` — a resume alone is a silent no-op on an
+    /// already-loaded thread, and a resume whose read-back still reports the old
+    /// pair is a **failure**. Every other client of the thread (a TUI, VS Code,
+    /// a second cola sharing the same `CODEX_HOME`) makes the switch impossible,
+    /// which is a named error: the caller must stop before sending a prompt on
+    /// the old provider.
+    ///
+    /// The default answers [`ThreadModelChange::Unchanged`]: a client with no
+    /// thread-level provider cannot have one to apply.
+    async fn apply_thread_model(
+        &self,
+        _session_id: &str,
+        _model: &ModelInfo,
+    ) -> Result<crate::backend::types::ThreadModelChange> {
+        Ok(crate::backend::types::ThreadModelChange::Unchanged)
     }
 
     /// Whether this generation keeps model/agent choices as durable session
