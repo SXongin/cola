@@ -103,6 +103,21 @@ fn scope_level(scope: &crate::backend::types::ModelScope) -> &str {
     }
 }
 
+/// The level one **option's** button carries: its own pick kind when the page
+/// mixes actions (Codex's `切换 provider…` drill on the model page, #908),
+/// else the scope's.
+fn option_level(
+    scope: &crate::backend::types::ModelScope,
+    option: &crate::backend::types::ModelOption,
+) -> &'static str {
+    use crate::backend::types::PickKind;
+    match option.pick.unwrap_or(scope.pick) {
+        PickKind::DrillDown => PICKER_LEVEL_PROVIDER,
+        PickKind::Provider => PICKER_LEVEL_PROVIDER_PICK,
+        PickKind::Model => PICKER_LEVEL_MODEL,
+    }
+}
+
 /// A picker card whose buttons carry an optional `level` (two-step navigation
 /// for the `/model` provider → model flow) and an optional leading "back"
 /// button. Each button's callback payload is `{action, chat_id, thread_id,
@@ -375,7 +390,11 @@ fn scope_cards(
     // A grouped scope (#908: the built-in catalog, config presets and probed
     // providers are separate sections inside one `model` scope) needs the group
     // heading rendered between options, so it cannot ride the flat chunker.
-    if scope.options.iter().any(|option| option.group.is_some()) {
+    if scope
+        .options
+        .iter()
+        .any(|option| option.group.is_some() || option.pick.is_some())
+    {
         return grouped_scope_cards(thread_key, current, scope, back);
     }
     chunk_picker_cards(
@@ -434,7 +453,7 @@ fn combined_surface_card(
                     thread_key,
                     "model",
                     &picker_option(option),
-                    Some(scope_level(scope)),
+                    Some(option_level(scope, option)),
                     &[],
                 ));
             }
@@ -479,7 +498,7 @@ fn grouped_scope_cards(
                 &header,
                 &intro_text,
                 thread_key,
-                Some(scope_level(scope)),
+                scope,
                 back,
                 &page,
                 scope.note.as_deref(),
@@ -556,7 +575,7 @@ fn grouped_picker_card(
     header: &str,
     intro: &str,
     thread_key: &crate::config::ThreadKey,
-    level: Option<&str>,
+    scope: &crate::backend::types::ModelScope,
     back: bool,
     options: &[&crate::backend::types::ModelOption],
     note: Option<&str>,
@@ -578,7 +597,7 @@ fn grouped_picker_card(
             thread_key,
             "model",
             &picker_option(option),
-            level,
+            Some(option_level(scope, option)),
             &[],
         ));
     }

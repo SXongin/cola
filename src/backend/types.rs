@@ -146,6 +146,10 @@ pub struct ModelOption {
     /// providers; #910 makes a bare provider unswitchable). The card renders it
     /// as text, never a button.
     pub disabled: bool,
+    /// Overrides the scope's [`PickKind`] for this option, so one page can mix
+    /// concrete picks with a drill-down (Codex's `切换 provider…`, #908). `None`
+    /// uses the scope's.
+    pub pick: Option<PickKind>,
 }
 
 impl ModelOption {

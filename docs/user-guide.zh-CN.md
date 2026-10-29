@@ -677,19 +677,20 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
 
 Codex 的模型轴不是 provider → model 树：provider 是**线程级**事实，模型是
 **每轮**事实，内置目录是**全局**的。因此不带参数的 `/model` 只有一行当前
-模型与两个分区，不会出现「选择 provider（共 1 个）」这种伪层级：
+模型与**一个模型页**；底部的 `切换 provider…` 一行打开 provider 页，不会出现
+「选择 provider（共 1 个）」这种伪层级：
 
 - **当前模型来自线程，cola 自己的选择排在它前面。** 卡片的 当前模型 行按
   顺序取：会话记录的所选值（你做过选择时），再用 `thread/read` 读到的线程
   自身 `model` 与 `modelProvider`——所以其他客户端改过这条线程后，再打开
   卡片就能看到那次变化，footer 与选择卡片不会各说一套。
-- **「模型（每轮可换）」** 列出四类来源，各自标注：`model/list` 的内置目录
-  （分组为「内置目录（任何 provider 可试）」——这些 id 不属于任何 provider，
-  可以经任意一个运行）、配置顶层 `model`（配置默认）、每个
+- **「模型（每轮可换）」** 列出只与模型有关的来源：`model/list` 的内置目录
+  （分组为「内置目录（全局，未校验）」——这些 id 不属于任何 provider，可以经
+  任意一个运行）、配置顶层 `model`（配置默认）、每个
   `[profiles.<name>]` 预设（`model` + `model_provider`，显示为
-  `profile：model（provider）`），以及某个 provider 的 `/models` 返回的 id
-  （按 provider 分组）。点选后，下一条消息的 `turn/start.model` 就是该 id，
-  线程后续轮次也继续使用它。
+  `profile：model（provider）`），以及**当前 provider** 的 `/models` 返回的
+  id。点选后，下一条消息的 `turn/start.model` 就是该 id，线程后续轮次也继续
+  使用它。
 - **任何清单之外的 id 用文本输入。** `/model codex/<id>` 记录一个 id，
   `/model <provider>/<model>` 记录一对。Codex 对两者都不校验：只有内置目录
   的条目带显示名、上下文窗口与思考等级，所以拼错会在下一条消息上以 provider
@@ -698,16 +699,15 @@ Codex 的模型轴不是 provider → model 树：provider 是**线程级**事�
 **`/models` 探测是尽力而为，它被拒绝也不算错误。** `GET <base_url>/models`
 不属于 Responses API——`wire_api = "responses"` 并不保证它存在。cola 用各
 `[model_providers.<id>]` 自己的 `experimental_bearer_token` 去问，每次探测
-2 秒，并把结果（包括失败）缓存三分钟。拿不到可用答案时，卡片用一行说明代替
-按钮：403「拒绝访问 /models（403）」、404「没有 /models（404）」、401、超时、
-网络不可达、响应无法解析，或凭据只写在 `env_key` 里——这种 provider 会被
-点名跳过，因为守护进程的环境不是 cola 的。内置目录、配置默认与 profile 始终
-在，而卡片回调只从缓存作答，所以第一次冷点击可能只显示 provider、没有探测到的
-模型，下一次从根页打开 `/model` 时补齐。token 只出现在请求的 `Authorization`
+2 秒，并缓存结果：确定性的答案（403、404、401、`env_key`、或解析出的模型）
+缓存三分钟，**暂时性**失败（超时、网络错误）只缓存约 20 秒，下次打开就会重试。
+provider 页把原因作为行尾的短标签（`403`、`超时`…），不是一段话，也不会出现在
+模型页上。内置目录、配置默认与 profile 始终在，而卡片回调只从缓存作答，所以
+第一次冷点击可能只显示 provider、没有探测到的模型，下一次打开时补齐。token 只出现在请求的 `Authorization`
 头里：卡片、日志行与错误信息中都不会出现。
 
-**provider 是线程级的，所以换 provider 是另一种操作。** 卡片的第二个分区
-「Provider（线程级：新线程 / resume）」就是这些行。provider 在
+**provider 是线程级的，所以换 provider 是另一种操作。** provider 页（`切换
+provider…` 那一行）就是这些成对的行，标签为 `provider/model`。provider 在
 `thread/start` 或 `thread/resume` 时确定；`turn/start` 没有 provider 字段，
 而且 provider 永远不能单独选——把旧模型名留在新 provider 上会 404。因此：
 

@@ -49,9 +49,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::backend::types::{
-    ChangeScope, ModelOption, ModelScope, ModelSelection, ModelSurface, ModelSurfaceQuery,
-};
+use crate::backend::types::{ModelSelection, ModelSurface, ModelSurfaceQuery};
 
 use super::error::Result as CodexResult;
 use super::transport::RpcConnection;
@@ -60,6 +58,15 @@ use super::transport::RpcConnection;
 /// The picker is re-opened by hand, so a few minutes is enough to make a
 /// double-open cheap without hiding a provider that just recovered.
 const PROBE_TTL: Duration = Duration::from_secs(180);
+
+/// How long a **transient** probe failure (`Timeout`, a network/transport error)
+/// is cached (issue #908's owner review): a one-off timeout should retry on the
+/// next open, not hide the group for three minutes. Definitive answers keep
+/// [`PROBE_TTL`].
+#[cfg(not(test))]
+const PROBE_TRANSIENT_TTL: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const PROBE_TRANSIENT_TTL: Duration = Duration::from_millis(200);
 
 /// One probe's own deadline. A provider that does not answer within this is
 /// "timeout", not a hung card.
@@ -108,16 +115,11 @@ pub(crate) const PROVIDER_SCOPE: &str = "provider";
 /// The built-in catalog's group inside the `model` scope. It is deliberately
 /// **not** a provider name: `model/list` is global and a catalog entry may run
 /// through any configured provider, so rendering it under one would lie.
-pub(crate) const CATALOG_GROUP: &str = "内置目录（任何 provider 可试）";
+pub(crate) const CATALOG_GROUP: &str = "内置目录（全局，未校验）";
 /// The top-level `model`'s group.
 pub(crate) const CONFIG_DEFAULT_GROUP: &str = "配置默认";
 /// Every `[profiles.<name>]` preset's group.
 pub(crate) const PROFILE_GROUP: &str = "Profile 预设";
-
-/// How long a note may be before it is clipped. Notes are rendered verbatim by
-/// the card, so the surface owns their one-line budget (the ticket's "one short
-/// line" rule).
-const NOTE_MAX_CHARS: usize = 64;
 
 /// The neutral provider bucket the picker's `codex/<id>` callback value uses.
 const MODEL_PROVIDER: &str = "codex";
@@ -455,24 +457,33 @@ pub(crate) enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// The one-line reason rendered on the card. No URL, header or token ever
-    /// reaches this text.
-    pub(crate) fn reason(&self) -> String {
+    /// How long this answer stays cached: a **transient** failure expires
+    /// quickly so the next open retries; everything else keeps [`PROBE_TTL`].
+    fn cache_ttl(&self) -> Duration {
+        match self {
+            Self::Timeout | Self::Network => PROBE_TRANSIENT_TTL,
+            _ => PROBE_TTL,
+        }
+    }
+
+    /// A three-or-so-character tag for the provider row (#908's owner review):
+    /// no sentence, no URL, no header.
+    pub(crate) fn short_tag(&self) -> String {
         match self {
             Self::Models(_) => String::new(),
-            Self::EnvKey => "用 env_key 取凭据，cola 读不到 daemon 环境，跳过探测".into(),
-            Self::LayerMismatch => "base_url 与凭据来自不同的配置层，不发送探测".into(),
-            Self::NoBaseUrl => "没有 base_url，无法探测".into(),
-            Self::BadBaseUrl => "base_url 无效，无法探测".into(),
-            Self::UnsupportedScheme => "base_url 不是 http(s)，跳过探测".into(),
-            Self::Unauthorized => "需要认证（401）".into(),
-            Self::Forbidden => "拒绝访问 /models（403）".into(),
-            Self::NotFound => "没有 /models（404）".into(),
-            Self::Timeout => "探测超时".into(),
-            Self::Network => "网络不可达".into(),
-            Self::BadResponse => "响应无法解析".into(),
-            Self::Http(status) => format!("返回 HTTP {status}"),
-            Self::Empty => "未列出任何模型".into(),
+            Self::EnvKey => "env_key".into(),
+            Self::NoBaseUrl => "无 URL".into(),
+            Self::BadBaseUrl => "URL 无效".into(),
+            Self::UnsupportedScheme => "非 http(s)".into(),
+            Self::Unauthorized => "401".into(),
+            Self::Forbidden => "403".into(),
+            Self::NotFound => "404".into(),
+            Self::Timeout => "超时".into(),
+            Self::Network => "网络".into(),
+            Self::BadResponse => "响应无效".into(),
+            Self::Http(status) => format!("HTTP {status}"),
+            Self::Empty => "无模型".into(),
+            Self::LayerMismatch => "凭据跨层".into(),
         }
     }
 }
@@ -506,7 +517,7 @@ fn token_fingerprint(token: Option<&str>) -> Option<u64> {
 /// one connection's map without bound.
 fn prune_expired(entries: &mut HashMap<ProbeCacheKey, ProbeEntry>) {
     let now = Instant::now();
-    entries.retain(|_, entry| now.saturating_duration_since(entry.at) < PROBE_TTL);
+    entries.retain(|_, entry| now.saturating_duration_since(entry.at) < entry.outcome.cache_ttl());
 }
 
 /// Per-provider `/models` cache (one per attached connection). Clones of a
@@ -785,46 +796,78 @@ pub(crate) fn build_surface(
         Some(provider) if provider != MODEL_PROVIDER => Some(provider.to_string()),
         _ => query_provider,
     };
+    let current_model = query
+        .current
+        .as_ref()
+        .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
+        .map(|model| model.id);
+    let pending = query.session_id.is_none();
+    let resumable = !pending && provider_switch_on_resume;
 
-    let mut options: Vec<ModelOption> = Vec::new();
+    // Two pages, one scope each (#908's owner review): the root is the **model**
+    // page, and `切换 provider…` drills into the provider page. A drilled page
+    // carries the back button from the bridge.
+    let scope = if query.scope == Some(PROVIDER_SCOPE) {
+        provider_page(
+            config,
+            probes,
+            current_provider.as_deref(),
+            current_model.as_deref(),
+            resumable,
+        )
+    } else {
+        model_page(catalog, config, probes, current_provider.as_deref())
+    };
+    ModelSurface {
+        current: resolved_current(query.current.as_ref(), thread_provider),
+        scopes: vec![scope],
+    }
+}
+
+/// The root page (#908): the flat catalog, the config's presets and the
+/// **current** provider's probed models — everything the next turn can take
+/// without changing the channel — plus the drill into the provider page. No
+/// probe-failure notes here: a broken provider is page 2's status row.
+fn model_page(
+    catalog: &[crate::backend::types::ProviderModels],
+    config: &CodexModelConfig,
+    probes: &HashMap<String, ProbeOutcome>,
+    current_provider: Option<&str>,
+) -> crate::backend::types::ModelScope {
+    let mut options: Vec<crate::backend::types::ModelOption> = Vec::new();
     for provider in catalog {
         for model in &provider.models {
-            options.push(ModelOption {
+            options.push(crate::backend::types::ModelOption {
                 id: model.id.clone(),
                 variants: model.variants.clone(),
                 value: Some(codex_ref(&model.id)),
                 group: Some(CATALOG_GROUP.to_string()),
-                ..ModelOption::default()
+                ..Default::default()
             });
         }
     }
     if let Some(model) = config.default_model.as_deref() {
-        options.push(ModelOption {
+        options.push(crate::backend::types::ModelOption {
             id: model.to_string(),
             label: Some(format!("{model}（配置默认）")),
             value: Some(codex_ref(model)),
             group: Some(CONFIG_DEFAULT_GROUP.to_string()),
-            ..ModelOption::default()
+            ..Default::default()
         });
     }
     for profile in &config.profiles {
         let mut label = format!("{}：{}", profile.name, profile.model);
         // `codex` is reserved for the neutral namespace (ADR-0092): a profile
         // naming it cannot be a real pair, so it is offered as the neutral
-        // catalog ref (a model-only pick) and labelled as such.
+        // catalog ref (a model-only pick).
         let reserved = profile.provider.as_deref() == Some(MODEL_PROVIDER);
         if reserved {
-            label.push_str("（`codex` 保留名，按内置目录处理）");
+            label.push_str("（codex 保留名）");
         } else if let Some(provider) = profile.provider.as_deref() {
             label.push_str(&format!("（{provider}）"));
         }
-        // A profile is Codex's own "model + provider" declaration: the pick is a
-        // **pair** (issue #910). The provider rides the callback's `provider`
-        // field and the value stays the bare model id, so the bridge composes
-        // `provider/model` and the path is decided by whether the provider
-        // changes. A profile without `model_provider` is model-only.
         let paired = profile.provider.is_some() && !reserved;
-        options.push(ModelOption {
+        options.push(crate::backend::types::ModelOption {
             id: profile.model.clone(),
             label: Some(clip(&label, 48)),
             value: Some(if paired {
@@ -834,206 +877,164 @@ pub(crate) fn build_surface(
             }),
             group: Some(PROFILE_GROUP.to_string()),
             provider: if paired { profile.provider.clone() } else { None },
-            ..ModelOption::default()
+            ..Default::default()
         });
     }
-    for provider in &config.providers {
-        // The reserved id's probe is the configured channel's, not the neutral
-        // catalog's: offering its models as `codex/<id>` would be a lie.
-        if provider.id == MODEL_PROVIDER {
-            continue;
-        }
-        let Some(ProbeOutcome::Models(models)) = probes.get(&provider.id) else {
-            continue;
-        };
+    // The current provider's own `/models` answer: the ids that provider listed
+    // are pairs (it named them itself). No other provider's models on this page.
+    if let Some(current) = current_provider
+        && current != MODEL_PROVIDER
+        && let Some(provider) = config.providers.iter().find(|provider| provider.id == current)
+        && let Some(ProbeOutcome::Models(models)) = probes.get(&provider.id)
+    {
         let group = format!("{}（/models）", provider.name);
         for model in models {
-            // A probed model was listed **by that provider**, so it is a pair:
-            // the model is known to exist there (issue #910).
-            options.push(ModelOption {
+            options.push(crate::backend::types::ModelOption {
                 id: model.clone(),
                 value: Some(model.clone()),
                 provider: Some(provider.id.clone()),
                 group: Some(group.clone()),
-                ..ModelOption::default()
+                ..Default::default()
             });
         }
     }
-
-    let note =
-        probe_note(config, probes).or_else(|| options.is_empty().then(|| "_(没有可用模型)_".to_string()));
-
-    let model_scope = ModelScope {
+    // The drill-down into the provider page (a client with a provider axis: this
+    // is Codex's own surface).
+    options.push(crate::backend::types::ModelOption {
+        id: PROVIDER_SCOPE.into(),
+        label: Some("切换 provider…".to_string()),
+        value: Some(PROVIDER_SCOPE.to_string()),
+        pick: Some(crate::backend::types::PickKind::DrillDown),
+        ..Default::default()
+    });
+    let only_drill = options
+        .iter()
+        .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown));
+    crate::backend::types::ModelScope {
         id: MODEL_SCOPE.into(),
         title: "模型（每轮可换）".into(),
-        changeable: ChangeScope::ThisTurn,
+        changeable: crate::backend::types::ChangeScope::ThisTurn,
         pick: crate::backend::types::PickKind::Model,
         options,
-        note,
-        free_text: Some(format!(
-            "💡 也可以直接发送 `/model {MODEL_PROVIDER}/<id>` 选择目录之外的模型。"
-        )),
+        // No probe-failure prose on this page; only an empty state.
+        note: only_drill.then(|| "_(没有可用模型)_".to_string()),
+        free_text: Some(format!("也可 `/model {MODEL_PROVIDER}/<id>`")),
         intro: None,
-    };
+    }
+}
 
-    // A Pending Session has no thread to resume: its pick is applied when the
-    // thread is created. A live thread can only take a change through
-    // `thread/resume`, and only when the client opted in — the card says which.
-    let pending = query.session_id.is_none();
-    let resumable = !pending && provider_switch_on_resume;
-    let current_model = query
-        .current
-        .as_ref()
-        .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
-        .map(|model| model.id);
-
-    // A provider is only half a model: the old model name sent to a new provider
-    // is a 404 (issue #910), so **every provider row is a pair**. The known
-    // pairs are Codex's own declarations — `[profiles.*]` (`model` +
-    // `model_provider`) and the models a provider's `/models` listed. A provider
-    // with neither has no valid pick here and is named in the note instead.
-    let mut provider_options: Vec<ModelOption> = Vec::new();
+/// Page 2 (#908): every configured provider as **pairs** (`provider/model`),
+/// the current pair marked, a probe failure as a short tag, a pairless provider
+/// as a disabled row. Nothing here changes the per-turn model by itself.
+fn provider_page(
+    config: &CodexModelConfig,
+    probes: &HashMap<String, ProbeOutcome>,
+    current_provider: Option<&str>,
+    current_model: Option<&str>,
+    resumable: bool,
+) -> crate::backend::types::ModelScope {
+    use crate::backend::types::{ChangeScope, ModelOption, ModelScope, PickKind};
+    let mut options: Vec<ModelOption> = Vec::new();
     let mut paired_providers: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for provider in &config.providers {
         if provider.id == MODEL_PROVIDER {
-            // `codex` is reserved for the neutral catalog namespace (ADR-0092):
-            // a pair through it would carry the catalog's own value and could
-            // never address the configured channel. Listed, never selectable.
+            // Reserved for the neutral catalog namespace (ADR-0092): a pair
+            // through it could never address the configured channel.
             paired_providers.insert(provider.id.as_str());
-            provider_options.push(ModelOption {
+            options.push(ModelOption {
                 id: provider.id.clone(),
-                label: Some(clip(
-                    &format!("{}：`codex` 是内置目录的保留名，不能在这里选择", provider.name),
-                    48,
-                )),
+                label: Some(clip(&format!("{}：内置目录保留名，不可选", provider.name), 48)),
                 disabled: true,
-                ..ModelOption::default()
+                ..Default::default()
             });
             continue;
         }
-        let mut models: Vec<(String, Option<String>)> = Vec::new();
+        let mut models: Vec<String> = Vec::new();
         for profile in config
             .profiles
             .iter()
             .filter(|profile| profile.provider.as_deref() == Some(provider.id.as_str()))
         {
-            models.push((profile.model.clone(), Some(profile.name.clone())));
+            models.push(profile.model.clone());
         }
         if let Some(ProbeOutcome::Models(probed)) = probes.get(&provider.id) {
-            for model in probed {
-                models.push((model.clone(), None));
-            }
+            models.extend(probed.iter().cloned());
         }
         let mut seen = std::collections::HashSet::new();
-        models.retain(|(model, _)| seen.insert(model.clone()));
+        models.retain(|model| seen.insert(model.clone()));
         if models.is_empty() {
             continue;
         }
         paired_providers.insert(provider.id.as_str());
-        for (model, profile) in models {
-            let same_provider = current_provider.as_deref() == Some(provider.id.as_str());
-            let same_pair = same_provider && current_model.as_deref() == Some(model.as_str());
-            let mut label = match profile.as_deref() {
-                Some(name) => format!("{}：{model}（{name}）", provider.name),
-                None => format!("{}：{model}", provider.name),
-            };
-            // The 「当前」 marker is the **provider** fact (#908 AC1): a thread
-            // whose model is not among this provider's known pairs still must
-            // see which provider it is on.
-            if same_pair {
+        for model in models {
+            let same_provider = current_provider == Some(provider.id.as_str());
+            let mut label = format!("{}/{model}", provider.id);
+            // The current marker is the provider fact (#908 AC1): the exact pair
+            // says 「当前」, another model of the same provider says so too.
+            if same_provider && current_model == Some(model.as_str()) {
                 label.push_str("（当前）");
             } else if same_provider {
                 label.push_str("（当前 provider）");
             }
-            // The annotation says what a pick of **this** row does: a row on the
-            // thread's own provider is an ordinary model pick, only a different
-            // provider needs a confirmation (or a new thread).
-            let suffix = if pending {
-                "（新线程生效）"
-            } else if same_provider {
-                ""
-            } else if resumable {
-                "（需确认）"
-            } else {
-                "（仅新线程）"
-            };
-            let room = 48usize.saturating_sub(suffix.chars().count());
-            provider_options.push(ModelOption {
+            options.push(ModelOption {
                 id: format!("{}/{model}", provider.id),
-                label: Some(format!("{}{suffix}", clip(&label, room))),
+                label: Some(clip(&label, 48)),
                 value: Some(model),
                 provider: Some(provider.id.clone()),
-                ..ModelOption::default()
+                ..Default::default()
             });
         }
     }
-    // #908 AC1: every provider `config/read` declares stays visible, even when
-    // it has no profile and its `/models` listed nothing — as a listed row
-    // marked 「没有已知模型」, never a button (a bare provider has no valid pair
-    // to send, #910).
-    let mut unpaired_named = false;
+    // Status rows: a short failure tag, and a pairless provider listed (never a
+    // bare provider button).
     for provider in &config.providers {
+        let current_marker = if current_provider == Some(provider.id.as_str()) {
+            "（当前）"
+        } else {
+            ""
+        };
+        let failed = probes
+            .get(&provider.id)
+            .filter(|outcome| !matches!(outcome, ProbeOutcome::Models(_)));
         if paired_providers.contains(provider.id.as_str()) {
+            if let Some(outcome) = failed {
+                options.push(ModelOption {
+                    id: provider.id.clone(),
+                    label: Some(clip(
+                        &format!("{}：{}{current_marker}", provider.name, outcome.short_tag()),
+                        48,
+                    )),
+                    disabled: true,
+                    ..Default::default()
+                });
+            }
             continue;
         }
-        unpaired_named = true;
-        // The current marker is the **provider** fact (#908 AC1), so it rides a
-        // disabled row too: the user must see which provider the thread is on
-        // even when it offers no known model.
-        let mut label = format!("{}：没有已知模型", provider.name);
-        if current_provider.as_deref() == Some(provider.id.as_str()) {
-            label.push_str("（当前）");
-        }
-        provider_options.push(ModelOption {
+        let label = match failed {
+            Some(outcome) => format!("{}：{}{current_marker}", provider.name, outcome.short_tag()),
+            None => format!("{}：没有已知模型{current_marker}", provider.name),
+        };
+        options.push(ModelOption {
             id: provider.id.clone(),
             label: Some(clip(&label, 48)),
             disabled: true,
-            ..ModelOption::default()
+            ..Default::default()
         });
     }
-    let selectable = provider_options.iter().any(|option| !option.disabled);
-    let mut note = if config.read_failed {
-        "_(读不到 config，provider / profile 未知)_".to_string()
-    } else if !selectable {
-        "_(config 里没有可切换的 provider + model 组合：可在 `[profiles.*]` 声明一对)_".to_string()
-    } else if pending {
-        "选中的 provider+model 会随第一条消息应用到新线程（`thread/start`）。".to_string()
-    } else if resumable {
-        "切换会释放并重新加载这条线程：**其他客户端（TUI / VS Code / 桌面端）或另一个共用同一个 \
-         `CODEX_HOME` 的 cola 实例也会看到新的 provider**，所以需要确认；模型一起换。"
-            .to_string()
-    } else {
-        "provider 只能在新线程切换；想换渠道请先 `/new`（或在 `[clients.<id>]` 打开 \
-         `provider_switch_on_resume`）。"
-            .to_string()
-    };
-    if unpaired_named {
-        note.push_str(
-            " 没有已知模型的 provider 已列在上面：请在 `[profiles.*]` 里声明 model + \\
-             model_provider，或让 `/models` 探测成功。",
-        );
-    }
-    let provider_scope = ModelScope {
+    ModelScope {
         id: PROVIDER_SCOPE.into(),
-        title: "Provider（线程级：新线程 / resume）".into(),
+        title: "切换 provider".into(),
         changeable: if resumable {
             ChangeScope::ResumeOnly
         } else {
             ChangeScope::NewThread
         },
-        // A thread-level provider **pair**, never a drill-down: the bridge routes
-        // it to its switch path (issue #910), where OpenCode's same-named scope
-        // opens another surface page.
-        pick: crate::backend::types::PickKind::Provider,
-        note: Some(note),
-        options: provider_options,
+        pick: PickKind::Provider,
+        // One short status, never a paragraph: the config read itself failed.
+        note: config.read_failed.then(|| "_(读不到 config)_".to_string()),
+        options,
         free_text: None,
         intro: None,
-    };
-
-    ModelSurface {
-        current: resolved_current(query.current.as_ref(), thread_provider),
-        scopes: vec![model_scope, provider_scope],
     }
 }
 
@@ -1071,31 +1072,6 @@ fn resolved_current(
     Some(ModelSelection { label, reference })
 }
 
-/// The one-line probe note: why a provider contributes no model buttons. One
-/// provider's reason fits; many are summarised and clipped, never wrapped.
-fn probe_note(config: &CodexModelConfig, probes: &HashMap<String, ProbeOutcome>) -> Option<String> {
-    let reasons: Vec<String> = config
-        .providers
-        .iter()
-        .filter_map(|provider| match probes.get(&provider.id) {
-            None | Some(ProbeOutcome::Models(_)) => None,
-            Some(outcome) => Some(format!("{}：{}", provider.name, outcome.reason())),
-        })
-        .collect();
-    match reasons.as_slice() {
-        [] => None,
-        [only] => Some(clip(&format!("⚠️ {only}"), NOTE_MAX_CHARS)),
-        many => Some(clip(
-            &format!(
-                "⚠️ {} 个 provider 的 /models 不可用：{}",
-                many.len(),
-                many.join("；")
-            ),
-            NOTE_MAX_CHARS,
-        )),
-    }
-}
-
 fn codex_ref(model: &str) -> String {
     format!("{MODEL_PROVIDER}/{model}")
 }
@@ -1103,7 +1079,7 @@ fn codex_ref(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::types::{ModelOption, ModelSelection, ProviderModels};
+    use crate::backend::types::{ChangeScope, ModelSelection};
 
     const TOKEN: &str = "sentinel-probe-token-DO-NOT-LEAK";
 
@@ -1155,11 +1131,6 @@ mod tests {
             }),
             ..Default::default()
         }
-    }
-
-    /// A root read for a live thread: the provider scope is a resume then.
-    fn live_query() -> ModelSurfaceQuery<'static> {
-        query()
     }
 
     /// Layers arrive highest-precedence first (project → user → system). The
@@ -1410,6 +1381,48 @@ mod tests {
         assert_eq!(server.request_count(), 1, "a cached probe makes no request");
     }
 
+    /// Issue #908 (owner review): a **transient** failure (a timeout) is cached
+    /// for the short TTL and retried on the next open, while a definitive one
+    /// (`403`) is still cached at that moment.
+    #[tokio::test]
+    async fn a_timed_out_probe_retries_after_the_short_ttl() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route("GET", "/forbidden", 403, "{}");
+        server.route_delayed("GET", "/slow", 200, "{}", Duration::from_millis(400));
+        let probes = ModelProbes::new();
+        let forbidden = provider(
+            "forbidden",
+            Some(format!("{}/forbidden", server.base_url())),
+            Some(TOKEN),
+            None,
+        );
+        let slow = provider(
+            "slow",
+            Some(format!("{}/slow", server.base_url())),
+            Some(TOKEN),
+            None,
+        );
+        let outcomes = probes.probe_all(&[forbidden.clone(), slow.clone()]).await;
+        assert_eq!(outcomes.get("slow"), Some(&ProbeOutcome::Timeout));
+        assert_eq!(outcomes.get("forbidden"), Some(&ProbeOutcome::Forbidden));
+        assert_eq!(server.request_count(), 2);
+
+        // Age only the transient entry past its short TTL; the 403 stays fresh.
+        {
+            let mut entries = probes.entries.lock().unwrap();
+            let key = ModelProbes::cache_key(&slow);
+            entries.get_mut(&key).unwrap().at =
+                Instant::now() - PROBE_TRANSIENT_TTL - Duration::from_millis(10);
+        }
+        let outcomes = probes.probe_all(&[forbidden.clone(), slow.clone()]).await;
+        assert_eq!(
+            outcomes.get("forbidden"),
+            Some(&ProbeOutcome::Forbidden),
+            "a definitive failure is still cached"
+        );
+        assert_eq!(server.request_count(), 3, "only the timed-out probe is retried");
+    }
+
     /// 403, 404, a timeout and an `env_key`-only provider are distinct outcomes;
     /// failures are cached too, and the skipped provider is never dialled.
     #[tokio::test]
@@ -1647,284 +1660,6 @@ mod tests {
         );
     }
 
-    /// Issue #908/#910: `codex` is reserved for the neutral catalog namespace.
-    /// A configured `[model_providers.codex]` is listed as a reserved,
-    /// non-selectable row, its probe contributes no `codex/<id>` pairs, and a
-    /// profile naming it degrades to the neutral catalog ref.
-    #[test]
-    fn a_configured_codex_provider_is_reserved() {
-        let mut config = CodexModelConfig::default();
-        config.providers.push(provider(
-            "codex",
-            Some("http://127.0.0.1:1/v1".into()),
-            Some(TOKEN),
-            None,
-        ));
-        config.providers.push(provider(
-            "deepseek",
-            Some("http://127.0.0.1:1/v1".into()),
-            Some(TOKEN),
-            None,
-        ));
-        config.profiles.push(ProfilePreset {
-            name: "via-codex".into(),
-            model: "gpt-custom".into(),
-            provider: Some("codex".into()),
-        });
-        let mut probes = HashMap::new();
-        probes.insert("codex".into(), ProbeOutcome::Models(vec!["gpt-probed".into()]));
-
-        let surface = build_surface(&[], &config, &probes, Some("openai"), false, &query());
-        let provider_scope = &surface.scopes[1];
-        let reserved = provider_scope
-            .options
-            .iter()
-            .find(|option| option.id == "codex")
-            .expect("the configured id is listed");
-        assert!(reserved.disabled, "never a selectable pair");
-        assert!(
-            reserved.display_label().contains("保留名"),
-            "the row explains the reservation: {}",
-            reserved.display_label()
-        );
-        assert!(
-            !provider_scope
-                .options
-                .iter()
-                .any(|option| !option.disabled && option.provider.as_deref() == Some("codex")),
-            "no pair is offered through the reserved id"
-        );
-
-        // The codex profile degrades to a neutral catalog ref (model-only).
-        let preset = surface.scopes[0]
-            .options
-            .iter()
-            .find(|option| option.id == "gpt-custom")
-            .expect("the profile stays reachable");
-        assert_eq!(preset.value.as_deref(), Some("codex/gpt-custom"));
-        assert_eq!(preset.provider, None, "it is not a pair");
-    }
-
-    /// Issue #908 AC1: the 「当前」 marker is the **provider** fact — a thread
-    /// whose model is not among the provider's known pairs still sees its
-    /// provider marked.
-    #[test]
-    fn the_current_provider_marker_does_not_require_the_exact_pair() {
-        let mut config = CodexModelConfig::default();
-        config
-            .providers
-            .push(provider("deepseek", None, Some(TOKEN), None));
-        config.profiles.push(ProfilePreset {
-            name: "fast".into(),
-            model: "deepseek-flash".into(),
-            provider: Some("deepseek".into()),
-        });
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), false, &query());
-        let label = surface.scopes[1].options[0].display_label();
-        assert!(
-            label.contains("当前"),
-            "the provider is marked even when the model differs: {label}"
-        );
-    }
-
-    /// The surface's shape: the built-in catalog is its own group (never under a
-    /// provider), config profiles are `codex/<model>` presets, probed models
-    /// group by provider, and the provider list marks the thread's provider.
-    #[test]
-    fn surface_groups_catalog_presets_and_probed_models() {
-        let catalog = vec![ProviderModels {
-            provider: "codex".into(),
-            models: vec![
-                ModelOption {
-                    id: "gpt-5.1-codex".into(),
-                    variants: vec!["low".into(), "high".into()],
-                    ..Default::default()
-                },
-                ModelOption {
-                    id: "gpt-6-luna".into(),
-                    ..Default::default()
-                },
-            ],
-        }];
-        let mut config = CodexModelConfig {
-            default_model: Some("gpt-6-luna".into()),
-            ..Default::default()
-        };
-        config.providers = vec![
-            ConfiguredProvider {
-                id: "deepseek".into(),
-                name: "DeepSeek".into(),
-                base_url: Some("http://127.0.0.1:9/v1".into()),
-                token: Some(TOKEN.into()),
-                env_key: None,
-                mixed_layers: false,
-            },
-            ConfiguredProvider {
-                id: "opencode-go".into(),
-                name: "OpenCode Go".into(),
-                base_url: Some("http://127.0.0.1:10/v1".into()),
-                token: None,
-                env_key: Some("OPENCODE_KEY".into()),
-                mixed_layers: false,
-            },
-        ];
-        config.profiles = vec![ProfilePreset {
-            name: "fast".into(),
-            model: "deepseek-flash".into(),
-            provider: Some("deepseek".into()),
-        }];
-        let mut probes = HashMap::new();
-        probes.insert(
-            "deepseek".into(),
-            ProbeOutcome::Models(vec!["deepseek-flash".into(), "deepseek-v4-pro".into()]),
-        );
-        probes.insert("opencode-go".into(), ProbeOutcome::EnvKey);
-
-        let surface = build_surface(&catalog, &config, &probes, Some("opencode-go"), false, &query());
-
-        assert_eq!(surface.scopes.len(), 2);
-        let model = &surface.scopes[0];
-        assert_eq!(model.options[0].id, "gpt-5.1-codex");
-        assert_eq!(model.options[0].group.as_deref(), Some(CATALOG_GROUP));
-        assert_eq!(model.options[0].callback_value(), "codex/gpt-5.1-codex");
-        assert_eq!(model.options[0].variants, ["low", "high"]);
-
-        let config_default = model
-            .options
-            .iter()
-            .find(|option| option.group.as_deref() == Some(CONFIG_DEFAULT_GROUP))
-            .expect("the config default is offered");
-        assert_eq!(config_default.callback_value(), "codex/gpt-6-luna");
-        assert!(config_default.display_label().contains("配置默认"));
-
-        let profile = model
-            .options
-            .iter()
-            .find(|option| option.group.as_deref() == Some(PROFILE_GROUP))
-            .expect("the profile is offered");
-        assert_eq!(
-            profile.callback_value(),
-            "deepseek-flash",
-            "a profile pick is a **pair**: the bare model id plus its provider"
-        );
-        assert_eq!(profile.provider.as_deref(), Some("deepseek"));
-        assert!(profile.display_label().contains("fast"));
-        assert!(profile.display_label().contains("deepseek"));
-
-        let probed: Vec<&ModelOption> = model
-            .options
-            .iter()
-            .filter(|option| option.group.as_deref() == Some("DeepSeek（/models）"))
-            .collect();
-        assert_eq!(probed.len(), 2);
-        assert_eq!(probed[0].callback_value(), "deepseek-flash");
-        assert_eq!(
-            probed[0].provider.as_deref(),
-            Some("deepseek"),
-            "a probed model belongs to the provider that listed it"
-        );
-
-        // The catalog entry is in no provider's group.
-        for option in model.options.iter().filter(|option| {
-            matches!(option.id.as_str(), "gpt-5.1-codex" | "gpt-6-luna")
-                && option.group.as_deref() != Some(CONFIG_DEFAULT_GROUP)
-        }) {
-            assert_eq!(option.group.as_deref(), Some(CATALOG_GROUP));
-        }
-
-        // The env_key provider contributes a note, no model buttons.
-        let note = model.note.as_deref().expect("the skipped provider has a note");
-        assert!(note.contains("env_key"), "note: {note}");
-        assert!(!note.contains('\n'), "the note stays one line: {note}");
-
-        // The provider scope lists **pairs** only (issue #910): the profile's
-        // pair and the two probed ones. `opencode-go` has no known model (its
-        // probe was skipped), so it has no row and is named in the note.
-        let provider_scope = &surface.scopes[1];
-        assert_eq!(provider_scope.id, PROVIDER_SCOPE);
-        assert_eq!(provider_scope.changeable, ChangeScope::NewThread);
-        assert_eq!(provider_scope.pick, crate::backend::types::PickKind::Provider);
-        let pairs: Vec<(&str, &str)> = provider_scope
-            .options
-            .iter()
-            .filter(|option| !option.disabled)
-            .map(|option| {
-                (
-                    option.provider.as_deref().unwrap_or_default(),
-                    option.callback_value(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            pairs,
-            [("deepseek", "deepseek-flash"), ("deepseek", "deepseek-v4-pro")],
-            "one row per known provider+model pair, deduplicated"
-        );
-        // #908 AC1: the provider with no known model is still **listed**, as a
-        // row that is not a button (it has no valid pair to send, #910).
-        let listed = provider_scope
-            .options
-            .iter()
-            .find(|option| option.id == "opencode-go")
-            .expect("a configured provider stays visible");
-        assert!(listed.disabled, "it is listed, not selectable");
-        assert!(
-            listed.display_label().contains("没有已知模型"),
-            "the row says why: {}",
-            listed.display_label()
-        );
-        assert_eq!(listed.provider, None, "no pair button");
-        assert_eq!(listed.value, None);
-        assert!(
-            provider_scope.options[0].display_label().contains("fast"),
-            "a profile pair names the profile: {:?}",
-            provider_scope.options[0].label
-        );
-        let note = provider_scope.note.as_deref().unwrap();
-        assert!(
-            note.contains("没有已知模型") && note.contains("profiles"),
-            "the note says how to pair a listed provider: {note}"
-        );
-        assert!(
-            !provider_scope
-                .options
-                .iter()
-                .any(|option| !option.disabled && option.id.contains("opencode-go")),
-            "a bare provider is never selectable"
-        );
-
-        // The token never reaches any surface field, a card, or a `{:?}`.
-        assert!(
-            !format!("{config:?}").contains(TOKEN),
-            "the token leaked into a config debug: {config:?}"
-        );
-        assert!(
-            !format!("{:?}", config.providers[0]).contains(TOKEN),
-            "the token leaked into a provider debug"
-        );
-        assert!(
-            format!("{:?}", config.providers[0]).contains("<redacted>"),
-            "the provider debug redacts the token"
-        );
-        let rendered = format!(
-            "{:?}{:?}",
-            surface
-                .scopes
-                .iter()
-                .flat_map(|scope| scope.options.iter())
-                .collect::<Vec<_>>(),
-            surface
-                .scopes
-                .iter()
-                .map(|scope| (&scope.note, &scope.free_text, &scope.intro))
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            !rendered.contains(TOKEN),
-            "the token leaked into the surface: {rendered}"
-        );
-    }
-
     /// A thread fact of the neutral `codex` bucket is not a channel: after a
     /// picker pick the caller's resolved provider is what the provider list
     /// should mark (and the pair that matches it is 「当前」).
@@ -1950,17 +1685,23 @@ mod tests {
             ..Default::default()
         };
         let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), false, &query);
-        let label = surface.scopes[1].options[0].display_label();
-        assert!(label.contains("当前"), "label: {label}");
-        assert!(
-            !label.contains("需确认"),
-            "a pair on the thread's own provider is an ordinary model pick: {label}"
-        );
         assert_eq!(
             surface.current.as_ref().map(|current| current.reference.as_str()),
             Some("deepseek/deepseek-flash"),
             "a neutral thread fact does not rename the caller's selection"
         );
+        let mut providers_query = query;
+        providers_query.scope = Some(PROVIDER_SCOPE);
+        let providers = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            Some("codex"),
+            false,
+            &providers_query,
+        );
+        let label = providers.scopes[0].options[0].display_label();
+        assert!(label.contains("当前"), "label: {label}");
 
         // Issue #910: a picker pick records the neutral bucket, so the current
         // line composes the thread's **real** provider (the same fact the footer
@@ -2031,7 +1772,7 @@ mod tests {
     /// A failed probe is a note on the model scope and a short tag on the
     /// provider's own row — never an error, a blank scope, or a model button.
     #[test]
-    fn a_failed_probe_surfaces_a_one_line_note() {
+    fn a_failed_probe_is_a_short_tag_on_the_provider_page() {
         let config = CodexModelConfig {
             providers: vec![provider(
                 "opencode-go",
@@ -2044,32 +1785,52 @@ mod tests {
         let mut probes = HashMap::new();
         probes.insert("opencode-go".into(), ProbeOutcome::Forbidden);
 
+        // The root page has no probe prose: only the catalog/current provider.
         let surface = build_surface(&[], &config, &probes, Some("opencode-go"), false, &query());
         let model = &surface.scopes[0];
-        assert!(model.options.is_empty(), "no provider models on a 403");
-        let note = model.note.as_deref().unwrap();
-        assert!(note.contains("403"), "note: {note}");
-        assert!(note.contains("opencode-go"), "note names the provider: {note}");
-        assert!(!note.contains('\n'));
+        assert!(
+            model
+                .note
+                .as_deref()
+                .is_none_or(|note| !note.contains("403") && !note.contains("opencode-go")),
+            "no probe prose on the model page: {:?}",
+            model.note
+        );
+        assert!(
+            !model.options.iter().any(|option| option.disabled),
+            "no probe rows here either"
+        );
 
-        // The provider scope lists it (#908 AC1) but never as a selectable pair:
-        // with no profile and a failed probe there is no valid pair to send
-        // (issue #910), so the row is disabled and the note says how to pair it.
-        let provider = &surface.scopes[1];
+        // The provider page lists it as a disabled row with a short tag, and
+        // marks it as the current provider (#908 AC1).
+        let provider_page = build_surface(
+            &[],
+            &config,
+            &probes,
+            Some("opencode-go"),
+            false,
+            &provider_query(),
+        );
+        let provider = &provider_page.scopes[0];
+        assert_eq!(provider.id, PROVIDER_SCOPE);
         assert_eq!(provider.options.len(), 1, "the provider is listed");
         assert!(provider.options[0].disabled, "never a bare provider button");
         assert_eq!(provider.options[0].provider, None);
         let label = provider.options[0].display_label();
         assert!(
-            label.contains("opencode-go") && label.contains("没有已知模型"),
-            "the row names the provider and the gap: {label}"
+            label.contains("opencode-go") && label.contains("403"),
+            "the row carries the short tag: {label}"
         );
         assert!(
             label.contains("当前"),
             "the thread's provider is marked even without a known model: {label}"
         );
-        let note = provider.note.as_deref().unwrap();
-        assert!(note.contains("profiles"), "note says how to pair it: {note}");
+    }
+
+    fn provider_query() -> ModelSurfaceQuery<'static> {
+        let mut query = query();
+        query.scope = Some(PROVIDER_SCOPE);
+        query
     }
 
     /// When `config/read` itself fails, an empty provider list means "unknown",
@@ -2081,16 +1842,8 @@ mod tests {
             read_failed: true,
             ..Default::default()
         };
-        let surface = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            None,
-            false,
-            &ModelSurfaceQuery::default(),
-        );
-        let provider = &surface.scopes[1];
-        let note = provider.note.as_deref().unwrap();
+        let surface = build_surface(&[], &config, &HashMap::new(), None, false, &provider_query());
+        let note = surface.scopes[0].note.as_deref().unwrap();
         assert!(note.contains("读不到 config"), "note: {note}");
         assert!(!note.contains("没有 provider"), "note: {note}");
     }
@@ -2156,7 +1909,7 @@ mod tests {
     /// provider is a new-thread pick or a confirmed resume, depending on the
     /// gate.
     #[test]
-    fn the_provider_scope_offers_pairs_and_says_where_a_pick_takes_effect() {
+    fn the_provider_page_offers_pairs_without_suffixes() {
         let mut config = CodexModelConfig::default();
         config.providers.push(provider("deepseek", None, None, None));
         config.profiles.push(ProfilePreset {
@@ -2165,61 +1918,34 @@ mod tests {
             provider: Some("deepseek".into()),
         });
 
-        // A Pending Session applies the pair when the thread is created.
-        let pending = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            None,
-            true,
-            &ModelSurfaceQuery::default(),
-        );
-        let scope = &pending.scopes[1];
+        // A Pending Session: the pair rides creation, no suffix on the row.
+        let pending_query = ModelSurfaceQuery {
+            session_id: None,
+            ..provider_query()
+        };
+        let pending = build_surface(&[], &config, &HashMap::new(), None, true, &pending_query);
+        let scope = &pending.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::NewThread, "nothing to resume");
-        let label = scope.options[0].display_label();
-        assert!(label.contains("新线程生效"), "{label}");
-        assert!(
-            scope.note.as_deref().unwrap().contains("thread/start"),
-            "the note names the creation call: {:?}",
-            scope.note
-        );
+        assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
+        assert!(scope.note.is_none(), "no long copy");
 
-        // A live thread whose provider differs: a confirmed resume when the
-        // gate is open.
-        let live = live_query();
+        // A live thread: the action is the confirmation, which the pick's card
+        // spells out — the row stays `provider/model`.
+        let live = provider_query();
         let resumable = build_surface(&[], &config, &HashMap::new(), None, true, &live);
-        let scope = &resumable.scopes[1];
+        let scope = &resumable.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::ResumeOnly);
-        assert!(
-            scope.options[0].display_label().contains("需确认"),
-            "{:?}",
-            scope.options[0].label
-        );
-        let note = scope.note.as_deref().unwrap();
-        assert!(
-            note.contains("其他客户端") && note.contains("CODEX_HOME"),
-            "both holder kinds are spelled out (ADR-0090): {note}"
-        );
+        assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
 
-        // A live thread with the gate shut: only a new thread can take it.
+        // The gate shut: only a new thread can take it (the pick says so).
         let locked = build_surface(&[], &config, &HashMap::new(), None, false, &live);
-        let scope = &locked.scopes[1];
+        let scope = &locked.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::NewThread, "the gate is shut");
-        assert!(
-            scope.options[0].display_label().contains("仅新线程"),
-            "{:?}",
-            scope.options[0].label
-        );
-        assert!(scope.note.as_deref().unwrap().contains("只能在新线程切换"));
 
-        // The same pair on the thread's own provider is an ordinary model
-        // pick: no confirmation annotation at all (issue #910, item 3).
+        // The same pair on the thread's own provider is marked current.
         let same = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), true, &live);
-        let label = same.scopes[1].options[0].display_label();
-        assert!(
-            !label.contains("需确认") && !label.contains("仅新线程"),
-            "the thread's own provider needs no thread action: {label}"
-        );
+        let label = same.scopes[0].options[0].display_label();
+        assert!(label.contains("当前"), "{label}");
     }
 
     /// Issue #910: a profile preset is Codex's own model + provider declaration,

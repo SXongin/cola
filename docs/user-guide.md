@@ -848,7 +848,8 @@ Notes:
 
 Codex's model axis is not a provider → model tree: a provider is **thread
 level**, a model is **per turn**, and the built-in catalog is **global**. Bare
-`/model` therefore shows one current line and two sections, and no
+`/model` therefore shows one current line and **one model page**; a
+`切换 provider…` row at the bottom opens the provider page. There is no
 「选择 provider（共 1 个）」 pseudo-level:
 
 - **The current model is the thread's, with cola's own pick in front of it.**
@@ -856,14 +857,13 @@ level**, a model is **per turn**, and the built-in catalog is **global**. Bare
   one), then the thread's own `model` and `modelProvider` read with
   `thread/read` — so a picker opened after another client changed the thread
   shows that change, and the footer and the picker cannot disagree.
-- **「模型（每轮可换）」** lists four sources, each labelled: `model/list`'s
-  built-in catalog (grouped as 「内置目录（任何 provider 可试）」 — those ids
-  name no provider and may run through any of them), the config's top-level
-  `model` (配置默认), every `[profiles.<name>]` preset (`model` +
-  `model_provider`, shown as `profile：model（provider）`), and the ids a
-  provider's `/models` endpoint answered (grouped per provider). A pick is sent
-  as `turn/start.model` on the next message and the thread keeps it for its
-  following turns.
+- **「模型（每轮可换）」** lists the model-only sources: `model/list`'s built-in
+  catalog (grouped as 「内置目录（全局，未校验）」 — those ids name no provider and
+  may run through any of them), the config's top-level `model` (配置默认), every
+  `[profiles.<name>]` preset (`model` + `model_provider`, shown as
+  `profile：model（provider）`), and **the current provider's** `/models` ids. A
+  pick is sent as `turn/start.model` on the next message and the thread keeps it
+  for its following turns.
 - **An id outside every list is typed.** `/model codex/<id>` records it, and
   `/model <provider>/<model>` records a pair. Codex validates neither one: only
   the catalog's entries carry a display name, a context window and reasoning
@@ -873,20 +873,19 @@ level**, a model is **per turn**, and the built-in catalog is **global**. Bare
 `GET <base_url>/models` is not part of the Responses API — `wire_api =
 "responses"` does not promise it. cola asks each `[model_providers.<id>]` with
 that provider's own `experimental_bearer_token`, with 2 s per probe, and caches
-the answer (failures too) for three minutes. When the answer cannot be used the
-card shows one line saying why instead of buttons: 403 「拒绝访问 /models（403）」,
-404 「没有 /models（404）」, 401, a timeout, an unreachable host, an undecodable
-body, or a credential that lives only in `env_key` — that provider is skipped by
-name, because the daemon's environment is not cola's. The catalog, the config
-default and the profiles are always there, and a card callback answers from the
-cache, so a first cold click may show the providers without their probed models
-until the next root `/model` open fills them. The token is sent only in the
+the answer: a definitive one (403, 404, 401, `env_key`, or the decoded models)
+for three minutes, a **transient** one (a timeout, a network error) for about
+20 seconds so the next open retries. The provider page shows the reason as a
+short tag on the provider row (`403`, `超时`, …) — never a paragraph, and never
+on the model page. The catalog, the config default and the profiles are always
+there, and a card callback answers from the cache, so a first cold click may
+show the providers without their probed models until the next open fills them. The token is sent only in the
 request's `Authorization` header: it never appears on a card, in a log line or in
 an error message.
 
 **A provider is thread level, so changing it is a different operation.** The
-card's second section, 「Provider（线程级：新线程 / resume）」, holds those rows. A
-provider is chosen on `thread/start` or `thread/resume`; `turn/start` has no
+provider page (the `切换 provider…` row) holds those pairs, labelled
+`provider/model`. A provider is chosen on `thread/start` or `thread/resume`; `turn/start` has no
 provider field, and a provider is never selectable without a model — the old
 model name on a new provider is a 404. So:
 
