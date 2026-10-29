@@ -131,6 +131,11 @@ pub(crate) struct ConfiguredProvider {
     pub(crate) base_url: Option<String>,
     pub(crate) token: Option<String>,
     pub(crate) env_key: Option<String>,
+    /// The base URL and the credential (token or `env_key`) came from
+    /// **different** config layers (issue #908): the layers are not equally
+    /// trusted, so no probe is made — a refused project layer must not receive
+    /// a user layer's token.
+    pub(crate) mixed_layers: bool,
 }
 
 /// The token and every URL part beyond scheme+host are redacted, so a `{:?}`
@@ -215,11 +220,17 @@ impl CodexModelConfig {
             std::collections::BTreeMap::new();
 
         if let Some(layers) = result.get("layers").and_then(Value::as_array) {
-            for layer in layers {
+            for (layer_index, layer) in layers.iter().enumerate() {
                 let Some(layer_config) = layer_config(layer) else {
                     continue;
                 };
-                merge_layer(&mut config, &layer_config, &mut providers, &mut profiles);
+                merge_layer(
+                    &mut config,
+                    &layer_config,
+                    &mut providers,
+                    &mut profiles,
+                    layer_index,
+                );
             }
         }
 
@@ -227,7 +238,9 @@ impl CodexModelConfig {
         // `model_providers` only in the resolved object) still contributes.
         if let Some(object) = result.get("config").and_then(Value::as_object) {
             let resolved = Value::Object(object.clone());
-            merge_layer(&mut config, &resolved, &mut providers, &mut profiles);
+            // The resolved object is its own (embedded) source: a URL from a
+            // layer and a token from here are different provenance too.
+            merge_layer(&mut config, &resolved, &mut providers, &mut profiles, usize::MAX);
             // The resolved object is the *effective* config, so when it names
             // the top-level model it outranks a layer: a project layer the
             // daemon refused to trust is listed but not applied, and showing its
@@ -243,6 +256,9 @@ impl CodexModelConfig {
                 name: parts.name.unwrap_or_else(|| id.clone()),
                 id,
                 base_url: parts.base_url,
+                mixed_layers: parts.base_url_layer.is_some()
+                    && parts.credential_layer.is_some()
+                    && parts.base_url_layer != parts.credential_layer,
                 token: parts.token,
                 env_key: parts.env_key,
             })
@@ -267,6 +283,12 @@ struct ProviderParts {
     base_url: Option<String>,
     token: Option<String>,
     env_key: Option<String>,
+    /// Which layer supplied each field (issue #908). A probe may only use a
+    /// URL and a credential that came from the **same** layer: the layers are
+    /// not equally trusted (a project layer may be refused by the daemon), and
+    /// merging them per field would let a project URL receive a user token.
+    base_url_layer: Option<usize>,
+    credential_layer: Option<usize>,
 }
 
 #[derive(Default)]
@@ -280,6 +302,21 @@ struct ProfileParts {
 fn set_first(slot: &mut Option<String>, value: Option<String>) {
     if slot.is_none() {
         *slot = value;
+    }
+}
+
+/// [`set_first`] plus the layer that won, for the fields a probe pairs up.
+fn set_first_at(
+    slot: &mut Option<String>,
+    layer_slot: &mut Option<usize>,
+    value: Option<String>,
+    layer: usize,
+) {
+    if slot.is_none()
+        && let Some(value) = value
+    {
+        *slot = Some(value);
+        *layer_slot = Some(layer);
     }
 }
 
@@ -302,6 +339,7 @@ fn merge_layer(
     layer: &Value,
     providers: &mut std::collections::BTreeMap<String, ProviderParts>,
     profiles: &mut std::collections::BTreeMap<String, ProfileParts>,
+    layer_index: usize,
 ) {
     if config.default_model.is_none() {
         config.default_model = non_empty_str(layer.get("model"));
@@ -320,9 +358,24 @@ fn merge_layer(
             };
             let parts = providers.entry(id.clone()).or_default();
             set_first(&mut parts.name, field("name"));
-            set_first(&mut parts.base_url, field("base_url"));
-            set_first(&mut parts.token, field("experimental_bearer_token"));
-            set_first(&mut parts.env_key, field("env_key"));
+            set_first_at(
+                &mut parts.base_url,
+                &mut parts.base_url_layer,
+                field("base_url"),
+                layer_index,
+            );
+            set_first_at(
+                &mut parts.token,
+                &mut parts.credential_layer,
+                field("experimental_bearer_token"),
+                layer_index,
+            );
+            set_first_at(
+                &mut parts.env_key,
+                &mut parts.credential_layer,
+                field("env_key"),
+                layer_index,
+            );
         }
     }
 
@@ -360,6 +413,10 @@ pub(crate) enum ProbeOutcome {
     Models(Vec<String>),
     /// Only `env_key` credentials: the daemon's environment is not cola's.
     EnvKey,
+    /// The base URL and the credential came from different config layers: a
+    /// lower layer's token must never be sent to a layer that may have been
+    /// refused (issue #908).
+    LayerMismatch,
     NoBaseUrl,
     BadBaseUrl,
     UnsupportedScheme,
@@ -380,6 +437,7 @@ impl ProbeOutcome {
         match self {
             Self::Models(_) => String::new(),
             Self::EnvKey => "用 env_key 取凭据，cola 读不到 daemon 环境，跳过探测".into(),
+            Self::LayerMismatch => "base_url 与凭据来自不同的配置层，不发送探测".into(),
             Self::NoBaseUrl => "没有 base_url，无法探测".into(),
             Self::BadBaseUrl => "base_url 无效，无法探测".into(),
             Self::UnsupportedScheme => "base_url 不是 http(s)，跳过探测".into(),
@@ -516,6 +574,11 @@ impl ModelProbes {
     }
 
     async fn probe(&self, provider: &ConfiguredProvider) -> ProbeOutcome {
+        if provider.mixed_layers {
+            // A refused project layer's base_url paired with a lower layer's
+            // bearer token: never send that token there (issue #908).
+            return ProbeOutcome::LayerMismatch;
+        }
         if provider.token.is_none() && provider.env_key.is_some() {
             tracing::debug!(
                 provider = %provider.id,
@@ -938,7 +1001,7 @@ pub(crate) fn build_surface(
     };
 
     ModelSurface {
-        current: resolved_current(query.current.as_ref(), thread_provider, config),
+        current: resolved_current(query.current.as_ref(), thread_provider),
         scopes: vec![model_scope, provider_scope],
     }
 }
@@ -951,7 +1014,6 @@ pub(crate) fn build_surface(
 fn resolved_current(
     current: Option<&ModelSelection>,
     thread_provider: Option<&str>,
-    config: &CodexModelConfig,
 ) -> Option<ModelSelection> {
     let current = current?;
     let Some((provider, model)) = current.reference.split_once('/') else {
@@ -963,7 +1025,11 @@ fn resolved_current(
     let Some(real) = thread_provider else {
         return Some(current.clone());
     };
-    if real == MODEL_PROVIDER || !config.providers.iter().any(|configured| configured.id == real) {
+    // The **thread projection** is the authority here, independent of the
+    // config read (issue #908): a failed `config/read` (or a provider the
+    // config no longer declares) must not leave a neutral `codex/<id>` on the
+    // card while the footer names the real channel.
+    if real == MODEL_PROVIDER {
         return Some(current.clone());
     }
     let reference = format!("{real}/{model}");
@@ -1044,6 +1110,7 @@ mod tests {
             base_url,
             token: token.map(str::to_string),
             env_key: env_key.map(str::to_string),
+            mixed_layers: false,
         }
     }
 
@@ -1208,6 +1275,7 @@ mod tests {
             ),
             token: Some(TOKEN.into()),
             env_key: None,
+            mixed_layers: false,
         };
         let debugged = format!("{provider:?}");
         assert!(debugged.contains("https://example.test"), "{debugged}");
@@ -1243,6 +1311,7 @@ mod tests {
             base_url: Some("sentinel-user:sentinel-pass@not a url".into()),
             token: None,
             env_key: None,
+            mixed_layers: false,
         };
         let debugged = format!("{invalid:?}");
         assert!(debugged.contains("<invalid>"), "{debugged}");
@@ -1268,6 +1337,7 @@ mod tests {
             base_url: Some(format!("{}/v1?token={URL_SECRET}", server.base_url())),
             token: Some(TOKEN.into()),
             env_key: None,
+            mixed_layers: false,
         };
 
         let (first, logs) = crate::bridge::test_support::capture_logs(async {
@@ -1361,6 +1431,90 @@ mod tests {
         let again = probes.probe_all(&providers).await;
         assert_eq!(outcomes, again);
         assert_eq!(server.request_count(), 3, "failures are cached within the TTL");
+    }
+
+    /// Issue #908 (blocking): a base URL from one config layer and a token from
+    /// another are never paired for a probe — a refused project layer must not
+    /// receive a user layer's bearer token.
+    #[tokio::test]
+    async fn a_layer_mixed_url_and_token_is_never_probed() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route("GET", "/models", 200, r#"{"data":[{"id":"leak"}]}"#);
+        let mixed = serde_json::json!({
+            "config": {},
+            "layers": [
+                {
+                    "name": { "type": "project" },
+                    "version": "v1",
+                    "config": {
+                        "model_providers": {
+                            "evil": { "base_url": server.base_url() }
+                        }
+                    }
+                },
+                {
+                    "name": { "type": "user" },
+                    "version": "v1",
+                    "config": {
+                        "model_providers": {
+                            "evil": { "experimental_bearer_token": "user-secret" }
+                        }
+                    }
+                }
+            ]
+        });
+        let config = CodexModelConfig::from_read(&mixed);
+        let evil = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == "evil")
+            .expect("the pair is still listed (display)");
+        assert!(
+            evil.mixed_layers,
+            "the URL and the token come from different layers"
+        );
+        assert_eq!(
+            evil.token.as_deref(),
+            Some("user-secret"),
+            "the fields still merge for display"
+        );
+
+        let probe = ModelProbes::new();
+        let outcomes = probe.probe_all(&config.providers).await;
+        assert_eq!(
+            outcomes.get("evil"),
+            Some(&ProbeOutcome::LayerMismatch),
+            "no probe is attempted"
+        );
+        assert_eq!(
+            server.request_count(),
+            0,
+            "the user token never reaches the project layer's URL"
+        );
+
+        // The same layer for both is probed normally.
+        let together = serde_json::json!({
+            "config": {},
+            "layers": [{
+                "name": { "type": "user" },
+                "version": "v1",
+                "config": {
+                    "model_providers": {
+                        "ok": {
+                            "base_url": server.base_url(),
+                            "experimental_bearer_token": "user-secret"
+                        }
+                    }
+                }
+            }]
+        });
+        let config = CodexModelConfig::from_read(&together);
+        let outcomes = ModelProbes::new().probe_all(&config.providers).await;
+        assert!(
+            matches!(outcomes.get("ok"), Some(ProbeOutcome::Models(_))),
+            "one layer's URL and token are fine: {outcomes:?}"
+        );
+        assert_eq!(server.request_count(), 1);
     }
 
     /// Issue #910: the probe cache key is the provider, its URL **and** its
@@ -1514,6 +1668,7 @@ mod tests {
                 base_url: Some("http://127.0.0.1:9/v1".into()),
                 token: Some(TOKEN.into()),
                 env_key: None,
+                mixed_layers: false,
             },
             ConfiguredProvider {
                 id: "opencode-go".into(),
@@ -1521,6 +1676,7 @@ mod tests {
                 base_url: Some("http://127.0.0.1:10/v1".into()),
                 token: None,
                 env_key: Some("OPENCODE_KEY".into()),
+                mixed_layers: false,
             },
         ];
         config.profiles = vec![ProfilePreset {
@@ -1742,21 +1898,43 @@ mod tests {
             "the label is composed with the real provider too"
         );
 
-        // An **unconfigured** thread provider is not composed, and a neutral one
-        // is not a channel: the line stays what the caller resolved.
+        // A **failed config read** does not hide the thread's real provider: the
+        // projection is the authority, not the config (issue #908).
+        let unreadable = CodexModelConfig {
+            read_failed: true,
+            ..Default::default()
+        };
         let surface = build_surface(
             &[],
-            &config,
+            &unreadable,
             &HashMap::new(),
-            Some("unknown"),
+            Some("deepseek"),
             false,
             &picker_pick,
         );
         assert_eq!(
             surface.current.unwrap().reference,
-            "codex/gpt-custom",
-            "an unknown provider is not claimed"
+            "deepseek/gpt-custom",
+            "the config read's failure must not leave the neutral ref"
         );
+
+        // The projection is the authority even for a provider the config no
+        // longer declares (it was renamed or removed while the thread runs).
+        let surface = build_surface(
+            &[],
+            &config,
+            &HashMap::new(),
+            Some("renamed"),
+            false,
+            &picker_pick,
+        );
+        assert_eq!(
+            surface.current.unwrap().reference,
+            "renamed/gpt-custom",
+            "the footer's provider is the current line's provider"
+        );
+
+        // A neutral thread fact is not a channel: the line stays as resolved.
         let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), false, &picker_pick);
         assert_eq!(surface.current.unwrap().reference, "codex/gpt-custom");
     }

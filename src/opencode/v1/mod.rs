@@ -55,6 +55,12 @@ const PERMISSION: &str = "/permission";
 const QUESTION: &str = "/question";
 /// The provider catalog (models, context windows).
 const PROVIDER: &str = "/provider";
+
+/// The provider route, named for the adapter-level wire tests so they do not
+/// spell a V1 path outside this strategy (the generation guard's rule,
+/// ADR-0055).
+#[cfg(test)]
+pub(crate) const PROVIDER_ROUTE_FOR_TESTS: &str = PROVIDER;
 /// The agent catalog.
 const AGENT: &str = "/agent";
 /// The skill catalog (spec #652, ticket #656). V1's `Skill.Info` carries no id
