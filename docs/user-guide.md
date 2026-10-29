@@ -295,8 +295,9 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   `thread/read` to verify. Success is only the read-back. If another client
   (a Codex TUI, VS Code, the desktop app) or another cola instance sharing the
   same `CODEX_HOME` still holds the thread, the change does not land: the
-  message is **not sent**, the card names both possibilities, and the recorded
-  pair stays for a retry — close the other client, or use `thread/fork` with the
+  message is **not sent**, the card names both possibilities, and the session
+  stays on the pair the thread actually runs — the unapplied record is dropped
+  (re-pick to retry) — close the other client, or use `thread/fork` with the
   pair. A pick made while a turn is running is recorded the same way and applied
   by the next message, and a thread that is already on the target provider but
   runs another model is not reloaded (the model rides that message). The click
@@ -906,7 +907,8 @@ model name on a new provider is a 404. So:
   desktop app) or another cola instance sharing the same `CODEX_HOME` still
   holds the thread, the server does not reload it and the switch cannot land:
   the message is **not sent**, the error names both possibilities, and the
-  recorded pair stays for a retry — close the other client, or fork the thread
+  session stays on the pair the thread actually runs — the unapplied record is
+  dropped, so re-pick to retry — close the other client, or fork the thread
   (`thread/fork`) with the pair. The cost is symmetric: while cola holds a live
   thread's subscription, a provider change made in your TUI is silently ignored.
   Neither side can tell that from success on the wire, so close the other face

@@ -447,6 +447,8 @@ struct State {
     /// a `/stop` can be exercised in the window before the server persists the
     /// turn.
     hide_live_turns: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// One-shot delay for the next `thread/read` reply (a stale read, #910).
+    read_delay: std::sync::Mutex<std::time::Duration>,
     /// One-shot: leave the next `thread/read` unanswered (a stalled read).
     silent_thread_read: std::sync::atomic::AtomicBool,
     /// Answer the next `thread/read` with THIS thread instead of the requested
@@ -533,6 +535,7 @@ impl Default for State {
             reject_compact: std::sync::atomic::AtomicBool::new(false),
             drop_on_compact: std::sync::atomic::AtomicBool::new(false),
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             read_returns: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
@@ -1194,6 +1197,13 @@ impl FakeServer {
         self.state.drop_on_compact.store(true, Ordering::SeqCst);
     }
 
+    /// Delay the next `thread/read` reply by `delay` (one-shot). The payload is
+    /// captured **before** the delay, so the reply is stale by the time it
+    /// lands — a broadcast arriving meanwhile must win (issue #910).
+    pub(crate) fn set_read_delay(&self, delay: std::time::Duration) {
+        *self.state.read_delay.lock().expect("read delay") = delay;
+    }
+
     /// Leave the next `thread/read` unanswered, modelling a stalled request.
     pub(crate) fn silence_next_thread_read(&self) {
         self.state.silent_thread_read.store(true, Ordering::SeqCst);
@@ -1433,6 +1443,11 @@ where
             if state.silent_thread_read.swap(false, Ordering::SeqCst) {
                 return true;
             }
+            // One-shot: capture the payload, then hold the answer (a stale read).
+            let delay = {
+                let mut delay = state.read_delay.lock().expect("read delay");
+                std::mem::take(&mut *delay)
+            };
             let requested = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let substituted = state.read_returns.lock().expect("read returns").take();
             let thread_id = substituted.as_deref().unwrap_or(requested);
@@ -1454,6 +1469,9 @@ where
                                 turn["status"] = json!("completed");
                             }
                         }
+                    }
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
                     }
                     replying(sink, id, json!({ "thread": thread_json(&thread) })).await
                 }

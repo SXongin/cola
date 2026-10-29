@@ -977,9 +977,16 @@ pub(crate) fn build_surface(
             continue;
         }
         unpaired_named = true;
+        // The current marker is the **provider** fact (#908 AC1), so it rides a
+        // disabled row too: the user must see which provider the thread is on
+        // even when it offers no known model.
+        let mut label = format!("{}：没有已知模型", provider.name);
+        if current_provider.as_deref() == Some(provider.id.as_str()) {
+            label.push_str("（当前）");
+        }
         provider_options.push(ModelOption {
             id: provider.id.clone(),
-            label: Some(clip(&format!("{}：没有已知模型", provider.name), 48)),
+            label: Some(clip(&label, 48)),
             disabled: true,
             ..ModelOption::default()
         });
@@ -2052,11 +2059,14 @@ mod tests {
         assert_eq!(provider.options.len(), 1, "the provider is listed");
         assert!(provider.options[0].disabled, "never a bare provider button");
         assert_eq!(provider.options[0].provider, None);
+        let label = provider.options[0].display_label();
         assert!(
-            provider.options[0].display_label().contains("opencode-go")
-                && provider.options[0].display_label().contains("没有已知模型"),
-            "the row names the provider and the gap: {}",
-            provider.options[0].display_label()
+            label.contains("opencode-go") && label.contains("没有已知模型"),
+            "the row names the provider and the gap: {label}"
+        );
+        assert!(
+            label.contains("当前"),
+            "the thread's provider is marked even without a known model: {label}"
         );
         let note = provider.note.as_deref().unwrap();
         assert!(note.contains("profiles"), "note says how to pair it: {note}");

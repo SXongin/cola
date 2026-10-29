@@ -381,7 +381,8 @@ async fn a_recorded_switch_that_cannot_apply_stops_the_prompt() {
             "thread/resume 之后这条线程仍是 `openai/gpt-5.1-codex`：可能有另一个客户端（Codex TUI / \
              VS Code）或另一个共用同一个 `CODEX_HOME` 的 cola 实例仍持有它；请关闭它，或改用 \
              `thread/fork` 带上 provider/model",
-        );
+        )
+        .with_observed_thread_model(crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap());
     let applies = backend.thread_model_calls.clone();
     let prompt_calls = backend.prompt_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
@@ -429,8 +430,8 @@ async fn a_recorded_switch_that_cannot_apply_stops_the_prompt() {
             .unwrap()
             .model
             .as_deref(),
-        Some("deepseek/deepseek-v4-pro"),
-        "the recorded intent stays for a retry"
+        Some("openai/gpt-5.1-codex"),
+        "AC6: a failed switch leaves the session on the pair the thread runs"
     );
 }
 

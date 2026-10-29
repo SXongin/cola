@@ -1817,6 +1817,9 @@ pub struct MockBackend {
     /// When set, `apply_thread_model` fails with this message and records
     /// nothing — a refused switch (a peer holds the thread).
     pub thread_model_error: Option<String>,
+    /// What `observed_thread_model` reports (issue #910 AC6): the pair the
+    /// adapter's read-back knows after a switch attempt.
+    pub observed_thread_model: Option<crate::backend::types::ModelInfo>,
     /// What a successful `apply_thread_model` reports.
     pub thread_model_change: crate::backend::types::ThreadModelChange,
     /// Every `create_session` call's thread-level provider and model id (issue
@@ -2109,6 +2112,7 @@ impl MockBackend {
             model_pick_route_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             thread_model_calls: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             thread_model_error: None,
+            observed_thread_model: None,
             thread_model_change: crate::backend::types::ThreadModelChange::Changed,
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
@@ -2290,6 +2294,16 @@ impl MockBackend {
     /// records nothing — a peer that still holds the thread.
     pub(crate) fn fail_provider_switch(&mut self, message: &str) -> &mut Self {
         self.thread_model_error = Some(message.to_string());
+        self
+    }
+
+    /// Scenario: the adapter's read-back knows the thread still runs `model`
+    /// (issue #910 AC6: a failed switch restores the mirror to it).
+    pub(crate) fn with_observed_thread_model(
+        &mut self,
+        model: crate::backend::types::ModelInfo,
+    ) -> &mut Self {
+        self.observed_thread_model = Some(model);
         self
     }
 
@@ -3115,6 +3129,10 @@ impl crate::backend::Backend for MockBackend {
 
     fn has_thread_provider(&self) -> bool {
         self.thread_provider
+    }
+
+    fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
+        self.observed_thread_model.clone()
     }
 
     fn known_thread_provider(&self, _session_id: &str) -> Option<String> {

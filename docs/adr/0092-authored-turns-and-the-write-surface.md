@@ -521,3 +521,13 @@ cached config read would also let one directory's config decide another
 directory's classification. Deciding "is `codex` configured?" from such a cache
 made a catalog pick on another provider look like a thread-level switch — the
 ambiguity this amendment removes.
+
+## Amendment (#910 AC6): a failed switch leaves the session as it was
+
+A switch whose read-back disagrees (or cannot be read) is a **named failure**,
+and the session must not be left holding a pair the thread never ran. The
+per-turn mirror is restored from the adapter's read-back observation — a
+compare-and-set back to the pair the thread actually runs (a newer pick keeps
+its own record); when the pair is unknown the mirror claims nothing. The prompt
+is still not sent, and the user **re-picks** to retry once the holder is closed
+— the unapplied record is not kept as a retry ticket.

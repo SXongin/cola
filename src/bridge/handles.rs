@@ -1364,6 +1364,42 @@ impl SessionsHandle {
             .set_auto_accept(thread_key, session_id, expected_epoch, on)
     }
 
+    /// Restore the session's mirror to the pair the **thread actually runs**
+    /// after a failed switch (issue #910 AC6): a compare-and-set from the
+    /// recorded pair, so a newer pick keeps its own record. `observed: None`
+    /// means the pair is unknown — the mirror claims nothing (`Forget`).
+    pub(crate) async fn restore_observed_pair(
+        &self,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        expected_model: &str,
+        expected_variant: Option<&str>,
+        observed_model: Option<&str>,
+        observed_variant: Option<&str>,
+    ) -> crate::error::Result<bool> {
+        use crate::bridge::session::MirrorWrite;
+        let gate = self.session_gates.gate(session_id);
+        let _held = gate.enter().await;
+        let write = match observed_model {
+            Some(model) => MirrorWrite::ModelWithVariant {
+                model,
+                variant: observed_variant,
+            },
+            None => MirrorWrite::Forget,
+        };
+        let written = self.store.lock().await.set_mirror_live(
+            thread_key,
+            session_id,
+            Some(expected_model),
+            expected_variant,
+            write,
+        )?;
+        Ok(matches!(
+            written,
+            crate::bridge::session::PairWrite::Applied { .. }
+        ))
+    }
+
     /// Record a `/model` spec as the session's next-turn model **without any
     /// catalog read** (issue #910): the confirmation must ack from a store write
     /// only, so the `/think` clear is deferred to the turn pre-flight. Same gate

@@ -822,10 +822,39 @@ impl Turn {
                 Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
                     let pair = format!("{}/{}", model.provider_id, model.id);
                     self.settle_switch_variant(handles, &pair).await?;
-                    handles
-                        .backend
-                        .apply_thread_model(&self.session_id, model)
-                        .await?;
+                    if let Err(error) = handles.backend.apply_thread_model(&self.session_id, model).await {
+                        // AC6: a failed switch leaves the session on the pair the
+                        // thread actually runs — never the unapplied record. The
+                        // adapter's read-back is that observation; the mirror is
+                        // compare-and-set restored (a newer pick keeps its own),
+                        // then the prompt stops with the named error and the user
+                        // re-picks to retry.
+                        let observed = handles.backend.observed_thread_model(&self.session_id);
+                        let observed_spec = observed
+                            .as_ref()
+                            .map(|model| format!("{}/{}", model.provider_id, model.id));
+                        if let Err(restore) = handles
+                            .sessions
+                            .restore_observed_pair(
+                                &self.thread_key,
+                                &self.session_id,
+                                &pair,
+                                self.turn_variant.as_deref(),
+                                observed_spec.as_deref(),
+                                // The pair's `/think` level is not part of a
+                                // thread read: keep the level this prompt
+                                // validated (cleared when the pair lacks it).
+                                self.turn_variant.as_deref(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "failed switch: restoring the session mirror failed for {}: {restore}",
+                                self.session_id
+                            );
+                        }
+                        return Err(error);
+                    }
                 }
                 Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
                 // Unknown is not "safe to skip": a failed classification must
