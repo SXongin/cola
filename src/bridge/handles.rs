@@ -845,8 +845,10 @@ impl SessionsHandle {
             .await;
         // A client without a thread-level provider axis (OpenCode) has nothing
         // to record: the pair's model is all that exists there, and its create
-        // payload must stay provider-free (issue #910).
-        let write = if backend.has_thread_provider() {
+        // payload must stay provider-free (issue #910). The **neutral bucket**
+        // (`codex`) is not a channel either: recording it as `modelProvider`
+        // would send a reserved namespace to `thread/start` (#906's text form).
+        let write = if backend.has_thread_provider() && !backend.is_neutral_provider(provider) {
             crate::bridge::session::MirrorWrite::Pair {
                 model: model_spec,
                 provider,
