@@ -252,15 +252,36 @@ impl CodexModelConfig {
 
         config.providers = providers
             .into_iter()
-            .map(|(id, parts)| ConfiguredProvider {
-                name: parts.name.unwrap_or_else(|| id.clone()),
-                id,
-                base_url: parts.base_url,
-                mixed_layers: parts.base_url_layer.is_some()
-                    && parts.credential_layer.is_some()
-                    && parts.base_url_layer != parts.credential_layer,
-                token: parts.token,
-                env_key: parts.env_key,
+            .map(|(id, parts)| {
+                // One credential, from the highest layer that named one: an
+                // `env_key` a project layer trusts must not be shadowed by a
+                // user layer's token (and the reverse). A lower layer's
+                // credential is dropped, never paired with another layer's
+                // URL (issue #908).
+                let mut token = parts.token;
+                let mut env_key = parts.env_key;
+                match (parts.token_layer, parts.env_key_layer) {
+                    (Some(token_layer), Some(env_key_layer)) if env_key_layer < token_layer => token = None,
+                    (Some(token_layer), Some(env_key_layer)) if token_layer < env_key_layer => env_key = None,
+                    _ => {}
+                }
+                let credential_layer = if token.is_some() {
+                    parts.token_layer
+                } else if env_key.is_some() {
+                    parts.env_key_layer
+                } else {
+                    None
+                };
+                ConfiguredProvider {
+                    name: parts.name.unwrap_or_else(|| id.clone()),
+                    id,
+                    base_url: parts.base_url,
+                    mixed_layers: parts.base_url_layer.is_some()
+                        && credential_layer.is_some()
+                        && parts.base_url_layer != credential_layer,
+                    token,
+                    env_key,
+                }
             })
             .collect();
         config.profiles = profiles
@@ -287,8 +308,11 @@ struct ProviderParts {
     /// URL and a credential that came from the **same** layer: the layers are
     /// not equally trusted (a project layer may be refused by the daemon), and
     /// merging them per field would let a project URL receive a user token.
+    /// The two credential kinds are tracked apart: a higher layer naming
+    /// `env_key` must not keep a lower layer's token (and the reverse).
     base_url_layer: Option<usize>,
-    credential_layer: Option<usize>,
+    token_layer: Option<usize>,
+    env_key_layer: Option<usize>,
 }
 
 #[derive(Default)]
@@ -366,13 +390,13 @@ fn merge_layer(
             );
             set_first_at(
                 &mut parts.token,
-                &mut parts.credential_layer,
+                &mut parts.token_layer,
                 field("experimental_bearer_token"),
                 layer_index,
             );
             set_first_at(
                 &mut parts.env_key,
-                &mut parts.credential_layer,
+                &mut parts.env_key_layer,
                 field("env_key"),
                 layer_index,
             );
@@ -1515,6 +1539,64 @@ mod tests {
             "one layer's URL and token are fine: {outcomes:?}"
         );
         assert_eq!(server.request_count(), 1);
+    }
+
+    /// Issue #908 (gate follow-up): a higher layer that names `env_key` wins the
+    /// credential, and the lower layer's token is **dropped** — never sent to
+    /// the higher layer's URL.
+    #[tokio::test]
+    async fn an_env_key_above_a_token_is_not_sent() {
+        let server = crate::test_http::TestHttpServer::start().await;
+        server.route("GET", "/models", 200, r#"{"data":[{"id":"leak"}]}"#);
+        let result = serde_json::json!({
+            "config": {},
+            "layers": [
+                {
+                    "name": { "type": "project" },
+                    "version": "v1",
+                    "config": {
+                        "model_providers": {
+                            "evil": {
+                                "base_url": server.base_url(),
+                                "env_key": "PROJECT_KEY"
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": { "type": "user" },
+                    "version": "v1",
+                    "config": {
+                        "model_providers": {
+                            "evil": { "experimental_bearer_token": "user-secret" }
+                        }
+                    }
+                }
+            ]
+        });
+        let config = CodexModelConfig::from_read(&result);
+        let evil = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == "evil")
+            .expect("merged");
+        assert!(
+            evil.token.is_none(),
+            "the lower layer's token is dropped when a higher layer names env_key"
+        );
+        assert_eq!(evil.env_key.as_deref(), Some("PROJECT_KEY"));
+        assert!(
+            !evil.mixed_layers,
+            "the URL and the winning credential share a layer"
+        );
+
+        let outcomes = ModelProbes::new().probe_all(&config.providers).await;
+        assert_eq!(
+            outcomes.get("evil"),
+            Some(&ProbeOutcome::EnvKey),
+            "an env_key provider is never dialled"
+        );
+        assert_eq!(server.request_count(), 0, "no request reaches the project URL");
     }
 
     /// Issue #910: the probe cache key is the provider, its URL **and** its

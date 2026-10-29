@@ -469,6 +469,10 @@ pub struct App {
     /// File Viewer callbacks are acknowledged before work begins; hold one
     /// process-local claim per Chat + clicked card until its task and PATCH end.
     viewer_actions_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<(String, String)>>>,
+    /// One confirmed provider switch per session at a time (issue #910 AC4):
+    /// the switch runs detached from the ack, and a replay/double click while
+    /// it runs must answer busy instead of starting a second one.
+    provider_switches_in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Viewer File Message outcomes, so stale callbacks cannot redeliver after
     /// either a confirmed send or an ambiguous timeout.
     viewer_file_transfers_sent:
@@ -563,6 +567,17 @@ fn thread_key_from_value(value: &serde_json::Value) -> crate::config::ThreadKey 
             .unwrap_or("")
             .to_string(),
     )
+}
+
+/// The card for a switch that did not land (issue #910 AC4): the named error,
+/// with the thread and the record left on the pair it still runs.
+fn switch_failure_card(pair: &str, error: &str) -> CardActionResult {
+    CardActionResult {
+        card: Some(crate::feishu::card::picker::build_provider_switch_failed_card(
+            pair, error,
+        )),
+        toast: Some("切换没有生效".to_string()),
+    }
 }
 
 /// Nested-topic rejection (ADR-0006, ADR-0025): a topic can only be created
@@ -1153,6 +1168,23 @@ impl Drop for ViewerActionGuard {
     }
 }
 
+/// Holds the per-session provider-switch claim until the detached switch has
+/// rendered its outcome (issue #910 AC4).
+struct ProviderSwitchGuard {
+    in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    session_id: String,
+}
+
+impl Drop for ProviderSwitchGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        in_flight.remove(&self.session_id);
+    }
+}
+
 /// Blocking filesystem reads cannot be cancelled by their async timeout. Keep
 /// only this many outstanding viewer reads; a timed-out closure holds its slot
 /// until the OS call returns, and later taps fail fast instead of queueing more.
@@ -1554,6 +1586,7 @@ impl App {
             core,
             access,
             viewer_actions_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            provider_switches_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             viewer_file_transfers_sent: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             turn_diff_sends: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             #[cfg(test)]
@@ -1564,6 +1597,22 @@ impl App {
     /// Claim one clicked viewer card until its spawned operation and final card
     /// update complete. The real card message id is supplied by Feishu callback
     /// context; chat scopes it defensively across targets.
+    /// Claim a session's provider switch (issue #910 AC4). `None` means one is
+    /// already running: the caller answers busy rather than starting a second.
+    fn claim_provider_switch(&self, session_id: &str) -> Option<ProviderSwitchGuard> {
+        let mut in_flight = self
+            .provider_switches_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !in_flight.insert(session_id.to_string()) {
+            return None;
+        }
+        Some(ProviderSwitchGuard {
+            in_flight: Arc::clone(&self.provider_switches_in_flight),
+            session_id: session_id.to_string(),
+        })
+    }
+
     fn claim_viewer_action(&self, thread_key: &ThreadKey, message_id: &str) -> Option<ViewerActionGuard> {
         let key = (thread_key.chat_id.clone(), message_id.to_string());
         let mut in_flight = self
@@ -4967,7 +5016,7 @@ impl App {
     /// owner's 「下一轮生效」 — so the click answers synchronously and no work runs
     /// off the ack.
     async fn handle_provider_switch_confirm(
-        &self,
+        self: &Arc<Self>,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
     ) -> Option<CardActionResult> {
@@ -5023,40 +5072,193 @@ impl App {
                 toast: Some("provider 只能在新线程切换".to_string()),
             });
         }
-        let pair = crate::backend::parsing::join_model(&provider, &model);
-        // Record the pair as the session's next-turn model. The same gated,
-        // compare-and-set write a `/model` pick uses, so a concurrent pick (or a
-        // remap, or a materialising session) is an honest refusal, never an
-        // overwrite.
-        // The card named a session: if `/switch` remapped the chat in between,
-        // this is a no-op instead of a record on the new session (issue #910).
-        // A store write only: no catalog read on the ack path (issue #910). The
-        // turn pre-flight resolves the `/think` clear for the recorded pair.
-        let saved = core
-            .record_pair_expecting(&thread_key, Some(&session_id), &pair)
+        // One switch per session at a time (issue #910 AC4): a replay or a
+        // double click while it runs answers busy, never a second switch.
+        let Some(claim) = self.claim_provider_switch(&session_id) else {
+            return Some(CardActionResult {
+                card: None,
+                toast: Some("切换正在进行，请稍候…".to_string()),
+            });
+        };
+        let card_message_id = value
+            .get("open_message_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        // The ack is immediate (ADR-0078's budget): the switch runs detached
+        // and patches this card with its outcome.
+        let app = Arc::clone(self);
+        let task_core = Arc::clone(core);
+        let thread_key = thread_key.clone();
+        let task_session = session_id.clone();
+        let task_provider = provider.clone();
+        let task_model = model.clone();
+        tokio::spawn(async move {
+            let outcome = app
+                .provider_switch_now(
+                    &task_core,
+                    &thread_key,
+                    &task_session,
+                    &task_provider,
+                    &task_model,
+                )
+                .await;
+            // The claim is released only after the card carries the outcome, so
+            // a replay during the slow part of the switch stays busy.
+            if let Some(message_id) = card_message_id
+                && let Some(card) = outcome.card
+                && let Err(error) = app.feishu.update_message(&message_id, &card).await
+            {
+                tracing::warn!("provider switch: card update failed: {error}");
+            }
+            drop(claim);
+        });
+        Some(CardActionResult {
+            card: Some(crate::feishu::card::picker::build_provider_switching_card(
+                &provider, &model,
+            )),
+            toast: Some("切换中…".to_string()),
+        })
+    }
+
+    /// Run one confirmed switch (issue #910 AC4): immediate when the session is
+    /// idle, recorded for the next prompt when a turn is in flight. The switch
+    /// point is held throughout, so no prompt can observe a half-applied pair.
+    async fn provider_switch_now(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        provider: &str,
+        model: &str,
+    ) -> CardActionResult {
+        let pair = crate::backend::parsing::join_model(provider, model);
+        let label = crate::bridge::display::feishu_side_label(thread_key);
+        let switch = core.session_gates.gate(session_id);
+        let _switching = match crate::bridge::session_gates::acquire_switch_bounded(
+            &switch,
+            crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
+        )
+        .await
+        {
+            Ok(guard) => guard,
+            Err(error) => return switch_failure_card(&pair, &error.to_string()),
+        };
+        // Turn admission is read **under the same point** (issue #910 AC4): a
+        // running turn cannot be reloaded mid-stream, so the pair is recorded
+        // and the next prompt's pre-flight applies it before submitting.
+        // (`Turn::start` admits before its pre-flight waits on this point, so a
+        // prompt racing this read either appears here or waits behind it.)
+        let turn_in_flight = core.inflight.lock().await.contains(session_id);
+        if turn_in_flight {
+            return self
+                .record_deferred_pair(core, thread_key, session_id, provider, model, &pair)
+                .await;
+        }
+        // Idle: record first, so a prompt arriving during the switch cannot send
+        // the old model name on the new provider; the record is rolled back if
+        // the switch does not land.
+        let previous = core.session_settings(thread_key).await;
+        let recorded = core
+            .pick_model_expecting(thread_key, Some(session_id), &pair)
             .await;
-        match classify_pick(
-            saved,
-            "Provider",
-            crate::bridge::display::feishu_side_label(&thread_key),
-        ) {
+        let cleared_variant = match classify_pick(recorded, "Provider", label) {
+            PickReply::Applied { cleared_variant } => cleared_variant,
+            PickReply::Failed(text) => {
+                return CardActionResult {
+                    card: Some(crate::feishu::card::picker::build_provider_save_blocked_card(
+                        &pair, &text,
+                    )),
+                    toast: Some(text),
+                };
+            }
+        };
+        let Some(model_info) = crate::backend::parsing::parse_model(&pair) else {
+            return CardActionResult {
+                card: Some(crate::feishu::card::picker::build_provider_save_blocked_card(
+                    &pair,
+                    "模型格式应为 `<provider>/<model>`",
+                )),
+                toast: Some("模型格式应为 `<provider>/<model>`".to_string()),
+            };
+        };
+        match core.client.apply_thread_model(session_id, &model_info).await {
+            Ok(_) => {
+                // Server and mirror moved together inside the point: the
+                // thread now runs the pair and the record is the truth.
+                let extra = cleared_variant
+                    .map(|v| format!("（已清除思考等级 `{v}`）"))
+                    .unwrap_or_default();
+                CardActionResult {
+                    card: Some(crate::feishu::card::picker::build_provider_switched_card(
+                        provider, model,
+                    )),
+                    toast: Some(format!("已切换{extra}")),
+                }
+            }
+            Err(error) => {
+                // The thread kept its pair: restore the record to the pair it
+                // still runs (compare-and-set; a newer pick keeps its own).
+                let (previous_model, previous_variant) = match &previous {
+                    Some(settings) => (settings.model.as_deref(), settings.variant.as_deref()),
+                    None => (None, None),
+                };
+                let recorded_variant = if cleared_variant.is_some() {
+                    None
+                } else {
+                    previous_variant
+                };
+                if let Err(restore) = core
+                    .restore_recorded_pair(
+                        thread_key,
+                        session_id,
+                        &pair,
+                        recorded_variant,
+                        previous_model,
+                        previous_variant,
+                    )
+                    .await
+                {
+                    tracing::warn!("provider switch: the mirror rollback failed for {session_id}: {restore}");
+                }
+                switch_failure_card(&pair, &error.to_string())
+            }
+        }
+    }
+
+    /// The deferred half of AC4: the pair is recorded and the next prompt's
+    /// pre-flight applies it (the shape every confirmation used before the
+    /// hybrid). One gated compare-and-set write; nothing thread-level.
+    async fn record_deferred_pair(
+        &self,
+        core: &Arc<SharedCore>,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        provider: &str,
+        model: &str,
+        pair: &str,
+    ) -> CardActionResult {
+        let label = crate::bridge::display::feishu_side_label(thread_key);
+        let saved = core
+            .record_pair_expecting(thread_key, Some(session_id), pair)
+            .await;
+        match classify_pick(saved, "Provider", label) {
             PickReply::Applied { cleared_variant } => {
                 let extra = cleared_variant
                     .map(|v| format!("（已清除思考等级 `{v}`）"))
                     .unwrap_or_default();
-                Some(CardActionResult {
+                CardActionResult {
                     card: Some(crate::feishu::card::picker::build_provider_recorded_card(
-                        &provider, &model,
+                        provider, model,
                     )),
                     toast: Some(format!("已记录：下一条消息发出前切换{extra}")),
-                })
+                }
             }
-            PickReply::Failed(text) => Some(CardActionResult {
+            PickReply::Failed(text) => CardActionResult {
                 card: Some(crate::feishu::card::picker::build_provider_save_blocked_card(
-                    &pair, &text,
+                    pair, &text,
                 )),
                 toast: Some(text),
-            }),
+            },
         }
     }
 

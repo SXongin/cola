@@ -789,6 +789,13 @@ pub(crate) async fn model_surface(
         // current line to resolve.
         _ => None,
     };
+    // A pair a confirmation recorded but the thread has not run yet (#908):
+    // shown separately from the current line, which is the thread fact. Only a
+    // client with a thread-level provider defers a pair this way.
+    let pending = settings
+        .as_ref()
+        .filter(|_| handles.flow.backend.has_thread_provider())
+        .and_then(|settings| settings.model.as_deref());
     let session_id = settings.as_ref().and_then(|s| s.session_id.as_deref());
     let directory = settings
         .as_ref()
@@ -805,6 +812,7 @@ pub(crate) async fn model_surface(
             session_id,
             directory,
             current,
+            pending,
             scope,
             selected,
             // A card page, not `/think`'s variant lookup: the full surface.

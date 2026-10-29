@@ -425,13 +425,19 @@ fn combined_surface_card(
                 }
                 current_group = option.group.as_deref();
             }
-            elements.push(option_button(
-                thread_key,
-                "model",
-                &picker_option(option),
-                Some(scope_level(scope)),
-                &[],
-            ));
+            if option.disabled {
+                // Same text-row rendering as the single-scope path (issue
+                // #910): a listed-but-unpickable row is never a button.
+                elements.push(markdown_element(&format!("· {}", option.display_label())));
+            } else {
+                elements.push(option_button(
+                    thread_key,
+                    "model",
+                    &picker_option(option),
+                    Some(scope_level(scope)),
+                    &[],
+                ));
+            }
         }
         if let Some(note) = &scope.note {
             elements.push(markdown_element(note));
@@ -656,6 +662,42 @@ pub fn build_provider_recorded_card(provider: &str, model: &str) -> serde_json::
              （释放订阅 → `thread/resume` → 回读校验）。\n\
              如果切换无法生效（别的客户端或另一个共用同一 `CODEX_HOME` 的 cola 实例还持有这条线程），\
              那条消息不会被发送，并会说明原因。"
+        ))],
+    )
+}
+
+/// The immediate ack of a confirmation (issue #910 AC4): the switch runs
+/// detached from the ack and this card is patched with its outcome.
+pub fn build_provider_switching_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "⏳ 正在切换…",
+        "orange",
+        vec![markdown_element(&format!(
+            "正在把这条线程切换到 `{provider}/{model}`：释放订阅 → `thread/resume` → 回读校验。             完成后这张卡片会更新结果。"
+        ))],
+    )
+}
+
+/// The immediate switch landed: the thread and the mirror now run the pair.
+pub fn build_provider_switched_card(provider: &str, model: &str) -> serde_json::Value {
+    card_shell(
+        "✅ 已切换",
+        "green",
+        vec![markdown_element(&format!(
+            "这条线程现在运行 `{provider}/{model}`（`thread/resume` 已成功，并已回读确认）。             其他连在同一条线程上的客户端（Codex TUI / VS Code / 桌面端）也会看到这次变化。"
+        ))],
+    )
+}
+
+/// The immediate switch did not land (issue #910 AC4): the named error, with
+/// the thread left on its previous pair and the record rolled back.
+pub fn build_provider_switch_failed_card(pair: &str, error: &str) -> serde_json::Value {
+    card_shell(
+        "⚠️ 切换没有生效",
+        "orange",
+        vec![markdown_element(&format!(
+            "切换到 `{pair}` 没有生效：{error}。\n\
+             线程保持原来的 provider/model，记录也已恢复；可以关闭占用它的客户端后重试。"
         ))],
     )
 }
@@ -1054,6 +1096,70 @@ mod tests {
             free_text: None,
             intro: None,
         }
+    }
+
+    /// Issue #910 (gate follow-up): the **combined** two-scope card fits most
+    /// Codex surfaces, and it must render a disabled row as text too — never a
+    /// button (that path had its own option loop).
+    #[test]
+    fn a_combined_card_renders_a_disabled_row_as_text() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let surface = surface(
+            None,
+            vec![
+                scope(
+                    "model",
+                    "模型（每轮可换）",
+                    vec![ModelOption {
+                        id: "gpt-5".into(),
+                        value: Some("codex/gpt-5".into()),
+                        ..Default::default()
+                    }],
+                ),
+                provider_scope(
+                    "provider",
+                    "Provider（线程级：新线程 / resume）",
+                    vec![
+                        ModelOption {
+                            id: "openai-fake".into(),
+                            label: Some("OpenAI Fake：gpt-5".into()),
+                            value: Some("gpt-5".into()),
+                            provider: Some("openai-fake".into()),
+                            ..Default::default()
+                        },
+                        ModelOption {
+                            id: "codex".into(),
+                            label: Some("Real Codex：`codex` 是内置目录的保留名，不能在这里选择".into()),
+                            disabled: true,
+                            ..Default::default()
+                        },
+                    ],
+                ),
+            ],
+        );
+        let cards = build_model_surface_cards(&key, &surface, false);
+        assert_eq!(cards.len(), 1, "this surface fits one combined card");
+        let elements = cards[0]["body"]["elements"].as_array().unwrap();
+        let buttons: Vec<String> = elements
+            .iter()
+            .filter(|element| element["tag"] == "button")
+            .map(|element| element.to_string())
+            .collect();
+        assert!(
+            !buttons.iter().any(|button| button.contains("保留名")),
+            "a disabled row is never a button: {buttons:?}"
+        );
+        assert!(
+            buttons.iter().any(|button| button.contains("OpenAI Fake")),
+            "a selectable pair still is one: {buttons:?}"
+        );
+        let text = elements
+            .iter()
+            .filter(|element| element["tag"] == "markdown")
+            .filter_map(|element| element["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("保留名"), "the disabled row is text: {text}");
     }
 
     /// Issue #910: a listed-but-unpickable row (a configured Codex provider
