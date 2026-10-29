@@ -2866,6 +2866,13 @@ async fn render_poll_loop(
     }
 }
 
+/// How long [`RenderPoll::stop`] waits for the poll task before aborting it
+/// (issue #910): a read in flight must not stall the turn's finalization.
+#[cfg(not(test))]
+const RENDER_STOP_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const RENDER_STOP_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// One attempt's incremental renderer: the poll loop plus its stop flag. Owns
 /// the spawn/stop pairing so an attempt cannot leak a running poll loop.
 pub(super) struct RenderPoll {
@@ -2899,13 +2906,68 @@ impl RenderPoll {
 
     pub(super) async fn stop(self) {
         self.done.store(true, Ordering::SeqCst);
-        let _ = self.handle.await;
+        // The loop checks the flag only **between iterations**: a transcript
+        // read the server never answers keeps it — and now the turn handler that
+        // awaits this stop — alive forever (issue #910). Bound the join and
+        // abort a poll that will not come back; the turn's own work is done.
+        let mut handle = self.handle;
+        if tokio::time::timeout(RENDER_STOP_BOUND, &mut handle)
+            .await
+            .is_err()
+        {
+            tracing::debug!("render poll did not stop within {RENDER_STOP_BOUND:?}; aborting it");
+            handle.abort();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #910 (the CI hang): a poll parked in a transcript read must not
+    /// stall `RenderPoll::stop` — and therefore the turn's finalization — when
+    /// the server never answers. The stop is bounded and aborts the task.
+    #[tokio::test]
+    async fn stop_is_bounded_when_the_poll_is_parked_in_a_read() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = MockBackend::new(realistic_parts());
+        let hung = backend.hang_transcript.clone();
+        let (app, _platform) = build_app(cfg, backend).await;
+        app.turn_render_poll_ms
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        seed_entry(
+            &app,
+            crate::config::SessionEntry::new(key.clone(), "ses_test", "/work/cola"),
+        )
+        .await;
+
+        let handles = app.turn_handles();
+        let poll = RenderPoll::spawn(&handles, "ses_test", &key);
+        // The one-shot hang is consumed once the poll's read has started.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while hung.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the poll never reached its transcript read"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(1), poll.stop())
+            .await
+            .expect("stop is bounded even with a parked read");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "stop waited {:?}",
+            started.elapsed()
+        );
+    }
+
     use crate::backend::{
         BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, MessageRole,
         MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput,

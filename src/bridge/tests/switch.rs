@@ -2575,6 +2575,18 @@ async fn a_peer_held_real_codex_thread_stops_the_next_prompt() {
     assert!(text.contains("TUI"), "{text}");
     assert!(text.contains("CODEX_HOME"), "{text}");
     assert!(text.contains("thread/fork"), "{text}");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()))
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "AC6: the failed switch restored the pair the thread still runs"
+    );
 }
 
 /// With the gate at its default (off), a provider pick on a live Codex thread is

@@ -2000,6 +2000,18 @@ impl Backend for CodexClient {
         provider == MODEL_PROVIDER
     }
 
+    /// The ordered thread fact, mapped for the bridge's failed-switch restore
+    /// (issue #910 AC6).
+    fn observed_thread_model(&self, session_id: &str) -> Option<crate::backend::types::ModelInfo> {
+        self.projections
+            .model(session_id)
+            .map(|model| crate::backend::types::ModelInfo {
+                id: model.model_id,
+                provider_id: model.provider_id,
+                variant: model.variant,
+            })
+    }
+
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
     /// bucket is not a channel, so it reads as unknown. A cold projection is
     /// unknown — deciding "is the gate relevant" must not cost a request.
@@ -2061,12 +2073,16 @@ impl Backend for CodexClient {
         // connection last looked, and a success claim ("already" included) is
         // only ever its answer about **both** halves of the pair. Bounded like
         // every other step of a switch.
+        // The stamp is taken **before** the read (issue #910): a
+        // `thread/settings/updated` arriving while the read is in flight is a
+        // newer fact, and the projection drops this stale answer instead of
+        // letting it overwrite the broadcast.
+        let observed = self.projections.next_model_stamp();
         let current = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false))
             .await
             .map_err(|_| switch_step_timeout("thread/read", "无法确认线程当前的 provider/model"))?
             .map_err(client_error)?;
-        self.projections
-            .remember_thread_metadata(&current, self.projections.next_model_stamp());
+        self.projections.remember_thread_metadata(&current, observed);
         let provider_matches = current.model_provider.as_deref() == Some(model.provider_id.as_str());
         let model_matches = current.model.as_deref() == Some(model.id.as_str());
         match (provider_matches, model_matches) {
@@ -2123,10 +2139,11 @@ impl Backend for CodexClient {
         // Step 3: the read is the verdict **and** the cleanup — attempted on
         // every path after the release, even when the resume failed or timed out,
         // so the local view is never left forgotten.
+        let observed = self.projections.next_model_stamp();
         let read = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false)).await;
         if let Ok(Ok(read)) = &read {
-            self.projections
-                .remember_thread_metadata(read, self.projections.next_model_stamp());
+            // The pre-read stamp: a broadcast that arrived meanwhile wins.
+            self.projections.remember_thread_metadata(read, observed);
         }
         // Keep mirroring: the release above ended this connection's consumer.
         // On a failed switch this re-adopts with the thread's stored settings
@@ -7714,6 +7731,75 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Issue #910 (blocking): a `thread/read` whose answer predates a
+    /// `thread/settings/updated` must not overwrite the newer broadcast fact.
+    /// The read's stamp is taken **before** the request, so the projection drops
+    /// the stale reply — a later pick then cannot classify against a provider
+    /// the thread has already left.
+    #[tokio::test]
+    async fn a_stale_thread_read_does_not_overwrite_a_newer_broadcast() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // The switch's first read captures `openai/gpt-5.1-codex` and then
+        // stalls; the same pair is the attempt, so it ends as `Unchanged`.
+        server.set_read_delay(Duration::from_millis(500));
+        let attempt = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
+        let switch = tokio::spawn({
+            let client = client.clone();
+            async move { Backend::apply_thread_model(&client, "thread-1", &attempt).await }
+        });
+
+        // While the read is in flight, a broadcast says a peer moved the thread.
+        server.push_thread_settings("thread-1", "deepseek-v4-pro", "deepseek", None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id)
+                == Some("deepseek".to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the broadcast fact never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The stale read's reply lands now; it must be dropped.
+        let result = switch.await.expect("the call joins");
+        assert!(result.is_ok(), "the same-pair attempt is a no-op: {result:?}");
+        assert_eq!(
+            client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id),
+            Some("deepseek".to_string()),
+            "the stale read never overwrites the newer broadcast"
+        );
     }
 
     /// Issue #910 (blocking): an ambiguous release (the unsubscribe reached the

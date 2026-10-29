@@ -482,6 +482,14 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         false
     }
 
+    /// The thread's own model pair as this client's **cache** knows it (issue
+    /// #910 AC6): after a failed switch the bridge restores the session mirror
+    /// to the pair the thread actually runs. Cache-only, no RPC; `None` means
+    /// unknown (a client without a thread-level axis never needs it).
+    fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
+        None
+    }
+
     /// The thread-level provider this client's **own cache** holds for the
     /// session, when it knows one (Codex's ordered thread fact). Cache-only: no
     /// RPC, so a card callback can decide "is the gate even relevant here"
