@@ -692,6 +692,14 @@ pub(crate) async fn send_model_card(
     thread_key: &ThreadKey,
     message_id: &str,
 ) -> Result<()> {
+    // A client can be lazy (Codex attaches or starts its daemon on demand), and
+    // the catalog/config the card needs are unreachable before that pass: the
+    // card would render "no models" on a brand-new chat. `/model` is a demand
+    // path like a prompt, so run the client-owned ensure pass first; a failure
+    // is best-effort and the surface then carries the unattached note.
+    if let Err(error) = crate::bridge::pollers::ensure_server(&handles.flow).await {
+        tracing::debug!("the model card's ensure-attached pass failed (best-effort): {error}");
+    }
     let surface = model_surface(handles, thread_key, None, None, None).await;
     let cards = super::picker::build_model_surface_cards(thread_key, &surface, false);
     for card in cards {
