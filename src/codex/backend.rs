@@ -821,15 +821,23 @@ impl Projections {
     /// Forget a dead subscription so the next read adopts again, and state the
     /// gap on the retained history: a later read must not present stale state
     /// as current.
+    ///
+    /// The thread's **model fact** dies with the subscription too (issue #910):
+    /// once nothing observes `thread/settings/updated`, another client may have
+    /// changed the provider, so the cached pair can no longer classify a pick as
+    /// per-turn — a stale `opencode-go` would send a model to the peer's real
+    /// provider without confirmation. Unknown is the safe answer; the next read
+    /// re-learns the pair.
     pub(crate) fn forget(&self, thread_id: &str) {
         self.states
             .lock()
             .expect("codex subscription states")
             .remove(thread_id);
-        self.projection(thread_id)
-            .lock()
-            .expect("codex projection")
-            .mark_incomplete();
+        let projection = self.projection(thread_id);
+        let mut projection = projection.lock().expect("codex projection");
+        projection.forget_model();
+        projection.mark_incomplete();
+        drop(projection);
         self.notify_ready(thread_id);
     }
 }
@@ -8113,6 +8121,58 @@ mod tests {
                 .await
                 .unwrap(),
             crate::backend::types::ModelPickRoute::PerTurn
+        );
+    }
+
+    /// Ordinary subscription loss invalidates the model fact too: while cola
+    /// holds no subscription, a peer may move the thread, so a cached provider
+    /// must not classify a pick as per-turn and send its model to the peer's
+    /// real provider (issue #910).
+    #[tokio::test]
+    async fn an_ordinary_subscription_loss_forgets_the_provider_fact() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        assert_eq!(
+            client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id),
+            Some("openai".to_string())
+        );
+
+        client.projections.forget("thread-1");
+
+        assert_eq!(
+            client.projections.model("thread-1"),
+            None,
+            "a dead subscription leaves the provider unknown, not stale"
+        );
+        assert_eq!(
+            Backend::known_thread_provider(&client, "thread-1").await,
+            None,
+            "no cached provider survives the subscription"
+        );
+
+        // While cola was unsubscribed, a peer moved the thread to `deepseek`.
+        // A pick for the old `openai` pair must be the thread-level path (and
+        // therefore a confirmation), never a per-turn send to `deepseek`.
+        server.set_thread_model("thread-1", Some("deepseek-v4-pro"), Some("deepseek"));
+        let stale = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
+        assert_eq!(
+            Backend::model_pick_route(&client, "thread-1", &stale)
+                .await
+                .unwrap(),
+            crate::backend::types::ModelPickRoute::ThreadModel,
+            "the peer's provider must not accept the stale pair as per-turn"
         );
     }
 
