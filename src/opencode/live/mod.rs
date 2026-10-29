@@ -971,7 +971,7 @@ async fn live_v2_scripted_selection_chain() {
     let pick_backend = std::sync::Arc::new(backend.clone()) as std::sync::Arc<dyn crate::backend::Backend>;
 
     let outcome = sessions
-        .pick_model_expecting(&pick_backend, &key, None, provider::MODEL_ALT_REF)
+        .pick_model_expecting(&pick_backend, &key, None, provider::MODEL_ALT_REF, None)
         .await
         .unwrap_or_else(|error| panic!("pick_model failed: {error}\n{}", server.stderr()));
     assert_eq!(
@@ -1014,7 +1014,7 @@ async fn live_v2_scripted_selection_chain() {
     );
 
     let outcome = sessions
-        .pick_model_expecting(&pick_backend, &key, None, provider::MODEL_REF)
+        .pick_model_expecting(&pick_backend, &key, None, provider::MODEL_REF, None)
         .await
         .unwrap_or_else(|error| panic!("pick_model failed: {error}\n{}", server.stderr()));
     assert_eq!(

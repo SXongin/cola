@@ -198,6 +198,31 @@ fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome
     }
 }
 
+/// Settle a mirror write's deferred receipt inside the card click's budget
+/// (ADR-0089), reported exactly like [`SessionsHandle::declare_pending_until`]
+/// reports its own: a failed write is the caller's "保存失败", and a write that
+/// outlived the deadline **still lands** — the mutation is already in memory, so
+/// the pick answers normally and only a warning records the slow save (never a
+/// claimed durable save; the writer settles it, or retries nothing is lost).
+async fn settle_mirror(
+    outcome: crate::bridge::session::MirrorWriteOutcome,
+    deadline: Option<tokio::time::Instant>,
+) -> crate::error::Result<crate::bridge::session::PairWrite> {
+    if let (Some(receipt), Some(deadline)) = (outcome.deferred, deadline) {
+        match receipt.settle_until(deadline).await {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return Err(error.into()),
+            None => {
+                // The write outlived the callback's bound; it still lands. The
+                // pair is already in memory, so the next message uses it even
+                // though the click's confirmation raced the file.
+                tracing::warn!("mirror write still in flight at the card deadline");
+            }
+        }
+    }
+    Ok(outcome.written)
+}
+
 /// What a `/model` pick's write must still find (issue #910). The decision
 /// classifies a target once; the write re-verifies it, so a `/switch` or a
 /// `/new` between the two is an honest refusal instead of a record on a target
@@ -826,6 +851,7 @@ impl SessionsHandle {
         expected_epoch: u64,
         provider: &str,
         model_spec: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
         // The snapshot is only the **compare-and-set** precondition and the
         // input to the variant lookup; no state is written from it.
@@ -860,14 +886,18 @@ impl SessionsHandle {
                 clear_variant: cleared.as_deref(),
             }
         };
-        let written = self.store.lock().await.set_mirror_pending(
-            thread_key,
-            expected_epoch,
-            settings.model.as_deref(),
-            settings.variant.as_deref(),
-            write,
-        )?;
-        Ok(match written {
+        let outcome = {
+            let mut store = self.store.lock().await;
+            store.set_mirror_pending(
+                thread_key,
+                expected_epoch,
+                settings.model.as_deref(),
+                settings.variant.as_deref(),
+                write,
+                deadline,
+            )?
+        };
+        Ok(match settle_mirror(outcome, deadline).await? {
             crate::bridge::session::PairWrite::Applied { cleared_variant } => {
                 PickOutcome::Applied { cleared_variant }
             }
@@ -1081,16 +1111,22 @@ impl SessionsHandle {
         session_id: &str,
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<()> {
         let gate = self.session_gates.gate(session_id);
         let _held = gate.enter().await;
-        self.store.lock().await.set_mirror_live(
-            thread_key,
-            session_id,
-            expected_model,
-            expected_variant,
-            crate::bridge::session::MirrorWrite::Forget,
-        )?;
+        let outcome = {
+            let mut store = self.store.lock().await;
+            store.set_mirror_live(
+                thread_key,
+                session_id,
+                expected_model,
+                expected_variant,
+                crate::bridge::session::MirrorWrite::Forget,
+                deadline,
+            )?
+        };
+        settle_mirror(outcome, deadline).await?;
         Ok(())
     }
 
@@ -1161,6 +1197,7 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         model_spec: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
         use crate::bridge::session::MirrorWrite;
         let Some((snapshot, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
@@ -1182,17 +1219,21 @@ impl SessionsHandle {
             let cleared = self
                 .clear_variant_for_model(backend, &mut probe, model_spec)
                 .await;
-            let written = self.store.lock().await.set_mirror_pending(
-                thread_key,
-                expected_epoch,
-                snapshot.model.as_deref(),
-                snapshot.variant.as_deref(),
-                MirrorWrite::Model {
-                    model: model_spec,
-                    clear_variant: cleared.as_deref(),
-                },
-            )?;
-            return Ok(pair_write_outcome(written));
+            let outcome = {
+                let mut store = self.store.lock().await;
+                store.set_mirror_pending(
+                    thread_key,
+                    expected_epoch,
+                    snapshot.model.as_deref(),
+                    snapshot.variant.as_deref(),
+                    MirrorWrite::Model {
+                        model: model_spec,
+                        clear_variant: cleared.as_deref(),
+                    },
+                    deadline,
+                )?
+            };
+            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
         };
         if !backend.keeps_session_selection() {
             // V1: the mirror is the whole decision. The clear is a catalog read
@@ -1213,17 +1254,21 @@ impl SessionsHandle {
             {
                 return Ok(PickOutcome::StateChanged);
             }
-            let written = self.store.lock().await.set_mirror_live(
-                thread_key,
-                &session_id,
-                snapshot.model.as_deref(),
-                snapshot.variant.as_deref(),
-                MirrorWrite::Model {
-                    model: model_spec,
-                    clear_variant: cleared.as_deref(),
-                },
-            )?;
-            return Ok(pair_write_outcome(written));
+            let outcome = {
+                let mut store = self.store.lock().await;
+                store.set_mirror_live(
+                    thread_key,
+                    &session_id,
+                    snapshot.model.as_deref(),
+                    snapshot.variant.as_deref(),
+                    MirrorWrite::Model {
+                        model: model_spec,
+                        clear_variant: cleared.as_deref(),
+                    },
+                    deadline,
+                )?
+            };
+            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
         }
         // A durable generation's selection is server state (V2): the selection
         // read, the `/think` clear and `switch_session_model` are RPCs, and they
@@ -1294,6 +1339,7 @@ impl SessionsHandle {
                         &session_id,
                         base.model.as_deref(),
                         base.variant.as_deref(),
+                        deadline,
                     )
                     .await?;
                     return Err(crate::error::BridgeError::State(format!(
@@ -1316,16 +1362,21 @@ impl SessionsHandle {
             {
                 return Ok(PickOutcome::StateChanged);
             }
-            self.store.lock().await.set_mirror_live(
-                thread_key,
-                &session_id,
-                base.model.as_deref(),
-                base.variant.as_deref(),
-                MirrorWrite::ModelWithVariant {
-                    model: model_spec,
-                    variant: variant.as_deref(),
-                },
-            )?
+            let outcome = {
+                let mut store = self.store.lock().await;
+                store.set_mirror_live(
+                    thread_key,
+                    &session_id,
+                    base.model.as_deref(),
+                    base.variant.as_deref(),
+                    MirrorWrite::ModelWithVariant {
+                        model: model_spec,
+                        variant: variant.as_deref(),
+                    },
+                    deadline,
+                )?
+            };
+            settle_mirror(outcome, deadline).await?
         };
         Ok(match pair_write_outcome(written) {
             // A durable generation's clear happens on the session (the write
@@ -1395,13 +1446,19 @@ impl SessionsHandle {
             },
             None => MirrorWrite::Forget,
         };
-        let written = self.store.lock().await.set_mirror_live(
-            thread_key,
-            session_id,
-            Some(expected_model),
-            expected_variant,
-            write,
-        )?;
+        let written = self
+            .store
+            .lock()
+            .await
+            .set_mirror_live(
+                thread_key,
+                session_id,
+                Some(expected_model),
+                expected_variant,
+                write,
+                None,
+            )?
+            .written;
         Ok(matches!(
             written,
             crate::bridge::session::PairWrite::Applied { .. }
@@ -1422,6 +1479,7 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         model_spec: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
         use crate::bridge::session::MirrorWrite;
         let Some((snapshot, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
@@ -1433,17 +1491,21 @@ impl SessionsHandle {
             return Ok(PickOutcome::StateChanged);
         }
         let Some(session_id) = snapshot.session_id.clone() else {
-            let written = self.store.lock().await.set_mirror_pending(
-                thread_key,
-                pending_epoch.unwrap_or_default(),
-                snapshot.model.as_deref(),
-                snapshot.variant.as_deref(),
-                MirrorWrite::Model {
-                    model: model_spec,
-                    clear_variant: None,
-                },
-            )?;
-            return Ok(pair_write_outcome(written));
+            let outcome = {
+                let mut store = self.store.lock().await;
+                store.set_mirror_pending(
+                    thread_key,
+                    pending_epoch.unwrap_or_default(),
+                    snapshot.model.as_deref(),
+                    snapshot.variant.as_deref(),
+                    MirrorWrite::Model {
+                        model: model_spec,
+                        clear_variant: None,
+                    },
+                    deadline,
+                )?
+            };
+            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
         };
         let gate = self.session_gates.gate(&session_id);
         let _held = gate.enter().await;
@@ -1456,14 +1518,18 @@ impl SessionsHandle {
         {
             return Ok(PickOutcome::StateChanged);
         }
-        let written = self.store.lock().await.set_mirror_live(
-            thread_key,
-            &session_id,
-            snapshot.model.as_deref(),
-            snapshot.variant.as_deref(),
-            MirrorWrite::ProviderSwitch { model: model_spec },
-        )?;
-        Ok(pair_write_outcome(written))
+        let outcome = {
+            let mut store = self.store.lock().await;
+            store.set_mirror_live(
+                thread_key,
+                &session_id,
+                snapshot.model.as_deref(),
+                snapshot.variant.as_deref(),
+                MirrorWrite::ProviderSwitch { model: model_spec },
+                deadline,
+            )?
+        };
+        Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?))
     }
 
     /// Clear the `/think` variant of a recorded pair, compare-and-set on the
@@ -1480,13 +1546,18 @@ impl SessionsHandle {
         let gate = self.session_gates.gate(session_id);
         let _held = gate.enter().await;
         matches!(
-            self.store.lock().await.set_mirror_live(
-                thread_key,
-                session_id,
-                Some(expected_model),
-                expected_variant,
-                crate::bridge::session::MirrorWrite::Variant(None),
-            ),
+            self.store
+                .lock()
+                .await
+                .set_mirror_live(
+                    thread_key,
+                    session_id,
+                    Some(expected_model),
+                    expected_variant,
+                    crate::bridge::session::MirrorWrite::Variant(None),
+                    None,
+                )
+                .map(|outcome| outcome.written),
             Ok(crate::bridge::session::PairWrite::Applied { .. })
         )
     }
@@ -1508,13 +1579,19 @@ impl SessionsHandle {
             return Ok(PickOutcome::NoTarget);
         };
         let Some(session_id) = snapshot.session_id.clone() else {
-            let written = self.store.lock().await.set_mirror_pending(
-                thread_key,
-                pending_epoch.unwrap_or_default(),
-                snapshot.model.as_deref(),
-                snapshot.variant.as_deref(),
-                MirrorWrite::Variant(variant.as_deref()),
-            )?;
+            let written = self
+                .store
+                .lock()
+                .await
+                .set_mirror_pending(
+                    thread_key,
+                    pending_epoch.unwrap_or_default(),
+                    snapshot.model.as_deref(),
+                    snapshot.variant.as_deref(),
+                    MirrorWrite::Variant(variant.as_deref()),
+                    None,
+                )?
+                .written;
             return Ok(pair_write_outcome(written));
         };
         if backend.keeps_session_selection() {
@@ -1573,6 +1650,7 @@ impl SessionsHandle {
                             &session_id,
                             base.model.as_deref(),
                             base.variant.as_deref(),
+                            None,
                         )
                         .await?;
                         return Err(crate::error::BridgeError::State(
@@ -1585,13 +1663,18 @@ impl SessionsHandle {
             }
             let written = {
                 let _held = switch.enter().await;
-                self.store.lock().await.set_mirror_live(
-                    thread_key,
-                    &session_id,
-                    base.model.as_deref(),
-                    base.variant.as_deref(),
-                    MirrorWrite::Variant(variant.as_deref()),
-                )?
+                self.store
+                    .lock()
+                    .await
+                    .set_mirror_live(
+                        thread_key,
+                        &session_id,
+                        base.model.as_deref(),
+                        base.variant.as_deref(),
+                        MirrorWrite::Variant(variant.as_deref()),
+                        None,
+                    )?
+                    .written
             };
             return Ok(pair_write_outcome(written));
         }
@@ -1606,13 +1689,19 @@ impl SessionsHandle {
         {
             return Ok(PickOutcome::StateChanged);
         }
-        let written = self.store.lock().await.set_mirror_live(
-            thread_key,
-            &session_id,
-            snapshot.model.as_deref(),
-            snapshot.variant.as_deref(),
-            MirrorWrite::Variant(variant.as_deref()),
-        )?;
+        let written = self
+            .store
+            .lock()
+            .await
+            .set_mirror_live(
+                thread_key,
+                &session_id,
+                snapshot.model.as_deref(),
+                snapshot.variant.as_deref(),
+                MirrorWrite::Variant(variant.as_deref()),
+                None,
+            )?
+            .written;
         Ok(pair_write_outcome(written))
     }
 

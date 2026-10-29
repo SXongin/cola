@@ -654,9 +654,10 @@ impl SharedCore {
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         model_spec: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .record_pair_expecting(thread_key, expected_session, model_spec)
+            .record_pair_expecting(thread_key, expected_session, model_spec, deadline)
             .await
     }
 
@@ -742,9 +743,10 @@ impl SharedCore {
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         model_spec: &str,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .pick_model_expecting(&self.client, thread_key, expected_session, model_spec)
+            .pick_model_expecting(&self.client, thread_key, expected_session, model_spec, deadline)
             .await
     }
 

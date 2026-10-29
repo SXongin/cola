@@ -118,3 +118,33 @@ exactly that wall.
   commits a pending whose confirmation is gone.
 - A deferred caller that abandons its receipt abandons the error with it. That
   is the price of the bound, and it is the caller's choice, not the store's.
+
+## Amendment (2026-10-30, #910): the model-mirror writes defer too
+
+The three pending-declaration callbacks were not the only card paths writing the
+store: a `/model` pick and the provider-switch confirmation also persist the
+per-thread model mirror, and they waited on the writer with no bound either.
+`SessionStore::set_mirror_live` / `set_mirror_pending` now take the same
+optional deadline (`write_to_disk_deferred`'s receipt), so:
+
+- **a card click defers.** The pick handlers (`pick_model_expecting`,
+  `pick_pending_pair`, `record_pair_expecting`, and the durable pick's
+  forget-on-failure) pass the click's store deadline — the same
+  `handler::CARD_STORE_BUDGET` that starts when the callback is entered — and
+  settle the receipt inside it.
+- **the turn pre-flight blocks.** The AC6 restore and the `/think` settle run
+  with no deadline: a prompt can afford the wait, and it must observe the write
+  before it submits.
+- **the compare-and-set is unchanged.** A refused write (moved, changed,
+  creating) returns before any save, exactly as before.
+- **a missed settle is a warning, not a claim.** The mutation is in memory, so
+  the pick answers normally; the file lands when the writer drains it, and the
+  click never says the save was durable. A write that *failed* settles as the
+  caller's save failure, as the blocking path did.
+
+The verification: a paused writer leaves the pick and the confirm inside
+`CARD_ACK_BUDGET` with the pair visible in memory and the file catching up on
+release (`a_stalled_writer_does_not_stall_a_model_pick_callback`,
+`a_stalled_writer_does_not_stall_a_provider_switch_confirm`), and a mirror write
+without a deadline does not return until the file has it
+(`a_mirror_write_without_a_deadline_blocks_until_the_file_has_it`).

@@ -303,6 +303,24 @@ fn apply_mirror_write(
     }
 }
 
+/// A mirror write's outcome (issue #910): the compare-and-set verdict and, for
+/// a **card callback**, the deferred save receipt it settles within its budget
+/// (ADR-0089). The mutation is in memory either way.
+pub(crate) struct MirrorWriteOutcome {
+    pub(crate) written: PairWrite,
+    pub(crate) deferred: Option<crate::bridge::store_writer::DeferredWrite>,
+}
+
+impl MirrorWriteOutcome {
+    /// No mutation happened: the CAS refused.
+    fn refused(written: PairWrite) -> Self {
+        Self {
+            written,
+            deferred: None,
+        }
+    }
+}
+
 /// What claiming a thread's Pending Session for materialisation found.
 pub(crate) enum PendingClaim {
     /// Claimed, with the snapshot the creation will use and the claim's
@@ -571,6 +589,22 @@ impl SessionStore {
             .is_some_and(|claim| claim.generation == generation)
     }
 
+    /// Persist a just-applied mirror write: blocking for a caller that can
+    /// afford the wait (a turn's pre-flight), deferred with a receipt for a card
+    /// callback (ADR-0089), which settles it within its own budget.
+    fn save_mirror(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::error::Result<Option<crate::bridge::store_writer::DeferredWrite>> {
+        match deadline {
+            Some(_) => Ok(Some(self.write_to_disk_deferred()?)),
+            None => {
+                self.write_to_disk()?;
+                Ok(None)
+            }
+        }
+    }
+
     /// The thread's current Pending Session identity (issue #910): `0` when it
     /// has none and none was ever declared since load.
     /// Whether the recorded pair was confirmed for a thread-level switch
@@ -749,28 +783,29 @@ impl SessionStore {
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
         write: MirrorWrite<'_>,
-    ) -> crate::error::Result<PairWrite> {
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::error::Result<MirrorWriteOutcome> {
         // A claimed (materialising) pending cannot take a write: the creation
         // already snapshotted it, so claiming success here would lie.
         if self.creating.contains_key(key) {
-            return Ok(PairWrite::Creating);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Creating));
         }
         let epoch_now = self.pending_epoch_for(key);
         let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
             // Materialised (or cleared) while the caller awaited its lookup:
             // never fall through to the live entry, whose thread was created
             // with the state the write could not reach.
-            return Ok(PairWrite::Moved);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
         };
         // The pick classified a **specific** pending: `/new` (or another
         // declaration) has a different identity, and a stale pair must never
         // land on it — even when its model/variant happen to match, which they
         // commonly do on a fresh pending (issue #910).
         if epoch_now != expected_epoch {
-            return Ok(PairWrite::Changed);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
         }
         if pending.model.as_deref() != expected_model || pending.variant.as_deref() != expected_variant {
-            return Ok(PairWrite::Changed);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
         }
         let mut pending_confirmed = false;
         let cleared_variant = apply_mirror_write(
@@ -782,8 +817,11 @@ impl SessionStore {
         if let MirrorWrite::Pair { provider, .. } = write {
             pending.provider = Some(provider.to_string());
         }
-        self.write_to_disk()?;
-        Ok(PairWrite::Applied { cleared_variant })
+        let deferred = self.save_mirror(deadline)?;
+        Ok(MirrorWriteOutcome {
+            written: PairWrite::Applied { cleared_variant },
+            deferred,
+        })
     }
 
     /// Write a model/provider mirror change onto a **live** entry (issue #910),
@@ -800,23 +838,24 @@ impl SessionStore {
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
         write: MirrorWrite<'_>,
-    ) -> crate::error::Result<PairWrite> {
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::error::Result<MirrorWriteOutcome> {
         let client_id = self.client_id.clone();
         if self.pending_for(key).is_some() {
-            return Ok(PairWrite::Moved);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
         }
         let Some(entry) = self
             .entries_mut()
             .iter_mut()
             .find(|e| e.client_id == client_id && e.session_id == session_id)
         else {
-            return Ok(PairWrite::Moved);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
         };
         if &entry.thread_key != key {
-            return Ok(PairWrite::Moved);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
         }
         if entry.model.as_deref() != expected_model || entry.variant.as_deref() != expected_variant {
-            return Ok(PairWrite::Changed);
+            return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
         }
         let cleared_variant = apply_mirror_write(
             &mut entry.model,
@@ -824,8 +863,11 @@ impl SessionStore {
             &mut entry.provider_switch_confirmed,
             write,
         );
-        self.write_to_disk()?;
-        Ok(PairWrite::Applied { cleared_variant })
+        let deferred = self.save_mirror(deadline)?;
+        Ok(MirrorWriteOutcome {
+            written: PairWrite::Applied { cleared_variant },
+            deferred,
+        })
     }
 
     /// Claim the thread's Pending Session for materialisation, taking the
@@ -1866,8 +1908,10 @@ mod tests {
                         provider: "deepseek",
                         clear_variant: None
                     },
+                    None
                 )
-                .unwrap(),
+                .unwrap()
+                .written,
             PairWrite::Changed
         );
         // While the pending exists, the pair lands and the CAS clear applies.
@@ -1882,8 +1926,10 @@ mod tests {
                     provider: "deepseek",
                     clear_variant: Some("high"),
                 },
+                None,
             )
-            .unwrap();
+            .unwrap()
+            .written;
         assert_eq!(
             written,
             PairWrite::Applied {
@@ -1912,8 +1958,10 @@ mod tests {
                         model: "openai/x",
                         clear_variant: None
                     },
+                    None
                 )
-                .unwrap(),
+                .unwrap()
+                .written,
             PairWrite::Creating
         );
         let claim = store
@@ -1936,8 +1984,10 @@ mod tests {
                         model: "deepseek/pro",
                         clear_variant: None
                     },
+                    None
                 )
-                .unwrap(),
+                .unwrap()
+                .written,
             PairWrite::Moved
         );
         assert_eq!(
@@ -2101,8 +2151,9 @@ mod tests {
         let pair = |model: &'static str| MirrorWrite::ProviderSwitch { model };
         assert!(matches!(
             store
-                .set_mirror_live(&key, "ses_1", None, None, pair("deepseek/pro"))
-                .unwrap(),
+                .set_mirror_live(&key, "ses_1", None, None, pair("deepseek/pro"), None)
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(
@@ -2118,9 +2169,11 @@ mod tests {
                     "ses_1",
                     Some("deepseek/pro"),
                     None,
-                    MirrorWrite::Variant(Some("high"))
+                    MirrorWrite::Variant(Some("high")),
+                    None
                 )
-                .unwrap(),
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(store.provider_switch_confirmed("ses_1"));
@@ -2137,8 +2190,10 @@ mod tests {
                         model: "deepseek/pro2",
                         clear_variant: Some("high"),
                     },
+                    None
                 )
-                .unwrap(),
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(
@@ -2149,8 +2204,16 @@ mod tests {
         // A durable pick and a forget clear it too.
         assert!(matches!(
             store
-                .set_mirror_live(&key, "ses_1", Some("deepseek/pro2"), None, pair("deepseek/pro3"))
-                .unwrap(),
+                .set_mirror_live(
+                    &key,
+                    "ses_1",
+                    Some("deepseek/pro2"),
+                    None,
+                    pair("deepseek/pro3"),
+                    None
+                )
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(store.provider_switch_confirmed("ses_1"));
@@ -2165,21 +2228,39 @@ mod tests {
                         model: "deepseek/pro4",
                         variant: None,
                     },
+                    None
                 )
-                .unwrap(),
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(!store.provider_switch_confirmed("ses_1"));
         assert!(matches!(
             store
-                .set_mirror_live(&key, "ses_1", Some("deepseek/pro4"), None, pair("deepseek/pro5"))
-                .unwrap(),
+                .set_mirror_live(
+                    &key,
+                    "ses_1",
+                    Some("deepseek/pro4"),
+                    None,
+                    pair("deepseek/pro5"),
+                    None
+                )
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(matches!(
             store
-                .set_mirror_live(&key, "ses_1", Some("deepseek/pro5"), None, MirrorWrite::Forget)
-                .unwrap(),
+                .set_mirror_live(
+                    &key,
+                    "ses_1",
+                    Some("deepseek/pro5"),
+                    None,
+                    MirrorWrite::Forget,
+                    None
+                )
+                .unwrap()
+                .written,
             PairWrite::Applied { .. }
         ));
         assert!(!store.provider_switch_confirmed("ses_1"));
@@ -2394,6 +2475,64 @@ mod tests {
             .unwrap()
             .expect("the mutation is inside the deadline");
         assert!(receipt.settle().await.is_err());
+    }
+
+    /// Issue #910: a mirror write with **no** deadline is the pre-flight's —
+    /// blocking, so it returns only once the file carries the pair. A card
+    /// callback's write instead hands back a receipt it settles on its own
+    /// budget (ADR-0089), which is why a stalled disk answers nothing here.
+    #[tokio::test]
+    async fn a_mirror_write_without_a_deadline_blocks_until_the_file_has_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        store
+            .activate(make_entry("chat1", "root1", "ses_1", "/tmp/one"))
+            .unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let pause = store.pause_writes().unwrap();
+        pause.hold();
+
+        let (done, written) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = store.set_mirror_live(
+                &key,
+                "ses_1",
+                None,
+                None,
+                MirrorWrite::ProviderSwitch {
+                    model: "deepseek/pro",
+                },
+                None,
+            );
+            let _ = done.send(outcome.map(|outcome| outcome.written));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            written.try_recv().is_err(),
+            "a pre-flight write waits for the file instead of returning a receipt"
+        );
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains("deepseek/pro"),
+            "the pair must not be reported durable before it is"
+        );
+
+        pause.release();
+        let outcome = written
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the blocking write returns once released");
+        assert!(
+            matches!(outcome.unwrap(), PairWrite::Applied { .. }),
+            "the write applied"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains("deepseek/pro"),
+            "the blocking write is on disk when it returns"
+        );
     }
 
     /// Handing a snapshot over never blocks, so a newer one replaces an older

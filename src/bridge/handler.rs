@@ -2929,7 +2929,10 @@ impl App {
                 // A provider switch is a two-step click (issue #910): the
                 // confirmation card's own tags land here. 取消 is a no-op — it
                 // answers the ack and leaves the thread exactly as it was.
-                "model_provider_confirm" => self.handle_provider_switch_confirm(&self.core, &value).await,
+                "model_provider_confirm" => {
+                    self.handle_provider_switch_confirm(&self.core, &value, deadline)
+                        .await
+                }
                 "model_provider_cancel" => Some(CardActionResult {
                     card: None,
                     toast: None,
@@ -4745,6 +4748,9 @@ impl App {
         // dispatch already spent part of the budget. The current-selection
         // ladder and the backend read are charged against what is left.
         let deadline = callback_started + crate::feishu::ws::CARD_ACK_BUDGET;
+        // The mirror writes settle on the store budget (ADR-0089): a stalled
+        // writer must not hold this callback past the ack.
+        let store_deadline = callback_started + CARD_STORE_BUDGET;
         let thread_key = thread_key_from_value(value);
         let picked = value
             .get("value")
@@ -4788,10 +4794,16 @@ impl App {
             .and_then(|v| v.as_str())
             .filter(|provider| !provider.is_empty());
         if let Some(provider) = paired {
-            return Some(self.pick_paired_model(core, &thread_key, provider, &picked).await);
+            return Some(
+                self.pick_paired_model(core, &thread_key, provider, &picked, store_deadline)
+                    .await,
+            );
         }
 
-        Some(self.pick_model_ref(core, &thread_key, None, &picked).await)
+        Some(
+            self.pick_model_ref(core, &thread_key, None, &picked, store_deadline)
+                .await,
+        )
     }
 
     /// A concrete **model-only** pick: record the override (and on a durable
@@ -4804,6 +4816,7 @@ impl App {
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         picked: &str,
+        deadline: tokio::time::Instant,
     ) -> CardActionResult {
         if crate::backend::parsing::parse_model(picked).is_none() {
             return CardActionResult {
@@ -4812,7 +4825,7 @@ impl App {
             };
         }
         let cleared_variant = match classify_pick(
-            core.pick_model_expecting(thread_key, expected_session, picked)
+            core.pick_model_expecting(thread_key, expected_session, picked, Some(deadline))
                 .await,
             "模型",
             crate::bridge::display::feishu_side_label(thread_key),
@@ -4846,6 +4859,7 @@ impl App {
         thread_key: &ThreadKey,
         provider: &str,
         model: &str,
+        deadline: tokio::time::Instant,
     ) -> CardActionResult {
         if model.trim().is_empty() {
             // The pair is what makes the switch safe: the old model name on a
@@ -4883,6 +4897,7 @@ impl App {
                     pending_epoch.unwrap_or_default(),
                     provider,
                     &spec,
+                    deadline,
                 )
                 .await;
         }
@@ -4897,14 +4912,14 @@ impl App {
         {
             ModelPickDecision::Record { target } => match target {
                 PickTarget::Live(session_id) => {
-                    self.pick_model_ref(core, thread_key, Some(&session_id), &spec)
+                    self.pick_model_ref(core, thread_key, Some(&session_id), &spec, deadline)
                         .await
                 }
                 // The thread became a Pending Session while the pick was
                 // classified: record the pair (its provider is a creation
                 // fact), never a model-only write that drops it.
                 PickTarget::Pending(epoch) => {
-                    self.save_pending_pair(core, thread_key, epoch, provider, &spec)
+                    self.save_pending_pair(core, thread_key, epoch, provider, &spec, deadline)
                         .await
                 }
             },
@@ -4943,12 +4958,20 @@ impl App {
         expected_epoch: u64,
         provider: &str,
         spec: &str,
+        deadline: tokio::time::Instant,
     ) -> CardActionResult {
         // One write for both halves: a partial pair would be applied at thread
         // creation, and the model is what makes the provider safe (issue #910).
         match core
             .sessions_handle()
-            .pick_pending_pair(&core.client, thread_key, expected_epoch, provider, spec)
+            .pick_pending_pair(
+                &core.client,
+                thread_key,
+                expected_epoch,
+                provider,
+                spec,
+                Some(deadline),
+            )
             .await
         {
             Ok(PickOutcome::Applied { cleared_variant }) => CardActionResult {
@@ -4991,6 +5014,7 @@ impl App {
         &self,
         core: &Arc<SharedCore>,
         value: &serde_json::Value,
+        deadline: tokio::time::Instant,
     ) -> Option<CardActionResult> {
         let provider = value
             .get("provider")
@@ -5054,7 +5078,7 @@ impl App {
         // A store write only: no catalog read on the ack path (issue #910). The
         // turn pre-flight resolves the `/think` clear for the recorded pair.
         let saved = core
-            .record_pair_expecting(&thread_key, Some(&session_id), &pair)
+            .record_pair_expecting(&thread_key, Some(&session_id), &pair, Some(deadline))
             .await;
         match classify_pick(
             saved,

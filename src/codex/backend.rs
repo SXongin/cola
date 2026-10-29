@@ -2778,7 +2778,7 @@ impl Backend for CodexClient {
         if let Some(model) = &thread_model
             && model.provider_id != MODEL_PROVIDER
         {
-            let reference = format!("{}/{}", model.provider_id, model.model_id);
+            let reference = crate::backend::parsing::join_model(&model.provider_id, &model.model_id);
             // The thread read carries no `/think` level; the resolved selection
             // does (`provider/model@variant`). Compose the label from the thread's
             // pair plus that level when it names this **model** — the resolved ref
@@ -5382,7 +5382,8 @@ mod tests {
             .expect("the provider drill");
         assert_eq!(drill.callback_value(), "provider");
 
-        // Page 2: one provider scope, the pair as `provider/model`.
+        // Page 2: one provider scope, the pair labelled `name/model` (the
+        // configured display name, #908 AC1); the callback keeps id + model.
         let mut provider_query = query;
         provider_query.scope = Some("provider");
         let surface = crate::codex::model_surface::build_surface(
@@ -5405,9 +5406,10 @@ mod tests {
             .expect("the profile pair");
         assert_eq!(
             pair.display_label(),
-            "opencode-go/gpt-5.1-codex（当前 provider）",
-            "the thread's provider is marked"
+            "OpenCode Go/gpt-5.1-codex（当前 provider）",
+            "the row shows the configured display name; the thread's provider is marked"
         );
+        assert_eq!(pair.provider.as_deref(), Some("opencode-go"));
         assert_eq!(pair.callback_value(), "gpt-5.1-codex");
     }
 
