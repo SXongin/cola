@@ -2795,11 +2795,13 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
         crate::backend::types::ModelSurfaceQuery {
             session_id: Some("thread-1"),
             directory: Some("/work/cola"),
+            // Page 2: the provider list.
+            scope: Some("provider"),
             ..Default::default()
         },
     )
     .await;
-    let reserved = surface.scopes[1]
+    let reserved = surface.scopes[0]
         .options
         .iter()
         .find(|option| option.id == "codex")

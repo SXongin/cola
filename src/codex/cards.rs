@@ -1145,10 +1145,11 @@ async fn a_model_pick_reaches_the_next_turn() {
         "defaultReasoningEffort": "high"
     })]);
     let directory = tempfile::tempdir().expect("tempdir");
-    let (app, _platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
     let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
 
-    // `/model` → the provider card → the model card.
+    // `/model` opens the single model page, which already lists the catalog
+    // (issue #908: no provider drill before a model pick).
     send_command_in(
         &app,
         "/model",
@@ -1157,17 +1158,12 @@ async fn a_model_pick_reaches_the_next_turn() {
         crate::config::ConversationKind::P2p,
     )
     .await;
-    let step = app
-        .host_action(json!({
-            "action": "model",
-            "level": "provider",
-            "chat_id": CHAT,
-            "thread_id": CHAT,
-            "value": "codex",
-        }))
+    let picker = platform
+        .replied_cards()
         .await
-        .expect("the provider pick");
-    let picker = step.card.expect("the model picker");
+        .into_iter()
+        .next()
+        .expect("the /model card");
     assert!(
         card_text(&picker).contains("gpt-5.1-codex"),
         "the picker lists the server's model: {picker}"
