@@ -31,9 +31,9 @@ use serde_json::{Value, json};
 
 use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, ServerLifecycle};
 use crate::backend::types::{
-    AgentInfo, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, ModelSurface,
-    ModelSurfaceQuery, PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo,
-    SessionListInfo, SessionModel, SessionStatus,
+    AgentInfo, ChangeScope, CreateSessionInput, FormAnswer, Location, ModelInfo, ModelOption, ModelScope,
+    ModelSurface, ModelSurfaceQuery, PermissionRequest, PickKind, PromptFile, ProviderModels,
+    QuestionRequest, Session, SessionInfo, SessionListInfo, SessionModel, SessionStatus,
 };
 use crate::backend::{
     Backend, BackendDirectory, ModelIdentity, PromptSkill, SessionTranscript, SkillInfo, TurnDiff,
@@ -1593,6 +1593,31 @@ const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 /// catalog-only read the `/think` variant lookup asks for). The real surface is
 /// [`super::model_surface::build_surface`], which adds the config default,
 /// profile presets, probed provider models and the provider scope.
+/// The card before a Codex daemon is attached. Its catalog, `config/read` and
+/// probes all live behind that connection, so the honest answer is a reason —
+/// not an empty "no models" list, which reads as if the client had none. The
+/// daemon attaches (or starts under the client's policy) on the first message;
+/// [`crate::feishu::card::command::send_model_card`] also runs that demand pass
+/// before asking for this surface.
+fn unattached_surface(query: &ModelSurfaceQuery<'_>) -> ModelSurface {
+    ModelSurface {
+        current: query.current.clone(),
+        scopes: vec![ModelScope {
+            id: "model".into(),
+            title: "模型（每轮可换）".into(),
+            changeable: ChangeScope::ThisTurn,
+            pick: PickKind::Model,
+            options: Vec::new(),
+            note: Some(
+                "Codex 尚未连接（daemon 未运行）；先发一条消息完成连接，再打开 `/model`。".to_string(),
+            ),
+            free_text: None,
+            intro: None,
+        }],
+    }
+}
+
+#[cfg(test)] // the unattached surface no longer uses it; its shape test still does
 fn model_surface_from_catalog(providers: &[ProviderModels], query: &ModelSurfaceQuery<'_>) -> ModelSurface {
     super::model_surface::build_surface(
         providers,
@@ -3001,7 +3026,7 @@ impl Backend for CodexLifecycle {
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
         match self.attached_client().await {
             Some(client) => Backend::model_surface(&client, query).await,
-            None => model_surface_from_catalog(&[], &query),
+            None => unattached_surface(&query),
         }
     }
 
@@ -5286,6 +5311,23 @@ mod tests {
             "an empty provider scope says how to declare a pair: {:?}",
             provider.note
         );
+    }
+
+    /// Before the daemon is attached the card names that reason instead of
+    /// rendering an empty "no models" list (a brand-new chat's `/model`).
+    #[test]
+    fn an_unattached_codex_client_says_so_instead_of_no_models() {
+        use crate::backend::types::ModelSurfaceQuery;
+
+        let surface = unattached_surface(&ModelSurfaceQuery::default());
+        let scope = &surface.scopes[0];
+        assert!(scope.options.is_empty());
+        assert!(
+            scope.note.as_deref().unwrap_or_default().contains("daemon"),
+            "the note names the connection: {:?}",
+            scope.note
+        );
+        assert!(surface.current.is_none());
     }
 
     /// Issue #908: a pair the bridge recorded but the thread has not run yet is
