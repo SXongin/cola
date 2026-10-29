@@ -878,6 +878,15 @@ impl CodexClient {
     pub(crate) async fn release_thread(&self, thread_id: &str) -> CodexResult<()> {
         let adoption = self.projections.adoption_lock(thread_id);
         let _adopting = adoption.lock().await;
+        self.release_thread_locked(thread_id).await
+    }
+
+    /// [`Self::release_thread`] **without** taking the adoption lock: the caller
+    /// already holds it, because a release and the provider-specific resume it
+    /// precedes must be one step — a poll's ordinary adopt between them would
+    /// load the thread first and turn the provider resume into a silent no-op
+    /// (issue #910).
+    async fn release_thread_locked(&self, thread_id: &str) -> CodexResult<()> {
         let Some(release) = self.projections.take_release(thread_id) else {
             return Ok(());
         };
@@ -2148,15 +2157,40 @@ impl Backend for CodexClient {
                     .to_string(),
             });
         }
-        // Step 1: release, bounded. `release_thread` takes the release handle and
-        // forgets the projection **before** it awaits the unsubscribe, so a
-        // failed or timed-out release may already have left this connection's
-        // consumer ended and the local view forgotten: the read-back and the
-        // re-subscribe below must run either way (issue #910). A release that
-        // did not land means the thread is still loaded, so the resume is not
-        // attempted — nothing has moved.
-        let released = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread(session_id)).await;
-        if !matches!(released, Ok(Ok(()))) {
+        // Steps 1 and 2 are **one step under the thread's adoption lock**
+        // (issue #910): a render poll's `ensure_subscription` landing between
+        // the release and the provider resume would load the thread with an
+        // ordinary resume first, and the provider-specific resume would then be
+        // a silent no-op on a loaded thread — the read-back would see the old
+        // pair and the prompt would be refused. The guard is dropped before the
+        // read-back below, which may adopt the thread again.
+        //
+        // `release_thread_locked` takes the release handle and forgets the
+        // projection **before** it awaits the unsubscribe, so a failed or
+        // timed-out release may already have left this connection's consumer
+        // ended and the local view forgotten: the read-back and the re-subscribe
+        // below run either way. A release that did not land means the thread is
+        // still loaded, so the resume is not attempted — nothing has moved.
+        let adoption = self.projections.adoption_lock(session_id);
+        let (released, resumed) = {
+            let _adopting = adoption.lock().await;
+            let released =
+                tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread_locked(session_id)).await;
+            let resumed = if matches!(released, Ok(Ok(()))) {
+                Some(
+                    tokio::time::timeout(
+                        SWITCH_RPC_TIMEOUT,
+                        self.threads()
+                            .resume_with_model(session_id, &model.provider_id, &model.id),
+                    )
+                    .await,
+                )
+            } else {
+                None
+            };
+            (released, resumed)
+        };
+        let Some(resumed) = resumed else {
             // Ambiguous (issue #910): the unsubscribe may have reached the
             // server while its answer was lost, so a peer may have moved the
             // thread since. Forget this connection's provider fact — keeping it
@@ -2173,14 +2207,7 @@ impl Backend for CodexClient {
                     "线程没有在期限内确认释放，因此没有开始切换",
                 )),
             };
-        }
-        // Step 2: the pair, never the provider alone, bounded on its own.
-        let resumed = tokio::time::timeout(
-            SWITCH_RPC_TIMEOUT,
-            self.threads()
-                .resume_with_model(session_id, &model.provider_id, &model.id),
-        )
-        .await;
+        };
         // Step 3: the read is the verdict **and** the cleanup — attempted on
         // every path after the release, even when the resume failed or timed out,
         // so the local view is never left forgotten.
@@ -7998,6 +8025,79 @@ mod tests {
                 .map(|model| model.provider_id),
             Some("deepseek".to_string()),
             "the stale recovery read never overwrites the broadcast"
+        );
+    }
+
+    /// Issue #910 (blocking): a poll's ordinary adopt must not land between the
+    /// release and the provider-specific resume. The switch holds the thread's
+    /// **adoption lock** across both, so a concurrent `transcript` read waits —
+    /// without it the poll would resume the thread first, the provider resume
+    /// would be a silent no-op, and the read-back would refuse the prompt.
+    #[tokio::test]
+    async fn a_poll_cannot_adopt_between_the_release_and_the_resume() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        let resumes_before = server.resume_calls();
+
+        // The provider resume is parked: the release is done, the re-adopt is
+        // not. A poll read landing here is the race.
+        server.set_resume_delay(Duration::from_millis(500));
+        let attempt = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
+        let switch = tokio::spawn({
+            let client = client.clone();
+            async move { Backend::apply_thread_model(&client, "thread-1", &attempt).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.resume_calls() == resumes_before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the switch's resume never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let poll = tokio::spawn({
+            let client = client.clone();
+            async move { client.transcript("thread-1").await }
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            server.resume_calls(),
+            resumes_before + 1,
+            "the poll did not adopt (no ordinary resume) while the switch held the thread"
+        );
+        assert!(!poll.is_finished(), "the poll waits for the switch to settle");
+
+        let switched = switch.await.expect("the switch joins");
+        assert!(switched.is_ok(), "the switch landed: {switched:?}");
+        poll.await
+            .expect("the poll joins")
+            .expect("the poll read succeeds");
+        assert_eq!(
+            client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id),
+            Some("deepseek".to_string()),
+            "after the switch the poll sees the new pair"
         );
     }
 

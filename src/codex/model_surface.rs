@@ -18,7 +18,7 @@
 //! - `GET <base_url>/models` is asked per provider, using that provider's
 //!   `experimental_bearer_token`. A provider that only declares `env_key` is
 //!   skipped: the daemon's environment is not cola's. Results (including
-//!   failures) are cached per provider for [`PROBE_TTL`], so opening the card
+//!   failures) are cached per provider for [`ProbeOutcome::cache_ttl`], so opening the card
 //!   twice does not hammer a provider.
 //!
 //! Credentials only ever go into the outbound `Authorization` header: no note,
@@ -72,7 +72,7 @@ const PROBE_TRANSIENT_TTL: Duration = Duration::from_millis(200);
 /// config or the credential changing — and both are part of the cache key, so
 /// a fix starts a fresh entry. Re-asking every open would only cost a request.
 #[cfg(not(test))]
-const PROBE_DEFINITIVE_TTL: Duration = Duration::from_secs(600);
+const PROBE_DEFINITIVE_TTL: Duration = Duration::from_secs(180);
 #[cfg(test)]
 const PROBE_DEFINITIVE_TTL: Duration = Duration::from_millis(600);
 
@@ -538,10 +538,12 @@ fn token_fingerprint(token: Option<&str>) -> Option<u64> {
     })
 }
 
-/// Drop every entry past [`PROBE_TTL`]. Called under the cache lock before a
-/// lookup and on insert, so expired provider/base-URL pairs are removed rather
-/// than merely ignored — visiting projects with distinct endpoints cannot grow
-/// one connection's map without bound.
+/// Drop every entry past **its own** TTL ([`ProbeOutcome::cache_ttl`]: the
+/// success/definitive [`PROBE_TTL`], the shorter [`PROBE_TRANSIENT_TTL`]).
+/// Called under the cache lock before a lookup and on insert, so expired
+/// provider/base-URL pairs are removed rather than merely ignored — visiting
+/// projects with distinct endpoints cannot grow one connection's map without
+/// bound.
 fn prune_expired(entries: &mut HashMap<ProbeCacheKey, ProbeEntry>) {
     let now = Instant::now();
     entries.retain(|_, entry| now.saturating_duration_since(entry.at) < entry.outcome.cache_ttl());
@@ -1061,7 +1063,17 @@ fn provider_page(
         note: config.read_failed.then(|| "_(读不到 config)_".to_string()),
         options,
         free_text: None,
-        intro: None,
+        // What a pick on this page does, in one line (#910 AC1): a live
+        // thread's switch is recorded and confirmed; a new thread takes it
+        // directly.
+        intro: Some(
+            if resumable {
+                "确认后，下一条消息前切换"
+            } else {
+                "只在新线程生效"
+            }
+            .to_string(),
+        ),
     }
 }
 
@@ -1993,11 +2005,21 @@ mod tests {
         let scope = &resumable.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::ResumeOnly);
         assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
+        assert_eq!(
+            scope.intro.as_deref(),
+            Some("确认后，下一条消息前切换"),
+            "a resumable switch says when it lands"
+        );
 
         // The gate shut: only a new thread can take it (the pick says so).
         let locked = build_surface(&[], &config, &HashMap::new(), None, false, &live);
         let scope = &locked.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::NewThread, "the gate is shut");
+        assert_eq!(
+            scope.intro.as_deref(),
+            Some("只在新线程生效"),
+            "a gated provider page says where it applies"
+        );
 
         // The same pair on the thread's own provider is marked current.
         let same = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), true, &live);
