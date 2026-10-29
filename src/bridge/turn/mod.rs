@@ -820,7 +820,7 @@ impl Turn {
         if let Some(model) = model.as_ref() {
             match handles.backend.model_pick_route(&self.session_id, model).await {
                 Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
-                    let pair = format!("{}/{}", model.provider_id, model.id);
+                    let pair = crate::backend::parsing::join_model(&model.provider_id, &model.id);
                     self.settle_switch_variant(handles, &pair).await?;
                     if let Err(error) = handles.backend.apply_thread_model(&self.session_id, model).await {
                         // AC6: a failed switch leaves the session on the pair the
@@ -832,7 +832,7 @@ impl Turn {
                         let observed = handles.backend.observed_thread_model(&self.session_id).await;
                         let observed_spec = observed
                             .as_ref()
-                            .map(|model| format!("{}/{}", model.provider_id, model.id));
+                            .map(|model| crate::backend::parsing::join_model(&model.provider_id, &model.id));
                         if let Err(restore) = handles
                             .sessions
                             .restore_observed_pair(
