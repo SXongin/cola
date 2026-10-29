@@ -1364,42 +1364,6 @@ impl SessionsHandle {
             .set_auto_accept(thread_key, session_id, expected_epoch, on)
     }
 
-    /// Restore the session's recorded pair after a switch that did not land
-    /// (issue #910 AC4): a compare-and-set from the pair the failed attempt
-    /// recorded back to the one the thread still runs. A newer pick keeps its
-    /// own record (the CAS refuses).
-    pub(crate) async fn restore_recorded_pair(
-        &self,
-        thread_key: &ThreadKey,
-        session_id: &str,
-        expected_model: &str,
-        expected_variant: Option<&str>,
-        previous_model: Option<&str>,
-        previous_variant: Option<&str>,
-    ) -> crate::error::Result<bool> {
-        use crate::bridge::session::MirrorWrite;
-        let gate = self.session_gates.gate(session_id);
-        let _held = gate.enter().await;
-        let write = match previous_model {
-            Some(model) => MirrorWrite::ModelWithVariant {
-                model,
-                variant: previous_variant,
-            },
-            None => MirrorWrite::Forget,
-        };
-        let written = self.store.lock().await.set_mirror_live(
-            thread_key,
-            session_id,
-            Some(expected_model),
-            expected_variant,
-            write,
-        )?;
-        Ok(matches!(
-            written,
-            crate::bridge::session::PairWrite::Applied { .. }
-        ))
-    }
-
     /// Record a `/model` spec as the session's next-turn model **without any
     /// catalog read** (issue #910): the confirmation must ack from a store write
     /// only, so the `/think` clear is deferred to the turn pre-flight. Same gate

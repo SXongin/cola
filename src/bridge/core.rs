@@ -646,29 +646,6 @@ impl SharedCore {
             .await
     }
 
-    /// Restore the session's recorded pair after a switch that did not land
-    /// (issue #910 AC4).
-    pub(crate) async fn restore_recorded_pair(
-        &self,
-        thread_key: &ThreadKey,
-        session_id: &str,
-        expected_model: &str,
-        expected_variant: Option<&str>,
-        previous_model: Option<&str>,
-        previous_variant: Option<&str>,
-    ) -> crate::error::Result<bool> {
-        self.sessions_handle()
-            .restore_recorded_pair(
-                thread_key,
-                session_id,
-                expected_model,
-                expected_variant,
-                previous_model,
-                previous_variant,
-            )
-            .await
-    }
-
     /// Record a `/model` spec **without a catalog read** (issue #910): the
     /// confirmation acks from a store write only, and the turn pre-flight
     /// resolves the `/think` clear.

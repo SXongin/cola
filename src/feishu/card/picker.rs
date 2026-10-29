@@ -666,42 +666,6 @@ pub fn build_provider_recorded_card(provider: &str, model: &str) -> serde_json::
     )
 }
 
-/// The immediate ack of a confirmation (issue #910 AC4): the switch runs
-/// detached from the ack and this card is patched with its outcome.
-pub fn build_provider_switching_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "⏳ 正在切换…",
-        "orange",
-        vec![markdown_element(&format!(
-            "正在把这条线程切换到 `{provider}/{model}`：释放订阅 → `thread/resume` → 回读校验。             完成后这张卡片会更新结果。"
-        ))],
-    )
-}
-
-/// The immediate switch landed: the thread and the mirror now run the pair.
-pub fn build_provider_switched_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "✅ 已切换",
-        "green",
-        vec![markdown_element(&format!(
-            "这条线程现在运行 `{provider}/{model}`（`thread/resume` 已成功，并已回读确认）。             其他连在同一条线程上的客户端（Codex TUI / VS Code / 桌面端）也会看到这次变化。"
-        ))],
-    )
-}
-
-/// The immediate switch did not land (issue #910 AC4): the named error, with
-/// the thread left on its previous pair and the record rolled back.
-pub fn build_provider_switch_failed_card(pair: &str, error: &str) -> serde_json::Value {
-    card_shell(
-        "⚠️ 切换没有生效",
-        "orange",
-        vec![markdown_element(&format!(
-            "切换到 `{pair}` 没有生效：{error}。\n\
-             线程保持原来的 provider/model，记录也已恢复；可以关闭占用它的客户端后重试。"
-        ))],
-    )
-}
-
 /// The pair could not be recorded, so the switch never started: a click that
 /// cannot be saved must not claim success, and the thread is untouched (issue
 /// #910). The pair is written **before** the RPC precisely so a prompt racing

@@ -2382,20 +2382,17 @@ async fn a_recorded_provider_switch_applies_before_the_next_prompt() {
         .find(|button| button["value"]["action"] == "model_provider_confirm")
         .expect("the confirm button")["value"]
         .clone();
-    // A turn is in flight: the confirmation takes the **deferred** half of the
-    // hybrid — record now, apply at the next prompt (issue #910 AC4).
-    app.inflight.lock().await.insert("thread-1".to_string());
     server.clear_calls();
-    app.host_action_on_message(confirm, "om_confirm")
+    let step = app
+        .host_action_on_message(confirm, "om_confirm")
         .await
         .expect("confirm");
-    wait_for_card_text(
-        &platform,
-        "om_confirm",
-        "已记录",
-        std::time::Duration::from_secs(10),
-    )
-    .await;
+    assert!(
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("已记录")),
+        "the confirmation records, it does not switch"
+    );
     assert_eq!(
         app.sessions
             .lock()
@@ -2413,7 +2410,6 @@ async fn a_recorded_provider_switch_applies_before_the_next_prompt() {
         1,
         "no resume happens from the card: only the adoption so far"
     );
-    app.inflight.lock().await.remove("thread-1");
 
     // The next prompt applies it before submitting. The fake server keeps the
     // turn live (no scripted completion), so the message runs detached and the
@@ -2544,20 +2540,9 @@ async fn a_peer_held_real_codex_thread_stops_the_next_prompt() {
         .find(|button| button["value"]["action"] == "model_provider_confirm")
         .expect("the confirm button")["value"]
         .clone();
-    // A turn in flight: the hybrid defers the pair, so the **prompt's**
-    // pre-flight is what attempts the (peer-blocked) switch (issue #910 AC4).
-    app.inflight.lock().await.insert("thread-1".to_string());
     app.host_action_on_message(confirm, "om_confirm")
         .await
         .expect("confirm");
-    wait_for_card_text(
-        &platform,
-        "om_confirm",
-        "已记录",
-        std::time::Duration::from_secs(10),
-    )
-    .await;
-    app.inflight.lock().await.remove("thread-1");
 
     let prompts_before = server.turn_starts();
     app.handle_message(incoming(
@@ -2864,10 +2849,12 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
     );
 }
 
-/// Issue #910 AC4 (hybrid): an idle confirmation switches the thread **now** —
-/// no further prompt is needed — and the ack card is patched with the outcome.
+/// Issue #908: a confirmation **records** the pair and acks ([#910 AC4]'s
+/// amended deferral: no RPC at confirm time). A reopened `/model` therefore
+/// shows the **thread's** pair as current and the recorded one as 待应用 — the
+/// footer and the card stay same-source.
 #[tokio::test]
-async fn an_idle_confirmation_switches_the_thread_immediately() {
+async fn a_recorded_pair_is_pending_in_the_model_card() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2897,7 +2884,6 @@ async fn an_idle_confirmation_switches_the_thread_immediately() {
     let mut entry = codex_entry("thread-1");
     entry.model = Some("openai/gpt-5.1-codex".into());
     seed_entry(&app, entry).await;
-    let turns_before = server.turn_starts();
 
     let step = app
         .host_action(serde_json::json!({
@@ -2923,18 +2909,9 @@ async fn an_idle_confirmation_switches_the_thread_immediately() {
     assert!(
         step.card
             .as_ref()
-            .is_some_and(|card| card.to_string().contains("正在切换")),
-        "the ack is immediate"
-    );
-
-    // The switch runs detached: release + resume + read-back, no prompt.
-    server.wait_for_resume_calls(2).await;
-    let text = wait_for_card_text(&platform, "om_card", "已切换", std::time::Duration::from_secs(10)).await;
-    assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
-    assert_eq!(
-        server.turn_starts(),
-        turns_before,
-        "no prompt was sent to apply the switch"
+            .is_some_and(|card| card.to_string().contains("已记录")),
+        "the ack records the pair: {:?}",
+        step.toast
     );
     assert_eq!(
         app.sessions
@@ -2946,182 +2923,9 @@ async fn an_idle_confirmation_switches_the_thread_immediately() {
             .model
             .as_deref(),
         Some("deepseek/deepseek-v4-pro"),
-        "the mirror records what the thread runs"
-    );
-    let calls = server.call_log();
-    let resume = calls
-        .iter()
-        .position(|method| method == "thread/resume")
-        .expect("a resume");
-    assert!(
-        calls
-            .iter()
-            .skip(resume + 1)
-            .any(|method| method == "thread/read"),
-        "the read-back is the verdict: {calls:?}"
-    );
-}
-
-/// Issue #910 AC4 (hybrid): a replay while the slow switch runs answers busy —
-/// exactly one switch is applied.
-#[tokio::test]
-async fn a_replayed_confirmation_during_the_switch_is_busy() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
-        "thread-1",
-        "session-root",
-        "/work/cola",
-        "a shared thread",
-    ));
-    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-    let endpoint = crate::codex::Endpoint::parse(&url).expect("endpoint");
-    let client = crate::codex::CodexClient::connect(
-        &crate::codex::CodexOptions::new(endpoint).with_thread_settings(crate::codex::ThreadSettings {
-            provider_switch_on_resume: true,
-            ..Default::default()
-        }),
-        &crate::codex::PinnedProbe,
-    )
-    .await
-    .expect("attach");
-    client.transcript("thread-1").await.expect("adopt the thread");
-    server.wait_for_subscribers("thread-1", 1).await;
-    // The **switch's** resume is the slow part (the adoption already ran).
-    server.set_resume_delay(std::time::Duration::from_millis(1_000));
-
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
-    let mut entry = codex_entry("thread-1");
-    entry.model = Some("openai/gpt-5.1-codex".into());
-    seed_entry(&app, entry).await;
-
-    let step = app
-        .host_action(serde_json::json!({
-            "action": "model",
-            "level": "model",
-            "chat_id": "chat_1",
-            "thread_id": "chat_1",
-            "provider": "deepseek",
-            "value": "deepseek-v4-pro",
-        }))
-        .await
-        .expect("provider pick");
-    let card = step.card.expect("a confirmation card");
-    let confirm = crate::bridge::test_support::card_buttons(&card)
-        .into_iter()
-        .find(|button| button["value"]["action"] == "model_provider_confirm")
-        .expect("the confirm button")["value"]
-        .clone();
-    app.host_action_on_message(confirm.clone(), "om_card")
-        .await
-        .expect("confirm");
-    let replay = app
-        .host_action_on_message(confirm, "om_card_replay")
-        .await
-        .expect("replay");
-    assert!(replay.card.is_none(), "no second switch card");
-    assert_eq!(
-        replay.toast.as_deref(),
-        Some("切换正在进行，请稍候…"),
-        "a replay answers busy"
+        "the pair is recorded, not applied"
     );
 
-    wait_for_card_text(&platform, "om_card", "已切换", std::time::Duration::from_secs(10)).await;
-    // The adoption, the one switch's pair resume, and the re-subscribe that
-    // keeps mirroring the thread — a replayed switch would add another pair.
-    assert_eq!(
-        server.resume_calls(),
-        3,
-        "adoption + exactly one switch (+ its re-subscribe)"
-    );
-}
-
-/// Issue #908 (gate follow-up): while a confirmed switch is still in flight, a
-/// `/model` open shows the **thread's** pair as current and the recorded one as
-/// 待应用 — the footer and the card stay same-source.
-#[tokio::test]
-async fn a_parked_switch_shows_the_thread_pair_as_current_and_the_record_as_pending() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
-        "thread-1",
-        "session-root",
-        "/work/cola",
-        "a shared thread",
-    ));
-    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-    let endpoint = crate::codex::Endpoint::parse(&url).expect("endpoint");
-    let client = crate::codex::CodexClient::connect(
-        &crate::codex::CodexOptions::new(endpoint).with_thread_settings(crate::codex::ThreadSettings {
-            provider_switch_on_resume: true,
-            ..Default::default()
-        }),
-        &crate::codex::PinnedProbe,
-    )
-    .await
-    .expect("attach");
-    client.transcript("thread-1").await.expect("adopt the thread");
-    server.wait_for_subscribers("thread-1", 1).await;
-    // Park the switch in its **release**: the thread's fact is still known
-    // (the resume, which re-adopts and so forgets it, has not started), while
-    // the pair is already recorded.
-    server.set_unsubscribe_delay(std::time::Duration::from_millis(1_500));
-    let platform = Arc::new(RecordingPlatform::new());
-    let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
-    let mut entry = codex_entry("thread-1");
-    entry.model = Some("openai/gpt-5.1-codex".into());
-    seed_entry(&app, entry).await;
-
-    let step = app
-        .host_action(serde_json::json!({
-            "action": "model",
-            "level": "model",
-            "chat_id": "chat_1",
-            "thread_id": "chat_1",
-            "provider": "deepseek",
-            "value": "deepseek-v4-pro",
-        }))
-        .await
-        .expect("provider pick");
-    let card = step.card.expect("a confirmation card");
-    let confirm = crate::bridge::test_support::card_buttons(&card)
-        .into_iter()
-        .find(|button| button["value"]["action"] == "model_provider_confirm")
-        .expect("the confirm button")["value"]
-        .clone();
-    app.host_action_on_message(confirm, "om_card")
-        .await
-        .expect("confirm");
-
-    // Wait until the detached task has recorded the pair (it records before the
-    // resume), so the 待应用 line has something to name.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let model = app
-            .sessions
-            .lock()
-            .await
-            .get_active(&crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()))
-            .cloned()
-            .unwrap()
-            .model;
-        if model.as_deref() == Some("deepseek/deepseek-v4-pro") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the switch never recorded its pair: {model:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-
-    // The switch is parked in its resume: the thread still runs the old pair,
-    // and the recorded one is a separate 待应用 line.
     send_command_in(
         &app,
         "/model",
