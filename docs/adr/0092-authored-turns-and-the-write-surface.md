@@ -366,19 +366,19 @@ could not send". Spec #906 measured what was actually on the other side and
 found the **shape** was the defect: the card rendered OpenCode's
 provider → model tree over a client that has no such tree, which is where
 「选择 provider（共 1 个）→ codex」 came from. The surface now belongs to the
-client, the card only renders it, and the first amendment's closing
+**Agent Client**, the card only renders it, and the first amendment's closing
 out-of-scope line is superseded.
 
 **1. `Backend::model_surface` is the one source, and it is a list of scopes.**
-`ModelSurface { current, scopes }` (`src/backend/types.rs`) answers what a
-client can offer and where each axis may change. A `ModelScope` carries a
+`ModelSurface { current, scopes }` (`src/backend/types.rs`) answers what an
+**Agent Client** can offer and where each axis may change. A `ModelScope` carries a
 `title`, a `ChangeScope` (`ThisTurn` / `NewThread` / `ResumeOnly`), a `PickKind`
 (`Model` / `Provider` / `DrillDown`), its options, an optional note and an
 optional hand-write hint. The pick kind — not the scope's id — says what a click
 does, because both clients legitimately name a scope `provider` and mean
 different things by it (OpenCode drills down into another page, Codex selects a
 thread-level fact). OpenCode maps its existing `GET /provider` tree onto two
-levels unchanged, pixels included; a third client (ACP) only has to answer this
+levels unchanged, pixels included; a third **Agent Client** (ACP) only has to answer this
 description.
 
 **2. Codex's model axis is three facts, not a tree.** A provider is
