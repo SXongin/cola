@@ -59,14 +59,22 @@ use super::transport::RpcConnection;
 /// double-open cheap without hiding a provider that just recovered.
 const PROBE_TTL: Duration = Duration::from_secs(180);
 
-/// How long a **transient** probe failure (`Timeout`, a network/transport error)
-/// is cached (issue #908's owner review): a one-off timeout should retry on the
-/// next open, not hide the group for three minutes. Definitive answers keep
-/// [`PROBE_TTL`].
+/// How long a **transient** probe failure is cached (issue #908's owner
+/// review): a one-off timeout, a transport error, a `5xx`/`429` or an empty
+/// list should retry on the next open, not hide the group for three minutes.
 #[cfg(not(test))]
 const PROBE_TRANSIENT_TTL: Duration = Duration::from_secs(20);
 #[cfg(test)]
 const PROBE_TRANSIENT_TTL: Duration = Duration::from_millis(200);
+
+/// How long a **definitive** probe failure is cached: a `401`/`403`/`404`, an
+/// `env_key`-only provider, a layer mix or a bad URL cannot change without the
+/// config or the credential changing — and both are part of the cache key, so
+/// a fix starts a fresh entry. Re-asking every open would only cost a request.
+#[cfg(not(test))]
+const PROBE_DEFINITIVE_TTL: Duration = Duration::from_secs(600);
+#[cfg(test)]
+const PROBE_DEFINITIVE_TTL: Duration = Duration::from_millis(600);
 
 /// One probe's own deadline. A provider that does not answer within this is
 /// "timeout", not a hung card.
@@ -457,12 +465,31 @@ pub(crate) enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// How long this answer stays cached: a **transient** failure expires
-    /// quickly so the next open retries; everything else keeps [`PROBE_TTL`].
+    /// How long this answer stays cached, by kind: a successful list is worth
+    /// [`PROBE_TTL`], a **transient** failure expires quickly so the next open
+    /// retries, and a **definitive** one (a config/credential verdict, or the
+    /// provider saying it has no such endpoint) is kept long — its cache key
+    /// includes the URL and credential fingerprint, so fixing either one starts
+    /// a fresh entry.
     fn cache_ttl(&self) -> Duration {
         match self {
-            Self::Timeout | Self::Network => PROBE_TRANSIENT_TTL,
-            _ => PROBE_TTL,
+            Self::Models(_) => PROBE_TTL,
+            Self::Timeout | Self::Network | Self::BadResponse | Self::Empty => PROBE_TRANSIENT_TTL,
+            Self::Http(code) => {
+                if *code == 429 || *code >= 500 {
+                    PROBE_TRANSIENT_TTL
+                } else {
+                    PROBE_DEFINITIVE_TTL
+                }
+            }
+            Self::EnvKey
+            | Self::LayerMismatch
+            | Self::NoBaseUrl
+            | Self::BadBaseUrl
+            | Self::UnsupportedScheme
+            | Self::Unauthorized
+            | Self::Forbidden
+            | Self::NotFound => PROBE_DEFINITIVE_TTL,
         }
     }
 
@@ -1388,11 +1415,18 @@ mod tests {
     async fn a_timed_out_probe_retries_after_the_short_ttl() {
         let server = crate::test_http::TestHttpServer::start().await;
         server.route("GET", "/forbidden", 403, "{}");
+        server.route("GET", "/broken", 500, "{}");
         server.route_delayed("GET", "/slow", 200, "{}", Duration::from_millis(400));
         let probes = ModelProbes::new();
         let forbidden = provider(
             "forbidden",
             Some(format!("{}/forbidden", server.base_url())),
+            Some(TOKEN),
+            None,
+        );
+        let broken = provider(
+            "broken",
+            Some(format!("{}/broken", server.base_url())),
             Some(TOKEN),
             None,
         );
@@ -1402,25 +1436,48 @@ mod tests {
             Some(TOKEN),
             None,
         );
-        let outcomes = probes.probe_all(&[forbidden.clone(), slow.clone()]).await;
+        let outcomes = probes
+            .probe_all(&[forbidden.clone(), broken.clone(), slow.clone()])
+            .await;
         assert_eq!(outcomes.get("slow"), Some(&ProbeOutcome::Timeout));
+        assert_eq!(outcomes.get("broken"), Some(&ProbeOutcome::Http(500)));
         assert_eq!(outcomes.get("forbidden"), Some(&ProbeOutcome::Forbidden));
-        assert_eq!(server.request_count(), 2);
+        assert_eq!(server.request_count(), 3);
 
-        // Age only the transient entry past its short TTL; the 403 stays fresh.
+        // Age the **transient** entries past their short TTL, but leave the
+        // 403 inside its definitive TTL: only the transient ones retry.
         {
             let mut entries = probes.entries.lock().unwrap();
-            let key = ModelProbes::cache_key(&slow);
-            entries.get_mut(&key).unwrap().at =
-                Instant::now() - PROBE_TRANSIENT_TTL - Duration::from_millis(10);
+            for provider in [&slow, &broken] {
+                let key = ModelProbes::cache_key(provider);
+                entries.get_mut(&key).unwrap().at =
+                    Instant::now() - PROBE_TRANSIENT_TTL - Duration::from_millis(10);
+            }
         }
-        let outcomes = probes.probe_all(&[forbidden.clone(), slow.clone()]).await;
+        let outcomes = probes
+            .probe_all(&[forbidden.clone(), broken.clone(), slow.clone()])
+            .await;
         assert_eq!(
             outcomes.get("forbidden"),
             Some(&ProbeOutcome::Forbidden),
-            "a definitive failure is still cached"
+            "a definitive failure keeps its long TTL"
         );
-        assert_eq!(server.request_count(), 3, "only the timed-out probe is retried");
+        assert_eq!(server.request_count(), 5, "both transient failures retried");
+
+        // A definitive entry does not survive its own (longer) TTL.
+        {
+            let mut entries = probes.entries.lock().unwrap();
+            let key = ModelProbes::cache_key(&forbidden);
+            entries.get_mut(&key).unwrap().at =
+                Instant::now() - PROBE_DEFINITIVE_TTL - Duration::from_millis(10);
+        }
+        let outcomes = probes.probe_all(std::slice::from_ref(&forbidden)).await;
+        assert_eq!(outcomes.get("forbidden"), Some(&ProbeOutcome::Forbidden));
+        assert_eq!(
+            server.request_count(),
+            6,
+            "an expired definitive answer is re-probed"
+        );
     }
 
     /// 403, 404, a timeout and an `env_key`-only provider are distinct outcomes;
