@@ -56,6 +56,14 @@ use types::{
 
 #[async_trait]
 impl Backend for OpenCodeBackend {
+    fn client_name(&self) -> &'static str {
+        "OpenCode"
+    }
+
+    fn start_hint(&self) -> &'static str {
+        "请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。"
+    }
+
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
         OpenCodeBackend::new_session_input(self, directory)
     }

@@ -2238,21 +2238,29 @@ impl App {
         match crate::bridge::pollers::ensure_server(&self.flow_handles()).await {
             Ok(true) => true,
             Ok(false) => {
+                let backend = &self.flow_handles().backend;
                 let _ = self
                     .feishu
                     .reply_text(
                         message_id,
-                        "⚠️ 当前没有可用的 OpenCode server，且 `start_server = \"never\"`。\
-                          \n请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。",
+                        &format!(
+                            "⚠️ 当前没有可用的 {} server，且 `start_server = \"never\"`。\n{}",
+                            backend.client_name(),
+                            backend.start_hint()
+                        ),
                     )
                     .await;
                 false
             }
             Err(e) => {
                 tracing::warn!("ensure server failed: {}", e);
+                let backend = &self.flow_handles().backend;
                 let _ = self
                     .feishu
-                    .reply_text(message_id, &format!("⚠️ 启动 OpenCode server 失败：{e}"))
+                    .reply_text(
+                        message_id,
+                        &format!("⚠️ 启动 {} 失败：{e}", backend.client_name()),
+                    )
                     .await;
                 false
             }

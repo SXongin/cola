@@ -2015,6 +2015,15 @@ impl Backend for CodexClient {
         }
     }
 
+    fn client_name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn start_hint(&self) -> &'static str {
+        "请启动 Codex daemon（`codex app-server daemon start`，并确认 `CODEX_HOME` 指向正确的 home），\
+         或把配置改为 `start_server = \"auto\"`。"
+    }
+
     fn has_thread_provider(&self) -> bool {
         true
     }
@@ -2030,7 +2039,7 @@ impl Backend for CodexClient {
 
     /// The ordered thread fact, mapped for the bridge's failed-switch restore
     /// (issue #910 AC6).
-    fn observed_thread_model(&self, session_id: &str) -> Option<crate::backend::types::ModelInfo> {
+    async fn observed_thread_model(&self, session_id: &str) -> Option<crate::backend::types::ModelInfo> {
         self.projections
             .model(session_id)
             .map(|model| crate::backend::types::ModelInfo {
@@ -2043,7 +2052,7 @@ impl Backend for CodexClient {
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
     /// bucket is not a channel, so it reads as unknown. A cold projection is
     /// unknown — deciding "is the gate relevant" must not cost a request.
-    fn known_thread_provider(&self, session_id: &str) -> Option<String> {
+    async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
         self.projections
             .model(session_id)
             .map(|model| model.provider_id)
@@ -2862,6 +2871,66 @@ impl Backend for CodexClient {
 /// the client the last attach pass installed.
 #[async_trait]
 impl Backend for CodexLifecycle {
+    fn client_name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn start_hint(&self) -> &'static str {
+        "请启动 Codex daemon（`codex app-server daemon start`，并确认 `CODEX_HOME` 指向正确的 home），\
+         或把配置改为 `start_server = \"auto\"`。"
+    }
+
+    // The provider axis is a property of the *client kind*, so the wrapper can
+    // answer it without a connection. The trait defaults are wrong here and
+    // silently turn every Codex pick into an OpenCode-shaped per-turn pick:
+    // the bridge talks to this lifecycle, never to the attached `CodexClient`
+    // (issue #910 follow-up).
+    fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
+        if self.provider_switch_on_resume() {
+            crate::backend::types::ChangeScope::ResumeOnly
+        } else {
+            crate::backend::types::ChangeScope::NewThread
+        }
+    }
+
+    fn has_thread_provider(&self) -> bool {
+        true
+    }
+
+    fn is_neutral_provider(&self, provider: &str) -> bool {
+        provider == MODEL_PROVIDER
+    }
+
+    async fn model_pick_route(
+        &self,
+        session_id: &str,
+        model: &crate::backend::types::ModelInfo,
+    ) -> Result<crate::backend::types::ModelPickRoute> {
+        Backend::model_pick_route(&self.current().await?, session_id, model).await
+    }
+
+    async fn apply_thread_model(
+        &self,
+        session_id: &str,
+        model: &crate::backend::types::ModelInfo,
+    ) -> Result<crate::backend::types::ThreadModelChange> {
+        Backend::apply_thread_model(&self.current().await?, session_id, model).await
+    }
+
+    async fn observed_thread_model(&self, session_id: &str) -> Option<ModelInfo> {
+        match self.attached_client().await {
+            Some(client) => Backend::observed_thread_model(&client, session_id).await,
+            None => None,
+        }
+    }
+
+    async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
+        match self.attached_client().await {
+            Some(client) => Backend::known_thread_provider(&client, session_id).await,
+            None => None,
+        }
+    }
+
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
         neutral_session_input(directory)
     }
@@ -8384,6 +8453,10 @@ mod tests {
             "a real thread",
         ));
         let client = connect(&url).await;
+        // The bridge's lifecycle messages name the configured client, not the
+        // adapter the sentence was first written for (#906 follow-up).
+        assert_eq!(Backend::client_name(&client), "Codex");
+        assert!(Backend::start_hint(&client).contains("codex app-server daemon start"));
 
         let model = crate::backend::parsing::parse_model("openai/gpt-5.1-codex");
         Backend::prompt(

@@ -972,7 +972,7 @@ impl SessionsHandle {
             && !backend.is_neutral_provider(provider)
             && backend.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly
         {
-            return match backend.known_thread_provider(&session_id) {
+            return match backend.known_thread_provider(&session_id).await {
                 Some(current) if current == provider => ModelPickDecision::Record {
                     target: PickTarget::Live(session_id),
                 },
