@@ -138,6 +138,8 @@ async fn external_message_from_shared_store_notifies_feishu() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -218,6 +220,8 @@ async fn a_client_authored_message_never_notifies_the_chat() {
                 topic_anchor: None,
                 topic_root: None,
                 variant: None,
+
+                provider_switch_confirmed: false,
             },
         )
         .await;
@@ -319,6 +323,8 @@ async fn a_compaction_carrier_is_never_the_external_message() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -389,6 +395,8 @@ async fn external_file_message_notifies_with_the_record_line() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -477,6 +485,8 @@ async fn external_poller_recovers_when_messages_hangs() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -556,6 +566,8 @@ async fn external_reply_completion_comes_from_the_transcript() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -624,6 +636,8 @@ async fn cola_own_message_after_heal_is_never_notified_external() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -706,6 +720,8 @@ async fn newer_external_message_after_cola_own_still_notifies() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -778,6 +794,8 @@ async fn external_message_to_historical_session_is_not_notified() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -794,6 +812,8 @@ async fn external_message_to_historical_session_is_not_notified() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -886,6 +906,8 @@ async fn reactivated_session_resyncs_silently() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -902,6 +924,8 @@ async fn reactivated_session_resyncs_silently() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -993,6 +1017,8 @@ async fn external_message_to_topic_session_notifies_into_thread() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1088,6 +1114,8 @@ async fn external_message_reply_renders_into_notification_card() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1337,6 +1365,8 @@ async fn external_reply_render_times_out_and_finalizes_partial_content() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1434,6 +1464,8 @@ async fn external_reply_render_renews_its_idle_bound_while_parts_arrive() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1497,6 +1529,8 @@ async fn external_reply_render_leaves_the_notification_card_when_nothing_produce
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1633,6 +1667,8 @@ async fn external_reply_render_renews_on_tool_panel_revisions() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1698,6 +1734,8 @@ async fn external_reply_render_idles_out_when_reads_fail() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1818,6 +1856,8 @@ async fn external_reply_render_renews_on_child_liveness() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1888,6 +1928,8 @@ async fn external_reply_render_idles_out_when_reads_hang() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1992,6 +2034,8 @@ async fn external_reply_render_does_not_finalize_a_replacement_card() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2137,6 +2181,8 @@ async fn external_reply_render_idles_out_when_a_child_read_hangs() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2226,6 +2272,8 @@ async fn external_reply_render_renews_on_progress_rendered_before_a_stall() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2300,6 +2348,8 @@ async fn external_render_follows_a_supplement_into_the_continuation() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2474,6 +2524,8 @@ async fn external_reply_render_honors_a_stop_and_drops_a_stale_marker() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2581,6 +2633,8 @@ async fn external_reply_keeps_the_user_message_above_it() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2707,6 +2761,8 @@ async fn external_reply_renders_its_user_message_as_a_separate_block() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -3287,6 +3343,8 @@ fn external_entry() -> crate::config::SessionEntry {
         topic_anchor: None,
         topic_root: None,
         variant: None,
+
+        provider_switch_confirmed: false,
     }
 }
 

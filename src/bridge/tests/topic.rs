@@ -560,6 +560,8 @@ async fn topic_cover_card_updated_with_auto_title_after_turn() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -909,6 +911,8 @@ async fn topic_command_gate_rejects_banned_commands_and_lets_others_through() {
                     topic_anchor: None,
                     topic_root: None,
                     variant: None,
+
+                    provider_switch_confirmed: false,
                 },
             )
             .await;
@@ -981,6 +985,8 @@ async fn cat_directory_pick_is_rejected_in_a_bound_topic() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1054,6 +1060,8 @@ async fn topic_gate_rejects_the_unparseable_topic_shape() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1246,6 +1254,8 @@ async fn topic_adopt_rejects_owned_session_without_force() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1290,6 +1300,8 @@ async fn topic_adopt_force_steals_mapping() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1427,6 +1439,8 @@ async fn switch_card_topic_adopt_occupied_offers_force_confirm() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1498,6 +1512,8 @@ async fn switch_card_force_topic_adopt_steals_owned_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1564,6 +1580,8 @@ async fn switch_card_force_topic_adopt_failure_keeps_old_owner() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1792,6 +1810,8 @@ async fn topic_plain_reply_skips_own_root_and_seed_injection() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_root_cmd".into()),
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1851,6 +1871,8 @@ async fn topic_explicit_quote_of_real_message_still_injects() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_root_cmd".into()),
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1909,6 +1931,8 @@ async fn manual_topic_plain_reply_injects_user_root() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;

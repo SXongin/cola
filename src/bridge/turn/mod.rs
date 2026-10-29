@@ -787,7 +787,7 @@ impl Turn {
                 )));
             }
         };
-        let (model, variant) = {
+        let (model, variant, switch_confirmed) = {
             let durable_variant = if handles.backend.keeps_session_selection() {
                 // Bounded like every other read under the point (issue #910):
                 // a silent server degrades to "unknown variant", never to a
@@ -814,12 +814,28 @@ impl Turn {
                 Some(variant) => variant,
                 None => handles.sessions.variant_override(&self.session_id).await,
             };
-            (model, variant)
+            let switch_confirmed = handles.sessions.provider_switch_confirmed(&self.session_id).await;
+            (model, variant, switch_confirmed)
         };
         self.turn_variant = variant;
         if let Some(model) = model.as_ref() {
             match handles.backend.model_pick_route(&self.session_id, model).await {
                 Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
+                    // A recorded pair may only become a **thread-level switch**
+                    // when it was confirmed as one (issue #910): a same-provider
+                    // model pick records it unconfirmed, and a peer that moved
+                    // the thread to another provider since makes the route
+                    // `ThreadModel`. Switching then would be an unconfirmed
+                    // provider change — refuse and ask for a re-pick, which goes
+                    // through the confirmation.
+                    if !switch_confirmed {
+                        return Err(crate::error::BridgeError::State(
+                            "这条线程的 provider 在你选择模型之后被其他客户端更改了；\
+                             这次保存的选择没有确认过线程级切换，本条消息没有发送。\
+                             请重新 `/model` 选择（新选择会先确认 provider 切换）。"
+                                .to_string(),
+                        ));
+                    }
                     let pair = crate::backend::parsing::join_model(&model.provider_id, &model.id);
                     self.settle_switch_variant(handles, &pair).await?;
                     if let Err(error) = handles.backend.apply_thread_model(&self.session_id, model).await {

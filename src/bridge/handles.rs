@@ -1343,6 +1343,12 @@ impl SessionsHandle {
     /// they describe (issue #910), read under one store lock: a `/new` cannot
     /// slip between the two, so a classified pending can be re-verified by
     /// identity at the write. The epoch is `None` for a live session.
+    /// Whether the session's recorded pair was confirmed for a thread-level
+    /// switch (issue #910).
+    pub(crate) async fn provider_switch_confirmed(&self, session_id: &str) -> bool {
+        self.store.lock().await.provider_switch_confirmed(session_id)
+    }
+
     pub(crate) async fn settings_and_pending_epoch(
         &self,
         thread_key: &ThreadKey,
@@ -1455,10 +1461,7 @@ impl SessionsHandle {
             &session_id,
             snapshot.model.as_deref(),
             snapshot.variant.as_deref(),
-            MirrorWrite::Model {
-                model: model_spec,
-                clear_variant: None,
-            },
+            MirrorWrite::ProviderSwitch { model: model_spec },
         )?;
         Ok(pair_write_outcome(written))
     }

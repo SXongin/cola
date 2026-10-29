@@ -1052,6 +1052,15 @@ pub struct SessionEntry {
     /// doesn't declare the current variant.
     #[serde(default)]
     pub variant: Option<String>,
+    /// When true, the recorded `model` was **confirmed for a thread-level
+    /// switch** (issue #910): a cross-provider `/model` confirmation records
+    /// the pair with this set, and the turn pre-flight may then release/resume
+    /// the thread to apply it. A same-provider model pick records it `false`,
+    /// so a thread whose provider moved underneath that pick is refused (the
+    /// user re-picks through the confirmation) instead of switched
+    /// unconfirmed. Persisted; the safe default is `false`.
+    #[serde(default)]
+    pub provider_switch_confirmed: bool,
     /// When true, pending permission requests for this session are answered
     /// automatically (`/autoaccept`) instead of showing a Feishu card.
     #[serde(default)]
@@ -1084,6 +1093,7 @@ impl SessionEntry {
             agent: None,
             model: None,
             variant: None,
+            provider_switch_confirmed: false,
             auto_accept: false,
             topic_anchor: None,
             topic_root: None,
