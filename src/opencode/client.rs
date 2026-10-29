@@ -623,8 +623,25 @@ impl OpenCodeBackend {
     /// that provider's models, keeping the two-page flow's callback values —
     /// provider ids on the root page, `provider/model` on the model page.
     pub async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
-        let providers = self.list_models().await;
-        model_surface_from_providers(&providers, &query)
+        // The read is **bounded** (issue #908): a server that accepts the
+        // request and then stalls must not keep a detached card handler alive
+        // past Feishu's ack deadline. A callback read may spend only what its
+        // budget leaves after the card build and the ack; a command page keeps
+        // a fixed allowance. Past the bound the surface degrades to what is
+        // known (nothing, for this all-or-nothing read) plus a note.
+        let bound = model_surface_timeout(query.ack_budget);
+        let (providers, timed_out) = match tokio::time::timeout(bound, self.list_models()).await {
+            Ok(providers) => (providers, false),
+            Err(_) => (Vec::new(), true),
+        };
+        let mut surface = model_surface_from_providers(&providers, &query);
+        if timed_out && let Some(scope) = surface.scopes.first_mut() {
+            scope.note = Some(format!(
+                "_（读取 provider 超时（{} 毫秒）：先显示已知内容，可稍后重试）_",
+                bound.as_millis()
+            ));
+        }
+        surface
     }
 
     pub async fn session_info(
@@ -663,6 +680,29 @@ impl OpenCodeBackend {
     pub(crate) fn disable_env_proxy(&self, username: Option<&str>, password: Option<&str>) {
         self.transport.disable_env_proxy(username, password);
     }
+}
+
+/// The fixed allowance a **command-page** `/provider` read gets (issue #908):
+/// a server that stalls must not leave the read running forever.
+#[cfg(not(test))]
+const MODEL_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+#[cfg(test)]
+const MODEL_SURFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// What a card build and its ack response need out of a callback budget; the
+/// provider read may spend only the remainder.
+const CALLBACK_ACK_MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The total bound for one `/provider` read: the callback budget minus the
+/// card/ack margin when there is one, never more than [`MODEL_SURFACE_TIMEOUT`].
+fn model_surface_timeout(ack_budget: Option<std::time::Duration>) -> std::time::Duration {
+    ack_budget
+        .map(|budget| {
+            budget
+                .saturating_sub(CALLBACK_ACK_MARGIN)
+                .min(MODEL_SURFACE_TIMEOUT)
+        })
+        .unwrap_or(MODEL_SURFACE_TIMEOUT)
 }
 
 /// Map `GET /provider`'s provider → model tree onto the client-declared

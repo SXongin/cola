@@ -342,6 +342,15 @@ impl ThreadProjection {
         self.incomplete = true;
     }
 
+    /// Forget the thread's model fact (issue #910). Called when this
+    /// connection's hold on the thread ended ambiguously: the server may have
+    /// taken a peer's provider/model since, so keeping ours would let
+    /// `thread_provider` classify a pick as per-turn against a stale channel.
+    /// The next `thread/read` re-learns the fact.
+    pub(crate) fn forget_model(&mut self) {
+        self.model = None;
+    }
+
     /// Clear a truncation that no longer applies (a thread resolved as
     /// never-run: an empty transcript is complete, not a prefix).
     pub(crate) fn clear_incomplete(&mut self) {

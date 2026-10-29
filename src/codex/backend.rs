@@ -816,10 +816,17 @@ impl Projections {
             .lock()
             .expect("codex subscription states")
             .remove(thread_id);
-        self.projection(thread_id)
-            .lock()
-            .expect("codex projection")
-            .mark_incomplete();
+        {
+            let shared = self.projection(thread_id);
+            let mut projection = shared.lock().expect("codex projection");
+            projection.mark_incomplete();
+            // A release is not a guarantee the server still runs our pair: a
+            // peer may have moved the thread before (or while) our unsubscribe
+            // landed, and a timed-out ack is exactly that ambiguity. Forget the
+            // fact so nothing classifies a pick as per-turn against a stale
+            // provider; the next read re-learns it (issue #910).
+            projection.forget_model();
+        }
         self.notify_ready(thread_id);
     }
 }
@@ -5102,6 +5109,7 @@ mod tests {
                 base_url: None,
                 token: None,
                 env_key: None,
+                mixed_layers: false,
             });
         // A provider comes to the card as a **pair** (issue #910); a profile is
         // Codex's own declaration of one.
@@ -7595,6 +7603,86 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Issue #910 (blocking): an ambiguous release (the unsubscribe reached the
+    /// server but its ack missed the bound) must **forget** this connection's
+    /// provider fact. A peer may have moved the thread since; keeping the old
+    /// provider would classify a pick for it as per-turn and send the model to
+    /// the peer's provider. With the fact unknown, the route takes the
+    /// read-back path (`thread/read`), and a read that fails stops by name in
+    /// the pre-flight — it never sends blind.
+    #[tokio::test]
+    async fn an_ambiguous_release_forgets_the_provider_fact() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+        assert_eq!(
+            client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id),
+            Some("openai".to_string())
+        );
+
+        // A peer moves the thread while cola still holds it, then our
+        // unsubscribe's ack misses the bound: the release is **ambiguous**.
+        server.set_thread_model("thread-1", Some("deepseek-v4-pro"), Some("deepseek"));
+        server.set_unsubscribe_delay(Duration::from_millis(2_500));
+        // The step's bound elapses while the unsubscribe ack is still pending:
+        // the release is ambiguous, exactly as `apply_thread_model`'s bounded
+        // call sees it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), client.release_thread("thread-1"))
+                .await
+                .is_err(),
+            "the ack misses the step bound"
+        );
+        assert_eq!(
+            client.projections.model("thread-1"),
+            None,
+            "the stale provider fact is forgotten, not marked merely incomplete"
+        );
+
+        // Let the delayed ack land before the read: the fake server serialises
+        // the connection, so a read during the pending unsubscribe would only
+        // prove the timeout path (and that is the pre-flight's job, tested
+        // separately).
+        tokio::time::sleep(Duration::from_millis(2_600)).await;
+        // A pick for the stale provider is a thread-level change (the read
+        // path), never a per-turn send to the peer's provider.
+        let stale = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
+        assert_eq!(
+            Backend::model_pick_route(&client, "thread-1", &stale)
+                .await
+                .unwrap(),
+            crate::backend::types::ModelPickRoute::ThreadModel
+        );
+        // The peer's own pair is the per-turn path: the read learned it.
+        let moved = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
+        assert_eq!(
+            Backend::model_pick_route(&client, "thread-1", &moved)
+                .await
+                .unwrap(),
+            crate::backend::types::ModelPickRoute::PerTurn
+        );
     }
 
     /// Issue #910 (item 5): a **stalled unsubscribe** takes the release handle

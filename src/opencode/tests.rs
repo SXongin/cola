@@ -19,6 +19,44 @@ fn wire_backend(server: &TestHttpServer) -> OpenCodeBackend {
     backend
 }
 
+/// Issue #908: a `/provider` request the server accepts and then stalls is
+/// bounded. A callback read returns **inside its budget** with the degraded
+/// surface (known content plus a note), so a detached card handler cannot
+/// outlive Feishu's ack deadline.
+#[tokio::test]
+async fn a_stalled_provider_read_returns_inside_the_callback_budget() {
+    let server = TestHttpServer::start().await;
+    server.route_delayed(
+        "GET",
+        crate::opencode::v1::PROVIDER_ROUTE_FOR_TESTS,
+        200,
+        "{}",
+        std::time::Duration::from_secs(30),
+    );
+    let backend = wire_backend(&server);
+    let started = std::time::Instant::now();
+    let surface = backend
+        .model_surface(crate::backend::types::ModelSurfaceQuery {
+            ack_budget: Some(crate::feishu::ws::CARD_ACK_BUDGET),
+            ..Default::default()
+        })
+        .await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the stalled read is bounded by the callback budget: {elapsed:?}"
+    );
+    let note = surface
+        .scopes
+        .first()
+        .and_then(|scope| scope.note.as_deref())
+        .unwrap_or_default();
+    assert!(
+        note.contains("超时"),
+        "the degradation is stated instead of hanging: {note}"
+    );
+}
+
 fn last_request(server: &TestHttpServer) -> RecordedRequest {
     server.requests().pop().expect("a request should have been sent")
 }
