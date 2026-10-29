@@ -300,6 +300,11 @@ pub struct ModelSurfaceQuery<'a> {
     /// stronger session fact may replace it; the bridge passes it so the
     /// card's current line keeps its one source of truth.
     pub current: Option<ModelSelection>,
+    /// A pair the bridge **recorded** for the next prompt but has not applied
+    /// to the thread yet (a confirmed provider switch, deferred or in flight).
+    /// A client with a thread-level provider shows it separately from the
+    /// current line, which must stay the thread fact (#908).
+    pub pending: Option<&'a str>,
     /// The scope the card has drilled into (`None` = the root page).
     pub scope: Option<&'a str>,
     /// The option tapped on the parent page that selected [`Self::scope`]

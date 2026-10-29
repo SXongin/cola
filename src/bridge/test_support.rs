@@ -4384,6 +4384,41 @@ pub(crate) enum CardUpdates {
 /// lands (the waits poll, so they return immediately).
 pub(crate) const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// Await a detached task's **patch** of the card `message_id` (issue #910
+/// AC4: the confirmation acks at once, then updates that card with the
+/// outcome), and return the card text that carries `needle`.
+pub(crate) async fn wait_for_card_text(
+    platform: &RecordingPlatform,
+    message_id: &str,
+    needle: &str,
+    within: std::time::Duration,
+) -> String {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let text = platform
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter_map(|call| match call {
+                PlatformCall::UpdateMessage { message_id: id, card } if id == message_id => {
+                    Some(card.to_string())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no `{needle}` update for card {message_id}: {text}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Await a spawned handler by polling `is_finished`, not by racing a fixed
 /// timeout: the very next poll after the work lands sees it, so the wait cannot
 /// lose a race a longer timeout would merely postpone.

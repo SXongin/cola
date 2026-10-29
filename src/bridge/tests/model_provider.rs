@@ -221,79 +221,6 @@ async fn a_provider_pick_with_the_gate_off_only_toasts() {
     );
 }
 
-/// The record-first shape: the confirmation **records** the pair and answers
-/// synchronously; the next prompt's pre-flight applies it before submitting.
-#[tokio::test]
-async fn a_confirmed_switch_is_recorded_then_applied_by_the_next_prompt() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend
-        .with_model_pick_route(ModelPickRoute::ThreadModel)
-        .with_provider_change_scope(ChangeScope::ResumeOnly);
-    let applies = backend.thread_model_calls.clone();
-    let prompt_models = backend.prompt_models.clone();
-    let (app, _platform) = build_app(cfg, backend).await;
-    let mut entry = entry();
-    entry.model = Some("openai/gpt-5.1-codex".into());
-    seed_entry(&app, entry).await;
-
-    let step = app
-        .host_action(paired_pick(PROVIDER, MODEL))
-        .await
-        .expect("provider pick");
-    let card = step.card.expect("a confirmation card");
-    assert!(card.to_string().contains("deepseek/deepseek-v4-pro"));
-    assert_eq!(applies.lock().await.len(), 0, "the pick applied nothing");
-
-    let step = app
-        .host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
-        .await
-        .expect("confirm");
-    let ack = step.card.expect("the recorded card");
-    assert!(
-        ack.to_string().contains("已记录") && ack.to_string().contains("下一条消息"),
-        "the click records the pair for the next message: {ack}"
-    );
-    assert!(
-        applies.lock().await.is_empty(),
-        "a confirmation never touches the thread"
-    );
-    assert_eq!(
-        app.sessions
-            .lock()
-            .await
-            .get_active(&key())
-            .cloned()
-            .unwrap()
-            .model
-            .as_deref(),
-        Some("deepseek/deepseek-v4-pro"),
-        "the pair is the recorded mirror"
-    );
-
-    app.handle_message(incoming(
-        "msg_prompt".into(),
-        "chat_1".into(),
-        "p2p".into(),
-        None,
-        "hi".into(),
-        None,
-    ))
-    .await;
-    assert_eq!(
-        applies.lock().await.as_slice(),
-        &[("ses_test".to_string(), "deepseek/deepseek-v4-pro".to_string())],
-        "the prompt's pre-flight applied the recorded pair once"
-    );
-    assert_eq!(
-        prompt_models.lock().await.last().cloned().flatten().as_deref(),
-        Some("deepseek/deepseek-v4-pro"),
-        "and the prompt was submitted with it"
-    );
-}
-
 /// Item 3 of the owner's bullets: a pick made **while a turn is running** needs
 /// no special case — it is recorded, and the next prompt applies it.
 #[tokio::test]
@@ -309,7 +236,7 @@ async fn a_pick_during_a_turn_is_applied_by_the_next_prompt() {
     let prompt_calls = backend.prompt_calls.clone();
     let prompt_models = backend.prompt_models.clone();
     let gate = backend.hold_prompts();
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, platform) = build_app(cfg, backend).await;
     app.turn_render_poll_ms
         .store(5, std::sync::atomic::Ordering::Relaxed);
     seed_entry(&app, entry()).await;
@@ -333,9 +260,16 @@ async fn a_pick_during_a_turn_is_applied_by_the_next_prompt() {
     assert!(
         step.card
             .as_ref()
-            .is_some_and(|card| card.to_string().contains("已记录")),
-        "a mid-turn confirmation records, it does not switch"
+            .is_some_and(|card| card.to_string().contains("正在切换")),
+        "the ack is immediate"
     );
+    wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "已记录",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert!(
         applies.lock().await.is_empty(),
         "the running turn is not disturbed"
@@ -389,6 +323,9 @@ async fn a_recorded_switch_that_cannot_apply_stops_the_prompt() {
     entry.model = Some("openai/gpt-5.1-codex".into());
     seed_entry(&app, entry).await;
 
+    // A turn in flight: the hybrid defers the pair, so the prompt's pre-flight
+    // is what attempts the switch and reports the failure (issue #910 AC4).
+    app.inflight.lock().await.insert("ses_test".to_string());
     let step = app
         .host_action(paired_pick(PROVIDER, MODEL))
         .await
@@ -397,6 +334,14 @@ async fn a_recorded_switch_that_cannot_apply_stops_the_prompt() {
     app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
         .await
         .expect("confirm");
+    wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "已记录",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    app.inflight.lock().await.remove("ses_test");
 
     // The turn ends on its error card: the prompt is never submitted.
     app.handle_message(incoming(
@@ -491,10 +436,12 @@ async fn a_failed_record_does_not_report_success() {
     backend
         .with_model_pick_route(ModelPickRoute::ThreadModel)
         .with_provider_change_scope(ChangeScope::ResumeOnly);
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
     seed_entry(&app, entry).await;
+    // A turn in flight: the confirmation takes the deferred (record-only) path.
+    app.inflight.lock().await.insert("ses_test".to_string());
 
     let step = app
         .host_action(paired_pick(PROVIDER, MODEL))
@@ -505,16 +452,20 @@ async fn a_failed_record_does_not_report_success() {
     std::fs::remove_file(&sessions).expect("the seeded store file");
     std::fs::create_dir(&sessions).expect("replace the store with a directory");
 
-    let step = app
-        .host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
         .await
         .expect("confirm");
-    let text = format!("{:?}{:?}", step.card, step.toast);
+    let text = wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "无法记录",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert!(
-        !text.contains("已记录：下一条消息"),
+        !text.contains("已记录"),
         "a failed record must not claim it was recorded: {text}"
     );
-    assert!(text.contains("保存") || text.contains("失败"), "{text}");
 }
 
 /// A replayed confirmation is idempotent: the same pair, written twice, leaves
@@ -529,8 +480,11 @@ async fn a_replayed_confirmation_is_idempotent() {
         .with_model_pick_route(ModelPickRoute::ThreadModel)
         .with_provider_change_scope(ChangeScope::ResumeOnly);
     let applies = backend.thread_model_calls.clone();
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, platform) = build_app(cfg, backend).await;
     seed_entry(&app, entry()).await;
+    // A turn in flight: the confirmation takes the deferred (record-only) path,
+    // so a replay is an idempotent second record, never a second switch.
+    app.inflight.lock().await.insert("ses_test".to_string());
 
     let step = app
         .host_action(paired_pick(PROVIDER, MODEL))
@@ -541,9 +495,23 @@ async fn a_replayed_confirmation_is_idempotent() {
     app.host_action_on_message(confirm.clone(), "om_confirm")
         .await
         .expect("first confirm");
-    app.host_action_on_message(confirm, "om_confirm")
+    wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "已记录",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    app.host_action_on_message(confirm, "om_confirm_replay")
         .await
         .expect("replayed confirm");
+    wait_for_card_text(
+        &platform,
+        "om_confirm_replay",
+        "已记录",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1141,6 +1109,15 @@ async fn the_model_text_form_confirms_a_provider_change() {
     app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
         .await
         .expect("confirm");
+    // Idle: the confirmation switches now (the ack is immediate, the outcome
+    // patches the card).
+    wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "已切换",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1151,7 +1128,7 @@ async fn the_model_text_form_confirms_a_provider_change() {
             .model
             .as_deref(),
         Some("deepseek/deepseek-v4-pro"),
-        "the confirmation records the pair"
+        "the thread and the mirror run the pair"
     );
 }
 
@@ -1168,7 +1145,7 @@ async fn a_remap_before_the_record_lands_writes_nothing() {
     backend
         .with_model_pick_route(ModelPickRoute::ThreadModel)
         .with_provider_change_scope(ChangeScope::ResumeOnly);
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
     entry.variant = Some("high".into());
@@ -1208,8 +1185,14 @@ async fn a_remap_before_the_record_lands_writes_nothing() {
         .expect("the new mapping activates");
     drop(held);
 
-    let step = confirm.await.expect("the confirm joins").expect("a result");
-    let text = format!("{:?}{:?}", step.card, step.toast);
+    confirm.await.expect("the confirm joins").expect("a result");
+    let text = wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "状态已变化",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert!(
         text.contains("状态已变化") || text.contains("过期"),
         "the record is refused honestly: {text}"
@@ -1474,8 +1457,7 @@ async fn a_confirmation_acks_without_a_catalog_read() {
         .with_model_pick_route(ModelPickRoute::ThreadModel)
         .with_provider_change_scope(ChangeScope::ResumeOnly);
     let gate = backend.hold_model_surface();
-    let entered = backend.model_surface_gate_entered.clone();
-    let (app, _platform) = build_app(cfg, backend).await;
+    let (app, platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
     entry.variant = Some("high".into());
@@ -1486,6 +1468,8 @@ async fn a_confirmation_acks_without_a_catalog_read() {
         .await
         .expect("provider pick");
     let card = step.card.expect("a confirmation card");
+    // The ack answers at once even while the catalog read (the detached task's
+    // record) is parked: a confirmation must never wait on a catalog.
     let step = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm"),
@@ -1493,17 +1477,22 @@ async fn a_confirmation_acks_without_a_catalog_read() {
     .await
     .expect("the confirmation acks inside the card budget")
     .expect("a result");
-    assert_eq!(
-        entered.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "the confirmation read no catalog"
-    );
     assert!(
         step.card
             .as_ref()
-            .is_some_and(|card| card.to_string().contains("已记录")),
-        "the recorded card is the ack"
+            .is_some_and(|card| card.to_string().contains("正在切换")),
+        "the switching card is the ack"
     );
+    // Releasing the catalog lets the detached task finish: it records the pair
+    // and patches the card.
+    gate.add_permits(1);
+    wait_for_card_text(
+        &platform,
+        "om_confirm",
+        "已切换",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(
         app.sessions
             .lock()
@@ -1803,14 +1792,19 @@ async fn a_racing_think_replaces_the_cleared_variant_instead_of_sending_it() {
     entry.variant = Some("high".into());
     seed_entry(&app, entry).await;
 
-    let step = app
-        .host_action(paired_pick(PROVIDER, MODEL))
+    // The recorded pair, written directly: this test is about the pre-flight's
+    // variant race, not the confirmation (whose catalog gate is held here).
+    let recorded = app
+        .sessions_handle()
+        .record_pair_expecting(&key(), Some("ses_test"), &format!("{PROVIDER}/{MODEL}"))
         .await
-        .expect("provider pick");
-    let card = step.card.expect("a confirmation card");
-    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
-        .await
-        .expect("confirm");
+        .expect("the record runs");
+    assert_eq!(
+        recorded,
+        crate::bridge::handles::PickOutcome::Applied {
+            cleared_variant: None
+        }
+    );
 
     prompt(&app, "msg_prompt", "hi");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -2079,14 +2073,19 @@ async fn a_racing_unsupported_variant_stops_the_prompt_by_name() {
     entry.variant = Some("high".into());
     seed_entry(&app, entry).await;
 
-    let step = app
-        .host_action(paired_pick(PROVIDER, MODEL))
+    // The recorded pair, written directly: this test is about the pre-flight's
+    // variant clear, not the confirmation (whose catalog gate is held here).
+    let recorded = app
+        .sessions_handle()
+        .record_pair_expecting(&key(), Some("ses_test"), &format!("{PROVIDER}/{MODEL}"))
         .await
-        .expect("provider pick");
-    let card = step.card.expect("a confirmation card");
-    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
-        .await
-        .expect("confirm");
+        .expect("the record runs");
+    assert_eq!(
+        recorded,
+        crate::bridge::handles::PickOutcome::Applied {
+            cleared_variant: None
+        }
+    );
 
     prompt(&app, "msg_prompt", "hi");
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -2854,4 +2853,127 @@ async fn a_slashed_provider_id_round_trips_through_a_card_pair() {
         &[(Some("foo/bar".to_string()), Some("gpt".to_string()))],
         "the creation carries the same pair"
     );
+}
+
+/// Issue #910 AC4 (hybrid): a confirmation while a turn is in flight defers —
+/// the pair is recorded and the next prompt's pre-flight applies it, exactly as
+/// before the hybrid.
+#[tokio::test]
+async fn a_confirmation_during_a_turn_defers_to_the_next_prompt() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let applies = backend.thread_model_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    // A turn is in flight for the session (the admission set `Turn::start`
+    // holds for the whole turn).
+    app.inflight.lock().await.insert("ses_test".to_string());
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    let step = app
+        .host_action_on_message(button_value(&card, "model_provider_confirm"), "om_card")
+        .await
+        .expect("confirm");
+    assert!(
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("正在切换")),
+        "the ack is immediate"
+    );
+    // The detached switch records and answers; nothing thread-level runs.
+    wait_for_card_text(&platform, "om_card", "已记录", std::time::Duration::from_secs(10)).await;
+    assert!(
+        applies.lock().await.is_empty(),
+        "no thread-level switch while a turn is in flight"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the pair is recorded"
+    );
+
+    // The next prompt applies it (the unchanged pre-flight path).
+    app.inflight.lock().await.remove("ses_test");
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert!(
+        !applies.lock().await.is_empty(),
+        "the pre-flight applied the deferred pair"
+    );
+}
+
+/// Issue #910 AC4 (hybrid): an idle confirmation switches immediately — the
+/// named failure leaves the mirror on the pair the thread still runs (the
+/// record is rolled back).
+#[tokio::test]
+async fn a_failed_immediate_switch_keeps_the_old_pair() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly)
+        .fail_provider_switch(
+            "thread/resume 之后这条线程仍是 `openai/gpt-5.1-codex`：可能被另一个客户端持有",
+        );
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    app.host_action_on_message(button_value(&card, "model_provider_confirm"), "om_card")
+        .await
+        .expect("confirm");
+
+    let text = wait_for_card_text(
+        &platform,
+        "om_card",
+        "没有生效",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        text.contains("thread/resume"),
+        "the named error is on the card: {text}"
+    );
+    let active = app.sessions.lock().await.get_active(&key()).cloned().unwrap();
+    assert_eq!(
+        active.model.as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the record was rolled back to the pair the thread still runs"
+    );
+    assert_eq!(active.variant.as_deref(), Some("high"), "and its thinking level");
 }

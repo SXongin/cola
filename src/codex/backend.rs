@@ -808,6 +808,16 @@ impl Projections {
         self.threads.lock().expect("codex projections").len()
     }
 
+    /// Forget one thread's model fact (issue #910): called when a switch's
+    /// outcome is **unknown**, so no stale provider serves a per-turn
+    /// classification. The next read re-learns it.
+    pub(crate) fn forget_model(&self, thread_id: &str) {
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .forget_model();
+    }
+
     /// Forget a dead subscription so the next read adopts again, and state the
     /// gap on the retained history: a later read must not present stale state
     /// as current.
@@ -816,17 +826,10 @@ impl Projections {
             .lock()
             .expect("codex subscription states")
             .remove(thread_id);
-        {
-            let shared = self.projection(thread_id);
-            let mut projection = shared.lock().expect("codex projection");
-            projection.mark_incomplete();
-            // A release is not a guarantee the server still runs our pair: a
-            // peer may have moved the thread before (or while) our unsubscribe
-            // landed, and a timed-out ack is exactly that ambiguity. Forget the
-            // fact so nothing classifies a pick as per-turn against a stale
-            // provider; the next read re-learns it (issue #910).
-            projection.forget_model();
-        }
+        self.projection(thread_id)
+            .lock()
+            .expect("codex projection")
+            .mark_incomplete();
         self.notify_ready(thread_id);
     }
 }
@@ -1025,6 +1028,31 @@ impl CodexClient {
             input.push(json!({ "type": "skill", "name": skill.name, "path": path }));
         }
         Ok(Value::Array(input))
+    }
+
+    /// The thread's own model fact (issue #908): the ordered projection when
+    /// this connection has one; otherwise — only on a **command page**
+    /// (`may_read`, never a card callback's ack budget) — one bounded
+    /// `thread/read`. `None` is unknown, never a guess.
+    async fn thread_model_fact(
+        &self,
+        session_id: Option<&str>,
+        may_read: bool,
+    ) -> Option<crate::backend::ModelIdentity> {
+        let session_id = session_id?;
+        if let Some(fact) = self.projections.model(session_id) {
+            return Some(fact);
+        }
+        if !may_read {
+            return None;
+        }
+        let observed = self.projections.next_model_stamp();
+        if let Ok(Ok(thread)) =
+            tokio::time::timeout(PROVIDER_READ_TIMEOUT, self.threads().read(session_id, false)).await
+        {
+            self.projections.remember_thread_metadata(&thread, observed);
+        }
+        self.projections.model(session_id)
     }
 
     /// The provider this connection has observed for the thread (issue #910).
@@ -2068,6 +2096,13 @@ impl Backend for CodexClient {
         // attempted — nothing has moved.
         let released = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread(session_id)).await;
         if !matches!(released, Ok(Ok(()))) {
+            // Ambiguous (issue #910): the unsubscribe may have reached the
+            // server while its answer was lost, so a peer may have moved the
+            // thread since. Forget this connection's provider fact — keeping it
+            // would let `thread_provider` classify a pick for the old provider
+            // as per-turn, sending the model to the peer's channel. The restore
+            // read below re-learns the truth (or leaves it unknown).
+            self.projections.forget_model(session_id);
             self.restore_after_release(session_id).await;
             return match released {
                 Ok(Err(error)) => Err(client_error(error)),
@@ -2111,6 +2146,10 @@ impl Backend for CodexClient {
         let read = match read {
             Ok(result) => result.map_err(client_error)?,
             Err(_) => {
+                // The verdict could not be read: the thread's pair is unknown,
+                // so no stale fact may serve a per-turn classification (issue
+                // #910). A later prompt reads before deciding.
+                self.projections.forget_model(session_id);
                 return Err(switch_step_timeout(
                     "thread/read",
                     "无法确认线程是否已切换，本地记录按原样恢复",
@@ -2637,21 +2676,48 @@ impl Backend for CodexClient {
         } else {
             self.model_probes.probe_all(&config.providers).await
         };
-        // A picker pick records the neutral `codex` bucket, so the thread's own
-        // ordered model fact (when this connection has one) is the honest
-        // provider marker.
-        let thread_provider = query
-            .session_id
-            .and_then(|session_id| self.projections.model(session_id))
-            .map(|model| model.provider_id);
-        super::model_surface::build_surface(
+        // The thread's own pair is the current line (issue #908): a recorded
+        // but unapplied pair is shown separately, so the footer (the thread
+        // fact) and this line stay same-source. A neutral provider fact names
+        // no channel, so it keeps the caller's resolved line.
+        let thread_model = self
+            .thread_model_fact(query.session_id, query.ack_budget.is_none())
+            .await;
+        let thread_provider = thread_model.as_ref().map(|model| model.provider_id.clone());
+        let mut effective_query = query.clone();
+        let mut current_reference = None;
+        if let Some(model) = &thread_model
+            && model.provider_id != MODEL_PROVIDER
+        {
+            let reference = format!("{}/{}", model.provider_id, model.model_id);
+            let label = match model.variant.as_deref() {
+                Some(variant) => format!("{reference}@{variant}"),
+                None => reference.clone(),
+            };
+            current_reference = Some(reference.clone());
+            effective_query.current = Some(crate::backend::types::ModelSelection { label, reference });
+        }
+        let mut surface = super::model_surface::build_surface(
             &catalog,
             &config,
             &probes,
             thread_provider.as_deref(),
             self.threads().provider_switch_on_resume(),
-            &query,
-        )
+            &effective_query,
+        );
+        // The recorded pair, when the thread has not run it yet: a separate
+        // line, never the current one.
+        if let Some(pending) = query.pending
+            && current_reference.as_deref() != Some(pending)
+            && let Some(scope) = surface.scopes.first_mut()
+        {
+            let line = format!("待应用：`{pending}`（下一条消息前切换）");
+            scope.note = Some(match scope.note.take() {
+                Some(note) => format!("{note}　{line}"),
+                None => line,
+            });
+        }
+        surface
     }
 
     async fn session_info(&self, session_id: &str, _directory: Option<&str>) -> Result<SessionInfo> {
@@ -5205,6 +5271,51 @@ mod tests {
         );
     }
 
+    /// Issue #908: a pair the bridge recorded but the thread has not run yet is
+    /// **not** the current line. The current line is the thread's own pair; the
+    /// recorded one is shown as 待应用, so the footer and the card agree.
+    #[tokio::test]
+    async fn a_recorded_pair_is_pending_not_current() {
+        use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
+
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        let surface = Backend::model_surface(
+            &client,
+            ModelSurfaceQuery {
+                session_id: Some("thread-1"),
+                directory: Some("/work/cola"),
+                current: Some(ModelSelection {
+                    label: "deepseek/deepseek-v4-pro".into(),
+                    reference: "deepseek/deepseek-v4-pro".into(),
+                }),
+                pending: Some("deepseek/deepseek-v4-pro"),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            surface.current.as_ref().map(|current| current.reference.as_str()),
+            Some("openai/gpt-5.1-codex"),
+            "the current line is the thread's pair"
+        );
+        let note = surface.scopes[0].note.as_deref().unwrap_or_default();
+        assert!(
+            note.contains("待应用") && note.contains("deepseek/deepseek-v4-pro"),
+            "the recorded pair is shown separately: {note}"
+        );
+    }
+
     /// The wired surface: `config/read` supplies providers, the config default
     /// and profiles; a provider with a token is probed against its own
     /// `/models`; a second open inside the TTL reuses that answer.
@@ -7643,39 +7754,36 @@ mod tests {
         );
 
         // A peer moves the thread while cola still holds it, then our
-        // unsubscribe's ack misses the bound: the release is **ambiguous**.
+        // unsubscribe's ack misses the bound: the switch is ambiguous.
         server.set_thread_model("thread-1", Some("deepseek-v4-pro"), Some("deepseek"));
         server.set_unsubscribe_delay(Duration::from_millis(2_500));
-        // The step's bound elapses while the unsubscribe ack is still pending:
-        // the release is ambiguous, exactly as `apply_thread_model`'s bounded
-        // call sees it.
+        let stale = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
+        let error = Backend::apply_thread_model(&client, "thread-1", &stale)
+            .await
+            .expect_err("the release misses its bound");
         assert!(
-            tokio::time::timeout(Duration::from_millis(600), client.release_thread("thread-1"))
-                .await
-                .is_err(),
-            "the ack misses the step bound"
+            error.to_string().contains("thread/unsubscribe"),
+            "the named failure is the release step: {error}"
         );
-        assert_eq!(
-            client.projections.model("thread-1"),
-            None,
-            "the stale provider fact is forgotten, not marked merely incomplete"
+        assert_ne!(
+            client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id),
+            Some("openai".to_string()),
+            "the stale provider fact is forgotten, never merely marked incomplete"
         );
 
-        // Let the delayed ack land before the read: the fake server serialises
-        // the connection, so a read during the pending unsubscribe would only
-        // prove the timeout path (and that is the pre-flight's job, tested
-        // separately).
+        // Let the delayed ack land, then the read path learns the peer's pair:
+        // a pick for the stale provider is a thread-level change, and the
+        // peer's own pair is the per-turn path.
         tokio::time::sleep(Duration::from_millis(2_600)).await;
-        // A pick for the stale provider is a thread-level change (the read
-        // path), never a per-turn send to the peer's provider.
-        let stale = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
         assert_eq!(
             Backend::model_pick_route(&client, "thread-1", &stale)
                 .await
                 .unwrap(),
             crate::backend::types::ModelPickRoute::ThreadModel
         );
-        // The peer's own pair is the per-turn path: the read learned it.
         let moved = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
         assert_eq!(
             Backend::model_pick_route(&client, "thread-1", &moved)
