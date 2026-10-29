@@ -3131,6 +3131,13 @@ impl crate::backend::Backend for MockBackend {
         self.thread_provider
     }
 
+    /// The mock's neutral catalog bucket is Codex's (`codex`), so an
+    /// OpenCode-shaped mock (no provider axis) never exercises it and a
+    /// Codex-shaped one treats it as reserved (issues #906, #910).
+    fn is_neutral_provider(&self, provider: &str) -> bool {
+        provider == "codex"
+    }
+
     fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
         self.observed_thread_model.clone()
     }

@@ -449,6 +449,9 @@ struct State {
     hide_live_turns: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// One-shot delay for the next `thread/read` reply (a stale read, #910).
     read_delay: std::sync::Mutex<std::time::Duration>,
+    /// `thread/read` calls received, so a test can wait until its read is in
+    /// flight before interleaving a broadcast (issue #908).
+    read_calls: AtomicUsize,
     /// One-shot: leave the next `thread/read` unanswered (a stalled read).
     silent_thread_read: std::sync::atomic::AtomicBool,
     /// Answer the next `thread/read` with THIS thread instead of the requested
@@ -536,6 +539,7 @@ impl Default for State {
             drop_on_compact: std::sync::atomic::AtomicBool::new(false),
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
+            read_calls: AtomicUsize::new(0),
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             read_returns: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
@@ -1197,6 +1201,11 @@ impl FakeServer {
         self.state.drop_on_compact.store(true, Ordering::SeqCst);
     }
 
+    /// `thread/read` calls received (issue #908).
+    pub(crate) fn read_calls(&self) -> usize {
+        self.state.read_calls.load(Ordering::SeqCst)
+    }
+
     /// Delay the next `thread/read` reply by `delay` (one-shot). The payload is
     /// captured **before** the delay, so the reply is stale by the time it
     /// lands — a broadcast arriving meanwhile must win (issue #910).
@@ -1440,6 +1449,7 @@ where
             reply(sink, id, json!({})).await
         }
         Some("thread/read") => {
+            state.read_calls.fetch_add(1, Ordering::SeqCst);
             if state.silent_thread_read.swap(false, Ordering::SeqCst) {
                 return true;
             }

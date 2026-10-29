@@ -2665,6 +2665,19 @@ impl App {
                 .model
                 .as_deref()
                 .and_then(crate::backend::parsing::parse_model);
+        } else if self.client.has_thread_provider() {
+            // A neutral-bucket pick (or any pairless pick on a provider-axis
+            // client) names only the model at creation: `thread/start` takes the
+            // bare id and must not carry `modelProvider` (issue #906).
+            input.model = pending
+                .model
+                .as_deref()
+                .and_then(crate::backend::parsing::parse_model)
+                .map(|model| crate::backend::types::ModelInfo {
+                    id: model.id,
+                    provider_id: model.provider_id,
+                    variant: None,
+                });
         }
         let session = self.client.create_session(&input).await?;
         // A thread forgotten or re-declared while `thread/start` ran is stale:

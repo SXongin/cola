@@ -1531,11 +1531,14 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
 /// failure itself (issue #910).
 impl CodexClient {
     async fn restore_after_release(&self, session_id: &str) {
+        // The stamp is taken **before** the read (ADR-0092's #904 amendment): a
+        // `thread/settings/updated` arriving while the recovery read is in
+        // flight is newer, and the projection drops the older answer.
+        let observed = self.projections.next_model_stamp();
         if let Ok(Ok(read)) =
             tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false)).await
         {
-            self.projections
-                .remember_thread_metadata(&read, self.projections.next_model_stamp());
+            self.projections.remember_thread_metadata(&read, observed);
         }
         match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.ensure_subscription(session_id)).await {
             Ok(Ok(())) => {}
@@ -2732,7 +2735,19 @@ impl Backend for CodexClient {
             && model.provider_id != MODEL_PROVIDER
         {
             let reference = format!("{}/{}", model.provider_id, model.model_id);
-            let label = match model.variant.as_deref() {
+            // The thread read carries no `/think` level; the resolved selection
+            // does (`provider/model@variant`). Compose the label from the thread's
+            // pair plus that level when it names this **model** — the resolved ref
+            // may sit on the neutral bucket (`codex/<id>`) while the thread runs a
+            // real provider — and fall back to the fact's own variant (issue
+            // #908).
+            let resolved_variant = query.current.as_ref().and_then(|current| {
+                let (base, variant) = current.label.split_once('@')?;
+                let same_model = crate::backend::parsing::parse_model(base)
+                    .is_some_and(|resolved| resolved.id == model.model_id);
+                same_model.then(|| variant.to_string())
+            });
+            let label = match resolved_variant.or_else(|| model.variant.clone()) {
                 Some(variant) => format!("{reference}@{variant}"),
                 None => reference.clone(),
             };
@@ -5330,6 +5345,45 @@ mod tests {
         assert!(surface.current.is_none());
     }
 
+    /// Issue #908: after `/think high` the current-model line keeps the level,
+    /// even though the thread read carries none: the label is the thread's pair
+    /// plus the **resolved selection's** variant.
+    #[tokio::test]
+    async fn the_current_line_keeps_the_resolved_think_level() {
+        use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
+
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-custom"), Some("openai"));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        let surface = Backend::model_surface(
+            &client,
+            ModelSurfaceQuery {
+                session_id: Some("thread-1"),
+                directory: Some("/work/cola"),
+                current: Some(ModelSelection {
+                    label: "codex/gpt-custom@high".into(),
+                    reference: "codex/gpt-custom".into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            surface.current.as_ref().map(|current| current.label.as_str()),
+            Some("openai/gpt-custom@high"),
+            "the thread's pair plus the resolved `/think` level"
+        );
+    }
+
     /// Issue #908: a pair the bridge recorded but the thread has not run yet is
     /// **not** the current line. The current line is the thread's own pair; the
     /// recorded one is shown as 待应用, so the footer and the card agree.
@@ -7773,6 +7827,78 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Issue #908: the **recovery** read of an ambiguous release follows the
+    /// same stamp rule — a broadcast that lands while it is in flight wins and
+    /// the stale result is dropped.
+    #[tokio::test]
+    async fn a_stale_recovery_read_does_not_overwrite_a_newer_broadcast() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a shared thread",
+        ));
+        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+        let endpoint = Endpoint::parse(&url).expect("endpoint");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
+        client.transcript("thread-1").await.expect("adopt");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        // The recovery read captures `openai` and then stalls.
+        let reads_before = server.read_calls();
+        server.set_read_delay(Duration::from_millis(500));
+        let restore = tokio::spawn({
+            let client = client.clone();
+            async move { client.restore_after_release("thread-1").await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.read_calls() == reads_before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the recovery read never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // A broadcast lands while it is in flight.
+        server.push_thread_settings("thread-1", "deepseek-v4-pro", "deepseek", None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id)
+                == Some("deepseek".to_string())
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the broadcast fact never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        restore.await.expect("the restore joins");
+        assert_eq!(
+            client
+                .projections
+                .model("thread-1")
+                .map(|model| model.provider_id),
+            Some("deepseek".to_string()),
+            "the stale recovery read never overwrites the broadcast"
+        );
     }
 
     /// Issue #910 (blocking): a `thread/read` whose answer predates a

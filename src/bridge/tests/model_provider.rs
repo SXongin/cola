@@ -141,6 +141,58 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
     );
 }
 
+/// Issue #906/#910: a Pending Session's pick through the **neutral bucket**
+/// (`codex/<id>`, the documented text form) names only the model at creation —
+/// `thread/start` must not carry the reserved namespace as `modelProvider`.
+/// A real provider pair still carries both halves (the test below).
+#[tokio::test]
+async fn a_neutral_pending_pick_creates_the_thread_without_a_provider() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    let picks = backend.created_session_picks.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model codex/gpt-custom",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending survives");
+    assert_eq!(pending.model.as_deref(), Some("codex/gpt-custom"));
+    assert_eq!(
+        pending.provider, None,
+        "the neutral namespace is not a creation provider"
+    );
+
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        picks.lock().await.as_slice(),
+        &[(None, Some("gpt-custom".to_string()))],
+        "thread/start takes the model only, never `modelProvider`"
+    );
+}
+
 /// Issue #910, item 3: the **same** provider with another model is an ordinary
 /// pick even with the gate open — no thread-level request, no confirmation.
 #[tokio::test]
