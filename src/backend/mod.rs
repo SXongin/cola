@@ -473,6 +473,21 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         false
     }
 
+    /// The client's display name for the bridge's user-facing lifecycle
+    /// messages ("start failed", "no server, `start_server = never`"). It never
+    /// rides the wire; it exists so a message names the client the user
+    /// configured instead of whichever adapter the sentence was written for.
+    fn client_name(&self) -> &'static str {
+        "Agent Client"
+    }
+
+    /// How to get this client's backend running by hand, for the
+    /// `start_server = "never"` message. The adapter owns the remedy it can
+    /// actually recommend.
+    fn start_hint(&self) -> &'static str {
+        "启动客户端的后端服务，或把 `start_server` 改为 `auto`。"
+    }
+
     /// Whether `provider` is this client's **neutral bucket** — a selection
     /// that names no thread-level channel (Codex's `codex`), so a pick using it
     /// is a model-only pick no matter what the thread currently runs. The
@@ -486,7 +501,7 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// #910 AC6): after a failed switch the bridge restores the session mirror
     /// to the pair the thread actually runs. Cache-only, no RPC; `None` means
     /// unknown (a client without a thread-level axis never needs it).
-    fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
+    async fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
         None
     }
 
@@ -494,7 +509,7 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// session, when it knows one (Codex's ordered thread fact). Cache-only: no
     /// RPC, so a card callback can decide "is the gate even relevant here"
     /// without a request. `None` means unknown.
-    fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
+    async fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
         None
     }
 

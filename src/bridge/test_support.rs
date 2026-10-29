@@ -3127,6 +3127,16 @@ impl crate::backend::Backend for MockBackend {
         Ok(())
     }
 
+    /// The mock is OpenCode-shaped unless a test opts into the provider axis;
+    /// its lifecycle messages keep naming OpenCode, like the real default.
+    fn client_name(&self) -> &'static str {
+        "OpenCode"
+    }
+
+    fn start_hint(&self) -> &'static str {
+        "请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。"
+    }
+
     fn has_thread_provider(&self) -> bool {
         self.thread_provider
     }
@@ -3138,11 +3148,11 @@ impl crate::backend::Backend for MockBackend {
         provider == "codex"
     }
 
-    fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
+    async fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
         self.observed_thread_model.clone()
     }
 
-    fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
+    async fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
         self.known_thread_provider.clone()
     }
 

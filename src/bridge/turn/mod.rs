@@ -829,7 +829,7 @@ impl Turn {
                         // compare-and-set restored (a newer pick keeps its own),
                         // then the prompt stops with the named error and the user
                         // re-picks to retry.
-                        let observed = handles.backend.observed_thread_model(&self.session_id);
+                        let observed = handles.backend.observed_thread_model(&self.session_id).await;
                         let observed_spec = observed
                             .as_ref()
                             .map(|model| format!("{}/{}", model.provider_id, model.id));
