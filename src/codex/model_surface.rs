@@ -1006,7 +1006,9 @@ fn provider_page(
         paired_providers.insert(provider.id.as_str());
         for model in models {
             let same_provider = current_provider == Some(provider.id.as_str());
-            let mut label = format!("{}/{model}", provider.id);
+            // #908 AC1: the row shows the configured display name (its id when
+            // the config names none); the callback still carries id + model.
+            let mut label = crate::backend::parsing::join_model(&provider.name, &model);
             // The current marker is the provider fact (#908 AC1): the exact pair
             // says 「当前」, another model of the same provider says so too.
             if same_provider && current_model == Some(model.as_str()) {
@@ -1096,10 +1098,11 @@ fn resolved_current(
     thread_provider: Option<&str>,
 ) -> Option<ModelSelection> {
     let current = current?;
-    let Some((provider, model)) = current.reference.split_once('/') else {
+    // Parsed, not split: a provider id may itself contain `/` (issue #908).
+    let Some(parsed) = crate::backend::parsing::parse_model(&current.reference) else {
         return Some(current.clone());
     };
-    if provider != MODEL_PROVIDER {
+    if parsed.provider_id != MODEL_PROVIDER {
         return Some(current.clone());
     }
     let Some(real) = thread_provider else {
@@ -1112,9 +1115,18 @@ fn resolved_current(
     if real == MODEL_PROVIDER {
         return Some(current.clone());
     }
-    let reference = format!("{real}/{model}");
+    let reference = crate::backend::parsing::join_model(real, &parsed.id);
     let label = match current.label.strip_prefix(&format!("{MODEL_PROVIDER}/")) {
-        Some(rest) => format!("{real}/{rest}"),
+        Some(rest) => {
+            let (model, variant) = match rest.split_once('@') {
+                Some((model, variant)) => (model, Some(variant)),
+                None => (rest, None),
+            };
+            match variant {
+                Some(variant) => format!("{}@{variant}", crate::backend::parsing::join_model(real, model)),
+                None => crate::backend::parsing::join_model(real, model),
+            }
+        }
         None => reference.clone(),
     };
     Some(ModelSelection { label, reference })
@@ -2042,6 +2054,78 @@ mod tests {
         let same = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), true, &live);
         let label = same.scopes[0].options[0].display_label();
         assert!(label.contains("当前"), "{label}");
+    }
+
+    /// #908 AC1: a pair row labels the provider's configured **display name**
+    /// (its id when the config names none); the callback keeps the id + model
+    /// separately, so the label is presentation only.
+    #[test]
+    fn a_pair_row_shows_the_providers_display_name() {
+        let mut config = CodexModelConfig::default();
+        let mut deepseek = provider("deepseek", None, None, None);
+        deepseek.name = "DeepSeek".into();
+        config.providers.push(deepseek);
+        config.profiles.push(ProfilePreset {
+            name: "fast".into(),
+            model: "deepseek-flash".into(),
+            provider: Some("deepseek".into()),
+        });
+
+        let surface = build_surface(&[], &config, &HashMap::new(), None, true, &provider_query());
+        let option = &surface.scopes[0].options[0];
+        assert_eq!(option.display_label(), "DeepSeek/deepseek-flash");
+        assert_eq!(
+            option.provider.as_deref(),
+            Some("deepseek"),
+            "the callback carries the id, not the display name"
+        );
+        assert_eq!(
+            option.value.as_deref(),
+            Some("deepseek-flash"),
+            "the callback carries the bare model id"
+        );
+    }
+
+    /// #908: a provider id may itself contain `/`. Every reference cola
+    /// composes for the current pair must quote it (issue #910's gate finding),
+    /// or `parse_model` reads the wrong provider — and the current marker lands
+    /// on the wrong row.
+    #[test]
+    fn a_slashed_provider_id_resolves_its_current_pair() {
+        let mut config = CodexModelConfig::default();
+        let mut slashed = provider("foo/bar", None, None, None);
+        slashed.name = "Foo Bar".into();
+        config.providers.push(slashed);
+        config.profiles.push(ProfilePreset {
+            name: "fast".into(),
+            model: "gpt-x".into(),
+            provider: Some("foo/bar".into()),
+        });
+        let query = ModelSurfaceQuery {
+            current: Some(ModelSelection {
+                label: "codex/gpt-x".into(),
+                reference: "codex/gpt-x".into(),
+            }),
+            ..provider_query()
+        };
+
+        // The thread runs `foo/bar`, the pick was the neutral `codex` bucket:
+        // the resolved current pair names the real provider, quoted.
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("foo/bar"), true, &query);
+        let option = &surface.scopes[0].options[0];
+        assert_eq!(option.display_label(), "Foo Bar/gpt-x（当前）");
+        assert_eq!(option.provider.as_deref(), Some("foo/bar"));
+        assert_eq!(option.value.as_deref(), Some("gpt-x"));
+
+        let current = surface.current.as_ref().expect("the resolved current pair");
+        assert_eq!(
+            current.reference, "\"foo/bar\"/gpt-x",
+            "a slashed provider is quoted so the pair round-trips"
+        );
+        assert_eq!(current.label, "\"foo/bar\"/gpt-x");
+        let parsed = crate::backend::parsing::parse_model(&current.reference).expect("the pair round-trips");
+        assert_eq!(parsed.provider_id, "foo/bar", "not `foo`");
+        assert_eq!(parsed.id, "gpt-x");
     }
 
     /// Issue #910: a profile preset is Codex's own model + provider declaration,

@@ -242,6 +242,165 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
     );
 }
 
+/// Issue #910 / ADR-0089: a card's model pick hands its mirror write to the
+/// store's writer and settles the receipt on the click's budget, so a stalled
+/// disk never holds the callback. The pair is in memory (the toast says it
+/// applies), the file catches up once the writer is released — and the click
+/// never claims a durable save.
+#[tokio::test]
+async fn a_stalled_writer_does_not_stall_a_model_pick_callback() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::PerTurn)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the app's store has a writer thread");
+    // Hold the writer BEFORE the click, so the mirror write is in flight for the
+    // whole callback (the seeded entry is already on disk).
+    pause.hold();
+
+    let started = std::time::Instant::now();
+    let step = app
+        .host_action(paired_pick("openai", "gpt-5.1"))
+        .await
+        .expect("the click still answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the callback answered inside the ack budget with the write stalled: {elapsed:?}"
+    );
+    assert!(
+        step.toast.as_deref().unwrap_or_default().starts_with("Model:"),
+        "the pick's own answer, not a save claim: {step:?}",
+        step = step.toast
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the mutation is in memory before the file"
+    );
+    let saved = std::fs::read_to_string(&sessions).unwrap_or_default();
+    assert!(
+        !saved.contains("\"openai/gpt-5.1\""),
+        "the stalled write has not landed yet: {saved}"
+    );
+
+    // Releasing the writer lands it, in order, after the callback answered.
+    pause.release();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("\"openai/gpt-5.1\"")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deferred mirror write landed after the callback"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The same bound for the **confirm** click (#910's record-first shape): the
+/// record is a store write from a callback, so it is deferred and settled on
+/// the click's budget too. A stalled writer still answers 「已记录」, the mark is
+/// in memory, and the file catches up on release.
+#[tokio::test]
+async fn a_stalled_writer_does_not_stall_a_provider_switch_confirm() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_model_pick_route(ModelPickRoute::ThreadModel)
+        .with_provider_change_scope(ChangeScope::ResumeOnly);
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    let step = app
+        .host_action(paired_pick(PROVIDER, MODEL))
+        .await
+        .expect("provider pick");
+    let card = step.card.expect("a confirmation card");
+    let pause = app
+        .sessions
+        .lock()
+        .await
+        .pause_writes()
+        .expect("the app's store has a writer thread");
+    pause.hold();
+
+    let started = std::time::Instant::now();
+    let step = app
+        .host_action_on_message(button_value(&card, "model_provider_confirm"), "om_confirm")
+        .await
+        .expect("the confirm still answers");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < crate::feishu::ws::CARD_ACK_BUDGET,
+        "the confirm answered inside the ack budget with the write stalled: {elapsed:?}"
+    );
+    assert!(
+        step.card
+            .as_ref()
+            .is_some_and(|card| card.to_string().contains("已记录")),
+        "the record acked even though the save is still in flight"
+    );
+    let stored = app.sessions.lock().await;
+    assert_eq!(
+        stored.get_active(&key()).cloned().unwrap().model.as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the recorded pair is in memory"
+    );
+    assert!(
+        stored.provider_switch_confirmed("ses_test"),
+        "the confirmation mark is in memory"
+    );
+    drop(stored);
+    assert!(
+        !std::fs::read_to_string(&sessions)
+            .unwrap_or_default()
+            .contains("deepseek/deepseek-v4-pro"),
+        "the stalled record has not reached the file"
+    );
+
+    pause.release();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::fs::read_to_string(&sessions).is_ok_and(|text| text.contains("deepseek/deepseek-v4-pro")) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the deferred record landed after the callback"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Issue #910, item 3 (gate closed): a provider pick without the opt-in only
 /// says where it *can* happen, and records nothing.
 #[tokio::test]
@@ -1673,7 +1832,7 @@ async fn a_live_session_that_became_pending_before_the_record_refuses() {
 
     let outcome = app
         .sessions_handle()
-        .pick_model_expecting(&app.client, &key(), Some("ses_test"), &spec)
+        .pick_model_expecting(&app.client, &key(), Some("ses_test"), &spec, None)
         .await
         .expect("the write runs");
     assert_eq!(
@@ -1705,7 +1864,7 @@ async fn a_live_session_that_became_pending_before_the_record_refuses() {
     };
     let outcome = app
         .sessions_handle()
-        .pick_pending_pair(&app.client, &key(), epoch, PROVIDER, &spec)
+        .pick_pending_pair(&app.client, &key(), epoch, PROVIDER, &spec, None)
         .await
         .expect("the pending write runs");
     assert_eq!(
@@ -2244,7 +2403,7 @@ async fn a_delayed_autoaccept_keeps_a_recorded_pair() {
     // A confirmation records a provider pair while the command waits.
     let outcome = app
         .sessions_handle()
-        .record_pair_expecting(&key(), Some("ses_test"), "deepseek/deepseek-v4-pro")
+        .record_pair_expecting(&key(), Some("ses_test"), "deepseek/deepseek-v4-pro", None)
         .await
         .expect("the record runs");
     assert_eq!(

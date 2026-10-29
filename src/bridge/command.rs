@@ -1499,6 +1499,7 @@ pub(crate) async fn handle_command(
                                     &thread_key,
                                     Some(&session_id),
                                     &name,
+                                    None,
                                 )
                                 .await
                         }
@@ -1516,6 +1517,7 @@ pub(crate) async fn handle_command(
                                     epoch,
                                     &parsed.provider_id,
                                     &name,
+                                    None,
                                 )
                                 .await
                         }
