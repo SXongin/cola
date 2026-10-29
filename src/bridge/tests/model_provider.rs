@@ -235,6 +235,11 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
             .as_deref(),
         Some("openai/gpt-5.1")
     );
+
+    assert!(
+        !app.sessions.lock().await.provider_switch_confirmed("ses_test"),
+        "an ordinary pick is unconfirmed (issue #910)"
+    );
 }
 
 /// Issue #910, item 3 (gate closed): a provider pick without the opt-in only

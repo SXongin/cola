@@ -4721,6 +4721,8 @@ pub(crate) async fn seed_session(app: &Arc<App>, session_id: &str, directory: &s
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -4948,6 +4950,8 @@ pub(crate) async fn build_reeswitch_app(
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;

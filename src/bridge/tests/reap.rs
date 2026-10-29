@@ -3310,6 +3310,8 @@ async fn a_record_without_a_directory_is_never_decided() {
             auto_accept: false,
             topic_anchor: None,
             topic_root: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;

@@ -531,3 +531,22 @@ compare-and-set back to the pair the thread actually runs (a newer pick keeps
 its own record); when the pair is unknown the mirror claims nothing. The prompt
 is still not sent, and the user **re-picks** to retry once the holder is closed
 — the unapplied record is not kept as a retry ticket.
+
+## Amendment (#908): the two-page model/provider presentation supersedes #906 AC1
+
+#906 AC1 asked for **one page** that lists `config/read`'s providers alongside
+the catalog and the presets. That page became unreadable: every group, every
+provider's probe and its notes crowded one card. The owner chose density over
+the letter of AC1, so the Codex surface is now **two pages**, one scope each:
+
+- the **model page** (root) carries only what a pick can run without changing
+  the channel — the catalog, the config default, the profiles and the **current
+  provider's** probed models — plus a `切换 provider…` drill;
+- the **provider page** (one tap away, with the back button) carries every
+  configured provider's pairs, the current marker, a failed probe as a short
+  tag and pairless providers as disabled rows.
+
+Nothing is lost in the split: every provider `config/read` declares is still
+listed (on the page it belongs to), no bare provider is selectable, and the
+model page never carries another provider's probe. OpenCode keeps its own
+two pages unchanged.

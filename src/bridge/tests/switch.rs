@@ -27,6 +27,8 @@ async fn switch_card_is_cached_within_ttl_and_invalidated_on_rename() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -152,6 +154,8 @@ async fn attach_rejects_session_owned_by_another_thread_without_force() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -192,6 +196,8 @@ async fn attach_force_steals_mapping_from_other_thread() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -227,6 +233,8 @@ async fn forget_unmaps_thread_keeping_server_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -473,6 +481,8 @@ async fn switch_reeswitch_elsewhere_case(pins_enabled: bool, expected_chip: &str
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -558,6 +568,8 @@ async fn switch_prefers_threads_own_sessions() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -574,6 +586,8 @@ async fn switch_prefers_threads_own_sessions() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -655,6 +669,8 @@ async fn switch_card_defaults_to_current_directory_scope() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -710,6 +726,8 @@ async fn switch_card_scope_toggle_shows_whole_store() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -851,6 +869,8 @@ async fn switch_card_adopt_occupied_offers_force_confirm() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -916,6 +936,8 @@ async fn switch_card_force_adopt_steals_owned_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -996,6 +1018,8 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1012,6 +1036,8 @@ async fn switch_card_switch_on_mapped_session_patches_to_snapshot() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1079,6 +1105,8 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1095,6 +1123,8 @@ async fn switch_card_switch_suppressed_patches_to_compact_state() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1199,6 +1229,8 @@ async fn switch_card_new_action_declares_pending_in_current_project() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2189,6 +2221,8 @@ fn codex_entry(thread_id: &str) -> crate::config::SessionEntry {
         topic_anchor: None,
         topic_root: None,
         variant: None,
+
+        provider_switch_confirmed: false,
     }
 }
 
@@ -2404,6 +2438,10 @@ async fn a_recorded_provider_switch_applies_before_the_next_prompt() {
             .as_deref(),
         Some("deepseek/deepseek-v4-pro"),
         "the pair is the recorded mirror"
+    );
+    assert!(
+        app.sessions.lock().await.provider_switch_confirmed("thread-1"),
+        "the confirmation marks the pair for a thread-level switch"
     );
     assert_eq!(
         server.resume_calls(),
@@ -2966,5 +3004,120 @@ async fn a_recorded_pair_is_pending_in_the_model_card() {
     assert!(
         text.contains("待应用") && text.contains("deepseek/deepseek-v4-pro"),
         "the recorded pair is pending: {text}"
+    );
+}
+
+/// Issue #910 (blocking): a same-provider model pick records an **unconfirmed**
+/// pair. A peer moving the thread to another provider before the next prompt
+/// makes the pre-flight's route `ThreadModel` — it must refuse, never switch
+/// the thread unconfirmed, and send no release/resume.
+#[tokio::test]
+async fn a_same_provider_pick_is_not_switched_when_the_thread_moved() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
+        "thread-1",
+        "session-root",
+        "/work/cola",
+        "a shared thread",
+    ));
+    server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
+    let endpoint = crate::codex::Endpoint::parse(&url).expect("endpoint");
+    let backend: Arc<crate::codex::CodexClient> = Arc::new(
+        crate::codex::CodexClient::connect(
+            &crate::codex::CodexOptions::new(endpoint).with_thread_settings(crate::codex::ThreadSettings {
+                provider_switch_on_resume: true,
+                ..Default::default()
+            }),
+            &crate::codex::PinnedProbe,
+        )
+        .await
+        .expect("attach"),
+    );
+    backend.transcript("thread-1").await.expect("adopt the thread");
+    server.wait_for_subscribers("thread-1", 1).await;
+
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+    let mut entry = codex_entry("thread-1");
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    // Same provider: an ordinary, **unconfirmed** model pick.
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        crate::config::ThreadKey::new("chat_1".into(), "chat_1".into()),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    assert!(
+        !app.sessions.lock().await.provider_switch_confirmed("thread-1"),
+        "an ordinary pick is not confirmed for a thread-level switch"
+    );
+
+    // A peer moves the thread to another provider, and cola learns it.
+    server.set_thread_model("thread-1", Some("deepseek-v4-pro"), Some("deepseek"));
+    server.push_thread_settings("thread-1", "deepseek-v4-pro", "deepseek", None);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if backend
+            .projections
+            .model("thread-1")
+            .map(|model| model.provider_id)
+            == Some("deepseek".to_string())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the peer's move never reached cola"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let turns_before = server.turn_starts();
+    server.clear_calls();
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        server.turn_starts(),
+        turns_before,
+        "the prompt is not sent on an unconfirmed switch"
+    );
+    let calls = server.call_log();
+    assert!(
+        !calls
+            .iter()
+            .any(|method| method == "thread/unsubscribe" || method == "thread/resume"),
+        "no release/resume happens for an unconfirmed pair: {calls:?}"
+    );
+    let text = platform
+        .calls
+        .lock()
+        .await
+        .iter()
+        .filter_map(|call| match call {
+            PlatformCall::ReplyCard { card, .. }
+            | PlatformCall::SendCard { card, .. }
+            | PlatformCall::UpdateMessage { card, .. } => Some(card.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("没有确认") && text.contains("重新 `/model`"),
+        "the refusal names the unconfirmed switch: {text}"
     );
 }

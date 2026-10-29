@@ -92,6 +92,8 @@ async fn build_bridge_authored(
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;

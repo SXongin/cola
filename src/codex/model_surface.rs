@@ -939,14 +939,23 @@ fn model_page(
     let only_drill = options
         .iter()
         .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown));
+    // One short line when `config/read` failed (ADR-0092 decision 8): the
+    // catalog is known, the provider/profile data is not — the provider page
+    // says so too, but the root page must not hide it.
+    let note = if config.read_failed {
+        Some("配置读取失败：只显示内置目录".to_string())
+    } else if only_drill {
+        Some("_(没有可用模型)_".to_string())
+    } else {
+        None
+    };
     crate::backend::types::ModelScope {
         id: MODEL_SCOPE.into(),
         title: "模型（每轮可换）".into(),
         changeable: crate::backend::types::ChangeScope::ThisTurn,
         pick: crate::backend::types::PickKind::Model,
         options,
-        // No probe-failure prose on this page; only an empty state.
-        note: only_drill.then(|| "_(没有可用模型)_".to_string()),
+        note,
         free_text: Some(format!("也可 `/model {MODEL_PROVIDER}/<id>`")),
         intro: None,
     }
@@ -1911,6 +1920,14 @@ mod tests {
             read_failed: true,
             ..Default::default()
         };
+        // The root page names the failure in one line, alongside the catalog.
+        let root = build_surface(&[], &config, &HashMap::new(), None, false, &query());
+        assert_eq!(
+            root.scopes[0].note.as_deref(),
+            Some("配置读取失败：只显示内置目录"),
+            "the model page says the provider/profile data is unknown"
+        );
+
         let surface = build_surface(&[], &config, &HashMap::new(), None, false, &provider_query());
         let note = surface.scopes[0].note.as_deref().unwrap();
         assert!(note.contains("读不到 config"), "note: {note}");

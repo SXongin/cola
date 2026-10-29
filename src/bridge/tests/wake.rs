@@ -2380,6 +2380,8 @@ async fn a_wake_on_a_non_active_session_is_not_rendered() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2396,6 +2398,8 @@ async fn a_wake_on_a_non_active_session_is_not_rendered() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -3120,6 +3124,8 @@ async fn a_settled_restart_continuation_is_not_re_split() {
             auto_accept: false,
             topic_anchor: Some("om_anchor".into()),
             topic_root: None,
+
+            provider_switch_confirmed: false,
         },
     )
     .await;
