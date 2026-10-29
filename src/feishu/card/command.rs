@@ -789,7 +789,7 @@ pub(crate) async fn model_surface(
                     .unwrap_or_default();
                 crate::backend::types::ModelSelection {
                     label: format!("{}/{}{}", model.provider_id, model.id, variant),
-                    reference: format!("{}/{}", model.provider_id, model.id),
+                    reference: crate::backend::parsing::join_model(&model.provider_id, &model.id),
                 }
             })
         }
