@@ -472,10 +472,10 @@ collide with; the model path is a turn input and holds no subscription.
 **8. Reads stay primary; the broadcast is a bonus.** `thread/settings/updated`
 is still consumed — the projection folds its `model`/`modelProvider` into the
 ordered fact — but no model switch depends on it: the stable path is
-`turn/start.model` plus the read-back. `effort` is left out of the fold (the
-surface never renders it), and a failed `config/read` degrades to the catalog
-plus a named note (「读不到 config，provider / profile 未知」) instead of an
-empty section.
+`turn/start.model` plus the read-back. `effort` is folded as well and rendered
+by `/status` and the model card, since the pending carries it; a failed
+`config/read` degrades to the catalog plus a named note (「读不到 config，
+provider / profile 未知」) instead of an empty section.
 
 `keeps_session_selection = false` and the trait's `switch_session_model` no-op
 stand unchanged: the model is turn-carried, not a durable server-side switch.
@@ -577,7 +577,11 @@ change is respected. The pending is cola state, not server state, and it is
 **in-memory only**: a restart drops it and the thread's own model remains. This
 is deliberate — a persisted pending cannot distinguish an accepted turn whose
 response was lost from one that never ran, and auto-resending could overwrite a
-peer's later change. The user re-picks after a restart.
+peer's later change. The user re-picks after a restart. The same rule covers an
+ambiguous submit while the process stays running: a transport failure, timeout
+or lost response drops the pending and never retries it, because the server may
+have accepted it; only a definite JSON-RPC refusal leaves the pending for a
+re-pick.
 
 **2. A steer, a folded turn, or a command does not consume the pending.** A
 Supplement uses `turn/steer`, which has no model field; a `turn/start` that is
