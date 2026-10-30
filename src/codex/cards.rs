@@ -1327,6 +1327,11 @@ async fn an_effort_only_pending_is_shown_and_then_consumed() {
         pending_text.contains("待应用") && pending_text.contains("openai/gpt-5.1-codex@high"),
         "an effort-only pending is shown with the thread's model: {pending_text}"
     );
+    assert_eq!(
+        pending_text.matches("openai/gpt-5.1-codex@high").count(),
+        1,
+        "only 待应用 carries the unaccepted level; 当前 stays the accepted fact: {pending_text}"
+    );
 
     let handler = tokio::spawn({
         let app = app.clone();
@@ -1338,6 +1343,22 @@ async fn an_effort_only_pending_is_shown_and_then_consumed() {
     let params = wait_for_turn_start(&server).await;
     assert_eq!(params["effort"], "high");
     assert_eq!(params.get("model"), None, "an effort-only pending sends no model");
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .as_deref()
+        != Some("high")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the accepted effort never reached the mirror"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 
     send_command_in(
         &app,
@@ -1353,10 +1374,14 @@ async fn an_effort_only_pending_is_shown_and_then_consumed() {
         .into_iter()
         .last()
         .expect("the post-turn /model card");
+    let after_text = card_text(&after_card);
     assert!(
-        !card_text(&after_card).contains("待应用"),
-        "the consumed effort-only pending is gone: {}",
-        card_text(&after_card)
+        after_text.contains("openai/gpt-5.1-codex@high"),
+        "the accepted level is now 当前: {after_text}"
+    );
+    assert!(
+        !after_text.contains("待应用"),
+        "the consumed effort-only pending is gone: {after_text}"
     );
 
     // End the turn so the spawned handler stops cleanly.
@@ -1371,6 +1396,156 @@ async fn an_effort_only_pending_is_shown_and_then_consumed() {
         }),
     );
     wait_for_handler(handler, "the effort-only turn", SETTLE_DEADLINE).await;
+}
+
+/// Spec #922 gate fix: a `/model` that clears an unsupported `/think` level
+/// must leave 当前 unchanged until the next new turn is accepted, then clear it.
+#[tokio::test]
+async fn a_model_pick_that_clears_a_level_changes_current_only_after_acceptance() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1-codex".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![
+        json!({
+            "id": "gpt-5.1-codex",
+            "hidden": false,
+            "supportedReasoningEfforts": [{ "reasoningEffort": "high", "description": "careful" }],
+            "defaultReasoningEffort": "high"
+        }),
+        json!({
+            "id": "gpt-new",
+            "hidden": false,
+            "supportedReasoningEfforts": [{ "reasoningEffort": "low", "description": "fast" }],
+            "defaultReasoningEffort": "low"
+        }),
+    ]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let handles = app.command_handles();
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+    let mut settings = handles
+        .flow
+        .sessions
+        .session_settings(&key)
+        .await
+        .expect("the seeded settings");
+    settings.variant = Some("high".into());
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .set_settings(&key, settings)
+            .expect("persist the variant")
+    );
+
+    send_command_in(
+        &app,
+        "/model codex/gpt-new",
+        key.clone(),
+        "om_model_clear",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_model_clear_card",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let pending_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the pending /model card");
+    let pending_text = card_text(&pending_card);
+    assert!(
+        pending_text.contains("当前模型**：`openai/gpt-5.1-codex@high`"),
+        "当前 keeps the accepted level until acceptance: {pending_text}"
+    );
+    assert!(
+        pending_text.contains("待应用")
+            && pending_text.contains("gpt-new")
+            && !pending_text.contains("gpt-new@high"),
+        "待应用 names the new model without the cleared level: {pending_text}"
+    );
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("use the new model", "om_after_clear"))
+                .await
+        }
+    });
+    let params = wait_for_turn_start(&server).await;
+    assert_eq!(params["model"], "gpt-new");
+    assert_eq!(params.get("effort"), None, "the unsupported level is not sent");
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the accepted clear never reached the mirror"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_model_clear_after",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let after_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the post-turn /model card");
+    let after_text = card_text(&after_card);
+    assert!(
+        after_text.contains("当前模型**：`openai/gpt-5.1-codex`")
+            && !after_text.contains("openai/gpt-5.1-codex@high"),
+        "the accepted turn clears the unsupported level: {after_text}"
+    );
+    assert!(
+        !after_text.contains("待应用"),
+        "the consumed pending is gone: {after_text}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone()),
+        None,
+        "the mirror records the cleared level only after acceptance"
+    );
+
+    // End the turn so the spawned handler stops cleanly.
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(handler, "the model-clear turn", SETTLE_DEADLINE).await;
 }
 
 /// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves

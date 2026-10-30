@@ -220,6 +220,9 @@ pub struct SharedCore {
     /// (30 s TTL; invalidated on create/adopt/rename). Private: the core's
     /// write wrappers and `invalidate_session_list_cache` own it.
     session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
+    /// Live Codex threads' unaccepted `/think` intents (spec #922): in-memory,
+    /// process-lifetime state shared by every reconstructed `SessionsHandle`.
+    pending_effort_intents: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// The active agent client (spec #860): the [`crate::backend::Backend`]
     /// every bridge path talks to. Named `client`, not `opencode`: the seam is
     /// a client, and the active one becomes a choice (#872). Today it is always
@@ -429,6 +432,7 @@ impl SharedCore {
                 cfg.bridge.instant_reminder,
             )),
             session_list_cache: Arc::new(Mutex::new(None)),
+            pending_effort_intents: Arc::new(Mutex::new(HashMap::new())),
             client,
             feishu,
             card_write_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -542,6 +546,7 @@ impl SharedCore {
             Arc::clone(&self.session_list_cache),
             self.default_auto_accept,
             self.session_gates.clone(),
+            Arc::clone(&self.pending_effort_intents),
         )
     }
 

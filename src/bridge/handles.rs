@@ -72,6 +72,11 @@ pub(crate) struct SessionsHandle {
     /// session cola CREATES starts with. Adoption paths never read it — an
     /// existing session keeps its own state.
     default_auto_accept: bool,
+    /// A live Codex thread's next-turn `/think` intent (spec #922), in-memory
+    /// only: the level the next accepted new turn should make current. The
+    /// session mirror keeps the last accepted fact until then. `Some(None)` is
+    /// an explicit reset; absence means no pending effort intent.
+    pending_effort_intents: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 /// The result of applying a settings pick (`/model`, `/think`, `/agent`): one
@@ -262,12 +267,14 @@ impl SessionsHandle {
         cache: Arc<Mutex<Option<SessionListCache>>>,
         default_auto_accept: bool,
         session_gates: crate::bridge::session_gates::SessionGates,
+        pending_effort_intents: Arc<Mutex<HashMap<String, Option<String>>>>,
     ) -> Self {
         Self {
             store,
             cache,
             default_auto_accept,
             session_gates,
+            pending_effort_intents,
         }
     }
 
@@ -275,6 +282,62 @@ impl SessionsHandle {
     /// that build a session directly instead of through a Pending Session.
     pub(crate) fn default_auto_accept(&self) -> bool {
         self.default_auto_accept
+    }
+
+    /// A live Codex thread's unaccepted `/think` intent, if one is recorded.
+    /// The outer `Option` distinguishes "no intent" from an explicit reset
+    /// (`Some(None)`), which clears the mirror once the next turn is accepted.
+    pub(crate) async fn pending_effort_intent(&self, session_id: &str) -> Option<Option<String>> {
+        self.pending_effort_intents.lock().await.get(session_id).cloned()
+    }
+
+    /// Record (or overwrite) the next accepted turn's effort intent.
+    pub(crate) async fn set_pending_effort_intent(&self, session_id: &str, intent: Option<String>) {
+        self.pending_effort_intents
+            .lock()
+            .await
+            .insert(session_id.to_string(), intent);
+    }
+
+    /// Take the intent for the caller that is about to apply it, or discard it
+    /// because the pending was dropped/refused before the mirror ever moved.
+    pub(crate) async fn take_pending_effort_intent(&self, session_id: &str) -> Option<Option<String>> {
+        self.pending_effort_intents.lock().await.remove(session_id)
+    }
+
+    /// Make a pending effort intent the accepted mirror fact. Compare-and-set
+    /// against the pair read here, so a newer pick that moved the mirror wins;
+    /// a store error is logged, never surfaced as a turn failure.
+    pub(crate) async fn apply_pending_effort_intent(
+        &self,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        intent: Option<String>,
+    ) {
+        let Some(entry) = self.entry_for_session(session_id).await else {
+            return;
+        };
+        let outcome = {
+            let mut store = self.store.lock().await;
+            store.set_mirror_live(
+                thread_key,
+                session_id,
+                entry.model.as_deref(),
+                entry.variant.as_deref(),
+                crate::bridge::session::MirrorWrite::Variant(intent.as_deref()),
+                None,
+            )
+        };
+        match outcome {
+            Ok(outcome) => {
+                if let Err(error) = settle_mirror(outcome, None).await {
+                    tracing::warn!("could not persist the accepted /think level for {session_id}: {error}");
+                }
+            }
+            Err(error) => {
+                tracing::warn!("could not apply the accepted /think level for {session_id}: {error}");
+            }
+        }
     }
 
     /// The mapped entry for `session_id`, cloned out of the store.
@@ -745,19 +808,26 @@ impl SessionsHandle {
     }
 
     /// The declared variants of a provider/model, read from the client's
-    /// model surface (a provider's model page). Best-effort: `None` when the
-    /// model can't be found in the advertised catalog (callers then leave a
-    /// stored variant in place rather than destroying it on an unknown).
+    /// model surface. Codex's flat catalog is the **root** model page, while
+    /// OpenCode's model page is provider-scoped; the scope follows the client
+    /// shape. Best-effort: `None` when the model can't be found in the
+    /// advertised catalog (callers then leave a stored variant in place rather
+    /// than destroying it on an unknown).
     pub(crate) async fn model_variants(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         provider: &str,
         model: &str,
     ) -> Option<Vec<String>> {
+        let (scope, selected) = if backend.has_thread_provider() {
+            (None, None)
+        } else {
+            (Some("provider"), Some(provider))
+        };
         backend
             .model_surface(crate::backend::types::ModelSurfaceQuery {
-                scope: Some("provider"),
-                selected: Some(provider),
+                scope,
+                selected,
                 // This lookup runs on a card callback's short ack budget and
                 // needs only the advertised variants: no config read, no
                 // provider probe, no session context.
@@ -1147,47 +1217,6 @@ impl SessionsHandle {
         })?
     }
 
-    /// Undo the optimistic variant write that preceded a fallible pending
-    /// write (spec #922). The pending layer is the authority; if it refused, the
-    /// mirror must not claim a level no next turn will carry. The restore is a
-    /// compare-and-set on the value the pick just wrote, so a newer concurrent
-    /// pick wins and is left untouched. Best-effort: the original pending error
-    /// is the user-facing failure, and a rollback failure is logged rather than
-    /// masked.
-    async fn restore_variant_after_pending_failure(
-        &self,
-        thread_key: &ThreadKey,
-        session_id: &str,
-        expected_model: Option<&str>,
-        written_variant: Option<&str>,
-        previous_variant: Option<String>,
-        deadline: Option<tokio::time::Instant>,
-    ) {
-        let outcome = {
-            let mut store = self.store.lock().await;
-            store.set_mirror_live(
-                thread_key,
-                session_id,
-                expected_model,
-                written_variant,
-                crate::bridge::session::MirrorWrite::Variant(previous_variant.as_deref()),
-                deadline,
-            )
-        };
-        match outcome {
-            Ok(outcome) => {
-                if let Err(error) = settle_mirror(outcome, deadline).await {
-                    tracing::warn!("could not persist the restored /think mirror for {session_id}: {error}");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "could not restore the /think mirror for {session_id} after a pending failure: {error}"
-                );
-            }
-        }
-    }
-
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches) for
     /// `expected_session`: a `/switch` between the caller's classification and
     /// this write is a named no-op instead of a record on the new session
@@ -1255,6 +1284,45 @@ impl SessionsHandle {
             // V1: the mirror is the whole decision. The clear is a catalog read
             // outside the gate; the state gate makes the write a
             // compare-and-set on what the caller read.
+            //
+            // A client with a thread-level provider axis (Codex) instead has a
+            // one-shot next-turn window (spec #922). `/model` records the
+            // pending in the adapter and **must not** write the store: the
+            // thread's current pair and effort stay the last accepted fact until
+            // a new turn runs. An unsupported `/think` level is carried as a
+            // pending intent and cleared only when that turn is accepted.
+            if backend.has_thread_provider() {
+                let intent_before = self.pending_effort_intent(&session_id).await;
+                let mut probe = intent_before.clone().unwrap_or_else(|| snapshot.variant.clone());
+                let cleared = self
+                    .clear_variant_for_model(backend, &mut probe, model_spec)
+                    .await;
+                let gate = self.session_gates.gate(&session_id);
+                let _held = gate.enter().await;
+                let Some(current) = self.session_settings(thread_key).await else {
+                    return Ok(PickOutcome::NoTarget);
+                };
+                if current.session_id.as_deref() != Some(session_id.as_str())
+                    || current.model != snapshot.model
+                    || current.variant != snapshot.variant
+                    || self.pending_effort_intent(&session_id).await != intent_before
+                {
+                    // The store moved, or a newer `/think` changed the intent
+                    // while the catalog read ran: the newer command wins.
+                    return Ok(PickOutcome::StateChanged);
+                }
+                backend
+                    .record_pending_model(&session_id, model_spec, probe.as_deref())
+                    .await?;
+                if cleared.is_some() {
+                    // The new model does not declare the level: the accepted
+                    // turn should clear it, not carry it forward.
+                    self.set_pending_effort_intent(&session_id, None).await;
+                }
+                return Ok(PickOutcome::Applied {
+                    cleared_variant: cleared,
+                });
+            }
             let mut probe = snapshot.variant.clone();
             let cleared = self
                 .clear_variant_for_model(backend, &mut probe, model_spec)
@@ -1270,22 +1338,6 @@ impl SessionsHandle {
             {
                 return Ok(PickOutcome::StateChanged);
             }
-            // A client with a thread-level provider axis (Codex) has a
-            // one-shot next-turn window (spec #922): `/model` records a pending
-            // selection in the adapter and **must not** write `entry.model`.
-            // The thread's current pair stays the fact until a new turn is
-            // accepted; only the `/think` clear still lands on the mirror for
-            // the current display. Every other client keeps its per-prompt
-            // mirror, unchanged.
-            let next_turn = backend.has_thread_provider();
-            let write = if next_turn {
-                MirrorWrite::Variant(probe.as_deref())
-            } else {
-                MirrorWrite::Model {
-                    model: model_spec,
-                    clear_variant: cleared.as_deref(),
-                }
-            };
             let outcome = {
                 let mut store = self.store.lock().await;
                 store.set_mirror_live(
@@ -1293,38 +1345,14 @@ impl SessionsHandle {
                     &session_id,
                     snapshot.model.as_deref(),
                     snapshot.variant.as_deref(),
-                    write,
+                    MirrorWrite::Model {
+                        model: model_spec,
+                        clear_variant: cleared.as_deref(),
+                    },
                     deadline,
                 )?
             };
-            let outcome = pair_write_outcome(settle_mirror(outcome, deadline).await?);
-            if next_turn {
-                if matches!(outcome, PickOutcome::Applied { .. }) {
-                    if let Err(error) = backend
-                        .record_pending_model(&session_id, model_spec, probe.as_deref())
-                        .await
-                    {
-                        // The pending seam failed after the mirror moved. Restore
-                        // the pre-pick variant by compare-and-set: a newer pick
-                        // that changed it meanwhile wins and is left alone.
-                        self.restore_variant_after_pending_failure(
-                            thread_key,
-                            &session_id,
-                            snapshot.model.as_deref(),
-                            probe.as_deref(),
-                            snapshot.variant.clone(),
-                            deadline,
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                    return Ok(PickOutcome::Applied {
-                        cleared_variant: cleared,
-                    });
-                }
-                return Ok(outcome);
-            }
-            return Ok(outcome);
+            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
         }
         // A durable generation's selection is server state (V2): the selection
         // read, the `/think` clear and `switch_session_model` are RPCs, and they
@@ -1600,6 +1628,20 @@ impl SessionsHandle {
         {
             return Ok(PickOutcome::StateChanged);
         }
+        // A live Codex thread applies a `/think` on its next **new** turn: the
+        // adapter's pending carries the effort and the intent map carries what
+        // the mirror should show once that turn is accepted (spec #922). The
+        // mirror itself keeps the last accepted level until then, so 当前 never
+        // shows an unaccepted 待应用 value.
+        if backend.has_thread_provider() {
+            backend
+                .record_pending_variant(&session_id, variant.as_deref())
+                .await?;
+            self.set_pending_effort_intent(&session_id, variant).await;
+            return Ok(PickOutcome::Applied {
+                cleared_variant: None,
+            });
+        }
         let written = self
             .store
             .lock()
@@ -1613,31 +1655,7 @@ impl SessionsHandle {
                 None,
             )?
             .written;
-        let outcome = pair_write_outcome(written);
-        // A Codex live thread applies a `/think` on its next **new** turn: the
-        // adapter's pending carries the effort, while the mirror keeps the
-        // level for the current display (spec #922). A steer, a folded turn or
-        // a command never consumes it.
-        if backend.has_thread_provider()
-            && matches!(outcome, PickOutcome::Applied { .. })
-            && let Err(error) = backend
-                .record_pending_variant(&session_id, variant.as_deref())
-                .await
-        {
-            // The pending seam failed after the mirror moved: restore the
-            // pre-pick level, unless a newer pick already changed it.
-            self.restore_variant_after_pending_failure(
-                thread_key,
-                &session_id,
-                snapshot.model.as_deref(),
-                variant.as_deref(),
-                snapshot.variant.clone(),
-                None,
-            )
-            .await;
-            return Err(error);
-        }
-        Ok(outcome)
+        Ok(pair_write_outcome(written))
     }
 
     /// Apply an `/agent` pick: `agent: None` clears it (back to the server's
