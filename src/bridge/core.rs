@@ -123,7 +123,7 @@ pub struct SharedCore {
     /// Session ids with a prompt currently in flight (serializes prompts per
     /// session so concurrent messages don't clobber each other's cards). This is
     /// turn-admission **bookkeeping**: the model/provider state has its own
-    /// per-session point ([`SessionGates`]), so a thread-level switch never
+    /// per-session point ([`SessionGates`]), so a durable session switch never
     /// holds this set across an app-server call (issue #910).
     pub inflight: Arc<Mutex<HashSet<String>>>,
     /// The per-session model/provider serialization points (issue #910). One
@@ -643,21 +643,6 @@ impl SharedCore {
     pub async fn effective_model(&self, settings: &SessionSettings) -> Option<(String, String)> {
         self.sessions_handle()
             .effective_model(&self.client, settings)
-            .await
-    }
-
-    /// Record a `/model` spec **without a catalog read** (issue #910): the
-    /// confirmation acks from a store write only, and the turn pre-flight
-    /// resolves the `/think` clear.
-    pub(crate) async fn record_pair_expecting(
-        &self,
-        thread_key: &ThreadKey,
-        expected_session: Option<&str>,
-        model_spec: &str,
-        deadline: Option<tokio::time::Instant>,
-    ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
-        self.sessions_handle()
-            .record_pair_expecting(thread_key, expected_session, model_spec, deadline)
             .await
     }
 

@@ -224,40 +224,6 @@ pub struct ModelScope {
     pub intro: Option<String>,
 }
 
-/// Where a model pick lands on a session (issue #910). A client whose provider
-/// is a **per-prompt** fact (OpenCode sends `provider/model` with each message)
-/// answers [`Self::PerTurn`] for every pick; a client whose provider is a
-/// **thread-level** fact (Codex's `modelProvider`) answers
-/// [`Self::ThreadModel`] when the pick would change the thread's provider —
-/// the thread must then be re-opened before the model can be sent on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ModelPickRoute {
-    /// The pick rides the next turn: nothing thread-level happens.
-    #[default]
-    PerTurn,
-    /// The pick changes a thread-level fact, so the thread must be switched
-    /// (Codex: release the subscription, resume with the pair, read back).
-    ThreadModel,
-}
-
-/// What making a thread run a model/provider pair concluded (issue #910).
-///
-/// Every variant that claims success is decided by a read-back of **both**
-/// halves — the provider alone is not the pair.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThreadModelChange {
-    /// The thread already ran the exact pair: no thread-level request was
-    /// needed.
-    #[default]
-    Unchanged,
-    /// The thread now runs the pair, verified by a read-back.
-    Changed,
-    /// The thread was already on this provider and only the model differs: no
-    /// thread-level request is made (a same-provider model change is the
-    /// per-turn path), and the model rides the next turn.
-    ModelNextTurn,
-}
-
 /// Where changing a model selection takes effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChangeScope {
@@ -266,8 +232,6 @@ pub enum ChangeScope {
     ThisTurn,
     /// Only a newly started thread can use it.
     NewThread,
-    /// Only resuming a thread can change it.
-    ResumeOnly,
 }
 
 /// The running model selection for a session: the display label and the wire
@@ -305,9 +269,9 @@ pub struct ModelSurfaceQuery<'a> {
     /// card's current line keeps its one source of truth.
     pub current: Option<ModelSelection>,
     /// A pair the bridge **recorded** for the next prompt but has not applied
-    /// to the thread yet (a confirmed provider switch, deferred or in flight).
-    /// A client with a thread-level provider shows it separately from the
-    /// current line, which must stay the thread fact (#908).
+    /// to the thread yet (a next-turn pick, deferred or in flight). A client
+    /// with a thread-level provider shows it separately from the current line,
+    /// which must stay the thread fact (#908).
     pub pending: Option<&'a str>,
     /// The scope the card has drilled into (`None` = the root page).
     pub scope: Option<&'a str>,

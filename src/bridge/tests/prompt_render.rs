@@ -2329,8 +2329,6 @@ async fn subtitle_falls_back_to_id_tail_without_server_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2374,8 +2372,6 @@ async fn subtitle_degrades_when_session_info_hangs() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2445,8 +2441,6 @@ async fn subtitle_ignores_server_default_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2482,8 +2476,6 @@ async fn subtitle_prefers_server_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;

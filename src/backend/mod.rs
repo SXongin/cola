@@ -47,9 +47,9 @@ use async_trait::async_trait;
 use crate::error::Result;
 
 use types::{
-    AgentInfo, ChangeScope, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery,
-    PermissionRequest, PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo,
-    SessionSelection, SessionStatus,
+    AgentInfo, CreateSessionInput, FormAnswer, ModelInfo, ModelSurface, ModelSurfaceQuery, PermissionRequest,
+    PromptFile, ProviderModels, QuestionRequest, Session, SessionInfo, SessionListInfo, SessionSelection,
+    SessionStatus,
 };
 
 /// One skill a caller attaches to a prompt (spec #652): a small generation-neutral
@@ -408,62 +408,6 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         Ok(())
     }
 
-    /// How a pick on the `/model` provider scope takes effect on a session of
-    /// this client (issue #910): `NewThread` means only a session created
-    /// later can use it, `ResumeOnly` means resuming the session may — the
-    /// bridge then asks for confirmation first. A `ThisTurn` answer is not
-    /// meaningful for a provider (no client's `turn/start` has the field).
-    ///
-    /// The default answers [`ChangeScope::NewThread`]: the conservative cell,
-    /// and the only one a client without a provider axis can mean. Codex
-    /// derives it from `[clients.<id>] provider_switch_on_resume`.
-    fn provider_change_scope(&self) -> ChangeScope {
-        ChangeScope::NewThread
-    }
-
-    /// Where a pick of `model` (a provider + model pair) lands on this
-    /// client's session (issue #910).
-    ///
-    /// [`ModelPickRoute::PerTurn`] is the default because a client whose
-    /// provider rides each prompt (OpenCode) has no thread-level provider: a
-    /// picked provider is just part of the per-turn model ref. Codex answers
-    /// [`ModelPickRoute::ThreadModel`] when the pair's provider differs from
-    /// the thread's own — the pick then has to change a thread fact, which is
-    /// a release + resume + read-back, never a turn field.
-    ///
-    /// The answer may need a bounded session read when the client has not
-    /// observed the thread yet; it is read on a card callback and must stay
-    /// cheap.
-    async fn model_pick_route(
-        &self,
-        _session_id: &str,
-        _model: &ModelInfo,
-    ) -> Result<crate::backend::types::ModelPickRoute> {
-        Ok(crate::backend::types::ModelPickRoute::PerTurn)
-    }
-
-    /// Make the session's thread run `model` (provider + model), switching it
-    /// if it does not (issue #910).
-    ///
-    /// Codex's implementation releases this connection's subscriptions for the
-    /// thread, resumes it with `modelProvider` + `model`, and verifies the
-    /// change with a `thread/read` — a resume alone is a silent no-op on an
-    /// already-loaded thread, and a resume whose read-back still reports the old
-    /// pair is a **failure**. Every other client of the thread (a TUI, VS Code,
-    /// a second cola sharing the same `CODEX_HOME`) makes the switch impossible,
-    /// which is a named error: the caller must stop before sending a prompt on
-    /// the old provider.
-    ///
-    /// The default answers [`ThreadModelChange::Unchanged`]: a client with no
-    /// thread-level provider cannot have one to apply.
-    async fn apply_thread_model(
-        &self,
-        _session_id: &str,
-        _model: &ModelInfo,
-    ) -> Result<crate::backend::types::ThreadModelChange> {
-        Ok(crate::backend::types::ThreadModelChange::Unchanged)
-    }
-
     /// Whether this client has a **thread-level provider axis** (Codex's
     /// `modelProvider`): only such a client can carry a provider into
     /// `thread/start` or switch one by resuming. The default answers `false` —
@@ -495,14 +439,6 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// (issue #910).
     fn is_neutral_provider(&self, _provider: &str) -> bool {
         false
-    }
-
-    /// The thread's own model pair as this client's **cache** knows it (issue
-    /// #910 AC6): after a failed switch the bridge restores the session mirror
-    /// to the pair the thread actually runs. Cache-only, no RPC; `None` means
-    /// unknown (a client without a thread-level axis never needs it).
-    async fn observed_thread_model(&self, _session_id: &str) -> Option<crate::backend::types::ModelInfo> {
-        None
     }
 
     /// The thread-level provider this client's **own cache** holds for the

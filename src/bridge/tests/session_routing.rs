@@ -140,8 +140,6 @@ async fn topic_message_isolates_session_from_lobby() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -158,8 +156,6 @@ async fn topic_message_isolates_session_from_lobby() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -242,8 +238,6 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -260,8 +254,6 @@ async fn p2p_topic_isolated_from_p2p_top_level() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -332,8 +324,6 @@ async fn stale_session_mapping_is_recreated_on_404() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -350,8 +340,6 @@ async fn stale_session_mapping_is_recreated_on_404() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -442,8 +430,6 @@ async fn stale_session_recreate_retry_button_names_the_fresh_session() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -500,8 +486,6 @@ async fn stale_topic_recreate_preserves_creation_messages() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_root_cmd".into()),
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -596,8 +580,6 @@ async fn message_during_inflight_goes_to_supplement_path() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;

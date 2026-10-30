@@ -32,8 +32,6 @@ async fn model_no_arg_sends_picker_card() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("low".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -108,8 +106,6 @@ async fn model_card_falls_back_to_the_configured_default_model() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -169,8 +165,6 @@ async fn model_card_falls_back_to_the_server_recorded_model() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -230,8 +224,6 @@ async fn model_card_button_records_override() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -302,8 +294,6 @@ async fn model_picker_back_button_returns_to_providers() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -364,8 +354,6 @@ async fn drilled_model_page_does_not_resolve_the_current_selection() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -482,8 +470,6 @@ async fn a_stalled_selection_ladder_still_returns_the_root_page_inside_the_ack_b
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -554,8 +540,6 @@ async fn a_card_callback_charges_pre_dispatch_store_time_to_the_budget() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -649,8 +633,6 @@ async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -765,8 +747,6 @@ async fn agent_card_picker_and_button() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -871,8 +851,6 @@ async fn agent_text_reset_flag_clears_override() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -939,8 +917,6 @@ async fn autoaccept_card_toggles_flag() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1010,8 +986,6 @@ async fn name_patches_server_title() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1050,8 +1024,6 @@ async fn name_patches_cover_card_in_cover_rooted_topic() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1120,8 +1092,6 @@ async fn default_server_title_does_not_patch_cover_card() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1182,8 +1152,6 @@ async fn cover_title_retry_ladder_catches_late_auto_title() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1255,8 +1223,6 @@ async fn model_command_records_override_used_on_next_prompt() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1313,8 +1279,6 @@ async fn think_command_records_variant_used_on_next_prompt() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1379,8 +1343,6 @@ async fn think_command_rejects_undeclared_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1437,8 +1399,6 @@ async fn think_reset_flag_clears_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1491,8 +1451,6 @@ async fn think_bare_default_undeclared_is_rejected() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1544,8 +1502,6 @@ async fn think_bare_default_declared_is_stored() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1597,8 +1553,6 @@ async fn think_no_arg_sends_variant_card() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1666,8 +1620,6 @@ async fn think_card_button_records_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1759,8 +1711,6 @@ async fn model_switch_clears_undeclared_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1833,8 +1783,6 @@ async fn model_switch_keeps_variant_when_new_model_unknown() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1880,8 +1828,6 @@ async fn model_command_rejects_malformed_value() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1925,8 +1871,6 @@ async fn model_override_flows_through_supplement_path() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1981,8 +1925,6 @@ async fn agent_command_records_override_used_on_next_prompt() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2038,8 +1980,6 @@ async fn agent_override_flows_through_supplement_path() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2083,8 +2023,6 @@ async fn model_override_persists_across_store_reload() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2147,8 +2085,6 @@ async fn model_pick_switches_the_session_and_carries_the_servers_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2239,8 +2175,6 @@ async fn think_pick_rewrites_the_model_ref_with_the_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2329,8 +2263,6 @@ async fn think_card_falls_back_to_the_last_run_model_on_v2() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2410,8 +2342,6 @@ async fn think_pick_uses_the_last_run_model_on_v2() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2468,8 +2398,6 @@ async fn think_card_degrades_when_the_last_run_read_fails() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2531,8 +2459,6 @@ async fn agent_pick_switches_the_session_and_reset_switches_the_default() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2615,8 +2541,6 @@ async fn agent_reset_refuses_when_no_default_agent_resolves() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2675,8 +2599,6 @@ async fn a_failed_session_switch_leaves_the_mirror_untouched() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2753,8 +2675,6 @@ async fn the_ladder_reads_the_servers_selection_over_the_local_mirror() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2855,8 +2775,6 @@ async fn a_failed_durable_read_never_confirms_a_think_pick() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2941,8 +2859,6 @@ async fn a_failed_durable_read_hides_the_mirror_and_drops_an_unknown_variant() {
             topic_anchor: None,
             topic_root: None,
             variant: Some("high".into()),
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -3042,8 +2958,6 @@ async fn picker_buttons_switch_the_session_on_a_durable_generation() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;

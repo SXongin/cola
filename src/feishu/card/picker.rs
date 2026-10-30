@@ -610,96 +610,6 @@ fn grouped_picker_card(
     card_shell(header, "blue", elements)
 }
 
-/// The confirmation card for a **thread-level provider switch** (issue #910).
-///
-/// A provider is only half a model — the old model name sent to a new provider
-/// is a 404 — so the card always names the **pair**, and its 确认 button carries
-/// it together with the target **session**, so a card that outlived a
-/// `/switch`, a delete or a recreate is refused instead of switching a
-/// different thread. 取消 carries its own action tag and changes nothing.
-pub fn build_provider_confirm_card(
-    thread_key: &crate::config::ThreadKey,
-    session_id: &str,
-    provider: &str,
-    model: &str,
-) -> serde_json::Value {
-    let intro = format!(
-        "**切换为 `{provider}/{model}`？**\n\
-         这会释放并重新加载这条线程（`thread/unsubscribe` → `thread/resume` → `thread/read`），\
-         把 provider 和模型一起换掉：旧模型名在新 provider 上会 404。\n\
-         **同一个线程上的其他客户端（Codex TUI / VS Code / 桌面端），以及另一个共用同一个 \
-         `CODEX_HOME` 的 cola 实例，也会看到这次变化**；如果它们仍持有该线程，切换不会生效，\
-         cola 会报错而不会假装成功。"
-    );
-    let cancel = json!({
-        "tag": "button",
-        "text": { "tag": "plain_text", "content": "取消" },
-        "type": "default",
-        "width": "fill",
-        "value": {
-            "action": "model_provider_cancel",
-            "chat_id": thread_key.chat_id,
-            "thread_id": thread_key.thread_id,
-            "value": "",
-        },
-    });
-    let confirm = json!({
-        "tag": "button",
-        "text": { "tag": "plain_text", "content": "✅ 确认切换" },
-        "type": "default",
-        "width": "fill",
-        "value": {
-            "action": "model_provider_confirm",
-            "chat_id": thread_key.chat_id,
-            "thread_id": thread_key.thread_id,
-            "session_id": session_id,
-            "provider": provider,
-            "value": model,
-        },
-    });
-    card_shell(
-        "🎯 确认切换 Provider",
-        "blue",
-        vec![
-            markdown_element(&intro),
-            cancel,
-            confirm,
-            markdown_element("取消不会发出任何请求，线程保持原样。"),
-        ],
-    )
-}
-
-/// The confirmation's synchronous answer: the pair is **recorded**, and the next
-/// message's pre-flight applies it before submitting (issue #910). It replaces
-/// the confirmation card, so its buttons cannot record twice.
-pub fn build_provider_recorded_card(provider: &str, model: &str) -> serde_json::Value {
-    card_shell(
-        "🎯 已记录：下一条消息前切换",
-        "green",
-        vec![markdown_element(&format!(
-            "已记录 `{provider}/{model}`：这条线程保持原样，**下一条消息发出前**会先切换到它\
-             （释放订阅 → `thread/resume` → 回读校验）。\n\
-             如果切换无法生效（别的客户端或另一个共用同一 `CODEX_HOME` 的 cola 实例还持有这条线程），\
-             那条消息不会被发送，并会说明原因。"
-        ))],
-    )
-}
-
-/// The pair could not be recorded, so the switch never started: a click that
-/// cannot be saved must not claim success, and the thread is untouched (issue
-/// #910). The pair is written **before** the RPC precisely so a prompt racing
-/// the switch cannot send the old model name on the new provider.
-pub fn build_provider_save_blocked_card(pair: &str, error: &str) -> serde_json::Value {
-    card_shell(
-        "⚠️ Provider 切换没有开始",
-        "orange",
-        vec![markdown_element(&format!(
-            "无法记录这次选择（`{pair}`）：{error}。\n\
-             线程保持原来的 provider/model，也没有发出任何切换请求。"
-        ))],
-    )
-}
-
 /// The leading "current model" line shared by the `/model` picker cards.
 /// Empty when there is no session or no rung of the effective-model ladder
 /// resolves — the card then shows only its "选择 …" intro, exactly as before.
@@ -1196,6 +1106,37 @@ mod tests {
         assert!(
             markdown.contains("没有已知模型"),
             "the disabled row is text: {markdown}"
+        );
+    }
+
+    /// Spec #922: a live thread's provider page is read-only — the current
+    /// provider and the `/new` / `/fork` note, with no clickable rows.
+    #[test]
+    fn a_read_only_provider_page_renders_no_buttons() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut provider = scope("provider", "Provider（仅新会话）", Vec::new());
+        provider.changeable = ChangeScope::NewThread;
+        provider.pick = crate::backend::types::PickKind::Provider;
+        provider.intro = Some("provider 是会话创建时的选择".into());
+        provider.note =
+            Some("当前 provider：`deepseek`。provider 只能在新会话中更换：请用 `/new` 或 `/fork`。".into());
+        let cards = build_model_surface_cards(&key, &surface(None, vec![provider]), false);
+        let mut buttons = 0;
+        let mut markdown = String::new();
+        for card in &cards {
+            for element in card["body"]["elements"].as_array().unwrap() {
+                match element["tag"].as_str() {
+                    Some("button") => buttons += 1,
+                    Some("markdown") => markdown.push_str(element["content"].as_str().unwrap_or_default()),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(buttons, 0, "no clickable provider rows on a live thread");
+        assert!(markdown.contains("当前 provider"), "{markdown}");
+        assert!(
+            markdown.contains("/new") && markdown.contains("/fork"),
+            "{markdown}"
         );
     }
 
@@ -2386,68 +2327,6 @@ mod tests {
         assert!(
             buttons[1]["value"].get("provider").is_none(),
             "an unpaired model pick carries no provider field"
-        );
-    }
-
-    /// Issue #910 acceptance 7: the confirmation copy names the **pair**, says
-    /// every attached client (and a second cola sharing `CODEX_HOME`) sees the
-    /// change, and its buttons carry the pair + target session the bridge
-    /// re-checks.
-    #[test]
-    fn the_provider_confirmation_names_the_pair_peers_and_target() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let card = build_provider_confirm_card(&key, "ses_1", "deepseek", "deepseek-v4-pro");
-        let text = card.to_string();
-        for expected in [
-            "deepseek/deepseek-v4-pro",
-            "其他客户端",
-            "TUI",
-            "VS Code",
-            "CODEX_HOME",
-            "cola",
-        ] {
-            assert!(text.contains(expected), "{expected} missing: {text}");
-        }
-        let buttons = card_buttons(&card);
-        let confirm = buttons
-            .iter()
-            .find(|button| button["value"]["action"] == "model_provider_confirm")
-            .expect("the confirm button");
-        assert_eq!(confirm["value"]["value"], "deepseek-v4-pro");
-        assert_eq!(confirm["value"]["provider"], "deepseek");
-        assert_eq!(confirm["value"]["session_id"], "ses_1");
-        assert!(
-            buttons
-                .iter()
-                .any(|button| button["value"]["action"] == "model_provider_cancel"),
-            "the cancel button keeps its own action tag (a mechanism, not a value)"
-        );
-        assert!(
-            card.to_string().len() <= MAX_CARD_JSON_CHARS,
-            "the confirmation stays inside the card budget"
-        );
-    }
-
-    /// The recorded answer names the pair and says when it takes effect — the
-    /// next message, never "switched now" (issue #910's record-first shape).
-    #[test]
-    fn the_recorded_card_says_the_next_message_applies_it() {
-        let card = build_provider_recorded_card("deepseek", "deepseek-v4-pro");
-        let text = card.to_string();
-        assert!(text.contains("已记录"), "{text}");
-        assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
-        assert!(text.contains("下一条消息"), "{text}");
-        assert!(text.contains("回读"), "the read-back is promised: {text}");
-        assert!(text.contains("CODEX_HOME"), "the holder kinds stay named: {text}");
-
-        // A failed *record* is never a success: it names the reason and says
-        // nothing switched.
-        let save = build_provider_save_blocked_card("deepseek/deepseek-v4-pro", "disk full");
-        let text = save.to_string();
-        assert!(text.contains("无法记录"), "{text}");
-        assert!(
-            text.contains("没有开始") && text.contains("原来的 provider/model"),
-            "{text}"
         );
     }
 }

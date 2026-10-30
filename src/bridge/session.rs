@@ -231,10 +231,6 @@ pub(crate) enum MirrorWrite<'a> {
         model: &'a str,
         variant: Option<&'a str>,
     },
-    /// A pair **confirmed for a thread-level switch** (issue #910): the model
-    /// ref, and the mirror marks it so the turn pre-flight may release/resume
-    /// the thread to apply it. Every other pair write clears that mark.
-    ProviderSwitch { model: &'a str },
     /// A `/think` pick: the variant, or `None` to clear it.
     Variant(Option<&'a str>),
     /// Forget the mirror's selection (issue #910): a durable switch whose
@@ -249,16 +245,8 @@ pub(crate) enum MirrorWrite<'a> {
 fn apply_mirror_write(
     model: &mut Option<String>,
     variant: &mut Option<String>,
-    provider_switch_confirmed: &mut bool,
     write: MirrorWrite<'_>,
 ) -> Option<String> {
-    // Only a confirmation marks the pair for a thread-level switch; a
-    // `/think` write changes no model, so it leaves the mark alone.
-    match write {
-        MirrorWrite::ProviderSwitch { .. } => *provider_switch_confirmed = true,
-        MirrorWrite::Variant(_) => {}
-        _ => *provider_switch_confirmed = false,
-    }
     match write {
         MirrorWrite::Model {
             model: new_model,
@@ -285,10 +273,6 @@ fn apply_mirror_write(
         } => {
             *model = Some(new_model.to_string());
             *variant = new_variant.map(str::to_string);
-            None
-        }
-        MirrorWrite::ProviderSwitch { model: new_model } => {
-            *model = Some(new_model.to_string());
             None
         }
         MirrorWrite::Variant(new_variant) => {
@@ -607,13 +591,6 @@ impl SessionStore {
 
     /// The thread's current Pending Session identity (issue #910): `0` when it
     /// has none and none was ever declared since load.
-    /// Whether the recorded pair was confirmed for a thread-level switch
-    /// (issue #910). `false` for a vanished session: the safe direction.
-    pub(crate) fn provider_switch_confirmed(&self, session_id: &str) -> bool {
-        self.entry_for_session(session_id)
-            .is_some_and(|entry| entry.provider_switch_confirmed)
-    }
-
     pub(crate) fn pending_epoch_for(&self, key: &ThreadKey) -> u64 {
         self.pending_epoch.get(key).copied().unwrap_or_default()
     }
@@ -807,13 +784,7 @@ impl SessionStore {
         if pending.model.as_deref() != expected_model || pending.variant.as_deref() != expected_variant {
             return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
         }
-        let mut pending_confirmed = false;
-        let cleared_variant = apply_mirror_write(
-            &mut pending.model,
-            &mut pending.variant,
-            &mut pending_confirmed,
-            write,
-        );
+        let cleared_variant = apply_mirror_write(&mut pending.model, &mut pending.variant, write);
         if let MirrorWrite::Pair { provider, .. } = write {
             pending.provider = Some(provider.to_string());
         }
@@ -857,12 +828,7 @@ impl SessionStore {
         if entry.model.as_deref() != expected_model || entry.variant.as_deref() != expected_variant {
             return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
         }
-        let cleared_variant = apply_mirror_write(
-            &mut entry.model,
-            &mut entry.variant,
-            &mut entry.provider_switch_confirmed,
-            write,
-        );
+        let cleared_variant = apply_mirror_write(&mut entry.model, &mut entry.variant, write);
         let deferred = self.save_mirror(deadline)?;
         Ok(MirrorWriteOutcome {
             written: PairWrite::Applied { cleared_variant },
@@ -1310,8 +1276,6 @@ mod tests {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         }
     }
 
@@ -2135,137 +2099,6 @@ mod tests {
         assert!(store.pending_for(&key).is_none(), "the pending was consumed");
     }
 
-    /// Issue #910 (blocking): only the confirmation's write marks the pair for a
-    /// thread-level switch; a model pick clears it, and a `/think` leaves it
-    /// alone.
-    #[test]
-    fn provider_switch_confirmed_tracks_only_the_confirmed_pair() {
-        let dir = tempdir().unwrap();
-        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
-        let key = ThreadKey::new("chat1".into(), "root1".into());
-        store
-            .activate(make_entry("chat1", "root1", "ses_1", "/tmp/one"))
-            .unwrap();
-        assert!(!store.provider_switch_confirmed("ses_1"));
-
-        let pair = |model: &'static str| MirrorWrite::ProviderSwitch { model };
-        assert!(matches!(
-            store
-                .set_mirror_live(&key, "ses_1", None, None, pair("deepseek/pro"), None)
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(
-            store.provider_switch_confirmed("ses_1"),
-            "the confirmation marks it"
-        );
-
-        // A `/think` changes no model: the mark survives.
-        assert!(matches!(
-            store
-                .set_mirror_live(
-                    &key,
-                    "ses_1",
-                    Some("deepseek/pro"),
-                    None,
-                    MirrorWrite::Variant(Some("high")),
-                    None
-                )
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(store.provider_switch_confirmed("ses_1"));
-
-        // A same-provider model pick records unconfirmed.
-        assert!(matches!(
-            store
-                .set_mirror_live(
-                    &key,
-                    "ses_1",
-                    Some("deepseek/pro"),
-                    Some("high"),
-                    MirrorWrite::Model {
-                        model: "deepseek/pro2",
-                        clear_variant: Some("high"),
-                    },
-                    None
-                )
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(
-            !store.provider_switch_confirmed("ses_1"),
-            "an ordinary pick is unconfirmed"
-        );
-
-        // A durable pick and a forget clear it too.
-        assert!(matches!(
-            store
-                .set_mirror_live(
-                    &key,
-                    "ses_1",
-                    Some("deepseek/pro2"),
-                    None,
-                    pair("deepseek/pro3"),
-                    None
-                )
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(store.provider_switch_confirmed("ses_1"));
-        assert!(matches!(
-            store
-                .set_mirror_live(
-                    &key,
-                    "ses_1",
-                    Some("deepseek/pro3"),
-                    None,
-                    MirrorWrite::ModelWithVariant {
-                        model: "deepseek/pro4",
-                        variant: None,
-                    },
-                    None
-                )
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(!store.provider_switch_confirmed("ses_1"));
-        assert!(matches!(
-            store
-                .set_mirror_live(
-                    &key,
-                    "ses_1",
-                    Some("deepseek/pro4"),
-                    None,
-                    pair("deepseek/pro5"),
-                    None
-                )
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(matches!(
-            store
-                .set_mirror_live(
-                    &key,
-                    "ses_1",
-                    Some("deepseek/pro5"),
-                    None,
-                    MirrorWrite::Forget,
-                    None
-                )
-                .unwrap()
-                .written,
-            PairWrite::Applied { .. }
-        ));
-        assert!(!store.provider_switch_confirmed("ses_1"));
-    }
-
     /// Issue #910 (extra finding): a `/agent` write touches only its own field —
     /// never the model/variant a recorded switch put there.
     #[test]
@@ -2500,8 +2333,9 @@ mod tests {
                 "ses_1",
                 None,
                 None,
-                MirrorWrite::ProviderSwitch {
+                MirrorWrite::Model {
                     model: "deepseek/pro",
+                    clear_variant: None,
                 },
                 None,
             );

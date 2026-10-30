@@ -36,8 +36,6 @@ async fn seed_work_dir(app: &Arc<App>) {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -167,8 +165,6 @@ async fn question_card_action_posts_answer_back() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -256,8 +252,6 @@ async fn form_reply_submits_keyed_answers_and_keeps_custom_verbatim() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -374,8 +368,6 @@ async fn completing_last_question_replaces_card_with_full_qa_summary() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;

@@ -799,16 +799,15 @@ pub(crate) async fn read_config(
 /// provider because a picker pick records the neutral `codex` bucket, not the
 /// channel the thread really runs on.
 ///
-/// `provider_switch_on_resume` is the client's `[clients.<id>]` gate (issue
-/// #910): it decides whether an existing thread's provider scope says
-/// 「需确认」 (`thread/resume`, confirmation first) or 「仅新线程」. A Pending
-/// Session has no thread to resume, so its pick is always a new-thread one.
+/// A provider is creation-only (spec #922): a Pending Session's provider page
+/// offers the selectable pairs that ride `thread/start`, while a live thread's
+/// page is a read-only current value with the `/new` / `/fork` note. A Pending
+/// Session has no thread yet, so its pick is always a creation one.
 pub(crate) fn build_surface(
     catalog: &[crate::backend::types::ProviderModels],
     config: &CodexModelConfig,
     probes: &HashMap<String, ProbeOutcome>,
     thread_provider: Option<&str>,
-    provider_switch_on_resume: bool,
     query: &ModelSurfaceQuery<'_>,
 ) -> ModelSurface {
     // Parsed, not string-split: a provider id may itself contain `/` (issue
@@ -831,7 +830,6 @@ pub(crate) fn build_surface(
         .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
         .map(|model| model.id);
     let pending = query.session_id.is_none();
-    let resumable = !pending && provider_switch_on_resume;
 
     // Two pages, one scope each (#908's owner review): the root is the **model**
     // page, and `切换 provider…` drills into the provider page. A drilled page
@@ -842,7 +840,7 @@ pub(crate) fn build_surface(
             probes,
             current_provider.as_deref(),
             current_model.as_deref(),
-            resumable,
+            pending,
         )
     } else {
         model_page(catalog, config, probes, current_provider.as_deref())
@@ -961,17 +959,41 @@ fn model_page(
     }
 }
 
-/// Page 2 (#908): every configured provider as **pairs** (`provider/model`),
-/// the current pair marked, a probe failure as a short tag, a pairless provider
-/// as a disabled row. Nothing here changes the per-turn model by itself.
+/// Page 2 (#908): on a **Pending Session**, every configured provider as
+/// **pairs** (`provider/model`), the current pair marked, a probe failure as a
+/// short tag, a pairless provider as a disabled row — the pair rides
+/// `thread/start`. On a **live thread** a provider is creation-only (spec
+/// #922): the page is a read-only current value with the `/new` / `/fork` note,
+/// and it offers no rows at all.
 fn provider_page(
     config: &CodexModelConfig,
     probes: &HashMap<String, ProbeOutcome>,
     current_provider: Option<&str>,
     current_model: Option<&str>,
-    resumable: bool,
+    pending: bool,
 ) -> crate::backend::types::ModelScope {
     use crate::backend::types::{ChangeScope, ModelOption, ModelScope, PickKind};
+    if !pending {
+        // The neutral `codex` bucket names no channel: only a real thread
+        // provider is worth showing.
+        let current = current_provider.filter(|provider| *provider != MODEL_PROVIDER);
+        let note = match current {
+            Some(provider) => {
+                format!("当前 provider：`{provider}`。provider 只能在新会话中更换：请用 `/new` 或 `/fork`。")
+            }
+            None => "provider 只能在新会话中更换：请用 `/new` 或 `/fork`。".to_string(),
+        };
+        return ModelScope {
+            id: PROVIDER_SCOPE.into(),
+            title: "Provider（仅新会话）".into(),
+            changeable: ChangeScope::NewThread,
+            pick: PickKind::Provider,
+            options: Vec::new(),
+            note: Some(note),
+            free_text: None,
+            intro: Some("provider 是会话创建时的选择".to_string()),
+        };
+    }
     let mut options: Vec<ModelOption> = Vec::new();
     let mut paired_providers: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for provider in &config.providers {
@@ -1064,27 +1086,14 @@ fn provider_page(
     ModelScope {
         id: PROVIDER_SCOPE.into(),
         title: "切换 provider".into(),
-        changeable: if resumable {
-            ChangeScope::ResumeOnly
-        } else {
-            ChangeScope::NewThread
-        },
+        changeable: ChangeScope::NewThread,
         pick: PickKind::Provider,
         // One short status, never a paragraph: the config read itself failed.
         note: config.read_failed.then(|| "_(读不到 config)_".to_string()),
         options,
         free_text: None,
-        // What a pick on this page does, in one line (#910 AC1): a live
-        // thread's switch is recorded and confirmed; a new thread takes it
-        // directly.
-        intro: Some(
-            if resumable {
-                "确认后，下一条消息前切换"
-            } else {
-                "只在新线程生效"
-            }
-            .to_string(),
-        ),
+        // A Pending Session's pick is a creation fact (spec #922).
+        intro: Some("只在新会话生效".to_string()),
     }
 }
 
@@ -1774,7 +1783,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), false, &query);
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), &query);
         assert_eq!(
             surface.current.as_ref().map(|current| current.reference.as_str()),
             Some("deepseek/deepseek-flash"),
@@ -1782,14 +1791,8 @@ mod tests {
         );
         let mut providers_query = query;
         providers_query.scope = Some(PROVIDER_SCOPE);
-        let providers = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            Some("codex"),
-            false,
-            &providers_query,
-        );
+        providers_query.session_id = None;
+        let providers = build_surface(&[], &config, &HashMap::new(), Some("codex"), &providers_query);
         let label = providers.scopes[0].options[0].display_label();
         assert!(label.contains("当前"), "label: {label}");
 
@@ -1803,14 +1806,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let surface = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            Some("deepseek"),
-            false,
-            &picker_pick,
-        );
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), &picker_pick);
         let current = surface.current.expect("the current line stays");
         assert_eq!(current.reference, "deepseek/gpt-custom");
         assert_eq!(
@@ -1824,14 +1820,7 @@ mod tests {
             read_failed: true,
             ..Default::default()
         };
-        let surface = build_surface(
-            &[],
-            &unreadable,
-            &HashMap::new(),
-            Some("deepseek"),
-            false,
-            &picker_pick,
-        );
+        let surface = build_surface(&[], &unreadable, &HashMap::new(), Some("deepseek"), &picker_pick);
         assert_eq!(
             surface.current.unwrap().reference,
             "deepseek/gpt-custom",
@@ -1840,14 +1829,7 @@ mod tests {
 
         // The projection is the authority even for a provider the config no
         // longer declares (it was renamed or removed while the thread runs).
-        let surface = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            Some("renamed"),
-            false,
-            &picker_pick,
-        );
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("renamed"), &picker_pick);
         assert_eq!(
             surface.current.unwrap().reference,
             "renamed/gpt-custom",
@@ -1855,7 +1837,7 @@ mod tests {
         );
 
         // A neutral thread fact is not a channel: the line stays as resolved.
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), false, &picker_pick);
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), &picker_pick);
         assert_eq!(surface.current.unwrap().reference, "codex/gpt-custom");
     }
 
@@ -1876,7 +1858,7 @@ mod tests {
         probes.insert("opencode-go".into(), ProbeOutcome::Forbidden);
 
         // The root page has no probe prose: only the catalog/current provider.
-        let surface = build_surface(&[], &config, &probes, Some("opencode-go"), false, &query());
+        let surface = build_surface(&[], &config, &probes, Some("opencode-go"), &query());
         let model = &surface.scopes[0];
         assert!(
             model
@@ -1893,14 +1875,11 @@ mod tests {
 
         // The provider page lists it as a disabled row with a short tag, and
         // marks it as the current provider (#908 AC1).
-        let provider_page = build_surface(
-            &[],
-            &config,
-            &probes,
-            Some("opencode-go"),
-            false,
-            &provider_query(),
-        );
+        let pending_provider = ModelSurfaceQuery {
+            session_id: None,
+            ..provider_query()
+        };
+        let provider_page = build_surface(&[], &config, &probes, Some("opencode-go"), &pending_provider);
         let provider = &provider_page.scopes[0];
         assert_eq!(provider.id, PROVIDER_SCOPE);
         assert_eq!(provider.options.len(), 1, "the provider is listed");
@@ -1933,14 +1912,18 @@ mod tests {
             ..Default::default()
         };
         // The root page names the failure in one line, alongside the catalog.
-        let root = build_surface(&[], &config, &HashMap::new(), None, false, &query());
+        let root = build_surface(&[], &config, &HashMap::new(), None, &query());
         assert_eq!(
             root.scopes[0].note.as_deref(),
             Some("配置读取失败：只显示内置目录"),
             "the model page says the provider/profile data is unknown"
         );
 
-        let surface = build_surface(&[], &config, &HashMap::new(), None, false, &provider_query());
+        let pending_provider = ModelSurfaceQuery {
+            session_id: None,
+            ..provider_query()
+        };
+        let surface = build_surface(&[], &config, &HashMap::new(), None, &pending_provider);
         let note = surface.scopes[0].note.as_deref().unwrap();
         assert!(note.contains("读不到 config"), "note: {note}");
         assert!(!note.contains("没有 provider"), "note: {note}");
@@ -2001,13 +1984,11 @@ mod tests {
         assert_eq!(entries.len(), 1, "nothing expired survives the insert");
     }
 
-    /// Issue #910, items 2 and 3: the provider scope offers **pairs** only, and
-    /// each row says what a pick of that row does. A row on the thread's own
-    /// provider is an ordinary model pick (no confirmation); a different
-    /// provider is a new-thread pick or a confirmed resume, depending on the
-    /// gate.
+    /// Spec #922: a Pending Session's provider page offers the **pairs** that
+    /// ride `thread/start`; a live thread's page is read-only — the current
+    /// provider plus the `/new` / `/fork` note, with no rows to click.
     #[test]
-    fn the_provider_page_offers_pairs_without_suffixes() {
+    fn the_provider_page_is_selectable_only_on_a_pending_session() {
         let mut config = CodexModelConfig::default();
         config.providers.push(provider("deepseek", None, None, None));
         config.profiles.push(ProfilePreset {
@@ -2021,39 +2002,26 @@ mod tests {
             session_id: None,
             ..provider_query()
         };
-        let pending = build_surface(&[], &config, &HashMap::new(), None, true, &pending_query);
+        let pending = build_surface(&[], &config, &HashMap::new(), None, &pending_query);
         let scope = &pending.scopes[0];
-        assert_eq!(scope.changeable, ChangeScope::NewThread, "nothing to resume");
+        assert_eq!(scope.changeable, ChangeScope::NewThread);
         assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
+        assert_eq!(scope.intro.as_deref(), Some("只在新会话生效"));
         assert!(scope.note.is_none(), "no long copy");
 
-        // A live thread: the action is the confirmation, which the pick's card
-        // spells out — the row stays `provider/model`.
+        // A live thread: the current provider is stated, the rows are gone, and
+        // the only remedy named is `/new` / `/fork`.
         let live = provider_query();
-        let resumable = build_surface(&[], &config, &HashMap::new(), None, true, &live);
-        let scope = &resumable.scopes[0];
-        assert_eq!(scope.changeable, ChangeScope::ResumeOnly);
-        assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
-        assert_eq!(
-            scope.intro.as_deref(),
-            Some("确认后，下一条消息前切换"),
-            "a resumable switch says when it lands"
+        let read_only = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), &live);
+        let scope = &read_only.scopes[0];
+        assert_eq!(scope.changeable, ChangeScope::NewThread);
+        assert!(scope.options.is_empty(), "no clickable rows: {:?}", scope.options);
+        let note = scope.note.as_deref().expect("the read-only note");
+        assert!(
+            note.contains("当前 provider") && note.contains("deepseek"),
+            "{note}"
         );
-
-        // The gate shut: only a new thread can take it (the pick says so).
-        let locked = build_surface(&[], &config, &HashMap::new(), None, false, &live);
-        let scope = &locked.scopes[0];
-        assert_eq!(scope.changeable, ChangeScope::NewThread, "the gate is shut");
-        assert_eq!(
-            scope.intro.as_deref(),
-            Some("只在新线程生效"),
-            "a gated provider page says where it applies"
-        );
-
-        // The same pair on the thread's own provider is marked current.
-        let same = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), true, &live);
-        let label = same.scopes[0].options[0].display_label();
-        assert!(label.contains("当前"), "{label}");
+        assert!(note.contains("/new") && note.contains("/fork"), "{note}");
     }
 
     /// #908 AC1: a pair row labels the provider's configured **display name**
@@ -2071,7 +2039,11 @@ mod tests {
             provider: Some("deepseek".into()),
         });
 
-        let surface = build_surface(&[], &config, &HashMap::new(), None, true, &provider_query());
+        let pending_query = ModelSurfaceQuery {
+            session_id: None,
+            ..provider_query()
+        };
+        let surface = build_surface(&[], &config, &HashMap::new(), None, &pending_query);
         let option = &surface.scopes[0].options[0];
         assert_eq!(option.display_label(), "DeepSeek/deepseek-flash");
         assert_eq!(
@@ -2111,7 +2083,11 @@ mod tests {
 
         // The thread runs `foo/bar`, the pick was the neutral `codex` bucket:
         // the resolved current pair names the real provider, quoted.
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("foo/bar"), true, &query);
+        let pending = ModelSurfaceQuery {
+            session_id: None,
+            ..query
+        };
+        let surface = build_surface(&[], &config, &HashMap::new(), Some("foo/bar"), &pending);
         let option = &surface.scopes[0].options[0];
         assert_eq!(option.display_label(), "Foo Bar/gpt-x（当前）");
         assert_eq!(option.provider.as_deref(), Some("foo/bar"));
@@ -2139,14 +2115,7 @@ mod tests {
             model: "deepseek-flash".into(),
             provider: Some("deepseek".into()),
         });
-        let surface = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            None,
-            false,
-            &ModelSurfaceQuery::default(),
-        );
+        let surface = build_surface(&[], &config, &HashMap::new(), None, &ModelSurfaceQuery::default());
         let profile = surface.scopes[0]
             .options
             .iter()
@@ -2160,14 +2129,7 @@ mod tests {
             model: "gpt-5.1".into(),
             provider: None,
         });
-        let surface = build_surface(
-            &[],
-            &config,
-            &HashMap::new(),
-            None,
-            false,
-            &ModelSurfaceQuery::default(),
-        );
+        let surface = build_surface(&[], &config, &HashMap::new(), None, &ModelSurfaceQuery::default());
         assert!(
             surface.scopes[0]
                 .options

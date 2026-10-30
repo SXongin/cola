@@ -142,9 +142,8 @@ optional deadline (`write_to_disk_deferred`'s receipt), so:
   click never says the save was durable. A write that *failed* settles as the
   caller's save failure, as the blocking path did.
 
-The verification: a paused writer leaves the pick and the confirm inside
-`CARD_ACK_BUDGET` with the pair visible in memory and the file catching up on
-release (`a_stalled_writer_does_not_stall_a_model_pick_callback`,
-`a_stalled_writer_does_not_stall_a_provider_switch_confirm`), and a mirror write
+The verification: a paused writer leaves the pick inside `CARD_ACK_BUDGET`
+with the pair visible in memory and the file catching up on release
+(`a_stalled_writer_does_not_stall_a_model_pick_callback`), and a mirror write
 without a deadline does not return until the file has it
 (`a_mirror_write_without_a_deadline_blocks_until_the_file_has_it`).

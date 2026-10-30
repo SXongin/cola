@@ -230,7 +230,6 @@ kind = "codex"                   # required: opencode | codex
 # sandbox = "danger-full-access" # optional: read-only | workspace-write | danger-full-access
 # approval_policy = "on-request" # optional: untrusted | on-request | never
 # apply_on_adopt = false         # optional: also send the pair on thread/resume
-# provider_switch_on_resume = false  # optional: let /model switch a live thread's provider (confirmation first)
 # reasoning_summary = "auto"     # optional: auto | concise | detailed | none
 
 [bridge]
@@ -253,7 +252,7 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   (`auto`/`never`/`eager`): `never` is attach-only, while the others may start
   the shared daemon through `codex app-server daemon start` — cola never owns
   or reaps it. It also accepts `sandbox`, `approval_policy`, `apply_on_adopt`,
-  `provider_switch_on_resume` and `reasoning_summary` (each described below). A
+  and `reasoning_summary` (each described below). A
   named Agent Client does not inherit `[opencode]`'s values.
 - **`sandbox` / `approval_policy` / `apply_on_adopt` (codex only)** — what a
   Codex thread runs under. cola sends the pair on `thread/start`, so a thread it
@@ -277,32 +276,15 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   settings: a thread created before the change keeps the policy it was created
   with, and a thread your TUI created and cola adopted keeps it too unless
   `apply_on_adopt = true`.
-- **`provider_switch_on_resume` (codex only, default `false`)** — whether
-  `/model` may change an **existing** thread's provider. A provider is a
-  thread-level fact (`thread/start`'s and `thread/resume`'s `modelProvider`;
-  `turn/start` has none), so it is always chosen as a **pair** with a model: a
-  `[profiles.*]` preset (`model` + `model_provider`) or a model a provider's
-  `/models` listed. A bare provider is not selectable — leaving the old model
-  name on a new provider is a 404. Off by default, for `apply_on_adopt`'s
-  reason: the thread may be shared with your TUI/VSCode, and every attached
-  client sees the new provider. Off, a provider pick only says 「provider 只能
-  在新线程切换」 and sends nothing — a new thread still takes the pair chosen on
-  a Pending Session at creation. On, the confirmation **records** the pair: the
-  thread is untouched, and the **next message** applies it before being sent —
-  the three protocol steps, release its own subscription
-  (`thread/unsubscribe`; a resume on an already-loaded thread is a silent
-  no-op), `thread/resume` with `modelProvider` **and** `model`, then
-  `thread/read` to verify. Success is only the read-back. If another client
-  (a Codex TUI, VS Code, the desktop app) or another cola instance sharing the
-  same `CODEX_HOME` still holds the thread, the change does not land: the
-  message is **not sent**, the card names both possibilities, and the session
-  stays on the pair the thread actually runs — the unapplied record is dropped
-  (re-pick to retry) — close the other client, or use `thread/fork` with the
-  pair. A pick made while a turn is running is recorded the same way and applied
-  by the next message, and a thread that is already on the target provider but
-  runs another model is not reloaded (the model rides that message). The click
-  itself is answered synchronously; no release, resume or read-back ever runs
-  from the card.
+- **A provider is creation-only.** `/new` (a Pending Session) and `/fork` are
+  the only paths that choose a provider; both send the `model` + `modelProvider`
+  pair to `thread/start` or `thread/fork` (`turn/start` has no such field). A
+  live thread's provider never changes: `/model` with a different provider is
+  refused without any request and points at `/new` or `/fork`. The provider page
+  on a live thread is read-only — the current provider plus that note, with no
+  clickable rows — while a Pending Session still offers the pairs its creation
+  will carry. A provider is never selectable without a model: the old model name
+  on a new provider is a 404.
 - **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the
@@ -883,38 +865,23 @@ show the providers without their probed models until the next open fills them. T
 request's `Authorization` header: it never appears on a card, in a log line or in
 an error message.
 
-**A provider is thread level, so changing it is a different operation.** The
-provider page (the `切换 provider…` row) holds those pairs, labelled
-`provider/model`. A provider is chosen on `thread/start` or `thread/resume`; `turn/start` has no
+**A provider is creation-only.** The provider page (the `切换 provider…` row)
+holds the configured pairs, labelled `provider/model`. A provider is chosen only
+when a thread is created or forked: `/new` sends the pair to `thread/start`, and
+`/fork` sends it to `thread/fork` (a separate feature). `turn/start` has no
 provider field, and a provider is never selectable without a model — the old
 model name on a new provider is a 404. So:
 
 - **A new thread takes the pair directly.** Pick a provider row on a Pending
-  Session (before its first message) and the pair rides `thread/start`. No
-  confirmation: there is no other client to surprise.
-- **A live thread is recorded, then switched before the next message.** With
-  `provider_switch_on_resume = true` (in `[clients.<id>]`; default `false`) a
-  provider pick opens a confirmation card. 确认 records the pair and answers
-  immediately — it touches nothing on the thread. The next message's pre-flight
-  then releases cola's subscription to that thread, calls `thread/resume` with
-  the provider **and** the model, and reads the thread back; success is the
-  read-back, never the RPC's `ok`. A pick made while a turn is running is
-  recorded the same way and applies to the next message. With the gate off, a
-  provider pick on a live thread answers 「provider 只能在新线程切换」 and
-  nothing is recorded or sent.
-- **A peer can hold the thread.** If another client (a Codex TUI, VS Code, the
-  desktop app) or another cola instance sharing the same `CODEX_HOME` still
-  holds the thread, the server does not reload it and the switch cannot land:
-  the message is **not sent**, the error names both possibilities, and the
-  session stays on the pair the thread actually runs — the unapplied record is
-  dropped, so re-pick to retry — close the other client, or fork the thread
-  (`thread/fork`) with the pair. The cost is symmetric: while cola holds a live
-  thread's subscription, a provider change made in your TUI is silently ignored.
-  Neither side can tell that from success on the wire, so close the other face
-  before changing a provider.
+  Session (before its first message) and the pair rides `thread/start`.
+- **A live thread's provider cannot change.** The provider page on a live thread
+  is read-only: it shows the current provider and says the provider can only be
+  changed in a new session or a fork. `/model` with a different provider is
+  refused without any request — no `turn/start`, no `thread/resume` — and both
+  the card and the text reply point at `/new` / `/fork`.
 - **A same-provider pick is just a model change.** A `[profiles.*]` preset whose
   `model_provider` is the thread's current provider, or any `codex/<id>` pick,
-  is recorded and rides the next message — no release, no resume, no reload.
+  is recorded and rides the next message — no resume, no reload.
 - **`codex` is a reserved name.** The built-in catalog's ref is `codex/<id>` —
   a shared neutral namespace, never a channel — so a `[model_providers.codex]`
   cannot be selected: the provider section lists it as 「`codex` 是内置目录的保留名，
@@ -922,10 +889,9 @@ model name on a new provider is a 404. So:
   catalog's own), and a `[profiles.*]` naming it degrades to the neutral catalog
   ref. The classification is lexical, so a catalog pick never reads your config.
 
-`provider_switch_on_resume` gates the text form too: `/model
-<provider>/<model>` for a different provider opens the same confirmation card (or
-is refused with the gate off), never a silent thread change. The setting is
-described with the rest of `[clients.<id>]` above.
+`/model <provider>/<model>` follows the same rule: a different provider on a
+live thread is refused (never a silent thread change), while a Pending Session
+takes the pair at creation.
 
 ## FAQ / troubleshooting
 

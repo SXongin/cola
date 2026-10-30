@@ -644,8 +644,6 @@ async fn a_topic_cover_retitle_carries_the_session_chat_and_topic() {
             topic_anchor: Some("om_seed".into()),
             topic_root: Some("om_cover".into()),
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
