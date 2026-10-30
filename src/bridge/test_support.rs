@@ -3122,9 +3122,8 @@ impl crate::backend::Backend for MockBackend {
             .entry(session_id.to_string())
             .or_insert_with(|| (None, None));
         selection.1 = variant.map(str::to_string);
-        if selection.0.is_none() && selection.1.is_none() {
-            pending.remove(session_id);
-        }
+        // `None` is an explicit reset marker, not the absence of a selection:
+        // keep the key so `has_pending_selection` mirrors the real adapter.
         Ok(())
     }
 
