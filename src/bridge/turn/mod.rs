@@ -741,24 +741,16 @@ impl Turn {
         // generation that keeps a durable selection (V2) deliberately drops
         // them inside its strategy — the pick already lives on the session as
         // a switch. Do NOT "fix" a V2 pick by making the strategy re-send them.
-        // Issue #910: the pair this prompt runs with is decided HERE, under the
-        // session's write serialization point, and only then is the prompt
-        // submitted (see `crate::bridge::session_gates` for the invariant). The
-        // model **and** the `/think` variant are read together, so a switch
-        // recorded by the previous turn is what this turn applies — and a
-        // `/think` write racing this read cannot split the pair.
+        // Issue #910: the model **and** the `/think` variant this prompt runs
+        // with are read HERE, under the session's write serialization point,
+        // and only then is the prompt submitted (see
+        // `crate::bridge::session_gates` for the invariant). Reading them
+        // together means a `/think` write racing this read cannot split the
+        // pair.
         //
-        // A recorded pair whose provider differs is applied **now**: release the
-        // thread's subscriptions → `thread/resume` with `modelProvider` + `model`
-        // → `thread/read` read-back. The read-back is the verdict; if it cannot
-        // apply (a peer holds the thread, the read-back did not change, or the
-        // gate is off), the prompt is not sent — running it on the old provider
-        // would be a silent lie, and the old model name would 404.
         // A durable generation's variant is the session's own, and resolving it
         // may read the backend — never under the gate (its contract is "no RPC
-        // under it"). All other clients read the `/think` mirror under the gate,
-        // which keeps the stale-variant guarantee for the client whose provider
-        // switch this is.
+        // under it"). All other clients read the `/think` mirror under the gate.
         // The read is the pair this prompt runs with, so it must see a
         // **settled** selection: the session's switch point comes first (the
         // established order, switch → state gate), waiting out any in-flight
@@ -787,7 +779,7 @@ impl Turn {
                 )));
             }
         };
-        let (model, variant, switch_confirmed) = {
+        let (model, variant) = {
             let durable_variant = if handles.backend.keeps_session_selection() {
                 // Bounded like every other read under the point (issue #910):
                 // a silent server degrades to "unknown variant", never to a
@@ -814,70 +806,9 @@ impl Turn {
                 Some(variant) => variant,
                 None => handles.sessions.variant_override(&self.session_id).await,
             };
-            let switch_confirmed = handles.sessions.provider_switch_confirmed(&self.session_id).await;
-            (model, variant, switch_confirmed)
+            (model, variant)
         };
         self.turn_variant = variant;
-        if let Some(model) = model.as_ref() {
-            match handles.backend.model_pick_route(&self.session_id, model).await {
-                Ok(crate::backend::types::ModelPickRoute::ThreadModel) => {
-                    // A recorded pair may only become a **thread-level switch**
-                    // when it was confirmed as one (issue #910): a same-provider
-                    // model pick records it unconfirmed, and a peer that moved
-                    // the thread to another provider since makes the route
-                    // `ThreadModel`. Switching then would be an unconfirmed
-                    // provider change — refuse and ask for a re-pick, which goes
-                    // through the confirmation.
-                    if !switch_confirmed {
-                        return Err(crate::error::BridgeError::State(
-                            "这条线程的 provider 在你选择模型之后被其他客户端更改了；\
-                             这次保存的选择没有确认过线程级切换，本条消息没有发送。\
-                             请重新 `/model` 选择（新选择会先确认 provider 切换）。"
-                                .to_string(),
-                        ));
-                    }
-                    let pair = crate::backend::parsing::join_model(&model.provider_id, &model.id);
-                    self.settle_switch_variant(handles, &pair).await?;
-                    if let Err(error) = handles.backend.apply_thread_model(&self.session_id, model).await {
-                        // AC6: a failed switch leaves the session on the pair the
-                        // thread actually runs — never the unapplied record. The
-                        // adapter's read-back is that observation; the mirror is
-                        // compare-and-set restored (a newer pick keeps its own),
-                        // then the prompt stops with the named error and the user
-                        // re-picks to retry.
-                        let observed = handles.backend.observed_thread_model(&self.session_id).await;
-                        let observed_spec = observed
-                            .as_ref()
-                            .map(|model| crate::backend::parsing::join_model(&model.provider_id, &model.id));
-                        if let Err(restore) = handles
-                            .sessions
-                            .restore_observed_pair(
-                                &self.thread_key,
-                                &self.session_id,
-                                &pair,
-                                self.turn_variant.as_deref(),
-                                observed_spec.as_deref(),
-                                // The pair's `/think` level is not part of a
-                                // thread read: keep the level this prompt
-                                // validated (cleared when the pair lacks it).
-                                self.turn_variant.as_deref(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "failed switch: restoring the session mirror failed for {}: {restore}",
-                                self.session_id
-                            );
-                        }
-                        return Err(error);
-                    }
-                }
-                Ok(crate::backend::types::ModelPickRoute::PerTurn) => {}
-                // Unknown is not "safe to skip": a failed classification must
-                // not let the prompt run on a pair the thread may not hold.
-                Err(error) => return Err(error),
-            }
-        }
         let agent = handles.sessions.agent_override(&self.session_id).await;
         // Released immediately before the submit (issue #910): `Backend::prompt`
         // has no total response bound, and holding the point across it would let
@@ -909,65 +840,6 @@ impl Turn {
         // bound for a run that was never scheduled.
         self.submit_failed = prompt_resp.is_err();
         prompt_resp
-    }
-
-    /// Resolve the `/think` variant of a recorded pair before the provider
-    /// switch (issue #910). The confirmation that recorded the pair acks from a
-    /// store write only, so it defers this clear; ADR-0020 still says a variant
-    /// the new model does not declare must not be sent.
-    ///
-    /// The clear is a catalog read (never under the state gate) followed by a
-    /// compare-and-set on the pair the pre-flight read. If a concurrent
-    /// `/think` (or a newer pick) moved the mirror in between, that value is the
-    /// truth — but the value just identified as unsupported is never sent: it is
-    /// re-validated against the pair, and if it is unsupported too the prompt
-    /// stops by name rather than lying to the model.
-    async fn settle_switch_variant(&mut self, handles: &TurnHandles, pair: &str) -> crate::error::Result<()> {
-        let mut cleared = self.turn_variant.clone();
-        if handles
-            .sessions
-            .clear_variant_for_model(&handles.backend, &mut cleared, pair)
-            .await
-            .is_none()
-        {
-            // The new model declares the variant: nothing to clear.
-            return Ok(());
-        }
-        if handles
-            .sessions
-            .clear_variant_for_pair(
-                &self.thread_key,
-                &self.session_id,
-                pair,
-                self.turn_variant.as_deref(),
-            )
-            .await
-        {
-            self.turn_variant = cleared;
-            return Ok(());
-        }
-        // The compare-and-set lost: another writer moved the mirror between the
-        // pre-flight's read and the clear. Take what it left, re-validated
-        // against the pair this prompt is about to run.
-        let fresh = {
-            let gate = handles.session_gates.gate(&self.session_id);
-            let _held = gate.enter().await;
-            handles.sessions.variant_override(&self.session_id).await
-        };
-        let mut candidate = fresh.clone();
-        if handles
-            .sessions
-            .clear_variant_for_model(&handles.backend, &mut candidate, pair)
-            .await
-            .is_some()
-        {
-            return Err(crate::error::BridgeError::State(format!(
-                "思考等级 `{}` 与模型 {pair} 不兼容，且这次清除被另一条命令改写；本条消息没有发送，请先 `/think` 一个受支持的等级后重试。",
-                fresh.unwrap_or_default()
-            )));
-        }
-        self.turn_variant = candidate;
-        Ok(())
     }
 
     /// Replace the dead mapping with a fresh session on the current server —

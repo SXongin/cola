@@ -163,7 +163,6 @@ kind = "codex"                   # 必填：opencode | codex
 # sandbox = "danger-full-access" # 可选：read-only | workspace-write | danger-full-access
 # approval_policy = "on-request" # 可选：untrusted | on-request | never
 # apply_on_adopt = false         # 可选：在 thread/resume 上也发送这一对
-# provider_switch_on_resume = false  # 可选：允许 /model 切换已有线程的 provider（先确认）
 # reasoning_summary = "auto"     # 可选：auto | concise | detailed | none
 
 [bridge]
@@ -184,9 +183,8 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   `codex` 的 Agent Client 接受 `start_server`（`auto`/`never`/`eager`）：
   `never` 只附加，其余取值允许通过 `codex app-server daemon start` 启动共享
   守护进程——cola 从不拥有、也从不回收它。它还接受 `sandbox`、
-  `approval_policy`、`apply_on_adopt`、`provider_switch_on_resume` 与
-  `reasoning_summary`（下面逐项说明）。具名的 Agent Client 不会继承
-  `[opencode]` 的取值。
+  `approval_policy`、`apply_on_adopt` 与 `reasoning_summary`（下面逐项说明）。
+  具名的 Agent Client 不会继承 `[opencode]` 的取值。
 - **`sandbox` / `approval_policy` / `apply_on_adopt`（仅 codex）** —— Codex
   线程运行在什么策略下。cola 在 `thread/start` 上发送这一对，因此它创建的
   线程可以在这个仓库里开发：`sandbox = "danger-full-access"` 去掉沙箱及其
@@ -205,25 +203,13 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
   改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
   也一样——除非 `apply_on_adopt = true`。
-- **`provider_switch_on_resume`（仅 codex，默认 `false`）** —— `/model` 能否改动
-  **已有**线程的 provider。provider 是线程级事实（`thread/start` 与
-  `thread/resume` 的 `modelProvider`，`turn/start` 没有这个字段），所以它永远与
-  模型**成对**选择：`[profiles.*]` 预设（`model` + `model_provider`），或某个
-  provider 的 `/models` 列出的模型。单独的 provider 不可选——把旧模型名留在新
-  provider 上会 404。默认关闭，理由与 `apply_on_adopt` 相同：这条线程可能与你的
-  TUI/VSCode 共享，接在上面的每个客户端都会看到新的 provider。关闭时，点选只会
-  提示「provider 只能在新线程切换」，**不发送任何请求**——新线程仍然在创建时接受
-  Pending Session 上选好的那一对。打开后，确认卡只**记录**这一对：线程保持原样，
-  **下一条消息**发出前才应用——协议规定的三步：先释放自己的订阅
-  （`thread/unsubscribe`；对已加载的线程直接 resume 是静默 no-op），然后
-  `thread/resume` 同时带上 `modelProvider` 与 `model`，最后用 `thread/read` 回读
-  校验。只有回读才算成功。如果有别的客户端（Codex TUI、VS Code、桌面端）或另一个
-  共用同一 `CODEX_HOME` 的 cola 实例仍持有这条线程，改动不会落地：**那条消息不会
-  被发送**，卡片会点名这两种可能，会话停留在实际运行的那一对上（未应用的记录被
-  撤销，重新选择即可重试）——关掉那个客户端，或用
-  `thread/fork` 带上 provider 与模型。一轮正在跑时做出的选择同样只是记录，由下一条
-  消息应用；如果线程已经在目标 provider 上、只是模型不同，cola 不会重新加载线程
-  （模型随那条消息生效）。点击本身同步应答，卡片回调里绝不执行释放、resume 或回读。
+- **provider 只在创建时选择。** `/new`（Pending Session）与 `/fork` 是唯一选择
+  provider 的路径；它们把 `model` + `modelProvider` 成对交给 `thread/start` 或
+  `thread/fork`（`turn/start` 没有这个字段）。活动线程的 provider 不会改变：
+  `/model` 选到不同 provider 时**不发送任何请求**，并提示 `/new` 或 `/fork`。
+  活动线程的 provider 页是只读的——只显示当前 provider 与这条说明，没有可点的
+  rows；Pending Session 仍提供创建时会带上的成对行。provider 不能离开模型单独
+  选择：把旧模型名留在新 provider 上会 404。
 - **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
@@ -706,39 +692,29 @@ provider 页把原因作为行尾的短标签（`403`、`超时`…），不是�
 第一次冷点击可能只显示 provider、没有探测到的模型，下一次打开时补齐。token 只出现在请求的 `Authorization`
 头里：卡片、日志行与错误信息中都不会出现。
 
-**provider 是线程级的，所以换 provider 是另一种操作。** provider 页（`切换
-provider…` 那一行）就是这些成对的行，标签为 `provider/model`。provider 在
-`thread/start` 或 `thread/resume` 时确定；`turn/start` 没有 provider 字段，
-而且 provider 永远不能单独选——把旧模型名留在新 provider 上会 404。因此：
+**provider 只在创建时选择。** provider 页（`切换 provider…` 那一行）列出配置好的
+成对行，标签为 `provider/model`。provider 只在线程创建或 fork 时确定：`/new` 把这一对
+交给 `thread/start`，`/fork` 交给 `thread/fork`（fork 是单独的功能）。`turn/start`
+没有 provider 字段，而且 provider 永远不能离开模型单独选——把旧模型名留在新 provider
+上会 404。因此：
 
 - **新线程直接带走这一对。** 在待建会话（第一条消息之前）上点 provider 行，
-  这一对随 `thread/start` 发送。无需确认：没有别的客户端会被影响。
-- **已有线程先记录，再在下一条消息前切换。** 打开
-  `provider_switch_on_resume = true`（位于 `[clients.<id>]`，默认 `false`）时，
-  点 provider 会弹出确认卡片。确认 只记录这一对并立即返回——线程本身不动。
-  下一条消息的预检随后释放 cola 对该线程的订阅，用 provider **和** 模型调用
-  `thread/resume`，再回读该线程；成功只认回读，不认 RPC 的 `ok`。轮次运行中
-  做的选择同样被记录，并作用于下一条消息。开关关闭时，对已有线程点 provider
-  只回答「provider 只能在新线程切换」，既不记录也不发送。
-- **对端可能持有该线程。** 如果另一个客户端（Codex TUI、VS Code、桌面端）
-  或另一个共用同一 `CODEX_HOME` 的 cola 实例仍持有这条线程，服务器不会重新
-  加载它，切换无法落地：那条消息**不会发送**，错误会点名这两种可能，会话停留在
-  线程实际运行的那一对上（未应用的记录被撤销，重新选择即可重试）——先关掉另一个
-  客户端，或带上这一对 fork 线程（`thread/fork`）。代价是对称的：cola 持有某条活动线程的订阅期间，你在 TUI
-  里改的 provider 同样会被静默忽略。线上这两者无法与成功区分，所以换 provider
-  前请关掉另一端。
+  这一对随 `thread/start` 发送。
+- **活动线程的 provider 不可变。** 活动线程的 provider 页是只读的：显示当前
+  provider，并说明只能在新会话或 fork 中更换。`/model` 选到不同 provider 时会被
+  拒绝且**不发送任何请求**——没有 `turn/start`，也没有 `thread/resume`——卡片与
+  文本回复都指向 `/new` / `/fork`。
 - **同一 provider 内的点选只是一次模型变更。** `model_provider` 等于线程当前
   provider 的 `[profiles.*]` 预设，或任意 `codex/<id>` 点选，都只记录模型并
-  随下一条消息生效——不释放、不 resume、不重新加载。
+  随下一条消息生效——不 resume、不重新加载。
 - **`codex` 是保留名。** 内置目录的引用是 `codex/<id>`——一个共享的中性命名
   空间，永远不是一个渠道——所以 `[model_providers.codex]` 不能被选中：Provider
   一栏把它列成「`codex` 是内置目录的保留名，不能在这里选择」，不提供任何组合
   （组合值会和目录自身的引用撞车）；命名它的 `[profiles.*]` 会退化成中性目录
   引用。分类是纯字面的，因此目录点选从不读取你的配置。
 
-`provider_switch_on_resume` 同样管着文本形式：对不同 provider 的
-`/model <provider>/<model>` 会打开同一张确认卡片（开关关闭时被拒绝），绝不会
-静默改动线程。该开关的完整说明见上文 `[clients.<id>]` 小节。
+`/model <provider>/<model>` 遵循同一规则：活动线程上的不同 provider 会被拒绝
+（绝不静默改动线程），而 Pending Session 在创建时接受这一对。
 
 ## FAQ / 故障排查
 

@@ -2926,17 +2926,6 @@ impl App {
                     self.handle_model_card_action(&self.core, &value, callback_started)
                         .await
                 }
-                // A provider switch is a two-step click (issue #910): the
-                // confirmation card's own tags land here. 取消 is a no-op — it
-                // answers the ack and leaves the thread exactly as it was.
-                "model_provider_confirm" => {
-                    self.handle_provider_switch_confirm(&self.core, &value, deadline)
-                        .await
-                }
-                "model_provider_cancel" => Some(CardActionResult {
-                    card: None,
-                    toast: None,
-                }),
                 "think" => self.handle_think_card_action(&self.core, &value, false).await,
                 "think_clear" => self.handle_think_card_action(&self.core, &value, true).await,
                 "autoaccept" => self.handle_autoaccept_card_action(&self.core, &value).await,
@@ -4907,7 +4896,7 @@ impl App {
         use crate::bridge::handles::{ModelPickDecision, PickTarget};
         match core
             .sessions_handle()
-            .model_pick_decision(&core.client, thread_key, provider, model)
+            .model_pick_decision(&core.client, thread_key, provider)
             .await
         {
             ModelPickDecision::Record { target } => match target {
@@ -4922,22 +4911,6 @@ impl App {
                     self.save_pending_pair(core, thread_key, epoch, provider, &spec, deadline)
                         .await
                 }
-            },
-            ModelPickDecision::Confirm {
-                session_id,
-                provider,
-                model,
-            } => CardActionResult {
-                // Idle or mid-turn makes no difference: the pair is **recorded**
-                // by the confirmation, and the next prompt's pre-flight applies
-                // it before submitting (the owner's 「下一轮生效」).
-                card: Some(crate::feishu::card::picker::build_provider_confirm_card(
-                    thread_key,
-                    &session_id,
-                    &provider,
-                    &model,
-                )),
-                toast: None,
             },
             ModelPickDecision::Refuse(text) => CardActionResult {
                 card: None,
@@ -4998,110 +4971,6 @@ impl App {
                 card: None,
                 toast: Some(format!("⚠️ 保存失败：{error}")),
             },
-        }
-    }
-
-    /// The confirmation card's 确认 click (issue #910). The target is resolved
-    /// **here**, so a card that outlived a `/switch`, a delete or a recreate
-    /// does nothing; the gate is re-read, so a card sitting in Feishu cannot
-    /// record a switch after `provider_switch_on_resume` was turned off.
-    ///
-    /// This only **records** the pair: the thread is not touched. The next
-    /// prompt's pre-flight (`Turn::attempt`) applies it before submitting — the
-    /// owner's 「下一轮生效」 — so the click answers synchronously and no work runs
-    /// off the ack.
-    async fn handle_provider_switch_confirm(
-        &self,
-        core: &Arc<SharedCore>,
-        value: &serde_json::Value,
-        deadline: tokio::time::Instant,
-    ) -> Option<CardActionResult> {
-        let provider = value
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let model = value
-            .get("value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let card_session = value
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let thread_key = thread_key_from_value(value);
-        if provider.is_empty() || model.is_empty() {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("这张确认卡缺少 provider/model，没有做任何改动".to_string()),
-            });
-        }
-        let Some(settings) = core.session_settings(&thread_key).await else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "{}还没有会话",
-                    crate::bridge::display::feishu_side_label(&thread_key)
-                )),
-            });
-        };
-        let Some(session_id) = settings.session_id.clone() else {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("这张确认卡已过期：会话已切换或尚未创建，没有做任何改动".to_string()),
-            });
-        };
-        if card_session.is_empty() || card_session != session_id {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("这张确认卡已过期（会话已切换），没有做任何改动".to_string()),
-            });
-        }
-        // Re-checked at confirmation: the config may have been turned off while
-        // the card sat in the chat. The pre-flight enforces it again before the
-        // thread is ever touched.
-        if core.client.provider_change_scope() != crate::backend::types::ChangeScope::ResumeOnly {
-            return Some(CardActionResult {
-                card: None,
-                toast: Some("provider 只能在新线程切换".to_string()),
-            });
-        }
-        let pair = crate::backend::parsing::join_model(&provider, &model);
-        // Record the pair as the session's next-turn model. The same gated,
-        // compare-and-set write a `/model` pick uses, so a concurrent pick (or a
-        // remap, or a materialising session) is an honest refusal, never an
-        // overwrite.
-        // The card named a session: if `/switch` remapped the chat in between,
-        // this is a no-op instead of a record on the new session (issue #910).
-        // A store write only: no catalog read on the ack path (issue #910). The
-        // turn pre-flight resolves the `/think` clear for the recorded pair.
-        let saved = core
-            .record_pair_expecting(&thread_key, Some(&session_id), &pair, Some(deadline))
-            .await;
-        match classify_pick(
-            saved,
-            "Provider",
-            crate::bridge::display::feishu_side_label(&thread_key),
-        ) {
-            PickReply::Applied { cleared_variant } => {
-                let extra = cleared_variant
-                    .map(|v| format!("（已清除思考等级 `{v}`）"))
-                    .unwrap_or_default();
-                Some(CardActionResult {
-                    card: Some(crate::feishu::card::picker::build_provider_recorded_card(
-                        &provider, &model,
-                    )),
-                    toast: Some(format!("已记录：下一条消息发出前切换{extra}")),
-                })
-            }
-            PickReply::Failed(text) => Some(CardActionResult {
-                card: Some(crate::feishu::card::picker::build_provider_save_blocked_card(
-                    &pair, &text,
-                )),
-                toast: Some(text),
-            }),
         }
     }
 

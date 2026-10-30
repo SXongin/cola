@@ -68,8 +68,6 @@ fn entry(key: &ThreadKey, directory: &std::path::Path) -> SessionEntry {
         topic_anchor: None,
         topic_root: None,
         variant: None,
-
-        provider_switch_confirmed: false,
     }
 }
 

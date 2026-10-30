@@ -1417,11 +1417,11 @@ pub(crate) async fn handle_command(
             // per-prompt model. Validate the shape up front so a typo gets
             // immediate feedback instead of a silent no-op.
             //
-            // The text form obeys the same rule as the card (issue #910): a
-            // provider change on a live thread is **never recorded silently** —
-            // with the gate off it is refused without recording, with it on the
-            // same confirmation card asks for the click. A Pending Session takes
-            // the pair at creation.
+            // The text form obeys the same rule as the card (spec #922): a
+            // different provider on a live thread is **never recorded** — it is
+            // refused without a request and points at `/new` / `/fork`, because
+            // a provider is creation-only. A Pending Session takes the pair at
+            // creation.
             let Some(parsed) = crate::backend::parsing::parse_model(&name) else {
                 handles
                     .flow
@@ -1459,27 +1459,9 @@ pub(crate) async fn handle_command(
             match handles
                 .flow
                 .sessions
-                .model_pick_decision(
-                    &handles.flow.backend,
-                    &thread_key,
-                    &parsed.provider_id,
-                    &parsed.id,
-                )
+                .model_pick_decision(&handles.flow.backend, &thread_key, &parsed.provider_id)
                 .await
             {
-                crate::bridge::handles::ModelPickDecision::Confirm {
-                    session_id,
-                    provider,
-                    model,
-                } => {
-                    let card = crate::feishu::card::picker::build_provider_confirm_card(
-                        &thread_key,
-                        &session_id,
-                        &provider,
-                        &model,
-                    );
-                    handles.flow.platform.reply_card(message_id, &card).await?;
-                }
                 crate::bridge::handles::ModelPickDecision::Refuse(text) => {
                     handles.flow.platform.reply_text(message_id, &text).await?;
                 }

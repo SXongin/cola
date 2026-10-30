@@ -158,8 +158,6 @@ async fn subtask_permission_without_streaming_card_sends_card_to_parent_chat() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;

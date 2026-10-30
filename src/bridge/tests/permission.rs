@@ -979,8 +979,6 @@ async fn auto_accept_session_answers_permission_without_card() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1060,8 +1058,6 @@ async fn autoaccept_on_approves_already_pending_permission() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1121,8 +1117,6 @@ async fn autoaccept_on_approves_child_session_permission() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1318,8 +1312,6 @@ async fn separate_permission_card_sent_into_topic_for_topic_session() {
             topic_anchor: Some("msg_in_topic_anchor".into()),
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -2335,8 +2327,6 @@ async fn auto_accept_declines_an_unshowable_permission_too() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;

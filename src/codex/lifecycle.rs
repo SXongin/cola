@@ -268,14 +268,6 @@ impl CodexLifecycle {
         self
     }
 
-    /// Whether a **live** thread may have its provider changed by a resume,
-    /// from `[clients.<id>] provider_switch_on_resume` (issue #910). Exposed
-    /// for [`super::backend::CodexLifecycle`]'s `Backend` capabilities, which
-    /// the bridge asks before it has (or without needing) a connection.
-    pub(crate) fn provider_switch_on_resume(&self) -> bool {
-        self.settings.provider_switch_on_resume
-    }
-
     /// The attached client the `Backend` surface reads through, if the last
     /// attach pass left one installed.
     pub(crate) async fn attached_client(&self) -> Option<CodexClient> {
@@ -1609,7 +1601,6 @@ mod tests {
         let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
         let lifecycle = fixture.lifecycle_with(crate::config::CodexConfig {
             start_server: crate::config::ServerStartPolicy::Auto,
-            provider_switch_on_resume: true,
             ..crate::config::CodexConfig::default()
         });
         let never_busy = || false;
@@ -1623,19 +1614,6 @@ mod tests {
 
         assert!(crate::backend::Backend::has_thread_provider(&lifecycle));
         assert!(crate::backend::Backend::is_neutral_provider(&lifecycle, "codex"));
-        assert_eq!(
-            crate::backend::Backend::provider_change_scope(&lifecycle),
-            crate::backend::types::ChangeScope::ResumeOnly
-        );
-        // An unobserved thread needs the thread-level switch; the trait default
-        // (PerTurn) would send the pair as a turn field instead.
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-flash").expect("pair");
-        assert_eq!(
-            crate::backend::Backend::model_pick_route(&lifecycle, "thread-1", &pair)
-                .await
-                .expect("route"),
-            crate::backend::types::ModelPickRoute::ThreadModel
-        );
         assert_eq!(
             crate::backend::Backend::known_thread_provider(&lifecycle, "thread-1").await,
             None
@@ -2598,7 +2576,6 @@ mod tests {
             sandbox: Some(crate::config::SandboxMode::DangerFullAccess),
             approval_policy: Some(crate::config::ApprovalPolicy::OnRequest),
             apply_on_adopt: false,
-            provider_switch_on_resume: false,
             reasoning_summary: crate::config::ReasoningSummary::Detailed,
         });
         let never_busy = || false;

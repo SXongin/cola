@@ -7315,8 +7315,6 @@ Index: /x/src/main.rs
                 topic_anchor: None,
                 topic_root: None,
                 variant: None,
-
-                provider_switch_confirmed: false,
             },
         )
         .await;
@@ -7492,8 +7490,6 @@ Index: /x/src/main.rs
                 topic_anchor: None,
                 topic_root: None,
                 variant: None,
-
-                provider_switch_confirmed: false,
             },
         )
         .await;
@@ -9437,8 +9433,6 @@ Index: /x/src/main.rs
                 topic_anchor: None,
                 topic_root: None,
                 variant: None,
-
-                provider_switch_confirmed: false,
             },
         )
         .await;
@@ -9526,8 +9520,6 @@ Index: /x/src/main.rs
                 topic_anchor: Some("om_seed".into()),
                 topic_root: Some("om_cover".into()),
                 variant: None,
-
-                provider_switch_confirmed: false,
             },
         )
         .await;

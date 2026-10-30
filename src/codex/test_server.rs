@@ -359,24 +359,9 @@ struct State {
     /// Answer `thread/resume` without a response, so a test can cancel a
     /// pending adopt.
     silent_resume: std::sync::atomic::AtomicBool,
-    /// One-shot: answer the next `thread/resume` with this JSON-RPC error, so a
-    /// refused provider switch is exercised (issue #910).
-    reject_resume: std::sync::Mutex<Option<String>>,
-    /// Ignore a resume's `modelProvider` (answer with the thread's old one), so
-    /// cola's "no silent fallback" check has something to catch.
-    keep_provider_on_resume: std::sync::atomic::AtomicBool,
     /// Every client→server method, in arrival order (issue #910's sequence
     /// assertions: unsubscribe → resume → read).
     calls: std::sync::Mutex<Vec<String>>,
-    /// How long the next `thread/resume` waits before replying, so a test can
-    /// prove the card-ack path does not wait for it.
-    resume_delay: std::sync::Mutex<std::time::Duration>,
-    /// One-shot: leave the next `thread/unsubscribe` unanswered, so a stalled
-    /// release's cleanup is exercised (issue #910).
-    silent_unsubscribe: std::sync::atomic::AtomicBool,
-    /// One-shot: delay the next `thread/unsubscribe` reply, so a *late* ack can
-    /// race a restore (issue #910).
-    unsubscribe_delay: std::sync::Mutex<std::time::Duration>,
     /// Fail this many `thread/turns/list` calls before answering normally.
     fail_turns_pages: AtomicUsize,
     /// Scripted notifications a `turn/start` emits to the thread's subscribers:
@@ -447,11 +432,6 @@ struct State {
     /// a `/stop` can be exercised in the window before the server persists the
     /// turn.
     hide_live_turns: std::sync::Mutex<std::collections::HashMap<String, usize>>,
-    /// One-shot delay for the next `thread/read` reply (a stale read, #910).
-    read_delay: std::sync::Mutex<std::time::Duration>,
-    /// `thread/read` calls received, so a test can wait until its read is in
-    /// flight before interleaving a broadcast (issue #908).
-    read_calls: AtomicUsize,
     /// One-shot: leave the next `thread/read` unanswered (a stalled read).
     silent_thread_read: std::sync::atomic::AtomicBool,
     /// Answer the next `thread/read` with THIS thread instead of the requested
@@ -499,12 +479,7 @@ impl Default for State {
             unsubscribe_calls: AtomicUsize::new(0),
             reject_unsubscribe: AtomicUsize::new(0),
             silent_resume: std::sync::atomic::AtomicBool::new(false),
-            reject_resume: std::sync::Mutex::new(None),
-            keep_provider_on_resume: std::sync::atomic::AtomicBool::new(false),
             calls: std::sync::Mutex::new(Vec::new()),
-            resume_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
-            silent_unsubscribe: std::sync::atomic::AtomicBool::new(false),
-            unsubscribe_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
             fail_turns_pages: AtomicUsize::new(0),
             scripted_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             turn_starts: AtomicUsize::new(0),
@@ -538,8 +513,6 @@ impl Default for State {
             reject_compact: std::sync::atomic::AtomicBool::new(false),
             drop_on_compact: std::sync::atomic::AtomicBool::new(false),
             hide_live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
-            read_delay: std::sync::Mutex::new(std::time::Duration::ZERO),
-            read_calls: AtomicUsize::new(0),
             silent_thread_read: std::sync::atomic::AtomicBool::new(false),
             read_returns: std::sync::Mutex::new(None),
             model_list_calls: AtomicUsize::new(0),
@@ -854,24 +827,6 @@ impl FakeServer {
         self.state.silent_resume.store(true, Ordering::SeqCst);
     }
 
-    /// Answer the next `thread/resume` with `message` (a JSON-RPC error), so a
-    /// refused provider switch is exercised (issue #910).
-    pub(crate) fn reject_next_resume(&self, message: &str) {
-        *self.state.reject_resume.lock().expect("reject resume") = Some(message.to_string());
-    }
-
-    /// Accept a resume's `modelProvider` but keep the thread's old provider in
-    /// the answer — a server that did not apply the switch.
-    pub(crate) fn keep_provider_on_resume(&self) {
-        self.state.keep_provider_on_resume.store(true, Ordering::SeqCst);
-    }
-
-    /// Delay the next `thread/resume` reply by `delay` (issue #910's off-ack
-    /// test: the click must be acknowledged before the switch finishes).
-    pub(crate) fn set_resume_delay(&self, delay: std::time::Duration) {
-        *self.state.resume_delay.lock().expect("resume delay") = delay;
-    }
-
     /// Every client→server method, in arrival order. Empty it with
     /// [`Self::clear_calls`] right before the traffic a test wants to order.
     pub(crate) fn call_log(&self) -> Vec<String> {
@@ -902,18 +857,6 @@ impl FakeServer {
             "thread/settings/updated",
             json!({ "threadId": thread_id, "threadSettings": settings }),
         )
-    }
-
-    /// Leave the next `thread/unsubscribe` unanswered (the connection stays
-    /// open), so a stalled release's cleanup path is exercised (issue #910).
-    pub(crate) fn silence_next_unsubscribe(&self) {
-        self.state.silent_unsubscribe.store(true, Ordering::SeqCst);
-    }
-
-    /// Delay the next `thread/unsubscribe` reply by `delay` (one-shot): lets a
-    /// test prove a **late** ack cannot evict a restored subscription.
-    pub(crate) fn set_unsubscribe_delay(&self, delay: std::time::Duration) {
-        *self.state.unsubscribe_delay.lock().expect("unsubscribe delay") = delay;
     }
 
     /// `thread/resume` calls received so far.
@@ -1201,18 +1144,6 @@ impl FakeServer {
         self.state.drop_on_compact.store(true, Ordering::SeqCst);
     }
 
-    /// `thread/read` calls received (issue #908).
-    pub(crate) fn read_calls(&self) -> usize {
-        self.state.read_calls.load(Ordering::SeqCst)
-    }
-
-    /// Delay the next `thread/read` reply by `delay` (one-shot). The payload is
-    /// captured **before** the delay, so the reply is stale by the time it
-    /// lands — a broadcast arriving meanwhile must win (issue #910).
-    pub(crate) fn set_read_delay(&self, delay: std::time::Duration) {
-        *self.state.read_delay.lock().expect("read delay") = delay;
-    }
-
     /// Leave the next `thread/read` unanswered, modelling a stalled request.
     pub(crate) fn silence_next_thread_read(&self) {
         self.state.silent_thread_read.store(true, Ordering::SeqCst);
@@ -1449,15 +1380,9 @@ where
             reply(sink, id, json!({})).await
         }
         Some("thread/read") => {
-            state.read_calls.fetch_add(1, Ordering::SeqCst);
             if state.silent_thread_read.swap(false, Ordering::SeqCst) {
                 return true;
             }
-            // One-shot: capture the payload, then hold the answer (a stale read).
-            let delay = {
-                let mut delay = state.read_delay.lock().expect("read delay");
-                std::mem::take(&mut *delay)
-            };
             let requested = params.get("threadId").and_then(Value::as_str).unwrap_or("");
             let substituted = state.read_returns.lock().expect("read returns").take();
             let thread_id = substituted.as_deref().unwrap_or(requested);
@@ -1479,9 +1404,6 @@ where
                                 turn["status"] = json!("completed");
                             }
                         }
-                    }
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
                     }
                     replying(sink, id, json!({ "thread": thread_json(&thread) })).await
                 }
@@ -1883,54 +1805,13 @@ where
                 .lock()
                 .expect("resume params")
                 .push(params.clone());
-            // One-shot: the delay models a slow switch, not every later resume.
-            let delay = {
-                let mut delay = state.resume_delay.lock().expect("resume delay");
-                std::mem::take(&mut *delay)
-            };
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
             if state.silent_resume.swap(false, Ordering::SeqCst) {
                 return true;
             }
-            let rejected = state.reject_resume.lock().expect("reject resume").take();
-            if let Some(message) = rejected {
-                return reply_error(sink, id, -32602, &message).await;
-            }
             let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
-            let Some(mut thread) = find_thread(state, thread_id) else {
+            let Some(thread) = find_thread(state, thread_id) else {
                 return reply_error(sink, id, -32600, &format!("thread not found: {thread_id}")).await;
             };
-            // A provider switch is `thread/resume`'s `modelProvider` **and**
-            // `model` (issue #910). The measured behaviour: it only lands when
-            // the thread is reloaded, i.e. when **no** connection (this one
-            // included, or a peer) still subscribes; otherwise the resume
-            // answers ok and changes nothing. The knob models a server that
-            // accepted the call but did not apply it.
-            let loaded = state
-                .subscribers
-                .lock()
-                .expect("subscribers")
-                .get(thread_id)
-                .is_some_and(|streams| !streams.is_empty());
-            if let Some(provider) = params.get("modelProvider").and_then(Value::as_str)
-                && !loaded
-                && !state.keep_provider_on_resume.load(Ordering::SeqCst)
-            {
-                let model = params.get("model").and_then(Value::as_str);
-                thread.model_provider = Some(provider.to_string());
-                if let Some(model) = model {
-                    thread.model = Some(model.to_string());
-                }
-                let mut threads = state.threads.lock().expect("scripted threads");
-                if let Some(stored) = threads.iter_mut().find(|thread| thread.id == thread_id) {
-                    stored.model_provider = Some(provider.to_string());
-                    if let Some(model) = model {
-                        stored.model = Some(model.to_string());
-                    }
-                }
-            }
             if !thread.has_history {
                 // The spike's exact shape (ADR-0090 amendment, question 2).
                 return reply_error(
@@ -1963,16 +1844,6 @@ where
         }
         Some("thread/unsubscribe") => {
             state.unsubscribe_calls.fetch_add(1, Ordering::SeqCst);
-            if state.silent_unsubscribe.swap(false, Ordering::SeqCst) {
-                return true;
-            }
-            let delay = {
-                let mut delay = state.unsubscribe_delay.lock().expect("unsubscribe delay");
-                std::mem::take(&mut *delay)
-            };
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
             if state.reject_unsubscribe.load(Ordering::SeqCst) > 0 {
                 state.reject_unsubscribe.fetch_sub(1, Ordering::SeqCst);
                 return reply_error(sink, id, -32600, "thread unsubscribe failed").await;

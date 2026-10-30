@@ -22,8 +22,6 @@ fn seeded_entry(key: &crate::config::ThreadKey, directory: &str) -> crate::confi
         topic_anchor: None,
         topic_root: None,
         variant: None,
-
-        provider_switch_confirmed: false,
     }
 }
 

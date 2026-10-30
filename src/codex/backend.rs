@@ -808,26 +808,15 @@ impl Projections {
         self.threads.lock().expect("codex projections").len()
     }
 
-    /// Forget one thread's model fact (issue #910): called when a switch's
-    /// outcome is **unknown**, so no stale provider serves a per-turn
-    /// classification. The next read re-learns it.
-    pub(crate) fn forget_model(&self, thread_id: &str) {
-        self.projection(thread_id)
-            .lock()
-            .expect("codex projection")
-            .forget_model();
-    }
-
     /// Forget a dead subscription so the next read adopts again, and state the
     /// gap on the retained history: a later read must not present stale state
     /// as current.
     ///
-    /// The thread's **model fact** dies with the subscription too (issue #910):
-    /// once nothing observes `thread/settings/updated`, another client may have
-    /// changed the provider, so the cached pair can no longer classify a pick as
-    /// per-turn — a stale `opencode-go` would send a model to the peer's real
-    /// provider without confirmation. Unknown is the safe answer; the next read
-    /// re-learns the pair.
+    /// The thread's **model fact** dies with the subscription too: once nothing
+    /// observes `thread/settings/updated`, another client may have changed the
+    /// provider, so the cached pair can no longer prove a pick is same-provider
+    /// (spec #922 refuses an unproven provider change). Unknown is the safe
+    /// answer; the next read re-learns the pair.
     pub(crate) fn forget(&self, thread_id: &str) {
         self.states
             .lock()
@@ -1070,46 +1059,6 @@ impl CodexClient {
             self.projections.remember_thread_metadata(&thread, observed);
         }
         self.projections.model(session_id)
-    }
-
-    /// The provider this connection has observed for the thread (issue #910).
-    ///
-    /// The ordered projection answers when it holds a real provider; the neutral
-    /// `codex` bucket is not one (a picker pick can record it when no thread fact
-    /// was known) and counts as unknown. One bounded `thread/read` then learns
-    /// the fact — and seeds the projection — so a pick right after a restart does
-    /// not guess. `None` is unknown, never a guess: a failed or slow read leaves
-    /// the caller to treat the pick as a possible thread-level change.
-    async fn thread_provider(&self, session_id: &str) -> Option<String> {
-        if let Some(held) = self.projections.model(session_id) {
-            let provider = held.provider_id;
-            if provider != MODEL_PROVIDER {
-                return Some(provider);
-            }
-        }
-        let observed = self.projections.next_model_stamp();
-        match tokio::time::timeout(PROVIDER_READ_TIMEOUT, self.threads().read(session_id, false)).await {
-            Ok(Ok(thread)) => {
-                self.projections.remember_thread_metadata(&thread, observed);
-                thread
-                    .model_provider
-                    .filter(|provider| !provider.trim().is_empty())
-            }
-            Ok(Err(error)) => {
-                tracing::debug!(
-                    thread = %session_id,
-                    "could not read the thread's provider (issue #910): {error}"
-                );
-                None
-            }
-            Err(_) => {
-                tracing::debug!(
-                    thread = %session_id,
-                    "the thread's provider read missed {PROVIDER_READ_TIMEOUT:?}; treating the                      pick as a possible thread-level change"
-                );
-                None
-            }
-        }
     }
 
     /// Subscribe the thread if this connection has not already: `thread/resume`
@@ -1494,26 +1443,14 @@ const SKILL_CWD_READ_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const SKILL_CWD_READ_TIMEOUT: Duration = Duration::from_millis(60);
 
-/// How long a model pick may wait for the thread's provider when this
-/// connection has not observed it yet (issue #910). The pick runs on a card
-/// callback's 2 s ack budget, so the read is short; on expiry the thread counts
-/// as **unknown**, which the pick treats as a thread-level change — the apply
-/// step then re-reads and answers [`ThreadModelChange::Unchanged`] when the pair
-/// already matches, so the unknown case can never silently send a wrong pair.
+/// How long an on-demand `thread/read` may wait when this connection has not
+/// observed the thread's model/provider fact (issue #908). The read runs on a
+/// command page, never a card callback's ack budget, and a timeout leaves the
+/// fact **unknown** rather than guessing.
 #[cfg(not(test))]
 const PROVIDER_READ_TIMEOUT: Duration = Duration::from_millis(800);
 #[cfg(test)]
 const PROVIDER_READ_TIMEOUT: Duration = Duration::from_millis(200);
-
-/// The bound on **each** step of a provider switch (issue #910). There is no
-/// outer timeout around the sequence: once the release landed, the read-back and
-/// the re-subscribe must still run, so a cancelled or timed-out outer wrapper
-/// cannot skip the cleanup. Written as per-call bounds, the sequence is finite
-/// without ever being dropped mid-flight by us.
-#[cfg(not(test))]
-const SWITCH_RPC_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const SWITCH_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The provider bucket the `/model` picker shows for Codex. `model/list` names
 /// no provider: a Codex model is whatever the attached app-server resolves
@@ -1540,49 +1477,6 @@ fn thread_model(thread: &Thread) -> Option<ModelIdentity> {
         model_id: model_id.to_string(),
         variant: None,
     })
-}
-
-/// Restore the local view and the subscription after a release whose outcome is
-/// unknown (a failure or a timeout): re-read the thread as the truth, record it,
-/// then re-subscribe. Bounded and best-effort — the caller reports the release
-/// failure itself (issue #910).
-impl CodexClient {
-    async fn restore_after_release(&self, session_id: &str) {
-        // The stamp is taken **before** the read (ADR-0092's #904 amendment): a
-        // `thread/settings/updated` arriving while the recovery read is in
-        // flight is newer, and the projection drops the older answer.
-        let observed = self.projections.next_model_stamp();
-        if let Ok(Ok(read)) =
-            tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false)).await
-        {
-            self.projections.remember_thread_metadata(&read, observed);
-        }
-        match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.ensure_subscription(session_id)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                thread = %session_id,
-                "could not re-subscribe after a failed release: {error}"
-            ),
-            Err(_) => tracing::warn!(
-                thread = %session_id,
-                "re-subscribing after a failed release did not answer within \
-                 {SWITCH_RPC_TIMEOUT:?}"
-            ),
-        }
-    }
-}
-
-/// The named failure of one bounded switch step (issue #910). The copy says what
-/// is known — never that the switch succeeded — and names the likely holders.
-fn switch_step_timeout(step: &str, what: &str) -> BridgeError {
-    BridgeError::Client {
-        client: "codex",
-        detail: format!(
-            "provider 切换在 `{step}` 上超过 {SWITCH_RPC_TIMEOUT:?} 没有完成：{what}。\
-             可能有另一个客户端（Codex TUI / VS Code）或另一个共用同一个 `CODEX_HOME` 的 cola \
-             实例持有该线程；请关闭它，或改用 `thread/fork` 带上 provider/model。"
-        ),
-    }
 }
 
 /// Bound the `/model` catalog read. A server that keeps minting fresh cursors
@@ -1644,8 +1538,6 @@ fn model_surface_from_catalog(providers: &[ProviderModels], query: &ModelSurface
         &super::model_surface::CodexModelConfig::default(),
         &std::collections::HashMap::new(),
         None,
-        // No config read, so no gate to open: the conservative cell.
-        false,
         query,
     )
 }
@@ -2020,18 +1912,6 @@ impl Backend for CodexClient {
         self.release_thread(session_id).await.map_err(client_error)
     }
 
-    /// Codex's provider axis is thread-level (issue #910): a new thread takes
-    /// one at creation, and an existing thread only through `thread/resume`,
-    /// which every client attached to it observes (ADR-0090). The config key
-    /// `provider_switch_on_resume` decides whether that second door is open.
-    fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
-        if self.threads().provider_switch_on_resume() {
-            crate::backend::types::ChangeScope::ResumeOnly
-        } else {
-            crate::backend::types::ChangeScope::NewThread
-        }
-    }
-
     fn client_name(&self) -> &'static str {
         "Codex"
     }
@@ -2054,18 +1934,6 @@ impl Backend for CodexClient {
         provider == MODEL_PROVIDER
     }
 
-    /// The ordered thread fact, mapped for the bridge's failed-switch restore
-    /// (issue #910 AC6).
-    async fn observed_thread_model(&self, session_id: &str) -> Option<crate::backend::types::ModelInfo> {
-        self.projections
-            .model(session_id)
-            .map(|model| crate::backend::types::ModelInfo {
-                id: model.model_id,
-                provider_id: model.provider_id,
-                variant: model.variant,
-            })
-    }
-
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
     /// bucket is not a channel, so it reads as unknown. A cold projection is
     /// unknown — deciding "is the gate relevant" must not cost a request.
@@ -2074,208 +1942,6 @@ impl Backend for CodexClient {
             .model(session_id)
             .map(|model| model.provider_id)
             .filter(|provider| provider != MODEL_PROVIDER)
-    }
-
-    /// Where a Codex model pick lands (issue #910): the neutral `codex` bucket
-    /// means "no provider named" and rides the turn; a real provider that is
-    /// the thread's own needs no thread action either (only the model changes,
-    /// and `turn/start.model` carries it); anything else — a different provider,
-    /// or a thread this connection has not observed yet — needs the thread-level
-    /// switch.
-    async fn model_pick_route(
-        &self,
-        session_id: &str,
-        model: &ModelInfo,
-    ) -> Result<crate::backend::types::ModelPickRoute> {
-        if model.provider_id == MODEL_PROVIDER {
-            return Ok(crate::backend::types::ModelPickRoute::PerTurn);
-        }
-        Ok(match self.thread_provider(session_id).await {
-            Some(current) if current == model.provider_id => crate::backend::types::ModelPickRoute::PerTurn,
-            _ => crate::backend::types::ModelPickRoute::ThreadModel,
-        })
-    }
-
-    /// Make the thread run `model` by the protocol's only three steps (issue
-    /// #910):
-    ///
-    /// 1. `thread/unsubscribe` — release this connection's subscription. A
-    ///    resume on a thread the server already has loaded is a **silent
-    ///    no-op**, so the release is not optional. `release_thread` is a no-op
-    ///    when there is no handle (the cheap defence) and the thread id — not a
-    ///    session mapping — is what it releases, so every local holder of that
-    ///    thread goes.
-    /// 2. `thread/resume { threadId, modelProvider, model }` — the pair, never
-    ///    the provider alone: leaving the old model on the thread would send
-    ///    the old model name to the new provider.
-    /// 3. `thread/read` — the verdict. A resume that returns ok while the read
-    ///    still reports the old pair is a failure, never a success.
-    ///
-    /// A peer holding the thread (another client, or another cola instance
-    /// sharing this `CODEX_HOME`) makes step 3 keep the old pair; that is the
-    /// named error, and nothing is recorded locally.
-    async fn apply_thread_model(
-        &self,
-        session_id: &str,
-        model: &ModelInfo,
-    ) -> Result<crate::backend::types::ThreadModelChange> {
-        use crate::backend::types::ThreadModelChange;
-        if model.provider_id == MODEL_PROVIDER {
-            return Ok(ThreadModelChange::Unchanged);
-        }
-        // The read is the authority: a peer may have moved the thread since this
-        // connection last looked, and a success claim ("already" included) is
-        // only ever its answer about **both** halves of the pair. Bounded like
-        // every other step of a switch.
-        // The stamp is taken **before** the read (issue #910): a
-        // `thread/settings/updated` arriving while the read is in flight is a
-        // newer fact, and the projection drops this stale answer instead of
-        // letting it overwrite the broadcast.
-        let observed = self.projections.next_model_stamp();
-        let current = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false))
-            .await
-            .map_err(|_| switch_step_timeout("thread/read", "无法确认线程当前的 provider/model"))?
-            .map_err(client_error)?;
-        self.projections.remember_thread_metadata(&current, observed);
-        let provider_matches = current.model_provider.as_deref() == Some(model.provider_id.as_str());
-        let model_matches = current.model.as_deref() == Some(model.id.as_str());
-        match (provider_matches, model_matches) {
-            (true, true) => return Ok(ThreadModelChange::Unchanged),
-            // Same provider, different model: a model change is the per-turn
-            // path, so no reload is made — the model rides the next turn.
-            (true, false) => return Ok(ThreadModelChange::ModelNextTurn),
-            (false, _) => {}
-        }
-        // A real provider change needs the opt-in, re-checked at the moment of
-        // the request: a card that sat in Feishu across a config change must
-        // not switch.
-        if !self.threads().provider_switch_on_resume() {
-            return Err(BridgeError::Client {
-                client: "codex",
-                detail: "provider 切换被关闭（`[clients.<id>] provider_switch_on_resume = false`）：\
-                         provider 只能在新线程切换"
-                    .to_string(),
-            });
-        }
-        // Steps 1 and 2 are **one step under the thread's adoption lock**
-        // (issue #910): a render poll's `ensure_subscription` landing between
-        // the release and the provider resume would load the thread with an
-        // ordinary resume first, and the provider-specific resume would then be
-        // a silent no-op on a loaded thread — the read-back would see the old
-        // pair and the prompt would be refused. The guard is dropped before the
-        // read-back below, which may adopt the thread again.
-        //
-        // `release_thread_locked` takes the release handle and forgets the
-        // projection **before** it awaits the unsubscribe, so a failed or
-        // timed-out release may already have left this connection's consumer
-        // ended and the local view forgotten: the read-back and the re-subscribe
-        // below run either way. A release that did not land means the thread is
-        // still loaded, so the resume is not attempted — nothing has moved.
-        let adoption = self.projections.adoption_lock(session_id);
-        let (released, resumed) = {
-            let _adopting = adoption.lock().await;
-            let released =
-                tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.release_thread_locked(session_id)).await;
-            let resumed = if matches!(released, Ok(Ok(()))) {
-                Some(
-                    tokio::time::timeout(
-                        SWITCH_RPC_TIMEOUT,
-                        self.threads()
-                            .resume_with_model(session_id, &model.provider_id, &model.id),
-                    )
-                    .await,
-                )
-            } else {
-                None
-            };
-            (released, resumed)
-        };
-        let Some(resumed) = resumed else {
-            // Ambiguous (issue #910): the unsubscribe may have reached the
-            // server while its answer was lost, so a peer may have moved the
-            // thread since. Forget this connection's provider fact — keeping it
-            // would let `thread_provider` classify a pick for the old provider
-            // as per-turn, sending the model to the peer's channel. The restore
-            // read below re-learns the truth (or leaves it unknown).
-            self.projections.forget_model(session_id);
-            self.restore_after_release(session_id).await;
-            return match released {
-                Ok(Err(error)) => Err(client_error(error)),
-                Ok(Ok(())) => unreachable!("guarded above"),
-                Err(_) => Err(switch_step_timeout(
-                    "thread/unsubscribe",
-                    "线程没有在期限内确认释放，因此没有开始切换",
-                )),
-            };
-        };
-        // Step 3: the read is the verdict **and** the cleanup — attempted on
-        // every path after the release, even when the resume failed or timed out,
-        // so the local view is never left forgotten.
-        let observed = self.projections.next_model_stamp();
-        let read = tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.threads().read(session_id, false)).await;
-        if let Ok(Ok(read)) = &read {
-            // The pre-read stamp: a broadcast that arrived meanwhile wins.
-            self.projections.remember_thread_metadata(read, observed);
-        }
-        // Keep mirroring: the release above ended this connection's consumer.
-        // On a failed switch this re-adopts with the thread's stored settings
-        // (no `modelProvider`), so it cannot apply the pair. Bounded, best-effort.
-        match tokio::time::timeout(SWITCH_RPC_TIMEOUT, self.ensure_subscription(session_id)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(
-                thread = %session_id,
-                "could not re-subscribe after a provider change: {error}"
-            ),
-            Err(_) => tracing::warn!(
-                thread = %session_id,
-                "re-subscribing after a provider change did not answer within \
-                 {SWITCH_RPC_TIMEOUT:?}"
-            ),
-        }
-        let read = match read {
-            Ok(result) => result.map_err(client_error)?,
-            Err(_) => {
-                // The verdict could not be read: the thread's pair is unknown,
-                // so no stale fact may serve a per-turn classification (issue
-                // #910). A later prompt reads before deciding.
-                self.projections.forget_model(session_id);
-                return Err(switch_step_timeout(
-                    "thread/read",
-                    "无法确认线程是否已切换，本地记录按原样恢复",
-                ));
-            }
-        };
-
-        let provider_ok = read.model_provider.as_deref() == Some(model.provider_id.as_str());
-        let model_ok = read.model.as_deref() == Some(model.id.as_str());
-        if !provider_ok || !model_ok {
-            // A resume that timed out may still have landed: the read decides,
-            // and a matching pair returns success above. A disagreeing read with
-            // a failed/timed-out resume reports that step's failure instead.
-            match resumed {
-                Ok(Err(error)) => return Err(client_error(error)),
-                Err(_) => {
-                    return Err(switch_step_timeout(
-                        "thread/resume",
-                        "回读仍是原来的 provider/model",
-                    ));
-                }
-                Ok(Ok(_)) => {}
-            }
-            return Err(BridgeError::Client {
-                client: "codex",
-                detail: format!(
-                    "thread/resume 之后这条线程仍是 `{}/{}`（应为 `{}/{}`）：可能有另一个客户端\
-                     （Codex TUI / VS Code）或另一个共用同一个 `CODEX_HOME` 的 cola 实例仍持有它，\
-                     服务端因此没有重新加载线程。请先关闭它，或改用 `thread/fork` 带上 provider/model。",
-                    read.model_provider.as_deref().unwrap_or("?"),
-                    read.model.as_deref().unwrap_or("?"),
-                    model.provider_id,
-                    model.id
-                ),
-            });
-        }
-        Ok(ThreadModelChange::Changed)
     }
 
     async fn prompt(
@@ -2687,10 +2353,9 @@ impl Backend for CodexClient {
     /// configured providers as a thread-level scope. Every model pick keeps the
     /// `codex/<id>` callback value the text form records, and a `[profiles.*]`
     /// preset also carries its `model_provider` (issue #910). The provider scope
-    /// is a **selection**, not OpenCode's drill-down: a Pending Session applies
-    /// the pick at `thread/start`, while an existing thread can only take one
-    /// through the bridge's confirmed `thread/resume` — and only when the client
-    /// set `provider_switch_on_resume`. `turn/start` never carries a provider.
+    /// is creation-only (spec #922): a Pending Session applies a pick at
+    /// `thread/start`, while a live thread's provider page is read-only and
+    /// points at `/new` / `/fork`. `turn/start` never carries a provider.
     ///
     /// # Read budgets
     ///
@@ -2803,7 +2468,6 @@ impl Backend for CodexClient {
             &config,
             &probes,
             thread_provider.as_deref(),
-            self.threads().provider_switch_on_resume(),
             &effective_query,
         );
         // The recorded pair, when the thread has not run it yet: a separate
@@ -2919,47 +2583,13 @@ impl Backend for CodexLifecycle {
     }
 
     // The provider axis is a property of the *client kind*, so the wrapper can
-    // answer it without a connection. The trait defaults are wrong here and
-    // silently turn every Codex pick into an OpenCode-shaped per-turn pick:
-    // the bridge talks to this lifecycle, never to the attached `CodexClient`
-    // (issue #910 follow-up).
-    fn provider_change_scope(&self) -> crate::backend::types::ChangeScope {
-        if self.provider_switch_on_resume() {
-            crate::backend::types::ChangeScope::ResumeOnly
-        } else {
-            crate::backend::types::ChangeScope::NewThread
-        }
-    }
-
+    // answer it without a connection (issue #910 follow-up).
     fn has_thread_provider(&self) -> bool {
         true
     }
 
     fn is_neutral_provider(&self, provider: &str) -> bool {
         provider == MODEL_PROVIDER
-    }
-
-    async fn model_pick_route(
-        &self,
-        session_id: &str,
-        model: &crate::backend::types::ModelInfo,
-    ) -> Result<crate::backend::types::ModelPickRoute> {
-        Backend::model_pick_route(&self.current().await?, session_id, model).await
-    }
-
-    async fn apply_thread_model(
-        &self,
-        session_id: &str,
-        model: &crate::backend::types::ModelInfo,
-    ) -> Result<crate::backend::types::ThreadModelChange> {
-        Backend::apply_thread_model(&self.current().await?, session_id, model).await
-    }
-
-    async fn observed_thread_model(&self, session_id: &str) -> Option<ModelInfo> {
-        match self.attached_client().await {
-            Some(client) => Backend::observed_thread_model(&client, session_id).await,
-            None => None,
-        }
     }
 
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
@@ -5353,7 +4983,6 @@ mod tests {
             &config,
             &std::collections::HashMap::new(),
             Some("opencode-go"),
-            false,
             &query,
         );
         assert_eq!(surface.scopes.len(), 1, "one scope per page");
@@ -5386,12 +5015,12 @@ mod tests {
         // configured display name, #908 AC1); the callback keeps id + model.
         let mut provider_query = query;
         provider_query.scope = Some("provider");
+        provider_query.session_id = None;
         let surface = crate::codex::model_surface::build_surface(
             &providers,
             &config,
             &std::collections::HashMap::new(),
             Some("opencode-go"),
-            false,
             &provider_query,
         );
         assert_eq!(surface.scopes.len(), 1);
@@ -5628,6 +5257,9 @@ mod tests {
         );
         let mut provider_page = query();
         provider_page.scope = Some("provider");
+        // The provider rows are a Pending Session's creation pairs; a live
+        // thread's page is read-only (spec #922).
+        provider_page.session_id = None;
         let page = Backend::model_surface(&client, provider_page).await;
         assert!(
             page.scopes[0]
@@ -7638,19 +7270,6 @@ mod tests {
             Some("deepseek".to_string()),
             "the created thread's ordered fact names the chosen provider"
         );
-        // The creation pair is not a "change": the first prompt needs no
-        // thread-level switch (issue #910, item 3).
-        assert_eq!(
-            Backend::model_pick_route(
-                &client,
-                &session.id,
-                &crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap(),
-            )
-            .await
-            .expect("route"),
-            crate::backend::types::ModelPickRoute::PerTurn,
-            "the thread already runs the created pair"
-        );
 
         // A provider pick alone sends only the provider: the thread keeps the
         // server's model until a turn names one.
@@ -7664,208 +7283,6 @@ mod tests {
         Backend::create_session(&client, &input).await.expect("create");
         let params = server.start_params();
         assert_eq!(params[1], json!({ "modelProvider": "openai" }));
-    }
-
-    /// Issue #910, item 1: a provider change is three steps — release, resume
-    /// with the pair, read back — and success is the read-back, not the RPC's
-    /// ok. The measured server only applies a resume when the thread is
-    /// reloaded, so the release is not optional.
-    #[tokio::test]
-    async fn a_provider_switch_releases_resumes_and_reads_back() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        assert_eq!(
-            Backend::provider_change_scope(&client),
-            crate::backend::types::ChangeScope::ResumeOnly,
-            "the opt-in opens the resume door"
-        );
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        assert_eq!(
-            Backend::model_pick_route(&client, "thread-1", &pair)
-                .await
-                .expect("route"),
-            crate::backend::types::ModelPickRoute::ThreadModel,
-            "a different provider is a thread-level change"
-        );
-
-        server.clear_calls();
-        let change = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect("switch");
-        assert_eq!(change, crate::backend::types::ThreadModelChange::Changed);
-
-        // The sequence the owner measured: the release must come first (a
-        // resume on a loaded thread is a silent no-op), then the resume, then
-        // the read that is the verdict.
-        let calls = server.call_log();
-        let release = calls
-            .iter()
-            .position(|method| method == "thread/unsubscribe")
-            .unwrap_or_else(|| panic!("no release in {calls:?}"));
-        let resume = calls
-            .iter()
-            .skip(release + 1)
-            .position(|method| method == "thread/resume")
-            .unwrap_or_else(|| panic!("no resume after the release in {calls:?}"))
-            + release
-            + 1;
-        let read = calls
-            .iter()
-            .skip(resume + 1)
-            .position(|method| method == "thread/read")
-            .unwrap_or_else(|| panic!("no read after the resume in {calls:?}"))
-            + resume
-            + 1;
-        assert!(release < resume && resume < read, "order: {calls:?}");
-
-        // The pair, both halves, on the resume.
-        let params = server.resume_params();
-        assert!(
-            params.iter().any(|params| params
-                == &json!({
-                    "threadId": "thread-1",
-                    "modelProvider": "deepseek",
-                    "model": "deepseek-v4-pro",
-                })),
-            "the resume carries the pair: {params:?}"
-        );
-        // The read-back is what moved the projection, and mirroring resumed.
-        let held = client.projections.model("thread-1").expect("a model fact");
-        assert_eq!(held.provider_id, "deepseek");
-        assert_eq!(held.model_id, "deepseek-v4-pro");
-        server.wait_for_subscribers("thread-1", 1).await;
-    }
-
-    /// Issue #910, item 3: the same provider with a different model is an
-    /// ordinary pick — the route says per-turn and the apply step sends nothing,
-    /// so no `thread/resume` and no `thread/unsubscribe` happens.
-    #[tokio::test]
-    async fn a_same_provider_pick_takes_no_thread_action() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        let same = crate::backend::parsing::parse_model("openai/gpt-5.1").unwrap();
-        server.clear_calls();
-        assert_eq!(
-            Backend::model_pick_route(&client, "thread-1", &same)
-                .await
-                .expect("route"),
-            crate::backend::types::ModelPickRoute::PerTurn,
-            "the provider does not change"
-        );
-        assert_eq!(
-            Backend::apply_thread_model(&client, "thread-1", &same)
-                .await
-                .expect("apply"),
-            crate::backend::types::ThreadModelChange::ModelNextTurn,
-            "the provider matches but the model does not: the model rides the next turn"
-        );
-        let calls = server.call_log();
-        for forbidden in ["thread/unsubscribe", "thread/resume"] {
-            assert!(
-                !calls.iter().any(|method| method == forbidden),
-                "a same-provider pick must not send `{forbidden}`: {calls:?}"
-            );
-        }
-    }
-
-    /// Issue #910, items 1 and 4: a peer holding the thread (another client, or
-    /// another cola sharing this `CODEX_HOME`) makes the read-back keep the old
-    /// pair. That is a named failure, the projection keeps the previous
-    /// provider, and the copy names both holder kinds plus the escape hatch.
-    #[tokio::test]
-    async fn a_provider_switch_refused_by_a_peer_keeps_the_previous_pair() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        // A peer (a TUI, or another cola) subscribes to the same thread.
-        let peer = connect(&url).await;
-        peer.transcript("thread-1").await.expect("the peer adopts");
-        client.transcript("thread-1").await.expect("cola adopts");
-        server.wait_for_subscribers("thread-1", 2).await;
-
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect_err("a peer-held thread cannot be reloaded");
-        let message = error.to_string();
-        assert!(message.contains("openai"), "names what it stayed on: {message}");
-        assert!(
-            message.contains("TUI") && message.contains("VS Code"),
-            "names the other-client holder: {message}"
-        );
-        assert!(
-            message.contains("cola") && message.contains("CODEX_HOME"),
-            "names the other-cola-instance holder: {message}"
-        );
-        assert!(
-            message.contains("thread/fork"),
-            "names the escape hatch: {message}"
-        );
-        assert_eq!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("openai".to_string()),
-            "a refused switch must not move the local mirror"
-        );
-        assert_eq!(
-            client.projections.model("thread-1").map(|model| model.model_id),
-            Some("gpt-5.1-codex".to_string()),
-        );
     }
 
     /// Issue #910 (extra finding): the subscription epoch counter never restarts,
@@ -7890,362 +7307,6 @@ mod tests {
             projections.state("thread-1"),
             Some(SubscriptionState::Live),
             "an old epoch cannot evict the re-created subscription"
-        );
-    }
-
-    /// Issue #910 (extra finding): a **late** unsubscribe ack must not evict the
-    /// projection a restore already re-adopted. The release handle is taken and
-    /// the projection forgotten before the ack; if the ack arrives after the
-    /// timeout's restore, it belongs to a superseded subscription epoch and is
-    /// ignored.
-    #[tokio::test]
-    async fn a_late_unsubscribe_ack_does_not_evict_the_restored_projection() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        // The ack lands after the step bound: the switch times out, the cleanup
-        // re-subscribes, and only then does the old task's ack arrive.
-        server.set_unsubscribe_delay(Duration::from_millis(2_500));
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        let _ = Backend::apply_thread_model(&client, "thread-1", &pair).await;
-        // The restore re-adopted within the bound; the old ack is still pending.
-        assert_eq!(
-            client.projections.state("thread-1"),
-            Some(SubscriptionState::Live),
-            "the restore re-subscribed"
-        );
-
-        // Past the late ack: the fresh projection must still be there.
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        assert_eq!(
-            client.projections.state("thread-1"),
-            Some(SubscriptionState::Live),
-            "a late ack from the superseded subscription must not evict the restore"
-        );
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id)
-                == Some("openai".to_string())
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the restored projection lost its model fact"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Issue #908: the **recovery** read of an ambiguous release follows the
-    /// same stamp rule — a broadcast that lands while it is in flight wins and
-    /// the stale result is dropped.
-    #[tokio::test]
-    async fn a_stale_recovery_read_does_not_overwrite_a_newer_broadcast() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        // The recovery read captures `openai` and then stalls.
-        let reads_before = server.read_calls();
-        server.set_read_delay(Duration::from_millis(500));
-        let restore = tokio::spawn({
-            let client = client.clone();
-            async move { client.restore_after_release("thread-1").await }
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while server.read_calls() == reads_before {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the recovery read never started"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        // A broadcast lands while it is in flight.
-        server.push_thread_settings("thread-1", "deepseek-v4-pro", "deepseek", None);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id)
-                == Some("deepseek".to_string())
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the broadcast fact never landed"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        restore.await.expect("the restore joins");
-        assert_eq!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("deepseek".to_string()),
-            "the stale recovery read never overwrites the broadcast"
-        );
-    }
-
-    /// Issue #910 (blocking): a poll's ordinary adopt must not land between the
-    /// release and the provider-specific resume. The switch holds the thread's
-    /// **adoption lock** across both, so a concurrent `transcript` read waits —
-    /// without it the poll would resume the thread first, the provider resume
-    /// would be a silent no-op, and the read-back would refuse the prompt.
-    #[tokio::test]
-    async fn a_poll_cannot_adopt_between_the_release_and_the_resume() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-        let resumes_before = server.resume_calls();
-
-        // The provider resume is parked: the release is done, the re-adopt is
-        // not. A poll read landing here is the race.
-        server.set_resume_delay(Duration::from_millis(500));
-        let attempt = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        let switch = tokio::spawn({
-            let client = client.clone();
-            async move { Backend::apply_thread_model(&client, "thread-1", &attempt).await }
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while server.resume_calls() == resumes_before {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the switch's resume never started"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        let poll = tokio::spawn({
-            let client = client.clone();
-            async move { client.transcript("thread-1").await }
-        });
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(
-            server.resume_calls(),
-            resumes_before + 1,
-            "the poll did not adopt (no ordinary resume) while the switch held the thread"
-        );
-        assert!(!poll.is_finished(), "the poll waits for the switch to settle");
-
-        let switched = switch.await.expect("the switch joins");
-        assert!(switched.is_ok(), "the switch landed: {switched:?}");
-        poll.await
-            .expect("the poll joins")
-            .expect("the poll read succeeds");
-        assert_eq!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("deepseek".to_string()),
-            "after the switch the poll sees the new pair"
-        );
-    }
-
-    /// Issue #910 (blocking): a `thread/read` whose answer predates a
-    /// `thread/settings/updated` must not overwrite the newer broadcast fact.
-    /// The read's stamp is taken **before** the request, so the projection drops
-    /// the stale reply — a later pick then cannot classify against a provider
-    /// the thread has already left.
-    #[tokio::test]
-    async fn a_stale_thread_read_does_not_overwrite_a_newer_broadcast() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        // The switch's first read captures `openai/gpt-5.1-codex` and then
-        // stalls; the same pair is the attempt, so it ends as `Unchanged`.
-        server.set_read_delay(Duration::from_millis(500));
-        let attempt = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
-        let switch = tokio::spawn({
-            let client = client.clone();
-            async move { Backend::apply_thread_model(&client, "thread-1", &attempt).await }
-        });
-
-        // While the read is in flight, a broadcast says a peer moved the thread.
-        server.push_thread_settings("thread-1", "deepseek-v4-pro", "deepseek", None);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id)
-                == Some("deepseek".to_string())
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the broadcast fact never landed"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
-        // The stale read's reply lands now; it must be dropped.
-        let result = switch.await.expect("the call joins");
-        assert!(result.is_ok(), "the same-pair attempt is a no-op: {result:?}");
-        assert_eq!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("deepseek".to_string()),
-            "the stale read never overwrites the newer broadcast"
-        );
-    }
-
-    /// Issue #910 (blocking): an ambiguous release (the unsubscribe reached the
-    /// server but its ack missed the bound) must **forget** this connection's
-    /// provider fact. A peer may have moved the thread since; keeping the old
-    /// provider would classify a pick for it as per-turn and send the model to
-    /// the peer's provider. With the fact unknown, the route takes the
-    /// read-back path (`thread/read`), and a read that fails stops by name in
-    /// the pre-flight — it never sends blind.
-    #[tokio::test]
-    async fn an_ambiguous_release_forgets_the_provider_fact() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-        assert_eq!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("openai".to_string())
-        );
-
-        // A peer moves the thread while cola still holds it, then our
-        // unsubscribe's ack misses the bound: the switch is ambiguous.
-        server.set_thread_model("thread-1", Some("deepseek-v4-pro"), Some("deepseek"));
-        server.set_unsubscribe_delay(Duration::from_millis(2_500));
-        let stale = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
-        let error = Backend::apply_thread_model(&client, "thread-1", &stale)
-            .await
-            .expect_err("the release misses its bound");
-        assert!(
-            error.to_string().contains("thread/unsubscribe"),
-            "the named failure is the release step: {error}"
-        );
-        assert_ne!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("openai".to_string()),
-            "the stale provider fact is forgotten, never merely marked incomplete"
-        );
-
-        // Let the delayed ack land, then the read path learns the peer's pair:
-        // a pick for the stale provider is a thread-level change, and the
-        // peer's own pair is the per-turn path.
-        tokio::time::sleep(Duration::from_millis(2_600)).await;
-        assert_eq!(
-            Backend::model_pick_route(&client, "thread-1", &stale)
-                .await
-                .unwrap(),
-            crate::backend::types::ModelPickRoute::ThreadModel
-        );
-        let moved = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        assert_eq!(
-            Backend::model_pick_route(&client, "thread-1", &moved)
-                .await
-                .unwrap(),
-            crate::backend::types::ModelPickRoute::PerTurn
         );
     }
 
@@ -8285,299 +7346,6 @@ mod tests {
             Backend::known_thread_provider(&client, "thread-1").await,
             None,
             "no cached provider survives the subscription"
-        );
-
-        // While cola was unsubscribed, a peer moved the thread to `deepseek`.
-        // A pick for the old `openai` pair must be the thread-level path (and
-        // therefore a confirmation), never a per-turn send to `deepseek`.
-        server.set_thread_model("thread-1", Some("deepseek-v4-pro"), Some("deepseek"));
-        let stale = crate::backend::parsing::parse_model("openai/gpt-5.1-codex").unwrap();
-        assert_eq!(
-            Backend::model_pick_route(&client, "thread-1", &stale)
-                .await
-                .unwrap(),
-            crate::backend::types::ModelPickRoute::ThreadModel,
-            "the peer's provider must not accept the stale pair as per-turn"
-        );
-    }
-
-    /// Issue #910 (item 5): a **stalled unsubscribe** takes the release handle
-    /// and forgets the projection before its ack, so the timeout must still
-    /// restore the local view and re-subscribe. The switch is reported by name
-    /// and the thread keeps its pair.
-    #[tokio::test]
-    async fn a_stalled_release_still_restores_the_subscription() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        server.silence_next_unsubscribe();
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect_err("the release timed out");
-        assert!(
-            error.to_string().contains("thread/unsubscribe"),
-            "the timed-out step is named: {error}"
-        );
-
-        // The cleanup restored both the subscription and the projection.
-        server.wait_for_subscribers("thread-1", 1).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            if client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id)
-                == Some("openai".to_string())
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the projection was not restored after the stalled release"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Design pass, symptom 6: each switch step is bounded on its own, with no
-    /// outer timeout around the sequence — so a step that times out still runs
-    /// the read-back and the re-subscribe cleanup. The local view is restored
-    /// from the thread and this connection keeps mirroring it.
-    #[tokio::test]
-    async fn a_timed_out_switch_still_resubscribes() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        // The thread is unloaded (the release runs), the resume never answers
-        // within its bound, and the thread keeps its pair — the read-back after
-        // the timeout must still run, and so must the re-subscribe.
-        server.keep_provider_on_resume();
-        server.set_resume_delay(Duration::from_millis(2_500));
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect_err("the resume timed out");
-        assert!(
-            error.to_string().contains("thread/resume"),
-            "the timed-out step is named: {error}"
-        );
-
-        // Cleanup: re-subscribed, and the projection speaks for the thread again.
-        server.wait_for_subscribers("thread-1", 1).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            if client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id)
-                == Some("openai".to_string())
-            {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the projection was not restored by the re-adoption"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
-    /// Review finding 3: "already switched" is decided by a read-back of **both**
-    /// halves. A thread already on the target provider but a different model is
-    /// not done — the model rides the next turn (no reload), and the outcome says
-    /// so instead of claiming the pair. The exact pair answers `Unchanged`.
-    #[tokio::test]
-    async fn a_provider_match_with_another_model_is_not_already_done() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        // The thread is already on `deepseek`, but runs `gpt-5.1-codex`.
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("deepseek"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-        server.wait_for_subscribers("thread-1", 1).await;
-
-        server.clear_calls();
-        let change = Backend::apply_thread_model(
-            &client,
-            "thread-1",
-            &crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap(),
-        )
-        .await
-        .expect("apply");
-        assert_eq!(
-            change,
-            crate::backend::types::ThreadModelChange::ModelNextTurn,
-            "a provider match alone is not the pair"
-        );
-        let calls = server.call_log();
-        for forbidden in ["thread/unsubscribe", "thread/resume"] {
-            assert!(
-                !calls.iter().any(|method| method == forbidden),
-                "a same-provider model change must not reload the thread: {calls:?}"
-            );
-        }
-        // The mirror keeps the thread's truth; the requested model rides the
-        // next `turn/start`.
-        let held = client.projections.model("thread-1").expect("a model fact");
-        assert_eq!(held.provider_id, "deepseek");
-        assert_eq!(held.model_id, "gpt-5.1-codex");
-
-        // The exact pair is the only "already" answer.
-        server.clear_calls();
-        assert_eq!(
-            Backend::apply_thread_model(
-                &client,
-                "thread-1",
-                &crate::backend::parsing::parse_model("deepseek/gpt-5.1-codex").unwrap(),
-            )
-            .await
-            .expect("apply"),
-            crate::backend::types::ThreadModelChange::Unchanged
-        );
-        assert!(
-            !server.call_log().iter().any(|method| method == "thread/resume"),
-            "an exactly-matching pair sends no resume"
-        );
-    }
-
-    /// Issue #910, item 1: a resume the server refuses is a named failure, not a
-    /// switch — and the local view is restored from the read, so the release's
-    /// effect (a dropped projection) does not survive it.
-    #[tokio::test]
-    async fn a_refused_resume_is_an_error_and_the_mirror_is_restored() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let endpoint = Endpoint::parse(&url).expect("endpoint");
-        let client = CodexClient::connect(
-            &CodexOptions::new(endpoint).with_thread_settings(super::super::threads::ThreadSettings {
-                provider_switch_on_resume: true,
-                ..Default::default()
-            }),
-            &PinnedProbe,
-        )
-        .await
-        .expect("attach");
-        client.transcript("thread-1").await.expect("adopt");
-
-        server.reject_next_resume("unknown provider: deepseek");
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect_err("the server refused the resume");
-        assert!(
-            error.to_string().contains("unknown provider"),
-            "the server's reason survives: {error}"
-        );
-        let held = client
-            .projections
-            .model("thread-1")
-            .expect("the mirror is restored");
-        assert_eq!(held.provider_id, "openai");
-        assert_eq!(held.model_id, "gpt-5.1-codex");
-
-        // The other failure shape: the resume is accepted but the read-back
-        // still reports the old pair (a peer holds the thread invisibly).
-        server.keep_provider_on_resume();
-        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect_err("the read-back did not change");
-        assert!(
-            error.to_string().contains("openai"),
-            "names the pair it stayed on: {error}"
-        );
-        assert_eq!(
-            client
-                .projections
-                .model("thread-1")
-                .map(|model| model.provider_id),
-            Some("openai".to_string())
-        );
-    }
-
-    /// Issue #910, item 7: the gate is enforced where the request is made, so a
-    /// confirmation card that outlived the config change cannot switch.
-    #[tokio::test]
-    async fn a_provider_switch_is_refused_when_the_gate_is_closed() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let client = connect(&url).await;
-        client.transcript("thread-1").await.expect("adopt");
-
-        let pair = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro").unwrap();
-        server.clear_calls();
-        let error = Backend::apply_thread_model(&client, "thread-1", &pair)
-            .await
-            .expect_err("the gate is off");
-        assert!(
-            error.to_string().contains("provider_switch_on_resume"),
-            "the gate is named: {error}"
-        );
-        assert!(
-            !server.call_log().iter().any(|method| method == "thread/resume"),
-            "nothing is sent when the gate is shut"
         );
     }
 
@@ -8622,6 +7390,45 @@ mod tests {
                 "the settings broadcast never reached the projection"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Spec #922 acceptance 2: no `thread/resume` ever carries a provider — the
+    /// provider is sent only by `thread/start` (a Pending Session's creation
+    /// pair). Asserted over the adoption and the prompt that follows it.
+    #[tokio::test]
+    async fn thread_resume_never_carries_a_provider() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        let model = crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro");
+        Backend::prompt(
+            &client,
+            "thread-1",
+            "hello",
+            &[],
+            &[],
+            model.as_ref(),
+            Some("high"),
+            None,
+            None,
+        )
+        .await
+        .expect("prompt");
+
+        let resumes = server.resume_params();
+        assert!(!resumes.is_empty(), "the adoption resumed the thread");
+        for params in &resumes {
+            assert!(
+                params.get("modelProvider").is_none(),
+                "thread/resume must never carry a provider: {params}"
+            );
         }
     }
 

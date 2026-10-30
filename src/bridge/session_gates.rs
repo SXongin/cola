@@ -1,24 +1,21 @@
-//! The per-session serialization point for a session's model/provider state
-//! (issue #910).
+//! The per-session serialization point for a session's model state (issue #910).
 //!
 //! # The invariant
 //!
-//! > For one session, the model/provider pair the **next prompt** will run with
-//! > is decided and durable **before that prompt is submitted**, and any
-//! > thread-level switch (release → resume → read-back) either completes with
-//! > read-back proof, defers to exactly that point, or fails by name with the
-//! > previous state intact — under **one per-session serialization point**, with
-//! > no app-server RPC held under a global lock.
+//! > For one session, the model/variant the **next prompt** will run with is
+//! > decided and durable **before that prompt is submitted**, and a durable
+//! > session switch either completes or fails by name with the previous state
+//! > intact — under **one per-session serialization point**, with no app-server
+//! > RPC held under a global lock.
 //!
-//! # The shape: record first, apply at pre-flight
+//! # The shape: record first, read at pre-flight
 //!
-//! A confirmed provider change is *recorded* — the pair goes into the session
-//! mirror — and applied by the next prompt's pre-flight (`Turn::attempt`), which
-//! runs the three steps and reports the outcome. Nothing is applied from a card
-//! callback, so this gate is only the **write** serialization point: it makes
-//! every mirror write a read-decide-write that cannot interleave with another
-//! writer (a `/model` pick, a `/think` pick, the recorded switch) or with the
-//! pre-flight's read of the pair.
+//! A `/model` or `/think` pick writes the session mirror; on a durable
+//! generation (V2) the pick is also a session switch performed inside this
+//! point. Nothing is applied from a card callback, so this gate is the **write**
+//! serialization point: it makes every mirror write a read-decide-write that
+//! cannot interleave with another writer (a `/model` pick, a `/think` pick, the
+//! durable switch) or with the pre-flight's read of the pair.
 //!
 //! The gate is deliberately **per session**: a write or a pre-flight in one chat
 //! never holds up another, and it never holds the global turn-admission set

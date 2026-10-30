@@ -312,11 +312,6 @@ pub(crate) struct ThreadSettings {
     /// default: an adopted thread may be shared with the user's own
     /// TUI/VSCode, and a silent override would change their session as well.
     pub(crate) apply_on_adopt: bool,
-    /// Whether a `/model` provider pick may change an **existing** thread's
-    /// provider through `thread/resume` (issue #910), behind a confirmation
-    /// card. Off by default, for the same reason as `apply_on_adopt`: the
-    /// provider is a thread-level fact every attached client sees.
-    pub(crate) provider_switch_on_resume: bool,
     /// `thread/start`'s `config.model_reasoning_summary` (issue #900).
     pub(crate) reasoning_summary: Option<ReasoningSummary>,
 }
@@ -346,24 +341,23 @@ impl From<&crate::config::CodexConfig> for ThreadSettings {
             sandbox: config.sandbox,
             approval_policy: config.approval_policy,
             apply_on_adopt: config.apply_on_adopt,
-            provider_switch_on_resume: config.provider_switch_on_resume,
             reasoning_summary: Some(config.reasoning_summary),
         }
     }
 }
 
-/// The model/provider a thread is created or resumed with (issue #910).
+/// The model/provider a thread is created with (issue #910, spec #922).
 ///
-/// `modelProvider` is a **thread-level** fact: `thread/start` and
-/// `thread/resume` accept it, while `turn/start` has no such field — so a
-/// provider never rides a turn, and cola must never invent one there. The model
-/// is the turn's own field *and* a creation field; when it pairs with a provider
-/// (a `[profiles.*]` preset) the two go in one creation call.
+/// `modelProvider` is a **creation-only** fact: `thread/start` accepts it, while
+/// `turn/start` has no such field — so a provider never rides a turn, and cola
+/// must never invent one there. The model is the turn's own field *and* a
+/// creation field; when it pairs with a provider (a `[profiles.*]` preset) the
+/// two go in one creation call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ThreadModel<'a> {
     /// `thread/start`'s `model`: the model id the new thread runs.
     pub(crate) model: Option<&'a str>,
-    /// `thread/start` / `thread/resume`'s `modelProvider`: the configured
+    /// `thread/start`'s `modelProvider`: the configured
     /// `[model_providers.<id>]` channel.
     pub(crate) provider: Option<&'a str>,
 }
@@ -621,42 +615,6 @@ impl Threads {
             }
             Err(error) => Err(error),
         }
-    }
-
-    /// Resume a thread with a new **provider + model pair** (issue #910).
-    ///
-    /// This is the protocol's only door to a thread-level provider change —
-    /// `turn/start` has no provider field — and it only takes effect when the
-    /// thread is **reloaded**: a resume on a thread this connection (or a peer)
-    /// already has loaded returns ok and changes nothing. The caller therefore
-    /// releases the thread first; this method never does (the subscription
-    /// bookkeeping lives with the adapter's projections).
-    ///
-    /// It deliberately *is not* [`Self::adopt`]: the caller is not taking a
-    /// subscription here, and a second local holder would leave the server
-    /// subscribed forever. The response proves nothing — the caller verifies
-    /// with a `thread/read` (a resume can return ok and keep the old pair).
-    pub(crate) async fn resume_with_model(
-        &self,
-        thread_id: &str,
-        provider: &str,
-        model: &str,
-    ) -> Result<Thread> {
-        let mut params = json!({ "threadId": thread_id });
-        ThreadModel {
-            model: Some(model),
-            provider: Some(provider),
-        }
-        .add_params(&mut params);
-        let result = self.connection.request("thread/resume", params).await?;
-        let response: ResumeResponse = decode("thread/resume", result)?;
-        Ok(response.thread)
-    }
-
-    /// Whether this client's threads may have their provider changed by a
-    /// resume (`[clients.<id>] provider_switch_on_resume`, issue #910).
-    pub(crate) fn provider_switch_on_resume(&self) -> bool {
-        self.settings.provider_switch_on_resume
     }
 
     /// End every live subscription's stream (test-only), as a broken
@@ -955,7 +913,6 @@ mod tests {
                 sandbox: Some(SandboxMode::DangerFullAccess),
                 approval_policy: Some(ApprovalPolicy::OnRequest),
                 apply_on_adopt: false,
-                provider_switch_on_resume: false,
                 reasoning_summary: None,
             },
         )
@@ -1071,7 +1028,6 @@ mod tests {
             sandbox: Some(SandboxMode::DangerFullAccess),
             approval_policy: Some(ApprovalPolicy::Never),
             apply_on_adopt: false,
-            provider_switch_on_resume: false,
             reasoning_summary: None,
         };
         let client = connect_with(&url, overrides).await;
@@ -1131,112 +1087,6 @@ mod tests {
             Some("deepseek"),
             "the response is the thread the server now holds"
         );
-    }
-
-    /// Issue #910: a provider switch is `thread/resume` with the **pair**
-    /// (`modelProvider` + `model`) — the old model name on the new provider is a
-    /// 404 — and nothing else: the thread's sandbox/approval overrides are not
-    /// re-sent, and the resume is not a second local subscription.
-    #[tokio::test]
-    async fn resume_with_model_sends_the_pair_and_nothing_else() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let client = connect_with(
-            &url,
-            ThreadSettings {
-                sandbox: Some(SandboxMode::DangerFullAccess),
-                approval_policy: Some(ApprovalPolicy::OnRequest),
-                apply_on_adopt: false,
-                provider_switch_on_resume: true,
-                reasoning_summary: None,
-            },
-        )
-        .await;
-
-        let Adoption::Subscribed(subscription) = client.threads().adopt("thread-1").await.expect("adopt")
-        else {
-            panic!("must subscribe");
-        };
-        assert_eq!(client.threads().local_holders("thread-1"), 1);
-
-        // The thread is loaded (this connection subscribes), so the measured
-        // server answers this resume without applying it: the response proves
-        // nothing, and the caller releases first.
-        client
-            .threads()
-            .resume_with_model("thread-1", "deepseek", "deepseek-v4-pro")
-            .await
-            .expect("the resume is accepted");
-
-        let params = server.resume_params();
-        assert_eq!(params.len(), 2, "the adopt, then the switch: {params:?}");
-        assert_eq!(
-            params[1],
-            json!({
-                "threadId": "thread-1",
-                "modelProvider": "deepseek",
-                "model": "deepseek-v4-pro",
-            }),
-            "the pair, and none of the thread's other overrides"
-        );
-        assert_eq!(
-            client.threads().local_holders("thread-1"),
-            1,
-            "a provider switch is not a second subscription"
-        );
-        drop(subscription);
-    }
-
-    /// Issue #910, item 1 (the measurement the switch is built on): a resume on
-    /// a thread this connection already has loaded answers ok and changes
-    /// **nothing**; only after `thread/unsubscribe` does the same resume land.
-    #[tokio::test]
-    async fn a_resume_without_a_release_is_a_silent_no_op() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.seed_thread(ScriptedThread::adopted(
-            "thread-1",
-            "session-root",
-            "/work/cola",
-            "a shared thread",
-        ));
-        server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
-        let client = connect(&url).await;
-        let Adoption::Subscribed(subscription) = client.threads().adopt("thread-1").await.expect("adopt")
-        else {
-            panic!("must subscribe");
-        };
-
-        // Loaded thread: the resume is accepted but the pair does not move.
-        client
-            .threads()
-            .resume_with_model("thread-1", "deepseek", "deepseek-v4-pro")
-            .await
-            .expect("accepted");
-        let read = client.threads().read("thread-1", false).await.expect("read");
-        assert_eq!(
-            read.model_provider.as_deref(),
-            Some("openai"),
-            "a resume on a loaded thread is a silent no-op"
-        );
-        assert_eq!(read.model.as_deref(), Some("gpt-5.1-codex"));
-
-        // Released first, the same request takes effect.
-        subscription.release().await.expect("release");
-        assert_eq!(server.subscribers("thread-1"), 0);
-        client
-            .threads()
-            .resume_with_model("thread-1", "deepseek", "deepseek-v4-pro")
-            .await
-            .expect("accepted");
-        let read = client.threads().read("thread-1", false).await.expect("read");
-        assert_eq!(read.model_provider.as_deref(), Some("deepseek"));
-        assert_eq!(read.model.as_deref(), Some("deepseek-v4-pro"));
     }
 
     /// Ticket #878 acceptance 1: the list is scoped to the directory, shows

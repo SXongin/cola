@@ -256,8 +256,6 @@ async fn dir_card_pick_current_directory_toasts_only() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -406,8 +404,6 @@ async fn dir_card_topic_on_current_directory_opens_topic() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -853,8 +849,6 @@ async fn dir_card_pick_current_directory_preserves_the_filter() {
             topic_anchor: None,
             topic_root: None,
             variant: None,
-
-            provider_switch_confirmed: false,
         },
     )
     .await;
@@ -1041,8 +1035,6 @@ fn seeded_entry(key: &crate::config::ThreadKey, directory: &str) -> crate::confi
         topic_anchor: None,
         topic_root: None,
         variant: None,
-
-        provider_switch_confirmed: false,
     }
 }
 
