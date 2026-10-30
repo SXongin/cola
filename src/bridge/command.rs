@@ -1515,9 +1515,14 @@ pub(crate) async fn handle_command(
                                     .map(|v| format!("（已清除思考等级 `{v}`）"))
                                     .unwrap_or_default();
                                 format!(
-                                    "Provider: {}（模型 {name}，新线程创建时生效）{extra}",
+                                    "Provider: {}（模型 {name}，将在会话创建时生效）{extra}",
                                     parsed.provider_id
                                 )
+                            } else if handles.flow.backend.has_thread_provider() {
+                                let extra = cleared_variant
+                                    .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
+                                    .unwrap_or_default();
+                                format!("Model: {name}（已记录：将在下一条新消息生效）{extra}")
                             } else {
                                 let extra = cleared_variant
                                     .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))

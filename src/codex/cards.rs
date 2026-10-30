@@ -1145,7 +1145,7 @@ async fn a_model_pick_reaches_the_next_turn() {
         "defaultReasoningEffort": "high"
     })]);
     let directory = tempfile::tempdir().expect("tempdir");
-    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let (app, platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
     let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
 
     // `/model` opens the single model page, which already lists the catalog
@@ -1178,7 +1178,42 @@ async fn a_model_pick_reaches_the_next_turn() {
     .await
     .expect("the model pick");
 
-    // The effort rides the model entry: `/think high` is accepted for it.
+    // Spec #922: the pick is a one-shot pending, not an applied switch. The
+    // store's current pair is untouched and the adapter shows 待应用.
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.model.clone()),
+        None,
+        "a live /model does not write the current model"
+    );
+    assert_eq!(
+        client.pending_model(THREAD).await.as_deref(),
+        Some("codex/gpt-5.1-codex")
+    );
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_model_pending",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let pending_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the pending /model card");
+    let pending_text = card_text(&pending_card);
+    assert!(
+        pending_text.contains("待应用") && pending_text.contains("下一条新消息生效"),
+        "the live card shows the adapter's pending: {pending_text}"
+    );
+
+    // The effort rides the model entry: `/think high` updates the same pending.
     send_command_in(
         &app,
         "/think high",
@@ -1216,6 +1251,29 @@ async fn a_model_pick_reaches_the_next_turn() {
     // the handler's completion is the signal. Poll it rather than racing a
     // fixed timeout: the first poll after the work lands sees it.
     wait_for_handler(handler, "the model turn", SETTLE_DEADLINE).await;
+
+    // The accepted new turn consumed the pending; the card no longer offers a
+    // 待应用 line and the adapter holds nothing.
+    assert_eq!(client.pending_model(THREAD).await, None);
+    send_command_in(
+        &app,
+        "/model",
+        key,
+        "om_model_after",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let after_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the post-turn /model card");
+    assert!(
+        !card_text(&after_card).contains("待应用"),
+        "a consumed pending is gone: {}",
+        card_text(&after_card)
+    );
 }
 
 /// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves
@@ -2654,7 +2712,7 @@ async fn a_silent_catalog_does_not_wedge_a_model_pick() {
     server.seed_thread(ScriptedThread::adopted(THREAD, "session-root", WORK, "a thread"));
     server.silence_next_model_list();
     let dir = tempfile::tempdir().unwrap();
-    let (app, _platform, _client) = build_bridge(&url, &dir.path().join("sessions.json"), 0).await;
+    let (app, _platform, client) = build_bridge(&url, &dir.path().join("sessions.json"), 0).await;
     let handles = app.command_handles();
     let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
     let mut settings = handles
@@ -2699,10 +2757,18 @@ async fn a_silent_catalog_does_not_wedge_a_model_pick() {
         .session_settings(&key)
         .await
         .expect("the stored settings");
-    assert_eq!(stored.model.as_deref(), Some("codex/new-model"));
+    assert_eq!(
+        stored.model, None,
+        "a live /model no longer writes the current pair"
+    );
     assert_eq!(
         stored.variant.as_deref(),
         Some("high"),
         "a timeout is unknown, not 'no variants'"
+    );
+    assert_eq!(
+        client.pending_model(THREAD).await.as_deref(),
+        Some("codex/new-model"),
+        "the pick is recorded as the next turn's pending"
     );
 }

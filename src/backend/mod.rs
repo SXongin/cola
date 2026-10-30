@@ -396,6 +396,53 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         Ok(())
     }
 
+    /// Record a **one-shot next-turn** model for a live session without
+    /// changing the session's current selection. Codex has no durable model
+    /// switch on its public surface: `turn/start.model` (and `effort`) are
+    /// documented to become the thread's defaults for later turns, so the pick
+    /// rides the next genuinely **new** turn and is then consumed.
+    ///
+    /// `variant` is the `/think` level the pick keeps (after ADR-0020's clear
+    /// rule); the pending owns it beside the model so one selection reaches the
+    /// turn as one pair. Recording is in-memory only — a restart drops it and
+    /// the thread's own model stays the fact — because a persisted pending
+    /// cannot distinguish an accepted turn whose response was lost from one
+    /// that never ran.
+    ///
+    /// The default is a no-op: a client whose selection rides each prompt has
+    /// no next-turn window to record, so this is **not applicable to this
+    /// client**. A client that has the window overrides this.
+    async fn record_pending_model(&self, _session_id: &str, _model: &str, _variant: Option<&str>) {}
+
+    /// Record a **one-shot next-turn** `/think` level, preserving any pending
+    /// model. `None` clears the pending effort (the model's own default). A
+    /// pending that ends up carrying neither a model nor an effort is dropped.
+    ///
+    /// The default is a no-op: **not applicable to a client** with no
+    /// next-turn window. A client that has one overrides this.
+    async fn record_pending_variant(&self, _session_id: &str, _variant: Option<&str>) {}
+
+    /// The model a live session's next new turn will carry, as a
+    /// `provider/model` reference, while a pending selection exists. This is
+    /// cola state, not the thread's current fact: the model card shows it as
+    /// 待应用 until the next new turn is accepted.
+    ///
+    /// The default answers `None`: **not applicable to a client** with no
+    /// next-turn pending. A client that has one overrides this.
+    async fn pending_model(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
+    /// The `/think` level a live session's next new turn will carry while a
+    /// pending selection exists. This is cola state (the pending's effort), not
+    /// the session's mirror; a turn captures it at send time for its footer.
+    ///
+    /// The default answers `None`: **not applicable to a client** with no
+    /// next-turn pending. A client that has one overrides this.
+    async fn pending_variant(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     /// Make the session's agent selection durable (V2's
     /// `POST /api/session/{id}/agent`). A no-op on V1, where the selection
     /// rides each prompt.

@@ -2511,6 +2511,21 @@ impl App {
                 // Each supplement is its own logical user message: fresh
                 // cola-authored id (ADR-0026), never reused.
                 let cola_msg_id = crate::backend::parsing::cola_message_id();
+                // A thread-provider client (Codex) owns the next-turn pick in
+                // its adapter (spec #922): a steer carries no model field, and
+                // its fallback `turn/start` reads the adapter's pending. Sending
+                // the stored mirror here would re-send a consumed pick.
+                let next_turn_pending = self.client.has_thread_provider();
+                let model = if next_turn_pending {
+                    None
+                } else {
+                    self.session_model_override(&session_id).await
+                };
+                let variant = if next_turn_pending {
+                    None
+                } else {
+                    self.session_variant_override(&session_id).await
+                };
                 let submitted = match self
                     .client
                     .steer(
@@ -2518,8 +2533,8 @@ impl App {
                         &text,
                         &attachments,
                         &skills,
-                        self.session_model_override(&session_id).await.as_ref(),
-                        self.session_variant_override(&session_id).await.as_deref(),
+                        model.as_ref(),
+                        variant.as_deref(),
                         self.session_agent_override(&session_id).await.as_deref(),
                         Some(&cola_msg_id),
                     )
@@ -2787,6 +2802,17 @@ impl App {
         {
             tracing::warn!("materialise: model switch failed for {session_id}: {e}");
             failures.push(format!("模型/思考等级未生效（{e}）"));
+        }
+        // A thread-level provider client's `thread/start` carries the model and
+        // provider only — there is no creation field for `/think`. The pending
+        // Session's level therefore becomes the new thread's first **new** turn
+        // pending (spec #922): it rides that `turn/start.effort` once, never
+        // every later prompt. No model pending is recorded: the thread already
+        // started on the creation pair, so the card shows no 待应用.
+        if self.client.has_thread_provider() {
+            self.client
+                .record_pending_variant(session_id, pending.variant.as_deref())
+                .await;
         }
         if let Some(agent) = &pending.agent
             && let Err(e) = self.client.switch_session_agent(session_id, agent).await
@@ -4813,6 +4839,13 @@ impl App {
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
             };
         }
+        // The toast must say where a pick applies: a Pending Session's pair rides
+        // `thread/start`, while a live thread's is the next new turn (spec
+        // #922). `expected_session` is Some only on the live same-provider path.
+        let pending_target = core
+            .session_settings(thread_key)
+            .await
+            .is_some_and(|settings| settings.session_id.is_none());
         let cleared_variant = match classify_pick(
             core.pick_model_expecting(thread_key, expected_session, picked, Some(deadline))
                 .await,
@@ -4830,9 +4863,18 @@ impl App {
         let extra = cleared_variant
             .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
             .unwrap_or_default();
+        // A client with a thread-level provider axis (Codex) records a one-shot
+        // next-turn pending, not an applied switch (spec #922).
+        let toast = if pending_target {
+            format!("Model: {picked}（将在会话创建时生效）{extra}")
+        } else if core.client.has_thread_provider() {
+            format!("Model: {picked}（已记录：将在下一条新消息生效）{extra}")
+        } else {
+            format!("Model: {picked}（下一条消息开始生效）{extra}")
+        };
         CardActionResult {
             card: None,
-            toast: Some(format!("Model: {picked}（下一条消息开始生效）{extra}")),
+            toast: Some(toast),
         }
     }
 
@@ -4950,7 +4992,7 @@ impl App {
             Ok(PickOutcome::Applied { cleared_variant }) => CardActionResult {
                 card: None,
                 toast: Some(format!(
-                    "Provider: {provider}（模型 {spec}，新线程创建时生效）{}",
+                    "Provider: {provider}（模型 {spec}，将在会话创建时生效）{}",
                     cleared_variant
                         .map(|v| format!("（已清除思考等级 `{v}`）"))
                         .unwrap_or_default()

@@ -1460,6 +1460,11 @@ pub(crate) type TaskRuntimeCall = (String, Vec<String>, Vec<String>);
 /// at a specific read without a timing race.
 pub(crate) type TranscriptReadHook = Box<dyn Fn(usize) + Send + Sync>;
 
+/// The per-session one-shot next-turn selections a test can seed and inspect
+/// (spec #922): `(model reference, effort)`.
+pub(crate) type PendingSelections =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<String, (Option<String>, Option<String>)>>>;
+
 /// One `model_surface` request's callback-relevant context, recorded so a test
 /// can pin what a caller sent — the `/think` validation read's `catalog_only`,
 /// a callback's remaining budget, or a drilled page's scope.
@@ -1467,6 +1472,7 @@ pub(crate) type TranscriptReadHook = Box<dyn Fn(usize) + Send + Sync>;
 pub(crate) struct ModelSurfaceQueryRecord {
     pub scope: Option<String>,
     pub selected: Option<String>,
+    pub pending: Option<String>,
     pub catalog_only: bool,
     pub ack_budget: Option<std::time::Duration>,
 }
@@ -1801,6 +1807,9 @@ pub struct MockBackend {
     pub thread_provider: bool,
     /// What `known_thread_provider` answers (the cache-only provider fact).
     pub known_thread_provider: Option<String>,
+    /// Per-session one-shot next-turn selections (spec #922): the model ref
+    /// and effort a live thread's next new turn will carry.
+    pub pending_selections: PendingSelections,
     /// Every `create_session` call's thread-level provider and model id (issue
     /// #910): a Pending Session's creation picks.
     #[allow(clippy::type_complexity)]
@@ -2084,6 +2093,7 @@ impl MockBackend {
             default_model: None,
             thread_provider: false,
             known_thread_provider: None,
+            pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3079,6 +3089,40 @@ impl crate::backend::Backend for MockBackend {
         self.known_thread_provider.clone()
     }
 
+    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) {
+        self.pending_selections.lock().await.insert(
+            session_id.to_string(),
+            (Some(model.to_string()), variant.map(str::to_string)),
+        );
+    }
+
+    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) {
+        let mut pending = self.pending_selections.lock().await;
+        let selection = pending
+            .entry(session_id.to_string())
+            .or_insert_with(|| (None, None));
+        selection.1 = variant.map(str::to_string);
+        if selection.0.is_none() && selection.1.is_none() {
+            pending.remove(session_id);
+        }
+    }
+
+    async fn pending_model(&self, session_id: &str) -> Option<String> {
+        self.pending_selections
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|(model, _)| model.clone())
+    }
+
+    async fn pending_variant(&self, session_id: &str) -> Option<String> {
+        self.pending_selections
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|(_, variant)| variant.clone())
+    }
+
     async fn prompt(
         &self,
         session_id: &str,
@@ -3405,6 +3449,7 @@ impl crate::backend::Backend for MockBackend {
             .push(ModelSurfaceQueryRecord {
                 scope: query.scope.map(str::to_string),
                 selected: query.selected.map(str::to_string),
+                pending: query.pending.map(str::to_string),
                 catalog_only: query.catalog_only,
                 ack_budget: query.ack_budget,
             });
