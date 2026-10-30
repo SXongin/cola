@@ -52,6 +52,15 @@ use crate::feishu;
 /// every rung (a persisted override, the server-recorded model) is read from
 /// the same store.
 ///
+/// A live Codex thread's unaccepted `/think` intent (spec #922). The generation
+/// lets a canceled or superseded turn remove only the intent it captured, never
+/// a newer pick; `value = None` is an explicit reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingEffortIntent {
+    pub(crate) generation: u64,
+    pub(crate) value: Option<String>,
+}
+
 /// **Locks owned:** the `store` mutex (the persisted [`SessionStore`]) and the
 /// private list-cache mutex. The two are never held at once — a write takes the
 /// store lock, drops it, then clears the cache — so no ordering between them
@@ -74,9 +83,12 @@ pub(crate) struct SessionsHandle {
     default_auto_accept: bool,
     /// A live Codex thread's next-turn `/think` intent (spec #922), in-memory
     /// only: the level the next accepted new turn should make current. The
-    /// session mirror keeps the last accepted fact until then. `Some(None)` is
-    /// an explicit reset; absence means no pending effort intent.
-    pending_effort_intents: Arc<Mutex<HashMap<String, Option<String>>>>,
+    /// session mirror keeps the last accepted fact until then. A `None` value is
+    /// an explicit reset; absence means no pending effort intent. The standard
+    /// mutex lets a turn's cancellation guard remove its generation on drop.
+    pending_effort_intents: Arc<std::sync::Mutex<HashMap<String, PendingEffortIntent>>>,
+    /// The monotonically increasing source of [`PendingEffortIntent::generation`].
+    pending_effort_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The result of applying a settings pick (`/model`, `/think`, `/agent`): one
@@ -267,7 +279,8 @@ impl SessionsHandle {
         cache: Arc<Mutex<Option<SessionListCache>>>,
         default_auto_accept: bool,
         session_gates: crate::bridge::session_gates::SessionGates,
-        pending_effort_intents: Arc<Mutex<HashMap<String, Option<String>>>>,
+        pending_effort_intents: Arc<std::sync::Mutex<HashMap<String, PendingEffortIntent>>>,
+        pending_effort_generation: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             store,
@@ -275,6 +288,7 @@ impl SessionsHandle {
             default_auto_accept,
             session_gates,
             pending_effort_intents,
+            pending_effort_generation,
         }
     }
 
@@ -285,27 +299,41 @@ impl SessionsHandle {
     }
 
     /// A live Codex thread's unaccepted `/think` intent, if one is recorded.
-    /// The outer `Option` distinguishes "no intent" from an explicit reset
-    /// (`Some(None)`), which clears the mirror once the next turn is accepted.
-    pub(crate) async fn pending_effort_intent(&self, session_id: &str) -> Option<Option<String>> {
-        self.pending_effort_intents.lock().await.get(session_id).cloned()
-    }
-
-    /// Record (or overwrite) the next accepted turn's effort intent.
-    pub(crate) async fn set_pending_effort_intent(&self, session_id: &str, intent: Option<String>) {
+    pub(crate) async fn pending_effort_intent(&self, session_id: &str) -> Option<PendingEffortIntent> {
         self.pending_effort_intents
             .lock()
-            .await
-            .insert(session_id.to_string(), intent);
+            .expect("pending effort intents")
+            .get(session_id)
+            .cloned()
     }
 
-    /// Take the intent for the caller that is about to apply it, or discard it
-    /// because the pending was dropped/refused before the mirror ever moved.
-    pub(crate) async fn take_pending_effort_intent(&self, session_id: &str) -> Option<Option<String>> {
-        self.pending_effort_intents.lock().await.remove(session_id)
+    /// Record (or overwrite) the next accepted turn's effort intent, returning
+    /// its generation so the caller can arm a cancellation guard.
+    pub(crate) async fn set_pending_effort_intent(&self, session_id: &str, value: Option<String>) -> u64 {
+        let generation = self
+            .pending_effort_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.pending_effort_intents
+            .lock()
+            .expect("pending effort intents")
+            .insert(session_id.to_string(), PendingEffortIntent { generation, value });
+        generation
     }
 
-    /// Make a pending effort intent the accepted mirror fact. Compare-and-set
+    /// Remove the intent only when it is still the generation a canceled or
+    /// superseded turn captured. A newer pick survives.
+    pub(crate) fn remove_pending_effort_intent_if(&self, session_id: &str, generation: u64) {
+        let mut intents = self
+            .pending_effort_intents
+            .lock()
+            .expect("pending effort intents");
+        if intents.get(session_id).map(|intent| intent.generation) == Some(generation) {
+            intents.remove(session_id);
+        }
+    }
+
+    /// Make a pending effort value the accepted mirror fact. Compare-and-set
     /// against the pair read here, so a newer pick that moved the mirror wins;
     /// a store error is logged, never surfaced as a turn failure.
     pub(crate) async fn apply_pending_effort_intent(
@@ -1293,7 +1321,10 @@ impl SessionsHandle {
             // pending intent and cleared only when that turn is accepted.
             if backend.has_thread_provider() {
                 let intent_before = self.pending_effort_intent(&session_id).await;
-                let mut probe = intent_before.clone().unwrap_or_else(|| snapshot.variant.clone());
+                let mut probe = match &intent_before {
+                    Some(intent) => intent.value.clone(),
+                    None => snapshot.variant.clone(),
+                };
                 let cleared = self
                     .clear_variant_for_model(backend, &mut probe, model_spec)
                     .await;

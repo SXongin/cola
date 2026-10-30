@@ -967,7 +967,8 @@ async fn live_v2_scripted_selection_chain() {
         std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         false,
         crate::bridge::session_gates::SessionGates::default(),
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     );
     let pick_backend = std::sync::Arc::new(backend.clone()) as std::sync::Arc<dyn crate::backend::Backend>;
 

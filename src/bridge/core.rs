@@ -222,7 +222,10 @@ pub struct SharedCore {
     session_list_cache: Arc<Mutex<Option<SessionListCache>>>,
     /// Live Codex threads' unaccepted `/think` intents (spec #922): in-memory,
     /// process-lifetime state shared by every reconstructed `SessionsHandle`.
-    pending_effort_intents: Arc<Mutex<HashMap<String, Option<String>>>>,
+    pending_effort_intents:
+        Arc<std::sync::Mutex<HashMap<String, crate::bridge::handles::PendingEffortIntent>>>,
+    /// The monotonically increasing source of each intent's generation.
+    pending_effort_generation: Arc<std::sync::atomic::AtomicU64>,
     /// The active agent client (spec #860): the [`crate::backend::Backend`]
     /// every bridge path talks to. Named `client`, not `opencode`: the seam is
     /// a client, and the active one becomes a choice (#872). Today it is always
@@ -432,7 +435,8 @@ impl SharedCore {
                 cfg.bridge.instant_reminder,
             )),
             session_list_cache: Arc::new(Mutex::new(None)),
-            pending_effort_intents: Arc::new(Mutex::new(HashMap::new())),
+            pending_effort_intents: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_effort_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             client,
             feishu,
             card_write_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -547,6 +551,7 @@ impl SharedCore {
             self.default_auto_accept,
             self.session_gates.clone(),
             Arc::clone(&self.pending_effort_intents),
+            Arc::clone(&self.pending_effort_generation),
         )
     }
 

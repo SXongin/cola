@@ -1606,7 +1606,12 @@ async fn a_reset_only_pending_keeps_current_until_acceptance() {
         "the reset is an adapter pending marker"
     );
     assert_eq!(
-        handles.flow.sessions.pending_effort_intent(THREAD).await,
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent(THREAD)
+            .await
+            .map(|intent| intent.value),
         Some(None),
         "the intent records an explicit clear"
     );
@@ -1657,7 +1662,12 @@ async fn a_reset_only_pending_keeps_current_until_acceptance() {
     );
     assert!(client.has_pending_selection(THREAD).await);
     assert_eq!(
-        handles.flow.sessions.pending_effort_intent(THREAD).await,
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent(THREAD)
+            .await
+            .map(|intent| intent.value),
         Some(None),
         "a refused reset keeps its intent"
     );
@@ -1817,6 +1827,263 @@ async fn the_accepted_effort_commit_waits_for_the_session_gate() {
         }),
     );
     wait_for_handler(handler, "the gated effort turn", SETTLE_DEADLINE).await;
+}
+
+/// Spec #922 gate review: cancelling a Turn while `turn/start` is outstanding
+/// drops the captured effort intent, so a later prompt neither sends it nor
+/// commits it to the current mirror.
+#[tokio::test]
+async fn a_cancelled_turn_drops_the_effort_intent() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1-codex".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![json!({
+        "id": "gpt-5.1-codex",
+        "hidden": false,
+        "supportedReasoningEfforts": [{ "reasoningEffort": "high", "description": "careful" }]
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+    send_command_in(
+        &app,
+        "/think high",
+        key.clone(),
+        "om_cancel_think",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let handles = app.command_handles();
+    assert_eq!(
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent(THREAD)
+            .await
+            .map(|intent| intent.value),
+        Some(Some("high".into()))
+    );
+
+    server.silence_next_turn_start();
+    let cancelled = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("cancel me", "om_cancel_prompt"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while server.turn_params(THREAD).is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never reached turn/start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    cancelled.abort();
+    let _ = cancelled.await;
+    // The aborted Turn never reached its finalizer; release its prompt guard and
+    // its loading card so the later prompt is a normal turn rather than a
+    // "busy"/Supplement path.
+    app.waits_handle().inflight.lock().await.remove(THREAD);
+    app.waits_handle().inbound.lock().await.remove(THREAD);
+    app.cards.lock().await.clear();
+    assert_eq!(
+        handles.flow.sessions.pending_effort_intent(THREAD).await,
+        None,
+        "cancellation removed the captured intent"
+    );
+    assert!(!client.has_pending_selection(THREAD).await);
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("later", "om_cancel_later"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while server.turn_params(THREAD).len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the later prompt never reached turn/start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let later = server.turn_params(THREAD).pop().expect("the later turn/start");
+    assert_eq!(later.get("model"), None);
+    assert_eq!(later.get("effort"), None);
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone()),
+        None,
+        "the dropped intent was never committed to the mirror"
+    );
+
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(handler, "the later turn", SETTLE_DEADLINE).await;
+}
+
+/// Spec #922 gate review (non-blocking): if `/think low` lands while a turn
+/// carrying `high` is still in flight, the accepted turn commits the captured
+/// `high`; the newer `low` intent survives for the next turn.
+#[tokio::test]
+async fn a_newer_think_before_acceptance_keeps_the_sent_level_current() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1-codex".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![json!({
+        "id": "gpt-5.1-codex",
+        "hidden": false,
+        "supportedReasoningEfforts": [
+            { "reasoningEffort": "high", "description": "careful" },
+            { "reasoningEffort": "low", "description": "fast" }
+        ]
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+    send_command_in(
+        &app,
+        "/think high",
+        key.clone(),
+        "om_interleave_high",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let response = server.hold_next_turn_start_response();
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("high turn", "om_interleave_prompt"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while server.turn_start_gate_entered() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the high turn never reached turn/start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let live_for_script = server.live_turn(THREAD).expect("the high turn is running");
+    server.script_turn(
+        THREAD,
+        vec![json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": THREAD,
+                "turn": {
+                    "id": live_for_script,
+                    "status": "completed",
+                    "startedAt": chrono::Utc::now().timestamp(),
+                    "completedAt": chrono::Utc::now().timestamp() + 1
+                }
+            }
+        })],
+    );
+    let handles = app.command_handles();
+    assert!(matches!(
+        handles
+            .flow
+            .sessions
+            .pick_think(&handles.flow.backend, &key, Some("low".into()))
+            .await,
+        Ok(crate::bridge::handles::PickOutcome::Applied { .. })
+    ));
+    response.add_permits(1);
+
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .as_deref()
+        != Some("high")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the accepted high turn never became current"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent(THREAD)
+            .await
+            .map(|intent| intent.value),
+        Some(Some("low".into())),
+        "the newer low intent survives the high acceptance"
+    );
+
+    wait_for_handler(first, "the high turn", SETTLE_DEADLINE).await;
+    server.script_turn(THREAD, Vec::new());
+
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("low turn", "om_interleave_low"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while server.turn_params(THREAD).len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the low turn never reached turn/start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let low = server.turn_params(THREAD).pop().expect("the low turn/start");
+    assert_eq!(low["effort"], "low");
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .as_deref()
+        != Some("low")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the low turn never became current"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let live = server.live_turn(THREAD).expect("the low turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(second, "the low turn", SETTLE_DEADLINE).await;
 }
 
 /// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves

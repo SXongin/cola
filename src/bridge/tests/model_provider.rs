@@ -50,6 +50,23 @@ fn prompt(app: &std::sync::Arc<crate::bridge::handler::App>, message_id: &str, t
     });
 }
 
+async fn command_text(
+    app: &std::sync::Arc<crate::bridge::handler::App>,
+    platform: &std::sync::Arc<crate::bridge::test_support::RecordingPlatform>,
+    command: &str,
+    message_id: &str,
+) -> String {
+    send_command_in(
+        app,
+        command,
+        key(),
+        message_id,
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    platform.texts().await.join("\n")
+}
+
 /// Issue #910, item 2 (and the kept creation path): a Pending Session records
 /// the **pair**, and the first message carries both halves into one
 /// `thread/start`.
@@ -1160,7 +1177,12 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
         "an unaccepted /think leaves the mirror at the last accepted level"
     );
     assert_eq!(
-        handles.flow.sessions.pending_effort_intent("ses_test").await,
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent("ses_test")
+            .await
+            .map(|intent| intent.value),
         Some(Some("high".into())),
         "the intent awaits the accepted turn"
     );
@@ -1195,7 +1217,12 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
         "the adapter still holds the pending effort"
     );
     assert_eq!(
-        handles.flow.sessions.pending_effort_intent("ses_test").await,
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent("ses_test")
+            .await
+            .map(|intent| intent.value),
         Some(Some("high".into())),
         "the intent is kept while the pending survives"
     );
@@ -1246,7 +1273,12 @@ async fn a_reset_only_pending_is_not_mistaken_for_no_pending() {
         "the unaccepted reset did not clear the mirror"
     );
     assert_eq!(
-        handles.flow.sessions.pending_effort_intent("ses_test").await,
+        handles
+            .flow
+            .sessions
+            .pending_effort_intent("ses_test")
+            .await
+            .map(|intent| intent.value),
         Some(None),
         "the reset intent is kept while its marker remains pending"
     );
@@ -2243,4 +2275,90 @@ async fn a_slashed_provider_id_round_trips_through_a_card_pair() {
         &[(Some("foo/bar".to_string()), Some("gpt".to_string()))],
         "the creation carries the same pair"
     );
+}
+
+/// Spec #922 decision 2: `/status` shows the live thread's current pair and the
+/// adapter's next-turn pending when one exists.
+#[tokio::test]
+async fn status_shows_the_live_current_and_pending_pair() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    backend.pending_selections.lock().await.insert(
+        "ses_test".into(),
+        (Some("openai/gpt-new".into()), Some("high".into())),
+    );
+    backend
+        .pending_generations
+        .lock()
+        .await
+        .insert("ses_test".into(), 1);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-current".into());
+    seed_entry(&app, entry).await;
+
+    let text = command_text(&app, &platform, "/status", "msg_status").await;
+    assert!(text.contains("当前：openai/gpt-current"), "{text}");
+    assert!(
+        text.contains("待应用：openai/gpt-new@high（下一条新消息生效）"),
+        "{text}"
+    );
+    assert!(text.contains("会话：`ses_test`"), "{text}");
+}
+
+/// A Pending Session's `/status` shows its creation pair and never 待应用.
+#[tokio::test]
+async fn status_shows_a_pending_sessions_creation_pair_only() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut pending = PendingEntry::new(key(), "/work/cola");
+    pending.model = Some("openai/gpt-creation".into());
+    pending.variant = Some("high".into());
+    seed_pending(&app, pending).await;
+
+    let text = command_text(&app, &platform, "/status", "msg_status").await;
+    assert!(
+        text.contains("当前：openai/gpt-creation@high（将在会话创建时生效）"),
+        "{text}"
+    );
+    assert!(!text.contains("待应用"), "{text}");
+    assert!(text.contains("会话：待创建"), "{text}");
+}
+
+/// No target session: the existing no-session phrasing.
+#[tokio::test]
+async fn status_without_a_session_says_so() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, platform) = build_app(cfg, backend).await;
+
+    let text = command_text(&app, &platform, "/status", "msg_status").await;
+    assert!(text.contains("还没有会话"), "{text}");
+}
+
+/// OpenCode has a current line and no pending line, even with a store variant.
+#[tokio::test]
+async fn status_on_opencode_shows_current_only() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = MockBackend::new(realistic_parts());
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-current".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let text = command_text(&app, &platform, "/status", "msg_status").await;
+    assert!(text.contains("当前：openai/gpt-current@high"), "{text}");
+    assert!(!text.contains("待应用"), "{text}");
 }

@@ -1810,6 +1810,11 @@ pub struct MockBackend {
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
+    /// Per-session generations for the mock's pending selections, so the
+    /// bridge can tell whether the selection it sent was consumed.
+    pub pending_generations: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u64>>>,
+    /// The monotonically increasing mock generation source.
+    pub next_pending_generation: Arc<std::sync::atomic::AtomicU64>,
     /// When set, `record_pending_model` / `record_pending_variant` fail with
     /// this message, modelling a lifecycle with no attached client.
     pub pending_error: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -2097,6 +2102,8 @@ impl MockBackend {
             thread_provider: false,
             known_thread_provider: None,
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_generations: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            next_pending_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_error: Arc::new(tokio::sync::Mutex::new(None)),
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
@@ -3102,6 +3109,14 @@ impl crate::backend::Backend for MockBackend {
         if let Some(message) = self.pending_error.lock().await.clone() {
             return Err(crate::error::BridgeError::OpenCode(message));
         }
+        let generation = self
+            .next_pending_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.pending_generations
+            .lock()
+            .await
+            .insert(session_id.to_string(), generation);
         self.pending_selections.lock().await.insert(
             session_id.to_string(),
             (Some(model.to_string()), variant.map(str::to_string)),
@@ -3117,6 +3132,14 @@ impl crate::backend::Backend for MockBackend {
         if let Some(message) = self.pending_error.lock().await.clone() {
             return Err(crate::error::BridgeError::OpenCode(message));
         }
+        let generation = self
+            .next_pending_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.pending_generations
+            .lock()
+            .await
+            .insert(session_id.to_string(), generation);
         let mut pending = self.pending_selections.lock().await;
         let selection = pending
             .entry(session_id.to_string())
@@ -3128,11 +3151,13 @@ impl crate::backend::Backend for MockBackend {
     }
 
     async fn pending_model(&self, session_id: &str) -> Option<String> {
-        self.pending_selections
-            .lock()
-            .await
-            .get(session_id)
-            .and_then(|(model, _)| model.clone())
+        let pending = self.pending_selections.lock().await;
+        let (model, variant) = pending.get(session_id)?;
+        let model = model.as_ref()?;
+        Some(match variant.as_deref() {
+            Some(variant) => format!("{model}@{variant}"),
+            None => model.clone(),
+        })
     }
 
     async fn pending_variant(&self, session_id: &str) -> Option<String> {
@@ -3145,6 +3170,19 @@ impl crate::backend::Backend for MockBackend {
 
     async fn has_pending_selection(&self, session_id: &str) -> bool {
         self.pending_selections.lock().await.contains_key(session_id)
+    }
+
+    async fn pending_generation(&self, session_id: &str) -> Option<u64> {
+        if let Some(generation) = self.pending_generations.lock().await.get(session_id).copied() {
+            return Some(generation);
+        }
+        // A test may seed the pending map directly; treat that as a stable
+        // generation so the bridge still sees a pending selection.
+        self.pending_selections
+            .lock()
+            .await
+            .contains_key(session_id)
+            .then_some(0)
     }
 
     async fn prompt(

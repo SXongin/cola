@@ -2269,14 +2269,29 @@ mod tests {
         .await;
         let handles = app.command_handles();
         assert_eq!(
-            handles.flow.sessions.pending_effort_intent("thread-1").await,
+            handles
+                .flow
+                .sessions
+                .pending_effort_intent("thread-1")
+                .await
+                .map(|intent| intent.value),
             Some(Some("high".into()))
         );
 
         // No client: the local prompt refusal is not permission to drop the
         // intent, because the shared store still holds the pending.
+        let sent_pending = crate::backend::Backend::pending_generation(&*lifecycle, "thread-1").await;
+        let intent_at_send = handles.flow.sessions.pending_effort_intent("thread-1").await;
         lifecycle.attached.lock().await.take();
-        crate::bridge::turn::Turn::commit_pending_effort(&app.turn_handles(), "thread-1", &key, false).await;
+        crate::bridge::turn::Turn::commit_pending_effort(
+            &app.turn_handles(),
+            "thread-1",
+            &key,
+            false,
+            sent_pending,
+            intent_at_send.as_ref(),
+        )
+        .await;
         assert_eq!(
             app.sessions
                 .lock()
@@ -2288,7 +2303,12 @@ mod tests {
             "the failed prompt did not move the mirror"
         );
         assert_eq!(
-            handles.flow.sessions.pending_effort_intent("thread-1").await,
+            handles
+                .flow
+                .sessions
+                .pending_effort_intent("thread-1")
+                .await
+                .map(|intent| intent.value),
             Some(Some("high".into())),
             "the unattached refusal kept the intent"
         );

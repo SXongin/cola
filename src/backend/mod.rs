@@ -470,6 +470,17 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         false
     }
 
+    /// The generation of the current pending selection, or `None` when nothing
+    /// is pending. The bridge captures it before a prompt so an accepted turn can
+    /// tell whether the selection it sent was consumed (generation gone/changed)
+    /// even when a newer pick has already replaced it.
+    ///
+    /// The default answers `None`: **not applicable to a client** with no
+    /// next-turn pending. A client that has one overrides this.
+    async fn pending_generation(&self, _session_id: &str) -> Option<u64> {
+        None
+    }
+
     /// Make the session's agent selection durable (V2's
     /// `POST /api/session/{id}/agent`). A no-op on V1, where the selection
     /// rides each prompt.
