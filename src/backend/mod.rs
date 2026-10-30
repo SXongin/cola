@@ -204,6 +204,10 @@ impl DirectoryBackend for BackendDirectory {
 pub trait Backend: ServerLifecycle + Send + Sync {
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput;
 
+    /// Create a session. A client whose provider is a **creation fact**
+    /// validates the pair here, before the create request: Codex runs one
+    /// provider per process, so a thread on another provider would be refused
+    /// at its first turn (spec #922).
     async fn create_session(&self, input: &CreateSessionInput) -> Result<Session>;
 
     /// List every session in the shared store (canonical `GET /session`).

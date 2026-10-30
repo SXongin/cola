@@ -1771,7 +1771,7 @@ fn unattached_surface(query: &ModelSurfaceQuery<'_>) -> ModelSurface {
         current: query.current.clone(),
         scopes: vec![ModelScope {
             id: "model".into(),
-            title: "模型（每轮可换）".into(),
+            title: "模型".into(),
             changeable: ChangeScope::ThisTurn,
             pick: PickKind::Model,
             options: Vec::new(),
@@ -2116,6 +2116,47 @@ impl Backend for CodexClient {
             .as_ref()
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
+        // Codex runs **one provider per process** (spec #922 correction,
+        // 2026-10-30): `thread/start { modelProvider }` on any other provider
+        // creates the thread, then refuses its first `turn/start` with
+        // `ModelProviderMismatch`. Refuse that by name here, before the
+        // request — no orphan thread, and a remedy the user can act on. The
+        // text form and a stale card both land here, so neither can carry an
+        // unusable pair past this check.
+        if let Some(requested) = input.provider.as_deref() {
+            // Bounded, and best-effort: a config read that fails must not
+            // block creation — Codex's own refusal is then the fallback.
+            match super::model_surface::read_config(
+                self.connection(),
+                cwd,
+                super::model_surface::CONFIG_READ_TIMEOUT,
+            )
+            .await
+            {
+                Ok(config) => {
+                    if let Some(configured) = config.configured_provider()
+                        && configured != requested
+                    {
+                        return Err(BridgeError::Client {
+                            client: "codex",
+                            detail: format!(
+                                "this Codex daemon's config sets model_provider = \"{configured}\", \
+                                 so a thread cannot be created on provider `{requested}`: Codex \
+                                 refuses every turn on a thread whose provider differs from the \
+                                 running config. Change ~/.codex/config.toml's model_provider to \
+                                 `{requested}` and restart the daemon, or pick a model on \
+                                 `{configured}`."
+                            ),
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    requested = %requested,
+                    "codex config/read failed before thread/start; creating the thread anyway \
+                     (Codex will refuse a mismatched provider itself): {error}"
+                ),
+            }
+        }
         let observed_stamp = self.projections.next_model_stamp();
         // A Pending Session's provider/model pair is a creation fact (issue
         // #910): `thread/start` takes both, and the provider has no other
@@ -5348,7 +5389,10 @@ mod tests {
                 ..Default::default()
             }],
         }];
-        let mut config = crate::codex::model_surface::CodexModelConfig::default();
+        let mut config = crate::codex::model_surface::CodexModelConfig {
+            model_provider: Some("opencode-go".into()),
+            ..Default::default()
+        };
         config
             .providers
             .push(crate::codex::model_surface::ConfiguredProvider {
@@ -5465,7 +5509,11 @@ mod tests {
             },
         );
         assert!(surface.scopes[0].options.is_empty());
-        assert!(surface.scopes[0].note.is_none());
+        assert_eq!(
+            surface.scopes[0].note.as_deref(),
+            Some(crate::codex::model_surface::PROVIDER_RULE_NOTE),
+            "nothing is selectable, and the page still states the provider rule"
+        );
     }
 
     /// Before the daemon is attached the card names that reason instead of
@@ -5597,7 +5645,7 @@ mod tests {
                 "version": "v1",
                 "config": {
                     "model": "gpt-5.1-codex",
-                    "model_provider": "opencode-go",
+                    "model_provider": "deepseek",
                     "model_providers": {
                         "deepseek": {
                             "name": "DeepSeek",
@@ -5680,9 +5728,9 @@ mod tests {
             model.note
         );
         // Page 2 is the same pairs, read by provider: the probed models are
-        // there, and `opencode-go` (env_key, no known model) is a disabled
-        // status row with its short tag — visible (#908 AC1), never a bare
-        // provider button (#910).
+        // there, and `opencode-go` — a provider this daemon is **not** on (spec
+        // #922 correction) — is a disabled row saying so, never a bare provider
+        // button (#910).
         let provider_scope = &page.scopes[0];
         assert_eq!(provider_scope.changeable, ChangeScope::NewThread);
         let pairs: Vec<&str> = provider_scope
@@ -5697,7 +5745,7 @@ mod tests {
                 .options
                 .iter()
                 .any(|option| !option.disabled && option.provider.as_deref() == Some("opencode-go")),
-            "a provider with no known model is not selectable"
+            "a provider the daemon is not on is not selectable"
         );
         let listed = provider_scope
             .options
@@ -5706,8 +5754,8 @@ mod tests {
             .expect("but it is still listed");
         assert!(listed.disabled);
         assert!(
-            listed.display_label().contains("env_key"),
-            "the row carries the short tag: {}",
+            listed.display_label().contains("当前 provider 不是它"),
+            "the row says why: {}",
             listed.display_label()
         );
 
@@ -5784,6 +5832,7 @@ mod tests {
                 "name": { "type": "user" },
                 "version": "v1",
                 "config": {
+                    "model_provider": "deepseek",
                     "model_providers": {
                         "deepseek": {
                             "name": "DeepSeek",
@@ -5840,13 +5889,25 @@ mod tests {
             .map(|option| option.id.as_str())
             .collect();
         assert!(listed.contains(&"deepseek") && listed.contains(&"opencode-go"));
+        let deepseek = surface.scopes[0]
+            .options
+            .iter()
+            .find(|option| option.id == "deepseek")
+            .expect("the configured provider is listed");
         assert!(
-            surface.scopes[0]
-                .options
-                .iter()
-                .all(|option| option.display_label().contains("没有已知模型")),
-            "each row says why: {:?}",
-            surface.scopes[0].options
+            deepseek.display_label().contains("没有已知模型"),
+            "the configured provider says why it has no pair: {}",
+            deepseek.display_label()
+        );
+        let other = surface.scopes[0]
+            .options
+            .iter()
+            .find(|option| option.id == "opencode-go")
+            .expect("the other provider stays listed");
+        assert!(
+            other.disabled && other.display_label().contains("当前 provider 不是它"),
+            "a provider the daemon is not on is disabled, not silently dropped: {}",
+            other.display_label()
         );
         assert!(
             !surface
@@ -8101,9 +8162,16 @@ mod tests {
     /// Issue #910 acceptance 2: a Pending Session's provider + model pair is a
     /// `thread/start` fact. `create_session` is the one path that carries it,
     /// so a new thread starts on the chosen channel with the chosen model.
+    ///
+    /// Spec #922 correction (2026-10-30): the pair is only accepted on the
+    /// provider the daemon's own `model_provider` names.
     #[tokio::test]
     async fn create_session_sends_the_chosen_model_and_provider() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_config_read(json!({
+            "config": { "model_provider": "deepseek" },
+            "layers": []
+        }));
         let client = connect(&url).await;
 
         let input = crate::backend::types::CreateSessionInput {
@@ -8136,9 +8204,18 @@ mod tests {
             Some("deepseek".to_string()),
             "the created thread's ordered fact names the chosen provider"
         );
+        let read = server.config_read_params();
+        assert_eq!(
+            read[0]["cwd"], "/work/cola",
+            "the pre-flight read is scoped to the creation directory: {read:?}"
+        );
 
-        // A provider pick alone sends only the provider: the thread keeps the
-        // server's model until a turn names one.
+        // The daemon is configured for another provider now: the picker alone
+        // still sends only the provider, but only a matching one is accepted.
+        server.set_config_read(json!({
+            "config": { "model_provider": "openai" },
+            "layers": []
+        }));
         let input = crate::backend::types::CreateSessionInput {
             id: None,
             agent: None,
@@ -8149,6 +8226,73 @@ mod tests {
         Backend::create_session(&client, &input).await.expect("create");
         let params = server.start_params();
         assert_eq!(params[1], json!({ "modelProvider": "openai" }));
+    }
+
+    /// Spec #922 correction (2026-10-30): Codex refuses every turn on a thread
+    /// whose `modelProvider` differs from the daemon's own `model_provider`, so
+    /// a mismatched creation is refused **by name before `thread/start`** — no
+    /// orphan thread, and a remedy the user can act on.
+    #[tokio::test]
+    async fn create_session_refuses_a_provider_the_daemon_is_not_on() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.set_config_read(json!({
+            "config": { "model_provider": "opencode-go" },
+            "layers": []
+        }));
+        let client = connect(&url).await;
+
+        let input = crate::backend::types::CreateSessionInput {
+            id: None,
+            agent: None,
+            model: crate::backend::parsing::parse_model("deepseek/deepseek-flash"),
+            provider: Some("deepseek".into()),
+            location: Some(crate::backend::types::Location {
+                directory: "/work/cola".into(),
+            }),
+        };
+        let error = Backend::create_session(&client, &input)
+            .await
+            .expect_err("a mismatch is refused");
+        let text = error.to_string();
+        assert!(
+            text.starts_with("codex error:"),
+            "the adapter's named error shape: {text}"
+        );
+        for expected in ["opencode-go", "deepseek", "model_provider", "restart the daemon"] {
+            assert!(text.contains(expected), "{expected:?} is in {text}");
+        }
+        assert!(
+            server.start_params().is_empty(),
+            "no thread was created: {:?}",
+            server.start_params()
+        );
+    }
+
+    /// A failed `config/read` must not block creation: the pre-flight is
+    /// best-effort, and Codex's own refusal is the fallback. The read is
+    /// bounded, so a wedged config read costs the creation that bound only.
+    #[tokio::test]
+    async fn create_session_proceeds_when_the_config_read_fails() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        // Test-config timeout is 200 ms; the answer is held well past it.
+        server.set_config_read_delay(Duration::from_millis(400));
+        let client = connect(&url).await;
+
+        let started = Instant::now();
+        let input = crate::backend::types::CreateSessionInput {
+            id: None,
+            agent: None,
+            model: None,
+            provider: Some("deepseek".into()),
+            location: None,
+        };
+        Backend::create_session(&client, &input).await.expect("create");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the pre-flight read is bounded"
+        );
+        assert_eq!(server.config_read_calls(), 1, "the read was attempted");
+        assert_eq!(server.start_params().len(), 1, "the thread is created anyway");
     }
 
     /// Issue #910 (extra finding): the subscription epoch counter never restarts,

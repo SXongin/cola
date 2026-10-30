@@ -583,7 +583,7 @@ async fn a_card_callback_charges_pre_dispatch_store_time_to_the_budget() {
 }
 
 /// A client that declares a flat model surface (Codex's shape) gets a flat
-/// `/model` card: the "current model" line, one 「模型（每轮可换）」 scope, and
+/// `/model` card: the "current model" line, one 「模型」 scope, and
 /// the hand-write hint — no provider pseudo-level. Tapping a model records the
 /// `codex/<id>` override, and the next prompt carries that id.
 #[tokio::test]
@@ -597,7 +597,7 @@ async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
         current: None,
         scopes: vec![crate::backend::types::ModelScope {
             id: "model".into(),
-            title: "模型（每轮可换）".into(),
+            title: "模型".into(),
             changeable: crate::backend::types::ChangeScope::ThisTurn,
             pick: crate::backend::types::PickKind::Model,
             options: vec![
@@ -660,7 +660,7 @@ async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
         text.contains("当前模型") && text.contains("codex/gpt-5.1"),
         "{text}"
     );
-    assert!(text.contains("模型（每轮可换）"), "flat scope title: {text}");
+    assert!(text.contains("模型"), "flat scope title: {text}");
     assert!(text.contains("/model codex/<id>"), "hand-write hint: {text}");
     assert!(
         !text.contains("选择 provider"),
