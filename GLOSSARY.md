@@ -342,7 +342,7 @@ The string a request carries as `"model"`, sent to the provider **verbatim**; it
 _Avoid_: Model (the run's identity is provider + id + **Variant**), model name
 
 **Catalog**:
-An **Agent Client**'s built-in list of model ids: Codex's `model/list` (eight entries compiled into the CLI, no provider field on any entry) and OpenCode's models.dev snapshot. A catalog is **global and belongs to no provider** — an id from it may run through whichever provider a thread or prompt names — so cola renders it as its own group, never under the current provider. It is also not everything selectable: the config default, `[profiles.*]` presets, a provider's probed `/models` ids and a hand-typed id sit beside it on Codex, as `provider.<id>.models` sits beside OpenCode's snapshot.
+An **Agent Client**'s built-in list of model ids: Codex's `model/list` (eight entries compiled into the CLI, no provider field on any entry) and OpenCode's models.dev snapshot. A catalog is **global and belongs to no provider** — an id from it may run through whichever provider a thread or prompt names — so cola renders it as its own group, never under the current provider. It is also not everything selectable: the config default, a provider's probed `/models` ids and a hand-typed id sit beside it on Codex, as `provider.<id>.models` sits beside OpenCode's snapshot.
 _Avoid_: Model list, the provider's catalog (the catalog is the Agent Client's)
 
 **Model Surface** (`ModelSurface`):

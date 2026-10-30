@@ -1506,7 +1506,7 @@ const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 /// there is no config read to enrich it (an unattached lifecycle, or the cheap
 /// catalog-only read the `/think` variant lookup asks for). The real surface is
 /// [`super::model_surface::build_surface`], which adds the config default,
-/// profile presets, probed provider models and the provider scope.
+/// probed provider models and the provider scope.
 /// The card before a Codex daemon is attached. Its catalog, `config/read` and
 /// probes all live behind that connection, so the honest answer is a reason —
 /// not an empty "no models" list, which reads as if the client had none. The
@@ -2348,14 +2348,14 @@ impl Backend for CodexClient {
     }
 
     /// The `/model` surface: the built-in catalog (global, its own group), the
-    /// config default and `[profiles.*]` presets (one-click model picks), every
-    /// successfully probed provider's models (per-provider groups), and the
-    /// configured providers as a thread-level scope. Every model pick keeps the
-    /// `codex/<id>` callback value the text form records, and a `[profiles.*]`
-    /// preset also carries its `model_provider` (issue #910). The provider scope
-    /// is creation-only (spec #922): a Pending Session applies a pick at
-    /// `thread/start`, while a live thread's provider page is read-only and
-    /// points at `/new` / `/fork`. `turn/start` never carries a provider.
+    /// top-level `model` as the config default, every successfully probed
+    /// provider's models (per-provider groups), and the configured providers as
+    /// a creation-only scope. Every model pick keeps the `codex/<id>` callback
+    /// value the text form records; a provider pick carries its model, because a
+    /// bare provider is never selectable. `[profiles.*]` is not read (spec
+    /// #922). The provider scope is creation-only: a Pending Session applies a
+    /// pick at `thread/start`, while a live thread's provider page is read-only
+    /// and points at `/new` / `/fork`. `turn/start` never carries a provider.
     ///
     /// # Read budgets
     ///
@@ -4937,7 +4937,7 @@ mod tests {
 
     /// The `/model` surface has two scopes: the per-turn `model` scope (the
     /// built-in catalog in its own group plus whatever config/probes add) and
-    /// the thread-level `provider` scope. The callback value stays `codex/<id>`
+    /// the creation-only `provider` scope. The callback value stays `codex/<id>`
     /// (what the text form records), and the hand-write hint names that shape.
     #[test]
     fn codex_has_a_model_page_and_a_provider_page() {
@@ -4962,11 +4962,11 @@ mod tests {
                 env_key: Some("OPENCODE_KEY".into()),
                 mixed_layers: false,
             });
-        config.profiles.push(crate::codex::model_surface::ProfilePreset {
-            name: "fast".into(),
-            model: "gpt-5.1-codex".into(),
-            provider: Some("opencode-go".into()),
-        });
+        let mut probes = std::collections::HashMap::new();
+        probes.insert(
+            "opencode-go".into(),
+            crate::codex::model_surface::ProbeOutcome::Models(vec!["gpt-5.1-codex".into()]),
+        );
         let query = ModelSurfaceQuery {
             session_id: Some("thread-1"),
             directory: Some("/work/cola"),
@@ -4977,11 +4977,11 @@ mod tests {
             ..Default::default()
         };
 
-        // Page 1: one model scope, the catalog + presets, the drill.
+        // Page 1: one model scope, the catalog + config default, the drill.
         let surface = crate::codex::model_surface::build_surface(
             &providers,
             &config,
-            &std::collections::HashMap::new(),
+            &probes,
             Some("opencode-go"),
             &query,
         );
@@ -5019,7 +5019,7 @@ mod tests {
         let surface = crate::codex::model_surface::build_surface(
             &providers,
             &config,
-            &std::collections::HashMap::new(),
+            &probes,
             Some("opencode-go"),
             &provider_query,
         );
@@ -5032,7 +5032,7 @@ mod tests {
             .options
             .iter()
             .find(|option| option.provider.is_some())
-            .expect("the profile pair");
+            .expect("the probed pair");
         assert_eq!(
             pair.display_label(),
             "OpenCode Go/gpt-5.1-codex（当前 provider）",
@@ -5172,9 +5172,10 @@ mod tests {
         );
     }
 
-    /// The wired surface: `config/read` supplies providers, the config default
-    /// and profiles; a provider with a token is probed against its own
-    /// `/models`; a second open inside the TTL reuses that answer.
+    /// The wired surface: `config/read` supplies providers and the config
+    /// default; a provider with a token is probed against its own `/models`; a
+    /// second open inside the TTL reuses that answer. A `[profiles.*]` table in
+    /// the same layer is ignored.
     #[tokio::test]
     async fn model_surface_wires_config_read_and_per_provider_probes() {
         use crate::backend::types::{ChangeScope, ModelSelection, ModelSurfaceQuery};
@@ -5270,23 +5271,21 @@ mod tests {
             "a probed model is a **pair**: it was listed by that provider"
         );
         assert!(
-            model
+            !model
                 .options
                 .iter()
-                .any(|option| option.callback_value() == "deepseek-v4-pro"
-                    && option.provider.as_deref() == Some("deepseek")
-                    && option.group.as_deref() == Some(crate::codex::model_surface::PROFILE_GROUP)),
-            "the profile preset is offered as its pair"
+                .any(|option| option.display_label().contains("fast")),
+            "a [profiles.*] table contributes no row"
         );
         assert!(
             model.note.as_deref().is_none_or(|note| !note.contains("env_key")),
             "no probe prose on the model page: {:?}",
             model.note
         );
-        // Page 2 is the same pairs, read by provider: the probed model and the
-        // profile are there, and `opencode-go` (env_key, no known model) is a
-        // disabled status row with its short tag — visible (#908 AC1), never a
-        // bare provider button (#910).
+        // Page 2 is the same pairs, read by provider: the probed models are
+        // there, and `opencode-go` (env_key, no known model) is a disabled
+        // status row with its short tag — visible (#908 AC1), never a bare
+        // provider button (#910).
         let provider_scope = &page.scopes[0];
         assert_eq!(provider_scope.changeable, ChangeScope::NewThread);
         let pairs: Vec<&str> = provider_scope
@@ -5369,13 +5368,13 @@ mod tests {
         assert_eq!(probed.request_count(), 0, "and never probes a provider");
     }
 
-    /// A Pending Session's card read has a directory but no session id, so the
-    /// provider scope must still render: that is where its provider pick lives
-    /// (issue #910), and a pick is applied at creation. Only `/think`'s explicit
-    /// `catalog_only` read skips config; a card read keeps it, and a cold cache
-    /// must not start a probe on a callback.
+    /// A Pending Session's card read has a directory but no session id. Only
+    /// `/think`'s explicit `catalog_only` read skips config; a card read keeps
+    /// it, lists every configured provider as a status row, and a cold cache
+    /// must not start a probe on a callback. With no probe (and no profiles,
+    /// spec #922) there is no selectable pair yet.
     #[tokio::test]
-    async fn a_pending_sessions_card_read_keeps_its_provider_options() {
+    async fn a_pending_sessions_cold_card_read_lists_providers_without_probing() {
         let probed = crate::test_http::TestHttpServer::start().await;
         probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
@@ -5396,8 +5395,7 @@ mod tests {
                         },
                         "opencode-go": { "name": "OpenCode Go" }
                     },
-                    // A pair declared by the user: it needs no probe, so a cold
-                    // callback cache still offers it (issue #910).
+                    // A `[profiles.*]` table is ignored (spec #922).
                     "profiles": {
                         "fast": { "model": "deepseek-v4-pro", "model_provider": "deepseek" }
                     }
@@ -5432,34 +5430,26 @@ mod tests {
         assert_eq!(
             surface.scopes[0].changeable,
             crate::backend::types::ChangeScope::NewThread,
-            "a pending session's provider is a creation pick, not a resume"
+            "a pending session's provider is a creation pick"
         );
-        let pairs: Vec<(&str, &str)> = surface.scopes[0]
-            .options
-            .iter()
-            .filter(|option| !option.disabled)
-            .map(|option| {
-                (
-                    option.provider.as_deref().unwrap_or_default(),
-                    option.callback_value(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            pairs,
-            [("deepseek", "deepseek-v4-pro")],
-            "the declared pair survives a cold callback cache"
-        );
-        let listed = surface.scopes[0]
-            .options
-            .iter()
-            .find(|option| option.id == "opencode-go")
-            .expect("a provider without a known model is still listed");
-        assert!(listed.disabled, "but it is not a button");
         assert!(
-            listed.display_label().contains("没有已知模型"),
-            "the row says why: {}",
-            listed.display_label()
+            surface.scopes[0].options.iter().all(|option| option.disabled),
+            "no cold pair is a status row, never a button: {:?}",
+            surface.scopes[0].options
+        );
+        let listed: Vec<&str> = surface.scopes[0]
+            .options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect();
+        assert!(listed.contains(&"deepseek") && listed.contains(&"opencode-go"));
+        assert!(
+            surface.scopes[0]
+                .options
+                .iter()
+                .all(|option| option.display_label().contains("没有已知模型")),
+            "each row says why: {:?}",
+            surface.scopes[0].options
         );
         assert!(
             !surface
@@ -5562,10 +5552,20 @@ mod tests {
             "the stalled page should wait for the request bound, took {elapsed:?}"
         );
         assert!(
-            surface.scopes[0].options.iter().any(|option| {
-                option.provider.as_deref() == Some("deepseek") && option.callback_value() == "deepseek-v4-pro"
-            }),
-            "the declared pair still renders while the catalog stalls"
+            surface.scopes[0]
+                .options
+                .iter()
+                .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown)),
+            "no profile pair is invented while the catalog stalls: {:?}",
+            surface.scopes[0].options
+        );
+        assert!(
+            surface.scopes[0]
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("没有可用模型")),
+            "the page says there is no available model: {:?}",
+            surface.scopes[0].note
         );
         assert!(
             surface.scopes[0].free_text.is_some(),
@@ -5748,11 +5748,11 @@ mod tests {
         assert!(surface.scopes[0].free_text.is_some());
     }
 
-    /// A profile preset's callback value reaches the next `turn/start` as its
-    /// bare model id — the profile's provider is a declaration, not a
-    /// per-turn protocol field.
+    /// A neutral `codex/<id>` pick (catalog, config default or provider row)
+    /// reaches the next `turn/start` as its bare model id — the provider is a
+    /// creation fact, not a per-turn protocol field.
     #[tokio::test]
-    async fn a_profile_preset_pick_rides_the_next_turn() {
+    async fn a_neutral_model_pick_rides_the_next_turn() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
@@ -5761,8 +5761,8 @@ mod tests {
             "a real thread",
         ));
         let client = connect(&url).await;
-        // `codex/deepseek-v4-pro` is the value a profile preset's button sends;
-        // the bridge parses it into this ModelInfo.
+        // `codex/deepseek-v4-pro` is the neutral ref a catalog/default row
+        // sends; the bridge parses it into this ModelInfo.
         let model = ModelInfo {
             id: "deepseek-v4-pro".into(),
             provider_id: "codex".into(),

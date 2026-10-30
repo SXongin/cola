@@ -672,15 +672,16 @@ Codex 的模型轴不是 provider → model 树：provider 是**线程级**事�
   卡片就能看到那次变化，footer 与选择卡片不会各说一套。
 - **「模型（每轮可换）」** 列出只与模型有关的来源：`model/list` 的内置目录
   （分组为「内置目录（全局，未校验）」——这些 id 不属于任何 provider，可以经
-  任意一个运行）、配置顶层 `model`（配置默认）、每个
-  `[profiles.<name>]` 预设（`model` + `model_provider`，显示为
-  `profile：model（provider）`），以及**当前 provider** 的 `/models` 返回的
-  id。点选后，下一条消息的 `turn/start.model` 就是该 id，线程后续轮次也继续
-  使用它。
+  任意一个运行）、配置顶层 `model`（配置默认），以及**当前 provider** 的
+  `/models` 返回的 id。点选后，下一条消息的 `turn/start.model` 就是该 id，
+  线程后续轮次也继续使用它。
 - **任何清单之外的 id 用文本输入。** `/model codex/<id>` 记录一个 id，
   `/model <provider>/<model>` 记录一对。Codex 对两者都不校验：只有内置目录
   的条目带显示名、上下文窗口与思考等级，所以拼错会在下一条消息上以 provider
   自身的报错出现。
+- **`[profiles.*]` 不会被读取。** Codex 0.134+ 已不再读取它（`--profile` 会
+  分层 `$CODEX_HOME/<name>.config.toml`），所以 cola 忽略该表：profile 既不
+  增加模型行，也不提供 provider 组合。
 
 **`/models` 探测是尽力而为，它被拒绝也不算错误。** `GET <base_url>/models`
 不属于 Responses API——`wire_api = "responses"` 并不保证它存在。cola 用各
@@ -688,7 +689,7 @@ Codex 的模型轴不是 provider → model 树：provider 是**线程级**事�
 2 秒，并缓存结果：确定性的答案（403、404、401、`env_key`、或解析出的模型）
 缓存三分钟，**暂时性**失败（超时、网络错误）只缓存约 20 秒，下次打开就会重试。
 provider 页把原因作为行尾的短标签（`403`、`超时`…），不是一段话，也不会出现在
-模型页上。内置目录、配置默认与 profile 始终在，而卡片回调只从缓存作答，所以
+模型页上。内置目录与配置默认始终在，而卡片回调只从缓存作答，所以
 第一次冷点击可能只显示 provider、没有探测到的模型，下一次打开时补齐。token 只出现在请求的 `Authorization`
 头里：卡片、日志行与错误信息中都不会出现。
 
@@ -704,14 +705,14 @@ provider 页把原因作为行尾的短标签（`403`、`超时`…），不是�
   provider，并说明只能在新会话或 fork 中更换。`/model` 选到不同 provider 时会被
   拒绝且**不发送任何请求**——没有 `turn/start`，也没有 `thread/resume`——卡片与
   文本回复都指向 `/new` / `/fork`。
-- **同一 provider 内的点选只是一次模型变更。** `model_provider` 等于线程当前
-  provider 的 `[profiles.*]` 预设，或任意 `codex/<id>` 点选，都只记录模型并
-  随下一条消息生效——不 resume、不重新加载。
+- **同一 provider 内的点选只是一次模型变更。** `codex/<id>` 目录/默认引用，或
+  线程当前 provider 自己 `/models` 返回的行，都只记录模型并随下一条消息生效
+  ——不 resume、不重新加载。
 - **`codex` 是保留名。** 内置目录的引用是 `codex/<id>`——一个共享的中性命名
   空间，永远不是一个渠道——所以 `[model_providers.codex]` 不能被选中：Provider
   一栏把它列成「`codex` 是内置目录的保留名，不能在这里选择」，不提供任何组合
-  （组合值会和目录自身的引用撞车）；命名它的 `[profiles.*]` 会退化成中性目录
-  引用。分类是纯字面的，因此目录点选从不读取你的配置。
+  （组合值会和目录自身的引用撞车）。分类是纯字面的，因此目录点选从不读取你的
+  配置。
 
 `/model <provider>/<model>` 遵循同一规则：活动线程上的不同 provider 会被拒绝
 （绝不静默改动线程），而 Pending Session 在创建时接受这一对。

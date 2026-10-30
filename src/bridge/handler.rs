@@ -4774,10 +4774,10 @@ impl App {
         }
 
         // A **paired** pick names a provider *and* the model it must run
-        // (issue #910): a `[profiles.*]` preset, a probed provider model, or a
-        // row of the provider scope. The path is decided by whether that
-        // provider differs from the thread's, never by which scope the row came
-        // from — a bare provider is not a valid pick.
+        // (issue #910): a probed provider model, or a row of the provider
+        // scope. The path is decided by whether that provider differs from the
+        // thread's, never by which scope the row came from — a bare provider is
+        // not a valid pick.
         let paired = value
             .get("provider")
             .and_then(|v| v.as_str())
@@ -4856,7 +4856,7 @@ impl App {
             return CardActionResult {
                 card: None,
                 toast: Some(format!(
-                    "provider `{provider}` 需要同时选择模型（可点同一行的 model，或在 `[profiles.*]` 里声明一对）"
+                    "provider `{provider}` 需要同时选择模型（可点同一行的 model）"
                 )),
             };
         }

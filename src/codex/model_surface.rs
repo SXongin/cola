@@ -9,12 +9,12 @@
 //!   `Config` struct is not the source the ticket names, and a layer carries the
 //!   raw TOML) becomes the `provider` scope, and every row there is a
 //!   **provider + model pair** (issue #910): the old model name on a new
-//!   provider is a 404, so a bare provider is never selectable. The pairs are
-//!   what `[profiles.*]` declares for that provider plus whatever its
-//!   `/models` listed;
-//! - the top-level `model` and every `[profiles.<name>]`'s `model` become
-//!   one-click presets in the `model` scope, because app-server has no "pick a
-//!   profile" field — a profile's model and provider travel as one pair;
+//!   provider is a 404, so a bare provider is never selectable. A pair comes
+//!   from what that provider's `/models` listed; a provider with no pair is a
+//!   status row, never a bare button;
+//! - the top-level `model` becomes the 「配置默认」 row in the `model` scope;
+//!   `[profiles.*]` is **not** read (ADR-0092, spec #922: Codex 0.134+ no longer
+//!   reads it, and `--profile` layers `$CODEX_HOME/<name>.config.toml`);
 //! - `GET <base_url>/models` is asked per provider, using that provider's
 //!   `experimental_bearer_token`. A provider that only declares `env_key` is
 //!   skipped: the daemon's environment is not cola's. Results (including
@@ -33,15 +33,13 @@
 //! from the adapter's ordered model projection (falling back to `current`), so
 //! the card reflects another client's switch on its next open.
 //!
-//! `thread/settings/updated` **is** consumed now (issue #910): the adapter's
-//! projection folds its `model`/`modelProvider` into the ordered fact
-//! (`Projections::apply_at`), so a server that broadcasts a change moves the
-//! card without a read. The measurement still stands — the pinned daemon does
-//! not send it for a resume-over-provider to a connection that just
-//! resubscribed — so a switch never depends on it: the `thread/read` read-back
-//! is the verdict, and the broadcast is a bonus when a server does send it.
-//! `effort` is left out of that fold: the surface never renders it, and the
-//! footer's `@variant` already has its own ordered fact.
+//! `thread/settings/updated` **is** consumed: the adapter's projection folds
+//! its `model`/`modelProvider` into the ordered fact (`Projections::apply_at`),
+//! so a server that broadcasts a peer's change moves the card without a read.
+//! The broadcast is a bonus, never the only source: a message the pinned daemon
+//! does not send cannot be required. `effort` is left out of that fold: the
+//! surface never renders it, and the footer's `@variant` already has its own
+//! ordered fact.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -126,8 +124,6 @@ pub(crate) const PROVIDER_SCOPE: &str = "provider";
 pub(crate) const CATALOG_GROUP: &str = "内置目录（全局，未校验）";
 /// The top-level `model`'s group.
 pub(crate) const CONFIG_DEFAULT_GROUP: &str = "配置默认";
-/// Every `[profiles.<name>]` preset's group.
-pub(crate) const PROFILE_GROUP: &str = "Profile 预设";
 
 /// The neutral provider bucket the picker's `codex/<id>` callback value uses.
 const MODEL_PROVIDER: &str = "codex";
@@ -193,23 +189,12 @@ fn clip(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// One `[profiles.<name>]` preset. Only `model` + `model_provider` are read:
-/// the other profile keys are not part of this card (and cola does not apply
-/// them).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProfilePreset {
-    pub(crate) name: String,
-    pub(crate) model: String,
-    pub(crate) provider: Option<String>,
-}
-
 /// What `config/read` declares that `model/list` cannot tell us.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CodexModelConfig {
     /// The top-level `model`, shown as 「配置默认」.
     pub(crate) default_model: Option<String>,
     pub(crate) providers: Vec<ConfiguredProvider>,
-    pub(crate) profiles: Vec<ProfilePreset>,
     /// `config/read` itself failed. An empty provider list is then "unknown",
     /// not "the user configured none", and the card says so.
     pub(crate) read_failed: bool,
@@ -226,21 +211,13 @@ impl CodexModelConfig {
         let mut config = Self::default();
         let mut providers: std::collections::BTreeMap<String, ProviderParts> =
             std::collections::BTreeMap::new();
-        let mut profiles: std::collections::BTreeMap<String, ProfileParts> =
-            std::collections::BTreeMap::new();
 
         if let Some(layers) = result.get("layers").and_then(Value::as_array) {
             for (layer_index, layer) in layers.iter().enumerate() {
                 let Some(layer_config) = layer_config(layer) else {
                     continue;
                 };
-                merge_layer(
-                    &mut config,
-                    &layer_config,
-                    &mut providers,
-                    &mut profiles,
-                    layer_index,
-                );
+                merge_layer(&mut config, &layer_config, &mut providers, layer_index);
             }
         }
 
@@ -250,7 +227,7 @@ impl CodexModelConfig {
             let resolved = Value::Object(object.clone());
             // The resolved object is its own (embedded) source: a URL from a
             // layer and a token from here are different provenance too.
-            merge_layer(&mut config, &resolved, &mut providers, &mut profiles, usize::MAX);
+            merge_layer(&mut config, &resolved, &mut providers, usize::MAX);
             // The resolved object is the *effective* config, so when it names
             // the top-level model it outranks a layer: a project layer the
             // daemon refused to trust is listed but not applied, and showing its
@@ -294,16 +271,6 @@ impl CodexModelConfig {
                 }
             })
             .collect();
-        config.profiles = profiles
-            .into_iter()
-            .filter_map(|(name, parts)| {
-                parts.model.map(|model| ProfilePreset {
-                    name,
-                    model,
-                    provider: parts.provider,
-                })
-            })
-            .collect();
         config
     }
 }
@@ -323,12 +290,6 @@ struct ProviderParts {
     base_url_layer: Option<usize>,
     token_layer: Option<usize>,
     env_key_layer: Option<usize>,
-}
-
-#[derive(Default)]
-struct ProfileParts {
-    model: Option<String>,
-    provider: Option<String>,
 }
 
 /// Fill only the fields a higher-precedence layer has not named yet: a table
@@ -372,7 +333,6 @@ fn merge_layer(
     config: &mut CodexModelConfig,
     layer: &Value,
     providers: &mut std::collections::BTreeMap<String, ProviderParts>,
-    profiles: &mut std::collections::BTreeMap<String, ProfileParts>,
     layer_index: usize,
 ) {
     if config.default_model.is_none() {
@@ -410,23 +370,6 @@ fn merge_layer(
                 field("env_key"),
                 layer_index,
             );
-        }
-    }
-
-    if let Some(layer_profiles) = layer.get("profiles").and_then(Value::as_object) {
-        for (name, profile) in layer_profiles {
-            let profile = profile.as_object();
-            let field = |key: &str| {
-                profile
-                    .and_then(|profile| profile.get(key))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            };
-            let parts = profiles.entry(name.clone()).or_default();
-            set_first(&mut parts.model, field("model"));
-            set_first(&mut parts.provider, field("model_provider"));
         }
     }
 }
@@ -851,10 +794,11 @@ pub(crate) fn build_surface(
     }
 }
 
-/// The root page (#908): the flat catalog, the config's presets and the
-/// **current** provider's probed models — everything the next turn can take
-/// without changing the channel — plus the drill into the provider page. No
-/// probe-failure notes here: a broken provider is page 2's status row.
+/// The root page (#908): the flat catalog, the top-level `model` as the
+/// config default, and the **current** provider's probed models — everything
+/// the next turn can take without changing the channel — plus the drill into
+/// the provider page. No probe-failure notes here: a broken provider is page
+/// 2's status row.
 fn model_page(
     catalog: &[crate::backend::types::ProviderModels],
     config: &CodexModelConfig,
@@ -879,31 +823,6 @@ fn model_page(
             label: Some(format!("{model}（配置默认）")),
             value: Some(codex_ref(model)),
             group: Some(CONFIG_DEFAULT_GROUP.to_string()),
-            ..Default::default()
-        });
-    }
-    for profile in &config.profiles {
-        let mut label = format!("{}：{}", profile.name, profile.model);
-        // `codex` is reserved for the neutral namespace (ADR-0092): a profile
-        // naming it cannot be a real pair, so it is offered as the neutral
-        // catalog ref (a model-only pick).
-        let reserved = profile.provider.as_deref() == Some(MODEL_PROVIDER);
-        if reserved {
-            label.push_str("（codex 保留名）");
-        } else if let Some(provider) = profile.provider.as_deref() {
-            label.push_str(&format!("（{provider}）"));
-        }
-        let paired = profile.provider.is_some() && !reserved;
-        options.push(crate::backend::types::ModelOption {
-            id: profile.model.clone(),
-            label: Some(clip(&label, 48)),
-            value: Some(if paired {
-                profile.model.clone()
-            } else {
-                codex_ref(&profile.model)
-            }),
-            group: Some(PROFILE_GROUP.to_string()),
-            provider: if paired { profile.provider.clone() } else { None },
             ..Default::default()
         });
     }
@@ -938,8 +857,8 @@ fn model_page(
         .iter()
         .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown));
     // One short line when `config/read` failed (ADR-0092 decision 8): the
-    // catalog is known, the provider/profile data is not — the provider page
-    // says so too, but the root page must not hide it.
+    // catalog is known, the provider data is not — the provider page says so
+    // too, but the root page must not hide it.
     let note = if config.read_failed {
         Some("配置读取失败：只显示内置目录".to_string())
     } else if only_drill {
@@ -1010,13 +929,6 @@ fn provider_page(
             continue;
         }
         let mut models: Vec<String> = Vec::new();
-        for profile in config
-            .profiles
-            .iter()
-            .filter(|profile| profile.provider.as_deref() == Some(provider.id.as_str()))
-        {
-            models.push(profile.model.clone());
-        }
         if let Some(ProbeOutcome::Models(probed)) = probes.get(&provider.id) {
             models.extend(probed.iter().cloned());
         }
@@ -1203,8 +1115,8 @@ mod tests {
     }
 
     /// Layers arrive highest-precedence first (project → user → system). The
-    /// first occurrence of an id/key wins, the display name falls back to the
-    /// id, and a profile without a model contributes no preset.
+    /// first occurrence of an id/key wins and the display name falls back to
+    /// the id.
     #[test]
     fn config_read_merges_layers_best_layer_first() {
         let result = json!({
@@ -1224,10 +1136,6 @@ mod tests {
                             },
                             "no-name": { "base_url": "http://127.0.0.1:2" }
                         },
-                        "profiles": {
-                            "fast": { "model": "deepseek-flash", "model_provider": "deepseek" },
-                            "no-model": { "model_provider": "deepseek" }
-                        }
                     }
                 },
                 {
@@ -1239,9 +1147,6 @@ mod tests {
                             "deepseek": { "name": "DeepSeek User", "base_url": "http://user" },
                             "user-only": { "name": "User Only", "env_key": "USER_KEY" }
                         },
-                        "profiles": {
-                            "fast": { "model": "user-model" }
-                        }
                     }
                 }
             ]
@@ -1263,10 +1168,6 @@ mod tests {
         );
         assert_eq!(config.providers[1].name, "no-name", "no name means the id");
         assert_eq!(config.providers[2].env_key.as_deref(), Some("USER_KEY"));
-        assert_eq!(config.profiles.len(), 1, "a model-less profile is not a preset");
-        assert_eq!(config.profiles[0].name, "fast");
-        assert_eq!(config.profiles[0].model, "deepseek-flash");
-        assert_eq!(config.profiles[0].provider.as_deref(), Some("deepseek"));
     }
 
     /// A higher layer may name only one provider field; the lower layer's
@@ -1771,11 +1672,11 @@ mod tests {
             Some(TOKEN),
             None,
         ));
-        config.profiles.push(ProfilePreset {
-            name: "fast".into(),
-            model: "deepseek-flash".into(),
-            provider: Some("deepseek".into()),
-        });
+        let mut probes = HashMap::new();
+        probes.insert(
+            "deepseek".into(),
+            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
+        );
         let query = ModelSurfaceQuery {
             current: Some(ModelSelection {
                 label: "deepseek/deepseek-flash".into(),
@@ -1792,7 +1693,7 @@ mod tests {
         let mut providers_query = query;
         providers_query.scope = Some(PROVIDER_SCOPE);
         providers_query.session_id = None;
-        let providers = build_surface(&[], &config, &HashMap::new(), Some("codex"), &providers_query);
+        let providers = build_surface(&[], &config, &probes, Some("codex"), &providers_query);
         let label = providers.scopes[0].options[0].display_label();
         assert!(label.contains("当前"), "label: {label}");
 
@@ -1916,7 +1817,7 @@ mod tests {
         assert_eq!(
             root.scopes[0].note.as_deref(),
             Some("配置读取失败：只显示内置目录"),
-            "the model page says the provider/profile data is unknown"
+            "the model page says the provider data is unknown"
         );
 
         let pending_provider = ModelSurfaceQuery {
@@ -1991,18 +1892,18 @@ mod tests {
     fn the_provider_page_is_selectable_only_on_a_pending_session() {
         let mut config = CodexModelConfig::default();
         config.providers.push(provider("deepseek", None, None, None));
-        config.profiles.push(ProfilePreset {
-            name: "fast".into(),
-            model: "deepseek-flash".into(),
-            provider: Some("deepseek".into()),
-        });
+        let mut probes = HashMap::new();
+        probes.insert(
+            "deepseek".into(),
+            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
+        );
 
         // A Pending Session: the pair rides creation, no suffix on the row.
         let pending_query = ModelSurfaceQuery {
             session_id: None,
             ..provider_query()
         };
-        let pending = build_surface(&[], &config, &HashMap::new(), None, &pending_query);
+        let pending = build_surface(&[], &config, &probes, None, &pending_query);
         let scope = &pending.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::NewThread);
         assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
@@ -2012,7 +1913,7 @@ mod tests {
         // A live thread: the current provider is stated, the rows are gone, and
         // the only remedy named is `/new` / `/fork`.
         let live = provider_query();
-        let read_only = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), &live);
+        let read_only = build_surface(&[], &config, &probes, Some("deepseek"), &live);
         let scope = &read_only.scopes[0];
         assert_eq!(scope.changeable, ChangeScope::NewThread);
         assert!(scope.options.is_empty(), "no clickable rows: {:?}", scope.options);
@@ -2033,17 +1934,17 @@ mod tests {
         let mut deepseek = provider("deepseek", None, None, None);
         deepseek.name = "DeepSeek".into();
         config.providers.push(deepseek);
-        config.profiles.push(ProfilePreset {
-            name: "fast".into(),
-            model: "deepseek-flash".into(),
-            provider: Some("deepseek".into()),
-        });
+        let mut probes = HashMap::new();
+        probes.insert(
+            "deepseek".into(),
+            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
+        );
 
         let pending_query = ModelSurfaceQuery {
             session_id: None,
             ..provider_query()
         };
-        let surface = build_surface(&[], &config, &HashMap::new(), None, &pending_query);
+        let surface = build_surface(&[], &config, &probes, None, &pending_query);
         let option = &surface.scopes[0].options[0];
         assert_eq!(option.display_label(), "DeepSeek/deepseek-flash");
         assert_eq!(
@@ -2068,11 +1969,8 @@ mod tests {
         let mut slashed = provider("foo/bar", None, None, None);
         slashed.name = "Foo Bar".into();
         config.providers.push(slashed);
-        config.profiles.push(ProfilePreset {
-            name: "fast".into(),
-            model: "gpt-x".into(),
-            provider: Some("foo/bar".into()),
-        });
+        let mut probes = HashMap::new();
+        probes.insert("foo/bar".into(), ProbeOutcome::Models(vec!["gpt-x".into()]));
         let query = ModelSurfaceQuery {
             current: Some(ModelSelection {
                 label: "codex/gpt-x".into(),
@@ -2087,7 +1985,7 @@ mod tests {
             session_id: None,
             ..query
         };
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("foo/bar"), &pending);
+        let surface = build_surface(&[], &config, &probes, Some("foo/bar"), &pending);
         let option = &surface.scopes[0].options[0];
         assert_eq!(option.display_label(), "Foo Bar/gpt-x（当前）");
         assert_eq!(option.provider.as_deref(), Some("foo/bar"));
@@ -2104,38 +2002,58 @@ mod tests {
         assert_eq!(parsed.id, "gpt-x");
     }
 
-    /// Issue #910: a profile preset is Codex's own model + provider declaration,
-    /// so the option carries the provider it pairs with — the card forwards it,
-    /// which is how a Pending Session applies both at `thread/start`.
+    /// Spec #922 decision 7: `[profiles.*]` is not a preset source. A layer
+    /// carrying one contributes no model row and no provider pair — the table is
+    /// simply ignored.
     #[test]
-    fn a_profile_preset_carries_its_paired_provider() {
-        let mut config = CodexModelConfig::default();
-        config.profiles.push(ProfilePreset {
-            name: "fast".into(),
-            model: "deepseek-flash".into(),
-            provider: Some("deepseek".into()),
+    fn a_profiles_table_is_ignored() {
+        let result = json!({
+            "config": {},
+            "layers": [{
+                "config": {
+                    "model": "top-level-model",
+                    "model_providers": {
+                        "deepseek": { "name": "DeepSeek", "base_url": "http://127.0.0.1:1/v1" }
+                    },
+                    "profiles": {
+                        "fast": { "model": "deepseek-flash", "model_provider": "deepseek" }
+                    }
+                }
+            }]
         });
+        let config = CodexModelConfig::from_read(&result);
+        assert_eq!(config.default_model.as_deref(), Some("top-level-model"));
+        assert_eq!(config.providers.len(), 1);
+
+        // The model page has the config default and the drill only: no profile
+        // row, and no pair that a profile could have supplied.
         let surface = build_surface(&[], &config, &HashMap::new(), None, &ModelSurfaceQuery::default());
-        let profile = surface.scopes[0]
+        let labels: Vec<&str> = surface.scopes[0]
             .options
             .iter()
-            .find(|option| option.group.as_deref() == Some(PROFILE_GROUP))
-            .expect("the preset is offered");
-        assert_eq!(profile.provider.as_deref(), Some("deepseek"));
-
-        // A preset without `model_provider` pairs with nothing.
-        config.profiles.push(ProfilePreset {
-            name: "plain".into(),
-            model: "gpt-5.1".into(),
-            provider: None,
-        });
-        let surface = build_surface(&[], &config, &HashMap::new(), None, &ModelSurfaceQuery::default());
+            .map(|option| option.display_label())
+            .collect();
         assert!(
-            surface.scopes[0]
-                .options
-                .iter()
-                .filter(|option| option.group.as_deref() == Some(PROFILE_GROUP))
-                .any(|option| option.provider.is_none())
+            labels.iter().any(|label| label.contains("top-level-model")),
+            "{labels:?}"
         );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("fast") || label.contains("deepseek-flash")),
+            "a profile contributes no model row: {labels:?}"
+        );
+
+        // The provider page lists DeepSeek as a status row with no pair: a
+        // profile did not give it one.
+        let provider_query = ModelSurfaceQuery {
+            scope: Some(PROVIDER_SCOPE),
+            ..Default::default()
+        };
+        let provider_page = build_surface(&[], &config, &HashMap::new(), None, &provider_query);
+        let option = &provider_page.scopes[0].options[0];
+        assert!(option.disabled, "no pair means a status row: {option:?}");
+        assert!(option.provider.is_none(), "{option:?}");
+        assert!(!option.display_label().contains("deepseek-flash"));
     }
 }
