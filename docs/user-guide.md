@@ -857,8 +857,9 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
   every later message carries no model and no effort: the thread's own default
   is the fact, so a peer client's later change is respected and the read-back
   only refreshes 当前. Only the next new turn cola observes starting counts — a
-  steer, a turn folded into the running one, and a command such as `/compact` do
-  not consume it. A definite refusal (a JSON-RPC error) keeps it for a retry; an
+  steer, a turn cola observes folded into the running one, and a command such as
+  `/compact` do not consume it. A definite refusal (a JSON-RPC error) keeps it for
+  a retry; an
   ambiguous submit (a timeout, a lost response) drops it, because the server may
   already have accepted it; a cola restart drops a **live thread's** pending too,
   because it is in-memory state — re-issue `/model` for a model pick, and

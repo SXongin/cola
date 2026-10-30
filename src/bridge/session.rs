@@ -98,9 +98,9 @@ pub struct SessionSettings {
     /// The thread-level provider a Pending Session will start on (issue #910).
     /// Only a creation can apply it, so this is `None` for a live session —
     /// there the thread's own `modelProvider` (the adapter's projection) is the
-    /// fact, and its change goes through the confirmation path, not this
-    /// mirror. [`SessionStore::set_settings`] honours that: an entry ignores
-    /// this field.
+    /// fact, and a live cross-provider pick is refused from the cache (no card,
+    /// no resume) rather than written here. [`SessionStore::set_settings`]
+    /// honours that: an entry ignores this field.
     pub provider: Option<String>,
     /// Per-session thinking level (`/think`).
     pub variant: Option<String>,
