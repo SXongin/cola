@@ -688,10 +688,10 @@ cola therefore:
   `thread/start`, naming both providers and the remedy (change `model_provider`
   in the daemon's `config.toml` — `$CODEX_HOME/config.toml`, default
   `~/.codex/config.toml` — and restart the daemon, or pick a model on the current
-  provider). A failed config read never blocks creation: Codex's own error is
-  then the fallback. This covers the text form
-  (`/model <provider>/<model>`) and a stale card alike, and leaves no orphan
-  thread.
+  provider). This covers the text form (`/model <provider>/<model>`) and a stale
+  card alike, and leaves no orphan thread **when the config is readable**. A
+  failed config read never blocks creation: the thread is created and Codex's own
+  mismatch, at its first turn, is the fallback — the same trade the guides state.
 
 cola never writes that file: changing a provider stays the user's config edit
 plus a daemon restart, and there is still no live provider-switch path.
