@@ -1625,8 +1625,10 @@ async fn a_reset_only_pending_keeps_current_until_acceptance() {
         "当前 keeps the old level: {reset_text}"
     );
     assert!(
-        !reset_text.contains("待应用"),
-        "a reset-only marker has no pending model line: {reset_text}"
+        reset_text.contains("待应用")
+            && reset_text.contains("清除思考等级")
+            && reset_text.contains("下一条新消息生效"),
+        "a reset-only marker shows the clear it will apply: {reset_text}"
     );
 
     // A definite refusal keeps the marker, the intent and the mirror.

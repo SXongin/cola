@@ -659,6 +659,30 @@ impl SessionsHandle {
                 Ok(None) | Err(_) => None,
             };
         }
+        // A live Codex thread carries the selection its accepted turns actually
+        // run, so the thread fact outranks the `/model` mirror: after a pending
+        // pick is accepted the mirror is committed separately and can lag. The
+        // bounded read falls through to the ladder below when it fails or names
+        // no model (spec #922). The accepted `/think` level stays on the
+        // settings, so attach it here.
+        if let Some(session_id) = settings.session_id.as_deref()
+            && backend.has_thread_provider()
+            && let Ok(Ok(info)) = tokio::time::timeout(
+                SESSION_INFO_TIMEOUT,
+                backend.session_info(
+                    session_id,
+                    (!settings.directory.is_empty()).then_some(settings.directory.as_str()),
+                ),
+            )
+            .await
+            && let Some(model) = info.model
+        {
+            return Some(crate::backend::types::ModelInfo {
+                id: model.id,
+                provider_id: model.provider_id,
+                variant: settings.variant.clone(),
+            });
+        }
         // The `/model` mirror. Its variant is the separate `/think` field on
         // the settings, so the model ref is assembled here.
         if let Some(mut model) = settings

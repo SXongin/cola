@@ -2226,6 +2226,36 @@ async fn status_shows_the_live_current_and_pending_pair() {
     assert!(text.contains("会话：`ses_test`"), "{text}");
 }
 
+/// Spec #922 gate review: after a pending model is accepted the thread fact is
+/// the model the session runs, so `/status` reports it rather than the mirror
+/// that still names the previous pick.
+#[tokio::test]
+async fn status_after_an_accepted_pick_reports_the_thread_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_session_model(crate::backend::types::SessionModel {
+            provider_id: "openai".into(),
+            id: "gpt-accepted".into(),
+        });
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-stale".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let text = command_text(&app, &platform, "/status", "msg_status").await;
+    assert!(
+        text.contains("当前：openai/gpt-accepted@high"),
+        "the accepted thread model is current: {text}"
+    );
+    assert!(!text.contains("gpt-stale"), "{text}");
+    assert!(!text.contains("待应用"), "{text}");
+}
+
 /// A Pending Session's `/status` shows its creation pair and never 待应用.
 #[tokio::test]
 async fn status_shows_a_pending_sessions_creation_pair_only() {
