@@ -420,25 +420,26 @@ the thread names. It is rendered as its own group 「内置目录（任何 provi
 the neutral `codex/<id>`: it is the reference cola records, not a claim about
 which channel runs the model.
 
-**5. A provider is never selected without a model.** *(Superseded in part by
-spec #922, 2026-10-30: the `[profiles.*]` preset source below is legacy —
-Codex 0.134+ removed it; presets, if kept, read
-`$CODEX_HOME/<name>.config.toml`. The pair rule and the no-bare-provider rule
-remain.)* `[profiles.*]` is Codex's native place to declare a **pair** —
-`model` + `model_provider` — and cola reads exactly those two keys as a
-one-click preset; a profile's other keys are neither applied nor shown. A profile is a *declaration source*, never a protocol field:
-app-server has no "pick a profile", so cola applies the pair through
-`thread/start` or the switch below. The rule the pair follows is measured, not
-stylistic: moving a thread from `opencode-go` to `deepseek` while its model stays
-`gpt-6-luna` sends that name to DeepSeek and gets a 404, so **every selectable
-provider row is a pair** — a `[profiles.*]` preset, or a model that provider's
-`/models` endpoint happened to list (a best-effort read, not a declaration). A
-configured provider with neither is not offered as a dead option; the note names
-it and says how to declare one. cola keeps no second model list of its own
-(cc-connect's `ProviderConfig.Models` was considered as the default and
-rejected); the catalog, the config's `model`, the `[profiles.*]` presets, a
-provider's `/models` answer and a hand-typed id are the sources, in that order of
-reliability.
+**5. A provider is never selected without a model.** A provider row is a
+**pair** — `model` + `model_provider` — because moving a thread from
+`opencode-go` to `deepseek` while its model stays `gpt-6-luna` sends that name
+to DeepSeek and gets a 404. The pair rule is measured, not stylistic, and it
+survives spec #922 (2026-10-30); the *source* of a pair is what changed.
+
+The original #906 text named `[profiles.*]` as that source: a profile was a
+declaration of `model` + `model_provider`, never a protocol field. That source
+is now **removed**: Codex 0.134+ no longer reads `[profiles.*]` or a top-level
+`profile = "..."`; `--profile` layers `$CODEX_HOME/<name>.config.toml`. cola
+therefore does **not** read `[profiles.*]` as a preset, and a surface that wants
+presets must read those config-profile files (or drop presets).
+
+A configured provider with no pair is not offered as a dead option; the note
+names it and says how to declare one. cola keeps no second model list of its
+own (cc-connect's `ProviderConfig.Models` was considered as the default and
+rejected). The pair sources are, in order of reliability: the catalog plus the
+config's `model` for the current provider; a config-profile file, if the
+surface reads one; a provider's `/models` answer (best effort, not a
+declaration); and a hand-typed id.
 
 **6. A provider change is recorded, then applied by the next prompt's
 pre-flight.** *(Superseded by spec #922, 2026-10-30: a live thread's provider is
@@ -514,15 +515,14 @@ confirmation only records — the pre-flight is where the thread is touched.
 2026-10-30; the reserved namespace itself still stands.)*
 
 The neutral catalog ref is `codex/<id>` (decision 3), and that ref is what the
-`model` scope's catalog rows and the profile presets carry back. The id is
-therefore **reserved**: `codex` can never name a real channel, whatever
-`config/read` declares. A `[model_providers.codex]` is still visible in the
-provider scope — a reserved, non-selectable row saying
-「`codex` 是内置目录的保留名，不能在这里选择」 — but it offers no pair: the pair
-value would collide with the catalog's own, so a pick through it could never
-address the configured channel. Its probe contributes no `codex/<id>` entries,
-and a `[profiles.*]` naming it degrades to the neutral catalog ref (a model-only
-pick).
+`model` scope's catalog rows carry back. The id is therefore **reserved**:
+`codex` can never name a real channel, whatever `config/read` declares. A
+`[model_providers.codex]` is still visible in the provider scope — a reserved,
+non-selectable row saying 「`codex` 是内置目录的保留名，不能在这里选择」 — but it
+offers no pair: the pair value would collide with the catalog's own, so a pick
+through it could never address the configured channel. Its probe contributes no
+`codex/<id>` entries. (A legacy `[profiles.*]` naming it is no longer read, so
+there is no preset to degrade; see decision 5.)
 
 The classification is lexical, so it needs **no** `config/read` on the pick
 path: a card callback has an ack budget and the text form has none, and a
@@ -552,16 +552,16 @@ provider's probe and its notes crowded one card. The owner chose density over
 the letter of AC1, so the Codex surface is now **two pages**, one scope each:
 
 - the **model page** (root) carries only what a pick can run without changing
-  the channel — the catalog, the config default, the **legacy** profiles and
-  the **current provider's** probed models — plus a `切换 provider…` drill;
+  the channel — the catalog, the config default and the **current provider's**
+  probed models — plus a `切换 provider…` drill;
 - the **provider page** (one tap away, with the back button) carries every
   configured provider's pairs, the current marker, a failed probe as a short
   tag and pairless providers as disabled rows.
 
-*(Spec #922, 2026-10-30: the profiles row is legacy, and on a live thread the
-provider page is a read-only current value with a `/new` / `/fork` note — the
-provider rows are selectable only on a Pending Session. The two-page split
-itself remains.)*
+*(Spec #922, 2026-10-30: the profiles row is removed (see decision 5), and on a
+live thread the provider page is a read-only current value with a `/new` /
+`/fork` note — the provider rows are selectable only on a Pending Session. The
+two-page split itself remains.)*
 
 Nothing is lost in the split: every provider `config/read` declares is still
 listed (on the page it belongs to), no bare provider is selectable, and the
