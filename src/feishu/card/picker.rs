@@ -1002,7 +1002,7 @@ mod tests {
             vec![
                 scope(
                     "model",
-                    "模型（每轮可换）",
+                    "模型",
                     vec![ModelOption {
                         id: "gpt-5".into(),
                         value: Some("codex/gpt-5".into()),
@@ -1265,7 +1265,7 @@ mod tests {
     #[test]
     fn empty_scope_renders_note_and_free_text_without_buttons() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut empty = scope("model", "模型（每轮可换）", Vec::new());
+        let mut empty = scope("model", "模型", Vec::new());
         empty.note = Some("_(没有可用模型)_".into());
         empty.free_text = Some("也可以直接发送 `/model codex/<id>`".into());
         let cards = build_model_surface_cards(&key, &surface(None, vec![empty]), false);
@@ -1337,7 +1337,7 @@ mod tests {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let model = scope(
             "model",
-            "模型（每轮可换）",
+            "模型",
             vec![
                 ModelOption {
                     id: "gpt-5.1-codex".into(),
@@ -1428,11 +1428,8 @@ mod tests {
                 });
             }
         }
-        let cards = build_model_surface_cards(
-            &key,
-            &surface(None, vec![scope("model", "模型（每轮可换）", options)]),
-            false,
-        );
+        let cards =
+            build_model_surface_cards(&key, &surface(None, vec![scope("model", "模型", options)]), false);
         assert!(cards.len() > 1, "120 options cannot fit one card");
 
         for card in &cards {
@@ -2312,7 +2309,7 @@ mod tests {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
         let model = scope(
             "model",
-            "模型（每轮可换）",
+            "模型",
             vec![
                 ModelOption {
                     id: "deepseek-flash".into(),
