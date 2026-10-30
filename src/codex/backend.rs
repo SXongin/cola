@@ -2993,7 +2993,6 @@ impl Backend for CodexClient {
             .await;
         let thread_provider = thread_model.as_ref().map(|model| model.provider_id.clone());
         let mut effective_query = query.clone();
-        let mut current_reference = None;
         if let Some(model) = &thread_model
             && model.provider_id != MODEL_PROVIDER
         {
@@ -3014,7 +3013,6 @@ impl Backend for CodexClient {
                 Some(variant) => format!("{reference}@{variant}"),
                 None => reference.clone(),
             };
-            current_reference = Some(reference.clone());
             effective_query.current = Some(crate::backend::types::ModelSelection { label, reference });
         }
         let mut surface = super::model_surface::build_surface(
@@ -3024,13 +3022,13 @@ impl Backend for CodexClient {
             thread_provider.as_deref(),
             &effective_query,
         );
-        // The recorded pair, when the thread has not run it yet: a separate
-        // line, never the current one.
-        // The pending line belongs to the model page; the provider page has no
-        // model content (issue #908).
+        // The recorded pair is unapplied even when it spells the current pair:
+        // a one-shot pick equal to what the thread runs still rides the next
+        // new turn, so it must be visible (spec #922). The pending line belongs
+        // to the model page; the provider page has no model content (issue
+        // #908).
         if query.scope.is_none()
             && let Some(pending) = query.pending
-            && current_reference.as_deref() != Some(pending)
             && let Some(scope) = surface.scopes.first_mut()
         {
             let line = format!("待应用：`{pending}`（下一条新消息生效）");
