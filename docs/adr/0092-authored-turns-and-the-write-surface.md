@@ -420,10 +420,13 @@ the thread names. It is rendered as its own group 「内置目录（任何 provi
 the neutral `codex/<id>`: it is the reference cola records, not a claim about
 which channel runs the model.
 
-**5. A provider is never selected without a model.** `[profiles.*]` is Codex's
-native place to declare a **pair** — `model` + `model_provider` — and cola reads
-exactly those two keys as a one-click preset; a profile's other keys are neither
-applied nor shown. A profile is a *declaration source*, never a protocol field:
+**5. A provider is never selected without a model.** *(Superseded in part by
+spec #922, 2026-10-30: the `[profiles.*]` preset source below is legacy —
+Codex 0.134+ removed it; presets, if kept, read
+`$CODEX_HOME/<name>.config.toml`. The pair rule and the no-bare-provider rule
+remain.)* `[profiles.*]` is Codex's native place to declare a **pair** —
+`model` + `model_provider` — and cola reads exactly those two keys as a
+one-click preset; a profile's other keys are neither applied nor shown. A profile is a *declaration source*, never a protocol field:
 app-server has no "pick a profile", so cola applies the pair through
 `thread/start` or the switch below. The rule the pair follows is measured, not
 stylistic: moving a thread from `opencode-go` to `deepseek` while its model stays
@@ -438,8 +441,11 @@ provider's `/models` answer and a hand-typed id are the sources, in that order o
 reliability.
 
 **6. A provider change is recorded, then applied by the next prompt's
-pre-flight.** Measured on the pinned daemon (#910's owner notes, two
-connections):
+pre-flight.** *(Superseded by spec #922, 2026-10-30: a live thread's provider is
+no longer changed. Provider is creation-only — `thread/start` for `/new`,
+`thread/fork` for `/fork` — and this record/pre-flight switch is removed. The
+measured resume behavior below remains the evidence for why.)* Measured on the
+pinned daemon (#910's owner notes, two connections):
 
 ```text
 A resume(deepseek)                  → deepseek      ← a fresh load applies
@@ -504,6 +510,9 @@ confirmation only records — the pre-flight is where the thread is touched.
 
 ## Amendment (#910, #908): `codex` is a reserved namespace
 
+*(The `[profiles.*]` half of this section is superseded by spec #922,
+2026-10-30; the reserved namespace itself still stands.)*
+
 The neutral catalog ref is `codex/<id>` (decision 3), and that ref is what the
 `model` scope's catalog rows and the profile presets carry back. The id is
 therefore **reserved**: `codex` can never name a real channel, whatever
@@ -524,6 +533,9 @@ ambiguity this amendment removes.
 
 ## Amendment (#910 AC6): a failed switch leaves the session as it was
 
+*(Superseded by spec #922, 2026-10-30: the live switch and its mirror rollback
+are removed. This section is kept as history.)*
+
 A switch whose read-back disagrees (or cannot be read) is a **named failure**,
 and the session must not be left holding a pair the thread never ran. The
 per-turn mirror is restored from the adapter's read-back observation — a
@@ -540,11 +552,16 @@ provider's probe and its notes crowded one card. The owner chose density over
 the letter of AC1, so the Codex surface is now **two pages**, one scope each:
 
 - the **model page** (root) carries only what a pick can run without changing
-  the channel — the catalog, the config default, the profiles and the **current
-  provider's** probed models — plus a `切换 provider…` drill;
+  the channel — the catalog, the config default, the **legacy** profiles and
+  the **current provider's** probed models — plus a `切换 provider…` drill;
 - the **provider page** (one tap away, with the back button) carries every
   configured provider's pairs, the current marker, a failed probe as a short
   tag and pairless providers as disabled rows.
+
+*(Spec #922, 2026-10-30: the profiles row is legacy, and on a live thread the
+provider page is a read-only current value with a `/new` / `/fork` note — the
+provider rows are selectable only on a Pending Session. The two-page split
+itself remains.)*
 
 Nothing is lost in the split: every provider `config/read` declares is still
 listed (on the page it belongs to), no bare provider is selectable, and the
@@ -572,8 +589,10 @@ the stable `turn/start.model` over an undocumented method.
 records a pending selection; it does not change the thread's current pair. The
 next **new** `turn/start` carries `model` + `effort`, whose overrides the
 protocol documents as becoming "the defaults for later turns on the same
-thread". The pending is cleared only after a bounded `thread/read` reports the
-pair; an accepted RPC alone is not the verdict. Subsequent prompts do not carry
+thread". The pending is cleared only when a bounded `thread/read` returns
+**the same `model` and `modelProvider` as the pending**; if it still returns the
+old pair, the pending stays and the next prompt reports the mismatch by name. An
+accepted RPC alone is not the verdict. Subsequent prompts do not carry
 the model again, so a peer's later change is respected. The pending is cola
 state, not server state: it may be persisted across a restart so a pick made
 before the next prompt is not lost, but it is never re-sent after it is
