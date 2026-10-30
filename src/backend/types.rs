@@ -120,7 +120,7 @@ pub struct ModelOption {
     /// provider id on a provider page.
     pub id: String,
     /// The provider this option applies **together with** its model, when the
-    /// client declares such a pair (Codex's `[profiles.*]` preset carries
+    /// client declares such a pair (a Codex provider's `/models` row carries
     /// `model` + `model_provider`). `None` means "the model only" — the pick
     /// leaves the thread's provider as it is (issue #910).
     pub provider: Option<String>,

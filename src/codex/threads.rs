@@ -351,8 +351,8 @@ impl From<&crate::config::CodexConfig> for ThreadSettings {
 /// `modelProvider` is a **creation-only** fact: `thread/start` accepts it, while
 /// `turn/start` has no such field — so a provider never rides a turn, and cola
 /// must never invent one there. The model is the turn's own field *and* a
-/// creation field; when it pairs with a provider (a `[profiles.*]` preset) the
-/// two go in one creation call.
+/// creation field; when a Pending Session chooses a provider, the two go in one
+/// creation call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ThreadModel<'a> {
     /// `thread/start`'s `model`: the model id the new thread runs.
@@ -1057,9 +1057,9 @@ mod tests {
     }
 
     /// Issue #910: a new thread takes its provider at creation. The pair — a
-    /// `[profiles.*]` preset's model + provider — goes in ONE `thread/start`,
-    /// because a provider has no other creation path and `turn/start` has no
-    /// provider field at all.
+    /// Pending Session's provider + model — goes in ONE `thread/start`, because
+    /// a provider has no other creation path and `turn/start` has no provider
+    /// field at all.
     #[tokio::test]
     async fn thread_start_carries_the_chosen_model_and_provider() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;

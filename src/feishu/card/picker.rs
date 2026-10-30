@@ -2298,9 +2298,9 @@ mod tests {
         );
     }
 
-    /// Issue #910: a profile preset's paired provider rides the callback, and
-    /// only there — a model option without a pairing emits no such field, so
-    /// every other card's bytes stay identical.
+    /// Issue #910: a paired option's provider rides the callback, and only
+    /// there — a model option without a pairing emits no such field, so every
+    /// other card's bytes stay identical.
     #[test]
     fn a_paired_provider_rides_the_model_button() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());

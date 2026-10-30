@@ -841,15 +841,17 @@ level**, a model is **per turn**, and the built-in catalog is **global**. Bare
   shows that change, and the footer and the picker cannot disagree.
 - **「模型（每轮可换）」** lists the model-only sources: `model/list`'s built-in
   catalog (grouped as 「内置目录（全局，未校验）」 — those ids name no provider and
-  may run through any of them), the config's top-level `model` (配置默认), every
-  `[profiles.<name>]` preset (`model` + `model_provider`, shown as
-  `profile：model（provider）`), and **the current provider's** `/models` ids. A
+  may run through any of them), the config's top-level `model` (配置默认), and
+  **the current provider's** `/models` ids. A
   pick is sent as `turn/start.model` on the next message and the thread keeps it
   for its following turns.
 - **An id outside every list is typed.** `/model codex/<id>` records it, and
   `/model <provider>/<model>` records a pair. Codex validates neither one: only
   the catalog's entries carry a display name, a context window and reasoning
   levels, so a typo shows up as the provider's own error on the next message.
+- **`[profiles.*]` is not read.** Codex 0.134+ no longer reads it (a
+  `--profile` layers `$CODEX_HOME/<name>.config.toml`), so cola ignores the
+  table: a profile neither adds a model row nor supplies a provider pair.
 
 **The `/models` probe is best effort, and its refusal is not an error.**
 `GET <base_url>/models` is not part of the Responses API — `wire_api =
@@ -859,7 +861,7 @@ the answer: a definitive one (403, 404, 401, `env_key`, or the decoded models)
 for three minutes, a **transient** one (a timeout, a network error) for about
 20 seconds so the next open retries. The provider page shows the reason as a
 short tag on the provider row (`403`, `超时`, …) — never a paragraph, and never
-on the model page. The catalog, the config default and the profiles are always
+on the model page. The catalog and the config default are always
 there, and a card callback answers from the cache, so a first cold click may
 show the providers without their probed models until the next open fills them. The token is sent only in the
 request's `Authorization` header: it never appears on a card, in a log line or in
@@ -879,15 +881,15 @@ model name on a new provider is a 404. So:
   changed in a new session or a fork. `/model` with a different provider is
   refused without any request — no `turn/start`, no `thread/resume` — and both
   the card and the text reply point at `/new` / `/fork`.
-- **A same-provider pick is just a model change.** A `[profiles.*]` preset whose
-  `model_provider` is the thread's current provider, or any `codex/<id>` pick,
-  is recorded and rides the next message — no resume, no reload.
+- **A same-provider pick is just a model change.** A `codex/<id>` catalog/default
+  ref, or one of the thread's own provider's `/models` rows, is recorded and
+  rides the next message — no resume, no reload.
 - **`codex` is a reserved name.** The built-in catalog's ref is `codex/<id>` —
   a shared neutral namespace, never a channel — so a `[model_providers.codex]`
   cannot be selected: the provider section lists it as 「`codex` 是内置目录的保留名，
   不能在这里选择」 and offers no pair (the pair value would collide with the
-  catalog's own), and a `[profiles.*]` naming it degrades to the neutral catalog
-  ref. The classification is lexical, so a catalog pick never reads your config.
+  catalog's own). The classification is lexical, so a catalog pick never reads
+  your config.
 
 `/model <provider>/<model>` follows the same rule: a different provider on a
 live thread is refused (never a silent thread change), while a Pending Session
