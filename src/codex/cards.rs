@@ -1276,6 +1276,114 @@ async fn a_model_pick_reaches_the_next_turn() {
     );
 }
 
+/// Spec #922 gate review: a pending pick equal to the current pair is still an
+/// unapplied choice, so the card shows it and the next new turn consumes it.
+#[tokio::test]
+async fn a_pending_equal_to_the_current_pair_is_shown_then_consumed() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![json!({
+        "id": "gpt-5.1",
+        "displayName": "GPT-5.1",
+        "hidden": false,
+        "supportedReasoningEfforts": []
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+
+    // A same-pair pick still records a one-shot pending.
+    app.host_action(json!({
+        "action": "model",
+        "level": "model",
+        "chat_id": CHAT,
+        "thread_id": CHAT,
+        "value": "openai/gpt-5.1",
+    }))
+    .await
+    .expect("the same-pair model pick");
+    assert_eq!(
+        client.pending_model(THREAD).await.as_deref(),
+        Some("openai/gpt-5.1")
+    );
+
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_same_pair_pending",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let pending_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the pending /model card");
+    let pending_text = card_text(&pending_card);
+    assert!(
+        pending_text.contains("当前模型**：`openai/gpt-5.1`"),
+        "the current pair is unchanged: {pending_text}"
+    );
+    assert!(
+        pending_text.contains("待应用：`openai/gpt-5.1`") && pending_text.contains("下一条新消息生效"),
+        "an unapplied same-pair pick is still shown: {pending_text}"
+    );
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("use the same pair", "om_same_pair_turn"))
+                .await
+        }
+    });
+    let params = wait_for_turn_start(&server).await;
+    assert_eq!(params["model"], "gpt-5.1");
+    assert_eq!(params.get("effort"), None, "no level was pending");
+
+    // The accepted new turn consumed it; the current pair did not move.
+    send_command_in(
+        &app,
+        "/model",
+        key,
+        "om_same_pair_after",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let after_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the post-turn /model card");
+    let after_text = card_text(&after_card);
+    assert!(
+        after_text.contains("当前模型**：`openai/gpt-5.1`"),
+        "the current pair is still the same: {after_text}"
+    );
+    assert!(
+        !after_text.contains("待应用"),
+        "the consumed same-pair pending is gone: {after_text}"
+    );
+
+    // End the turn so the spawned handler stops cleanly.
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(handler, "the same-pair turn", SETTLE_DEADLINE).await;
+}
+
 /// Spec #922 whole-branch review: an effort-only pending (a `/think` with no
 /// `/model`) must still show on the card as 待应用, and disappear once the next
 /// new turn consumes it.
