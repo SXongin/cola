@@ -818,7 +818,9 @@ Notes:
   next-new-message pending, dropped by a restart; a Pending Session's picks are
   stored with the session and survive until it is created — see 「`/model` on a
   Codex client」 below.
-  `/model`'s value must exist on the server cola attaches to. Bare `/model` opens
+  On OpenCode, `/model`'s value must exist on the server cola attaches to; Codex
+  validates neither a catalog nor a typed id, so a typo surfaces as the
+  provider's own error on the next turn. Bare `/model` opens
   the provider → model picker, whose intro shows the model the next message will
   actually run (the session's own selection, else `[opencode] model`, else what
   the server recorded). `/compact` and `/stop` need a real session and keep their
@@ -854,14 +856,14 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
   `model` + `effort`; when the turn is accepted the pick is **consumed**, and
   every later message carries no model and no effort: the thread's own default
   is the fact, so a peer client's later change is respected and the read-back
-  only refreshes 当前. Only a genuinely new turn counts — a steer, a turn folded
-  into the running one, and a command such as `/compact` do not consume it. A
-  definite refusal (a JSON-RPC error) keeps it for a retry; an ambiguous submit
-  (a timeout, a lost response) drops it, because the server may already have
-  accepted it; a cola restart drops a **live thread's** pending too, because it
-  is in-memory state — re-issue `/model` for a model pick, and `/think` again
-  when only the level was pending (`/model` alone does not restore a `/think`
-  level).
+  only refreshes 当前. Only the next new turn cola observes starting counts — a
+  steer, a turn folded into the running one, and a command such as `/compact` do
+  not consume it. A definite refusal (a JSON-RPC error) keeps it for a retry; an
+  ambiguous submit (a timeout, a lost response) drops it, because the server may
+  already have accepted it; a cola restart drops a **live thread's** pending too,
+  because it is in-memory state — re-issue `/model` for a model pick, and
+  `/think` again when only the level was pending (`/model` alone does not restore
+  a `/think` level).
 - **`/think` is the same one-shot window.** On a live Codex thread a level is
   recorded as the next new message's `effort` (keeping any pending model), not
   a per-prompt override; once it applies, later messages carry no effort.
