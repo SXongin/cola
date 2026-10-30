@@ -1854,15 +1854,26 @@ async fn a_cancel_during_read_back_leaves_the_applied_effort_for_the_next_turn()
     app.waits_handle().inflight.lock().await.remove(THREAD);
     app.waits_handle().inbound.lock().await.remove(THREAD);
     app.cards.lock().await.clear();
-    assert_eq!(
-        app.sessions
-            .lock()
-            .await
-            .get_active(&key)
-            .and_then(|entry| entry.variant.clone()),
-        None,
-        "the cancelled read-back did not commit yet"
-    );
+    // Two legitimate orderings: the read-back completed and the bridge committed
+    // before the abort landed, or the abort won and the adapter's applied record
+    // is still waiting. Either way the fact must not be lost.
+    let first_mirror = app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone());
+    if first_mirror.as_deref() != Some("high") {
+        assert_eq!(
+            first_mirror, None,
+            "the mirror did not move to an unexpected level"
+        );
+        assert_eq!(
+            client.applied_effort(THREAD).await,
+            Some(Some("high".into())),
+            "the cancelled read-back kept the applied effort for the next turn"
+        );
+    }
 
     let handler = tokio::spawn({
         let app = app.clone();
@@ -1897,6 +1908,11 @@ async fn a_cancel_during_read_back_leaves_the_applied_effort_for_the_next_turn()
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    assert_eq!(
+        client.applied_effort(THREAD).await,
+        None,
+        "the committed applied effort is consumed exactly once"
+    );
 
     let live = server.live_turn(THREAD).expect("the turn is running");
     let now = chrono::Utc::now().timestamp();
