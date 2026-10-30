@@ -974,13 +974,22 @@ async fn an_unattachable_pending_seam_fails_the_pick_instead_of_claiming_success
     let mut backend = MockBackend::new(realistic_parts());
     backend
         .with_thread_provider(true)
-        .with_known_thread_provider(Some("openai"));
+        .with_known_thread_provider(Some("openai"))
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: "openai".into(),
+            models: vec![crate::backend::types::ModelOption {
+                id: "gpt-5.1".into(),
+                variants: vec!["high".into()],
+                ..Default::default()
+            }],
+        }]);
     let pending_error = backend.pending_error.clone();
     let pending = backend.pending_selections.clone();
     *pending_error.lock().await = Some("not attached to a codex app-server daemon".into());
     let (app, platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
+    entry.variant = Some("low".into());
     seed_entry(&app, entry).await;
 
     send_command_in(
@@ -1000,6 +1009,18 @@ async fn an_unattachable_pending_seam_fails_the_pick_instead_of_claiming_success
         !text.contains("已记录"),
         "an unattached pending seam must not claim success: {text}"
     );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("low"),
+        "a failed /model restores the mirror's pre-pick /think level"
+    );
 
     send_command_in(
         &app,
@@ -1013,6 +1034,18 @@ async fn an_unattachable_pending_seam_fails_the_pick_instead_of_claiming_success
     assert!(
         text.contains("切换思考等级失败") && text.contains("not attached"),
         "the think error is named: {text}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .cloned()
+            .unwrap()
+            .variant
+            .as_deref(),
+        Some("low"),
+        "a failed /think restores the mirror's pre-pick level"
     );
     assert!(
         pending.lock().await.is_empty(),
