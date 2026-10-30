@@ -698,7 +698,7 @@ Codex 的模型轴不是 provider → model 树：provider 是**创建时**事�
   ——绝不是「待应用」。那里的 `/think` 也是同一个创建意图：在线程建立后随
   第一条新轮生效。两者都随会话存储，而不在 adapter 的一次性窗口里，所以重启
   会保留它们，直到第一条消息创建线程。
-- **「模型（每轮可换）」** 列出只与模型有关的来源：`model/list` 的内置目录
+- **「模型」** 列出只与模型有关的来源：`model/list` 的内置目录
   （分组为「内置目录（全局，未校验）」——这些 id 不属于任何 provider，可以经
   任意一个运行）、配置顶层 `model`（配置默认），以及**当前 provider** 的
   `/models` 返回的 id。点选只是记录，不会每条消息都发送：它只在下一个新消息的
@@ -714,12 +714,26 @@ Codex 的模型轴不是 provider → model 树：provider 是**创建时**事�
 **`/models` 探测是尽力而为，它被拒绝也不算错误。** `GET <base_url>/models`
 不属于 Responses API——`wire_api = "responses"` 并不保证它存在。cola 用各
 `[model_providers.<id>]` 自己的 `experimental_bearer_token` 去问，每次探测
-2 秒，并缓存结果：确定性的答案（403、404、401、`env_key`、或解析出的模型）
-缓存三分钟，**暂时性**失败（超时、网络错误）只缓存约 20 秒，下次打开就会重试。
-provider 页把原因作为行尾的短标签（`403`、`超时`…），不是一段话，也不会出现在
-模型页上。内置目录与配置默认始终在，而卡片回调只从缓存作答，所以
+2 秒，并缓存结果：确定性的答案（鉴权被拒、没有 `/models` 端点、`env_key`、或
+解析出的模型）缓存三分钟，**暂时性**失败（超时、网络错误）只缓存约 20 秒，
+下次打开就会重试。provider 页把原因作为行尾的短标签（`无权列出模型`、
+`探测超时`…），不是一段话，也不会出现在模型页上。探测返回 404 的 provider
+行尾会多一句手输提示——它正是需要手输的那一个：`/model <provider>/<id>`。
+内置目录与配置默认始终在，而卡片回调只从缓存作答，所以
 第一次冷点击可能只显示 provider、没有探测到的模型，下一次打开时补齐。token 只出现在请求的 `Authorization`
 头里：卡片、日志行与错误信息中都不会出现。
+
+**Codex 一次只用一个 provider。** daemon 自身 `~/.codex/config.toml` 顶层的
+`model_provider`（未设置时为 `openai`）必须与线程的 provider 相同：用其他
+provider 调 `thread/start` 仍会成功，但第一条消息会被
+`ModelProviderMismatch` 拒绝（「This chat uses X, but your current provider is
+Y」）。因此待建会话的 provider 页**只**提供那个 provider 的成对行；其他已配置
+的 provider 都是说明原因、不可点的行，页面把这条规则说一次。换 provider 是
+改配置——`~/.codex/config.toml` 的 `model_provider`——再重启 daemon，绝不是
+一次点选，而且 cola 从不写这个文件。在错误的 provider 上创建会话的请求会在
+创建任何东西之前就被按名拒绝（过期的卡片或手输的 `/model <provider>/<model>`
+同样），并同时点名两个 provider 与修复办法。读不到配置时，页面回退到线程当前
+的 provider；连它也不知道时就照旧列出所有 provider——看不见的规则无法执行。
 
 **provider 只在创建时选择。** provider 页（`切换 provider…` 那一行）列出配置好的
 成对行，标签为 `provider/model`。provider 只在线程创建时确定：`/new` 把这一对交给

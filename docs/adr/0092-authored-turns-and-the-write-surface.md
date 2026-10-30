@@ -650,3 +650,44 @@ implementation, `provider_switch_on_resume`, its tests and its confirmation
 copy are superseded; #918/#919/#920 no longer serve a live switch. The
 `GLOSSARY.md` Provider Id / Model Surface entries and both user guides follow
 in spec #922's tickets.
+
+## Amendment (2026-10-30, spec #922): Codex runs one provider per process
+
+The protocol makes the provider a creation-only field, but Codex adds a rule on
+top of it: the thread's `modelProvider` must equal the **process config's**
+top-level `model_provider`. `config_manager.rs`'s
+`check_thread_model_provider_for_input`, called from the turn processor, compares
+the thread's provider with the latest config on every input and refuses a
+mismatch with `ModelProviderMismatch`:
+
+> This chat uses {model_provider}, but your current provider is {current_model_provider}. Switch to {model_provider} to continue.
+
+So `thread/start { modelProvider }` succeeds and the **first `turn/start`** is
+rejected (openai/codex#21464). Measured live on 0.166: a Pending Session pick of
+`deepseek/deepseek-flash` created the thread and then failed its first message,
+because the user's `~/.codex/config.toml` sets `model_provider = "opencode-go"`.
+That is not a cola bug in the pending path — it is Codex's one-provider-per-process
+rule, and the pending path has to respect it.
+
+cola therefore:
+
+- **reads** the top-level `model_provider` from `config/read` (the same layer
+  merge as `model`, `openai` when the config names none) and offers **only** that
+  provider's pairs on a Pending Session's provider page; every other configured
+  provider is a disabled row naming the config edit, and the page states the rule
+  once. A failed config read falls back to the surface's resolved current
+  provider; when that is unknown too the page keeps listing every provider with
+  the existing 「读不到 config」 note, because it cannot enforce a rule it cannot
+  see;
+- **refuses** a mismatched creation by name in `create_session`, before
+  `thread/start`, naming both providers and the remedy (change
+  `~/.codex/config.toml`'s `model_provider` and restart the daemon, or pick a
+  model on the current provider). A failed config read never blocks creation:
+  Codex's own error is then the fallback. This covers the text form
+  (`/model <provider>/<model>`) and a stale card alike, and leaves no orphan
+  thread.
+
+cola never writes `~/.codex/config.toml`: changing a provider stays the user's
+config edit plus a daemon restart, and there is still no live provider-switch
+path. Decision 5's creation-only rule is unchanged; this only narrows *which*
+creation a daemon will accept.

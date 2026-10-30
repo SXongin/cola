@@ -876,7 +876,7 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
   same creation intent: it rides the first new turn once the thread exists. Both
   are stored with the session rather than in the adapter's one-shot window, so a
   restart keeps them until the first message creates the thread.
-- **「模型（每轮可换）」** lists the model-only sources: `model/list`'s built-in
+- **「模型」** lists the model-only sources: `model/list`'s built-in
   catalog (grouped as 「内置目录（全局，未校验）」 — those ids name no provider and
   may run through any of them), the config's top-level `model` (配置默认), and
   **the current provider's** `/models` ids. A pick is recorded, not sent on every
@@ -893,15 +893,33 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
 `GET <base_url>/models` is not part of the Responses API — `wire_api =
 "responses"` does not promise it. cola asks each `[model_providers.<id>]` with
 that provider's own `experimental_bearer_token`, with 2 s per probe, and caches
-the answer: a definitive one (403, 404, 401, `env_key`, or the decoded models)
-for three minutes, a **transient** one (a timeout, a network error) for about
-20 seconds so the next open retries. The provider page shows the reason as a
-short tag on the provider row (`403`, `超时`, …) — never a paragraph, and never
-on the model page. The catalog and the config default are always
+the answer: a definitive one (an auth refusal, no `/models` endpoint, `env_key`,
+or the decoded models) for three minutes, a **transient** one (a timeout, a
+network error) for about 20 seconds so the next open retries. The provider page
+shows the reason as a short tag on the provider row (`无权列出模型`, `探测超时`,
+…) — never a paragraph, and never on the model page. A provider whose probe
+answered 404 gets one extra short hint on its row, because it is exactly the one
+you have to hand-type: `/model <provider>/<id>`. The catalog and the config
+default are always
 there, and a card callback answers from the cache, so a first cold click may
 show the providers without their probed models until the next open fills them. The token is sent only in the
 request's `Authorization` header: it never appears on a card, in a log line or in
 an error message.
+
+**Codex runs one provider per process.** The daemon's own top-level
+`model_provider` in `~/.codex/config.toml` (`openai` when it names none) must
+equal the thread's provider: `thread/start` on any other one succeeds, but the
+first message is refused with `ModelProviderMismatch` ("This chat uses X, but
+your current provider is Y"). A Pending Session's provider page therefore offers
+**only** that provider's pairs; every other configured provider is a disabled row
+saying so, and the page states the rule once. Changing a provider is a config
+edit — `model_provider` in `~/.codex/config.toml` — plus a daemon restart, never
+a pick, and cola never writes that file. A creation on the wrong provider is
+refused by name before anything is created (a stale card or a typed
+`/model <provider>/<model>` included), naming both providers and the fix. When
+the config cannot be read the page falls back to the thread's current provider,
+and when even that is unknown it lists every provider as before — it cannot
+enforce a rule it cannot see.
 
 **A provider is creation-only.** The provider page (the `切换 provider…` row)
 holds the configured pairs, labelled `provider/model`. A provider is chosen only
