@@ -387,6 +387,8 @@ struct State {
     /// One-shot: the `startedAt` the next new turn reports (a test can make an
     /// unobserved live turn look older than the next request).
     next_turn_started_at: std::sync::Mutex<Option<i64>>,
+    /// One-shot: omit `startedAt` from the next fold reply.
+    omit_fold_started_at: std::sync::atomic::AtomicBool,
     /// One-shot: hold the next new `turn/start` reply behind this gate, so a
     /// test can record a newer pending while the first request is in flight.
     turn_start_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -501,6 +503,7 @@ impl Default for State {
             live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
             live_turn_started_at: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_turn_started_at: std::sync::Mutex::new(None),
+            omit_fold_started_at: std::sync::atomic::AtomicBool::new(false),
             turn_start_gate: std::sync::Mutex::new(None),
             turn_start_gate_entered: AtomicUsize::new(0),
             next_turn: AtomicUsize::new(1),
@@ -955,6 +958,12 @@ impl FakeServer {
             .next_turn_started_at
             .lock()
             .expect("next turn startedAt") = Some(started_at);
+    }
+
+    /// One-shot: omit `startedAt` from the next **fold** reply, modelling a
+    /// server that does not prove whether the turn started before our request.
+    pub(crate) fn omit_next_fold_started_at(&self) {
+        self.state.omit_fold_started_at.store(true, Ordering::SeqCst);
     }
 
     /// How many connection streams are currently subscribed to `thread_id`.
@@ -1554,7 +1563,10 @@ where
                     .get(thread_id)
                     .copied();
                 let mut turn = json!({ "id": live, "status": "inProgress" });
-                if let Some(started) = live_started {
+                let omit_started = state.omit_fold_started_at.swap(false, Ordering::SeqCst);
+                if let Some(started) = live_started
+                    && !omit_started
+                {
                     turn["startedAt"] = json!(started);
                 }
                 if !drop_response && !reply(sink, id, json!({ "turn": turn })).await {
