@@ -225,6 +225,10 @@ pub(crate) struct CodexLifecycle {
     /// The turns cola started (ADR-0090): shared by every connection this
     /// lifecycle attaches, and durable when the daemon wires the file.
     authored: Arc<super::authorship::Authorship>,
+    /// The next-turn pending selections (spec #922): in-memory, shared by every
+    /// connection this lifecycle attaches, so a liveness-probe replacement
+    /// keeps a pick the user just made. A process restart drops it.
+    pending: Arc<super::backend::PendingSelections>,
     /// The current connection. A `tokio` mutex because the attach pass holds it
     /// across the handshake's await.
     attached: tokio::sync::Mutex<Option<Attachment>>,
@@ -251,6 +255,7 @@ impl CodexLifecycle {
             probes,
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
+            pending: Arc::new(super::backend::PendingSelections::default()),
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
@@ -360,6 +365,7 @@ impl CodexLifecycle {
             let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()))
                 .with_tasks(self.tasks.clone())
                 .with_authorship(self.authored.clone())
+                .with_pending(self.pending.clone())
                 .with_thread_settings(super::threads::ThreadSettings::from(&self.settings));
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
@@ -2037,6 +2043,111 @@ mod tests {
             "the old daemon was never killed"
         );
         assert!(!fixture.layout().self_spawned_pid().exists());
+    }
+
+    /// Spec #922 gate fix: a pending pick is in-memory, but an attachment
+    /// replacement is not a process restart. The lifecycle's shared store keeps
+    /// it, and the next new turn on the replacement daemon still sends it.
+    #[tokio::test]
+    async fn a_pending_survives_attachment_replacement() {
+        let fixture = Fixture::new();
+        let _first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        let never_busy = || false;
+        std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
+            .expect("control dir");
+        std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("attached"),
+            AttachOutcome::Attached
+        );
+        crate::backend::Backend::record_pending_model(
+            &lifecycle,
+            "thread-1",
+            "openai/gpt-next",
+            Some("high"),
+        )
+        .await
+        .expect("the pick is recorded");
+
+        let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
+        std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-5.1-codex".into());
+        thread.model_provider = Some("openai".into());
+        second.seed_thread(thread);
+        std::fs::remove_file(fixture.environment.socket()).expect("remove link");
+        std::os::unix::fs::symlink(&replacement_path, fixture.environment.socket())
+            .expect("re-point the link");
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("reattached"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(
+            crate::backend::Backend::pending_model(&lifecycle, "thread-1")
+                .await
+                .as_deref(),
+            Some("openai/gpt-next@high"),
+            "the replacement attachment reads the same shared pending store"
+        );
+
+        crate::backend::Backend::prompt(&lifecycle, "thread-1", "run it", &[], &[], None, None, None, None)
+            .await
+            .expect("the prompt");
+        let params = second.turn_params("thread-1");
+        assert_eq!(params[0]["model"], "gpt-next");
+        assert_eq!(params[0]["effort"], "high");
+        assert_eq!(
+            crate::backend::Backend::pending_model(&lifecycle, "thread-1").await,
+            None,
+            "the new turn consumes the shared pending"
+        );
+    }
+
+    /// A pending pick is process-lifetime state: a fresh lifecycle (a restart)
+    /// starts with an empty store even when it attaches to the same daemon.
+    #[tokio::test]
+    async fn a_pending_is_dropped_by_a_process_restart() {
+        let fixture = Fixture::new();
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
+            .expect("control dir");
+        std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
+        let never_busy = || false;
+
+        let first = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        assert_eq!(
+            first
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("attached"),
+            AttachOutcome::Attached
+        );
+        crate::backend::Backend::record_pending_model(&first, "thread-1", "openai/gpt-next", Some("high"))
+            .await
+            .expect("the pick is recorded");
+        drop(first);
+
+        let restarted = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        assert_eq!(
+            restarted
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("reattached after restart"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(
+            crate::backend::Backend::pending_model(&restarted, "thread-1").await,
+            None,
+            "a restart drops the in-memory pending"
+        );
     }
 
     /// A daemon replaced behind the same control path (a restart re-points the

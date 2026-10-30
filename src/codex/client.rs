@@ -65,6 +65,10 @@ pub(crate) struct CodexOptions {
     /// under (issue #898). `Default` sends nothing, so a bare client keeps the
     /// daemon's own defaults.
     pub(crate) thread_settings: ThreadSettings,
+    /// The next-turn pending selections shared with every other attachment the
+    /// lifecycle builds (spec #922). A bare client leaves it `None` and gets
+    /// its own store.
+    pub(crate) pending: Option<Arc<super::backend::PendingSelections>>,
 }
 
 impl CodexOptions {
@@ -75,6 +79,7 @@ impl CodexOptions {
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
             thread_settings: ThreadSettings::default(),
+            pending: None,
         }
     }
 
@@ -94,6 +99,13 @@ impl CodexOptions {
     /// this connection (issue #898).
     pub(crate) fn with_thread_settings(mut self, settings: ThreadSettings) -> Self {
         self.thread_settings = settings;
+        self
+    }
+
+    /// Carry the lifecycle's in-memory pending store into this connection
+    /// (spec #922), so a replacement attachment keeps a pick the user made.
+    pub(crate) fn with_pending(mut self, pending: Arc<super::backend::PendingSelections>) -> Self {
+        self.pending = Some(pending);
         self
     }
 }
@@ -335,7 +347,7 @@ impl CodexClient {
         // same broadcast: `thread/status/changed` is server-broadcast, so
         // Session Sync must read it even for a thread this connection never
         // resumes.
-        let projections = Arc::new(Projections::default());
+        let projections = Arc::new(Projections::default().with_pending(options.pending.clone()));
         projections.watch_thread_status(&connection);
 
         // Record server-initiated requests before any subscription can produce

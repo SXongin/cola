@@ -107,16 +107,16 @@ impl PendingSelection {
 /// ambiguous transport failure, and is never re-sent. A newer pending recorded
 /// while the request was in flight belongs to the next new turn and survives.
 struct PendingGuard {
-    projections: Arc<Projections>,
+    pending: Arc<PendingSelections>,
     thread_id: String,
     sent: PendingSelection,
     armed: bool,
 }
 
 impl PendingGuard {
-    fn arm(projections: Arc<Projections>, thread_id: &str, sent: &PendingSelection) -> Self {
+    fn arm(pending: Arc<PendingSelections>, thread_id: &str, sent: &PendingSelection) -> Self {
         Self {
-            projections,
+            pending,
             thread_id: thread_id.to_string(),
             sent: sent.clone(),
             armed: true,
@@ -133,7 +133,93 @@ impl PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.projections.consume_pending_if(&self.thread_id, &self.sent);
+            self.pending.consume_pending_if(&self.thread_id, &self.sent);
+        }
+    }
+}
+
+/// The in-memory next-turn selections shared by every connection the lifecycle
+/// attaches (spec #922). A liveness-probe replacement drops the old
+/// `CodexClient` and builds a new one, but must not drop a pick the user just
+/// made; a process restart still does, because this object is not persisted.
+#[derive(Default)]
+pub(crate) struct PendingSelections {
+    pending: Mutex<HashMap<String, PendingSelection>>,
+    /// A process-wide, never-reset counter, so two identical picks are still
+    /// distinguishable across an in-flight request.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl PendingSelections {
+    /// Stamp the next pending selection. The counter never restarts, so an
+    /// identical pick recorded while a request is in flight gets a distinct
+    /// generation.
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    fn record_pending_model(
+        &self,
+        thread_id: &str,
+        spec: &str,
+        variant: Option<&str>,
+        current_provider: Option<String>,
+    ) {
+        let Some(parsed) = crate::backend::parsing::parse_model(spec) else {
+            tracing::warn!(thread = %thread_id, model = %spec, "ignoring a pending model that does not parse");
+            return;
+        };
+        let provider_id = if parsed.provider_id == MODEL_PROVIDER {
+            current_provider
+                .filter(|provider| provider != MODEL_PROVIDER)
+                .unwrap_or(parsed.provider_id)
+        } else {
+            parsed.provider_id
+        };
+        let pending = PendingSelection {
+            generation: self.next_generation(),
+            model: Some(ModelIdentity {
+                provider_id,
+                model_id: parsed.id,
+                variant: None,
+            }),
+            effort: variant.map(str::to_string),
+        };
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .insert(thread_id.to_string(), pending);
+    }
+
+    fn record_pending_variant(&self, thread_id: &str, variant: Option<&str>) {
+        let mut pending = self.pending.lock().expect("codex pending selections");
+        let empty = {
+            let selection = pending.entry(thread_id.to_string()).or_default();
+            selection.effort = variant.map(str::to_string);
+            selection.is_empty()
+        };
+        if empty {
+            pending.remove(thread_id);
+        } else if let Some(selection) = pending.get_mut(thread_id) {
+            selection.generation = self.next_generation();
+        }
+    }
+
+    fn pending_selection(&self, thread_id: &str) -> Option<PendingSelection> {
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .get(thread_id)
+            .cloned()
+    }
+
+    fn consume_pending_if(&self, thread_id: &str, sent: &PendingSelection) -> bool {
+        let mut pending = self.pending.lock().expect("codex pending selections");
+        if pending.get(thread_id).map(|held| held.generation) == Some(sent.generation) {
+            pending.remove(thread_id);
+            true
+        } else {
+            false
         }
     }
 }
@@ -194,15 +280,12 @@ pub(crate) struct Projections {
     /// The adoption backlog drain limit. Zero means the production default;
     /// tests lower it to exercise the truncation-and-retry path.
     drain_limit: Mutex<usize>,
-    /// Each live thread's one-shot next-turn selection (spec #922). Kept beside
-    /// the projections because acceptance, the fold check and the bounded
-    /// read-back all live at this protocol boundary; the bridge only records a
-    /// pick and reads it back for display.
-    pending: Mutex<HashMap<String, PendingSelection>>,
-    /// The source of [`PendingSelection::generation`]: a process-wide,
-    /// never-reset counter, so two identical picks are still distinguishable
-    /// across an in-flight request.
-    pending_generation: std::sync::atomic::AtomicU64,
+    /// Each live thread's one-shot next-turn selection (spec #922), shared with
+    /// every attachment the lifecycle builds so a replacement does not silently
+    /// drop a pick. Acceptance, the fold check and the bounded read-back all live
+    /// at this protocol boundary; the bridge only records a pick and reads it
+    /// back for display.
+    pub(crate) pending: Arc<PendingSelections>,
 }
 
 impl Drop for Projections {
@@ -242,6 +325,15 @@ enum SubscriptionState {
 }
 
 impl Projections {
+    /// Share the lifecycle's pending store with this connection's projections.
+    /// A directly built client leaves the default and gets its own store.
+    pub(crate) fn with_pending(mut self, pending: Option<Arc<PendingSelections>>) -> Self {
+        if let Some(pending) = pending {
+            self.pending = pending;
+        }
+        self
+    }
+
     fn adoption_lock(&self, thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         shared_lock(&self.adopting, thread_id)
     }
@@ -644,72 +736,26 @@ impl Projections {
             .record_sent_model(model, sent);
     }
 
-    /// Stamp the next pending selection. The counter never restarts, so an
-    /// identical pick recorded while a request is in flight gets a distinct
-    /// generation.
-    fn next_pending_generation(&self) -> u64 {
-        self.pending_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1
-    }
-
     /// Record the next new turn's model for a live thread (spec #922). The
     /// provider is normalized like an accepted pick's: a neutral `codex` ref
     /// takes the thread's real provider when one is known, so the pending line
     /// and the bounded read-back compare the same pair.
     pub(crate) fn record_pending_model(&self, thread_id: &str, spec: &str, variant: Option<&str>) {
-        let Some(parsed) = crate::backend::parsing::parse_model(spec) else {
-            tracing::warn!(thread = %thread_id, model = %spec, "ignoring a pending model that does not parse");
-            return;
-        };
-        let provider_id = if parsed.provider_id == MODEL_PROVIDER {
-            self.model(thread_id)
-                .map(|held| held.provider_id)
-                .filter(|provider| provider != MODEL_PROVIDER)
-                .unwrap_or(parsed.provider_id)
-        } else {
-            parsed.provider_id
-        };
-        let pending = PendingSelection {
-            generation: self.next_pending_generation(),
-            model: Some(ModelIdentity {
-                provider_id,
-                model_id: parsed.id,
-                variant: None,
-            }),
-            effort: variant.map(str::to_string),
-        };
+        let current_provider = self.model(thread_id).map(|held| held.provider_id);
         self.pending
-            .lock()
-            .expect("codex pending selections")
-            .insert(thread_id.to_string(), pending);
+            .record_pending_model(thread_id, spec, variant, current_provider);
     }
 
     /// Record a pending `/think` level, preserving a pending model (spec #922).
     /// Every call is a fresh generation, so an identical level re-picked while
     /// a request is in flight survives that request's compare-and-set.
     pub(crate) fn record_pending_variant(&self, thread_id: &str, variant: Option<&str>) {
-        let mut pending = self.pending.lock().expect("codex pending selections");
-        let empty = {
-            let selection = pending.entry(thread_id.to_string()).or_default();
-            selection.effort = variant.map(str::to_string);
-            selection.is_empty()
-        };
-        if empty {
-            // No model and no effort: there is nothing left to apply.
-            pending.remove(thread_id);
-        } else if let Some(selection) = pending.get_mut(thread_id) {
-            selection.generation = self.next_pending_generation();
-        }
+        self.pending.record_pending_variant(thread_id, variant);
     }
 
     /// A live thread's one-shot next-turn selection, if one is recorded.
     pub(crate) fn pending_selection(&self, thread_id: &str) -> Option<PendingSelection> {
-        self.pending
-            .lock()
-            .expect("codex pending selections")
-            .get(thread_id)
-            .cloned()
+        self.pending.pending_selection(thread_id)
     }
 
     /// Consume the pending selection only when it is still the generation that
@@ -718,13 +764,7 @@ impl Projections {
     /// so it must survive this response (spec #922). Returns whether the sent
     /// selection was removed.
     pub(crate) fn consume_pending_if(&self, thread_id: &str, sent: &PendingSelection) -> bool {
-        let mut pending = self.pending.lock().expect("codex pending selections");
-        if pending.get(thread_id).map(|held| held.generation) == Some(sent.generation) {
-            pending.remove(thread_id);
-            true
-        } else {
-            false
-        }
+        self.pending.consume_pending_if(thread_id, sent)
     }
 
     /// The display reference of a live thread's pending selection, for the
@@ -2367,7 +2407,7 @@ impl Backend for CodexClient {
         let sent_at = unix_now_seconds();
         let mut pending_guard = pending
             .as_ref()
-            .map(|sent| PendingGuard::arm(Arc::clone(&self.projections), session_id, sent));
+            .map(|sent| PendingGuard::arm(Arc::clone(&self.projections.pending), session_id, sent));
         let result = match self.connection().request("turn/start", params).await {
             Ok(result) => result,
             Err(error) => {
