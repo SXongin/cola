@@ -845,9 +845,11 @@ impl Projections {
     /// thread fact to anchor).
     pub(crate) fn pending_model(&self, thread_id: &str) -> Option<String> {
         let selection = self.pending_selection(thread_id)?;
-        // A reset-only marker has nothing to display: it clears the current
-        // level on acceptance, and showing the thread's model as 待应用 would
-        // name a value the pending does not change.
+        // A reset-only marker has no model or effort to spell here: it clears
+        // the current level on acceptance, and showing the thread's model as
+        // 待应用 would name a value the pending does not change. The bridge
+        // renders its own clear label for this marker (via
+        // `has_pending_selection`).
         if selection.model.is_none() && selection.effort.is_none() {
             return None;
         }

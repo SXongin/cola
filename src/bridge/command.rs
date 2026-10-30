@@ -1,3 +1,7 @@
+/// The pending line for an explicit `/think --reset`: the adapter carries no
+/// model or effort to name, only the clear the next turn will apply.
+pub(crate) const PENDING_CLEAR_LABEL: &str = "清除思考等级";
+
 /// Parsed slash command from user message text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -1807,10 +1811,19 @@ pub(crate) async fn handle_command(
                         && handles.flow.backend.has_pending_selection(session_id).await
                     {
                         let pending = match handles.flow.backend.pending_model(session_id).await {
-                            Some(model) => model,
-                            None => "清除思考等级".to_string(),
+                            Some(model) => Some(model),
+                            // A reset-only marker has neither a model nor an
+                            // effort; an effort-only pending with no thread
+                            // fact has nothing to display, so only the former
+                            // becomes the clear label.
+                            None if handles.flow.backend.pending_variant(session_id).await.is_none() => {
+                                Some(PENDING_CLEAR_LABEL.to_string())
+                            }
+                            None => None,
                         };
-                        lines.push(format!("待应用：{pending}（下一条新消息生效）"));
+                        if let Some(pending) = pending {
+                            lines.push(format!("待应用：{pending}（下一条新消息生效）"));
+                        }
                     }
                 }
             }
