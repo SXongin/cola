@@ -532,9 +532,12 @@ the letter of AC1, so the Codex surface is now **two pages**, one scope each:
   the channel — the catalog, the config default and the **current provider's**
   probed models — plus a `切换 provider…` drill (it now reads `Provider：<id>…`:
   the row names the provider page, it does not promise a switch — 2026-10-30);
-- the **provider page** (one tap away, with the back button) carries every
-  configured provider's pairs, the current marker, a failed probe as a short
-  tag and pairless providers as disabled rows.
+- the **provider page** (one tap away, with the back button) **lists** every
+  configured provider with the current marker, a failed probe as a short tag and
+  pairless providers as disabled rows — but only the **process provider's** pairs
+  are selectable (2026-10-30 correction, spec #922): every other configured
+  provider is a disabled row naming the config edit, so a listed provider is not
+  a selectable one.
 
 *(Spec #922, 2026-10-30: the profiles row is removed (see decision 5), and on a
 live thread the provider page is a read-only current value with a `/new` /
@@ -666,7 +669,8 @@ mismatch with `ModelProviderMismatch`:
 So `thread/start { modelProvider }` succeeds and the **first `turn/start`** is
 rejected (openai/codex#21464). Measured live on 0.166: a Pending Session pick of
 `deepseek/deepseek-flash` created the thread and then failed its first message,
-because the user's `~/.codex/config.toml` sets `model_provider = "opencode-go"`.
+because the daemon's config (the user's `~/.codex/config.toml`, the default
+`$CODEX_HOME/config.toml`) sets `model_provider = "opencode-go"`.
 That is not a cola bug in the pending path — it is Codex's one-provider-per-process
 rule, and the pending path has to respect it.
 
@@ -681,14 +685,15 @@ cola therefore:
   the existing 「读不到 config」 note, because it cannot enforce a rule it cannot
   see;
 - **refuses** a mismatched creation by name in `create_session`, before
-  `thread/start`, naming both providers and the remedy (change
-  `~/.codex/config.toml`'s `model_provider` and restart the daemon, or pick a
-  model on the current provider). A failed config read never blocks creation:
-  Codex's own error is then the fallback. This covers the text form
+  `thread/start`, naming both providers and the remedy (change `model_provider`
+  in the daemon's `config.toml` — `$CODEX_HOME/config.toml`, default
+  `~/.codex/config.toml` — and restart the daemon, or pick a model on the current
+  provider). A failed config read never blocks creation: Codex's own error is
+  then the fallback. This covers the text form
   (`/model <provider>/<model>`) and a stale card alike, and leaves no orphan
   thread.
 
-cola never writes `~/.codex/config.toml`: changing a provider stays the user's
-config edit plus a daemon restart, and there is still no live provider-switch
-path. Decision 5's creation-only rule is unchanged; this only narrows *which*
+cola never writes that file: changing a provider stays the user's config edit
+plus a daemon restart, and there is still no live provider-switch path.
+Decision 5's creation-only rule is unchanged; this only narrows *which*
 creation a daemon will accept.

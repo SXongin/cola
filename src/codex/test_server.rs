@@ -1136,8 +1136,10 @@ impl FakeServer {
             .clone()
     }
 
-    /// Hold the next `config/read` answers for `delay` before writing them (a
-    /// stalled config read, for the drilled card-callback deadline).
+    /// Hold every `config/read` answer for `delay` before writing it (a stalled
+    /// config read, for the drilled card-callback deadline and the creation
+    /// pre-flight). The answer is written from a spawned task, so the delay
+    /// stalls only the caller that waits for it, never the serve loop.
     pub(crate) fn set_config_read_delay(&self, delay: std::time::Duration) {
         *self.state.config_read_delay.lock().expect("config read delay") = delay;
     }
@@ -1820,10 +1822,23 @@ where
                 .push(params.clone());
             let result = state.config_read.lock().expect("config read").clone();
             let delay = *state.config_read_delay.lock().expect("config read delay");
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+            if delay.is_zero() {
+                return replying(sink, id, result).await;
             }
-            replying(sink, id, result).await
+            // Answer from a spawned task so the serve loop keeps serving: a
+            // wedged config read must not also block the requests queued behind
+            // it — the client's own bound is what abandons it, and a late
+            // answer for an abandoned call is ignored by the transport.
+            let outgoing = outgoing.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = outgoing.send(Message::Text(
+                    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+                        .to_string()
+                        .into(),
+                ));
+            });
+            true
         }
         Some("model/list") => {
             state.model_list_calls.fetch_add(1, Ordering::SeqCst);

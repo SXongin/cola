@@ -661,6 +661,10 @@ async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
         "{text}"
     );
     assert!(text.contains("模型"), "flat scope title: {text}");
+    assert!(
+        !text.contains("每轮可换"),
+        "the Codex model scope is titled 模型: {text}"
+    );
     assert!(text.contains("/model codex/<id>"), "hand-write hint: {text}");
     assert!(
         !text.contains("选择 provider"),

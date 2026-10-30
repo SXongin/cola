@@ -2143,7 +2143,8 @@ impl Backend for CodexClient {
                                 "this Codex daemon's config sets model_provider = \"{configured}\", \
                                  so a thread cannot be created on provider `{requested}`: Codex \
                                  refuses every turn on a thread whose provider differs from the \
-                                 running config. Change ~/.codex/config.toml's model_provider to \
+                                 running config. Change model_provider in the daemon's config.toml \
+                                 ($CODEX_HOME/config.toml, default ~/.codex/config.toml) to \
                                  `{requested}` and restart the daemon, or pick a model on \
                                  `{configured}`."
                             ),
@@ -5433,6 +5434,11 @@ mod tests {
         );
         let model = &surface.scopes[0];
         assert_eq!(model.id, "model");
+        assert_eq!(
+            model.title, "模型",
+            "the Codex model scope is titled 模型, not a per-turn promise"
+        );
+        assert!(!model.title.contains("每轮可换"), "{}", model.title);
         assert_eq!(model.changeable, ChangeScope::ThisTurn);
         assert_eq!(model.options[0].id, "gpt-5.1-codex");
         assert_eq!(model.options[0].callback_value(), "codex/gpt-5.1-codex");
@@ -8264,7 +8270,13 @@ mod tests {
             text.starts_with("codex error:"),
             "the adapter's named error shape: {text}"
         );
-        for expected in ["opencode-go", "deepseek", "model_provider", "restart the daemon"] {
+        for expected in [
+            "opencode-go",
+            "deepseek",
+            "model_provider",
+            "$CODEX_HOME/config.toml",
+            "restart the daemon",
+        ] {
             assert!(text.contains(expected), "{expected:?} is in {text}");
         }
         assert!(
@@ -8276,12 +8288,16 @@ mod tests {
 
     /// A failed `config/read` must not block creation: the pre-flight is
     /// best-effort, and Codex's own refusal is the fallback. The read is
-    /// bounded, so a wedged config read costs the creation that bound only.
+    /// bounded, so a wedged config read costs the creation that bound only —
+    /// the fake holds its answer far past the bound, so an unbounded read would
+    /// take the whole delay and fail the wall-clock assert.
     #[tokio::test]
     async fn create_session_proceeds_when_the_config_read_fails() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        // Test-config timeout is 200 ms; the answer is held well past it.
-        server.set_config_read_delay(Duration::from_millis(400));
+        // Test-config timeout is 200 ms; the answer is held far past it, so a
+        // pre-flight that waited for the answer could not return under the
+        // bound asserted below.
+        server.set_config_read_delay(Duration::from_secs(5));
         let client = connect(&url).await;
 
         let started = Instant::now();
@@ -8293,9 +8309,16 @@ mod tests {
             location: None,
         };
         Backend::create_session(&client, &input).await.expect("create");
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the pre-flight read is bounded"
+            elapsed >= crate::codex::model_surface::CONFIG_READ_TIMEOUT,
+            "the config read was really attempted, not skipped: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the pre-flight read is bounded at {:?}, well under the fake's 5s answer: \
+             it took {elapsed:?}",
+            crate::codex::model_surface::CONFIG_READ_TIMEOUT
         );
         assert_eq!(server.config_read_calls(), 1, "the read was attempted");
         assert_eq!(server.start_params().len(), 1, "the thread is created anyway");
