@@ -1810,6 +1810,8 @@ pub struct MockBackend {
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
+    /// Effort an accepted turn applied, exposed through the backend seam.
+    pub applied_efforts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>>,
     /// When set, `record_pending_model` / `record_pending_variant` fail with
     /// this message, modelling a lifecycle with no attached client.
     pub pending_error: Arc<tokio::sync::Mutex<Option<String>>>,
@@ -2097,6 +2099,7 @@ impl MockBackend {
             thread_provider: false,
             known_thread_provider: None,
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            applied_efforts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             pending_error: Arc::new(tokio::sync::Mutex::new(None)),
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
@@ -3147,6 +3150,14 @@ impl crate::backend::Backend for MockBackend {
 
     async fn has_pending_selection(&self, session_id: &str) -> bool {
         self.pending_selections.lock().await.contains_key(session_id)
+    }
+
+    async fn take_applied_effort(&self, session_id: &str) -> Option<Option<String>> {
+        self.applied_efforts.lock().await.remove(session_id)
+    }
+
+    async fn applied_effort(&self, session_id: &str) -> Option<Option<String>> {
+        self.applied_efforts.lock().await.get(session_id).cloned()
     }
 
     async fn prompt(

@@ -279,16 +279,17 @@ impl SessionsHandle {
 
     /// Make the effort an accepted turn actually applied the current mirror
     /// fact. Compare-and-set against the pair read here, so a newer pick that
-    /// moved the mirror wins; a store error is logged at WARN, never surfaced as
-    /// a turn failure (the turn already ran). `None` clears the level.
+    /// moved the mirror wins. Returns whether the record may be removed: a
+    /// store/persist failure keeps it for the next turn's retry. A missing
+    /// mapping is terminal (nothing to write), so it also returns `true`.
     pub(crate) async fn apply_applied_effort(
         &self,
         thread_key: &ThreadKey,
         session_id: &str,
         effort: Option<String>,
-    ) {
+    ) -> bool {
         let Some(entry) = self.entry_for_session(session_id).await else {
-            return;
+            return true;
         };
         let outcome = {
             let mut store = self.store.lock().await;
@@ -302,15 +303,20 @@ impl SessionsHandle {
             )
         };
         match outcome {
-            Ok(outcome) => {
-                if let Err(error) = settle_mirror(outcome, None).await {
-                    tracing::warn!("accepted /think level for {session_id} could not be persisted: {error}");
+            Ok(outcome) => match settle_mirror(outcome, None).await {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        "accepted /think level for {session_id} could not be persisted; it will be retried: {error}"
+                    );
+                    false
                 }
-            }
+            },
             Err(error) => {
                 tracing::warn!(
-                    "accepted /think level for {session_id} could not be applied to the mirror: {error}"
+                    "accepted /think level for {session_id} could not be applied to the mirror; it will be retried: {error}"
                 );
+                false
             }
         }
     }
@@ -1608,10 +1614,10 @@ impl SessionsHandle {
             return Ok(PickOutcome::StateChanged);
         }
         // A live Codex thread applies a `/think` on its next **new** turn: the
-        // adapter's pending carries the effort and the intent map carries what
-        // the mirror should show once that turn is accepted (spec #922). The
-        // mirror itself keeps the last accepted level until then, so 当前 never
-        // shows an unaccepted 待应用 value.
+        // adapter's pending carries the effort, and an accepted turn records it
+        // as applied for the bridge to commit once (spec #922). The mirror
+        // itself keeps the last accepted level until then, so 当前 never shows
+        // an unaccepted 待应用 value.
         if backend.has_thread_provider() {
             backend
                 .record_pending_variant(&session_id, variant.as_deref())

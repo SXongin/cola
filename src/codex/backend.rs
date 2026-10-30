@@ -283,6 +283,15 @@ impl PendingSelections {
             .expect("codex applied efforts")
             .remove(thread_id)
     }
+
+    /// Peek at the applied effort without removing it.
+    pub(crate) fn applied_effort(&self, thread_id: &str) -> Option<Option<String>> {
+        self.applied
+            .lock()
+            .expect("codex applied efforts")
+            .get(thread_id)
+            .cloned()
+    }
 }
 
 /// One thread's projection and the state of its subscription.
@@ -2393,6 +2402,10 @@ impl Backend for CodexClient {
         self.projections.pending.take_applied_effort(session_id)
     }
 
+    async fn applied_effort(&self, session_id: &str) -> Option<Option<String>> {
+        self.projections.pending.applied_effort(session_id)
+    }
+
     async fn prompt(
         &self,
         session_id: &str,
@@ -3172,6 +3185,10 @@ impl Backend for CodexLifecycle {
 
     async fn take_applied_effort(&self, session_id: &str) -> Option<Option<String>> {
         self.pending.take_applied_effort(session_id)
+    }
+
+    async fn applied_effort(&self, session_id: &str) -> Option<Option<String>> {
+        self.pending.applied_effort(session_id)
     }
 
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
