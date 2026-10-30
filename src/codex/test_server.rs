@@ -381,6 +381,17 @@ struct State {
     /// The live turn per thread: a second `turn/start` while one is running is
     /// folded into it and returns the same id (the spike's finding).
     live_turns: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// The live turn's protocol `startedAt` (epoch seconds), so a fold reply
+    /// names when the turn that accepted the prompt actually started.
+    live_turn_started_at: std::sync::Mutex<std::collections::HashMap<String, i64>>,
+    /// One-shot: the `startedAt` the next new turn reports (a test can make an
+    /// unobserved live turn look older than the next request).
+    next_turn_started_at: std::sync::Mutex<Option<i64>>,
+    /// One-shot: hold the next new `turn/start` reply behind this gate, so a
+    /// test can record a newer pending while the first request is in flight.
+    turn_start_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// How many held `turn/start` replies have reached the gate.
+    turn_start_gate_entered: AtomicUsize,
     /// The next turn/item id the server assigns, as the real server does.
     next_turn: AtomicUsize,
     next_item: AtomicUsize,
@@ -488,6 +499,10 @@ impl Default for State {
             interrupt_params: std::sync::Mutex::new(Vec::new()),
             compact_params: std::sync::Mutex::new(Vec::new()),
             live_turns: std::sync::Mutex::new(std::collections::HashMap::new()),
+            live_turn_started_at: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_turn_started_at: std::sync::Mutex::new(None),
+            turn_start_gate: std::sync::Mutex::new(None),
+            turn_start_gate_entered: AtomicUsize::new(0),
             next_turn: AtomicUsize::new(1),
             next_item: AtomicUsize::new(1),
             next_thread: AtomicUsize::new(1),
@@ -913,6 +928,33 @@ impl FakeServer {
     /// id — the cancelled-cleanup path that must find it from the thread.
     pub(crate) fn silence_next_turn_start(&self) {
         self.state.silent_turn_start.store(true, Ordering::SeqCst);
+    }
+
+    /// One-shot: hold the next **new** `turn/start` reply behind a gate the
+    /// test releases, so it can record a newer selection while the request is
+    /// in flight (spec #922's compare-and-set).
+    pub(crate) fn hold_next_turn_start_response(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.state.turn_start_gate.lock().expect("turn start gate") = Some(Arc::clone(&gate));
+        self.state.turn_start_gate_entered.store(0, Ordering::SeqCst);
+        gate
+    }
+
+    /// How many held `turn/start` replies have reached the gate.
+    pub(crate) fn turn_start_gate_entered(&self) -> usize {
+        self.state.turn_start_gate_entered.load(Ordering::SeqCst)
+    }
+
+    /// One-shot: the `startedAt` (epoch seconds) the next new turn reports.
+    /// Lets a test create a live turn the client has not observed whose
+    /// `startedAt` predates the next request, so the response must classify it
+    /// as a fold.
+    pub(crate) fn start_next_turn_at(&self, started_at: i64) {
+        *self
+            .state
+            .next_turn_started_at
+            .lock()
+            .expect("next turn startedAt") = Some(started_at);
     }
 
     /// How many connection streams are currently subscribed to `thread_id`.
@@ -1503,14 +1545,17 @@ where
                 .get(thread_id)
                 .cloned();
             if let Some(live) = folded {
-                if !drop_response
-                    && !reply(
-                        sink,
-                        id,
-                        json!({ "turn": { "id": live, "status": "inProgress" } }),
-                    )
-                    .await
-                {
+                let live_started = state
+                    .live_turn_started_at
+                    .lock()
+                    .expect("live turn startedAt")
+                    .get(thread_id)
+                    .copied();
+                let mut turn = json!({ "id": live, "status": "inProgress" });
+                if let Some(started) = live_started {
+                    turn["startedAt"] = json!(started);
+                }
+                if !drop_response && !reply(sink, id, json!({ "turn": turn })).await {
                     return false;
                 }
                 if echo {
@@ -1519,11 +1564,22 @@ where
                 return !drop_response;
             }
             let turn_id = format!("turn-{}", state.next_turn.fetch_add(1, Ordering::SeqCst));
+            let started_at = state
+                .next_turn_started_at
+                .lock()
+                .expect("next turn startedAt")
+                .take()
+                .unwrap_or_else(now_secs);
             state
                 .live_turns
                 .lock()
                 .expect("live turns")
                 .insert(thread_id.to_string(), turn_id.clone());
+            state
+                .live_turn_started_at
+                .lock()
+                .expect("live turn startedAt")
+                .insert(thread_id.to_string(), started_at);
             // The initiating connection is a subscriber of its own turn (the
             // spike's A received the stream without an explicit resume), so
             // `turn/*`, `item/*` and `error` reach it.
@@ -1534,10 +1590,16 @@ where
                     streams.push((connection_id, outgoing.clone()));
                 }
             }
-            let started_at = now_secs();
             let result = json!({
                 "turn": { "id": turn_id, "status": "inProgress", "startedAt": started_at, "items": [] }
             });
+            // A test can hold this reply to record a newer pending while the
+            // request is in flight (spec #922's compare-and-set).
+            let gate = state.turn_start_gate.lock().expect("turn start gate").take();
+            if let Some(gate) = gate {
+                state.turn_start_gate_entered.fetch_add(1, Ordering::SeqCst);
+                let _permit = gate.acquire().await.expect("turn start gate");
+            }
             // A silent start persists and streams the turn but never answers:
             // the client can never cache the id (a cancelled cleanup must find
             // it from the thread itself).
@@ -1577,6 +1639,11 @@ where
                 emit(state, thread_id, method, params);
                 if method == "turn/completed" {
                     state.live_turns.lock().expect("live turns").remove(thread_id);
+                    state
+                        .live_turn_started_at
+                        .lock()
+                        .expect("live turn startedAt")
+                        .remove(thread_id);
                 }
             }
             !drop_response
@@ -1629,6 +1696,12 @@ where
             }
             let live = state.live_turns.lock().expect("live turns").remove(thread_id);
             if let Some(turn_id) = live {
+                let started_at = state
+                    .live_turn_started_at
+                    .lock()
+                    .expect("live turn startedAt")
+                    .remove(thread_id)
+                    .unwrap_or_else(now_secs);
                 emit(
                     state,
                     thread_id,
@@ -1638,7 +1711,7 @@ where
                         "turn": {
                             "id": turn_id,
                             "status": "interrupted",
-                            "startedAt": now_secs(),
+                            "startedAt": started_at,
                             "completedAt": now_secs() + 1,
                         },
                     }),
