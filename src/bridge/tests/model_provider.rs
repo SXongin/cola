@@ -1165,7 +1165,6 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
         crate::config::ConversationKind::P2p,
     )
     .await;
-    let handles = app.command_handles();
     assert_eq!(
         app.sessions
             .lock()
@@ -1175,16 +1174,6 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
             .as_deref(),
         Some("low"),
         "an unaccepted /think leaves the mirror at the last accepted level"
-    );
-    assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent("ses_test")
-            .await
-            .map(|intent| intent.value),
-        Some(Some("high".into())),
-        "the intent awaits the accepted turn"
     );
 
     prompt(&app, "msg_prompt", "hi");
@@ -1216,73 +1205,6 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
         Some("high"),
         "the adapter still holds the pending effort"
     );
-    assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent("ses_test")
-            .await
-            .map(|intent| intent.value),
-        Some(Some("high".into())),
-        "the intent is kept while the pending survives"
-    );
-}
-
-/// Spec #922 gate review: an explicit reset marker (no model, no effort) must
-/// not be mistaken for "no pending"; a turn that leaves it pending leaves the
-/// mirror and intent alone.
-#[tokio::test]
-async fn a_reset_only_pending_is_not_mistaken_for_no_pending() {
-    let _wd = test_work_dir();
-    let dir = tempfile::tempdir().unwrap();
-    let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
-    let prompt_models = backend.prompt_models.clone();
-    let pending = backend.pending_selections.clone();
-    pending.lock().await.insert("ses_test".into(), (None, None));
-    let (app, _platform) = build_app(cfg, backend).await;
-    let mut entry = entry();
-    entry.model = Some("openai/gpt-accepted".into());
-    entry.variant = Some("high".into());
-    seed_entry(&app, entry).await;
-    let handles = app.command_handles();
-    handles
-        .flow
-        .sessions
-        .set_pending_effort_intent("ses_test", None)
-        .await;
-
-    prompt(&app, "msg_prompt", "hi");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while prompt_models.lock().await.is_empty() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the prompt never reached the backend"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    assert_eq!(
-        app.sessions
-            .lock()
-            .await
-            .get_active(&key())
-            .and_then(|entry| entry.variant.clone())
-            .as_deref(),
-        Some("high"),
-        "the unaccepted reset did not clear the mirror"
-    );
-    assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent("ses_test")
-            .await
-            .map(|intent| intent.value),
-        Some(None),
-        "the reset intent is kept while its marker remains pending"
-    );
-    assert!(pending.lock().await.contains_key("ses_test"));
 }
 
 /// Issue #910, item 3: two competing durable picks. The first is slow (parked
@@ -2290,11 +2212,6 @@ async fn status_shows_the_live_current_and_pending_pair() {
         "ses_test".into(),
         (Some("openai/gpt-new".into()), Some("high".into())),
     );
-    backend
-        .pending_generations
-        .lock()
-        .await
-        .insert("ses_test".into(), 1);
     let (app, platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-current".into());

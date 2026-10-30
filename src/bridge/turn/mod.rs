@@ -298,41 +298,6 @@ pub(crate) struct PromptContext {
     pub(crate) advisory_live: bool,
 }
 
-/// Cancellation cleanup for a turn's captured effort intent (spec #922). Armed
-/// before `prompt`, disarmed after `commit_pending_effort`; a dropped future
-/// removes only the captured generation, never a newer pick, and never touches
-/// the mirror.
-struct EffortIntentGuard {
-    sessions: SessionsHandle,
-    session_id: String,
-    generation: u64,
-    armed: bool,
-}
-
-impl EffortIntentGuard {
-    fn arm(sessions: SessionsHandle, session_id: &str, generation: u64) -> Self {
-        Self {
-            sessions,
-            session_id: session_id.to_string(),
-            generation,
-            armed: true,
-        }
-    }
-
-    fn defuse(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for EffortIntentGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.sessions
-                .remove_pending_effort_intent_if(&self.session_id, self.generation);
-        }
-    }
-}
-
 /// One user→assistant exchange (GLOSSARY.md: Turn). Owns the per-turn state and
 /// carries it through the phases in [`Turn::run`]:
 ///
@@ -798,6 +763,11 @@ impl Turn {
         // before the submit: on V2 the server is the authority, so a switch
         // that lands while the turn is being submitted applies from the **next**
         // turn, and this snapshot governs this turn's variant.
+        // An accepted turn recorded its effort in the adapter. Commit any
+        // outstanding record before reading this turn's current variant, so a
+        // turn whose bridge was cancelled (or interrupted during the read-back)
+        // catches up here, and this turn sees the accepted level.
+        Self::commit_applied_effort(handles, &self.thread_key, &self.session_id).await;
         let switch = handles.session_gates.gate(&self.session_id);
         let _switching = match tokio::time::timeout(
             crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
@@ -855,21 +825,6 @@ impl Turn {
         } else {
             variant.clone()
         };
-        // Capture both sides of the pending before the send: the adapter
-        // generation the turn will consume, and the bridge intent it carries.
-        // The guard removes only that intent generation if this future is
-        // cancelled before the commit; a newer pick survives.
-        let (sent_pending_generation, intent_at_send) = if next_turn_pending {
-            (
-                handles.backend.pending_generation(&self.session_id).await,
-                handles.sessions.pending_effort_intent(&self.session_id).await,
-            )
-        } else {
-            (None, None)
-        };
-        let mut intent_guard = intent_at_send.as_ref().map(|intent| {
-            EffortIntentGuard::arm(handles.sessions.clone(), &self.session_id, intent.generation)
-        });
         let agent = handles.sessions.agent_override(&self.session_id).await;
         // Released immediately before the submit (issue #910): `Backend::prompt`
         // has no total response bound, and holding the point across it would let
@@ -899,23 +854,12 @@ impl Turn {
                 Some(&self.cola_message_id),
             )
             .await;
-        // A thread-provider client's pending effort is applied to the mirror
-        // only once the adapter no longer holds the sent selection (spec #922):
-        // acceptance consumed it, or an ambiguous failure dropped it. A fold,
-        // steer, definite refusal or newer in-flight pick leaves it pending, so
-        // the intent and the last accepted mirror stay untouched.
-        Self::commit_pending_effort(
-            handles,
-            &self.session_id,
-            &self.thread_key,
-            prompt_resp.is_ok(),
-            sent_pending_generation,
-            intent_at_send.as_ref(),
-        )
-        .await;
-        if let Some(guard) = intent_guard.take() {
-            guard.defuse();
-        }
+        // The adapter records what an accepted new turn actually applied; take
+        // and commit it now. This is the single source of truth for the mirror,
+        // so a pick that landed between the pre-flight and the adapter's
+        // snapshot commits what was really sent. On an error nothing is applied
+        // (a fold/refusal leaves the pending), so this is a no-op.
+        Self::commit_applied_effort(handles, &self.thread_key, &self.session_id).await;
         // The poll runs only while the submit is in flight; the post-prompt
         // drain observes the submitted run from here on (ADR-0056, ADR-0043).
         // A rejected submit is recorded so the drain does not wait out its
@@ -924,47 +868,26 @@ impl Turn {
         prompt_resp
     }
 
-    /// Commit a prompt's captured effort intent to the mirror, or discard it on
-    /// an ambiguous drop. Runs under the same per-session gate as `/model` and
-    /// `/think`: they hold it across both the adapter record and the intent
-    /// write, so a newer pick either finishes before this check (and leaves a
-    /// pending we see) or waits until the old intent is committed/cleared.
-    ///
-    /// `sent_pending` is the adapter generation captured at send. When it is
-    /// gone or differs now, the sent selection was consumed (or replaced) and
-    /// the **captured** value becomes current — even if a newer pending already
-    /// exists. The intent is removed only when its generation still matches, so
-    /// a newer pick survives.
-    pub(crate) async fn commit_pending_effort(
+    /// Commit what the adapter actually applied to the session mirror, under the
+    /// same per-session gate as `/model` and `/think`. `None` from the adapter
+    /// means nothing is waiting; `Some(None)` is an explicit clear.
+    pub(crate) async fn commit_applied_effort(
         handles: &TurnHandles,
-        session_id: &str,
         thread_key: &crate::config::ThreadKey,
-        prompt_ok: bool,
-        sent_pending: Option<u64>,
-        intent: Option<&crate::bridge::handles::PendingEffortIntent>,
+        session_id: &str,
     ) {
         if !handles.backend.has_thread_provider() {
             return;
         }
         let gate = handles.sessions.session_gates.gate(session_id);
         let _held = gate.enter().await;
-        let sent_consumed =
-            sent_pending.is_some() && handles.backend.pending_generation(session_id).await != sent_pending;
-        if !sent_consumed {
-            return;
-        }
-        let Some(intent) = intent else {
+        let Some(effort) = handles.backend.take_applied_effort(session_id).await else {
             return;
         };
-        if prompt_ok {
-            handles
-                .sessions
-                .apply_pending_effort_intent(thread_key, session_id, intent.value.clone())
-                .await;
-        }
         handles
             .sessions
-            .remove_pending_effort_intent_if(session_id, intent.generation);
+            .apply_applied_effort(thread_key, session_id, effort)
+            .await;
     }
 
     /// Replace the dead mapping with a fresh session on the current server —
