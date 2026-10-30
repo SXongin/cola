@@ -1810,6 +1810,9 @@ pub struct MockBackend {
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
+    /// When set, `record_pending_model` / `record_pending_variant` fail with
+    /// this message, modelling a lifecycle with no attached client.
+    pub pending_error: Arc<tokio::sync::Mutex<Option<String>>>,
     /// Every `create_session` call's thread-level provider and model id (issue
     /// #910): a Pending Session's creation picks.
     #[allow(clippy::type_complexity)]
@@ -2094,6 +2097,7 @@ impl MockBackend {
             thread_provider: false,
             known_thread_provider: None,
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_error: Arc::new(tokio::sync::Mutex::new(None)),
             created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3089,14 +3093,30 @@ impl crate::backend::Backend for MockBackend {
         self.known_thread_provider.clone()
     }
 
-    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) {
+    async fn record_pending_model(
+        &self,
+        session_id: &str,
+        model: &str,
+        variant: Option<&str>,
+    ) -> crate::error::Result<()> {
+        if let Some(message) = self.pending_error.lock().await.clone() {
+            return Err(crate::error::BridgeError::OpenCode(message));
+        }
         self.pending_selections.lock().await.insert(
             session_id.to_string(),
             (Some(model.to_string()), variant.map(str::to_string)),
         );
+        Ok(())
     }
 
-    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) {
+    async fn record_pending_variant(
+        &self,
+        session_id: &str,
+        variant: Option<&str>,
+    ) -> crate::error::Result<()> {
+        if let Some(message) = self.pending_error.lock().await.clone() {
+            return Err(crate::error::BridgeError::OpenCode(message));
+        }
         let mut pending = self.pending_selections.lock().await;
         let selection = pending
             .entry(session_id.to_string())
@@ -3105,6 +3125,7 @@ impl crate::backend::Backend for MockBackend {
         if selection.0.is_none() && selection.1.is_none() {
             pending.remove(session_id);
         }
+        Ok(())
     }
 
     async fn pending_model(&self, session_id: &str) -> Option<String> {

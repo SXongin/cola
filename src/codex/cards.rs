@@ -1276,6 +1276,103 @@ async fn a_model_pick_reaches_the_next_turn() {
     );
 }
 
+/// Spec #922 whole-branch review: an effort-only pending (a `/think` with no
+/// `/model`) must still show on the card as 待应用, and disappear once the next
+/// new turn consumes it.
+#[tokio::test]
+async fn an_effort_only_pending_is_shown_and_then_consumed() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1-codex".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![json!({
+        "id": "gpt-5.1-codex",
+        "displayName": "GPT-5.1 Codex",
+        "hidden": false,
+        "supportedReasoningEfforts": [
+            { "reasoningEffort": "low", "description": "fast" },
+            { "reasoningEffort": "high", "description": "careful" }
+        ],
+        "defaultReasoningEffort": "high"
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+
+    send_command_in(
+        &app,
+        "/think high",
+        key.clone(),
+        "om_think_only",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_model_pending",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let pending_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the pending /model card");
+    let pending_text = card_text(&pending_card);
+    assert!(
+        pending_text.contains("待应用") && pending_text.contains("openai/gpt-5.1-codex@high"),
+        "an effort-only pending is shown with the thread's model: {pending_text}"
+    );
+
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("use the new effort", "om_after_think"))
+                .await
+        }
+    });
+    let params = wait_for_turn_start(&server).await;
+    assert_eq!(params["effort"], "high");
+    assert_eq!(params.get("model"), None, "an effort-only pending sends no model");
+
+    send_command_in(
+        &app,
+        "/model",
+        key,
+        "om_model_after_think",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let after_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the post-turn /model card");
+    assert!(
+        !card_text(&after_card).contains("待应用"),
+        "the consumed effort-only pending is gone: {}",
+        card_text(&after_card)
+    );
+
+    // End the turn so the spawned handler stops cleanly.
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(handler, "the effort-only turn", SETTLE_DEADLINE).await;
+}
+
 /// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves
 /// against `skills/list` and the pick reaches `turn/start` as the protocol's
 /// `skill` input.
@@ -2768,7 +2865,7 @@ async fn a_silent_catalog_does_not_wedge_a_model_pick() {
     );
     assert_eq!(
         client.pending_model(THREAD).await.as_deref(),
-        Some("codex/new-model"),
+        Some("codex/new-model@high"),
         "the pick is recorded as the next turn's pending"
     );
 }

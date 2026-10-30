@@ -1620,6 +1620,48 @@ mod tests {
         );
     }
 
+    /// Spec #922 whole-branch review: the pending seam is fallible. An
+    /// unattached lifecycle returns a named error instead of silently dropping
+    /// the pick; once a daemon is attached the same write reaches the client.
+    #[tokio::test]
+    async fn pending_seams_refuse_unattached_and_record_once_attached() {
+        let fixture = Fixture::new();
+        let unattached = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        let error = crate::backend::Backend::record_pending_model(
+            &unattached,
+            "thread-1",
+            "openai/gpt-5.1",
+            Some("high"),
+        )
+        .await
+        .expect_err("an unattached lifecycle cannot record a pending");
+        assert!(error.to_string().contains("not attached"), "{error}");
+        let error = crate::backend::Backend::record_pending_variant(&unattached, "thread-1", Some("low"))
+            .await
+            .expect_err("an unattached lifecycle cannot record a pending effort");
+        assert!(error.to_string().contains("not attached"), "{error}");
+
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let attached = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let never_busy = || false;
+        assert_eq!(
+            attached
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("auto starts and attaches"),
+            AttachOutcome::Attached
+        );
+        crate::backend::Backend::record_pending_model(&attached, "thread-1", "openai/gpt-5.1", Some("high"))
+            .await
+            .expect("the attached client records the pending");
+        assert_eq!(
+            crate::backend::Backend::pending_model(&attached, "thread-1")
+                .await
+                .as_deref(),
+            Some("openai/gpt-5.1@high")
+        );
+    }
+
     /// The acceptance path: `auto`, no daemon, one daemon started through the
     /// CLI, attached — and then left alone. No pid record, no signal, and the
     /// process outlives the client.

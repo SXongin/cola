@@ -727,15 +727,26 @@ impl Projections {
         }
     }
 
-    /// The model reference of a live thread's pending selection, for the
-    /// model card's 待应用 line.
+    /// The display reference of a live thread's pending selection, for the
+    /// model card's 待应用 line. A model-only pending is its `provider/model`;
+    /// an effort-only pending composes the thread's current pair with the same
+    /// `@variant` spelling the current line uses; a model **and** an effort show
+    /// both. `None` when nothing is pending (or an effort-only pending has no
+    /// thread fact to anchor).
     pub(crate) fn pending_model(&self, thread_id: &str) -> Option<String> {
         let selection = self.pending_selection(thread_id)?;
-        let model = selection.model?;
-        Some(crate::backend::parsing::join_model(
-            &model.provider_id,
-            &model.model_id,
-        ))
+        let mut reference = match selection.model {
+            Some(model) => crate::backend::parsing::join_model(&model.provider_id, &model.model_id),
+            None => {
+                let model = self.model(thread_id)?;
+                crate::backend::parsing::join_model(&model.provider_id, &model.model_id)
+            }
+        };
+        if let Some(effort) = selection.effort.as_deref() {
+            reference.push('@');
+            reference.push_str(effort);
+        }
+        Some(reference)
     }
 
     /// The effort of a live thread's pending selection, for the footer of the
@@ -2190,7 +2201,8 @@ impl Backend for CodexClient {
 
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
     /// bucket is not a channel, so it reads as unknown. A cold projection is
-    /// unknown — deciding "is the gate relevant" must not cost a request.
+    /// unknown — deciding whether a provider comparison is relevant must not
+    /// cost a request, and a live thread's provider is creation-only.
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
         self.projections
             .model(session_id)
@@ -2202,12 +2214,14 @@ impl Backend for CodexClient {
     /// model switch on its public surface, so `/model` is a one-shot pending
     /// held here; it rides the next genuinely new `turn/start` and is consumed
     /// when that turn is accepted.
-    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) {
+    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) -> Result<()> {
         self.projections.record_pending_model(session_id, model, variant);
+        Ok(())
     }
 
-    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) {
+    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) -> Result<()> {
         self.projections.record_pending_variant(session_id, variant);
+        Ok(())
     }
 
     async fn pending_model(&self, session_id: &str) -> Option<String> {
@@ -2946,17 +2960,15 @@ impl Backend for CodexLifecycle {
     }
 
     /// The pending next-turn selection lives on the attached client (it must
-    /// travel with the connection's projections), so the wrapper delegates.
-    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) {
-        if let Some(client) = self.attached_client().await {
-            Backend::record_pending_model(&client, session_id, model, variant).await;
-        }
+    /// travel with the connection's projections), so the wrapper delegates. A
+    /// missing attachment is a named error: `/model` and `/think` must not
+    /// report a recorded pick the adapter never received.
+    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) -> Result<()> {
+        Backend::record_pending_model(&self.current().await?, session_id, model, variant).await
     }
 
-    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) {
-        if let Some(client) = self.attached_client().await {
-            Backend::record_pending_variant(&client, session_id, variant).await;
-        }
+    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) -> Result<()> {
+        Backend::record_pending_variant(&self.current().await?, session_id, variant).await
     }
 
     async fn pending_model(&self, session_id: &str) -> Option<String> {
@@ -7167,10 +7179,11 @@ mod tests {
 
         client
             .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-6-luna")
+            Some("openai/gpt-6-luna@high")
         );
 
         let ((), logs) = crate::bridge::test_support::capture_logs(async {
@@ -7234,7 +7247,8 @@ mod tests {
         wait_for_live_turn(&client, "thread-1").await;
         client
             .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
-            .await;
+            .await
+            .expect("the pending is recorded");
 
         client
             .steer(
@@ -7251,7 +7265,7 @@ mod tests {
             .expect("the steer");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-6-luna"),
+            Some("openai/gpt-6-luna@high"),
             "a steer carries no model and consumes nothing"
         );
 
@@ -7263,14 +7277,14 @@ mod tests {
             .expect("the folded turn");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-6-luna"),
+            Some("openai/gpt-6-luna@high"),
             "a folded turn does not consume the pending"
         );
 
         client.compact("thread-1").await.expect("the compaction");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-6-luna"),
+            Some("openai/gpt-6-luna@high"),
             "a command does not consume the pending"
         );
     }
@@ -7293,7 +7307,8 @@ mod tests {
         server.wait_for_subscribers("thread-1", 1).await;
         client
             .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
-            .await;
+            .await
+            .expect("the pending is recorded");
 
         server.reject_next_turn_start("model is not available here");
         client
@@ -7302,7 +7317,7 @@ mod tests {
             .expect_err("the refusal is an error");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-6-luna"),
+            Some("openai/gpt-6-luna@high"),
             "a definite refusal did not apply the pick, so it may be retried"
         );
 
@@ -7333,7 +7348,10 @@ mod tests {
         client.transcript("thread-1").await.expect("adopt the thread");
         server.wait_for_subscribers("thread-1", 1).await;
 
-        client.record_pending_variant("thread-1", Some("low")).await;
+        client
+            .record_pending_variant("thread-1", Some("low"))
+            .await
+            .expect("the pending is recorded");
         assert_eq!(client.pending_variant("thread-1").await.as_deref(), Some("low"));
         client
             .prompt("thread-1", "run it", &[], &[], None, None, None, None)
@@ -7362,7 +7380,8 @@ mod tests {
 
         client
             .record_pending_model("thread-1", "openai/gpt-a", Some("low"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         let gate = server.hold_next_turn_start_response();
         let first_client = client.clone();
         let first = tokio::spawn(async move {
@@ -7399,7 +7418,8 @@ mod tests {
         // A newer pick lands while the first request is still waiting.
         client
             .record_pending_model("thread-1", "openai/gpt-b", Some("high"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         gate.add_permits(1);
         first
             .await
@@ -7411,7 +7431,7 @@ mod tests {
         assert_eq!(first_params[0]["model"], "gpt-a");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-b"),
+            Some("openai/gpt-b@high"),
             "the older response must not erase the newer pick"
         );
 
@@ -7455,7 +7475,8 @@ mod tests {
 
         client
             .record_pending_model("thread-1", "openai/gpt-a", Some("low"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         let gate = server.hold_next_turn_start_response();
         let first_client = client.clone();
         let first = tokio::spawn(async move {
@@ -7491,7 +7512,8 @@ mod tests {
         // flight: only the generation distinguishes it.
         client
             .record_pending_model("thread-1", "openai/gpt-a", Some("low"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         gate.add_permits(1);
         first
             .await
@@ -7500,7 +7522,7 @@ mod tests {
         server.script_turn("thread-1", Vec::new());
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-a"),
+            Some("openai/gpt-a@low"),
             "the older generation's acceptance must not erase the re-pick"
         );
         assert_eq!(client.pending_variant("thread-1").await.as_deref(), Some("low"));
@@ -7553,14 +7575,15 @@ mod tests {
         assert_eq!(client.projections.live_turn("thread-1"), None);
         client
             .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         client
             .prompt("thread-1", "from cola", &[], &[], None, None, None, None)
             .await
             .expect("the folded prompt");
         assert_eq!(
             client.pending_model("thread-1").await.as_deref(),
-            Some("openai/gpt-6-luna"),
+            Some("openai/gpt-6-luna@high"),
             "a fold into a turn that started before our send does not consume the pending"
         );
     }
@@ -7581,7 +7604,8 @@ mod tests {
 
         client
             .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
-            .await;
+            .await
+            .expect("the pending is recorded");
         server.silence_next_turn_start();
         let cancelled = tokio::time::timeout(
             Duration::from_millis(200),
