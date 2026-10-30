@@ -237,11 +237,13 @@ pub(crate) enum PickTarget {
     Pending(u64),
 }
 
-/// The one refusal a provider pick on a live thread gets (spec #922): a
-/// provider is a creation fact, so the remedy is a new session or a fork. Both
+/// The refusal a provider pick on a live thread gets (spec #922): a provider is
+/// a creation fact, so `/new` is the actionable remedy. `/fork` is named as the
+/// independent capability it will become, never as a command to type today —
+/// cola has no `/fork` command yet (typing it is submitted as a prompt). Both
 /// the card toast and the text `/model` reply use this message.
 const PROVIDER_CREATION_ONLY: &str =
-    "provider 只能在新会话中选择：请用 `/new` 或 `/fork` 新建一条线程，再选择这个 provider。";
+    "provider 只能在新会话中选择：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。";
 
 /// What a `/model` pick needs before it is recorded (issue #910): the card form
 /// and the text form (`/model <provider>/<model>`) obey one rule.

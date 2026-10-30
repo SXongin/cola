@@ -276,11 +276,13 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   settings: a thread created before the change keeps the policy it was created
   with, and a thread your TUI created and cola adopted keeps it too unless
   `apply_on_adopt = true`.
-- **A provider is creation-only.** `/new` (a Pending Session) and `/fork` are
-  the only paths that choose a provider; both send the `model` + `modelProvider`
-  pair to `thread/start` or `thread/fork` (`turn/start` has no such field). A
-  live thread's provider never changes: `/model` with a different provider is
-  refused without any request and points at `/new` or `/fork`. The provider page
+- **A provider is creation-only.** `/new` (a Pending Session) is the only path
+  that chooses a provider today: it sends the `model` + `modelProvider` pair to
+  `thread/start` (`turn/start` has no such field). `/fork` is an independent
+  capability planned for a later version; it will send the pair to
+  `thread/fork`, and it is not a command today. A live thread's provider never
+  changes: `/model` with a different provider is refused without any request and
+  points at `/new`, naming `/fork` only as that later option. The provider page
   on a live thread is read-only — the current provider plus that note, with no
   clickable rows — while a Pending Session still offers the pairs its creation
   will carry. A provider is never selectable without a model: the old model name
@@ -869,18 +871,20 @@ an error message.
 
 **A provider is creation-only.** The provider page (the `切换 provider…` row)
 holds the configured pairs, labelled `provider/model`. A provider is chosen only
-when a thread is created or forked: `/new` sends the pair to `thread/start`, and
-`/fork` sends it to `thread/fork` (a separate feature). `turn/start` has no
-provider field, and a provider is never selectable without a model — the old
-model name on a new provider is a 404. So:
+when a thread is created: `/new` sends the pair to `thread/start`. `/fork` is an
+independent capability planned for a later version (it will use `thread/fork`);
+cola has no `/fork` command today, so typing it is submitted as an ordinary
+prompt. `turn/start` has no provider field, and a provider is never selectable
+without a model — the old model name on a new provider is a 404. So:
 
 - **A new thread takes the pair directly.** Pick a provider row on a Pending
   Session (before its first message) and the pair rides `thread/start`.
 - **A live thread's provider cannot change.** The provider page on a live thread
   is read-only: it shows the current provider and says the provider can only be
-  changed in a new session or a fork. `/model` with a different provider is
-  refused without any request — no `turn/start`, no `thread/resume` — and both
-  the card and the text reply point at `/new` / `/fork`.
+  changed in a new session (with `/fork` as the later, independent option).
+  `/model` with a different provider is refused without any request — no
+  `turn/start`, no `thread/resume` — and points at `/new`, naming `/fork` only
+  as that later capability.
 - **A same-provider pick is just a model change.** A `codex/<id>` catalog/default
   ref, or one of the thread's own provider's `/models` rows, is recorded and
   rides the next message — no resume, no reload.

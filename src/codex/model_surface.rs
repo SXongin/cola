@@ -898,9 +898,14 @@ fn provider_page(
         let current = current_provider.filter(|provider| *provider != MODEL_PROVIDER);
         let note = match current {
             Some(provider) => {
-                format!("当前 provider：`{provider}`。provider 只能在新会话中更换：请用 `/new` 或 `/fork`。")
+                format!(
+                    "当前 provider：`{provider}`。provider 只能在新会话中更换：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。"
+                )
             }
-            None => "provider 只能在新会话中更换：请用 `/new` 或 `/fork`。".to_string(),
+            None => {
+                "provider 只能在新会话中更换：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。"
+                    .to_string()
+            }
         };
         return ModelScope {
             id: PROVIDER_SCOPE.into(),
@@ -1887,7 +1892,7 @@ mod tests {
 
     /// Spec #922: a Pending Session's provider page offers the **pairs** that
     /// ride `thread/start`; a live thread's page is read-only — the current
-    /// provider plus the `/new` / `/fork` note, with no rows to click.
+    /// provider plus the `/new` / later `/fork` note, with no rows to click.
     #[test]
     fn the_provider_page_is_selectable_only_on_a_pending_session() {
         let mut config = CodexModelConfig::default();
@@ -1911,7 +1916,7 @@ mod tests {
         assert!(scope.note.is_none(), "no long copy");
 
         // A live thread: the current provider is stated, the rows are gone, and
-        // the only remedy named is `/new` / `/fork`.
+        // `/new` is the actionable remedy while `/fork` reads as a later one.
         let live = provider_query();
         let read_only = build_surface(&[], &config, &probes, Some("deepseek"), &live);
         let scope = &read_only.scopes[0];
@@ -1923,6 +1928,10 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("/new") && note.contains("/fork"), "{note}");
+        assert!(
+            note.contains("后续版本") && note.contains("独立功能"),
+            "a `/fork` mention must read as a future capability: {note}"
+        );
     }
 
     /// #908 AC1: a pair row labels the provider's configured **display name**

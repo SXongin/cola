@@ -275,8 +275,9 @@ async fn a_stalled_writer_does_not_stall_a_model_pick_callback() {
 }
 
 /// Spec #922: a provider pick on a live thread is refused **without any
-/// request** and names the only remedies — `/new` and `/fork`. Nothing is
-/// recorded, and no prompt/turn or resume is sent.
+/// request** and names `/new` as the actionable remedy and `/fork` as a later,
+/// independent capability. Nothing is recorded, and no prompt/turn or resume is
+/// sent.
 #[tokio::test]
 async fn a_live_provider_pick_is_refused_and_points_at_new_and_fork() {
     let _wd = test_work_dir();
@@ -300,6 +301,10 @@ async fn a_live_provider_pick_is_refused_and_points_at_new_and_fork() {
     assert!(step.card.is_none(), "a refusal is a toast, not a card");
     let toast = step.toast.expect("the named refusal");
     assert!(toast.contains("/new") && toast.contains("/fork"), "{toast}");
+    assert!(
+        toast.contains("后续版本") && toast.contains("独立功能"),
+        "`/fork` must not read as a command available today: {toast}"
+    );
     assert_eq!(
         app.sessions
             .lock()
@@ -610,7 +615,7 @@ async fn a_newer_selection_during_a_parked_creation_wins() {
 
 /// Spec #922: the `/model <provider>/<model>` text form obeys the same rule —
 /// a different provider on a live thread is refused **without recording**, and
-/// the reply names `/new` / `/fork`.
+/// the reply names `/new` (actionable) and `/fork` (a later capability).
 #[tokio::test]
 async fn the_model_text_form_refuses_a_live_provider_change() {
     let _wd = test_work_dir();
@@ -637,6 +642,10 @@ async fn the_model_text_form_refuses_a_live_provider_change() {
     .await;
     let text = platform.texts().await.join("\n");
     assert!(text.contains("/new") && text.contains("/fork"), "{text}");
+    assert!(
+        text.contains("后续版本") && text.contains("独立功能"),
+        "`/fork` must not read as a command available today: {text}"
+    );
     assert_eq!(
         app.sessions
             .lock()

@@ -552,8 +552,9 @@ impl Threads {
     /// The configured sandbox/approval pair and reasoning summary ride along:
     /// cola creates this thread, so it owns the choice (issues #898, #900).
     /// `model` is the Pending Session's chosen model/provider pair (issue #910):
-    /// a thread's provider can only be chosen when it is created, or by
-    /// resuming it. Unset halves send nothing.
+    /// a thread's provider can only be chosen when it is created
+    /// (`thread/start`); `thread/fork` is the protocol's other creation path.
+    /// Unset halves send nothing.
     pub(crate) async fn start(&self, cwd: Option<&str>, model: ThreadModel<'_>) -> Result<Thread> {
         let mut params = json!({});
         if let Some(cwd) = cwd {
