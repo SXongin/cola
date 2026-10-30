@@ -382,13 +382,14 @@ levels unchanged, pixels included; a third **Agent Client** (ACP) only has to an
 description.
 
 **2. Codex's model axis is three facts, not a tree.** A provider is
-**thread-level** (`thread/start` and `thread/resume` take `modelProvider`;
-`turn/start` has no such field), a model is **per turn**
-(`turn/start.model`, *"for this turn and subsequent turns"*), and the catalog is
-**global**. The Codex surface therefore declares exactly two scopes —
-「模型（每轮可换）」 (`ThisTurn`) and 「Provider（线程级：新线程 / resume）」
-(`NewThread`, or `ResumeOnly` when `[clients.<id>] provider_switch_on_resume` is
-on) — plus the hand-write hint `/model codex/<id>` for an id no list carries.
+**thread-level** (`thread/start` for a new thread and `thread/fork` for a fork
+take `modelProvider`; `turn/start` has no such field; `thread/resume`'s override
+is a cold-load detail and is no longer used by cola — spec #922), a model is
+**per turn** (`turn/start.model`, *"for this turn and subsequent turns"*), and
+the catalog is **global**. The Codex surface therefore declares exactly two
+scopes — 「模型（下一轮可换）」 (`ThisTurn`) and 「Provider（仅新线程）」
+(`NewThread`, only on a Pending Session or through `/fork`; no `ResumeOnly`) —
+plus the hand-write hint `/model codex/<id>` for an id no list carries.
 
 **3. `GET <base_url>/models` is not part of the Responses API.** `wire_api =
 "responses"` promises the response shape, not the platform's model-listing
@@ -441,12 +442,12 @@ config's `model` for the current provider; a config-profile file, if the
 surface reads one; a provider's `/models` answer (best effort, not a
 declaration); and a hand-typed id.
 
-**6. A provider change is recorded, then applied by the next prompt's
-pre-flight.** *(Superseded by spec #922, 2026-10-30: a live thread's provider is
-no longer changed. Provider is creation-only — `thread/start` for `/new`,
-`thread/fork` for `/fork` — and this record/pre-flight switch is removed. The
-measured resume behavior below remains the evidence for why.)* Measured on the
-pinned daemon (#910's owner notes, two connections):
+**6. A provider change was a live operation in #910, and is now removed.**
+*(Historical; superseded by spec #922, 2026-10-30. Do not implement this path:
+provider is creation-only — `thread/start` for `/new`, `thread/fork` for
+`/fork` — and `/model` refuses a different provider on a live thread.)* #910
+measured that a `thread/resume` naming a provider only applies when the thread
+reloads, and that a peer-held thread cannot change at all:
 
 ```text
 A resume(deepseek)                  → deepseek      ← a fresh load applies
@@ -456,58 +457,34 @@ B also resumes (a peer holds it)
 A unsubscribe + resume(deepseek)    → opencode-go   ← still ignored: the server keeps it loaded
 ```
 
-Three conclusions make up the mechanism. A `thread/resume` that names a provider
-only takes effect when the thread **reloads**, so a change is
-`thread/unsubscribe` (every local subscription for that thread id, not one
-mapping's) → `thread/resume { modelProvider, model }` → `thread/read` — and
-success is **only** the read-back of both halves, never the RPC's `ok`. A peer
-holding the thread makes the provider genuinely unchangeable, so the failure is
-named by its two holder kinds — another client (a Codex TUI, VS Code, the
-desktop app), or another cola instance sharing the same `CODEX_HOME` — and
-`thread/fork` with the pair is the escape hatch. And a prompt must not run on a
-pair the thread does not hold, so the change cannot be applied from a card: the
-confirmation **records** the pair (a gated compare-and-set on the session
-mirror), answers synchronously, and the turn's pre-flight applies it before
-submitting — the same three steps, each bounded — and on any failure **does not
-send the prompt**. A click made mid-turn therefore means "next message", which
-is what the owner asked for. The pre-flight's own read is the authority: if it
-proves the thread already runs that provider, only the model changes and no
-reload is made. `turn/start` never carries a provider, and a same-provider pick
-(a `/model` model change, or a profile preset on the current provider) is
-recorded and rides the next turn with **no** unsubscribe, resume or reload.
+Those measurements are why a live provider switch is not offered. The
+implementation that followed them — a release → resume → read-back sequence,
+a `provider_switch_on_resume` gate, a confirmation and a mirror rollback — is
+deleted with this amendment. The new-thread path (`thread/start` with the pair)
+is the only survivor; it is described in decision 5 and the 2026-10-30
+amendment.
 
-The switch is off by default (`provider_switch_on_resume = false`), for
-`apply_on_adopt`'s reason: the thread is shared, and the change is what every
-attached client then sees. Off, a provider pick on a live thread says
-「provider 只能在新线程切换」, records nothing and sends nothing; a **new**
-thread still takes the pair at `thread/start` with no confirmation, because
-there is no other client to surprise.
-
-**7. The symmetric cost is a documented trade.** Because the release must land
-for the resume to reload, cola holding a subscription for a live thread makes
-*another* client's provider change a silent no-op in exactly the same way — the
-TUI's request succeeds and the thread does not move. That is peer attachment's
-price, not a defect to fix here: neither side can tell it apart from success on
-the wire, so the user guide states it where `/model` is used.
+**7. The old symmetric cost is gone with the switch.** While the switch existed,
+cola holding a subscription made another client's provider change a silent
+no-op. With provider creation-only there is no live provider operation to
+collide with; the model path is a turn input and holds no subscription.
 
 **8. Reads stay primary; the broadcast is a bonus.** `thread/settings/updated`
-is consumed — the projection folds its `model`/`modelProvider` into the ordered
-fact — but the pinned daemon does not send it for a resume-over-provider to a
-connection that has just re-subscribed, so no switch depends on it: the read-back
-remains the verdict, `effort` is left out of the fold (the surface never renders
-it), and a failed `config/read` degrades to the catalog plus a named note
-(「读不到 config，provider / profile 未知」) instead of an empty section.
+is still consumed — the projection folds its `model`/`modelProvider` into the
+ordered fact — but no model switch depends on it: the stable path is
+`turn/start.model` plus the read-back. `effort` is left out of the fold (the
+surface never renders it), and a failed `config/read` degrades to the catalog
+plus a named note (「读不到 config，provider / profile 未知」) instead of an
+empty section.
 
-Decision 7's `keeps_session_selection = false` and the trait's
-`switch_session_model` no-op stand unchanged: what this amendment adds is a
-**thread-level provider** operation, not a durable session-model switch. The
-per-turn model is still the honest shape, and the thread's provider is the only
-fact that ever needed a reload.
+`keeps_session_selection = false` and the trait's `switch_session_model` no-op
+stand unchanged: the model is turn-carried, not a durable server-side switch.
+The per-turn model is the chosen stable shape; the thread's provider is
+creation-only.
 
-Where #906's prose and the code disagree, the code is the record: #906 sketched
-the provider scope as "the config's provider keys" and the confirmation as the
-moment of change; a bare provider key is not selectable (the 404 above), and the
-confirmation only records — the pre-flight is where the thread is touched.
+Where #906's prose and the code disagree, the code is the record: the old
+provider-scope sketch and the confirmation are historical now, and a bare
+provider key is not selectable (the 404 above).
 
 ## Amendment (#910, #908): `codex` is a reserved namespace
 
@@ -589,20 +566,22 @@ the stable `turn/start.model` over an undocumented method.
 records a pending selection; it does not change the thread's current pair. The
 next **new** `turn/start` carries `model` + `effort`, whose overrides the
 protocol documents as becoming "the defaults for later turns on the same
-thread". The pending is cleared only when a bounded `thread/read` returns
-**the same `model` and `modelProvider` as the pending**; if it still returns the
-old pair, the pending stays and the next prompt reports the mismatch by name. An
-accepted RPC alone is not the verdict. Subsequent prompts do not carry
-the model again, so a peer's later change is respected. The pending is cola
-state, not server state: it may be persisted across a restart so a pick made
-before the next prompt is not lost, but it is never re-sent after it is
-consumed.
+thread". The pending is consumed by the **acceptance of the next new turn**:
+when `turn/start` returns a turn that was not already active, the override was
+applied and the pending is cleared. It is not re-sent after that. A bounded
+`thread/read` then updates the current fact; if it disagrees, that is a named
+mismatch (a peer may have changed the pair after us), and the pending is
+**not** resurrected — re-sending a stale pick would overwrite the peer's later
+change. Subsequent prompts do not carry the model again, so a peer's later
+change is respected. The pending is cola state, not server state: it may be
+persisted across a restart so a pick made before the next prompt is not lost,
+but it is never re-sent after it is consumed.
 
 **2. A steer, a folded turn, or a command does not consume the pending.** A
 Supplement uses `turn/steer`, which has no model field; a `turn/start` that is
 folded into an active turn does not promise the override applies; a command
 such as `/status` or `/compact` starts no model turn. The pending belongs to
-the next *new* turn, and only the read-back above clears it.
+the next *new* turn; only that turn's acceptance consumes it.
 
 **3. A Pending Session's pick is a creation fact, not a pending turn.** It
 rides `thread/start { model, modelProvider }` on the first message and has no
