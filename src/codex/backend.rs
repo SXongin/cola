@@ -82,6 +82,10 @@ const THREAD_STATUS_CHANGED: &str = "thread/status/changed";
 /// the acceptance of a new turn, never by a steer, a folded turn or a command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PendingSelection {
+    /// A process-wide, never-reset stamp: every recorded selection gets a new
+    /// value, so an identical re-pick made while a `turn/start` is in flight is
+    /// still a *different* pending and survives that request's compare-and-set.
+    generation: u64,
     /// The model, with the provider normalized the same way `record_sent_model`
     /// does (a neutral `codex` pick takes the thread's real provider for
     /// display) so the pending line and the read-back compare the same pair.
@@ -195,6 +199,10 @@ pub(crate) struct Projections {
     /// read-back all live at this protocol boundary; the bridge only records a
     /// pick and reads it back for display.
     pending: Mutex<HashMap<String, PendingSelection>>,
+    /// The source of [`PendingSelection::generation`]: a process-wide,
+    /// never-reset counter, so two identical picks are still distinguishable
+    /// across an in-flight request.
+    pending_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Drop for Projections {
@@ -636,6 +644,15 @@ impl Projections {
             .record_sent_model(model, sent);
     }
 
+    /// Stamp the next pending selection. The counter never restarts, so an
+    /// identical pick recorded while a request is in flight gets a distinct
+    /// generation.
+    fn next_pending_generation(&self) -> u64 {
+        self.pending_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+    }
+
     /// Record the next new turn's model for a live thread (spec #922). The
     /// provider is normalized like an accepted pick's: a neutral `codex` ref
     /// takes the thread's real provider when one is known, so the pending line
@@ -654,6 +671,7 @@ impl Projections {
             parsed.provider_id
         };
         let pending = PendingSelection {
+            generation: self.next_pending_generation(),
             model: Some(ModelIdentity {
                 provider_id,
                 model_id: parsed.id,
@@ -668,12 +686,20 @@ impl Projections {
     }
 
     /// Record a pending `/think` level, preserving a pending model (spec #922).
+    /// Every call is a fresh generation, so an identical level re-picked while
+    /// a request is in flight survives that request's compare-and-set.
     pub(crate) fn record_pending_variant(&self, thread_id: &str, variant: Option<&str>) {
         let mut pending = self.pending.lock().expect("codex pending selections");
-        let selection = pending.entry(thread_id.to_string()).or_default();
-        selection.effort = variant.map(str::to_string);
-        if selection.is_empty() {
+        let empty = {
+            let selection = pending.entry(thread_id.to_string()).or_default();
+            selection.effort = variant.map(str::to_string);
+            selection.is_empty()
+        };
+        if empty {
+            // No model and no effort: there is nothing left to apply.
             pending.remove(thread_id);
+        } else if let Some(selection) = pending.get_mut(thread_id) {
+            selection.generation = self.next_pending_generation();
         }
     }
 
@@ -686,13 +712,14 @@ impl Projections {
             .cloned()
     }
 
-    /// Consume the pending selection only when it is still the one that was
-    /// actually sent. A `/model` recorded while the request was in flight
-    /// replaced it and belongs to the next new turn, so it must survive this
-    /// response (spec #922). Returns whether the sent selection was removed.
+    /// Consume the pending selection only when it is still the generation that
+    /// was actually sent. A `/model` (even an identical re-pick) recorded while
+    /// the request was in flight replaced it and belongs to the next new turn,
+    /// so it must survive this response (spec #922). Returns whether the sent
+    /// selection was removed.
     pub(crate) fn consume_pending_if(&self, thread_id: &str, sent: &PendingSelection) -> bool {
         let mut pending = self.pending.lock().expect("codex pending selections");
-        if pending.get(thread_id) == Some(sent) {
+        if pending.get(thread_id).map(|held| held.generation) == Some(sent.generation) {
             pending.remove(thread_id);
             true
         } else {
@@ -2333,14 +2360,22 @@ impl Backend for CodexClient {
         // protocol's own `startedAt` is the second signal, so a fold into a
         // turn that started before this request must not consume the pending
         // (spec #922 decision 2). A steer and a command never reach this path.
+        //
+        // Deliberate residual race: `startedAt` is whole epoch seconds, and the
+        // stable API exposes no monotonic turn sequence. A TUI turn that starts
+        // in the same second as our send, or after `sent_at` but before our
+        // delayed `turn/start` is handled, still classifies as new. Biasing
+        // equality toward "fold" would make every normal same-second new turn
+        // fail to consume and re-send its pick, so equality stays "new"; the
+        // uncommon residual can leave a pick consumed early, never replayed.
         let accepted_new_turn = live_before.as_deref() != Some(turn.id.as_str())
             && turn.started_at.is_none_or(|started| started >= sent_at);
         if let Some(sent) = pending.as_ref()
             && accepted_new_turn
         {
-            // Compare-and-set on the selection actually sent: a `/model`
-            // recorded while this request was in flight belongs to the
-            // next new turn and survives.
+            // Compare-and-set on the **generation actually sent**: even an
+            // identical `/model` re-picked while this request was in flight is
+            // a newer pending and survives for the next new turn.
             self.projections.consume_pending_if(session_id, sent);
             // The override is "for this turn and subsequent turns", so the
             // thread now runs it (issue #904). Record it before the read so
@@ -7401,6 +7436,98 @@ mod tests {
         assert_eq!(second["model"], "gpt-b", "the newer pending is sent");
         assert_eq!(second["effort"], "high");
         assert_eq!(client.pending_model("thread-1").await, None);
+    }
+
+    /// Spec #922 (review round 2): even an **identical** re-pick recorded while
+    /// the first request is in flight is a newer generation. The sent request
+    /// consumes only its own generation, so the explicit re-pick survives and is
+    /// what the next new turn sends.
+    #[tokio::test]
+    async fn an_identical_pending_recorded_in_flight_survives_by_generation() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-5.1-codex".into());
+        thread.model_provider = Some("openai".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .record_pending_model("thread-1", "openai/gpt-a", Some("low"))
+            .await;
+        let gate = server.hold_next_turn_start_response();
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .prompt("thread-1", "first", &[], &[], None, None, None, None)
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while server.turn_start_gate_entered() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first turn/start never reached the gate"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let live = server.live_turn("thread-1").expect("the gated turn");
+        server.script_turn(
+            "thread-1",
+            vec![json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": live,
+                        "status": "completed",
+                        "startedAt": 1_700_000_000,
+                        "completedAt": 1_700_000_001
+                    }
+                }
+            })],
+        );
+        // The very same selection, recorded again while the request is in
+        // flight: only the generation distinguishes it.
+        client
+            .record_pending_model("thread-1", "openai/gpt-a", Some("low"))
+            .await;
+        gate.add_permits(1);
+        first
+            .await
+            .expect("the prompt task joins")
+            .expect("the first prompt");
+        server.script_turn("thread-1", Vec::new());
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-a"),
+            "the older generation's acceptance must not erase the re-pick"
+        );
+        assert_eq!(client.pending_variant("thread-1").await.as_deref(), Some("low"));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while client.projections.live_turn("thread-1").is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the completed turn never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        client
+            .prompt("thread-1", "second", &[], &[], None, None, None, None)
+            .await
+            .expect("the second prompt");
+        let second = server
+            .turn_params("thread-1")
+            .pop()
+            .expect("the second turn/start");
+        assert_eq!(second["model"], "gpt-a", "the re-pick is sent");
+        assert_eq!(second["effort"], "low");
+        assert_eq!(
+            client.pending_model("thread-1").await,
+            None,
+            "the next new turn consumes the newer generation"
+        );
     }
 
     /// Spec #922 (review blocking 2): a turn this connection never observed can
