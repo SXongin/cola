@@ -738,6 +738,10 @@ impl Projections {
         let mut reference = match selection.model {
             Some(model) => crate::backend::parsing::join_model(&model.provider_id, &model.model_id),
             None => {
+                // An effort-only pending is shown against the thread's current
+                // pair. When there is no current model fact there is no current
+                // line to compose either; inventing one would lie on the card,
+                // so this stays `None` until a model is known.
                 let model = self.model(thread_id)?;
                 crate::backend::parsing::join_model(&model.provider_id, &model.model_id)
             }

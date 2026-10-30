@@ -2677,10 +2677,10 @@ impl App {
         message_id: &str,
     ) -> crate::error::Result<String> {
         let mut input = self.client.new_session_input(Some(&pending.directory));
-        // A provider pick is a **creation** fact (issue #910): a Codex thread's
-        // provider can only be chosen by `thread/start` (or by a confirmed
-        // resume), and it pairs with the model chosen beside it — a profile
-        // preset names both. `input.provider` stays `None` for a client with no
+        // A provider pick is a **creation** fact (spec #922): a Codex thread's
+        // provider is chosen only by `thread/start` (or, later, `thread/fork`);
+        // a live thread never resumes with one. It pairs with the model chosen
+        // beside it. `input.provider` stays `None` for a client with no
         // provider axis, so OpenCode's create body is byte-identical.
         if pending.provider.is_some() {
             input.provider = pending.provider.clone();
@@ -4882,12 +4882,12 @@ impl App {
         }
     }
 
-    /// A **provider + model pair** (issue #910). A provider is a thread-level
-    /// fact with no per-turn field, so a pick that changes it must re-open the
-    /// thread — while a pick whose provider is the thread's own is an ordinary
-    /// model pick (no resume, no unsubscribe). A running turn defers the switch
-    /// to the next prompt instead of failing now; an existing idle thread asks
-    /// for confirmation first.
+    /// A **provider + model pair**. A provider is creation-only (spec #922):
+    /// only a Pending Session accepts it (it rides `thread/start`), while a
+    /// live thread's provider never changes. A live cross-provider pick is
+    /// refused from the cache with no request and points at `/new`; `/fork` is
+    /// the later, independent capability. A pick whose provider is the thread's
+    /// own is an ordinary model pick — no confirmation card, no resume.
     async fn pick_paired_model(
         &self,
         core: &Arc<SharedCore>,
@@ -4937,8 +4937,8 @@ impl App {
                 .await;
         }
         // The rule is shared with the `/model` text form: a model-only pick is
-        // recorded; a provider change needs the gate and a confirmation; nothing
-        // unclassifiable is recorded.
+        // recorded; a live thread's different provider is refused from the cache
+        // with no request; nothing unclassifiable is recorded.
         use crate::bridge::handles::{ModelPickDecision, PickTarget};
         match core
             .sessions_handle()

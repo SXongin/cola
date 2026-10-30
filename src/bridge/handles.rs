@@ -1147,6 +1147,47 @@ impl SessionsHandle {
         })?
     }
 
+    /// Undo the optimistic variant write that preceded a fallible pending
+    /// write (spec #922). The pending layer is the authority; if it refused, the
+    /// mirror must not claim a level no next turn will carry. The restore is a
+    /// compare-and-set on the value the pick just wrote, so a newer concurrent
+    /// pick wins and is left untouched. Best-effort: the original pending error
+    /// is the user-facing failure, and a rollback failure is logged rather than
+    /// masked.
+    async fn restore_variant_after_pending_failure(
+        &self,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        expected_model: Option<&str>,
+        written_variant: Option<&str>,
+        previous_variant: Option<String>,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        let outcome = {
+            let mut store = self.store.lock().await;
+            store.set_mirror_live(
+                thread_key,
+                session_id,
+                expected_model,
+                written_variant,
+                crate::bridge::session::MirrorWrite::Variant(previous_variant.as_deref()),
+                deadline,
+            )
+        };
+        match outcome {
+            Ok(outcome) => {
+                if let Err(error) = settle_mirror(outcome, deadline).await {
+                    tracing::warn!("could not persist the restored /think mirror for {session_id}: {error}");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not restore the /think mirror for {session_id} after a pending failure: {error}"
+                );
+            }
+        }
+    }
+
     /// Apply a `/model` pick (ADR-0020 and V2's durable switches) for
     /// `expected_session`: a `/switch` between the caller's classification and
     /// this write is a named no-op instead of a record on the new session
@@ -1259,9 +1300,24 @@ impl SessionsHandle {
             let outcome = pair_write_outcome(settle_mirror(outcome, deadline).await?);
             if next_turn {
                 if matches!(outcome, PickOutcome::Applied { .. }) {
-                    backend
+                    if let Err(error) = backend
                         .record_pending_model(&session_id, model_spec, probe.as_deref())
-                        .await?;
+                        .await
+                    {
+                        // The pending seam failed after the mirror moved. Restore
+                        // the pre-pick variant by compare-and-set: a newer pick
+                        // that changed it meanwhile wins and is left alone.
+                        self.restore_variant_after_pending_failure(
+                            thread_key,
+                            &session_id,
+                            snapshot.model.as_deref(),
+                            probe.as_deref(),
+                            snapshot.variant.clone(),
+                            deadline,
+                        )
+                        .await;
+                        return Err(error);
+                    }
                     return Ok(PickOutcome::Applied {
                         cleared_variant: cleared,
                     });
@@ -1562,10 +1618,24 @@ impl SessionsHandle {
         // adapter's pending carries the effort, while the mirror keeps the
         // level for the current display (spec #922). A steer, a folded turn or
         // a command never consumes it.
-        if backend.has_thread_provider() && matches!(outcome, PickOutcome::Applied { .. }) {
-            backend
+        if backend.has_thread_provider()
+            && matches!(outcome, PickOutcome::Applied { .. })
+            && let Err(error) = backend
                 .record_pending_variant(&session_id, variant.as_deref())
-                .await?;
+                .await
+        {
+            // The pending seam failed after the mirror moved: restore the
+            // pre-pick level, unless a newer pick already changed it.
+            self.restore_variant_after_pending_failure(
+                thread_key,
+                &session_id,
+                snapshot.model.as_deref(),
+                variant.as_deref(),
+                snapshot.variant.clone(),
+                None,
+            )
+            .await;
+            return Err(error);
         }
         Ok(outcome)
     }
