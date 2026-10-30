@@ -230,6 +230,34 @@ impl PendingSelections {
             false
         }
     }
+
+    /// Whether any selection (including a reset-only marker) is pending. This
+    /// is the lifecycle's answer even while no client is attached.
+    pub(crate) fn has_pending(&self, thread_id: &str) -> bool {
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .contains_key(thread_id)
+    }
+
+    /// A pending model's display reference from the store alone. An effort-only
+    /// selection has no thread model fact to anchor here, so it answers `None`;
+    /// the attached client's `pending_model` composes it with that fact.
+    pub(crate) fn pending_model_ref(&self, thread_id: &str) -> Option<String> {
+        let selection = self.pending_selection(thread_id)?;
+        let model = selection.model?;
+        let mut reference = crate::backend::parsing::join_model(&model.provider_id, &model.model_id);
+        if let Some(effort) = selection.effort.as_deref() {
+            reference.push('@');
+            reference.push_str(effort);
+        }
+        Some(reference)
+    }
+
+    /// The pending effort from the store alone.
+    pub(crate) fn pending_variant(&self, thread_id: &str) -> Option<String> {
+        self.pending_selection(thread_id)?.effort
+    }
 }
 
 /// One thread's projection and the state of its subscription.
@@ -3076,24 +3104,34 @@ impl Backend for CodexLifecycle {
     }
 
     async fn pending_model(&self, session_id: &str) -> Option<String> {
-        match self.attached_client().await {
-            Some(client) => Backend::pending_model(&client, session_id).await,
-            None => None,
+        // A model pending is answered from the lifecycle-owned store directly:
+        // an attachment replacement briefly leaves no client, but the pending is
+        // still real and must not look empty to the bridge.
+        if let Some(reference) = self.pending.pending_model_ref(session_id) {
+            return Some(reference);
         }
+        // An effort-only pending needs the attached client's thread-model fact
+        // to compose `provider/model@effort`; without a thread fact there is no
+        // current line to display either. A reset-only marker has no display.
+        if self
+            .pending
+            .pending_selection(session_id)
+            .is_some_and(|selection| selection.effort.is_some())
+        {
+            return match self.attached_client().await {
+                Some(client) => Backend::pending_model(&client, session_id).await,
+                None => None,
+            };
+        }
+        None
     }
 
     async fn pending_variant(&self, session_id: &str) -> Option<String> {
-        match self.attached_client().await {
-            Some(client) => Backend::pending_variant(&client, session_id).await,
-            None => None,
-        }
+        self.pending.pending_variant(session_id)
     }
 
     async fn has_pending_selection(&self, session_id: &str) -> bool {
-        match self.attached_client().await {
-            Some(client) => Backend::has_pending_selection(&client, session_id).await,
-            None => false,
-        }
+        self.pending.has_pending(session_id)
     }
 
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {

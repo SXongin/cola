@@ -855,33 +855,43 @@ impl Turn {
         // definite refusal or newer in-flight pick leaves it pending, so the
         // intent and the last accepted mirror stay untouched. An ambiguous drop
         // consumes the intent without touching the mirror, which never moved.
-        //
-        // The commit runs under the same per-session gate as `/model` and
-        // `/think`: they hold it across both the adapter record and the intent
-        // write, so a newer pick either finishes before this check (and leaves a
-        // pending we see) or waits until the old intent is committed/cleared.
-        if handles.backend.has_thread_provider() {
-            let gate = handles.sessions.session_gates.gate(&self.session_id);
-            let _held = gate.enter().await;
-            if !handles.backend.has_pending_selection(&self.session_id).await
-                && let Some(intent) = handles
-                    .sessions
-                    .take_pending_effort_intent(&self.session_id)
-                    .await
-                && prompt_resp.is_ok()
-            {
-                handles
-                    .sessions
-                    .apply_pending_effort_intent(&self.thread_key, &self.session_id, intent)
-                    .await;
-            }
-        }
+        Self::commit_pending_effort(handles, &self.session_id, &self.thread_key, prompt_resp.is_ok()).await;
         // The poll runs only while the submit is in flight; the post-prompt
         // drain observes the submitted run from here on (ADR-0056, ADR-0043).
         // A rejected submit is recorded so the drain does not wait out its
         // bound for a run that was never scheduled.
         self.submit_failed = prompt_resp.is_err();
         prompt_resp
+    }
+
+    /// Commit a prompt's pending effort intent to the mirror, or discard it on an
+    /// ambiguous drop. Runs under the same per-session gate as `/model` and
+    /// `/think`: they hold it across both the adapter record and the intent
+    /// write, so a newer pick either finishes before this check (and leaves a
+    /// pending we see) or waits until the old intent is committed/cleared.
+    ///
+    /// This is a seam so the gate-held check-and-take can be tested without
+    /// running the full post-prompt drain.
+    pub(crate) async fn commit_pending_effort(
+        handles: &TurnHandles,
+        session_id: &str,
+        thread_key: &crate::config::ThreadKey,
+        prompt_ok: bool,
+    ) {
+        if !handles.backend.has_thread_provider() {
+            return;
+        }
+        let gate = handles.sessions.session_gates.gate(session_id);
+        let _held = gate.enter().await;
+        if !handles.backend.has_pending_selection(session_id).await
+            && let Some(intent) = handles.sessions.take_pending_effort_intent(session_id).await
+            && prompt_ok
+        {
+            handles
+                .sessions
+                .apply_pending_effort_intent(thread_key, session_id, intent)
+                .await;
+        }
     }
 
     /// Replace the dead mapping with a fresh session on the current server —
