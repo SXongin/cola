@@ -203,13 +203,14 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
   改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
   也一样——除非 `apply_on_adopt = true`。
-- **provider 只在创建时选择。** `/new`（Pending Session）与 `/fork` 是唯一选择
-  provider 的路径；它们把 `model` + `modelProvider` 成对交给 `thread/start` 或
-  `thread/fork`（`turn/start` 没有这个字段）。活动线程的 provider 不会改变：
-  `/model` 选到不同 provider 时**不发送任何请求**，并提示 `/new` 或 `/fork`。
-  活动线程的 provider 页是只读的——只显示当前 provider 与这条说明，没有可点的
-  rows；Pending Session 仍提供创建时会带上的成对行。provider 不能离开模型单独
-  选择：把旧模型名留在新 provider 上会 404。
+- **provider 只在创建时选择。** 目前只有 `/new`（Pending Session）能选择
+  provider：它把 `model` + `modelProvider` 成对交给 `thread/start`
+  （`turn/start` 没有这个字段）。`/fork` 是后续版本才提供的独立功能，届时会把
+  这一对交给 `thread/fork`；现在它不是可用命令。活动线程的 provider 不会改变：
+  `/model` 选到不同 provider 时**不发送任何请求**，并提示 `/new`，只把 `/fork`
+  作为后续选项提及。活动线程的 provider 页是只读的——只显示当前 provider 与这条
+  说明，没有可点的 rows；Pending Session 仍提供创建时会带上的成对行。provider
+  不能离开模型单独选择：把旧模型名留在新 provider 上会 404。
 - **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
@@ -694,17 +695,18 @@ provider 页把原因作为行尾的短标签（`403`、`超时`…），不是�
 头里：卡片、日志行与错误信息中都不会出现。
 
 **provider 只在创建时选择。** provider 页（`切换 provider…` 那一行）列出配置好的
-成对行，标签为 `provider/model`。provider 只在线程创建或 fork 时确定：`/new` 把这一对
-交给 `thread/start`，`/fork` 交给 `thread/fork`（fork 是单独的功能）。`turn/start`
+成对行，标签为 `provider/model`。provider 只在线程创建时确定：`/new` 把这一对交给
+`thread/start`。`/fork` 是后续版本才提供的独立功能（届时使用 `thread/fork`）；
+cola 目前没有 `/fork` 命令，输入它会被当成普通消息提交。`turn/start`
 没有 provider 字段，而且 provider 永远不能离开模型单独选——把旧模型名留在新 provider
 上会 404。因此：
 
 - **新线程直接带走这一对。** 在待建会话（第一条消息之前）上点 provider 行，
   这一对随 `thread/start` 发送。
 - **活动线程的 provider 不可变。** 活动线程的 provider 页是只读的：显示当前
-  provider，并说明只能在新会话或 fork 中更换。`/model` 选到不同 provider 时会被
-  拒绝且**不发送任何请求**——没有 `turn/start`，也没有 `thread/resume`——卡片与
-  文本回复都指向 `/new` / `/fork`。
+  provider，并说明只能在新会话中更换（`/fork` 是后续的独立选项）。`/model` 选到
+  不同 provider 时会被拒绝且**不发送任何请求**——没有 `turn/start`，也没有
+  `thread/resume`——并指向 `/new`，只把 `/fork` 作为后续能力提及。
 - **同一 provider 内的点选只是一次模型变更。** `codex/<id>` 目录/默认引用，或
   线程当前 provider 自己 `/models` 返回的行，都只记录模型并随下一条消息生效
   ——不 resume、不重新加载。

@@ -1110,7 +1110,7 @@ mod tests {
     }
 
     /// Spec #922: a live thread's provider page is read-only — the current
-    /// provider and the `/new` / `/fork` note, with no clickable rows.
+    /// provider and the `/new` / later `/fork` note, with no clickable rows.
     #[test]
     fn a_read_only_provider_page_renders_no_buttons() {
         let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
@@ -1118,8 +1118,10 @@ mod tests {
         provider.changeable = ChangeScope::NewThread;
         provider.pick = crate::backend::types::PickKind::Provider;
         provider.intro = Some("provider 是会话创建时的选择".into());
-        provider.note =
-            Some("当前 provider：`deepseek`。provider 只能在新会话中更换：请用 `/new` 或 `/fork`。".into());
+        provider.note = Some(
+            "当前 provider：`deepseek`。provider 只能在新会话中更换：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。"
+                .into(),
+        );
         let cards = build_model_surface_cards(&key, &surface(None, vec![provider]), false);
         let mut buttons = 0;
         let mut markdown = String::new();
@@ -1137,6 +1139,10 @@ mod tests {
         assert!(
             markdown.contains("/new") && markdown.contains("/fork"),
             "{markdown}"
+        );
+        assert!(
+            markdown.contains("后续版本") && markdown.contains("独立功能"),
+            "a `/fork` mention must read as a future capability: {markdown}"
         );
     }
 

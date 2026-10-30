@@ -2327,8 +2327,9 @@ async fn a_failed_release_does_not_fail_switch_forget() {
     assert!(text.contains("已解除"), "the confirmation still lands: {text}");
 }
 
-/// Spec #922: a provider pick on a live Codex thread is a toast and **no**
-/// request — not even a `thread/resume` — and names `/new` / `/fork`.
+/// Spec #922: a provider pick on a live Codex thread is a toast and **no
+/// outbound request at all** — not even a `thread/resume` — and names `/new`
+/// (actionable) and `/fork` (a later capability).
 #[tokio::test]
 async fn a_live_provider_pick_is_refused_with_no_request() {
     let _wd = test_work_dir();
@@ -2358,11 +2359,21 @@ async fn a_live_provider_pick_is_refused_with_no_request() {
         "provider": "deepseek",
         "value": "deepseek-v4-pro",
     });
+    server.clear_calls();
     let step = app.host_action(pick).await.expect("provider pick");
     assert!(step.card.is_none(), "a refusal is a toast, not a card");
     let toast = step.toast.expect("the named refusal");
     assert!(toast.contains("/new") && toast.contains("/fork"), "{toast}");
-    assert_eq!(server.resume_calls(), 1, "the click sent no request at all");
+    assert!(
+        toast.contains("后续版本") && toast.contains("独立功能"),
+        "`/fork` must not read as a command available today: {toast}"
+    );
+    assert_eq!(server.resume_calls(), 1, "the click sent no resume");
+    assert_eq!(
+        server.call_log(),
+        Vec::<String>::new(),
+        "the refusal sent no outbound request at all"
+    );
 }
 
 /// Spec #922: a provider pick on a live Codex thread whose projection is

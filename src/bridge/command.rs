@@ -1419,9 +1419,9 @@ pub(crate) async fn handle_command(
             //
             // The text form obeys the same rule as the card (spec #922): a
             // different provider on a live thread is **never recorded** — it is
-            // refused without a request and points at `/new` / `/fork`, because
-            // a provider is creation-only. A Pending Session takes the pair at
-            // creation.
+            // refused without a request and points at `/new`, with `/fork`
+            // named only as a later capability. A Pending Session takes the
+            // pair at creation.
             let Some(parsed) = crate::backend::parsing::parse_model(&name) else {
                 handles
                     .flow
