@@ -686,8 +686,8 @@ detailed help for any of these.
 | `/compact` | Compact context |
 | `/card` | Pull the live card down to the newest position after mid-turn command replies bury it (replies a notice when no turn is running) |
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
-| `/model <p/m>` | Switch model (takes effect next message; persisted) |
-| `/think [level]` | Set/clear thinking level, per model (takes effect next message) |
+| `/model <p/m>` | Switch model (OpenCode: takes effect next message, persisted; Codex: records a one-shot pick for the next new message, dropped on restart) |
+| `/think [level]` | Set/clear thinking level, per model (OpenCode: next message, persisted; Codex: one-shot for the next new message, dropped on restart) |
 | `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and a `#<id>` that matches no skill stays plain text (`#644`, `C#caveman` and `##foreman` are never skill tokens). A bare `/skill` opens the skill picker — searchable by id/name/description and paged 20 rows at a time — and `/skill <id>` is an alias for ids the `#` form cannot type (`2fa-helper`, `web_scrape`) |
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session. A permission whose target the card cannot show in full (an over-long command) is still declined, never approved unseen |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
@@ -807,19 +807,20 @@ Notes:
   the Host process can read. In a group chat everyone can read the card, while
   the Access List gates who may act in cola, not who may read.
 - `/agent`, `/model`, `/think`, `/autoaccept` are **per-session** and apply from
-  the next message, persisting across restarts. On OpenCode 2 the first three are
+  the next message; on OpenCode they persist across restarts. On OpenCode 2 the first three are
   durable session state — the pick is written to the session itself (`POST
   /api/session/{id}/model|agent`, the thinking level inside the model ref), so it
   persists with nothing re-sent and other clients on the shared store see it. On
   a session that is still pending (`/new`, `/dir` or `/topic` before its first
   message — including its card forms), the override is recorded on the pending
-  and applies to the session the first message creates. `/model`'s value must
-  exist on the server cola attaches to. Bare `/model` opens the provider → model
-  picker, whose intro shows the model the next message will actually run (the
-  session's own selection, else `[opencode] model`, else what the server
-  recorded). `/compact` and `/stop` need a real session and keep their
-  "还没有会话" replies on a pending. A Codex Agent Client reads `/model`
-  differently — see 「`/model` on a Codex client」 below.
+  and applies to the session the first message creates. A Codex client is the
+  exception: its `/model` and `/think` are a one-shot next-new-message pending,
+  dropped by a restart — see 「`/model` on a Codex client」 below.
+  `/model`'s value must exist on the server cola attaches to. Bare `/model` opens
+  the provider → model picker, whose intro shows the model the next message will
+  actually run (the session's own selection, else `[opencode] model`, else what
+  the server recorded). `/compact` and `/stop` need a real session and keep their
+  "还没有会话" replies on a pending.
 - `/restart-opencode` restarts an Owned Server or the V2 Shared Service
   (`opencode service restart`); a server launched by another tool is left alone
   (`NotOwned`).
@@ -830,23 +831,44 @@ Notes:
 
 ### `/model` on a Codex client
 
-Codex's model axis is not a provider → model tree: a provider is **thread
-level**, a model is **per turn**, and the built-in catalog is **global**. Bare
+Codex's model axis is not a provider → model tree: a provider is a **creation
+fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
 `/model` therefore shows one current line and **one model page**; a
 `切换 provider…` row at the bottom opens the provider page. There is no
 「选择 provider（共 1 个）」 pseudo-level:
 
-- **The current model is the thread's, with cola's own pick in front of it.**
-  The card's 当前模型 line resolves the session's recorded pick (when you made
-  one), then the thread's own `model` and `modelProvider` read with
-  `thread/read` — so a picker opened after another client changed the thread
-  shows that change, and the footer and the picker cannot disagree.
+- **A pick is recorded, not switched.** `/model` records the choice as a
+  one-shot pending pair (model plus its `/think` level, in memory) and answers
+  「已记录：将在下一条新消息生效」. The card shows two facts: **当前** — the
+  thread's own `provider / model` with its reasoning level, as the adapter holds
+  it (the newest `thread/read` or `thread/settings/updated`) — and **待应用** —
+  the recorded pair with 「下一条新消息生效」.
+  A pick never rewrites the current line before the server has run it, so a
+  picker opened after another client changed the thread shows that change, and
+  the footer and the picker cannot disagree.
+- **The next new message applies it — once.** That turn's `turn/start` carries
+  `model` + `effort`; when the turn is accepted the pick is **consumed**, and
+  every later message carries no model and no effort: the thread's own default
+  is the fact, so a peer client's later change is respected and the read-back
+  only refreshes 当前. Only a genuinely new turn counts — a steer, a turn folded
+  into the running one, and a command (`/status`, `/compact`, …) do not consume
+  it. A definite refusal (a JSON-RPC error) keeps it for a retry; an ambiguous
+  submit (a timeout, a lost response) drops it, because the server may already
+  have accepted it; a cola restart drops it too, so re-pick with `/model`.
+- **`/think` is the same one-shot window.** On a live Codex thread a level is
+  recorded as the next new message's `effort` (keeping any pending model), not
+  a per-prompt override; once it applies, later messages carry no effort.
+  `/think --reset` clears the pending level, and a fresh pick on a model that
+  does not declare it clears it as usual.
+- **A Pending Session's pick is a creation parameter.** Before the first message
+  there is no thread, so the pair is `thread/start`'s `model` + `modelProvider`
+  and the reply says 「将在会话创建时生效」 — never 待应用. `/think` there is the
+  same creation intent: it rides the first new turn once the thread exists.
 - **「模型（每轮可换）」** lists the model-only sources: `model/list`'s built-in
   catalog (grouped as 「内置目录（全局，未校验）」 — those ids name no provider and
   may run through any of them), the config's top-level `model` (配置默认), and
-  **the current provider's** `/models` ids. A
-  pick is sent as `turn/start.model` on the next message and the thread keeps it
-  for its following turns.
+  **the current provider's** `/models` ids. A pick is recorded, not sent on every
+  prompt: it reaches the next new message's `turn/start.model` once.
 - **An id outside every list is typed.** `/model codex/<id>` records it, and
   `/model <provider>/<model>` records a pair. Codex validates neither one: only
   the catalog's entries carry a display name, a context window and reasoning
@@ -887,7 +909,7 @@ without a model — the old model name on a new provider is a 404. So:
   as that later capability.
 - **A same-provider pick is just a model change.** A `codex/<id>` catalog/default
   ref, or one of the thread's own provider's `/models` rows, is recorded and
-  rides the next message — no resume, no reload.
+  rides the next new message — no resume, no reload, no thread change.
 - **`codex` is a reserved name.** The built-in catalog's ref is `codex/<id>` —
   a shared neutral namespace, never a channel — so a `[model_providers.codex]`
   cannot be selected: the provider section lists it as 「`codex` 是内置目录的保留名，
