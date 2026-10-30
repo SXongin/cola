@@ -459,6 +459,17 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         None
     }
 
+    /// Whether a next-turn pending selection exists at all, including an
+    /// explicit `/think --reset` marker whose model and effort are both absent.
+    /// The bridge uses this one seam before applying an effort intent, so a
+    /// clear marker is not mistaken for "no pending".
+    ///
+    /// The default answers `false`: **not applicable to a client** with no
+    /// next-turn pending. A client that has one overrides this.
+    async fn has_pending_selection(&self, _session_id: &str) -> bool {
+        false
+    }
+
     /// Make the session's agent selection durable (V2's
     /// `POST /api/session/{id}/agent`). A no-op on V1, where the selection
     /// rides each prompt.

@@ -855,10 +855,15 @@ impl Turn {
         // definite refusal or newer in-flight pick leaves it pending, so the
         // intent and the last accepted mirror stay untouched. An ambiguous drop
         // consumes the intent without touching the mirror, which never moved.
+        //
+        // The commit runs under the same per-session gate as `/model` and
+        // `/think`: they hold it across both the adapter record and the intent
+        // write, so a newer pick either finishes before this check (and leaves a
+        // pending we see) or waits until the old intent is committed/cleared.
         if handles.backend.has_thread_provider() {
-            let pending_gone = handles.backend.pending_model(&self.session_id).await.is_none()
-                && handles.backend.pending_variant(&self.session_id).await.is_none();
-            if pending_gone
+            let gate = handles.sessions.session_gates.gate(&self.session_id);
+            let _held = gate.enter().await;
+            if !handles.backend.has_pending_selection(&self.session_id).await
                 && let Some(intent) = handles
                     .sessions
                     .take_pending_effort_intent(&self.session_id)

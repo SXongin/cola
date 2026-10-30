@@ -1548,6 +1548,277 @@ async fn a_model_pick_that_clears_a_level_changes_current_only_after_acceptance(
     wait_for_handler(handler, "the model-clear turn", SETTLE_DEADLINE).await;
 }
 
+/// Spec #922 gate review: an explicit `/think --reset` keeps 当前 at the old
+/// level until a new turn is accepted, survives a definite refusal, and clears
+/// the mirror only after acceptance.
+#[tokio::test]
+async fn a_reset_only_pending_keeps_current_until_acceptance() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1-codex".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![json!({
+        "id": "gpt-5.1-codex",
+        "hidden": false,
+        "supportedReasoningEfforts": [{ "reasoningEffort": "high", "description": "careful" }],
+        "defaultReasoningEffort": "high"
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let handles = app.command_handles();
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+    let mut settings = handles
+        .flow
+        .sessions
+        .session_settings(&key)
+        .await
+        .expect("the seeded settings");
+    settings.variant = Some("high".into());
+    assert!(
+        app.sessions
+            .lock()
+            .await
+            .set_settings(&key, settings)
+            .expect("persist the variant")
+    );
+
+    send_command_in(
+        &app,
+        "/think --reset",
+        key.clone(),
+        "om_think_reset",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone())
+            .as_deref(),
+        Some("high"),
+        "the reset does not clear the current level before acceptance"
+    );
+    assert!(
+        client.has_pending_selection(THREAD).await,
+        "the reset is an adapter pending marker"
+    );
+    assert_eq!(
+        handles.flow.sessions.pending_effort_intent(THREAD).await,
+        Some(None),
+        "the intent records an explicit clear"
+    );
+
+    send_command_in(
+        &app,
+        "/model",
+        key.clone(),
+        "om_reset_card",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let reset_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the reset /model card");
+    let reset_text = card_text(&reset_card);
+    assert!(
+        reset_text.contains("当前模型**：`openai/gpt-5.1-codex@high`"),
+        "当前 keeps the old level: {reset_text}"
+    );
+    assert!(
+        !reset_text.contains("待应用"),
+        "a reset-only marker has no pending model line: {reset_text}"
+    );
+
+    // A definite refusal keeps the marker, the intent and the mirror.
+    server.reject_next_turn_start("reset refused");
+    let refused = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("refused reset", "om_reset_refused"))
+                .await
+        }
+    });
+    wait_for_handler(refused, "the refused reset turn", SETTLE_DEADLINE).await;
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone())
+            .as_deref(),
+        Some("high"),
+        "a refused reset did not move the mirror"
+    );
+    assert!(client.has_pending_selection(THREAD).await);
+    assert_eq!(
+        handles.flow.sessions.pending_effort_intent(THREAD).await,
+        Some(None),
+        "a refused reset keeps its intent"
+    );
+
+    // An accepted new turn consumes the marker and clears the mirror.
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("accepted reset", "om_reset_accepted"))
+                .await
+        }
+    });
+    wait_for_turn_start(&server).await;
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .is_some()
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the accepted reset never cleared the mirror"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(!client.has_pending_selection(THREAD).await);
+    assert_eq!(handles.flow.sessions.pending_effort_intent(THREAD).await, None);
+    send_command_in(
+        &app,
+        "/model",
+        key,
+        "om_reset_after",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let after_card = platform
+        .replied_cards()
+        .await
+        .into_iter()
+        .last()
+        .expect("the post-reset /model card");
+    let after_text = card_text(&after_card);
+    assert!(
+        !after_text.contains("@high") && !after_text.contains("待应用"),
+        "the accepted reset is no longer current or pending: {after_text}"
+    );
+
+    // End the turn so the spawned handler stops cleanly.
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(handler, "the accepted reset turn", SETTLE_DEADLINE).await;
+}
+
+/// Spec #922 gate review: the post-prompt effort commit waits on the same
+/// per-session gate as `/think` and `/model`, so it cannot apply an intent that a
+/// newer pick has already replaced.
+#[tokio::test]
+async fn the_accepted_effort_commit_waits_for_the_session_gate() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
+    thread.model = Some("gpt-5.1-codex".into());
+    thread.model_provider = Some("openai".into());
+    server.seed_thread(thread);
+    server.set_models(vec![json!({
+        "id": "gpt-5.1-codex",
+        "hidden": false,
+        "supportedReasoningEfforts": [{ "reasoningEffort": "high", "description": "careful" }]
+    })]);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, _platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
+    send_command_in(
+        &app,
+        "/think high",
+        key.clone(),
+        "om_gate_think",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let gate = app.command_handles().flow.sessions.session_gates.gate(THREAD);
+    let response = server.hold_next_turn_start_response();
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("apply high", "om_gate_prompt"))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while server.turn_start_gate_entered() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never reached turn/start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // The pre-flight is over and the submit is parked at the server; take the
+    // session gate before the response can reach the post-prompt commit.
+    let held = gate.enter().await;
+    response.add_permits(1);
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while client.has_pending_selection(THREAD).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the adapter never consumed the pending"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone()),
+        None,
+        "the mirror is untouched while the commit waits for the gate"
+    );
+    drop(held);
+
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .as_deref()
+        != Some("high")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the commit never ran after the gate was released"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    let live = server.live_turn(THREAD).expect("the turn is running");
+    let now = chrono::Utc::now().timestamp();
+    server.push_to_thread(
+        THREAD,
+        "turn/completed",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
+        }),
+    );
+    wait_for_handler(handler, "the gated effort turn", SETTLE_DEADLINE).await;
+}
+
 /// Ticket #881 acceptance 5 (skills half) through the bridge: `/skill` resolves
 /// against `skills/list` and the pick reaches `turn/start` as the protocol's
 /// `skill` input.

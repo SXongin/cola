@@ -92,11 +92,15 @@ pub(crate) struct PendingSelection {
     pub(crate) model: Option<ModelIdentity>,
     /// The `/think` level to send as `effort`.
     pub(crate) effort: Option<String>,
+    /// An explicit `/think --reset`. The selection is a real pending marker
+    /// even with no model and no effort, so a fold or a refusal keeps it and an
+    /// accepted new turn consumes it before the bridge clears the mirror.
+    clear_effort: bool,
 }
 
 impl PendingSelection {
     fn is_empty(&self) -> bool {
-        self.model.is_none() && self.effort.is_none()
+        self.model.is_none() && self.effort.is_none() && !self.clear_effort
     }
 }
 
@@ -184,6 +188,7 @@ impl PendingSelections {
                 variant: None,
             }),
             effort: variant.map(str::to_string),
+            clear_effort: false,
         };
         self.pending
             .lock()
@@ -196,6 +201,9 @@ impl PendingSelections {
         let empty = {
             let selection = pending.entry(thread_id.to_string()).or_default();
             selection.effort = variant.map(str::to_string);
+            // `None` is an explicit clear: keep a non-empty marker so a fold or
+            // a definite refusal does not let the bridge apply it early.
+            selection.clear_effort = variant.is_none();
             selection.is_empty()
         };
         if empty {
@@ -775,6 +783,12 @@ impl Projections {
     /// thread fact to anchor).
     pub(crate) fn pending_model(&self, thread_id: &str) -> Option<String> {
         let selection = self.pending_selection(thread_id)?;
+        // A reset-only marker has nothing to display: it clears the current
+        // level on acceptance, and showing the thread's model as 待应用 would
+        // name a value the pending does not change.
+        if selection.model.is_none() && selection.effort.is_none() {
+            return None;
+        }
         let mut reference = match selection.model {
             Some(model) => crate::backend::parsing::join_model(&model.provider_id, &model.model_id),
             None => {
@@ -2318,6 +2332,10 @@ impl Backend for CodexClient {
         self.projections.pending_variant(session_id)
     }
 
+    async fn has_pending_selection(&self, session_id: &str) -> bool {
+        self.projections.pending_selection(session_id).is_some()
+    }
+
     async fn prompt(
         &self,
         session_id: &str,
@@ -3068,6 +3086,13 @@ impl Backend for CodexLifecycle {
         match self.attached_client().await {
             Some(client) => Backend::pending_variant(&client, session_id).await,
             None => None,
+        }
+    }
+
+    async fn has_pending_selection(&self, session_id: &str) -> bool {
+        match self.attached_client().await {
+            Some(client) => Backend::has_pending_selection(&client, session_id).await,
+            None => false,
         }
     }
 
@@ -7447,6 +7472,81 @@ mod tests {
             client.pending_model("thread-1").await,
             None,
             "an ambiguous failure drops the pending and never retries it"
+        );
+    }
+
+    /// Spec #922 gate review: an explicit `/think --reset` is a pending marker,
+    /// not "no pending". A fold and a definite refusal keep it; only a genuinely
+    /// new accepted turn consumes it.
+    #[tokio::test]
+    async fn a_reset_only_pending_survives_fold_and_refusal_until_acceptance() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-5.1-codex".into());
+        thread.model_provider = Some("openai".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .prompt("thread-1", "start", &[], &[], None, None, None, None)
+            .await
+            .expect("the live turn");
+        wait_for_live_turn(&client, "thread-1").await;
+        client
+            .record_pending_variant("thread-1", None)
+            .await
+            .expect("the reset is recorded");
+        assert!(
+            client.has_pending_selection("thread-1").await,
+            "an explicit reset is a pending marker"
+        );
+
+        // Folded into the running turn: the marker survives and sends no effort.
+        client
+            .prompt("thread-1", "folded", &[], &[], None, None, None, None)
+            .await
+            .expect("the folded turn");
+        let folded = server
+            .turn_params("thread-1")
+            .pop()
+            .expect("the folded turn/start");
+        assert_eq!(folded.get("model"), None);
+        assert_eq!(folded.get("effort"), None);
+        assert!(
+            client.has_pending_selection("thread-1").await,
+            "a fold does not consume an explicit reset"
+        );
+
+        // A definite refusal keeps it too.
+        server.reject_next_turn_start("no reset here");
+        client
+            .prompt("thread-1", "refused", &[], &[], None, None, None, None)
+            .await
+            .expect_err("the refusal is an error");
+        assert!(
+            client.has_pending_selection("thread-1").await,
+            "a definite refusal keeps an explicit reset"
+        );
+
+        // End the folded turn, then accept a genuinely new one.
+        client.interrupt("thread-1").await.expect("interrupt the turn");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while client.projections.live_turn("thread-1").is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupted turn never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        client
+            .prompt("thread-1", "accepted", &[], &[], None, None, None, None)
+            .await
+            .expect("the new turn");
+        assert!(
+            !client.has_pending_selection("thread-1").await,
+            "the accepted new turn consumes the reset marker"
         );
     }
 

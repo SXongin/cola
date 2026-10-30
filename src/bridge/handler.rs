@@ -2821,6 +2821,7 @@ impl App {
         // every later prompt. No model pending is recorded: the thread already
         // started on the creation pair, so the card shows no 待应用.
         if self.client.has_thread_provider()
+            && pending.variant.is_some()
             && let Err(e) = self
                 .client
                 .record_pending_variant(session_id, pending.variant.as_deref())

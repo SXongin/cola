@@ -3144,6 +3144,10 @@ impl crate::backend::Backend for MockBackend {
             .and_then(|(_, variant)| variant.clone())
     }
 
+    async fn has_pending_selection(&self, session_id: &str) -> bool {
+        self.pending_selections.lock().await.contains_key(session_id)
+    }
+
     async fn prompt(
         &self,
         session_id: &str,
