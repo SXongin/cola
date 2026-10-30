@@ -143,6 +143,13 @@ amendment: `initialize`, `initialized`, `thread/*` discovery and subscription,
 - `windowsSandbox/readiness`
 - `windowsSandbox/setupStart`
 
+`thread/settings/update` is deliberately absent from this list: it exists in the
+CLI source — Codex's own TUI uses it for `/model` — but it is experimental and
+not in the public app-server API overview, so cola does not adopt it and it is
+**not** a required client method. The adapter's model switch is the stable
+`turn/start` `model` + `effort`, which the protocol documents as becoming the
+thread's defaults for later turns.
+
 ## Notifications (85)
 
 Broadcast (`thread/started`, `thread/status/changed`,
