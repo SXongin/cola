@@ -2549,17 +2549,6 @@ impl App {
                     }
                     Err(e) => {
                         tracing::warn!("supplement: prompt failed: {}", e);
-                        // An ambiguous supplement may have dropped the adapter's
-                        // pending; the intent must not outlive it, or a later
-                        // successful turn would apply a level no prompt carried.
-                        if self.client.has_thread_provider()
-                            && !self.client.has_pending_selection(&session_id).await
-                        {
-                            let sessions = self.sessions_handle();
-                            if let Some(intent) = sessions.pending_effort_intent(&session_id).await {
-                                sessions.remove_pending_effort_intent_if(&session_id, intent.generation);
-                            }
-                        }
                         // The failure notice is sent first, then the split
                         // still happens below — the live card must remain the
                         // newest message, not the notice.

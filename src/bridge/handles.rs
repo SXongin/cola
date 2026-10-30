@@ -52,15 +52,6 @@ use crate::feishu;
 /// every rung (a persisted override, the server-recorded model) is read from
 /// the same store.
 ///
-/// A live Codex thread's unaccepted `/think` intent (spec #922). The generation
-/// lets a canceled or superseded turn remove only the intent it captured, never
-/// a newer pick; `value = None` is an explicit reset.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingEffortIntent {
-    pub(crate) generation: u64,
-    pub(crate) value: Option<String>,
-}
-
 /// **Locks owned:** the `store` mutex (the persisted [`SessionStore`]) and the
 /// private list-cache mutex. The two are never held at once — a write takes the
 /// store lock, drops it, then clears the cache — so no ordering between them
@@ -81,14 +72,6 @@ pub(crate) struct SessionsHandle {
     /// session cola CREATES starts with. Adoption paths never read it — an
     /// existing session keeps its own state.
     default_auto_accept: bool,
-    /// A live Codex thread's next-turn `/think` intent (spec #922), in-memory
-    /// only: the level the next accepted new turn should make current. The
-    /// session mirror keeps the last accepted fact until then. A `None` value is
-    /// an explicit reset; absence means no pending effort intent. The standard
-    /// mutex lets a turn's cancellation guard remove its generation on drop.
-    pending_effort_intents: Arc<std::sync::Mutex<HashMap<String, PendingEffortIntent>>>,
-    /// The monotonically increasing source of [`PendingEffortIntent::generation`].
-    pending_effort_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The result of applying a settings pick (`/model`, `/think`, `/agent`): one
@@ -279,16 +262,12 @@ impl SessionsHandle {
         cache: Arc<Mutex<Option<SessionListCache>>>,
         default_auto_accept: bool,
         session_gates: crate::bridge::session_gates::SessionGates,
-        pending_effort_intents: Arc<std::sync::Mutex<HashMap<String, PendingEffortIntent>>>,
-        pending_effort_generation: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             store,
             cache,
             default_auto_accept,
             session_gates,
-            pending_effort_intents,
-            pending_effort_generation,
         }
     }
 
@@ -298,49 +277,15 @@ impl SessionsHandle {
         self.default_auto_accept
     }
 
-    /// A live Codex thread's unaccepted `/think` intent, if one is recorded.
-    pub(crate) async fn pending_effort_intent(&self, session_id: &str) -> Option<PendingEffortIntent> {
-        self.pending_effort_intents
-            .lock()
-            .expect("pending effort intents")
-            .get(session_id)
-            .cloned()
-    }
-
-    /// Record (or overwrite) the next accepted turn's effort intent, returning
-    /// its generation so the caller can arm a cancellation guard.
-    pub(crate) async fn set_pending_effort_intent(&self, session_id: &str, value: Option<String>) -> u64 {
-        let generation = self
-            .pending_effort_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        self.pending_effort_intents
-            .lock()
-            .expect("pending effort intents")
-            .insert(session_id.to_string(), PendingEffortIntent { generation, value });
-        generation
-    }
-
-    /// Remove the intent only when it is still the generation a canceled or
-    /// superseded turn captured. A newer pick survives.
-    pub(crate) fn remove_pending_effort_intent_if(&self, session_id: &str, generation: u64) {
-        let mut intents = self
-            .pending_effort_intents
-            .lock()
-            .expect("pending effort intents");
-        if intents.get(session_id).map(|intent| intent.generation) == Some(generation) {
-            intents.remove(session_id);
-        }
-    }
-
-    /// Make a pending effort value the accepted mirror fact. Compare-and-set
-    /// against the pair read here, so a newer pick that moved the mirror wins;
-    /// a store error is logged, never surfaced as a turn failure.
-    pub(crate) async fn apply_pending_effort_intent(
+    /// Make the effort an accepted turn actually applied the current mirror
+    /// fact. Compare-and-set against the pair read here, so a newer pick that
+    /// moved the mirror wins; a store error is logged at WARN, never surfaced as
+    /// a turn failure (the turn already ran). `None` clears the level.
+    pub(crate) async fn apply_applied_effort(
         &self,
         thread_key: &ThreadKey,
         session_id: &str,
-        intent: Option<String>,
+        effort: Option<String>,
     ) {
         let Some(entry) = self.entry_for_session(session_id).await else {
             return;
@@ -352,18 +297,20 @@ impl SessionsHandle {
                 session_id,
                 entry.model.as_deref(),
                 entry.variant.as_deref(),
-                crate::bridge::session::MirrorWrite::Variant(intent.as_deref()),
+                crate::bridge::session::MirrorWrite::Variant(effort.as_deref()),
                 None,
             )
         };
         match outcome {
             Ok(outcome) => {
                 if let Err(error) = settle_mirror(outcome, None).await {
-                    tracing::warn!("could not persist the accepted /think level for {session_id}: {error}");
+                    tracing::warn!("accepted /think level for {session_id} could not be persisted: {error}");
                 }
             }
             Err(error) => {
-                tracing::warn!("could not apply the accepted /think level for {session_id}: {error}");
+                tracing::warn!(
+                    "accepted /think level for {session_id} could not be applied to the mirror: {error}"
+                );
             }
         }
     }
@@ -1317,14 +1264,15 @@ impl SessionsHandle {
             // one-shot next-turn window (spec #922). `/model` records the
             // pending in the adapter and **must not** write the store: the
             // thread's current pair and effort stay the last accepted fact until
-            // a new turn runs. An unsupported `/think` level is carried as a
-            // pending intent and cleared only when that turn is accepted.
+            // a new turn runs. The effort the pick keeps is the pending one when
+            // a pick is already waiting, else the last accepted level.
             if backend.has_thread_provider() {
-                let intent_before = self.pending_effort_intent(&session_id).await;
-                let mut probe = match &intent_before {
-                    Some(intent) => intent.value.clone(),
-                    None => snapshot.variant.clone(),
+                let intended_before = if backend.has_pending_selection(&session_id).await {
+                    backend.pending_variant(&session_id).await
+                } else {
+                    snapshot.variant.clone()
                 };
+                let mut probe = intended_before.clone();
                 let cleared = self
                     .clear_variant_for_model(backend, &mut probe, model_spec)
                     .await;
@@ -1333,23 +1281,23 @@ impl SessionsHandle {
                 let Some(current) = self.session_settings(thread_key).await else {
                     return Ok(PickOutcome::NoTarget);
                 };
+                let intended_now = if backend.has_pending_selection(&session_id).await {
+                    backend.pending_variant(&session_id).await
+                } else {
+                    snapshot.variant.clone()
+                };
                 if current.session_id.as_deref() != Some(session_id.as_str())
                     || current.model != snapshot.model
                     || current.variant != snapshot.variant
-                    || self.pending_effort_intent(&session_id).await != intent_before
+                    || intended_now != intended_before
                 {
-                    // The store moved, or a newer `/think` changed the intent
-                    // while the catalog read ran: the newer command wins.
+                    // The store or the pending effort moved while the catalog
+                    // read ran: the newer command wins, retry.
                     return Ok(PickOutcome::StateChanged);
                 }
                 backend
                     .record_pending_model(&session_id, model_spec, probe.as_deref())
                     .await?;
-                if cleared.is_some() {
-                    // The new model does not declare the level: the accepted
-                    // turn should clear it, not carry it forward.
-                    self.set_pending_effort_intent(&session_id, None).await;
-                }
                 return Ok(PickOutcome::Applied {
                     cleared_variant: cleared,
                 });
@@ -1668,7 +1616,6 @@ impl SessionsHandle {
             backend
                 .record_pending_variant(&session_id, variant.as_deref())
                 .await?;
-            self.set_pending_effort_intent(&session_id, variant).await;
             return Ok(PickOutcome::Applied {
                 cleared_variant: None,
             });

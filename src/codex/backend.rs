@@ -152,6 +152,10 @@ pub(crate) struct PendingSelections {
     /// A process-wide, never-reset counter, so two identical picks are still
     /// distinguishable across an in-flight request.
     generation: std::sync::atomic::AtomicU64,
+    /// What the adapter actually applied on an accepted new turn, waiting for
+    /// the bridge to commit it to the persisted mirror. Shared at the lifecycle
+    /// so a replacement does not lose it. `Some(None)` is an explicit clear.
+    applied: Mutex<HashMap<String, Option<String>>>,
 }
 
 impl PendingSelections {
@@ -188,7 +192,10 @@ impl PendingSelections {
                 variant: None,
             }),
             effort: variant.map(str::to_string),
-            clear_effort: false,
+            // A model pick that carries no effort means the accepted turn
+            // should clear the current level (the bridge passes the post-clear
+            // value). A pick that keeps a declared level passes it as `Some`.
+            clear_effort: variant.is_none(),
         };
         self.pending
             .lock()
@@ -259,13 +266,22 @@ impl PendingSelections {
         self.pending_selection(thread_id)?.effort
     }
 
-    /// The generation of the pending selection, if any.
-    pub(crate) fn pending_generation(&self, thread_id: &str) -> Option<u64> {
-        self.pending
+    /// Record what an accepted new turn actually applied, for the bridge to
+    /// commit to the persisted mirror. The bridge takes it; an interrupted
+    /// bridge leaves it for the next turn.
+    pub(crate) fn record_applied_effort(&self, thread_id: &str, effort: Option<String>) {
+        self.applied
             .lock()
-            .expect("codex pending selections")
-            .get(thread_id)
-            .map(|selection| selection.generation)
+            .expect("codex applied efforts")
+            .insert(thread_id.to_string(), effort);
+    }
+
+    /// Take the applied effort, if one is waiting to be committed.
+    pub(crate) fn take_applied_effort(&self, thread_id: &str) -> Option<Option<String>> {
+        self.applied
+            .lock()
+            .expect("codex applied efforts")
+            .remove(thread_id)
     }
 }
 
@@ -2373,8 +2389,8 @@ impl Backend for CodexClient {
         self.projections.pending_selection(session_id).is_some()
     }
 
-    async fn pending_generation(&self, session_id: &str) -> Option<u64> {
-        self.projections.pending.pending_generation(session_id)
+    async fn take_applied_effort(&self, session_id: &str) -> Option<Option<String>> {
+        self.projections.pending.take_applied_effort(session_id)
     }
 
     async fn prompt(
@@ -2536,6 +2552,13 @@ impl Backend for CodexClient {
             // identical `/model` re-picked while this request was in flight is
             // a newer pending and survives for the next new turn.
             self.projections.consume_pending_if(session_id, sent);
+            // Record what this accepted turn actually sent for the bridge's
+            // mirror commit. A model-only pick leaves the effort unchanged.
+            if sent.effort.is_some() || sent.clear_effort {
+                self.projections
+                    .pending
+                    .record_applied_effort(session_id, sent.effort.clone());
+            }
             // The override is "for this turn and subsequent turns", so the
             // thread now runs it (issue #904). Record it before the read so
             // a read that omits the model does not erase what was sent; a
@@ -3147,8 +3170,8 @@ impl Backend for CodexLifecycle {
         self.pending.has_pending(session_id)
     }
 
-    async fn pending_generation(&self, session_id: &str) -> Option<u64> {
-        self.pending.pending_generation(session_id)
+    async fn take_applied_effort(&self, session_id: &str) -> Option<Option<String>> {
+        self.pending.take_applied_effort(session_id)
     }
 
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
@@ -7573,6 +7596,10 @@ mod tests {
             client.has_pending_selection("thread-1").await,
             "a fold does not consume an explicit reset"
         );
+        assert!(
+            client.take_applied_effort("thread-1").await.is_none(),
+            "a fold applied nothing"
+        );
 
         // A definite refusal keeps it too.
         server.reject_next_turn_start("no reset here");
@@ -7583,6 +7610,10 @@ mod tests {
         assert!(
             client.has_pending_selection("thread-1").await,
             "a definite refusal keeps an explicit reset"
+        );
+        assert!(
+            client.take_applied_effort("thread-1").await.is_none(),
+            "a definite refusal applied nothing"
         );
 
         // End the folded turn, then accept a genuinely new one.
@@ -7602,6 +7633,11 @@ mod tests {
         assert!(
             !client.has_pending_selection("thread-1").await,
             "the accepted new turn consumes the reset marker"
+        );
+        assert_eq!(
+            client.take_applied_effort("thread-1").await,
+            Some(None),
+            "the accepted reset reports a clear to the bridge"
         );
     }
 

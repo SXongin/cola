@@ -1605,17 +1605,6 @@ async fn a_reset_only_pending_keeps_current_until_acceptance() {
         client.has_pending_selection(THREAD).await,
         "the reset is an adapter pending marker"
     );
-    assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent(THREAD)
-            .await
-            .map(|intent| intent.value),
-        Some(None),
-        "the intent records an explicit clear"
-    );
-
     send_command_in(
         &app,
         "/model",
@@ -1661,17 +1650,6 @@ async fn a_reset_only_pending_keeps_current_until_acceptance() {
         "a refused reset did not move the mirror"
     );
     assert!(client.has_pending_selection(THREAD).await);
-    assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent(THREAD)
-            .await
-            .map(|intent| intent.value),
-        Some(None),
-        "a refused reset keeps its intent"
-    );
-
     // An accepted new turn consumes the marker and clears the mirror.
     let handler = tokio::spawn({
         let app = app.clone();
@@ -1697,7 +1675,6 @@ async fn a_reset_only_pending_keeps_current_until_acceptance() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(!client.has_pending_selection(THREAD).await);
-    assert_eq!(handles.flow.sessions.pending_effort_intent(THREAD).await, None);
     send_command_in(
         &app,
         "/model",
@@ -1829,11 +1806,11 @@ async fn the_accepted_effort_commit_waits_for_the_session_gate() {
     wait_for_handler(handler, "the gated effort turn", SETTLE_DEADLINE).await;
 }
 
-/// Spec #922 gate review: cancelling a Turn while `turn/start` is outstanding
-/// drops the captured effort intent, so a later prompt neither sends it nor
-/// commits it to the current mirror.
+/// Spec #922: an accepted turn records its applied effort before the bounded
+/// read-back. Cancelling during that read-back leaves the record for the next
+/// turn's pre-flight, so the mirror catches up.
 #[tokio::test]
-async fn a_cancelled_turn_drops_the_effort_intent() {
+async fn a_cancel_during_read_back_leaves_the_applied_effort_for_the_next_turn() {
     let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
     let mut thread = ScriptedThread::adopted(THREAD, "session-root", WORK, "a real thread");
     thread.model = Some("gpt-5.1-codex".into());
@@ -1855,18 +1832,8 @@ async fn a_cancelled_turn_drops_the_effort_intent() {
         crate::config::ConversationKind::P2p,
     )
     .await;
-    let handles = app.command_handles();
-    assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent(THREAD)
-            .await
-            .map(|intent| intent.value),
-        Some(Some("high".into()))
-    );
 
-    server.silence_next_turn_start();
+    server.silence_next_thread_read();
     let cancelled = tokio::spawn({
         let app = app.clone();
         async move {
@@ -1875,27 +1842,27 @@ async fn a_cancelled_turn_drops_the_effort_intent() {
         }
     });
     let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
-    while server.turn_params(THREAD).is_empty() {
+    while client.has_pending_selection(THREAD).await {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the prompt never reached turn/start"
+            "the adapter never accepted the pending turn"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     cancelled.abort();
     let _ = cancelled.await;
-    // The aborted Turn never reached its finalizer; release its prompt guard and
-    // its loading card so the later prompt is a normal turn rather than a
-    // "busy"/Supplement path.
     app.waits_handle().inflight.lock().await.remove(THREAD);
     app.waits_handle().inbound.lock().await.remove(THREAD);
     app.cards.lock().await.clear();
     assert_eq!(
-        handles.flow.sessions.pending_effort_intent(THREAD).await,
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone()),
         None,
-        "cancellation removed the captured intent"
+        "the cancelled read-back did not commit yet"
     );
-    assert!(!client.has_pending_selection(THREAD).await);
 
     let handler = tokio::spawn({
         let app = app.clone();
@@ -1915,15 +1882,21 @@ async fn a_cancelled_turn_drops_the_effort_intent() {
     let later = server.turn_params(THREAD).pop().expect("the later turn/start");
     assert_eq!(later.get("model"), None);
     assert_eq!(later.get("effort"), None);
-    assert_eq!(
-        app.sessions
-            .lock()
-            .await
-            .get_active(&key)
-            .and_then(|entry| entry.variant.clone()),
-        None,
-        "the dropped intent was never committed to the mirror"
-    );
+    while app
+        .sessions
+        .lock()
+        .await
+        .get_active(&key)
+        .and_then(|entry| entry.variant.clone())
+        .as_deref()
+        != Some("high")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the next turn did not commit the outstanding applied effort"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 
     let live = server.live_turn(THREAD).expect("the turn is running");
     let now = chrono::Utc::now().timestamp();
@@ -1957,7 +1930,7 @@ async fn a_newer_think_before_acceptance_keeps_the_sent_level_current() {
         ]
     })]);
     let directory = tempfile::tempdir().expect("tempdir");
-    let (app, _platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let (app, _platform, client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
     let key = crate::config::ThreadKey::new(CHAT.into(), CHAT.into());
     send_command_in(
         &app,
@@ -2028,14 +2001,9 @@ async fn a_newer_think_before_acceptance_keeps_the_sent_level_current() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert_eq!(
-        handles
-            .flow
-            .sessions
-            .pending_effort_intent(THREAD)
-            .await
-            .map(|intent| intent.value),
-        Some(Some("low".into())),
-        "the newer low intent survives the high acceptance"
+        client.pending_variant(THREAD).await.as_deref(),
+        Some("low"),
+        "the newer low pick survives the high acceptance"
     );
 
     wait_for_handler(first, "the high turn", SETTLE_DEADLINE).await;

@@ -1348,9 +1348,6 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::bridge::test_support::{
-        RecordingPlatform, incoming, seed_entry, send_command_in, test_config,
-    };
     use crate::codex::schema::PinnedProbe;
     use crate::codex::test_server::{FakeCodex, FakeServer, ScriptedThread};
 
@@ -2211,21 +2208,16 @@ mod tests {
         );
     }
 
-    /// Spec #922 final review: a prompt refused while no client is attached must
-    /// not take the bridge's effort intent. The shared store still reports the
-    /// pending, and the later attached turn consumes it and commits the mirror.
+    /// Spec #922 final review: an accepted turn's applied effort is shared at
+    /// the lifecycle, so it is still readable while no client is attached.
     #[tokio::test]
-    async fn an_unattached_refusal_keeps_the_effort_intent() {
+    async fn applied_effort_survives_an_unattached_interval() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
-        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
-        thread.model = Some("gpt-5.1-codex".into());
-        thread.model_provider = Some("openai".into());
-        server.seed_thread(thread);
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
             .expect("control dir");
         std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
-        let lifecycle = Arc::new(fixture.lifecycle(crate::config::ServerStartPolicy::Never));
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
         let never_busy = || false;
         assert_eq!(
             lifecycle
@@ -2234,146 +2226,16 @@ mod tests {
                 .expect("attached"),
             AttachOutcome::Attached
         );
+        lifecycle
+            .pending
+            .record_applied_effort("thread-1", Some("high".into()));
 
-        let directory = tempfile::tempdir().expect("tempdir");
-        let platform = Arc::new(RecordingPlatform::new());
-        let backend: Arc<dyn crate::backend::Backend> = lifecycle.clone();
-        let app = Arc::new(
-            crate::bridge::App::new(
-                test_config(&directory.path().join("sessions.json")),
-                backend,
-                platform,
-            )
-            .expect("the bridge app"),
-        );
-        // The local refusal leaves the turn without observable contact; keep
-        // the lost-contact grace short so the test does not wait the production
-        // ten minutes for the error card to settle.
-        app.turn_follow_grace_ms
-            .store(200, std::sync::atomic::Ordering::Relaxed);
-        app.turn_follow_read_timeout_ms
-            .store(50, std::sync::atomic::Ordering::Relaxed);
-        let key = crate::config::ThreadKey::new("chat-1".into(), "chat-1".into());
-        let mut entry = crate::config::SessionEntry::new(key.clone(), "thread-1", "/work/cola");
-        entry.model = Some("openai/gpt-accepted".into());
-        entry.variant = Some("low".into());
-        seed_entry(&app, entry).await;
-
-        send_command_in(
-            &app,
-            "/think high",
-            key.clone(),
-            "msg_think",
-            crate::config::ConversationKind::P2p,
-        )
-        .await;
-        let handles = app.command_handles();
-        assert_eq!(
-            handles
-                .flow
-                .sessions
-                .pending_effort_intent("thread-1")
-                .await
-                .map(|intent| intent.value),
-            Some(Some("high".into()))
-        );
-
-        // No client: the local prompt refusal is not permission to drop the
-        // intent, because the shared store still holds the pending.
-        let sent_pending = crate::backend::Backend::pending_generation(&*lifecycle, "thread-1").await;
-        let intent_at_send = handles.flow.sessions.pending_effort_intent("thread-1").await;
         lifecycle.attached.lock().await.take();
-        crate::bridge::turn::Turn::commit_pending_effort(
-            &app.turn_handles(),
-            "thread-1",
-            &key,
-            false,
-            sent_pending,
-            intent_at_send.as_ref(),
-        )
-        .await;
         assert_eq!(
-            app.sessions
-                .lock()
-                .await
-                .get_active(&key)
-                .and_then(|entry| entry.variant.clone())
-                .as_deref(),
-            Some("low"),
-            "the failed prompt did not move the mirror"
-        );
-        assert_eq!(
-            handles
-                .flow
-                .sessions
-                .pending_effort_intent("thread-1")
-                .await
-                .map(|intent| intent.value),
+            crate::backend::Backend::take_applied_effort(&lifecycle, "thread-1").await,
             Some(Some("high".into())),
-            "the unattached refusal kept the intent"
+            "the shared applied record survives an unattached interval"
         );
-
-        // Re-attach: the next new turn consumes the shared pending and commits.
-        assert_eq!(
-            lifecycle
-                .ensure_attached(request(&never_busy))
-                .await
-                .expect("reattached"),
-            AttachOutcome::Attached
-        );
-        let handler = tokio::spawn({
-            let app = app.clone();
-            async move {
-                app.handle_message(incoming(
-                    "msg_attached".into(),
-                    "chat-1".into(),
-                    "p2p".into(),
-                    None,
-                    "run it".into(),
-                    None,
-                ))
-                .await
-            }
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while server.turn_params("thread-1").is_empty() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the reattached turn never started"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let params = server.turn_params("thread-1");
-        assert_eq!(params[0]["effort"], "high");
-        while app
-            .sessions
-            .lock()
-            .await
-            .get_active(&key)
-            .and_then(|entry| entry.variant.clone())
-            .as_deref()
-            != Some("high")
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the accepted turn never committed the mirror"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let live = server.live_turn("thread-1").expect("the turn is running");
-        let now = chrono::Utc::now().timestamp();
-        server.push_to_thread(
-            "thread-1",
-            "turn/completed",
-            json!({
-                "threadId": "thread-1",
-                "turn": { "id": live, "status": "completed", "startedAt": now, "completedAt": now + 1 },
-            }),
-        );
-        tokio::time::timeout(Duration::from_secs(15), handler)
-            .await
-            .expect("the turn settles")
-            .expect("the handler joins");
     }
 
     /// A daemon replaced behind the same control path (a restart re-points the

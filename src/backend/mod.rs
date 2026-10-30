@@ -470,14 +470,14 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         false
     }
 
-    /// The generation of the current pending selection, or `None` when nothing
-    /// is pending. The bridge captures it before a prompt so an accepted turn can
-    /// tell whether the selection it sent was consumed (generation gone/changed)
-    /// even when a newer pick has already replaced it.
+    /// Take the effort an accepted turn actually applied, waiting to be written
+    /// to the session mirror. `None` means nothing is waiting; `Some(None)` is
+    /// an explicit clear. The adapter records this at acceptance, so a bridge
+    /// cancellation after that point leaves it for the next turn.
     ///
     /// The default answers `None`: **not applicable to a client** with no
     /// next-turn pending. A client that has one overrides this.
-    async fn pending_generation(&self, _session_id: &str) -> Option<u64> {
+    async fn take_applied_effort(&self, _session_id: &str) -> Option<Option<String>> {
         None
     }
 
