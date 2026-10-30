@@ -75,6 +75,27 @@ const ADOPTION_DRAIN_LIMIT: usize = 1024;
 /// feeds [`Projections`] without a subscription.
 const THREAD_STATUS_CHANGED: &str = "thread/status/changed";
 
+/// A live thread's one-shot next-turn selection (spec #922): the model and
+/// effort the next **new** `turn/start` should carry. Either half may be
+/// absent — a `/think` alone is a pending effort, a `/model` alone a pending
+/// model. It is deliberately in-memory (a restart drops it) and consumed by
+/// the acceptance of a new turn, never by a steer, a folded turn or a command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PendingSelection {
+    /// The model, with the provider normalized the same way `record_sent_model`
+    /// does (a neutral `codex` pick takes the thread's real provider for
+    /// display) so the pending line and the read-back compare the same pair.
+    pub(crate) model: Option<ModelIdentity>,
+    /// The `/think` level to send as `effort`.
+    pub(crate) effort: Option<String>,
+}
+
+impl PendingSelection {
+    fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none()
+    }
+}
+
 /// One thread's projection and the state of its subscription.
 #[derive(Default)]
 pub(crate) struct Projections {
@@ -131,6 +152,11 @@ pub(crate) struct Projections {
     /// The adoption backlog drain limit. Zero means the production default;
     /// tests lower it to exercise the truncation-and-retry path.
     drain_limit: Mutex<usize>,
+    /// Each live thread's one-shot next-turn selection (spec #922). Kept beside
+    /// the projections because acceptance, the fold check and the bounded
+    /// read-back all live at this protocol boundary; the bridge only records a
+    /// pick and reads it back for display.
+    pending: Mutex<HashMap<String, PendingSelection>>,
 }
 
 impl Drop for Projections {
@@ -572,6 +598,82 @@ impl Projections {
             .record_sent_model(model, sent);
     }
 
+    /// Record the next new turn's model for a live thread (spec #922). The
+    /// provider is normalized like an accepted pick's: a neutral `codex` ref
+    /// takes the thread's real provider when one is known, so the pending line
+    /// and the bounded read-back compare the same pair.
+    pub(crate) fn record_pending_model(&self, thread_id: &str, spec: &str, variant: Option<&str>) {
+        let Some(parsed) = crate::backend::parsing::parse_model(spec) else {
+            tracing::warn!(thread = %thread_id, model = %spec, "ignoring a pending model that does not parse");
+            return;
+        };
+        let provider_id = if parsed.provider_id == MODEL_PROVIDER {
+            self.model(thread_id)
+                .map(|held| held.provider_id)
+                .filter(|provider| provider != MODEL_PROVIDER)
+                .unwrap_or(parsed.provider_id)
+        } else {
+            parsed.provider_id
+        };
+        let pending = PendingSelection {
+            model: Some(ModelIdentity {
+                provider_id,
+                model_id: parsed.id,
+                variant: None,
+            }),
+            effort: variant.map(str::to_string),
+        };
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .insert(thread_id.to_string(), pending);
+    }
+
+    /// Record a pending `/think` level, preserving a pending model (spec #922).
+    pub(crate) fn record_pending_variant(&self, thread_id: &str, variant: Option<&str>) {
+        let mut pending = self.pending.lock().expect("codex pending selections");
+        let selection = pending.entry(thread_id.to_string()).or_default();
+        selection.effort = variant.map(str::to_string);
+        if selection.is_empty() {
+            pending.remove(thread_id);
+        }
+    }
+
+    /// A live thread's one-shot next-turn selection, if one is recorded.
+    pub(crate) fn pending_selection(&self, thread_id: &str) -> Option<PendingSelection> {
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .get(thread_id)
+            .cloned()
+    }
+
+    /// Consume the pending selection: the next new turn was accepted, so its
+    /// override has become the thread's default. Never resurrected.
+    pub(crate) fn consume_pending(&self, thread_id: &str) {
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .remove(thread_id);
+    }
+
+    /// The model reference of a live thread's pending selection, for the
+    /// model card's 待应用 line.
+    pub(crate) fn pending_model(&self, thread_id: &str) -> Option<String> {
+        let selection = self.pending_selection(thread_id)?;
+        let model = selection.model?;
+        Some(crate::backend::parsing::join_model(
+            &model.provider_id,
+            &model.model_id,
+        ))
+    }
+
+    /// The effort of a live thread's pending selection, for the footer of the
+    /// turn that will carry it.
+    pub(crate) fn pending_variant(&self, thread_id: &str) -> Option<String> {
+        self.pending_selection(thread_id)?.effort
+    }
+
     /// The model the ordered store holds for a thread (issue #904), which is
     /// what both surfaces must report: a read whose answer an accepted pick
     /// superseded is not shown, even to the caller that made the read.
@@ -980,10 +1082,13 @@ impl CodexClient {
 
     /// The `turn/start` params for one prompt. Model and effort ride the turn
     /// (and the thread's subsequent turns, per the protocol's own field
-    /// documentation) rather than a durable session switch: `turn/start` is
-    /// where Codex accepts them, so a `/model` or `/think` pick reaches the
-    /// next turn through cola's per-session override — the same place V1 puts
-    /// it, and the reason `switch_session_model` stays a no-op on this client.
+    /// documentation) rather than a durable session switch. On a live Codex
+    /// thread the bridge hands over no pick at all (spec #922): the adapter's
+    /// one-shot pending owns it, and it is sent only until the next new turn is
+    /// accepted. The direct arguments remain for adapter-level callers (and an
+    /// effort a caller states explicitly), but a pending always wins so a
+    /// consumed pick can never be re-sent from a stale mirror.
+    #[allow(clippy::too_many_arguments)] // session/text/skills/model/variant/id/pending
     fn turn_params(
         &self,
         session_id: &str,
@@ -992,6 +1097,7 @@ impl CodexClient {
         model: Option<&ModelInfo>,
         variant: Option<&str>,
         message_id: Option<&str>,
+        pending: Option<&PendingSelection>,
     ) -> Result<Value> {
         let mut params = json!({
             "threadId": session_id,
@@ -1000,13 +1106,67 @@ impl CodexClient {
         if let Some(message_id) = message_id {
             params["clientUserMessageId"] = json!(message_id);
         }
-        if let Some(model) = model {
-            params["model"] = json!(model.id);
-        }
-        if let Some(effort) = variant.or_else(|| model.and_then(|model| model.variant.as_deref())) {
-            params["effort"] = json!(effort);
+        if let Some(pending) = pending {
+            if let Some(model) = &pending.model {
+                params["model"] = json!(model.model_id);
+            }
+            if let Some(effort) = &pending.effort {
+                params["effort"] = json!(effort);
+            }
+        } else {
+            if let Some(model) = model {
+                params["model"] = json!(model.id);
+            }
+            if let Some(effort) = variant.or_else(|| model.and_then(|model| model.variant.as_deref())) {
+                params["effort"] = json!(effort);
+            }
         }
         Ok(params)
+    }
+
+    /// The bounded `thread/read` after a pending selection's acceptance (spec
+    /// #922): it updates the thread fact, and a disagreement is a **named
+    /// mismatch** only. The pending is already consumed and is never
+    /// resurrected — a peer may have changed the pair after us, and re-sending
+    /// the stale pick would overwrite it.
+    async fn read_back_pending(&self, session_id: &str, pending: &PendingSelection) {
+        let observed = self.projections.next_model_stamp();
+        match tokio::time::timeout(PENDING_READ_BACK_TIMEOUT, self.threads().read(session_id, false)).await {
+            Ok(Ok(thread)) => {
+                self.projections.remember_thread_metadata(&thread, observed);
+                let Some(expected) = pending.model.as_ref() else {
+                    return;
+                };
+                let Some(actual) = self.projections.model(session_id) else {
+                    return;
+                };
+                if actual.provider_id != expected.provider_id || actual.model_id != expected.model_id {
+                    let expected =
+                        crate::backend::parsing::join_model(&expected.provider_id, &expected.model_id);
+                    let actual = crate::backend::parsing::join_model(&actual.provider_id, &actual.model_id);
+                    tracing::warn!(
+                        thread = %session_id,
+                        expected = %expected,
+                        observed = %actual,
+                        "next-turn model mismatch after turn/start: the read still reports another pair; \
+                         keeping the thread fact and not re-sending the consumed pick"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    thread = %session_id,
+                    "the next-turn model read-back failed; keeping the thread's own model: {error}"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    thread = %session_id,
+                    "the next-turn model read-back did not answer within {PENDING_READ_BACK_TIMEOUT:?}; \
+                     keeping the thread's own model"
+                );
+            }
+        }
     }
 
     /// The protocol's `input` array: the prompt text, then one `skill` part per
@@ -1451,6 +1611,14 @@ const SKILL_CWD_READ_TIMEOUT: Duration = Duration::from_millis(60);
 const PROVIDER_READ_TIMEOUT: Duration = Duration::from_millis(800);
 #[cfg(test)]
 const PROVIDER_READ_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// The bounded `thread/read` after a pending `/model`'s new turn is accepted
+/// (spec #922). It only updates the thread fact; a timeout leaves that fact as
+/// the accepted turn set it, never a retry of the consumed pick.
+#[cfg(not(test))]
+const PENDING_READ_BACK_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const PENDING_READ_BACK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The provider bucket the `/model` picker shows for Codex. `model/list` names
 /// no provider: a Codex model is whatever the attached app-server resolves
@@ -1944,6 +2112,26 @@ impl Backend for CodexClient {
             .filter(|provider| provider != MODEL_PROVIDER)
     }
 
+    /// Record the next new turn's selection (spec #922). Codex has no durable
+    /// model switch on its public surface, so `/model` is a one-shot pending
+    /// held here; it rides the next genuinely new `turn/start` and is consumed
+    /// when that turn is accepted.
+    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) {
+        self.projections.record_pending_model(session_id, model, variant);
+    }
+
+    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) {
+        self.projections.record_pending_variant(session_id, variant);
+    }
+
+    async fn pending_model(&self, session_id: &str) -> Option<String> {
+        self.projections.pending_model(session_id)
+    }
+
+    async fn pending_variant(&self, session_id: &str) -> Option<String> {
+        self.projections.pending_variant(session_id)
+    }
+
     async fn prompt(
         &self,
         session_id: &str,
@@ -1990,6 +2178,12 @@ impl Backend for CodexClient {
                 }
             }
         }
+        // The one-shot next-turn selection (spec #922) is read **before** the
+        // send and before the params: a `/model` that lands while this submit
+        // is in flight belongs to the next turn, and the acceptance check below
+        // must compare against the live turn this request saw.
+        let pending = self.projections.pending_selection(session_id);
+        let live_before = self.projections.live_turn(session_id);
         // `turn/start` is the write half of this ticket's read model; a failed
         // submit is its own error, while the Turn's outcome is observed from
         // the transcript and session status (ADR-0011).
@@ -1997,7 +2191,15 @@ impl Backend for CodexClient {
         // The params are built BEFORE the pending marker: a pre-send validation
         // failure (an unknown skill) must not leave a marker behind, or a later
         // external live turn on this thread could be classified cola's.
-        let params = self.turn_params(session_id, text, skills, model, variant, message_id)?;
+        let params = self.turn_params(
+            session_id,
+            text,
+            skills,
+            model,
+            variant,
+            message_id,
+            pending.as_ref(),
+        )?;
         // The turn id is Codex's, so the authorship record is bound from the
         // response. The chosen submission id is recorded durably BEFORE the
         // request: the server may emit the turn's user item before this task
@@ -2014,6 +2216,16 @@ impl Backend for CodexClient {
         let result = match self.connection().request("turn/start", params).await {
             Ok(result) => result,
             Err(error) => {
+                if definitely_refused(&error) {
+                    // The server answered a JSON-RPC error, so the turn did not
+                    // start: the pending is still owed to the next new turn.
+                } else {
+                    // Ambiguous: the connection closed, the request timed out,
+                    // or no answer arrived. The server may have accepted it and
+                    // applied the override, so re-sending would overwrite a
+                    // peer's later change. Drop the pending, never retry.
+                    self.projections.consume_pending(session_id);
+                }
                 if definitely_refused(&error) || message_id.is_none() {
                     // A definite refusal did not start the turn. A submission
                     // with no chosen id cannot be reconciled by a later read
@@ -2033,8 +2245,11 @@ impl Backend for CodexClient {
             Err(error) => {
                 // The server answered, but the payload did not name the turn:
                 // it may have started one, so a chosen id's pending marker
-                // stays for the next read. An anonymous one cannot be
-                // reconciled, so it does not linger.
+                // stays for the next read. The same ambiguity covers the
+                // next-turn selection: we cannot prove it applied, and
+                // re-sending could overwrite a peer.
+                self.projections.consume_pending(session_id);
+                // An anonymous one cannot be reconciled, so it does not linger.
                 if message_id.is_none() {
                     self.authored.abandon(session_id, message_id);
                 }
@@ -2045,12 +2260,33 @@ impl Backend for CodexClient {
         // fold) binds that turn: it is the turn cola's message landed in, and
         // the card must settle on it. Never a second turn.
         self.authored.bind(session_id, &turn.id, message_id);
-        // A pick rides `turn/start` "for this turn and subsequent turns", so
-        // the thread now runs this model: record it here or the footer would
-        // keep naming the model from before the pick (issue #904). The
-        // response is the acceptance this waits for — a refused turn/start
-        // changed nothing.
-        if let Some(model) = model {
+        // Only a *new* turn is the acceptance this waits for. A response naming
+        // the live turn observed before the send was folded into it: the
+        // protocol does not promise the override applies there, so it does not
+        // consume the pending (spec #922 decision 2). A steer and a command
+        // never reach this path at all.
+        let accepted_new_turn = live_before.as_deref() != Some(turn.id.as_str());
+        if let Some(pending) = pending {
+            if accepted_new_turn {
+                self.projections.consume_pending(session_id);
+                // The override is "for this turn and subsequent turns", so the
+                // thread now runs it (issue #904). Record it before the read so
+                // a read that omits the model does not erase what was sent; a
+                // read that reports a different pair then wins (and is only
+                // reported, never undone — spec #922).
+                if let Some(model) = pending.model.clone() {
+                    let sent = self.projections.next_model_stamp();
+                    self.projections.record_sent_model(session_id, model, sent);
+                }
+                self.read_back_pending(session_id, &pending).await;
+            }
+        } else if let Some(model) = model {
+            // The direct-call path (adapter tests and callers that are not the
+            // bridge): a pick rides `turn/start` "for this turn and subsequent
+            // turns", so the thread now runs this model. The bridge itself
+            // never passes one on this client — the pending above is the only
+            // next-turn source.
+            //
             // The pick's provider is the neutral `codex` bucket when it came from
             // the picker, and a model pick does not change the thread's provider
             // (`model_provider` is configuration, not part of `turn/start`). A
@@ -2479,7 +2715,7 @@ impl Backend for CodexClient {
             && current_reference.as_deref() != Some(pending)
             && let Some(scope) = surface.scopes.first_mut()
         {
-            let line = format!("待应用：`{pending}`（下一条消息前切换）");
+            let line = format!("待应用：`{pending}`（下一条新消息生效）");
             scope.note = Some(match scope.note.take() {
                 Some(note) => format!("{note}　{line}"),
                 None => line,
@@ -2590,6 +2826,34 @@ impl Backend for CodexLifecycle {
 
     fn is_neutral_provider(&self, provider: &str) -> bool {
         provider == MODEL_PROVIDER
+    }
+
+    /// The pending next-turn selection lives on the attached client (it must
+    /// travel with the connection's projections), so the wrapper delegates.
+    async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) {
+        if let Some(client) = self.attached_client().await {
+            Backend::record_pending_model(&client, session_id, model, variant).await;
+        }
+    }
+
+    async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) {
+        if let Some(client) = self.attached_client().await {
+            Backend::record_pending_variant(&client, session_id, variant).await;
+        }
+    }
+
+    async fn pending_model(&self, session_id: &str) -> Option<String> {
+        match self.attached_client().await {
+            Some(client) => Backend::pending_model(&client, session_id).await,
+            None => None,
+        }
+    }
+
+    async fn pending_variant(&self, session_id: &str) -> Option<String> {
+        match self.attached_client().await {
+            Some(client) => Backend::pending_variant(&client, session_id).await,
+            None => None,
+        }
     }
 
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {
@@ -6767,6 +7031,201 @@ mod tests {
             !client.keeps_session_selection(),
             "the pick is per-turn, not a durable session switch"
         );
+    }
+
+    /// Spec #922: a live thread's `/model` is a one-shot pending. The next new
+    /// turn carries `model` + `effort`, its acceptance consumes the pending, and
+    /// the bounded read-back reporting the old pair is only a named mismatch —
+    /// the pending is never resurrected and later turns send no pick.
+    #[tokio::test]
+    async fn a_pending_model_rides_the_next_new_turn_then_is_consumed() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-5.1-codex".into());
+        thread.model_provider = Some("openai".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
+            .await;
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-6-luna")
+        );
+
+        let ((), logs) = crate::bridge::test_support::capture_logs(async {
+            client
+                .prompt("thread-1", "run it", &[], &[], None, None, None, None)
+                .await
+                .expect("the prompt");
+        })
+        .await;
+        let params = server.turn_params("thread-1");
+        assert_eq!(params.len(), 1, "one turn/start");
+        assert_eq!(params[0]["model"], "gpt-6-luna");
+        assert_eq!(params[0]["effort"], "high");
+        assert_eq!(
+            client.pending_model("thread-1").await,
+            None,
+            "the accepted new turn consumed the pending"
+        );
+        assert!(
+            logs.contains("next-turn model mismatch after turn/start")
+                && logs.contains("thread-1")
+                && logs.contains("openai/gpt-6-luna")
+                && logs.contains("openai/gpt-5.1-codex"),
+            "the read-back mismatch names the thread and both pairs: {logs}"
+        );
+
+        // The next prompt carries no model/effort: the thread's default is the
+        // fact, and a peer's later change is respected.
+        client
+            .prompt("thread-1", "again", &[], &[], None, None, None, None)
+            .await
+            .expect("the second prompt");
+        let params = server.turn_params("thread-1");
+        let second = params.last().expect("the second turn/start");
+        assert_eq!(second.get("model"), None, "no re-sent model: {second}");
+        assert_eq!(second.get("effort"), None, "no re-sent effort: {second}");
+        assert_eq!(
+            client.pending_model("thread-1").await,
+            None,
+            "the mismatch did not resurrect the pending"
+        );
+    }
+
+    /// Spec #922 decision 2: a steer, a folded `turn/start`, and a command do
+    /// not consume the pending. Only a genuinely new turn does.
+    #[tokio::test]
+    async fn a_steer_a_fold_and_a_command_do_not_consume_the_pending() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-5.1-codex".into());
+        thread.model_provider = Some("openai".into());
+        server.seed_thread(thread);
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client
+            .prompt("thread-1", "start", &[], &[], None, None, None, None)
+            .await
+            .expect("the first turn");
+        wait_for_live_turn(&client, "thread-1").await;
+        client
+            .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
+            .await;
+
+        client
+            .steer(
+                "thread-1",
+                "extra",
+                &[],
+                &[],
+                None,
+                None,
+                None,
+                Some("msg_cola_steer"),
+            )
+            .await
+            .expect("the steer");
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-6-luna"),
+            "a steer carries no model and consumes nothing"
+        );
+
+        // The server folds this into the live turn (its response names the same
+        // turn id); the protocol does not promise the override applies there.
+        client
+            .prompt("thread-1", "folded", &[], &[], None, None, None, None)
+            .await
+            .expect("the folded turn");
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-6-luna"),
+            "a folded turn does not consume the pending"
+        );
+
+        client.compact("thread-1").await.expect("the compaction");
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-6-luna"),
+            "a command does not consume the pending"
+        );
+    }
+
+    /// Spec #922: a definite JSON-RPC refusal leaves the pending for a retry,
+    /// while an ambiguous failure (the accepted request's response is lost)
+    /// drops it — the server may have applied it, so re-sending could overwrite
+    /// a peer.
+    #[tokio::test]
+    async fn a_definite_refusal_keeps_the_pending_and_an_ambiguous_failure_drops_it() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+        client
+            .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
+            .await;
+
+        server.reject_next_turn_start("model is not available here");
+        client
+            .prompt("thread-1", "run it", &[], &[], None, None, None, None)
+            .await
+            .expect_err("the refusal is an error");
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-6-luna"),
+            "a definite refusal did not apply the pick, so it may be retried"
+        );
+
+        server.drop_next_turn_start_response();
+        client
+            .prompt("thread-1", "run it again", &[], &[], None, None, None, None)
+            .await
+            .expect_err("the response was lost");
+        assert_eq!(
+            client.pending_model("thread-1").await,
+            None,
+            "an ambiguous failure drops the pending and never retries it"
+        );
+    }
+
+    /// Spec #922: a `/think` alone is a pending too — the next new turn carries
+    /// the effort with no model field.
+    #[tokio::test]
+    async fn a_pending_effort_alone_rides_the_next_new_turn() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a thread",
+        ));
+        let client = connect(&url).await;
+        client.transcript("thread-1").await.expect("adopt the thread");
+        server.wait_for_subscribers("thread-1", 1).await;
+
+        client.record_pending_variant("thread-1", Some("low")).await;
+        assert_eq!(client.pending_variant("thread-1").await.as_deref(), Some("low"));
+        client
+            .prompt("thread-1", "run it", &[], &[], None, None, None, None)
+            .await
+            .expect("the prompt");
+        let params = server.turn_params("thread-1");
+        assert_eq!(params[0]["effort"], "low");
+        assert_eq!(params[0].get("model"), None, "a variant-only pending");
+        assert_eq!(client.pending_variant("thread-1").await, None);
     }
 
     /// The pick changes what the thread runs from then on ("for this turn and

@@ -808,7 +808,18 @@ impl Turn {
             };
             (model, variant)
         };
-        self.turn_variant = variant;
+        // A client with a thread-level provider axis (Codex) owns its next-turn
+        // pick at the protocol boundary (spec #922): the adapter's one-shot
+        // pending supplies `model`/`effort` on the next **new** `turn/start`,
+        // and the bridge must neither re-send a stale mirror nor send the
+        // stored `/think` level on every later prompt. The footer still
+        // captures the effort this turn will carry, read from the same pending.
+        let next_turn_pending = handles.backend.has_thread_provider();
+        self.turn_variant = if next_turn_pending {
+            handles.backend.pending_variant(&self.session_id).await
+        } else {
+            variant.clone()
+        };
         let agent = handles.sessions.agent_override(&self.session_id).await;
         // Released immediately before the submit (issue #910): `Backend::prompt`
         // has no total response bound, and holding the point across it would let
@@ -828,8 +839,12 @@ impl Turn {
                 &self.text,
                 &self.files,
                 &self.skills,
-                model.as_ref(),
-                self.turn_variant.as_deref(),
+                if next_turn_pending { None } else { model.as_ref() },
+                if next_turn_pending {
+                    None
+                } else {
+                    self.turn_variant.as_deref()
+                },
                 agent.as_deref(),
                 Some(&self.cola_message_id),
             )

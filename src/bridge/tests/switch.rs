@@ -2454,6 +2454,7 @@ async fn a_neutral_bucket_pick_is_model_only() {
     let client = codex_client(&url).await;
     client.transcript("thread-1").await.expect("adopt the thread");
     server.wait_for_subscribers("thread-1", 1).await;
+    let pending_client = client.clone();
 
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
@@ -2495,8 +2496,13 @@ async fn a_neutral_bucket_pick_is_model_only() {
             .unwrap()
             .model
             .as_deref(),
-        Some("codex/gpt-5.1"),
-        "the mirror holds the neutral model"
+        Some("openai/gpt-5.1-codex"),
+        "a live pick does not rewrite the thread's current model"
+    );
+    assert_eq!(
+        pending_client.pending_model("thread-1").await.as_deref(),
+        Some("openai/gpt-5.1"),
+        "the neutral pick is the next turn's pending, shown on the thread's provider"
     );
     assert_eq!(
         server.call_log(),
@@ -2563,6 +2569,7 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
         reserved.display_label()
     );
 
+    let pending_client = client.clone();
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
     let mut entry = codex_entry("thread-1");
@@ -2603,8 +2610,13 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
             .unwrap()
             .model
             .as_deref(),
-        Some("codex/gpt-5.1"),
-        "recorded as a per-turn model"
+        Some("openai/gpt-5.1-codex"),
+        "the live thread's current pair is untouched"
+    );
+    assert_eq!(
+        pending_client.pending_model("thread-1").await.as_deref(),
+        Some("openai/gpt-5.1"),
+        "the neutral bucket is the next turn's pending"
     );
     assert_eq!(
         server.call_log(),

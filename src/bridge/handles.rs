@@ -1229,6 +1229,22 @@ impl SessionsHandle {
             {
                 return Ok(PickOutcome::StateChanged);
             }
+            // A client with a thread-level provider axis (Codex) has a
+            // one-shot next-turn window (spec #922): `/model` records a pending
+            // selection in the adapter and **must not** write `entry.model`.
+            // The thread's current pair stays the fact until a new turn is
+            // accepted; only the `/think` clear still lands on the mirror for
+            // the current display. Every other client keeps its per-prompt
+            // mirror, unchanged.
+            let next_turn = backend.has_thread_provider();
+            let write = if next_turn {
+                MirrorWrite::Variant(probe.as_deref())
+            } else {
+                MirrorWrite::Model {
+                    model: model_spec,
+                    clear_variant: cleared.as_deref(),
+                }
+            };
             let outcome = {
                 let mut store = self.store.lock().await;
                 store.set_mirror_live(
@@ -1236,14 +1252,23 @@ impl SessionsHandle {
                     &session_id,
                     snapshot.model.as_deref(),
                     snapshot.variant.as_deref(),
-                    MirrorWrite::Model {
-                        model: model_spec,
-                        clear_variant: cleared.as_deref(),
-                    },
+                    write,
                     deadline,
                 )?
             };
-            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
+            let outcome = pair_write_outcome(settle_mirror(outcome, deadline).await?);
+            if next_turn {
+                if matches!(outcome, PickOutcome::Applied { .. }) {
+                    backend
+                        .record_pending_model(&session_id, model_spec, probe.as_deref())
+                        .await;
+                    return Ok(PickOutcome::Applied {
+                        cleared_variant: cleared,
+                    });
+                }
+                return Ok(outcome);
+            }
+            return Ok(outcome);
         }
         // A durable generation's selection is server state (V2): the selection
         // read, the `/think` clear and `switch_session_model` are RPCs, and they
@@ -1532,7 +1557,17 @@ impl SessionsHandle {
                 None,
             )?
             .written;
-        Ok(pair_write_outcome(written))
+        let outcome = pair_write_outcome(written);
+        // A Codex live thread applies a `/think` on its next **new** turn: the
+        // adapter's pending carries the effort, while the mirror keeps the
+        // level for the current display (spec #922). A steer, a folded turn or
+        // a command never consumes it.
+        if backend.has_thread_provider() && matches!(outcome, PickOutcome::Applied { .. }) {
+            backend
+                .record_pending_variant(&session_id, variant.as_deref())
+                .await;
+        }
+        Ok(outcome)
     }
 
     /// Apply an `/agent` pick: `agent: None` clears it (back to the server's

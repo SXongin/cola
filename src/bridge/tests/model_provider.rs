@@ -73,7 +73,10 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
         .expect("paired pick");
     assert!(step.card.is_none(), "a pending pick is toast-only");
     assert!(
-        step.toast.as_deref().unwrap_or_default().contains("新线程"),
+        step.toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("会话创建时生效"),
         "the toast says where it applies: {step:?}",
         step = step.toast
     );
@@ -103,8 +106,8 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
     );
     assert_eq!(
         prompt_models.lock().await.as_slice(),
-        &[Some("deepseek/deepseek-v4-pro".to_string())],
-        "the turn carries the model only — a provider is never a turn field"
+        &[None],
+        "the thread already carries the model; the first turn sends no per-prompt pick"
     );
 }
 
@@ -161,7 +164,9 @@ async fn a_neutral_pending_pick_creates_the_thread_without_a_provider() {
 }
 
 /// Spec #922: the **same** provider with another model is an ordinary pick on a
-/// live thread — no thread-level request and no refusal.
+/// live thread — no thread-level request and no refusal. On a thread-provider
+/// client it records a one-shot next-turn pending and leaves the thread's
+/// current pair alone.
 #[tokio::test]
 async fn a_same_provider_pick_is_an_ordinary_model_pick() {
     let _wd = test_work_dir();
@@ -171,6 +176,7 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
     backend
         .with_thread_provider(true)
         .with_known_thread_provider(Some("openai"));
+    let pending = backend.pending_selections.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
@@ -182,8 +188,8 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
         .expect("same-provider pick");
     assert!(step.card.is_none(), "no confirmation for a model pick");
     assert!(
-        step.toast.as_deref().unwrap_or_default().starts_with("Model:"),
-        "the ordinary model toast: {step:?}",
+        step.toast.as_deref().unwrap_or_default().contains("已记录"),
+        "the pending answer is honest: {step:?}",
         step = step.toast
     );
     assert_eq!(
@@ -195,7 +201,14 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
             .unwrap()
             .model
             .as_deref(),
-        Some("openai/gpt-5.1")
+        Some("openai/gpt-5.1-codex"),
+        "the live thread's current pair is untouched"
+    );
+    let pending = pending.lock().await;
+    assert_eq!(
+        pending.get("ses_test").and_then(|(model, _)| model.as_deref()),
+        Some("openai/gpt-5.1"),
+        "the pick is the next new turn's pending model"
     );
 }
 
@@ -820,6 +833,7 @@ async fn a_same_provider_pick_is_recorded_when_the_cache_knows_it() {
     backend
         .with_thread_provider(true)
         .with_known_thread_provider(Some("openai"));
+    let pending = backend.pending_selections.clone();
     let (app, platform) = build_app(cfg, backend).await;
     let mut entry = entry();
     entry.model = Some("openai/gpt-5.1-codex".into());
@@ -846,6 +860,10 @@ async fn a_same_provider_pick_is_recorded_when_the_cache_knows_it() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(reply.contains("Model: openai/gpt-5.1"), "{reply}");
+    assert!(
+        reply.contains("已记录：将在下一条新消息生效"),
+        "the pick is a pending, not an applied switch: {reply}"
+    );
     assert_eq!(
         app.sessions
             .lock()
@@ -855,8 +873,92 @@ async fn a_same_provider_pick_is_recorded_when_the_cache_knows_it() {
             .unwrap()
             .model
             .as_deref(),
+        Some("openai/gpt-5.1-codex"),
+        "the thread's current pair is untouched"
+    );
+    assert_eq!(
+        pending
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|(model, _)| model.as_deref()),
         Some("openai/gpt-5.1"),
-        "the same-provider pick is recorded"
+        "the same-provider pick is the next turn's pending"
+    );
+}
+
+/// Spec #922: the live model card's 待应用 line comes from the adapter's
+/// one-shot pending, not from the store mirror, so it can disappear as soon as
+/// the next new turn consumes it.
+#[tokio::test]
+async fn the_model_card_shows_the_adapters_pending_for_a_live_thread() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_known_thread_provider(Some("openai"));
+    let queries = backend.model_surface_queries.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let handles = app.command_handles();
+    crate::feishu::card::command::model_surface(&handles, &key(), None, None, None).await;
+    let recorded = queries.lock().await;
+    let last = recorded.last().expect("the model-surface read");
+    assert_eq!(
+        last.pending.as_deref(),
+        Some("openai/gpt-5.1"),
+        "the card is told about the adapter's pending, not the untouched store"
+    );
+}
+
+/// Spec #922: a Pending Session's pick is a creation fact. The model card must
+/// show no 待应用 state for it.
+#[tokio::test]
+async fn a_pending_session_has_no_next_turn_pending_on_the_model_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    let queries = backend.model_surface_queries.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("将在会话创建时生效"),
+        "the pending session names creation, not the next turn: {text}"
+    );
+
+    let handles = app.command_handles();
+    crate::feishu::card::command::model_surface(&handles, &key(), None, None, None).await;
+    let recorded = queries.lock().await;
+    let last = recorded.last().expect("the model-surface read");
+    assert_eq!(
+        last.pending, None,
+        "a Pending Session's pair rides thread/start and is never 待应用"
     );
 }
 
