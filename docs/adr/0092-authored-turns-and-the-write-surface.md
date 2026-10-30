@@ -573,12 +573,11 @@ applied and the pending is cleared. It is not re-sent after that. A bounded
 mismatch (a peer may have changed the pair after us), and the pending is
 **not** resurrected — re-sending a stale pick would overwrite the peer's later
 change. Subsequent prompts do not carry the model again, so a peer's later
-change is respected. The pending is cola state, not server state: it may be
-persisted across a restart so a pick made before the next prompt is not lost,
-but it is never re-sent after it is consumed. If a persisted pending was in
-flight when the process died, it is treated as consumed on restart, never
-re-sent: the server may have accepted it, and a re-send could overwrite a
-peer's later change. If it was not accepted, the user re-picks.
+change is respected. The pending is cola state, not server state, and it is
+**in-memory only**: a restart drops it and the thread's own model remains. This
+is deliberate — a persisted pending cannot distinguish an accepted turn whose
+response was lost from one that never ran, and auto-resending could overwrite a
+peer's later change. The user re-picks after a restart.
 
 **2. A steer, a folded turn, or a command does not consume the pending.** A
 Supplement uses `turn/steer`, which has no model field; a `turn/start` that is
