@@ -694,6 +694,7 @@ detailed help for any of these.
 | `/restart-opencode` | Restart the OpenCode server (cola's Owned Server or the V2 Shared Service) |
 | `/update` | Update cola via its install channel (GitHub Releases self-update, or the cargo command for `cargo install`/`cargo binstall` installs) |
 | `/version` | Show cola version and build provenance (release / crates.io / dev build) |
+| `/status` | Show the current model/level, next-turn pending pick, and a short session summary |
 | `/help [command]` | List commands, or show detailed help for one |
 
 Notes:
@@ -871,6 +872,12 @@ provider it shows — it is not a switch). There is no
   a per-prompt override; once it applies, later messages carry no effort.
   `/think --reset` clears the pending level, and a fresh pick on a model that
   does not declare it clears it as usual.
+- **`/status` is the text view of both facts.** It prints 当前 (the same
+  effective-selection ladder as the model card), 待应用 for a live Codex thread
+  when a pick is pending (`清除思考等级` for an explicit reset), then a short
+  session summary (session, directory, agent, auto-accept). A Pending Session
+  shows its creation pair with 「将在会话创建时生效」 and no 待应用; OpenCode
+  has a current line and no pending line.
 - **A Pending Session's pick is a creation parameter.** Before the first message
   there is no thread, so the pair is `thread/start`'s `model` + `modelProvider`
   and the reply says 「将在会话创建时生效」 — never 待应用. `/think` there is the

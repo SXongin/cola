@@ -563,6 +563,7 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
 | `/restart-opencode` | 重启 OpenCode 服务器（cola 自有的服务器或 V2 Shared Service） |
 | `/update` | 按安装渠道更新 cola（GitHub Releases 自更新，或 `cargo install`/`cargo binstall` 安装的 cargo 命令） |
 | `/version` | 显示 cola 版本与构建来源（release / crates.io / dev 构建） |
+| `/status` | 显示当前模型/等级、下一条新消息的待应用选择，以及一段简短的会话摘要 |
 | `/help [command]` | 列出命令，或显示某一条的详细帮助 |
 
 说明：
@@ -694,6 +695,11 @@ Codex 的模型轴不是 provider → model 树：provider 是**创建时**事�
   下一条新消息的 `effort`（保留已有的待应用模型），不是每次 prompt 的覆盖；
   生效之后，后续消息不再携带 effort。`/think --reset` 清除待应用等级；换到
   不支持该等级的新模型时同样会清除。
+- **`/status` 是这两个事实的文本视图。** 它打印「当前」（与模型卡片相同的
+  effective-selection 阶梯）；活动 Codex 线程有待应用选择时打印「待应用」
+  （显式 reset 为「清除思考等级」）；最后是一行会话摘要（会话、目录、agent、
+  自动通过）。待建会话显示创建对，标注「将在会话创建时生效」，没有「待应用」；
+  OpenCode 只显示当前行，没有待应用行。
 - **待建会话的选择是创建参数。** 第一条消息之前没有线程，所以这一对交给
   `thread/start` 的 `model` + `modelProvider`，回复说「将在会话创建时生效」
   ——绝不是「待应用」。那里的 `/think` 也是同一个创建意图：在线程建立后随

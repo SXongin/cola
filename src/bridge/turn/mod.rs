@@ -298,6 +298,41 @@ pub(crate) struct PromptContext {
     pub(crate) advisory_live: bool,
 }
 
+/// Cancellation cleanup for a turn's captured effort intent (spec #922). Armed
+/// before `prompt`, disarmed after `commit_pending_effort`; a dropped future
+/// removes only the captured generation, never a newer pick, and never touches
+/// the mirror.
+struct EffortIntentGuard {
+    sessions: SessionsHandle,
+    session_id: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl EffortIntentGuard {
+    fn arm(sessions: SessionsHandle, session_id: &str, generation: u64) -> Self {
+        Self {
+            sessions,
+            session_id: session_id.to_string(),
+            generation,
+            armed: true,
+        }
+    }
+
+    fn defuse(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EffortIntentGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.sessions
+                .remove_pending_effort_intent_if(&self.session_id, self.generation);
+        }
+    }
+}
+
 /// One user→assistant exchange (GLOSSARY.md: Turn). Owns the per-turn state and
 /// carries it through the phases in [`Turn::run`]:
 ///
@@ -820,6 +855,21 @@ impl Turn {
         } else {
             variant.clone()
         };
+        // Capture both sides of the pending before the send: the adapter
+        // generation the turn will consume, and the bridge intent it carries.
+        // The guard removes only that intent generation if this future is
+        // cancelled before the commit; a newer pick survives.
+        let (sent_pending_generation, intent_at_send) = if next_turn_pending {
+            (
+                handles.backend.pending_generation(&self.session_id).await,
+                handles.sessions.pending_effort_intent(&self.session_id).await,
+            )
+        } else {
+            (None, None)
+        };
+        let mut intent_guard = intent_at_send.as_ref().map(|intent| {
+            EffortIntentGuard::arm(handles.sessions.clone(), &self.session_id, intent.generation)
+        });
         let agent = handles.sessions.agent_override(&self.session_id).await;
         // Released immediately before the submit (issue #910): `Backend::prompt`
         // has no total response bound, and holding the point across it would let
@@ -850,12 +900,22 @@ impl Turn {
             )
             .await;
         // A thread-provider client's pending effort is applied to the mirror
-        // only once the adapter no longer holds it (spec #922): acceptance
-        // consumed it, or an ambiguous failure dropped it. A fold, steer,
-        // definite refusal or newer in-flight pick leaves it pending, so the
-        // intent and the last accepted mirror stay untouched. An ambiguous drop
-        // consumes the intent without touching the mirror, which never moved.
-        Self::commit_pending_effort(handles, &self.session_id, &self.thread_key, prompt_resp.is_ok()).await;
+        // only once the adapter no longer holds the sent selection (spec #922):
+        // acceptance consumed it, or an ambiguous failure dropped it. A fold,
+        // steer, definite refusal or newer in-flight pick leaves it pending, so
+        // the intent and the last accepted mirror stay untouched.
+        Self::commit_pending_effort(
+            handles,
+            &self.session_id,
+            &self.thread_key,
+            prompt_resp.is_ok(),
+            sent_pending_generation,
+            intent_at_send.as_ref(),
+        )
+        .await;
+        if let Some(guard) = intent_guard.take() {
+            guard.defuse();
+        }
         // The poll runs only while the submit is in flight; the post-prompt
         // drain observes the submitted run from here on (ADR-0056, ADR-0043).
         // A rejected submit is recorded so the drain does not wait out its
@@ -864,34 +924,47 @@ impl Turn {
         prompt_resp
     }
 
-    /// Commit a prompt's pending effort intent to the mirror, or discard it on an
-    /// ambiguous drop. Runs under the same per-session gate as `/model` and
+    /// Commit a prompt's captured effort intent to the mirror, or discard it on
+    /// an ambiguous drop. Runs under the same per-session gate as `/model` and
     /// `/think`: they hold it across both the adapter record and the intent
     /// write, so a newer pick either finishes before this check (and leaves a
     /// pending we see) or waits until the old intent is committed/cleared.
     ///
-    /// This is a seam so the gate-held check-and-take can be tested without
-    /// running the full post-prompt drain.
+    /// `sent_pending` is the adapter generation captured at send. When it is
+    /// gone or differs now, the sent selection was consumed (or replaced) and
+    /// the **captured** value becomes current — even if a newer pending already
+    /// exists. The intent is removed only when its generation still matches, so
+    /// a newer pick survives.
     pub(crate) async fn commit_pending_effort(
         handles: &TurnHandles,
         session_id: &str,
         thread_key: &crate::config::ThreadKey,
         prompt_ok: bool,
+        sent_pending: Option<u64>,
+        intent: Option<&crate::bridge::handles::PendingEffortIntent>,
     ) {
         if !handles.backend.has_thread_provider() {
             return;
         }
         let gate = handles.sessions.session_gates.gate(session_id);
         let _held = gate.enter().await;
-        if !handles.backend.has_pending_selection(session_id).await
-            && let Some(intent) = handles.sessions.take_pending_effort_intent(session_id).await
-            && prompt_ok
-        {
+        let sent_consumed =
+            sent_pending.is_some() && handles.backend.pending_generation(session_id).await != sent_pending;
+        if !sent_consumed {
+            return;
+        }
+        let Some(intent) = intent else {
+            return;
+        };
+        if prompt_ok {
             handles
                 .sessions
-                .apply_pending_effort_intent(thread_key, session_id, intent)
+                .apply_pending_effort_intent(thread_key, session_id, intent.value.clone())
                 .await;
         }
+        handles
+            .sessions
+            .remove_pending_effort_intent_if(session_id, intent.generation);
     }
 
     /// Replace the dead mapping with a fresh session on the current server —

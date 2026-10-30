@@ -258,6 +258,15 @@ impl PendingSelections {
     pub(crate) fn pending_variant(&self, thread_id: &str) -> Option<String> {
         self.pending_selection(thread_id)?.effort
     }
+
+    /// The generation of the pending selection, if any.
+    pub(crate) fn pending_generation(&self, thread_id: &str) -> Option<u64> {
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .get(thread_id)
+            .map(|selection| selection.generation)
+    }
 }
 
 /// One thread's projection and the state of its subscription.
@@ -2364,6 +2373,10 @@ impl Backend for CodexClient {
         self.projections.pending_selection(session_id).is_some()
     }
 
+    async fn pending_generation(&self, session_id: &str) -> Option<u64> {
+        self.projections.pending.pending_generation(session_id)
+    }
+
     async fn prompt(
         &self,
         session_id: &str,
@@ -3132,6 +3145,10 @@ impl Backend for CodexLifecycle {
 
     async fn has_pending_selection(&self, session_id: &str) -> bool {
         self.pending.has_pending(session_id)
+    }
+
+    async fn pending_generation(&self, session_id: &str) -> Option<u64> {
+        self.pending.pending_generation(session_id)
     }
 
     async fn known_thread_provider(&self, session_id: &str) -> Option<String> {

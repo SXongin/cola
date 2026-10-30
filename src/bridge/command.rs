@@ -68,6 +68,9 @@ pub enum Command {
     /// Show the running cola version and build provenance (release or dev
     /// build) — ADR-0027. Never talks to the network.
     Version,
+    /// Show this conversation's current model/effort, any next-turn pending,
+    /// and a short session summary (spec #922). A text reply, no card.
+    Status,
     /// Show available commands, or help for one command (`/help <cmd>`).
     Help(Option<String>),
     /// Load one or more OpenCode skills into the prompt (spec #652, tickets
@@ -462,6 +465,7 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/restart-opencode" => Some(Command::RestartOpenCode),
         "/update" => Some(Command::Update),
         "/version" => Some(Command::Version),
+        "/status" => Some(Command::Status),
         "/help" => Some(Command::Help(arg.map(|s| s.to_lowercase()))),
         // `/skill <id> [/skill <id> …] [text]` — load the named skills into the
         // prompt (spec #652). Each `/skill` token takes the token that follows
@@ -681,6 +685,7 @@ pub fn help_text() -> String {
 `/restart-opencode` · Restart the OpenCode server (an owned server or the V2 managed service)
 `/update` · Update cola (GitHub Releases self-update; cargo installs get the cargo command)
 `/version` · Show cola version & build provenance (release / crates.io / dev build)
+`/status` · Show this conversation's current model/effort, next-turn pending, and session summary
 `/help <command>` · Show help for one command (e.g. `/help model`)
 
 话题规则：已绑定会话的话题里，`/switch`、`/new`、`/dir`、`/sub attach` 被拒绝，请回主对话操作。从未绑定过会话的话题可以用它们来绑定该话题的唯一会话。
@@ -762,6 +767,9 @@ pub fn command_help(name: &str) -> Option<String> {
         }
         "version" => {
             "/version\nShow the running cola's version and build provenance (no network).\n- Release build (built at a clean release tag): `cola 0.7.0`\n- crates.io install (`cargo install colark`): `cola 0.8.1 (crates.io)`\n- Dev build (local or untagged): `cola 0.7.0-dev <branch>@<sha> ⚠` — ⚠ means the source tree had uncommitted changes at build time\nUpdate checks compare only the release version, so a dev build is never reported outdated by its dev marker.\nCLI equivalent: `cola --version`."
+        }
+        "status" => {
+            "/status\nShow this conversation's current model and thinking level, the next-turn pending pick (if any), and a short session summary (session, directory, agent, auto-accept). On a Pending Session the creation pair is shown instead of a 待应用 line. Codex's live pending is one-shot: it applies to the next new message. A model/level pick does not change 当前 until that turn runs.\nExample: `/status`"
         }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
@@ -1741,6 +1749,90 @@ pub(crate) async fn handle_command(
                 .flow
                 .platform
                 .reply_text(message_id, &crate::version::feishu_reply())
+                .await?;
+        }
+        Command::Status => {
+            // A text-only read (spec #922 decision 2): current + pending + a
+            // compact session summary. The pending line is Codex's live
+            // one-shot selection; a Pending Session shows its creation pair
+            // instead and never 待应用.
+            let Some(settings) = handles.flow.sessions.session_settings(&thread_key).await else {
+                handles
+                    .flow
+                    .platform
+                    .reply_text(
+                        message_id,
+                        &format!(
+                            "⚠️ {}还没有会话，先用 `/new` 或 `/dir` 创建。",
+                            crate::bridge::display::feishu_side_label(&thread_key)
+                        ),
+                    )
+                    .await?;
+                return Ok(());
+            };
+            let at_level = |variant: Option<&str>| {
+                variant
+                    .filter(|variant| !variant.is_empty())
+                    .map(|variant| format!("@{variant}"))
+                    .unwrap_or_default()
+            };
+            let mut lines = Vec::new();
+            match settings.session_id.as_deref() {
+                None => {
+                    let pair = settings.model.as_deref().unwrap_or("未选择");
+                    lines.push(format!(
+                        "当前：{pair}{}（将在会话创建时生效）",
+                        at_level(settings.variant.as_deref())
+                    ));
+                }
+                Some(session_id) => {
+                    let current = handles
+                        .flow
+                        .sessions
+                        .effective_selection(&handles.flow.backend, &settings)
+                        .await;
+                    let current_line = current
+                        .as_ref()
+                        .map(|model| {
+                            format!(
+                                "{}/{}{}",
+                                model.provider_id,
+                                model.id,
+                                at_level(model.variant.as_deref())
+                            )
+                        })
+                        .unwrap_or_else(|| "未知".to_string());
+                    lines.push(format!("当前：{current_line}"));
+                    if handles.flow.backend.has_thread_provider()
+                        && handles.flow.backend.has_pending_selection(session_id).await
+                    {
+                        let pending = match handles.flow.backend.pending_model(session_id).await {
+                            Some(model) => model,
+                            None => "清除思考等级".to_string(),
+                        };
+                        lines.push(format!("待应用：{pending}（下一条新消息生效）"));
+                    }
+                }
+            }
+            let session = settings
+                .session_id
+                .as_deref()
+                .map(|id| format!("会话：`{id}`"))
+                .unwrap_or_else(|| "会话：待创建".to_string());
+            let directory = if settings.directory.is_empty() {
+                "(默认目录)".to_string()
+            } else {
+                format!("`{}`", settings.directory)
+            };
+            let agent = settings.agent.as_deref().unwrap_or("服务器默认");
+            let auto_accept = if settings.auto_accept { "开" } else { "关" };
+            lines.push(format!(
+                "{session} · 目录：{directory} · Agent：{agent} · 自动通过：{auto_accept}"
+            ));
+            handles
+                .flow
+                .platform
+                .reply_text(message_id, &lines.join("\n"))
                 .await?;
         }
         Command::Forward(_) => {
@@ -2737,6 +2829,7 @@ mod tests {
     #[test]
     fn parse_agent_model_no_arg_is_card() {
         assert_eq!(parse_command("/model"), Some(Command::ModelCard));
+        assert_eq!(parse_command("/status"), Some(Command::Status));
         assert_eq!(parse_command("/agent"), Some(Command::AgentCard));
     }
 
@@ -3340,6 +3433,7 @@ mod tests {
         );
         assert!(cat.contains("相对") || cat.contains("Path Scope"), "{cat}");
         assert!(command_help("version").unwrap().contains("/version"));
+        assert!(command_help("status").unwrap().contains("/status"));
         assert!(command_help("sub").unwrap().contains("/sub list"));
         assert!(
             command_help("sub").unwrap().contains("/sub attach"),
