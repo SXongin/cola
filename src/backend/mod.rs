@@ -461,7 +461,7 @@ pub trait Backend: ServerLifecycle + Send + Sync {
 
     /// Whether a next-turn pending selection exists at all, including an
     /// explicit `/think --reset` marker whose model and effort are both absent.
-    /// The bridge uses this one seam before applying an effort intent, so a
+    /// The bridge uses this one seam before committing an applied effort, so a
     /// clear marker is not mistaken for "no pending".
     ///
     /// The default answers `false`: **not applicable to a client** with no
@@ -478,6 +478,16 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// The default answers `None`: **not applicable to a client** with no
     /// next-turn pending. A client that has one overrides this.
     async fn take_applied_effort(&self, _session_id: &str) -> Option<Option<String>> {
+        None
+    }
+
+    /// Peek at the effort an accepted turn applied without removing it. The
+    /// bridge reads this, writes the mirror, and only then takes the record —
+    /// so a failed mirror write is retried by the next turn.
+    ///
+    /// The default answers `None`: **not applicable to a client** with no
+    /// next-turn pending. A client that has one overrides this.
+    async fn applied_effort(&self, _session_id: &str) -> Option<Option<String>> {
         None
     }
 

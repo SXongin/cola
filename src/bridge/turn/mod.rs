@@ -870,7 +870,9 @@ impl Turn {
 
     /// Commit what the adapter actually applied to the session mirror, under the
     /// same per-session gate as `/model` and `/think`. `None` from the adapter
-    /// means nothing is waiting; `Some(None)` is an explicit clear.
+    /// means nothing is waiting; `Some(None)` is an explicit clear. The record is
+    /// removed only after a successful mirror write, so a failed write is retried
+    /// by the next turn.
     pub(crate) async fn commit_applied_effort(
         handles: &TurnHandles,
         thread_key: &crate::config::ThreadKey,
@@ -881,13 +883,16 @@ impl Turn {
         }
         let gate = handles.sessions.session_gates.gate(session_id);
         let _held = gate.enter().await;
-        let Some(effort) = handles.backend.take_applied_effort(session_id).await else {
+        let Some(effort) = handles.backend.applied_effort(session_id).await else {
             return;
         };
-        handles
+        if handles
             .sessions
             .apply_applied_effort(thread_key, session_id, effort)
-            .await;
+            .await
+        {
+            handles.backend.take_applied_effort(session_id).await;
+        }
     }
 
     /// Replace the dead mapping with a fresh session on the current server —

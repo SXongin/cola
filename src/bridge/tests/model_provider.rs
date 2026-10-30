@@ -2279,3 +2279,56 @@ async fn status_on_opencode_shows_current_only() {
     assert!(text.contains("当前：openai/gpt-current@high"), "{text}");
     assert!(!text.contains("待应用"), "{text}");
 }
+
+/// Spec #922 post-review: an applied effort is removed only after the mirror
+/// write succeeds. A failed write leaves the record for the next commit.
+#[tokio::test]
+async fn a_failed_mirror_write_keeps_the_applied_effort_for_a_retry() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = dir.path().join("sessions.json");
+    let cfg = test_config(&sessions);
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    backend
+        .applied_efforts
+        .lock()
+        .await
+        .insert("ses_test".into(), Some("high".into()));
+    let applied = backend.applied_efforts.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.variant = Some("low".into());
+    seed_entry(&app, entry).await;
+    let handles = app.turn_handles();
+    let key = key();
+
+    // Make the store path unwritable: a directory cannot be replaced by the
+    // writer's atomic rename.
+    std::fs::remove_file(&sessions).unwrap();
+    std::fs::create_dir(&sessions).unwrap();
+    crate::bridge::turn::Turn::commit_applied_effort(&handles, &key, "ses_test").await;
+    assert_eq!(
+        applied.lock().await.get("ses_test").cloned().flatten(),
+        Some("high".into()),
+        "a failed mirror write keeps the applied record"
+    );
+
+    std::fs::remove_dir(&sessions).unwrap();
+    crate::bridge::turn::Turn::commit_applied_effort(&handles, &key, "ses_test").await;
+    assert!(
+        applied.lock().await.get("ses_test").is_none(),
+        "a successful retry removes the applied record"
+    );
+    let reloaded =
+        crate::bridge::session::SessionStore::for_client(sessions, crate::config::DEFAULT_CLIENT_ID)
+            .expect("the store reloads");
+    assert_eq!(
+        reloaded
+            .get_active(&key)
+            .and_then(|entry| entry.variant.clone())
+            .as_deref(),
+        Some("high"),
+        "the retry persisted the applied level"
+    );
+}
