@@ -2547,7 +2547,11 @@ impl Backend for CodexClient {
         // a turn that existed but this connection had not observed — the
         // protocol's own `startedAt` is the second signal, so a fold into a
         // turn that started before this request must not consume the pending
-        // (spec #922 decision 2). A steer and a command never reach this path.
+        // (spec #922 decision 2). A missing `startedAt` is **not proven new**:
+        // treat it as a fold, because consuming a pick a folded turn may not
+        // apply is the worse failure. The pinned protocol always includes it for
+        // a genuinely new turn; one that omits it simply re-sends the pending on
+        // the next new turn. A steer and a command never reach this path.
         //
         // Deliberate residual race: `startedAt` is whole epoch seconds, and the
         // stable API exposes no monotonic turn sequence. A TUI turn that starts
@@ -2557,7 +2561,7 @@ impl Backend for CodexClient {
         // fail to consume and re-send its pick, so equality stays "new"; the
         // uncommon residual can leave a pick consumed early, never replayed.
         let accepted_new_turn = live_before.as_deref() != Some(turn.id.as_str())
-            && turn.started_at.is_none_or(|started| started >= sent_at);
+            && turn.started_at.map(|started| started >= sent_at).unwrap_or(false);
         if let Some(sent) = pending.as_ref()
             && accepted_new_turn
         {
@@ -7910,6 +7914,38 @@ mod tests {
             client.pending_model("thread-1").await.as_deref(),
             Some("openai/gpt-6-luna@high"),
             "a fold into a turn that started before our send does not consume the pending"
+        );
+    }
+
+    /// Spec #922 gate review: a fold reply that omits `startedAt` is not proven
+    /// new, so it must not consume the pending either.
+    #[tokio::test]
+    async fn an_unobserved_fold_without_started_at_does_not_consume_the_pending() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
+        thread.model = Some("gpt-5.1-codex".into());
+        thread.model_provider = Some("openai".into());
+        server.seed_thread(thread);
+        let tui = connect(&url).await;
+        tui.prompt("thread-1", "from the TUI", &[], &[], None, None, None, None)
+            .await
+            .expect("the TUI turn");
+        server.omit_next_fold_started_at();
+
+        let client = connect(&url).await;
+        assert_eq!(client.projections.live_turn("thread-1"), None);
+        client
+            .record_pending_model("thread-1", "openai/gpt-6-luna", Some("high"))
+            .await
+            .expect("the pending is recorded");
+        client
+            .prompt("thread-1", "from cola", &[], &[], None, None, None, None)
+            .await
+            .expect("the folded prompt");
+        assert_eq!(
+            client.pending_model("thread-1").await.as_deref(),
+            Some("openai/gpt-6-luna@high"),
+            "a fold without a start time does not consume the pending"
         );
     }
 
