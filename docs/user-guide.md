@@ -686,8 +686,8 @@ detailed help for any of these.
 | `/compact` | Compact context |
 | `/card` | Pull the live card down to the newest position after mid-turn command replies bury it (replies a notice when no turn is running) |
 | `/agent <name>` | Switch agent (takes effect next message; persisted; `--reset` clears to the server default) |
-| `/model <p/m>` | Switch model (OpenCode: takes effect next message, persisted; Codex: records a one-shot pick for the next new message, dropped on restart) |
-| `/think [level]` | Set/clear thinking level, per model (OpenCode: next message, persisted; Codex: one-shot for the next new message, dropped on restart) |
+| `/model <p/m>` | Switch model (OpenCode: takes effect next message, persisted; Codex: records a one-shot pick for a live thread's next new message, dropped on restart; a Pending Session keeps its creation pick) |
+| `/think [level]` | Set/clear thinking level, per model (OpenCode: next message, persisted; Codex: one-shot for a live thread's next new message, dropped on restart; a Pending Session keeps its creation level) |
 | `#<id> [#<id> …] [text]` | Load OpenCode skills into this message's prompt (e.g. `#implement-spec 644`); the whole message is submitted verbatim, and a `#<id>` that matches no skill stays plain text (`#644`, `C#caveman` and `##foreman` are never skill tokens). A bare `/skill` opens the skill picker — searchable by id/name/description and paged 20 rows at a time — and `/skill <id>` is an alias for ids the `#` form cannot type (`2fa-helper`, `web_scrape`) |
 | `/autoaccept [on\|off]` | Show/switch auto-allowing tool-permission requests for this session. A permission whose target the card cannot show in full (an over-long command) is still declined, never approved unseen |
 | `/restart` | Restart cola (keeps startup args + log redirect) |
@@ -814,8 +814,10 @@ Notes:
   a session that is still pending (`/new`, `/dir` or `/topic` before its first
   message — including its card forms), the override is recorded on the pending
   and applies to the session the first message creates. A Codex client is the
-  exception: its `/model` and `/think` are a one-shot next-new-message pending,
-  dropped by a restart — see 「`/model` on a Codex client」 below.
+  exception: on a live thread its `/model` and `/think` are a one-shot
+  next-new-message pending, dropped by a restart; a Pending Session's picks are
+  stored with the session and survive until it is created — see 「`/model` on a
+  Codex client」 below.
   `/model`'s value must exist on the server cola attaches to. Bare `/model` opens
   the provider → model picker, whose intro shows the model the next message will
   actually run (the session's own selection, else `[opencode] model`, else what
@@ -838,11 +840,13 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
 「选择 provider（共 1 个）」 pseudo-level:
 
 - **A pick is recorded, not switched.** `/model` records the choice as a
-  one-shot pending pair (model plus its `/think` level, in memory) and answers
-  「已记录：将在下一条新消息生效」. The card shows two facts: **当前** — the
-  thread's own `provider / model` with its reasoning level, as the adapter holds
-  it (the newest `thread/read` or `thread/settings/updated`) — and **待应用** —
-  the recorded pair with 「下一条新消息生效」.
+  one-shot pending pair — a **Pending Model** (model plus its `/think` level, in
+  memory) — and answers 「已记录：将在下一条新消息生效」. The card shows two
+  facts: **当前** — the thread's own `provider / model`, refreshed by the newest
+  `thread/read` or `thread/settings/updated`, plus the thinking level cola last
+  recorded for the session with `/think` (a peer's effort change is **not**
+  adopted, so the pair can refresh while the level stays cola's) — and
+  **待应用** — the recorded pair with 「下一条新消息生效」.
   A pick never rewrites the current line before the server has run it, so a
   picker opened after another client changed the thread shows that change, and
   the footer and the picker cannot disagree.
@@ -854,7 +858,10 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
   into the running one, and a command such as `/compact` do not consume it. A
   definite refusal (a JSON-RPC error) keeps it for a retry; an ambiguous submit
   (a timeout, a lost response) drops it, because the server may already have
-  accepted it; a cola restart drops it too, so re-pick with `/model`.
+  accepted it; a cola restart drops a **live thread's** pending too, because it
+  is in-memory state — re-issue `/model` for a model pick, and `/think` again
+  when only the level was pending (`/model` alone does not restore a `/think`
+  level).
 - **`/think` is the same one-shot window.** On a live Codex thread a level is
   recorded as the next new message's `effort` (keeping any pending model), not
   a per-prompt override; once it applies, later messages carry no effort.
@@ -863,7 +870,9 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
 - **A Pending Session's pick is a creation parameter.** Before the first message
   there is no thread, so the pair is `thread/start`'s `model` + `modelProvider`
   and the reply says 「将在会话创建时生效」 — never 待应用. `/think` there is the
-  same creation intent: it rides the first new turn once the thread exists.
+  same creation intent: it rides the first new turn once the thread exists. Both
+  are stored with the session rather than in the adapter's one-shot window, so a
+  restart keeps them until the first message creates the thread.
 - **「模型（每轮可换）」** lists the model-only sources: `model/list`'s built-in
   catalog (grouped as 「内置目录（全局，未校验）」 — those ids name no provider and
   may run through any of them), the config's top-level `model` (配置默认), and
