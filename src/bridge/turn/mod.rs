@@ -849,6 +849,28 @@ impl Turn {
                 Some(&self.cola_message_id),
             )
             .await;
+        // A thread-provider client's pending effort is applied to the mirror
+        // only once the adapter no longer holds it (spec #922): acceptance
+        // consumed it, or an ambiguous failure dropped it. A fold, steer,
+        // definite refusal or newer in-flight pick leaves it pending, so the
+        // intent and the last accepted mirror stay untouched. An ambiguous drop
+        // consumes the intent without touching the mirror, which never moved.
+        if handles.backend.has_thread_provider() {
+            let pending_gone = handles.backend.pending_model(&self.session_id).await.is_none()
+                && handles.backend.pending_variant(&self.session_id).await.is_none();
+            if pending_gone
+                && let Some(intent) = handles
+                    .sessions
+                    .take_pending_effort_intent(&self.session_id)
+                    .await
+                && prompt_resp.is_ok()
+            {
+                handles
+                    .sessions
+                    .apply_pending_effort_intent(&self.thread_key, &self.session_id, intent)
+                    .await;
+            }
+        }
         // The poll runs only while the submit is in flight; the post-prompt
         // drain observes the submitted run from here on (ADR-0056, ADR-0043).
         // A rejected submit is recorded so the drain does not wait out its

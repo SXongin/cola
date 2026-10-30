@@ -1122,6 +1122,85 @@ async fn a_materialised_store_pair_is_not_resent_when_the_adapter_holds_a_pendin
     );
 }
 
+/// Spec #922 gate fix: an unaccepted effort must not become the current mirror,
+/// and a turn that leaves the adapter pending (a fold/steer or newer pick) must
+/// not move it either.
+#[tokio::test]
+async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    let prompt_models = backend.prompt_models.clone();
+    let pending = backend.pending_selections.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-accepted".into());
+    entry.variant = Some("low".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/think high",
+        key(),
+        "msg_think_pending",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let handles = app.command_handles();
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .and_then(|entry| entry.variant.clone())
+            .as_deref(),
+        Some("low"),
+        "an unaccepted /think leaves the mirror at the last accepted level"
+    );
+    assert_eq!(
+        handles.flow.sessions.pending_effort_intent("ses_test").await,
+        Some(Some("high".into())),
+        "the intent awaits the accepted turn"
+    );
+
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_models.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never reached the backend"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .and_then(|entry| entry.variant.clone())
+            .as_deref(),
+        Some("low"),
+        "a turn that leaves the pending in place does not move the mirror"
+    );
+    assert_eq!(
+        pending
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|(_, variant)| variant.clone())
+            .as_deref(),
+        Some("high"),
+        "the adapter still holds the pending effort"
+    );
+    assert_eq!(
+        handles.flow.sessions.pending_effort_intent("ses_test").await,
+        Some(Some("high".into())),
+        "the intent is kept while the pending survives"
+    );
+}
+
 /// Issue #910, item 3: two competing durable picks. The first is slow (parked
 /// inside its `switch_session_model`), the second queues at the session's
 /// switch point — so the newer one applies **after** the older one, and both
