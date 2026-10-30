@@ -133,8 +133,9 @@ pub(crate) const CONFIG_DEFAULT_GROUP: &str = "配置默认";
 
 /// The rule a Pending Session's provider page states once (spec #922
 /// correction, 2026-10-30): Codex runs one provider per process, so changing
-/// one is a config edit plus a daemon restart, never a pick.
-pub(crate) const PROVIDER_RULE_NOTE: &str = "Codex 一次只用一个 provider；换 provider 需改 `~/.codex/config.toml` 的 `model_provider` 并重启 daemon。";
+/// one is a config edit plus a daemon restart, never a pick. The file is the
+/// daemon's own — `$CODEX_HOME/config.toml`, `~/.codex/config.toml` by default.
+pub(crate) const PROVIDER_RULE_NOTE: &str = "Codex 一次只用一个 provider；换 provider 需改 daemon 的 `config.toml`（`$CODEX_HOME/config.toml`，默认 `~/.codex/config.toml`）里的 `model_provider`，再重启 daemon。";
 
 /// The neutral provider bucket the picker's `codex/<id>` callback value uses.
 const MODEL_PROVIDER: &str = "codex";

@@ -908,19 +908,22 @@ request's `Authorization` header: it never appears on a card, in a log line or i
 an error message.
 
 **Codex runs one provider per process.** The daemon's own top-level
-`model_provider` in `~/.codex/config.toml` (`openai` when it names none) must
-equal the thread's provider: `thread/start` on any other one succeeds, but the
-first message is refused with `ModelProviderMismatch` ("This chat uses X, but
-your current provider is Y"). A Pending Session's provider page therefore offers
+`model_provider` (`openai` when it names none) must equal the thread's provider:
+`thread/start` on any other one succeeds, but the first message is refused with
+`ModelProviderMismatch` ("This chat uses X, but your current provider is Y").
+The config is the daemon's own file — `$CODEX_HOME/config.toml`, which defaults
+to `~/.codex/config.toml`. A Pending Session's provider page therefore offers
 **only** that provider's pairs; every other configured provider is a disabled row
 saying so, and the page states the rule once. Changing a provider is a config
-edit — `model_provider` in `~/.codex/config.toml` — plus a daemon restart, never
-a pick, and cola never writes that file. A creation on the wrong provider is
-refused by name before anything is created (a stale card or a typed
+edit — `model_provider` in that file — plus a daemon restart, never a pick, and
+cola never writes it. When the config can be read, a creation on the wrong
+provider is refused by name before anything is created (a stale card or a typed
 `/model <provider>/<model>` included), naming both providers and the fix. When
-the config cannot be read the page falls back to the thread's current provider,
-and when even that is unknown it lists every provider as before — it cannot
-enforce a rule it cannot see.
+the config cannot be read, the creation proceeds and Codex's own mismatch is the
+fallback, while the page falls back to the provider the surface already resolves
+— a live thread's own provider, or a Pending Session's recorded pick — and when
+even that is unknown it lists every provider as before: it cannot enforce a rule
+it cannot see.
 
 **A provider is creation-only.** The provider page (the `Provider：<id>…` row)
 holds the configured pairs, labelled `provider/model`. A provider is chosen only
