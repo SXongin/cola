@@ -5451,6 +5451,11 @@ mod tests {
             .find(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown))
             .expect("the provider drill");
         assert_eq!(drill.callback_value(), "provider");
+        assert_eq!(
+            drill.display_label(),
+            "Provider：opencode-go…",
+            "the row names the page; it never promises a switch"
+        );
 
         // Page 2: one provider scope, the pair labelled `name/model` (the
         // configured display name, #908 AC1); the callback keeps id + model.
@@ -5467,6 +5472,7 @@ mod tests {
         assert_eq!(surface.scopes.len(), 1);
         let provider = &surface.scopes[0];
         assert_eq!(provider.id, "provider");
+        assert_eq!(provider.title, "Provider");
         assert_eq!(provider.pick, crate::backend::types::PickKind::Provider);
         assert_eq!(provider.changeable, ChangeScope::NewThread);
         let pair = provider

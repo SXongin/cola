@@ -822,7 +822,7 @@ pub(crate) fn build_surface(
     let pending = query.session_id.is_none();
 
     // Two pages, one scope each (#908's owner review): the root is the **model**
-    // page, and `切换 provider…` drills into the provider page. A drilled page
+    // page, and the provider row drills into the provider page. A drilled page
     // carries the back button from the bridge.
     let scope = if query.scope == Some(PROVIDER_SCOPE) {
         provider_page(
@@ -892,10 +892,18 @@ fn model_page(
         }
     }
     // The drill-down into the provider page (a client with a provider axis: this
-    // is Codex's own surface).
+    // is Codex's own surface). The row names the provider that page is about —
+    // it never reads as a switch: only the daemon's own provider is selectable
+    // there, so changing one is a config edit plus a restart.
+    let provider_hint = current_provider
+        .filter(|provider| *provider != MODEL_PROVIDER)
+        .or_else(|| config.configured_provider());
     options.push(crate::backend::types::ModelOption {
         id: PROVIDER_SCOPE.into(),
-        label: Some("切换 provider…".to_string()),
+        label: Some(match provider_hint {
+            Some(provider) => format!("Provider：{provider}…"),
+            None => "Provider…".to_string(),
+        }),
         value: Some(PROVIDER_SCOPE.to_string()),
         pick: Some(crate::backend::types::PickKind::DrillDown),
         ..Default::default()
@@ -1112,7 +1120,9 @@ fn provider_page(
     }
     ModelScope {
         id: PROVIDER_SCOPE.into(),
-        title: "切换 provider".into(),
+        // Not a switch: the page names the provider and its pairs, and only the
+        // daemon's own provider is selectable.
+        title: "Provider".into(),
         changeable: ChangeScope::NewThread,
         pick: PickKind::Provider,
         note: (!notes.is_empty()).then(|| notes.join("　")),
@@ -2074,6 +2084,51 @@ mod tests {
         assert_eq!(entries.len(), 1, "nothing expired survives the insert");
     }
 
+    /// The model page's provider row names the page, never a switch (spec #922
+    /// correction, 2026-10-30): only the daemon's own provider is selectable,
+    /// so `切换 provider…` would promise an action the card cannot take.
+    #[test]
+    fn the_provider_row_names_the_provider_and_never_a_switch() {
+        let drill = |config: &CodexModelConfig, thread: Option<&str>, current: Option<&str>| {
+            let query = ModelSurfaceQuery {
+                current: current.map(|reference| ModelSelection {
+                    label: reference.to_string(),
+                    reference: reference.to_string(),
+                }),
+                ..Default::default()
+            };
+            build_surface(&[], config, &HashMap::new(), thread, &query).scopes[0]
+                .options
+                .iter()
+                .find(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown))
+                .expect("the provider drill")
+                .display_label()
+                .to_string()
+        };
+        let config = config_on("opencode-go", Vec::new());
+        // A thread's known provider.
+        assert_eq!(drill(&config, Some("openai"), None), "Provider：openai…");
+        // A Pending Session's recorded pick.
+        assert_eq!(
+            drill(&config, None, Some("deepseek/deepseek-flash")),
+            "Provider：deepseek…"
+        );
+        // No resolved provider: the daemon's own provider still names the page.
+        assert_eq!(drill(&config, None, None), "Provider：opencode-go…");
+        // A neutral `codex/<id>` pick names no channel, so it is not shown.
+        assert_eq!(
+            drill(&config, Some("codex"), Some("codex/gpt-5")),
+            "Provider：opencode-go…"
+        );
+
+        // Nothing is known: a bare label, never an invented provider.
+        let unreadable = CodexModelConfig {
+            read_failed: true,
+            ..Default::default()
+        };
+        assert_eq!(drill(&unreadable, None, Some("codex/gpt-5")), "Provider…");
+    }
+
     /// Spec #922: a Pending Session's provider page offers the **pairs** that
     /// ride `thread/start`; a live thread's page is read-only — the current
     /// provider plus the `/new` / later `/fork` note, with no rows to click.
@@ -2093,6 +2148,7 @@ mod tests {
         };
         let pending = build_surface(&[], &config, &probes, None, &pending_query);
         let scope = &pending.scopes[0];
+        assert_eq!(scope.title, "Provider", "the page names a provider, not a switch");
         assert_eq!(scope.changeable, ChangeScope::NewThread);
         assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
         assert_eq!(scope.intro.as_deref(), Some("只在新会话生效"));
@@ -2107,6 +2163,7 @@ mod tests {
         let live = provider_query();
         let read_only = build_surface(&[], &config, &probes, Some("deepseek"), &live);
         let scope = &read_only.scopes[0];
+        assert_eq!(scope.title, "Provider（仅新会话）");
         assert_eq!(scope.changeable, ChangeScope::NewThread);
         assert!(scope.options.is_empty(), "no clickable rows: {:?}", scope.options);
         let note = scope.note.as_deref().expect("the read-only note");

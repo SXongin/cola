@@ -838,7 +838,8 @@ Notes:
 Codex's model axis is not a provider → model tree: a provider is a **creation
 fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
 `/model` therefore shows one current line and **one model page**; a
-`切换 provider…` row at the bottom opens the provider page. There is no
+`Provider：<id>…` row at the bottom opens the provider page (the row names the
+provider it shows — it is not a switch). There is no
 「选择 provider（共 1 个）」 pseudo-level:
 
 - **A pick is recorded, not switched.** `/model` records the choice as a
@@ -921,7 +922,7 @@ the config cannot be read the page falls back to the thread's current provider,
 and when even that is unknown it lists every provider as before — it cannot
 enforce a rule it cannot see.
 
-**A provider is creation-only.** The provider page (the `切换 provider…` row)
+**A provider is creation-only.** The provider page (the `Provider：<id>…` row)
 holds the configured pairs, labelled `provider/model`. A provider is chosen only
 when a thread is created: `/new` sends the pair to `thread/start`. `/fork` is an
 independent capability planned for a later version (it will use `thread/fork`);

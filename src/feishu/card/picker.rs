@@ -104,7 +104,7 @@ fn scope_level(scope: &crate::backend::types::ModelScope) -> &str {
 }
 
 /// The level one **option's** button carries: its own pick kind when the page
-/// mixes actions (Codex's `切换 provider…` drill on the model page, #908),
+/// mixes actions (Codex's `Provider：<id>…` drill on the model page, #908),
 /// else the scope's.
 fn option_level(
     scope: &crate::backend::types::ModelScope,

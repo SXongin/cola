@@ -668,7 +668,8 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
 
 Codex 的模型轴不是 provider → model 树：provider 是**创建时**事实，模型是
 **每轮**事实，内置目录是**全局**的。因此不带参数的 `/model` 只有一行当前
-模型与**一个模型页**；底部的 `切换 provider…` 一行打开 provider 页，不会出现
+模型与**一个模型页**；底部的 `Provider：<id>…` 一行打开 provider 页（这一行只是
+点名当前的 provider，不是切换），不会出现
 「选择 provider（共 1 个）」这种伪层级：
 
 - **点选只是记录，不是立即切换。** `/model` 把选择记录成一次性的待应用
@@ -735,7 +736,7 @@ Y」）。因此待建会话的 provider 页**只**提供那个 provider 的成�
 同样），并同时点名两个 provider 与修复办法。读不到配置时，页面回退到线程当前
 的 provider；连它也不知道时就照旧列出所有 provider——看不见的规则无法执行。
 
-**provider 只在创建时选择。** provider 页（`切换 provider…` 那一行）列出配置好的
+**provider 只在创建时选择。** provider 页（`Provider：<id>…` 那一行）列出配置好的
 成对行，标签为 `provider/model`。provider 只在线程创建时确定：`/new` 把这一对交给
 `thread/start`。`/fork` 是后续版本才提供的独立功能（届时使用 `thread/fork`）；
 cola 目前没有 `/fork` 命令，输入它会被当成普通消息提交。`turn/start`
