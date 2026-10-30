@@ -851,10 +851,10 @@ fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
   every later message carries no model and no effort: the thread's own default
   is the fact, so a peer client's later change is respected and the read-back
   only refreshes 当前. Only a genuinely new turn counts — a steer, a turn folded
-  into the running one, and a command (`/status`, `/compact`, …) do not consume
-  it. A definite refusal (a JSON-RPC error) keeps it for a retry; an ambiguous
-  submit (a timeout, a lost response) drops it, because the server may already
-  have accepted it; a cola restart drops it too, so re-pick with `/model`.
+  into the running one, and a command such as `/compact` do not consume it. A
+  definite refusal (a JSON-RPC error) keeps it for a retry; an ambiguous submit
+  (a timeout, a lost response) drops it, because the server may already have
+  accepted it; a cola restart drops it too, so re-pick with `/model`.
 - **`/think` is the same one-shot window.** On a live Codex thread a level is
   recorded as the next new message's `effort` (keeping any pending model), not
   a per-prompt override; once it applies, later messages carry no effort.
