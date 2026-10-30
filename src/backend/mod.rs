@@ -409,18 +409,30 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// cannot distinguish an accepted turn whose response was lost from one
     /// that never ran.
     ///
-    /// The default is a no-op: a client whose selection rides each prompt has
-    /// no next-turn window to record, so this is **not applicable to this
-    /// client**. A client that has the window overrides this.
-    async fn record_pending_model(&self, _session_id: &str, _model: &str, _variant: Option<&str>) {}
+    /// The default is `Ok(())`: a client whose selection rides each prompt has
+    /// no next-turn window to record, so recording is **not applicable to this
+    /// client**. A client that has the window overrides this and answers `Err`
+    /// when the write cannot reach its adapter (for example, no attached
+    /// client).
+    async fn record_pending_model(
+        &self,
+        _session_id: &str,
+        _model: &str,
+        _variant: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
 
     /// Record a **one-shot next-turn** `/think` level, preserving any pending
     /// model. `None` clears the pending effort (the model's own default). A
     /// pending that ends up carrying neither a model nor an effort is dropped.
     ///
-    /// The default is a no-op: **not applicable to a client** with no
-    /// next-turn window. A client that has one overrides this.
-    async fn record_pending_variant(&self, _session_id: &str, _variant: Option<&str>) {}
+    /// The default is `Ok(())`: **not applicable to a client** with no
+    /// next-turn window. A client that has one overrides this and answers `Err`
+    /// when the write cannot reach its adapter.
+    async fn record_pending_variant(&self, _session_id: &str, _variant: Option<&str>) -> Result<()> {
+        Ok(())
+    }
 
     /// The model a live session's next new turn will carry, as a
     /// `provider/model` reference, while a pending selection exists. This is
@@ -457,9 +469,11 @@ pub trait Backend: ServerLifecycle + Send + Sync {
 
     /// Whether this client has a **thread-level provider axis** (Codex's
     /// `modelProvider`): only such a client can carry a provider into
-    /// `thread/start` or switch one by resuming. The default answers `false` —
-    /// a client whose provider rides each prompt (OpenCode) has nothing to
-    /// record, and its create body must stay exactly as it was.
+    /// `thread/start` or `thread/fork`. A live thread's provider is
+    /// creation-only — never `thread/resume`, never a per-turn field. The
+    /// default answers `false` — a client whose provider rides each prompt
+    /// (OpenCode) has nothing to record, and its create body must stay exactly
+    /// as it was.
     fn has_thread_provider(&self) -> bool {
         false
     }
@@ -490,8 +504,10 @@ pub trait Backend: ServerLifecycle + Send + Sync {
 
     /// The thread-level provider this client's **own cache** holds for the
     /// session, when it knows one (Codex's ordered thread fact). Cache-only: no
-    /// RPC, so a card callback can decide "is the gate even relevant here"
-    /// without a request. `None` means unknown.
+    /// RPC, so a card callback can decide whether a provider comparison is
+    /// relevant without a request. A live thread's provider is creation-only:
+    /// the cache decides whether a pick is same-provider, and a different
+    /// provider is refused without any request. `None` means unknown.
     async fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
         None
     }

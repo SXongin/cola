@@ -1261,7 +1261,7 @@ impl SessionsHandle {
                 if matches!(outcome, PickOutcome::Applied { .. }) {
                     backend
                         .record_pending_model(&session_id, model_spec, probe.as_deref())
-                        .await;
+                        .await?;
                     return Ok(PickOutcome::Applied {
                         cleared_variant: cleared,
                     });
@@ -1565,7 +1565,7 @@ impl SessionsHandle {
         if backend.has_thread_provider() && matches!(outcome, PickOutcome::Applied { .. }) {
             backend
                 .record_pending_variant(&session_id, variant.as_deref())
-                .await;
+                .await?;
         }
         Ok(outcome)
     }

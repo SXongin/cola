@@ -2809,10 +2809,14 @@ impl App {
         // pending (spec #922): it rides that `turn/start.effort` once, never
         // every later prompt. No model pending is recorded: the thread already
         // started on the creation pair, so the card shows no 待应用.
-        if self.client.has_thread_provider() {
-            self.client
+        if self.client.has_thread_provider()
+            && let Err(e) = self
+                .client
                 .record_pending_variant(session_id, pending.variant.as_deref())
-                .await;
+                .await
+        {
+            tracing::warn!("materialise: pending think level failed for {session_id}: {e}");
+            failures.push(format!("思考等级未生效（{e}）"));
         }
         if let Some(agent) = &pending.agent
             && let Err(e) = self.client.switch_session_agent(session_id, agent).await

@@ -962,6 +962,133 @@ async fn a_pending_session_has_no_next_turn_pending_on_the_model_card() {
     );
 }
 
+/// Spec #922 whole-branch review: a lifecycle with no attached client must not
+/// let `/model` or `/think` claim a recorded pick. The seam error reaches the
+/// command reply; once the pending layer accepts the write again, the pick is
+/// recorded.
+#[tokio::test]
+async fn an_unattachable_pending_seam_fails_the_pick_instead_of_claiming_success() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_known_thread_provider(Some("openai"));
+    let pending_error = backend.pending_error.clone();
+    let pending = backend.pending_selections.clone();
+    *pending_error.lock().await = Some("not attached to a codex app-server daemon".into());
+    let (app, platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-5.1-codex".into());
+    seed_entry(&app, entry).await;
+
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("切换模型失败") && text.contains("not attached"),
+        "the model error is named: {text}"
+    );
+    assert!(
+        !text.contains("已记录"),
+        "an unattached pending seam must not claim success: {text}"
+    );
+
+    send_command_in(
+        &app,
+        "/think high",
+        key(),
+        "msg_think",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("切换思考等级失败") && text.contains("not attached"),
+        "the think error is named: {text}"
+    );
+    assert!(
+        pending.lock().await.is_empty(),
+        "neither failed seam recorded a pending"
+    );
+
+    *pending_error.lock().await = None;
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model_retry",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+    let text = platform.texts().await.join("\n");
+    assert!(
+        text.contains("已记录：将在下一条新消息生效"),
+        "an attached seam records the pick: {text}"
+    );
+    assert_eq!(
+        pending
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|(model, _)| model.as_deref()),
+        Some("openai/gpt-5.1"),
+        "the retry reaches the pending layer"
+    );
+}
+
+/// Spec #922 whole-branch review (test gap): a materialised Pending Session
+/// carries its creation pair in the store, and the adapter may still hold a
+/// next-turn pending. `Turn::run` must pass **no** per-prompt pair on a
+/// thread-provider client — the adapter's pending owns the next turn — or a
+/// later prompt would re-send the stored creation pair.
+#[tokio::test]
+async fn a_materialised_store_pair_is_not_resent_when_the_adapter_holds_a_pending() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    let prompt_models = backend.prompt_models.clone();
+    let prompt_variants = backend.prompt_variants.clone();
+    backend.pending_selections.lock().await.insert(
+        "ses_test".into(),
+        (Some("openai/gpt-next".into()), Some("high".into())),
+    );
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/gpt-creation".into());
+    entry.variant = Some("low".into());
+    seed_entry(&app, entry).await;
+
+    prompt(&app, "msg_prompt", "hi");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prompt_models.lock().await.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the prompt never reached the backend"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        prompt_models.lock().await.as_slice(),
+        &[None],
+        "the stored creation pair is not re-sent; the adapter pending is"
+    );
+    assert_eq!(
+        prompt_variants.lock().await.as_slice(),
+        &[None],
+        "the stored /think level is not re-sent either"
+    );
+}
+
 /// Issue #910, item 3: two competing durable picks. The first is slow (parked
 /// inside its `switch_session_model`), the second queues at the session's
 /// switch point — so the newer one applies **after** the older one, and both
