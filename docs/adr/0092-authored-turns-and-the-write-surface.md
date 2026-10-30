@@ -344,10 +344,10 @@ works). Three consequences of that shape:
   override does not change `model_provider` — that is configuration, not part
   of `turn/start`. So a provider the thread already named wins the label, and
   only a thread that never named one shows the neutral bucket.
-- A projection released with its thread loses a pick that was never reported on
-  the wire; the pick is re-sent (and re-recorded) on the next prompt, and a
-  conforming server restores it on the next read. The window is a footer label,
-  not a dispatch decision, so it is not made durable.
+- *(Superseded by spec #922, 2026-10-30.)* A projection released with its
+  thread no longer re-sends a pick on its own: the one-shot pending is the only
+  state that carries a pick, and it is consumed by the next new turn's
+  acceptance. The projection is a display fact, not a dispatch input.
 - With no thread model ever named, nothing is shown. Filling it from
   `~/.codex/config.toml` would be a different read (`config/read`) and is left
   out: a fact cola does not have must not be presented as the server's.
@@ -575,7 +575,10 @@ mismatch (a peer may have changed the pair after us), and the pending is
 change. Subsequent prompts do not carry the model again, so a peer's later
 change is respected. The pending is cola state, not server state: it may be
 persisted across a restart so a pick made before the next prompt is not lost,
-but it is never re-sent after it is consumed.
+but it is never re-sent after it is consumed. If a persisted pending was in
+flight when the process died, it is treated as consumed on restart, never
+re-sent: the server may have accepted it, and a re-send could overwrite a
+peer's later change. If it was not accepted, the user re-picks.
 
 **2. A steer, a folded turn, or a command does not consume the pending.** A
 Supplement uses `turn/steer`, which has no model field; a `turn/start` that is
