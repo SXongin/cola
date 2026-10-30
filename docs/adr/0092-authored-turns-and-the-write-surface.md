@@ -530,7 +530,8 @@ the letter of AC1, so the Codex surface is now **two pages**, one scope each:
 
 - the **model page** (root) carries only what a pick can run without changing
   the channel — the catalog, the config default and the **current provider's**
-  probed models — plus a `切换 provider…` drill;
+  probed models — plus a `切换 provider…` drill (it now reads `Provider：<id>…`:
+  the row names the provider page, it does not promise a switch — 2026-10-30);
 - the **provider page** (one tap away, with the back button) carries every
   configured provider's pairs, the current marker, a failed probe as a short
   tag and pairless providers as disabled rows.
