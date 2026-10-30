@@ -550,3 +550,99 @@ Nothing is lost in the split: every provider `config/read` declares is still
 listed (on the page it belongs to), no bare provider is selectable, and the
 model page never carries another provider's probe. OpenCode keeps its own
 two pages unchanged.
+
+## Amendment (2026-10-30, spec #922): the model rides the next turn; the provider is creation-only
+
+Decision 7 and the #904/#906/#910 amendments left two claims that the last
+implementation could not keep:
+
+- that Codex had no durable model switch, so a pick had to ride every prompt;
+- that a provider change could be made by releasing the thread and resuming it
+  with `modelProvider`.
+
+Source reading at `rust-v0.163.0` / `rust-v0.166.0`, plus the official
+app-server documentation, shows both are wrong in the same direction: the
+stable model switch is turn-carried, and the provider is a creation-time fact,
+not a live setting. The experimental `thread/settings/update` does exist —
+Codex's own TUI uses it for `/model` — but it is deliberately **not** adopted
+here: it is not in the public app-server API overview, and this repo prefers
+the stable `turn/start.model` over an undocumented method.
+
+**1. `/model` on a live thread is a one-shot, next-turn switch.** `/model`
+records a pending selection; it does not change the thread's current pair. The
+next **new** `turn/start` carries `model` + `effort`, whose overrides the
+protocol documents as becoming "the defaults for later turns on the same
+thread". The pending is cleared only after a bounded `thread/read` reports the
+pair; an accepted RPC alone is not the verdict. Subsequent prompts do not carry
+the model again, so a peer's later change is respected. The pending is cola
+state, not server state: it may be persisted across a restart so a pick made
+before the next prompt is not lost, but it is never re-sent after it is
+consumed.
+
+**2. A steer, a folded turn, or a command does not consume the pending.** A
+Supplement uses `turn/steer`, which has no model field; a `turn/start` that is
+folded into an active turn does not promise the override applies; a command
+such as `/status` or `/compact` starts no model turn. The pending belongs to
+the next *new* turn, and only the read-back above clears it.
+
+**3. A Pending Session's pick is a creation fact, not a pending turn.** It
+rides `thread/start { model, modelProvider }` on the first message and has no
+"next message" state. The card must say "将在会话创建时生效", never the
+live-thread label.
+
+**4. The provider is creation-only.** `/new` (a Pending Session) and `/fork`
+are the only paths that name a provider; both send the pair to `thread/start`
+or `thread/fork`. A live thread's provider never changes. `/model` refuses a
+different provider on a live thread and names `/new` / `/fork`; it sends no
+resume and no turn. `provider_switch_on_resume`, the confirmation, the
+release-all → `thread/resume { modelProvider, model }` → `thread/read` switch,
+and its mirror restore/compare-and-set are removed. This is not a repair of the
+resume path: 0.166's `thread/resume` applies a provider override only on a cold
+load, and a loaded thread with any subscriber keeps its pair and logs a warning
+(source, not a public contract). A switch that silently no-ops under a peer is
+worse than refusing the action.
+
+**5. The model surface follows the same split.** The model scope is
+`ThisTurn` (a one-shot pending); the provider scope is creation-only
+(`NewThread`) and is offered only on a Pending Session or through `/fork`. A
+live thread's provider page is a read-only current value with a `/new` /
+`/fork` note, not selectable rows. `[profiles.*]` is not a preset source:
+Codex 0.134+ removed it, and `--profile` layers
+`$CODEX_HOME/<name>.config.toml`. A surface that wants presets reads those
+files (or drops presets); this amendment does not keep the dead table alive.
+
+**6. Why the stable interface, and what it costs.** `thread/settings/update`
+would make `/model` immediate, durable and peer-visible, but it is an
+experimental, undocumented method; a client that needs to stay on the public
+surface cannot require it. `turn/start.model` is documented and already
+becomes the thread default, so the only cost is the window between `/model`
+and the next new turn: `/status` and the card must show "current" and
+"pending" as two facts, and another client sees the change after that turn,
+not at the click. That is the trade this repo accepts. A future migration is
+local: implement `switch_session_model` with `thread/settings/update`, set
+`keeps_session_selection = true`, and stop sending the per-turn model; the
+provider rule is unchanged.
+
+**7. Two reading rules where docs and source disagree.** The official
+app-server docs say a forked thread keeps the session id of the root it came
+from, while the 0.166 test asserts the fork's own id; and the docs say the
+no-subscriber grace is 30 minutes, while 0.166's default config is 60 seconds.
+The adapter reads `thread.sessionId` from the response and the live
+`thread/status`; it derives neither.
+
+**Why.** Peer attachment makes a thread's provider a shared fact, not a private
+setting. A model pick is a per-turn input that already becomes the thread's
+default, so a one-shot pending matches the protocol without a mirror; a
+provider pick is a different thread lifecycle, so it belongs to `thread/start`
+or `thread/fork`. Separating the two removes the resume/rollback machine that
+tried to make a provider switch look like a setting.
+
+**Consequences.** `/model` gains a two-fact display (current + pending) and an
+honest "next new message" label. A peer sees the model change after the next
+new turn, not immediately, and no `thread/settings/updated` is expected from
+this path. Provider changes are refused on a live thread and happen only in
+`/new` / `/fork`; `/fork` is a separate feature. The #910 provider-switch
+implementation, `provider_switch_on_resume`, its tests and its confirmation
+copy are superseded; #918/#919/#920 no longer serve a live switch. The
+`GLOSSARY.md` Provider Id / Model Surface entries and both user guides follow
+in spec #922's tickets.
