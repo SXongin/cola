@@ -2540,23 +2540,10 @@ async fn render_and_flush_inner(
     // so an adopt-mid-turn transition cannot fork the conversation.
     let file_changed = resolve_file_deliveries(cards, session_id).await;
     // One output read per planned entry, OUTSIDE the cards lock (the reads are
-    // network), then one short lock to announce and insert them (spec #593).
+    // network). The entries themselves are COMMITTED below, together with the
+    // ledger and the write (spec #593, issue #917): committing them here would
+    // consume them for a write the guard may suppress.
     read_planned_outputs(backend, &mut plans).await;
-    let entries_changed = {
-        let mut live = cards.cards.lock().await;
-        match live.get_mut(session_id) {
-            Some(card) => {
-                let inserted = commit_planned_entries(&mut card.acc, plans, Endings::of(cards, session_id));
-                if inserted {
-                    // An inserted entry is rendered content, not clock churn:
-                    // it owes its flush and counts as progress, like a part.
-                    card.acc.bump_progress_mark();
-                }
-                inserted
-            }
-            None => false,
-        }
-    };
     // Persist the captured anchor on the durable record (ADR-0063), so a
     // restart's reap can ask the transcript what became of this Turn's message
     // instead of probing for it. A no-op while the record names another card.
@@ -2573,6 +2560,62 @@ async fn render_and_flush_inner(
     // (provider, model) for the turn, so later polls are a field swap. Runs
     // outside the cards lock (network).
     crate::bridge::turn::state::refresh_context_window(cards, backend, session_id).await;
+    // The live child liveness this render needs, gathered ONCE for both
+    // surfaces that show it (spec #501, ticket #504): the card's live task
+    // panels and the read's live background subagents. It runs AFTER the parts
+    // render, so a panel that first appeared this poll is in the union; the
+    // union means a child named by both is read — and its wait queried — at
+    // most once this render, while a render that names no child at all (V1, a
+    // session with no live task) spends no request. The fragment's age is
+    // measured at the build clock. The early `typing` sample spares those
+    // reads when the card already renders a waiting form (issue #917).
+    let gathered = if typing {
+        None
+    } else {
+        Some(gather_render_liveness(cards, backend, requests, session_id, transcript).await)
+    };
+    // The apply (entries, footer, ledger, panel activity) and the write share
+    // ONE card-write-lock acquisition — the lock a question's block insertion
+    // and the form's own flush also take. That is what makes "the card renders
+    // no unanswered typed answer" a fact this pass can act on: a question
+    // cannot land between the check and the build, and a pass that stands down
+    // has APPLIED nothing, so nothing is consumed (issue #917).
+    if mode.flushes() {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        if cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.awaits_typed_answer())
+        {
+            return Some(RenderPass {
+                stats: RenderStats {
+                    new_parts,
+                    text_len,
+                    reasoning_len,
+                    new_content: changed,
+                },
+                flush: FlushOutcome::Unwritten,
+            });
+        }
+    }
+    let entries_changed = {
+        let mut live = cards.cards.lock().await;
+        match live.get_mut(session_id) {
+            Some(card) => {
+                let inserted = commit_planned_entries(&mut card.acc, plans, Endings::of(cards, session_id));
+                if inserted {
+                    // An inserted entry is rendered content, not clock churn:
+                    // it owes its flush and counts as progress, like a part.
+                    card.acc.bump_progress_mark();
+                }
+                inserted
+            }
+            None => false,
+        }
+    };
     // A usage (or window) change must flush even when no part and no header
     // second changed: the 📊 segment is footer state the header signature
     // cannot see, and a silently-stale percentage is the bug this fixes.
@@ -2593,73 +2636,51 @@ async fn render_and_flush_inner(
             None => false,
         }
     };
-    // The live child liveness this render needs, gathered ONCE for both
-    // surfaces that show it (spec #501, ticket #504): the card's live task
-    // panels and the read's live background subagents. It runs AFTER the parts
-    // render, so a panel that first appeared this poll is in the union; the
-    // union means a child named by both is read — and its wait queried — at
-    // most once this render, while a render that names no child at all (V1, a
-    // session with no live task) spends no request. The fragment's age is
-    // measured at the build clock.
-    // The ledger and the live task panels are the BACKGROUND's own progress: a
-    // card rendering an unanswered free-text answer field is not repainted for
-    // them (issue #917), and the read is not consumed either — applying it to a
-    // body nothing will write would make the next read see no difference to
-    // carry. So the child gather and the apply are skipped together while the
-    // form waits; the first read after the answer rebuilds both from the
-    // transcript.
-    let (ledger, liveness_changed) = if typing {
-        (super::state::LedgerChange::default(), false)
-    } else {
-        let (panel_children, liveness) =
-            gather_render_liveness(cards, backend, requests, session_id, transcript).await;
+    let (ledger, liveness_changed) = match gathered {
         // Apply that ONE gather to both surfaces under one lock: the ledger's
         // `subagent` rows and every live task panel (ADR-0060/0054). A change on
         // either must flush even when no part, header second or context figure
         // moved — the line is the only thing that changed.
-        let mut live = cards.cards.lock().await;
-        match live.get_mut(session_id) {
-            Some(card) => {
-                let ledger = refresh_ledger(
-                    &mut card.acc,
-                    transcript,
-                    &liveness,
-                    backend.background_tasks_supported(),
-                );
-                let liveness_changed = apply_task_liveness(&mut card.acc, &panel_children, &liveness);
-                // Only the ROW half is progress: a rendered elapsed/age
-                // crossing its cadence (the clock half) must not renew the
-                // external renderer's idle bound, or a silent task's ticking
-                // age would keep its card live forever (#457).
-                if ledger.rows || liveness_changed {
-                    card.acc.bump_progress_mark();
+        Some((panel_children, liveness)) => {
+            let mut live = cards.cards.lock().await;
+            match live.get_mut(session_id) {
+                Some(card) => {
+                    let ledger = refresh_ledger(
+                        &mut card.acc,
+                        transcript,
+                        &liveness,
+                        backend.background_tasks_supported(),
+                    );
+                    let liveness_changed = apply_task_liveness(&mut card.acc, &panel_children, &liveness);
+                    // Only the ROW half is progress: a rendered elapsed/age
+                    // crossing its cadence (the clock half) must not renew the
+                    // external renderer's idle bound, or a silent task's
+                    // ticking age would keep its card live forever (#457).
+                    if ledger.rows || liveness_changed {
+                        card.acc.bump_progress_mark();
+                    }
+                    (ledger, liveness_changed)
                 }
-                (ledger, liveness_changed)
+                None => (super::state::LedgerChange::default(), false),
             }
-            None => (super::state::LedgerChange::default(), false),
         }
+        None => (super::state::LedgerChange::default(), false),
     };
-    let flush = if !mode.flushes() {
-        // A settling render (#604) leaves the card write to finalization, which
-        // renders and flushes this same read: no carrier here.
-        FlushOutcome::Unwritten
-    } else if changed
+    let owed = changed
         || file_changed
         || header_changed
         || context_changed
         || ledger.owes()
         || liveness_changed
-        || entries_changed
-    {
-        // The render pass writes NOTHING while the card renders an unanswered
-        // free-text answer (issue #917) — content included, because a pass can
-        // render a part, pause for its reads, and resume after a question
-        // landed and the Host started typing. The check runs under the write
-        // lock the flush itself shares (`flush_card_unless_typing`), and the
-        // form's own flush (its arrival, or its answer) is the write that
-        // lands. A suppressed pass consumes nothing: the build is what advances
-        // `render_from`, so the next pass after the answer renders it all.
-        Turn::flush_card_unless_typing(cards, session_id).await
+        || entries_changed;
+    let flush = if !mode.flushes() {
+        // A settling render (#604) leaves the card write to finalization, which
+        // renders and flushes this same read: no carrier here.
+        FlushOutcome::Unwritten
+    } else if owed {
+        // The write lock is already held (above) — the check and the build
+        // cannot be interleaved by a form's arrival.
+        super::flush::flush_card_locked(cards, session_id, super::flush::SplitPolicy::Allow).await
     } else {
         // Nothing this pass did owed a card write: no carrier, so nothing a
         // caller may read as accepted (review, PR #595).
@@ -9247,6 +9268,76 @@ Index: /x/src/main.rs
             updates.len(),
             before,
             "the click's ack is the card's body: no tick may re-send it: {headers:?}"
+        );
+    }
+
+    /// Issue #917, the mid-pass arrival: a form can land while a render pass is
+    /// parked in one of its reads. The pass must then write NOTHING — even
+    /// though it already found rendered content of its own — because the Host
+    /// may have started typing. The upload below is the pass's own await (the
+    /// File Content delivery), so the form's insert-and-flush happens strictly
+    /// inside the pass, between its content decision and its write.
+    #[tokio::test]
+    async fn a_form_that_lands_mid_pass_leaves_the_parked_pass_without_a_write() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+        platform.given_file_key("file_mid_pass");
+        let sid = "ses_mid_pass";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_mid_pass")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![message(
+            "a1",
+            1_000,
+            vec![read_file_part("call_read", "doc.pdf", "application/pdf", b"%PDF")],
+        )]);
+
+        let (entered, release) = platform.pause("upload_file", "");
+        let parked = {
+            let app = Arc::clone(&app);
+            let sid = sid.to_string();
+            let transcript = transcript.clone();
+            tokio::spawn(async move {
+                let cards = app.core.cards_handle();
+                render(&app, &cards, &sid, &transcript).await;
+            })
+        };
+        entered.notified().await;
+
+        // The Host is typing a custom answer: the block lands and its own flush
+        // writes the form, all while the pass is parked.
+        let request = crate::backend::types::QuestionRequest {
+            id: "que_mid_pass".into(),
+            session_id: sid.into(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "备注一下".into(),
+                header: "备注".into(),
+                options: Vec::new(),
+                kind: crate::backend::types::FormFieldKind::String,
+                custom: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Turn::add_question(&cards, sid, &request, "/work", &[None], &[false]).await;
+        Turn::flush_card(&cards, sid).await;
+        let with_form = platform.updated_cards().await.len();
+
+        release.notify_one();
+        parked.await.unwrap();
+
+        let updates = platform.updated_cards().await;
+        let headers: Vec<&str> = updates
+            .iter()
+            .map(|card| card["header"]["title"]["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            updates.len(),
+            with_form,
+            "a pass that parked before the form landed writes nothing at all: {headers:?}"
         );
     }
 

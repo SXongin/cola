@@ -139,32 +139,30 @@ and the map from the old numbers.
   3000 chars, so its size is not a bug and splitting it buys nothing.
 - **`card-repaints`** — every card PATCH rebuilds `body.elements`, and a form
   input's unsubmitted text lives only in the client, so **any** repaint wipes
-  what the Host is typing (issue #917). Two rules follow. A card that
-  renders an unanswered free-text answer field (`awaits_typed_answer`) is never
-  repainted for **background progress** — the live header's second, the
-  ledger's rows, its clock and its completion entries, a task panel's activity,
-  the yielded read as a whole. The read must not be **consumed** either: plan
-  no entry, apply no ledger, spend no liveness read while the form waits, or
+  what the Host is typing (issue #917). Two rules follow.
+
+  **The render pass writes nothing while the card renders an unanswered
+  free-text answer field** (`awaits_typed_answer`): content included, not just
+  the header's second, the ledger's rows/clock/entries and a panel's activity —
+  a pass can render a part, pause for its reads and resume after the form
+  landed, so its own "content" is a stale view. The pass must not **consume**
+  the read either (plan no entry, apply no ledger, spend no liveness read), or
   every later read sees "no difference" and the fact never reaches a card. The
-  render pass writes nothing at all while the form waits — not even rendered
-  content, since a pass can pause for its reads and resume after the form
-  landed; the form's own flush (its arrival or its answer) is the write that
-  lands, and the suppressed pass consumed nothing because the build is what
-  advances `render_from`.
-  Re-check under the card-write lock at the apply/write boundary too
-  (`Turn::flush_card_unless_typing`, and the yielded refresh's second check):
-  a question that surfaces mid-pass brings a form this pass must not repaint.
-  Block insertion takes that lock as well (`Turn::add_question`), so "insert,
-  then flush" is ordered against every card write. Every clock-derived cause —
-  the header second, the context footer, the ledger, the panel activity, the
-  completion entry — goes through that guarded write.
-  The turn's own content and the settlement still flush. And every card write must
-  advance the render gate's signature cache: the flush does it
-  (`advance_sent_signatures`, `src/bridge/turn/flush.rs`) and so must an
-  out-of-band write that restamps the header (`Turn::mark_header_shown` for a
-  click's ack, once the eager patches landed). The cache records what the card
+  check, the apply and the build share ONE card-write-lock acquisition, and
+  block insertion takes that lock too (`Turn::add_question` /
+  `add_permission`), so "insert, then flush" is ordered against every write:
+  the form's own flush either lands first (the pass stands down having applied
+  nothing, and its content flushes once the freeze lifts) or after it. The
+  form's own writes (its arrival, a click's ack, the answer) and the
+  settlement are not the render pass and still land.
+
+  **Every card write advances the render gate's signature cache** — the flush
+  does it (`advance_sent_signatures`, `src/bridge/turn/flush.rs`), and so must
+  an out-of-band write that restamps the header (`Turn::mark_header_shown` for
+  a click's ack, once the eager patches landed). The cache records what the card
   last SHOWED, so a stale one makes the next render tick re-PATCH an identical
-  body — the "it refreshed by itself and ate my text" report.
+  body — the "it refreshed by itself and ate my text" report. The render pass
+  never pre-advances it, so a suppressed or refused write still owes its PATCH.
 - **`info-probe`** — the generation is probed with `GET /api/info`, and the
   status alone cannot classify it: V1's web-UI catch-all serves `index.html` for
   every unknown path, so V1 answers 200 `text/html`. The rule — 200 + V2's JSON
