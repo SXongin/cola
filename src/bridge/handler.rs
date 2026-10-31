@@ -2758,6 +2758,7 @@ impl App {
         let model_generation_at_activation = pending.validated_provider_fact_generation;
         let model_before_activation = pending.model.clone();
         let variant_before_activation = pending.variant.clone();
+        let directory_for_generation = pending.directory.clone();
         let entry = pending.into_entry(session.id.clone());
         let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
@@ -2786,12 +2787,17 @@ impl App {
             // few fact swaps without making a config read; churn ultimately
             // converges to the neutral model ref.
             for _ in 0..3 {
+                let fact = self.client.configured_provider_fact(&directory_for_generation);
                 let generation_before = self.client.provider_fact_generation();
+                let current_provider = (fact.generation == generation_before)
+                    .then_some(fact.provider_id.as_deref())
+                    .flatten();
                 let (neutral_model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
                     original_model,
                     expected_generation,
                     generation_before,
                     self.client.neutral_provider_id(),
+                    current_provider,
                 );
                 if stale && neutral_model != stored_model {
                     match self
@@ -2836,11 +2842,17 @@ impl App {
         let Some(model) = pending.model.as_deref() else {
             return;
         };
+        let fact = self.client.configured_provider_fact(&pending.directory);
+        let generation = self.client.provider_fact_generation();
+        let current_provider = (fact.generation == generation)
+            .then_some(fact.provider_id.as_deref())
+            .flatten();
         let (model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
             model,
             Some(pending.validated_provider_fact_generation.unwrap_or_default()),
-            self.client.provider_fact_generation(),
+            generation,
             self.client.neutral_provider_id(),
+            current_provider,
         );
         if stale {
             pending.model = Some(model);

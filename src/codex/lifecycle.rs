@@ -360,11 +360,16 @@ impl CodexLifecycle {
     ) -> crate::error::Result<()> {
         let _provider_fact = self.provider_fact_gate.lock().await;
         let current_generation = self.configured_provider_fact_snapshot().generation();
+        let current_provider = provider_fact
+            .as_ref()
+            .filter(|fact| fact.generation == current_generation)
+            .and_then(|fact| fact.provider_id.as_deref());
         let (model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
             model,
             provider_fact.as_ref().map(|fact| fact.generation),
             current_generation,
             Some("codex"),
+            current_provider,
         );
         self.pending.record_pending_model(
             session_id,
