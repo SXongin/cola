@@ -5721,6 +5721,122 @@ async fn a_yielded_rows_activity_age_advances_on_the_rendered_second() {
     );
 }
 
+/// The poller's inline question block, as a card renders it. `typed` picks the
+/// field the operator answers by typing — a V1 question's `custom` is unset,
+/// which reads as allowed, so its block renders the custom-answer form (issue
+/// #917's input) — or one answered by clicking its single option.
+async fn add_question_block(app: &Arc<App>, session_id: &str, directory: &str, typed: bool) {
+    use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionOption, QuestionRequest};
+    let request = QuestionRequest {
+        id: if typed { "que_typed" } else { "que_click" }.into(),
+        session_id: session_id.into(),
+        questions: vec![QuestionInfo {
+            question: "备注一下".into(),
+            header: "备注".into(),
+            options: if typed {
+                Vec::new()
+            } else {
+                vec![QuestionOption {
+                    label: "/a".into(),
+                    ..Default::default()
+                }]
+            },
+            kind: FormFieldKind::String,
+            custom: if typed { None } else { Some(false) },
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    Turn::add_question(
+        &app.cards_handle(),
+        session_id,
+        &request,
+        directory,
+        &[None],
+        &[false],
+    )
+    .await;
+}
+
+/// Issue #917: a card that renders an unanswered free-text answer field is
+/// never repainted for a clock-only reason. Feishu rebuilds the whole body on
+/// every update, so any repaint wipes what the operator typed — and the
+/// yielded ledger's rendered second (ADR-0060) is exactly such a repaint: the
+/// card looks settled (the turn is over, the AI is quiet) while a background
+/// task's age ticks once a second.
+///
+/// The rows half is real content and still PATCHes (the activity fragment
+/// landing below); only the clock freezes.
+#[tokio::test]
+async fn a_typed_answer_freezes_the_yielded_ledger_clock() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "bash")])
+        .await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    // The operator is typing a custom answer on the waiting card.
+    add_question_block(&app, "ses_test", "/work", true).await;
+    Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+    // The read's own rows still land: the subagent's fragment arriving is a
+    // visible fact, not a clock.
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the fragment arriving", CardUpdates::Latest, |card| {
+        ledger_activity(card, "· subagent：**review the diff**").is_some()
+    })
+    .await;
+    let before = patches_to(&platform, "om_waiting").await.len();
+
+    // Several Session Sync reads at the injected cadence: a rendered second
+    // turns, but the card owes no PATCH while a typed answer waits.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert_eq!(
+        patches.len(),
+        before,
+        "a rendered second must not repaint a card with an unanswered typed answer: {:?}",
+        &patches[before..]
+    );
+}
+
+/// The other half of issue #917's rule: the freeze is scoped to a card that
+/// actually renders a free-text input. A question answered by clicking its
+/// option has nothing the client holds unsubmitted, so the yielded clock keeps
+/// proving the wait is alive — the gate narrows the aliveness contract
+/// (ADR-0060) exactly as far as the input demands, no further.
+#[tokio::test]
+async fn a_click_only_question_leaves_the_yielded_ledger_clock_running() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
+    let (_dir, app, backend, platform) = scripted_app(vec![live], Some(SessionStatus::Idle)).await;
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 30_000, "bash")])
+        .await;
+    yield_waiting_card(&app, &platform, 2).await;
+
+    add_question_block(&app, "ses_test", "/work", false).await;
+    Turn::flush_card(&app.cards_handle(), "ses_test").await;
+
+    spawn_sync(&app);
+    wait_for_card_update(&platform, "the fragment arriving", CardUpdates::Latest, |card| {
+        ledger_activity(card, "· subagent：**review the diff**").is_some()
+    })
+    .await;
+    let before = patches_to(&platform, "om_waiting").await.len();
+
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let patches = patches_to(&platform, "om_waiting").await;
+    assert!(
+        patches.len() > before,
+        "a click-only card has no input to protect: its clock stays a liveness signal"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A live background subagent's child activity on the LIVE render path (spec
 // #501, ticket #504): while the parent turn is still running and the card is

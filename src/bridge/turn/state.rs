@@ -758,9 +758,22 @@ pub(super) struct PendingQuestion {
     pub(super) done: Vec<bool>,
 }
 
+impl PendingQuestion {
+    /// Whether this block renders a free-text input the operator may be typing
+    /// into (issue #917): a still-open field with a custom-answer box or a
+    /// numeric form. A finalized field renders no controls at all, so it never
+    /// counts. The same predicate renders the form (`renders_typed_input`), so
+    /// the card and the freeze cannot disagree about which cards have an input.
+    pub(super) fn awaits_typed_answer(&self) -> bool {
+        self.questions.iter().enumerate().any(|(i, q)| {
+            !self.done.get(i).copied().unwrap_or(false)
+                && crate::feishu::card::question::renders_typed_input(q)
+        })
+    }
+}
+
 /// One entry in a card's interaction section: a live permission or question
-/// block, or the tombstone of the receipt left once resolved. The section has
-/// ONE representation (this list), ONE mutation API (the `*_interaction`
+/// block, or the tombstone of the receipt left once resolved. The section has/// ONE representation (this list), ONE mutation API (the `*_interaction`
 /// methods on [`StreamAccumulator`]) and one render point for live blocks
 /// (`build_card_inner`'s tail): every update — add, state change, resolve —
 /// goes through that seam, so what the card renders cannot drift from the
@@ -3328,6 +3341,20 @@ impl StreamAccumulator {
             (false, true) => AwaitingAction::Question,
             (false, false) => AwaitingAction::None,
         }
+    }
+
+    /// Whether this card renders a free-text answer field nobody has submitted
+    /// yet — the custom-answer box or a numeric form (issue #917). Such a card
+    /// must not be repainted for a clock-only reason: Feishu rebuilds the body
+    /// on every update and the unsubmitted text lives only in the client, so a
+    /// tick of a rendered second (the yielded ledger's, ADR-0060) would eat the
+    /// answer as the operator types it. A permission block has no input, and a
+    /// receipt is already settled, so neither counts.
+    pub(super) fn awaits_typed_answer(&self) -> bool {
+        self.interactions.iter().any(|block| match block {
+            InteractionBlock::Question(q) => q.awaits_typed_answer(),
+            InteractionBlock::Permission(_) | InteractionBlock::Receipt(_) => false,
+        })
     }
 
     /// Progress inputs for the header (ADR-0014): which request kinds await the
@@ -7728,6 +7755,70 @@ mod tests {
             apply(&Disposition::StuckPanel),
             (CardState::Error, Some(STUCK_PANEL_ERROR.into()))
         );
+    }
+
+    /// Issue #917: only a live question field that renders an input counts —
+    /// a permission card has no form, a finalized field's controls are gone,
+    /// and a resolved block is a receipt.
+    #[test]
+    fn awaits_typed_answer_names_only_a_live_question_form() {
+        let mut acc = StreamAccumulator::new("test");
+        let question = |done: bool, custom: Option<bool>| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: "q".into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "备注?".into(),
+                    header: "备注".into(),
+                    // A field with an option has a clickable control; one with
+                    // none renders only its input.
+                    options: if custom == Some(false) {
+                        vec![crate::backend::types::QuestionOption {
+                            label: "/a".into(),
+                            ..Default::default()
+                        }]
+                    } else {
+                        Vec::new()
+                    },
+                    kind: crate::backend::types::FormFieldKind::String,
+                    custom,
+                    ..Default::default()
+                }],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None],
+                done: vec![done],
+            })
+        };
+        assert!(!acc.awaits_typed_answer(), "no block, no input");
+        acc.add_interaction(InteractionBlock::Permission(PendingPermission {
+            session_id: "s".into(),
+            request_id: "p".into(),
+            body: "bash".into(),
+            target: "⚡ 执行 Shell 命令 `ls -la`".into(),
+            directory: "/w".into(),
+            always_supported: true,
+        }));
+        assert!(
+            !acc.awaits_typed_answer(),
+            "a permission card renders buttons, never a form input"
+        );
+        // A finalized field rendered no form: its controls are gone.
+        acc.add_interaction(question(true, None));
+        assert!(!acc.awaits_typed_answer(), "a done field has no controls");
+        acc.interactions.clear();
+        acc.add_interaction(question(false, Some(false)));
+        assert!(
+            !acc.awaits_typed_answer(),
+            "custom disabled: options only, nothing to type into"
+        );
+        acc.interactions.clear();
+        acc.add_interaction(question(false, None));
+        assert!(acc.awaits_typed_answer(), "the custom-answer box is an input");
+        // Resolving the request leaves its receipt behind — no controls.
+        assert!(acc.dismiss_interaction("q"));
+        assert!(!acc.awaits_typed_answer());
     }
 
     /// The header signature carries the phase label, and flips to a title
