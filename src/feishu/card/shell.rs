@@ -543,6 +543,24 @@ pub(crate) fn collapsible_panel_chunks(
     chunks: &[String],
     element_id: Option<&str>,
 ) -> serde_json::Value {
+    let elements = chunks
+        .iter()
+        .map(|c| json!({ "tag": "markdown", "content": c }))
+        .collect::<Vec<_>>();
+    collapsible_panel_elements(title, elements, element_id)
+}
+
+/// [`collapsible_panel_chunks`] with arbitrary body elements, folded by
+/// default. Folded content costs only the header line, which is what lets a
+/// card keep its input within reach on mobile: the Feishu Android client scrolls
+/// the message's bottom to the keyboard's top, so anything more than about half
+/// a screen BELOW an input pushes the input off the top of the screen when it
+/// takes focus (issue #917, measured on Android 14 / Feishu 8.4.9).
+pub(crate) fn collapsible_panel_elements(
+    title: &str,
+    elements: Vec<serde_json::Value>,
+    element_id: Option<&str>,
+) -> serde_json::Value {
     let mut panel = json!({
         "tag": "collapsible_panel",
         "expanded": false,
@@ -551,10 +569,7 @@ pub(crate) fn collapsible_panel_chunks(
             "icon": { "tag": "standard_icon", "token": "down-small-ccm_outlined" },
             "icon_position": "right"
         },
-        "elements": chunks
-            .iter()
-            .map(|c| json!({ "tag": "markdown", "content": c }))
-            .collect::<Vec<_>>(),
+        "elements": elements,
     });
     if let Some(id) = element_id {
         panel["element_id"] = json!(id);

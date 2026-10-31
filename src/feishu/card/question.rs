@@ -364,9 +364,24 @@ pub fn question_elements(
     }
 
     if uncollectable.is_none() {
+        // Issue #917: the Feishu Android client scrolls the message's bottom to
+        // the keyboard's top when a card input takes focus, so an input with
+        // more than about half a screen of content BELOW it is pushed off the
+        // top of the screen — unreadable, and the typed text stays invisible.
+        // Keep exactly one question open at a time: the first unanswered one
+        // renders its controls, and every other unanswered one folds into a
+        // collapsible panel, whose folded cost is its header line (measured:
+        // folded content does not push the input away). A single-question ask —
+        // the common case — is unchanged.
+        let current = questions
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !is_done(*i))
+            .map(|(i, _)| i);
         for (i, q) in questions.iter().enumerate() {
             let multi = q.is_multi();
             let finalized = is_done(i);
+            let block_start = elements.len();
 
             // Per-question heading: number + text + status, option bullets while
             // the question is still open (so the full option list reads together
@@ -547,6 +562,34 @@ pub fn question_elements(
                         }
                     }
                 }
+            }
+
+            // Fold every unanswered question but the open one (issue #917).
+            // The block built above is exactly what the expanded question shows,
+            // except the typed form: Feishu rejects a `form` nested in a
+            // `collapsible_panel` (ErrCode 200621 "type of element is not
+            // supported tag: form"), and the open question owns the card's only
+            // input anyway. A panel left with no clickable control (an
+            // input-only field) says what to do instead of showing nothing.
+            let mut block: Vec<serde_json::Value> = elements.split_off(block_start);
+            if !finalized && Some(i) != current {
+                block.retain(|e| e["tag"] != "form");
+                if !block
+                    .iter()
+                    .any(|e| e["tag"] == "button" || e["tag"] == "overflow")
+                {
+                    block.push(json!({
+                        "tag": "markdown",
+                        "content": "_（回答完当前问题后，这里才能作答）_",
+                    }));
+                }
+                elements.push(super::shell::collapsible_panel_elements(
+                    &format!("{}. {}", i + 1, question_label(q, 40)),
+                    std::mem::take(&mut block),
+                    Some(&format!("question_{i}")),
+                ));
+            } else {
+                elements.append(&mut block);
             }
 
             // A divider separates question blocks so options never mix visually.
@@ -1290,8 +1333,10 @@ mod tests {
         let hr = elements.iter().filter(|e| e["tag"] == "hr").count();
         assert_eq!(hr, 1, "one divider between two questions: {}", card);
         // The multi-select's confirm button is grouped right under ITS own
-        // options (after Q1's option + custom form) and before the reject
-        // button — no separate bottom submit for a multi-select question.
+        // options and before the reject button — no separate bottom submit for
+        // a multi-select question. Question 2 is folded (issue #917), so both
+        // controls live inside its panel; the panel sits before the reject.
+        let elements = all_elements(&card);
         let opt1 = elements
             .iter()
             .position(|e| {
@@ -1318,6 +1363,35 @@ mod tests {
             "no bottom submit button when questions remain open: {}",
             card
         );
+    }
+
+    /// A one-option String question — the shape the fold tests need.
+    fn string_question(n: usize) -> crate::backend::types::QuestionInfo {
+        crate::backend::types::QuestionInfo {
+            question: format!("问题 {n}"),
+            header: format!("h{n}"),
+            options: vec![crate::backend::types::QuestionOption {
+                label: format!("/a{n}"),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        }
+    }
+
+    /// Every element the card renders, folded panel bodies included, so a test
+    /// can assert on a control wherever the fold put it (issue #917 keeps one
+    /// question open and folds the rest).
+    fn all_elements(card: &serde_json::Value) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for e in card["body"]["elements"].as_array().into_iter().flatten() {
+            out.push(e.clone());
+            if e["tag"] == "collapsible_panel" {
+                out.extend(e["elements"].as_array().into_iter().flatten().cloned());
+            }
+        }
+        out
     }
 
     #[test]
@@ -1633,23 +1707,24 @@ mod tests {
             url: Some("https://example.com/x".into()),
             ..Default::default()
         };
-        let card = build_question_card(
-            "Questions",
-            "frm_1",
-            "ses_1",
-            &[string_field, boolean, integer, external],
-            "/tmp/proj",
-            &[None, None, None, None],
-            &[false, false, false, false],
-        );
-        let text = card.to_string();
-        assert_eq!(card["header"]["title"]["content"], "❓ Questions");
-        assert!(
-            text.contains("https://example.com/x"),
-            "external link missing: {text}"
-        );
+        // One card per field: issue #917 folds every question but the first
+        // unanswered one, and Feishu rejects a form nested in a folded panel, so
+        // only the open field's controls render on a multi-field card.
+        let one = |field: QuestionInfo| {
+            build_question_card(
+                "Questions",
+                "frm_1",
+                "ses_1",
+                &[field],
+                "/tmp/proj",
+                &[None],
+                &[false],
+            )
+        };
 
         // The option button displays the LABEL and submits the VALUE.
+        let card = one(string_field);
+        assert_eq!(card["header"]["title"]["content"], "❓ Questions");
         let elements = card["body"]["elements"].as_array().unwrap();
         let option = elements
             .iter()
@@ -1658,12 +1733,14 @@ mod tests {
         assert_eq!(option["value"]["answer"], "/a");
 
         // Boolean: 是 / 否 with boolean answer values.
+        let card = one(boolean);
+        let elements = card["body"]["elements"].as_array().unwrap();
         let yes = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 是")
             .expect("boolean 是 button missing");
         assert_eq!(yes["value"]["answer"], "true");
-        assert_eq!(yes["value"]["question_index"], 1);
+        assert_eq!(yes["value"]["question_index"], 0);
         let no = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "否")
@@ -1671,6 +1748,8 @@ mod tests {
         assert_eq!(no["value"]["answer"], "false");
 
         // Number: an input form whose submit routes as an answer.
+        let card = one(integer);
+        let elements = card["body"]["elements"].as_array().unwrap();
         let number_form = elements
             .iter()
             .find(|e| e["tag"] == "form" && e["value"].is_null())
@@ -1680,10 +1759,17 @@ mod tests {
             "numeric placeholder missing: {number_form}"
         );
         let number_button = &number_form["elements"][1];
-        assert_eq!(number_button["value"]["question_index"], 2);
+        assert_eq!(number_button["value"]["question_index"], 0);
         assert_eq!(number_button["value"]["reply"], "answer");
 
-        // External: an acknowledgement button answering `true`.
+        // External: the link, and an acknowledgement button answering `true`.
+        let card = one(external);
+        let text = card.to_string();
+        assert!(
+            text.contains("https://example.com/x"),
+            "external link missing: {text}"
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
         let ack = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 我已了解")
@@ -1771,5 +1857,239 @@ mod tests {
         // answers, through the same one-line sanitizer.
         let buried = question_label(&question(&format!("{}问什么？", " ".repeat(600)), "`选择`"), 40);
         assert_eq!(buried, "'选择'");
+    }
+
+    /// Issue #917: a card with several questions renders ONE open question and
+    /// folds the rest. The client scrolls the message's bottom to the keyboard's
+    /// top on focus, so a card holding more than about half a screen below an
+    /// input loses that input off the top of the screen; a folded panel costs
+    /// only its header line.
+    #[test]
+    fn a_multi_question_card_folds_every_question_but_the_open_one() {
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[string_question(1), string_question(2), string_question(3)],
+            "/tmp/proj/lib",
+            &[None, None, None],
+            &[false, false, false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panels: Vec<_> = elements
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .collect();
+        assert_eq!(panels.len(), 2, "the two closed questions fold: {card}");
+        assert!(panels.iter().all(|p| p["expanded"] == json!(false)));
+        assert_eq!(panels[0]["header"]["title"]["content"], "2. 问题 2");
+        assert_eq!(panels[1]["header"]["title"]["content"], "3. 问题 3");
+        // The open question's controls (including its input) are on the card;
+        // a folded question keeps its controls but never a form — Feishu rejects
+        // a form nested in a collapsible panel (ErrCode 200621).
+        let top_level = elements.iter().map(|e| e.to_string()).collect::<String>();
+        assert!(
+            top_level.contains("form_0"),
+            "open question has its input: {card}"
+        );
+        assert!(
+            !elements
+                .iter()
+                .any(|e| e["tag"] == "form" && e["name"] == "form_1"),
+            "the folded question's input stays off the card: {card}"
+        );
+        for panel in &panels {
+            assert!(
+                !panel.to_string().contains("\"tag\":\"form\""),
+                "Feishu rejects a form nested in a collapsible panel (200621): {panel}"
+            );
+        }
+        // The reject control stays last, below the open question.
+        assert_eq!(elements.last().unwrap()["value"]["reply"], "reject");
+    }
+
+    /// A numeric field folded behind the open question renders no form (Feishu
+    /// rejects a form inside a panel, 200621) and points at the open one, while
+    /// the open question keeps the card's only input.
+    #[test]
+    fn a_folded_numeric_field_renders_no_form() {
+        let numeric = |n: usize| crate::backend::types::QuestionInfo {
+            question: format!("数量 {n}"),
+            header: format!("h{n}"),
+            kind: crate::backend::types::FormFieldKind::Integer,
+            ..Default::default()
+        };
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[string_question(1), numeric(2)],
+            "/tmp/proj/lib",
+            &[None, None],
+            &[false, false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panel = elements
+            .iter()
+            .find(|e| e["tag"] == "collapsible_panel")
+            .expect("the numeric field folds");
+        assert!(
+            !panel.to_string().contains("\"tag\":\"form\""),
+            "no form nested in a panel: {panel}"
+        );
+        assert!(
+            panel["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["tag"] == "markdown"
+                    && e["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("回答完当前问题后"))),
+            "the fold says how to reach it: {panel}"
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["tag"] == "form" && e["name"] == "form_0"),
+            "the open string question keeps the only input: {card}"
+        );
+    }
+
+    /// A folded question whose only control would be a typed input renders a
+    /// pointer instead: its form cannot live inside the panel (Feishu 200621)
+    /// and the open question owns the card's single input (issue #917).
+    #[test]
+    fn a_folded_input_only_question_points_at_the_open_one() {
+        let question = |n: usize| crate::backend::types::QuestionInfo {
+            question: format!("问题 {n}"),
+            header: format!("h{n}"),
+            kind: crate::backend::types::FormFieldKind::String,
+            ..Default::default()
+        };
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[question(1), question(2)],
+            "/tmp/proj/lib",
+            &[None, None],
+            &[false, false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panel = elements
+            .iter()
+            .find(|e| e["tag"] == "collapsible_panel")
+            .expect("the second question folds");
+        assert!(
+            !panel.to_string().contains("\"tag\":\"form\""),
+            "no form nested in a panel: {panel}"
+        );
+        assert!(
+            panel["elements"].as_array().unwrap().iter().any(|e| {
+                e["tag"] == "markdown"
+                    && e["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("回答完当前问题后"))
+            }),
+            "a control-less fold says how to reach it: {panel}"
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["tag"] == "form" && e["name"] == "form_0"),
+            "the open question still renders its input: {card}"
+        );
+    }
+
+    /// The open question's form keeps ITS index in the routing payload even when
+    /// earlier questions are already answered and off the card: the submit's
+    /// `question_index` is what ws.rs echoes back as the answered field.
+    #[test]
+    fn the_open_questions_form_keeps_its_index() {
+        let numeric = |n: usize| crate::backend::types::QuestionInfo {
+            question: format!("数量 {n}"),
+            header: format!("h{n}"),
+            kind: crate::backend::types::FormFieldKind::Integer,
+            ..Default::default()
+        };
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[string_question(1), numeric(2)],
+            "/tmp/proj/lib",
+            &[Some(vec!["/a1".into()]), None],
+            &[true, false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let form = elements
+            .iter()
+            .find(|e| e["tag"] == "form")
+            .expect("the numeric field is the open one");
+        assert_eq!(form["name"], "form_1");
+        let submit = form["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button")
+            .expect("the form has its submit");
+        assert_eq!(submit["value"]["question_index"], 1);
+        assert_eq!(submit["value"]["reply"], "answer");
+    }
+
+    /// Answering the open question moves the fold: the next unanswered question
+    /// opens, the answered one becomes its one-line receipt.
+    #[test]
+    fn the_open_question_is_the_first_unanswered_one() {
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[string_question(1), string_question(2), string_question(3)],
+            "/tmp/proj/lib",
+            &[Some(vec!["/a1".into()]), None, None],
+            &[true, false, false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panels: Vec<_> = elements
+            .iter()
+            .filter(|e| e["tag"] == "collapsible_panel")
+            .collect();
+        assert_eq!(panels.len(), 1, "only question 3 folds: {card}");
+        assert_eq!(panels[0]["header"]["title"]["content"], "3. 问题 3");
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["tag"] == "form" && e["name"] == "form_1"),
+            "question 2 is open and renders its input: {card}"
+        );
+        assert!(
+            elements.iter().any(|e| {
+                e["tag"] == "markdown" && e["content"].as_str().is_some_and(|c| c.contains("✅ **1."))
+            }),
+            "the answered question stays a one-line receipt: {card}"
+        );
+    }
+
+    /// One question — the common ask — keeps today's flat layout: no fold, no
+    /// extra tap.
+    #[test]
+    fn a_single_question_card_does_not_fold() {
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[many_option_question()],
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+        );
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            elements.iter().all(|e| e["tag"] != "collapsible_panel"),
+            "a one-question card has nothing to fold: {card}"
+        );
+        assert!(elements.iter().any(|e| e["tag"] == "form"));
     }
 }
