@@ -5759,16 +5759,16 @@ async fn add_question_block(app: &Arc<App>, session_id: &str, directory: &str, t
 }
 
 /// Issue #917: a card that renders an unanswered free-text answer field is
-/// never repainted for a clock-only reason. Feishu rebuilds the whole body on
-/// every update, so any repaint wipes what the operator typed — and the
-/// yielded ledger's rendered second (ADR-0060) is exactly such a repaint: the
-/// card looks settled (the turn is over, the AI is quiet) while a background
-/// task's age ticks once a second.
+/// frozen against the yielded ledger — no PATCH at all, not even one whose only
+/// difference is a background task's row or age. Feishu rebuilds the whole body
+/// on every update, so any repaint wipes what the operator typed; the card
+/// looks settled (the turn is over, the AI is quiet) while a task's age ticks
+/// once a second and its fragment arrives once.
 ///
-/// The rows half is real content and still PATCHes (the activity fragment
-/// landing below); only the clock freezes.
+/// The read is deferred, not dropped: the second half proves the answer's own
+/// flush renders the ledger the wait froze.
 #[tokio::test]
-async fn a_typed_answer_freezes_the_yielded_ledger_clock() {
+async fn a_typed_answer_freezes_the_yielded_ledger() {
     let _wd = test_work_dir();
     let now = chrono::Utc::now().timestamp_millis();
     let live = waiting_shell_and_subagent(frozen_start(now), now - 30_000);
@@ -5781,25 +5781,37 @@ async fn a_typed_answer_freezes_the_yielded_ledger_clock() {
     // The operator is typing a custom answer on the waiting card.
     add_question_block(&app, "ses_test", "/work", true).await;
     Turn::flush_card(&app.cards_handle(), "ses_test").await;
-
-    // The read's own rows still land: the subagent's fragment arriving is a
-    // visible fact, not a clock.
-    spawn_sync(&app);
-    wait_for_card_update(&platform, "the fragment arriving", CardUpdates::Latest, |card| {
-        ledger_activity(card, "· subagent：**review the diff**").is_some()
-    })
-    .await;
     let before = patches_to(&platform, "om_waiting").await.len();
 
-    // Several Session Sync reads at the injected cadence: a rendered second
-    // turns, but the card owes no PATCH while a typed answer waits.
+    // Several Session Sync reads at the injected cadence: the fragment arrives
+    // and a rendered second turns, but the card owes no PATCH while the typed
+    // answer waits.
+    spawn_sync(&app);
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let patches = patches_to(&platform, "om_waiting").await;
     assert_eq!(
         patches.len(),
         before,
-        "a rendered second must not repaint a card with an unanswered typed answer: {:?}",
+        "no background refresh may repaint a card with an unanswered typed answer: {:?}",
         &patches[before..]
+    );
+
+    // The answer's own flush renders what the wait kept: the ledger row is
+    // there with its fragment, so the freeze defers the read, never drops it.
+    let cards = app.cards_handle();
+    let receipt = |_: &str| "✅ 已回答".to_string();
+    Turn::resolve_interactions(
+        &cards,
+        "ses_test",
+        &["que_typed".into()],
+        &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+    )
+    .await;
+    Turn::flush_card(&cards, "ses_test").await;
+    let card = platform.updated_cards().await.last().cloned().unwrap();
+    assert!(
+        ledger_activity(&card, "· subagent：**review the diff**").is_some(),
+        "the frozen ledger lands with the answer: {card}"
     );
 }
 

@@ -242,6 +242,22 @@ impl Turn {
         resolved_here.then(|| acc.header_title_and_template())
     }
 
+    /// Advance the render gate's header cache after a resolution restamped the
+    /// cards itself: `resolve_interactions` returns the accumulator's
+    /// post-resolution header and every card the resolution edits (the click's
+    /// ack, another card's eager PATCH) is restamped with it, so the cache must
+    /// follow. A stale cache made the next render tick re-send the identical
+    /// body — which wipes an unsubmitted form answer (issue #917).
+    ///
+    /// Only the header: a surgical edit re-renders a block and the header, not
+    /// the footer's context segment, so that half's cache stays the flush's.
+    pub(crate) async fn mark_header_shown(cards: &CardsHandle, session_id: &str) {
+        let mut live = cards.cards.lock().await;
+        if let Some(card) = live.get_mut(session_id) {
+            card.last_header_sig = card.acc.header_sig();
+        }
+    }
+
     /// The clicked card's updated JSON, built from a CLONE of the session's
     /// accumulator — a split probe that cannot advance the live `render_from`
     /// from inside a click handler (the flush owns that flow). `None` when the

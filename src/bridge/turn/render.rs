@@ -1444,8 +1444,8 @@ pub(super) fn commit_planned_entries(
 /// words, an activity's words, a committed completion entry — and `clock` is
 /// only a rendered number crossing `cadence`. A terminal card that moved still
 /// owes its handover PATCH; a yielded card is only PATCHed for a real change,
-/// and a clock-only one not even then when the card renders an unanswered
-/// free-text field (issue #917).
+/// and not at all when it renders an unanswered free-text field (issue #917) —
+/// both halves are deferred there, never dropped.
 #[allow(clippy::too_many_arguments)] // the read's ledger inputs: acc + read + gather + clock + cadence + endings + plans + capability
 pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
@@ -2620,17 +2620,17 @@ async fn render_and_flush_inner(
         // renders and flushes this same read: no carrier here.
         FlushOutcome::Unwritten
     } else if changed
-        || entries_changed
         || file_changed
         || header_changed
         || context_changed
-        // A card that renders an unanswered free-text field is never repainted
-        // for a clock-only reason: Feishu rebuilds the body on every update, so
-        // the tick would wipe what the operator is typing (issue #917). The
-        // rows half is real content and still flushes.
-        || ledger.rows
-        || (ledger.clock && !typed_answer)
-        || liveness_changed
+        // A card that renders an unanswered free-text field is not repainted by
+        // background progress: Feishu rebuilds the body on every update, so any
+        // such repaint wipes what the operator is typing (issue #917). The
+        // ledger's live rows, its rendered clock and a task panel's activity are
+        // the background's own progress — deferred, not dropped: the acc keeps
+        // them, so the answer's own flush (or the next content) renders them.
+        || (!typed_answer
+            && (entries_changed || ledger.rows || ledger.clock || liveness_changed))
     {
         Turn::flush_card(cards, session_id).await
     } else {
@@ -2988,9 +2988,9 @@ mod tests {
         TaskRunRecord, cursor_prefix_digest,
     };
     use crate::bridge::test_support::{
-        MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card, realistic_parts,
-        seed_cover_title, seed_entry, send_command_in, test_config, test_work_dir, text_part, turn_anchor,
-        typed_message,
+        HostCardAction, MockBackend, PlatformCall, RecordingPlatform, build_app, card_text, final_card,
+        realistic_parts, seed_cover_title, seed_entry, send_command_in, test_config, test_work_dir,
+        text_part, turn_anchor, typed_message,
     };
     use crate::bridge::turn::state::{CursorSeed, StreamAccumulator, file_content_hash};
     use crate::feishu::card::CardState;
@@ -9132,6 +9132,94 @@ Index: /x/src/main.rs
             updates.len(),
             with_block,
             "a card with an unanswered typed answer is never repainted by a tick: {headers:?}"
+        );
+    }
+
+    /// Issue #917 (the ack path): a click that resolves one block restamps the
+    /// header on the clicked card itself (the callback ack, ADR-0038 rule 3).
+    /// The render gate's cache must follow that write too — a stale cache made
+    /// the next tick re-PATCH the identical body, wiping the answer being typed
+    /// in another field's form. The permission below is resolved while a typed
+    /// question stays live, so the header narrows from both to the question.
+    #[tokio::test]
+    async fn a_click_that_resolves_one_block_leaves_no_repaint_behind() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_typed";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_typed")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        Turn::add_permission(
+            &cards,
+            sid,
+            &crate::backend::types::PermissionRequest {
+                request_id: "per_1".into(),
+                session_id: Some(sid.into()),
+                permission: Some("bash".into()),
+                patterns: vec!["ls -la".into()],
+                metadata: None,
+                always: Vec::new(),
+                always_supported: true,
+            },
+            "/work",
+        )
+        .await;
+        let request = crate::backend::types::QuestionRequest {
+            id: "que_typed".into(),
+            session_id: sid.into(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "备注一下".into(),
+                header: "备注".into(),
+                options: Vec::new(),
+                kind: crate::backend::types::FormFieldKind::String,
+                custom: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Turn::add_question(&cards, sid, &request, "/work", &[None], &[false]).await;
+        Turn::flush_card(&cards, sid).await;
+        let before = platform.updated_cards().await.len();
+
+        // The click's own write is the ack, not a PATCH.
+        app.host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": sid,
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": "om_typed",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+
+        // The ack carried the narrowed header; the tick must find nothing new.
+        let transcript = SessionTranscript::default();
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
+        let updates = platform.updated_cards().await;
+        let headers: Vec<&str> = updates
+            .iter()
+            .map(|card| card["header"]["title"]["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            updates.len(),
+            before,
+            "the click's ack is the card's body: no tick may re-send it: {headers:?}"
         );
     }
 

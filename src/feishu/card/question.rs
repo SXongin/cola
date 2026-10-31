@@ -637,7 +637,7 @@ fn submit_name(name_prefix: &str, request_id: &str, session_id: &str, index: usi
 /// client alone holds: Feishu rebuilds `body.elements` on every card update,
 /// so an input comes back empty after any PATCH — a repaint while the operator
 /// types eats their answer. The bridge therefore never repaints that card for
-/// a clock-only reason ([`crate::bridge::turn::state::StreamAccumulator::awaits_typed_answer`]).
+/// background progress ([`crate::bridge::turn::state::StreamAccumulator::awaits_typed_answer`]).
 pub(crate) fn renders_typed_input(q: &crate::backend::types::QuestionInfo) -> bool {
     use crate::backend::types::FormFieldKind;
     match q.kind {

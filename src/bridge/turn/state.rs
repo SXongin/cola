@@ -3345,11 +3345,11 @@ impl StreamAccumulator {
 
     /// Whether this card renders a free-text answer field nobody has submitted
     /// yet — the custom-answer box or a numeric form (issue #917). Such a card
-    /// must not be repainted for a clock-only reason: Feishu rebuilds the body
+    /// must not be repainted for background progress: Feishu rebuilds the body
     /// on every update and the unsubmitted text lives only in the client, so a
-    /// tick of a rendered second (the yielded ledger's, ADR-0060) would eat the
-    /// answer as the operator types it. A permission block has no input, and a
-    /// receipt is already settled, so neither counts.
+    /// ledger read (ADR-0060) or a clock tick would eat the answer as the
+    /// operator types it. A permission block has no input, and a receipt is
+    /// already settled, so neither counts.
     pub(super) fn awaits_typed_answer(&self) -> bool {
         self.interactions.iter().any(|block| match block {
             InteractionBlock::Question(q) => q.awaits_typed_answer(),
