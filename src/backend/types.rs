@@ -367,6 +367,17 @@ pub struct ModelInfo {
     pub variant: Option<String>,
 }
 
+/// A provider fact used to validate a `/model` prefix. `generation` identifies
+/// the attached client's fact cache, so a pick can detect a daemon replacement
+/// after it reads `provider_id` and fall back to the neutral model ref.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderFactSnapshot {
+    /// The known provider channel, or `None` when this fact is unknown.
+    pub provider_id: Option<String>,
+    /// The connection/cache generation this observation belongs to.
+    pub generation: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Location {
     pub directory: String,

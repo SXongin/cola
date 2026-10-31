@@ -575,6 +575,146 @@ async fn another_directorys_cached_provider_does_not_validate_a_pick() {
     );
 }
 
+/// Spec #933 round 3: a prefix was validated against generation N, but the
+/// attachment changes before the pending mirror write. The write must treat the
+/// channel as unknown and store `codex/<id>`, not the stale provider prefix.
+#[tokio::test]
+async fn a_pending_pick_becomes_neutral_if_its_provider_generation_changes() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_configured_provider("/work/cola", "openai");
+    let generation = backend.provider_fact_generation.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    let decision = app
+        .sessions_handle()
+        .model_pick_decision(&app.client, &key(), "openai")
+        .await;
+    let (target, provider_generation) = match decision {
+        crate::bridge::handles::ModelPickDecision::Record {
+            target,
+            provider_generation: Some(generation),
+        } => (target, generation),
+        _ => panic!("the known current provider should pass validation"),
+    };
+    let crate::bridge::handles::PickTarget::Pending(epoch) = target else {
+        panic!("the target should be the Pending Session");
+    };
+
+    // Deterministically interleave an attachment replacement after the
+    // provider was read, but before the pending model write commits.
+    generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let outcome = app
+        .sessions_handle()
+        .pick_pending_model(
+            &app.client,
+            &key(),
+            epoch,
+            Some(provider_generation),
+            "openai/gpt-5.1",
+            None,
+        )
+        .await
+        .expect("the now-unknown channel remains model-pickable");
+    assert!(
+        matches!(outcome, crate::bridge::handles::PickOutcome::Applied { .. }),
+        "a generation change must not refuse the model-only pick: {outcome:?}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.as_deref()),
+        Some("codex/gpt-5.1"),
+        "the stale provider is discarded but the model is retained"
+    );
+}
+
+/// The same generation guard covers a live thread: let variant validation
+/// pause the pick after its provider decision, replace the fact generation,
+/// then verify the adapter pending carries the neutral ref.
+#[tokio::test]
+async fn a_live_pick_becomes_neutral_if_its_provider_generation_changes() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_known_thread_provider(Some("openai"));
+    let generation = backend.provider_fact_generation.clone();
+    let pending = backend.pending_selections.clone();
+    let lookup_gate = backend.hold_model_surface();
+    let lookup_entered = backend.model_surface_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut live = entry();
+    live.model = Some("openai/gpt-5.1-codex".into());
+    live.variant = Some("high".into());
+    seed_entry(&app, live).await;
+
+    let decision = app
+        .sessions_handle()
+        .model_pick_decision(&app.client, &key(), "openai")
+        .await;
+    let (target, provider_generation) = match decision {
+        crate::bridge::handles::ModelPickDecision::Record {
+            target,
+            provider_generation: Some(generation),
+        } => (target, generation),
+        _ => panic!("the known current provider should pass validation"),
+    };
+    let crate::bridge::handles::PickTarget::Live(session_id) = target else {
+        panic!("the target should be the live session");
+    };
+
+    let sessions = app.sessions_handle();
+    let backend = app.client.clone();
+    let pick = tokio::spawn(async move {
+        sessions
+            .pick_model_expecting(
+                &backend,
+                &key(),
+                Some(&session_id),
+                Some(provider_generation),
+                "openai/gpt-5.1",
+                None,
+            )
+            .await
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while lookup_entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "variant lookup did not begin"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The pick is paused after deciding `openai`; replace the fact generation
+    // before its pending model is recorded.
+    generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    lookup_gate.add_permits(1);
+    assert!(matches!(
+        pick.await.expect("pick task joins").expect("pick succeeds"),
+        crate::bridge::handles::PickOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        pending
+            .lock()
+            .await
+            .get("ses_test")
+            .and_then(|(model, _)| model.as_deref()),
+        Some("codex/gpt-5.1"),
+        "the stale provider is discarded but the next-turn model is retained"
+    );
+}
+
 /// Finding (record-first): a session that materialises while the pending's
 /// catalog lookup runs is a failure, never a silent claim.
 #[tokio::test]
@@ -1764,6 +1904,7 @@ async fn a_delayed_autoaccept_keeps_a_recorded_model() {
             &app.client,
             &key(),
             Some("ses_test"),
+            None,
             "deepseek/deepseek-v4-pro",
             None,
         )
@@ -2481,7 +2622,7 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
         let backend = backend.clone();
         async move {
             sessions
-                .pick_model_expecting(&backend, &key(), Some("ses_test"), "openai/model-a", None)
+                .pick_model_expecting(&backend, &key(), Some("ses_test"), None, "openai/model-a", None)
                 .await
         }
     });
@@ -2496,7 +2637,7 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
 
     // The later pick records while the earlier lookup is still parked.
     let later = sessions
-        .pick_model_expecting(&backend, &key(), Some("ses_test"), "openai/model-b", None)
+        .pick_model_expecting(&backend, &key(), Some("ses_test"), None, "openai/model-b", None)
         .await
         .expect("the later pick");
     assert!(

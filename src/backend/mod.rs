@@ -427,6 +427,32 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         Ok(())
     }
 
+    /// Record a live model pick only if the provider fact generation used by
+    /// validation is still current. A replaced fact makes the channel unknown,
+    /// so Codex stores the neutral `<codex>/<model>` ref instead of carrying a
+    /// stale provider into the next turn. The lifecycle adapter overrides this
+    /// to serialize the generation check with attachment replacement.
+    async fn record_pending_model_for_generation(
+        &self,
+        session_id: &str,
+        model: &str,
+        variant: Option<&str>,
+        expected_generation: Option<u64>,
+    ) -> Result<()> {
+        let model =
+            if expected_generation.is_some_and(|generation| self.provider_fact_generation() != generation) {
+                self.neutral_provider_id()
+                    .and_then(|provider| {
+                        crate::backend::parsing::parse_model(model)
+                            .map(|parsed| crate::backend::parsing::join_model(provider, &parsed.id))
+                    })
+                    .unwrap_or_else(|| model.to_string())
+            } else {
+                model.to_string()
+            };
+        self.record_pending_model(session_id, &model, variant).await
+    }
+
     /// Record a **one-shot next-turn** `/think` level, preserving any pending
     /// model. `None` clears the pending effort (the model's own default). A
     /// pending that ends up carrying neither a model nor an effort is dropped.
@@ -562,6 +588,19 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         None
     }
 
+    /// The live thread provider and the attachment generation that supplied
+    /// it. A provider comparison is valid only while this generation remains
+    /// current at the eventual model write.
+    async fn known_thread_provider_fact(
+        &self,
+        session_id: &str,
+    ) -> crate::backend::types::ProviderFactSnapshot {
+        crate::backend::types::ProviderFactSnapshot {
+            provider_id: self.known_thread_provider(session_id).await,
+            generation: self.provider_fact_generation(),
+        }
+    }
+
     /// The provider this client's configuration names (`config/read`'s
     /// top-level `model_provider`) **for the exact `directory`** a successful
     /// read was scoped to. Cache-only: no RPC on the pick path, because a
@@ -569,6 +608,28 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// (no read for that directory, a failed read, or the fact was invalidated
     /// by a new attachment), and an unknown channel never blocks a pick.
     fn configured_provider(&self, _directory: &str) -> Option<String> {
+        None
+    }
+
+    /// The configured provider fact and its attachment generation, read
+    /// atomically by clients that cache it. Unknown facts still carry their
+    /// generation so a late model write can notice that the cache was replaced.
+    fn configured_provider_fact(&self, directory: &str) -> crate::backend::types::ProviderFactSnapshot {
+        crate::backend::types::ProviderFactSnapshot {
+            provider_id: self.configured_provider(directory),
+            generation: self.provider_fact_generation(),
+        }
+    }
+
+    /// The current generation of provider facts. The bridge captures it during
+    /// pick validation and re-checks it immediately before writing.
+    fn provider_fact_generation(&self) -> u64 {
+        0
+    }
+
+    /// The neutral provider bucket used when a pick's fact generation expires.
+    /// A client without one leaves its picks unchanged.
+    fn neutral_provider_id(&self) -> Option<&'static str> {
         None
     }
 

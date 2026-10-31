@@ -4819,7 +4819,7 @@ impl App {
             };
         };
         use crate::bridge::handles::{ModelPickDecision, PickTarget};
-        let (target, pending_target) = match core
+        let (target, pending_target, provider_generation) = match core
             .sessions_handle()
             .model_pick_decision(&core.client, thread_key, &parsed.provider_id)
             .await
@@ -4830,9 +4830,12 @@ impl App {
                     toast: Some(text),
                 };
             }
-            ModelPickDecision::Record { target } => {
+            ModelPickDecision::Record {
+                target,
+                provider_generation,
+            } => {
                 let pending = matches!(target, PickTarget::Pending(_));
-                (target, pending)
+                (target, pending, provider_generation)
             }
         };
         // The toast must say where a pick applies: a Pending Session's model
@@ -4840,12 +4843,25 @@ impl App {
         // (spec #922).
         let outcome = match target {
             PickTarget::Live(session_id) => {
-                core.pick_model_expecting(thread_key, Some(&session_id), picked, Some(deadline))
-                    .await
+                core.pick_model_expecting(
+                    thread_key,
+                    Some(&session_id),
+                    provider_generation,
+                    picked,
+                    Some(deadline),
+                )
+                .await
             }
             PickTarget::Pending(epoch) => {
                 core.sessions_handle()
-                    .pick_pending_model(&core.client, thread_key, epoch, picked, Some(deadline))
+                    .pick_pending_model(
+                        &core.client,
+                        thread_key,
+                        epoch,
+                        provider_generation,
+                        picked,
+                        Some(deadline),
+                    )
                     .await
             }
         };

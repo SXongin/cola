@@ -251,13 +251,37 @@ fn provider_refusal(current: &str, picked: &str) -> String {
     )
 }
 
+/// Keep only the model id when the provider fact used during validation has
+/// expired. The neutral bucket is accepted by the adapter regardless of the
+/// daemon's current channel; the next turn resolves the actual provider.
+fn model_spec_for_current_provider_generation(
+    backend: &Arc<dyn crate::backend::Backend>,
+    expected_generation: Option<u64>,
+    model_spec: &str,
+) -> String {
+    let stale =
+        expected_generation.is_some_and(|generation| backend.provider_fact_generation() != generation);
+    if stale
+        && let Some(neutral_provider) = backend.neutral_provider_id()
+        && let Some(model) = crate::backend::parsing::parse_model(model_spec)
+    {
+        return crate::backend::parsing::join_model(neutral_provider, &model.id);
+    }
+    model_spec.to_string()
+}
+
 /// What a `/model` pick needs before it is recorded (spec #930): the card form
 /// and the text form (`/model <provider>/<model>`) obey one rule.
 pub(crate) enum ModelPickDecision {
     /// A model-only pick (the provider names the current channel, the neutral
     /// `codex` bucket, or is simply unknown): record it for `target`,
     /// re-verified at the write.
-    Record { target: PickTarget },
+    Record {
+        target: PickTarget,
+        /// The provider-fact generation used for prefix validation. When it is
+        /// stale at the write, the model is stored through the neutral bucket.
+        provider_generation: Option<u64>,
+    },
     /// The named provider differs from a determinable current channel: say why,
     /// record nothing and send nothing.
     Refuse(String),
@@ -940,6 +964,7 @@ impl SessionsHandle {
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         expected_epoch: u64,
+        expected_provider_generation: Option<u64>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
@@ -970,13 +995,18 @@ impl SessionsHandle {
         }
         let outcome = {
             let mut store = self.store.lock().await;
+            // Catalog/variant validation may have awaited while the daemon
+            // attachment changed. A stale channel is no longer attributable:
+            // retain only the model id in Codex's neutral bucket.
+            let model_spec =
+                model_spec_for_current_provider_generation(backend, expected_provider_generation, model_spec);
             store.set_mirror_pending(
                 thread_key,
                 expected_epoch,
                 settings.model.as_deref(),
                 settings.variant.as_deref(),
                 crate::bridge::session::MirrorWrite::Model {
-                    model: model_spec,
+                    model: &model_spec,
                     clear_variant: cleared.as_deref(),
                 },
                 deadline,
@@ -1083,35 +1113,47 @@ impl SessionsHandle {
                     Some(session_id) => PickTarget::Live(session_id),
                     None => PickTarget::Pending(pending_epoch.unwrap_or_default()),
                 },
+                provider_generation: None,
             };
         }
         let Some(session_id) = settings.session_id else {
             // A Pending Session: the cached config/read provider is the current
             // channel. Without a cached read it is unknown — record, never
-            // block (spec #930's residual limit).
-            return match backend.configured_provider(&settings.directory) {
-                Some(configured) if configured != provider => {
-                    ModelPickDecision::Refuse(provider_refusal(&configured, provider))
-                }
-                _ => ModelPickDecision::Record {
-                    target: PickTarget::Pending(pending_epoch.unwrap_or_default()),
-                },
+            // block (spec #930's residual limit). The snapshot ties the
+            // eventual write to the same cache generation.
+            let fact = backend.configured_provider_fact(&settings.directory);
+            let target = PickTarget::Pending(pending_epoch.unwrap_or_default());
+            if let Some(configured) = fact.provider_id
+                && configured != provider
+                && backend.provider_fact_generation() == fact.generation
+            {
+                return ModelPickDecision::Refuse(provider_refusal(&configured, provider));
+            }
+            return ModelPickDecision::Record {
+                target,
+                provider_generation: Some(fact.generation),
             };
         };
         if backend.tracks_thread_provider() {
-            return match backend.known_thread_provider(&session_id).await {
-                Some(current) if current != provider => {
-                    ModelPickDecision::Refuse(provider_refusal(&current, provider))
-                }
-                // Same provider, or unknown: record. Unknown must not block —
-                // the server's own refusal is the fallback (spec #930).
-                _ => ModelPickDecision::Record {
-                    target: PickTarget::Live(session_id),
-                },
+            // The lifecycle may replace its attachment while the async thread
+            // fact is read. The snapshot carries the source generation; if it
+            // is already stale, treat the channel as unknown, not a mismatch.
+            let fact = backend.known_thread_provider_fact(&session_id).await;
+            let target = PickTarget::Live(session_id);
+            if let Some(current) = fact.provider_id
+                && current != provider
+                && backend.provider_fact_generation() == fact.generation
+            {
+                return ModelPickDecision::Refuse(provider_refusal(&current, provider));
+            }
+            return ModelPickDecision::Record {
+                target,
+                provider_generation: Some(fact.generation),
             };
         }
         ModelPickDecision::Record {
             target: PickTarget::Live(session_id),
+            provider_generation: None,
         }
     }
 
@@ -1276,6 +1318,7 @@ impl SessionsHandle {
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
+        expected_provider_generation: Option<u64>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
@@ -1369,8 +1412,18 @@ impl SessionsHandle {
                     // read ran: the newer command wins, retry.
                     return Ok(PickOutcome::StateChanged);
                 }
+                let model_spec = model_spec_for_current_provider_generation(
+                    backend,
+                    expected_provider_generation,
+                    model_spec,
+                );
                 backend
-                    .record_pending_model(&session_id, model_spec, probe.as_deref())
+                    .record_pending_model_for_generation(
+                        &session_id,
+                        &model_spec,
+                        probe.as_deref(),
+                        expected_provider_generation,
+                    )
                     .await?;
                 return Ok(PickOutcome::Applied {
                     cleared_variant: cleared,

@@ -727,11 +727,19 @@ impl SharedCore {
         &self,
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
+        expected_provider_generation: Option<u64>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
         self.sessions_handle()
-            .pick_model_expecting(&self.client, thread_key, expected_session, model_spec, deadline)
+            .pick_model_expecting(
+                &self.client,
+                thread_key,
+                expected_session,
+                expected_provider_generation,
+                model_spec,
+                deadline,
+            )
             .await
     }
 
