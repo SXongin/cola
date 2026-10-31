@@ -34,6 +34,7 @@ The slugs:
 | `child-session-permissions` | a subagent's permission carries the child session id, so the card needs the parent walk |
 | `card-budgets` | the 3000-char element budget is cola's, not Feishu's |
 | `card-repaints` | any card PATCH rebuilds the body and wipes a live form's unsubmitted text; every write must advance the render gate's signature cache |
+| `card-inputs` | a typed input must sit at the card's end: the Android client scrolls the message's bottom to the keyboard's top on focus, and a folded panel is the only cheap content below it |
 | `info-probe` | V1's catch-all answers 200 `text/html`, so the status alone cannot classify a server |
 
 Renaming a slug is the one breaking change, and it is deliberate: a rename means
