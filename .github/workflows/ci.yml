@@ -96,6 +96,9 @@ jobs:
       always() &&
       needs.classify.outputs.heavy != 'false' &&
       !startsWith(github.head_ref || '', 'release/')
+    # Same bound as the `test` job for the same reason: it runs the same
+    # workspace suite, so the same wedge hangs it silently (see `test`).
+    timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -203,6 +206,14 @@ jobs:
     name: Test (${{ matrix.os }})
     needs: classify
     if: always()
+    # Bounded on purpose: `cargo test` has no per-test timeout, so one wedged
+    # test (a deadlock, a runner that stops making progress) hangs the job
+    # silently — GitHub serves no logs while a job is in progress — until the
+    # 360-minute default. A Windows run on #935 sat in `cargo test` for 40
+    # minutes with no output while the same commit's macOS finished in 6. 30
+    # minutes is ~4x the slowest observed run (7m47s) and turns that failure
+    # from a silent hang into a red check with the partial log.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
