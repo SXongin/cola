@@ -1893,10 +1893,10 @@ const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const CATALOG_REQUEST_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Map Codex's flat `model/list` catalog onto the client-declared surface when
-/// there is no config read to enrich it (an unattached lifecycle, or the cheap
-/// catalog-only read the `/think` variant lookup asks for). The real surface is
-/// [`super::model_surface::build_surface`], which adds the config default,
-/// probed provider models and the provider scope.
+/// there is no config read to enrich it (the cheap catalog-only read the
+/// `/think` variant lookup asks for). The real surface is
+/// [`super::model_surface::build_surface`], which adds the config default and
+/// the current channel's probed models.
 /// The card before a Codex daemon is attached. Its catalog, `config/read` and
 /// probes all live behind that connection, so the honest answer is a reason —
 /// not an empty "no models" list, which reads as if the client had none. The
@@ -2920,15 +2920,15 @@ impl Backend for CodexClient {
         self.list_models_within(None).await
     }
 
-    /// The `/model` surface: the built-in catalog (global, its own group), the
-    /// top-level `model` as the config default, every successfully probed
-    /// provider's models (per-provider groups), and the configured providers as
-    /// a creation-only scope. Every model pick keeps the `codex/<id>` callback
-    /// value the text form records; a provider pick carries its model, because a
-    /// bare provider is never selectable. `[profiles.*]` is not read (spec
-    /// #922). The provider scope is creation-only: a Pending Session applies a
-    /// pick at `thread/start`, while a live thread's provider page is read-only
-    /// and points at `/new` / `/fork`. `turn/start` never carries a provider.
+    /// The `/model` surface: one 「模型」 scope (#931) holding the built-in
+    /// catalog (global, its own group), the top-level `model` as the config
+    /// default, and the **current channel's** probed models. Every callback
+    /// value is `<channel>/<model>` — the thread provider on a live thread, the
+    /// `config/read` provider on a Pending Session or a cold projection, and the
+    /// neutral `codex` bucket only when the channel is unknown. A provider is a
+    /// config fact, so there is no provider page, drill or pair row.
+    /// `[profiles.*]` is not read (spec #922); `turn/start` never carries a
+    /// provider.
     ///
     /// # Read budgets
     ///
@@ -3043,11 +3043,9 @@ impl Backend for CodexClient {
         );
         // The recorded pair is unapplied even when it spells the current pair:
         // a one-shot pick equal to what the thread runs still rides the next
-        // new turn, so it must be visible (spec #922). The pending line belongs
-        // to the model page; the provider page has no model content (issue
-        // #908).
-        if query.scope.is_none()
-            && let Some(pending) = query.pending
+        // new turn, so it must be visible (spec #922). It rides the one model
+        // page (#931).
+        if let Some(pending) = query.pending
             && let Some(scope) = surface.scopes.first_mut()
         {
             let line = format!("待应用：`{pending}`（下一条新消息生效）");
@@ -5557,12 +5555,12 @@ mod tests {
         );
     }
 
-    /// The `/model` surface has two scopes: the per-turn `model` scope (the
-    /// built-in catalog in its own group plus whatever config/probes add) and
-    /// the creation-only `provider` scope. The callback value stays `codex/<id>`
-    /// (what the text form records), and the hand-write hint names that shape.
+    /// The `/model` surface has exactly one 「模型」 scope (#931): the built-in
+    /// catalog, the config default and the current channel's probed models.
+    /// Callback values name that channel — never a bare id, never a pair — and
+    /// a stale `provider` scope request still gets the same one page.
     #[test]
-    fn codex_has_a_model_page_and_a_provider_page() {
+    fn codex_has_one_model_page_for_the_current_provider() {
         use crate::backend::types::{ChangeScope, ModelSelection, ModelSurfaceQuery};
 
         let providers = vec![ProviderModels {
@@ -5602,113 +5600,88 @@ mod tests {
             ..Default::default()
         };
 
-        // Page 1: one model scope, the catalog + config default, the drill.
-        let surface = crate::codex::model_surface::build_surface(
-            &providers,
-            &config,
-            &probes,
-            Some("opencode-go"),
-            &query,
-        );
-        assert_eq!(surface.scopes.len(), 1, "one scope per page");
-        assert_eq!(
-            surface.current.as_ref().map(|c| c.label.as_str()),
-            Some("opencode-go/gpt-6-luna@high")
-        );
-        let model = &surface.scopes[0];
-        assert_eq!(model.id, "model");
-        assert_eq!(
-            model.title, "模型",
-            "the Codex model scope is titled 模型, not a per-turn promise"
-        );
-        assert!(!model.title.contains("每轮可换"), "{}", model.title);
-        assert_eq!(model.changeable, ChangeScope::ThisTurn);
-        assert_eq!(model.options[0].id, "gpt-5.1-codex");
-        assert_eq!(model.options[0].callback_value(), "codex/gpt-5.1-codex");
-        assert_eq!(
-            model.options[0].group.as_deref(),
-            Some(crate::codex::model_surface::CATALOG_GROUP),
-            "the global catalog is its own group, never a provider's"
-        );
-        assert!(
-            model.free_text.as_deref().unwrap().contains("codex/<id>"),
-            "the short hand-write hint names the provider prefix"
-        );
-        let drill = model
-            .options
-            .iter()
-            .find(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown))
-            .expect("the provider drill");
-        assert_eq!(drill.callback_value(), "provider");
-        assert_eq!(
-            drill.display_label(),
-            "Provider：opencode-go…",
-            "the row names the page; it never promises a switch"
-        );
+        // The root page, and a stale `provider` drill alike: one page.
+        for scope in [None, Some("provider")] {
+            let query = ModelSurfaceQuery {
+                scope,
+                ..query.clone()
+            };
+            let surface = crate::codex::model_surface::build_surface(
+                &providers,
+                &config,
+                &probes,
+                Some("opencode-go"),
+                &query,
+            );
+            assert_eq!(surface.scopes.len(), 1, "one scope, no provider page");
+            assert_eq!(
+                surface.current.as_ref().map(|c| c.label.as_str()),
+                Some("opencode-go/gpt-6-luna@high")
+            );
+            let model = &surface.scopes[0];
+            assert_eq!(model.id, "model");
+            assert_eq!(model.title, "模型");
+            assert_eq!(model.changeable, ChangeScope::ThisTurn);
+            assert_eq!(model.pick, crate::backend::types::PickKind::Model);
+            assert!(
+                model
+                    .options
+                    .iter()
+                    .all(|option| option.pick.is_none() && !option.disabled),
+                "no drill or pair rows: {:?}",
+                model.options
+            );
 
-        // Page 2: one provider scope, the pair labelled `name/model` (the
-        // configured display name, #908 AC1); the callback keeps id + model.
-        let mut provider_query = query;
-        provider_query.scope = Some("provider");
-        provider_query.session_id = None;
-        let surface = crate::codex::model_surface::build_surface(
-            &providers,
-            &config,
-            &probes,
-            Some("opencode-go"),
-            &provider_query,
-        );
-        assert_eq!(surface.scopes.len(), 1);
-        let provider = &surface.scopes[0];
-        assert_eq!(provider.id, "provider");
-        assert_eq!(provider.title, "Provider");
-        assert_eq!(provider.pick, crate::backend::types::PickKind::Provider);
-        assert_eq!(provider.changeable, ChangeScope::NewThread);
-        let pair = provider
-            .options
-            .iter()
-            .find(|option| option.provider.is_some())
-            .expect("the probed pair");
-        assert_eq!(
-            pair.display_label(),
-            "OpenCode Go/gpt-5.1-codex（当前 provider）",
-            "the row shows the configured display name; the thread's provider is marked"
-        );
-        assert_eq!(pair.provider.as_deref(), Some("opencode-go"));
-        assert_eq!(pair.callback_value(), "gpt-5.1-codex");
+            let catalog_row = model
+                .options
+                .iter()
+                .find(|option| option.group.as_deref() == Some(crate::codex::model_surface::CATALOG_GROUP))
+                .expect("the built-in catalog");
+            assert_eq!(catalog_row.callback_value(), "opencode-go/gpt-5.1-codex");
+
+            let probed = model
+                .options
+                .iter()
+                .find(|option| option.group.as_deref() == Some("OpenCode Go（/models）"))
+                .expect("the current provider's probed group");
+            assert_eq!(probed.id, "gpt-5.1-codex");
+            assert_eq!(probed.callback_value(), "opencode-go/gpt-5.1-codex");
+            assert_eq!(
+                probed.provider, None,
+                "a probed row carries no provider callback field"
+            );
+
+            assert!(
+                model.free_text.as_deref().unwrap().contains("opencode-go/<id>"),
+                "the hand-write hint names the current channel"
+            );
+            let note = model.note.as_deref().expect("the config-fact note");
+            assert_eq!(
+                note.matches(crate::codex::model_surface::PROVIDER_RULE_NOTE)
+                    .count(),
+                1,
+                "the config fact appears exactly once: {note}"
+            );
+            assert!(note.contains("model_provider") && note.contains("重启 daemon"));
+        }
     }
 
-    /// An empty catalog still answers both scopes with a note and the
-    /// hand-write hint — never a blank card.
+    /// An empty catalog still degrades with a note and the hand-write hint —
+    /// never a blank card.
     #[test]
     fn model_surface_degrades_to_a_note_and_hint() {
         use crate::backend::types::ModelSurfaceQuery;
 
         let surface = model_surface_from_catalog(&[], &ModelSurfaceQuery::default());
         let scope = &surface.scopes[0];
+        assert!(scope.options.is_empty(), "nothing to select");
+        let note = scope.note.as_deref().unwrap();
+        assert!(note.contains("没有可用模型"), "note: {note}");
         assert!(
-            scope
-                .options
-                .iter()
-                .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown)),
-            "only the provider drill is left"
+            note.contains(crate::codex::model_surface::PROVIDER_RULE_NOTE),
+            "the config fact still shows: {note}"
         );
-        assert_eq!(scope.note.as_deref(), Some("_(没有可用模型)_"));
-        assert!(scope.free_text.is_some());
-
-        let surface = model_surface_from_catalog(
-            &[],
-            &ModelSurfaceQuery {
-                scope: Some("provider"),
-                ..Default::default()
-            },
-        );
-        assert!(surface.scopes[0].options.is_empty());
-        assert_eq!(
-            surface.scopes[0].note.as_deref(),
-            Some(crate::codex::model_surface::PROVIDER_RULE_NOTE),
-            "nothing is selectable, and the page still states the provider rule"
-        );
+        assert!(scope.free_text.is_some(), "the hand-write hint stays");
     }
 
     /// Before the daemon is attached the card names that reason instead of
@@ -5818,7 +5791,7 @@ mod tests {
     /// the same layer is ignored.
     #[tokio::test]
     async fn model_surface_wires_config_read_and_per_provider_probes() {
-        use crate::backend::types::{ChangeScope, ModelSelection, ModelSurfaceQuery};
+        use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
 
         let probed = crate::test_http::TestHttpServer::start().await;
         probed.route(
@@ -5889,26 +5862,33 @@ mod tests {
             1,
             "the catalog keeps its own group"
         );
-        assert!(
-            !model
-                .options
-                .iter()
-                .any(|option| option.group.as_deref() == Some("DeepSeek（/models）")),
-            "another provider's probed models are page 2's, not the root's"
+        // The current channel is the config provider (`deepseek`): its probed
+        // models are on the one page, named `<provider>/<model>` and carrying
+        // no `provider` callback field (#931).
+        let probed_rows: Vec<&ModelOption> = model
+            .options
+            .iter()
+            .filter(|option| option.group.as_deref() == Some("DeepSeek（/models）"))
+            .collect();
+        assert_eq!(
+            probed_rows.len(),
+            2,
+            "the current provider's probed models: {:?}",
+            model.options
         );
-        let mut provider_page = query();
-        provider_page.scope = Some("provider");
-        // The provider rows are a Pending Session's creation pairs; a live
-        // thread's page is read-only (spec #922).
-        provider_page.session_id = None;
-        let page = Backend::model_surface(&client, provider_page).await;
+        assert_eq!(probed_rows[0].callback_value(), "deepseek/deepseek-flash");
+        assert_eq!(probed_rows[1].callback_value(), "deepseek/deepseek-v4-pro");
         assert!(
-            page.scopes[0]
-                .options
-                .iter()
-                .any(|option| option.callback_value() == "deepseek-v4-pro"
-                    && option.provider.as_deref() == Some("deepseek")),
-            "a probed model is a **pair**: it was listed by that provider"
+            probed_rows.iter().all(|option| option.provider.is_none()),
+            "a probed row carries no provider callback field"
+        );
+        assert!(probed_rows.iter().all(|option| !option.disabled));
+        assert!(
+            !model.options.iter().any(|option| option
+                .group
+                .as_deref()
+                .is_some_and(|group| group.contains("OpenCode Go"))),
+            "a provider this daemon is not on contributes no group"
         );
         assert!(
             !model
@@ -5922,36 +5902,15 @@ mod tests {
             "no probe prose on the model page: {:?}",
             model.note
         );
-        // Page 2 is the same pairs, read by provider: the probed models are
-        // there, and `opencode-go` — a provider this daemon is **not** on (spec
-        // #922 correction) — is a disabled row saying so, never a bare provider
-        // button (#910).
-        let provider_scope = &page.scopes[0];
-        assert_eq!(provider_scope.changeable, ChangeScope::NewThread);
-        let pairs: Vec<&str> = provider_scope
-            .options
-            .iter()
-            .filter(|option| !option.disabled)
-            .map(|option| option.provider.as_deref().unwrap_or_default())
-            .collect();
-        assert_eq!(pairs, ["deepseek", "deepseek"]);
+        let note = model.note.as_deref().unwrap();
         assert!(
-            !provider_scope
-                .options
-                .iter()
-                .any(|option| !option.disabled && option.provider.as_deref() == Some("opencode-go")),
-            "a provider the daemon is not on is not selectable"
+            note.contains("model_provider") && note.contains("重启 daemon"),
+            "the config fact is stated once: {note}"
         );
-        let listed = provider_scope
-            .options
-            .iter()
-            .find(|option| option.id == "opencode-go")
-            .expect("but it is still listed");
-        assert!(listed.disabled);
         assert!(
-            listed.display_label().contains("当前 provider 不是它"),
-            "the row says why: {}",
-            listed.display_label()
+            !model.options.iter().any(|option| option.pick.is_some()),
+            "no drill row: {:?}",
+            model.options
         );
 
         // A second open within the cache TTL: another `config/read` and
@@ -6010,11 +5969,11 @@ mod tests {
 
     /// A Pending Session's card read has a directory but no session id. Only
     /// `/think`'s explicit `catalog_only` read skips config; a card read keeps
-    /// it, lists every configured provider as a status row, and a cold cache
-    /// must not start a probe on a callback. With no probe (and no profiles,
-    /// spec #922) there is no selectable pair yet.
+    /// it, names the config provider in every value, and a cold cache must not
+    /// start a probe on a callback. There is no provider row or page any more
+    /// (#931), even when a stale `provider` scope is requested.
     #[tokio::test]
-    async fn a_pending_sessions_cold_card_read_lists_providers_without_probing() {
+    async fn a_pending_sessions_cold_card_read_names_the_config_provider() {
         let probed = crate::test_http::TestHttpServer::start().await;
         probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
@@ -6049,9 +6008,10 @@ mod tests {
             &client,
             crate::backend::types::ModelSurfaceQuery {
                 directory: Some("/work/cola"),
+                // A stale drill request must not resurrect the provider page.
+                scope: Some("provider"),
                 // A card callback; 2 s mirrors the bridge's ack budget without
                 // naming the Feishu layer here.
-                scope: Some("provider"),
                 ack_budget: Some(Duration::from_secs(2)),
                 ..Default::default()
             },
@@ -6068,50 +6028,36 @@ mod tests {
             0,
             "a callback read never starts a probe on a cold cache"
         );
+        assert_eq!(surface.scopes.len(), 1, "one model page");
+        let page = &surface.scopes[0];
+        assert_eq!(page.id, "model");
         assert_eq!(
-            surface.scopes[0].changeable,
-            crate::backend::types::ChangeScope::NewThread,
-            "a pending session's provider is a creation pick"
+            page.changeable,
+            crate::backend::types::ChangeScope::ThisTurn,
+            "a model pick is per-turn; the provider is a config fact"
         );
         assert!(
-            surface.scopes[0].options.iter().all(|option| option.disabled),
-            "no cold pair is a status row, never a button: {:?}",
-            surface.scopes[0].options
-        );
-        let listed: Vec<&str> = surface.scopes[0]
-            .options
-            .iter()
-            .map(|option| option.id.as_str())
-            .collect();
-        assert!(listed.contains(&"deepseek") && listed.contains(&"opencode-go"));
-        let deepseek = surface.scopes[0]
-            .options
-            .iter()
-            .find(|option| option.id == "deepseek")
-            .expect("the configured provider is listed");
-        assert!(
-            deepseek.display_label().contains("没有已知模型"),
-            "the configured provider says why it has no pair: {}",
-            deepseek.display_label()
-        );
-        let other = surface.scopes[0]
-            .options
-            .iter()
-            .find(|option| option.id == "opencode-go")
-            .expect("the other provider stays listed");
-        assert!(
-            other.disabled && other.display_label().contains("当前 provider 不是它"),
-            "a provider the daemon is not on is disabled, not silently dropped: {}",
-            other.display_label()
-        );
-        assert!(
-            !surface
-                .scopes
+            page.options
                 .iter()
-                .flat_map(|scope| scope.options.iter())
-                .any(|option| option.callback_value() == "codex/one"),
-            "a cold callback read omits the probed models rather than probing"
+                .all(|option| !option.disabled && option.pick.is_none()),
+            "no status row or drill: {:?}",
+            page.options
         );
+        let catalog_row = page
+            .options
+            .iter()
+            .find(|option| option.group.as_deref() == Some(crate::codex::model_surface::CATALOG_GROUP))
+            .expect("the built-in catalog");
+        assert_eq!(catalog_row.callback_value(), "deepseek/gpt-5.1-codex");
+        assert!(
+            !page
+                .options
+                .iter()
+                .any(|option| option.display_label().contains("fast")),
+            "a [profiles.*] table contributes no row"
+        );
+        let note = page.note.as_deref().unwrap();
+        assert!(note.contains("model_provider") && note.contains("重启 daemon"));
         let params = server.config_read_params();
         assert_eq!(params[0]["includeLayers"], true);
         assert_eq!(params[0]["cwd"], "/work/cola");
@@ -6119,8 +6065,8 @@ mod tests {
 
     /// A card-callback read (`ack_budget = Some`) is bounded: a stalled config
     /// read is abandoned at the callback slice of `CARD_ACK_BUDGET` (600 ms),
-    /// not at the root page's 2 s, and probes are not started. The provider
-    /// scope then says config was unreadable instead of hanging the ack.
+    /// not at the root page's 2 s, and probes are not started. The model page
+    /// then says config was unreadable instead of hanging the ack.
     #[tokio::test]
     async fn a_callback_config_read_is_bounded_by_the_ack_budget() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
@@ -6132,7 +6078,6 @@ mod tests {
             &client,
             crate::backend::types::ModelSurfaceQuery {
                 directory: Some("/work/cola"),
-                scope: Some("provider"),
                 // A card callback; 2 s mirrors the bridge's ack budget without
                 // naming the Feishu layer here.
                 ack_budget: Some(Duration::from_secs(2)),
@@ -6205,10 +6150,7 @@ mod tests {
             "the stalled page should wait for the request bound, took {elapsed:?}"
         );
         assert!(
-            surface.scopes[0]
-                .options
-                .iter()
-                .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown)),
+            surface.scopes[0].options.is_empty(),
             "no profile pair is invented while the catalog stalls: {:?}",
             surface.scopes[0].options
         );
@@ -6348,11 +6290,8 @@ mod tests {
             "a silent catalog held the validation read for {elapsed:?}"
         );
         assert!(
-            surface.scopes[0]
-                .options
-                .iter()
-                .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown)),
-            "only the provider drill is left"
+            surface.scopes[0].options.is_empty(),
+            "an unknown catalog leaves no rows"
         );
         assert!(
             surface.scopes[0].note.is_some(),
@@ -6390,13 +6329,8 @@ mod tests {
             elapsed >= Duration::from_millis(150),
             "the lookup should wait for the request bound, took {elapsed:?}"
         );
-        // Degrades to the empty-scope note + hint, never a failed read.
-        assert!(
-            surface.scopes[0]
-                .options
-                .iter()
-                .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown))
-        );
+        // Degrades to the empty-page note + hint, never a failed read.
+        assert!(surface.scopes[0].options.is_empty());
         assert!(surface.scopes[0].note.is_some());
         assert!(surface.scopes[0].free_text.is_some());
     }

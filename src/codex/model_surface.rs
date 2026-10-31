@@ -1,27 +1,30 @@
 //! The Codex `/model` surface: what `config/read` declares and what each
-//! provider's `/models` endpoint will answer (ticket #908).
+//! provider's `/models` endpoint will answer (tickets #908, #931).
+//!
+//! `/model` is **one page, one 「模型」 scope** (#931). A provider is a config
+//! fact, not a pick: Codex runs one provider per process, so switching one is a
+//! `$CODEX_HOME/config.toml` edit plus a daemon restart. The page lists only the
+//! current channel's models.
 //!
 //! `model/list` is a **flat, global** catalog compiled into the app-server: it
-//! names no provider and is therefore rendered as its own group, never under a
-//! provider. Everything else is user configuration:
+//! names no provider and is therefore rendered as its own group. Everything
+//! else is user configuration:
 //!
 //! - `[model_providers.<id>]` (from `config/read`'s raw layers — the resolved
 //!   `Config` struct is not the source the ticket names, and a layer carries the
-//!   raw TOML) becomes the `provider` scope, and every row there is a
-//!   **provider + model pair** (issue #910): the old model name on a new
-//!   provider is a 404, so a bare provider is never selectable. A pair comes
-//!   from what that provider's `/models` listed; a provider with no pair is a
-//!   status row, never a bare button;
-//! - the top-level `model` becomes the 「配置默认」 row in the `model` scope;
+//!   raw TOML) supplies the display name and the probe target for the daemon's
+//!   own provider;
+//! - the top-level `model` becomes the 「配置默认」 row;
 //!   `[profiles.*]` is **not** read (ADR-0092, spec #922: Codex 0.134+ no longer
 //!   reads it, and `--profile` layers `$CODEX_HOME/<name>.config.toml`);
 //! - **Codex runs one provider per process.** The top-level `model_provider` is
 //!   the provider the daemon itself is on (`openai` when unset), and a thread
 //!   whose `modelProvider` differs from it is created but refuses every turn
-//!   (`ModelProviderMismatch`, `config_manager.rs`). Only that provider is
-//!   creation-selectable here, and a mismatched creation is refused by name
-//!   before `thread/start` (spec #922 correction, 2026-10-30);
-//! - `GET <base_url>/models` is asked per provider, using that provider's
+//!   (`ModelProviderMismatch`, `config_manager.rs`). The page's callback values
+//!   therefore name that one channel, and only when it is unknown (`config/read`
+//!   failed, the daemon is not connected) do they fall back to the neutral
+//!   `codex/<id>` bucket;
+//! - `GET <base_url>/models` is asked for the current channel, using its
 //!   `experimental_bearer_token`. A provider that only declares `env_key` is
 //!   skipped: the daemon's environment is not cola's. Results (including
 //!   failures) are cached per provider for [`ProbeOutcome::cache_ttl`], so opening the card
@@ -118,11 +121,8 @@ pub(crate) fn config_read_timeout(ack_budget: Option<Duration>) -> Duration {
     callback_read_slice(ack_budget).unwrap_or(CONFIG_READ_TIMEOUT)
 }
 
-/// The `model` scope's identity (also the card callback's `level`).
+/// The single scope's identity (also the card callback's `level`).
 pub(crate) const MODEL_SCOPE: &str = "model";
-/// The `provider` scope's identity. The bridge's provider navigation keys on
-/// this name, so it is the same neutral word OpenCode uses.
-pub(crate) const PROVIDER_SCOPE: &str = "provider";
 
 /// The built-in catalog's group inside the `model` scope. It is deliberately
 /// **not** a provider name: `model/list` is global and a catalog entry may run
@@ -131,11 +131,10 @@ pub(crate) const CATALOG_GROUP: &str = "内置目录（全局，未校验）";
 /// The top-level `model`'s group.
 pub(crate) const CONFIG_DEFAULT_GROUP: &str = "配置默认";
 
-/// The rule a Pending Session's provider page states once (spec #922
-/// correction, 2026-10-30): Codex runs one provider per process, so changing
-/// one is a config edit plus a daemon restart, never a pick. The file is the
-/// daemon's own — `$CODEX_HOME/config.toml`, `~/.codex/config.toml` by default.
-pub(crate) const PROVIDER_RULE_NOTE: &str = "Codex 一次只用一个 provider；换 provider 需改 daemon 的 `config.toml`（`$CODEX_HOME/config.toml`，默认 `~/.codex/config.toml`）里的 `model_provider`，再重启 daemon。";
+/// The config fact the model page states once (#931): Codex runs one provider
+/// per process, so changing one is a config edit plus a daemon restart — never
+/// a pick — and the page only lists that provider's models.
+pub(crate) const PROVIDER_RULE_NOTE: &str = "Codex 一次只用一个 provider；改 `$CODEX_HOME/config.toml` 的 `model_provider` 并重启 daemon；这里只列当前 provider 的模型。";
 
 /// The neutral provider bucket the picker's `codex/<id>` callback value uses.
 const MODEL_PROVIDER: &str = "codex";
@@ -187,17 +186,6 @@ fn safe_base_url(base_url: Option<&str>) -> Option<String> {
             url.host_str().unwrap_or("<invalid>")
         )),
         Ok(_) | Err(_) => Some("<invalid>".to_string()),
-    }
-}
-
-/// Clip a surface label/note to `max_chars` characters, adding an ellipsis.
-/// The surface owns its one-line budget; a backend adapter does not reach into
-/// the card layer for it.
-fn clip(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
-    } else {
-        format!("{}…", text.chars().take(max_chars).collect::<String>())
     }
 }
 
@@ -477,29 +465,6 @@ impl ProbeOutcome {
             | Self::Unauthorized
             | Self::Forbidden
             | Self::NotFound => PROBE_DEFINITIVE_TTL,
-        }
-    }
-
-    /// A short, user-readable tag for the provider row (#908's owner review):
-    /// no sentence, no URL, no header. The numeric tags (`401`, `403`, `404`)
-    /// said nothing to a user, so each failure names what happened instead
-    /// (2026-10-30); `HTTP n` stays for a status with no better word.
-    pub(crate) fn short_tag(&self) -> String {
-        match self {
-            Self::Models(_) => String::new(),
-            Self::EnvKey => "env_key".into(),
-            Self::NoBaseUrl => "无 URL".into(),
-            Self::BadBaseUrl => "URL 无效".into(),
-            Self::UnsupportedScheme => "非 http(s)".into(),
-            Self::Unauthorized => "需要鉴权".into(),
-            Self::Forbidden => "无权列出模型".into(),
-            Self::NotFound => "不支持模型列表".into(),
-            Self::Timeout => "探测超时".into(),
-            Self::Network => "网络不通".into(),
-            Self::BadResponse => "响应无效".into(),
-            Self::Http(status) => format!("HTTP {status}"),
-            Self::Empty => "无模型".into(),
-            Self::LayerMismatch => "凭据跨层".into(),
         }
     }
 }
@@ -783,17 +748,18 @@ pub(crate) async fn read_config(
 /// Build the Codex surface from the built-in catalog, the config declaration
 /// and this open's probe answers.
 ///
-/// `thread_provider` is the thread's own provider when the caller knows it
-/// (the projection's ordered model fact); it outranks `query.current`'s
-/// provider because a picker pick records the neutral `codex` bucket, not the
-/// channel the thread really runs on.
+/// It is **one page, one 「模型」 scope** (#931): a provider is a config fact,
+/// so there is no provider page and no drill row. Every option value names the
+/// **current channel**:
 ///
-/// A provider is creation-only (spec #922): a Pending Session's provider page
-/// offers the selectable pairs that ride `thread/start`, while a live thread's
-/// page is a read-only current value with the `/new` / `/fork` note. A Pending
-/// Session has no thread yet, so its pick is always a creation one. Only the
-/// process's own `model_provider` is selectable there — a thread on any other
-/// provider is refused at its first turn (2026-10-30 correction).
+/// - a live thread's ordered provider fact (`thread_provider`);
+/// - a Pending Session's — or a cold projection's — `config/read` provider;
+/// - the neutral `codex` bucket only when neither is known (`config/read`
+///   failed, the daemon is not connected).
+///
+/// `thread_provider` outranks `query.current`'s provider because a picker pick
+/// records the neutral `codex` bucket, not the channel the thread really runs
+/// on.
 pub(crate) fn build_surface(
     catalog: &[crate::backend::types::ProviderModels],
     config: &CodexModelConfig,
@@ -801,337 +767,101 @@ pub(crate) fn build_surface(
     thread_provider: Option<&str>,
     query: &ModelSurfaceQuery<'_>,
 ) -> ModelSurface {
-    // Parsed, not string-split: a provider id may itself contain `/` (issue
-    // #908), and the parser knows the quoted form.
-    let query_provider = query
-        .current
-        .as_ref()
-        .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
-        .map(|model| model.provider_id);
     // A picker pick records the neutral `codex` bucket, so a thread fact of
-    // `codex` is not a channel: the caller's resolved provider is the honest
-    // marker then. A real thread provider outranks it.
-    let current_provider = match thread_provider {
-        Some(provider) if provider != MODEL_PROVIDER => Some(provider.to_string()),
-        _ => query_provider,
-    };
-    let current_model = query
-        .current
-        .as_ref()
-        .and_then(|current| crate::backend::parsing::parse_model(&current.reference))
-        .map(|model| model.id);
-    let pending = query.session_id.is_none();
-
-    // Two pages, one scope each (#908's owner review): the root is the **model**
-    // page, and the provider row drills into the provider page. A drilled page
-    // carries the back button from the bridge.
-    let scope = if query.scope == Some(PROVIDER_SCOPE) {
-        provider_page(
-            config,
-            probes,
-            current_provider.as_deref(),
-            current_model.as_deref(),
-            pending,
-        )
-    } else {
-        model_page(catalog, config, probes, current_provider.as_deref())
+    // `codex` is not a channel. A thread with no projection yet ("cold") falls
+    // back to the config's process provider, exactly like a Pending Session.
+    let channel = match thread_provider.filter(|provider| *provider != MODEL_PROVIDER) {
+        Some(provider) => Some(provider.to_string()),
+        None => config.configured_provider().map(str::to_string),
     };
     ModelSurface {
         current: resolved_current(query.current.as_ref(), thread_provider),
-        scopes: vec![scope],
+        scopes: vec![model_page(catalog, config, probes, channel.as_deref())],
     }
 }
 
-/// The root page (#908): the flat catalog, the top-level `model` as the
-/// config default, and the **current** provider's probed models — everything
-/// the next turn can take without changing the channel — plus the drill into
-/// the provider page. No probe-failure notes here: a broken provider is page
-/// 2's status row.
+/// The one page (#931): the flat catalog, the top-level `model` as the config
+/// default, and the **current channel's** probed models. Every callback value
+/// is `<channel>/<model>`; the neutral `codex` bucket is only the fallback when
+/// the channel is unknown. No provider rows, pairs or drills — a provider is a
+/// config fact, stated once in the note.
 fn model_page(
     catalog: &[crate::backend::types::ProviderModels],
     config: &CodexModelConfig,
     probes: &HashMap<String, ProbeOutcome>,
-    current_provider: Option<&str>,
+    channel: Option<&str>,
 ) -> crate::backend::types::ModelScope {
-    let mut options: Vec<crate::backend::types::ModelOption> = Vec::new();
+    use crate::backend::types::{ChangeScope, ModelOption, ModelScope, PickKind};
+
+    let channel = channel.unwrap_or(MODEL_PROVIDER);
+    let mut options: Vec<ModelOption> = Vec::new();
     for provider in catalog {
         for model in &provider.models {
-            options.push(crate::backend::types::ModelOption {
+            options.push(ModelOption {
                 id: model.id.clone(),
                 variants: model.variants.clone(),
-                value: Some(codex_ref(&model.id)),
+                value: Some(model_ref(channel, &model.id)),
                 group: Some(CATALOG_GROUP.to_string()),
                 ..Default::default()
             });
         }
     }
     if let Some(model) = config.default_model.as_deref() {
-        options.push(crate::backend::types::ModelOption {
+        options.push(ModelOption {
             id: model.to_string(),
             label: Some(format!("{model}（配置默认）")),
-            value: Some(codex_ref(model)),
+            value: Some(model_ref(channel, model)),
             group: Some(CONFIG_DEFAULT_GROUP.to_string()),
             ..Default::default()
         });
     }
-    // The current provider's own `/models` answer: the ids that provider listed
-    // are pairs (it named them itself). No other provider's models on this page.
-    if let Some(current) = current_provider
-        && current != MODEL_PROVIDER
-        && let Some(provider) = config.providers.iter().find(|provider| provider.id == current)
+    // The current channel's own `/models` answer: the ids it listed are the
+    // only ones this daemon can run. Another provider's models are not shown.
+    // The neutral `codex` bucket is not a configured channel (ADR-0092), so it
+    // never matches a probe.
+    if channel != MODEL_PROVIDER
+        && let Some(provider) = config.providers.iter().find(|provider| provider.id == channel)
         && let Some(ProbeOutcome::Models(models)) = probes.get(&provider.id)
     {
         let group = format!("{}（/models）", provider.name);
         for model in models {
-            options.push(crate::backend::types::ModelOption {
+            options.push(ModelOption {
                 id: model.clone(),
-                value: Some(model.clone()),
-                provider: Some(provider.id.clone()),
+                value: Some(model_ref(channel, model)),
                 group: Some(group.clone()),
                 ..Default::default()
             });
         }
-    }
-    // The drill-down into the provider page (a client with a provider axis: this
-    // is Codex's own surface). The row names the provider that page is about —
-    // it never reads as a switch: only the daemon's own provider is selectable
-    // there, so changing one is a config edit plus a restart.
-    let provider_hint = current_provider
-        .filter(|provider| *provider != MODEL_PROVIDER)
-        .or_else(|| config.configured_provider());
-    options.push(crate::backend::types::ModelOption {
-        id: PROVIDER_SCOPE.into(),
-        label: Some(match provider_hint {
-            Some(provider) => format!("Provider：{provider}…"),
-            None => "Provider…".to_string(),
-        }),
-        value: Some(PROVIDER_SCOPE.to_string()),
-        pick: Some(crate::backend::types::PickKind::DrillDown),
-        ..Default::default()
-    });
-    let only_drill = options
-        .iter()
-        .all(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown));
-    // One short line when `config/read` failed (ADR-0092 decision 8): the
-    // catalog is known, the provider data is not — the provider page says so
-    // too, but the root page must not hide it.
-    let note = if config.read_failed {
-        Some("配置读取失败：只显示内置目录".to_string())
-    } else if only_drill {
-        Some("_(没有可用模型)_".to_string())
-    } else {
-        None
-    };
-    crate::backend::types::ModelScope {
-        id: MODEL_SCOPE.into(),
-        title: "模型".into(),
-        changeable: crate::backend::types::ChangeScope::ThisTurn,
-        pick: crate::backend::types::PickKind::Model,
-        options,
-        note,
-        free_text: Some(format!("也可 `/model {MODEL_PROVIDER}/<id>`")),
-        intro: None,
-    }
-}
-
-/// Page 2 (#908): on a **Pending Session**, the configured provider's
-/// **pairs** (`provider/model`), the current pair marked, a probe failure as a
-/// short tag, a pairless provider as a disabled row — the pair rides
-/// `thread/start`. On a **live thread** a provider is creation-only (spec
-/// #922): the page is a read-only current value with the `/new` / `/fork` note,
-/// and it offers no rows at all.
-///
-/// **Codex runs one provider per process** (spec #922 correction, 2026-10-30):
-/// the top-level `model_provider` is the provider the daemon itself is on, and
-/// a thread created on any other one is refused at its first turn. So only that
-/// provider's pairs are selectable; every other configured provider is a
-/// disabled row saying why. When `config/read` failed the surface's resolved
-/// current provider is the fallback (the thread fact is still a provider this
-/// daemon served), and when neither is known the page keeps listing every
-/// provider as before — it cannot enforce a rule it cannot see.
-fn provider_page(
-    config: &CodexModelConfig,
-    probes: &HashMap<String, ProbeOutcome>,
-    current_provider: Option<&str>,
-    current_model: Option<&str>,
-    pending: bool,
-) -> crate::backend::types::ModelScope {
-    use crate::backend::types::{ChangeScope, ModelOption, ModelScope, PickKind};
-    if !pending {
-        // The neutral `codex` bucket names no channel: only a real thread
-        // provider is worth showing.
-        let current = current_provider.filter(|provider| *provider != MODEL_PROVIDER);
-        let note = match current {
-            Some(provider) => {
-                format!(
-                    "当前 provider：`{provider}`。provider 只能在新会话中更换：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。"
-                )
-            }
-            None => {
-                "provider 只能在新会话中更换：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。"
-                    .to_string()
-            }
-        };
-        return ModelScope {
-            id: PROVIDER_SCOPE.into(),
-            title: "Provider（仅新会话）".into(),
-            changeable: ChangeScope::NewThread,
-            pick: PickKind::Provider,
-            options: Vec::new(),
-            note: Some(note),
-            free_text: None,
-            intro: Some("provider 是会话创建时的选择".to_string()),
-        };
-    }
-    // The one provider this daemon can serve turns on. A failed config read
-    // leaves it unknown, and the resolved current provider — a provider this
-    // same daemon already ran — is the honest fallback; when that is unknown
-    // too the page lists every provider, as it did before this rule.
-    let enforced = match config.configured_provider() {
-        Some(provider) => Some(provider.to_string()),
-        None => current_provider
-            .filter(|provider| *provider != MODEL_PROVIDER)
-            .map(str::to_string),
-    };
-    let mut options: Vec<ModelOption> = Vec::new();
-    let mut paired_providers: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    // Providers whose row already explains why they are not selectable: they
-    // never get a second status row.
-    let mut declined: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for provider in &config.providers {
-        if provider.id == MODEL_PROVIDER {
-            // Reserved for the neutral catalog namespace (ADR-0092): a pair
-            // through it could never address the configured channel.
-            paired_providers.insert(provider.id.as_str());
-            options.push(ModelOption {
-                id: provider.id.clone(),
-                label: Some(clip(&format!("{}：内置目录保留名，不可选", provider.name), 48)),
-                disabled: true,
-                ..Default::default()
-            });
-            continue;
-        }
-        if let Some(enforced) = enforced.as_deref()
-            && provider.id != enforced
-        {
-            // A thread on this provider would create, then refuse its first
-            // turn: offer no pair, and say what would make it usable.
-            declined.insert(provider.id.as_str());
-            options.push(ModelOption {
-                id: provider.id.clone(),
-                label: Some(clip(
-                    &format!(
-                        "{}：当前 provider 不是它（改 config 后重启 daemon）",
-                        provider.name
-                    ),
-                    48,
-                )),
-                disabled: true,
-                ..Default::default()
-            });
-            continue;
-        }
-        let mut models: Vec<String> = Vec::new();
-        if let Some(ProbeOutcome::Models(probed)) = probes.get(&provider.id) {
-            models.extend(probed.iter().cloned());
-        }
-        let mut seen = std::collections::HashSet::new();
-        models.retain(|model| seen.insert(model.clone()));
-        if models.is_empty() {
-            continue;
-        }
-        paired_providers.insert(provider.id.as_str());
-        for model in models {
-            let same_provider = current_provider == Some(provider.id.as_str());
-            // #908 AC1: the row shows the configured display name (its id when
-            // the config names none); the callback still carries id + model.
-            let mut label = crate::backend::parsing::join_model(&provider.name, &model);
-            // The current marker is the provider fact (#908 AC1): the exact pair
-            // says 「当前」, another model of the same provider says so too.
-            if same_provider && current_model == Some(model.as_str()) {
-                label.push_str("（当前）");
-            } else if same_provider {
-                label.push_str("（当前 provider）");
-            }
-            options.push(ModelOption {
-                id: format!("{}/{model}", provider.id),
-                label: Some(clip(&label, 48)),
-                value: Some(model),
-                provider: Some(provider.id.clone()),
-                ..Default::default()
-            });
-        }
-    }
-    // Status rows: a short failure tag, and a pairless provider listed (never a
-    // bare provider button).
-    for provider in &config.providers {
-        if declined.contains(provider.id.as_str()) {
-            continue;
-        }
-        let current_marker = if current_provider == Some(provider.id.as_str()) {
-            "（当前）"
-        } else {
-            ""
-        };
-        let failed = probes
-            .get(&provider.id)
-            .filter(|outcome| !matches!(outcome, ProbeOutcome::Models(_)));
-        if paired_providers.contains(provider.id.as_str()) {
-            if let Some(outcome) = failed {
-                options.push(ModelOption {
-                    id: provider.id.clone(),
-                    label: Some(clip(
-                        &format!("{}：{}{current_marker}", provider.name, outcome.short_tag()),
-                        48,
-                    )),
-                    disabled: true,
-                    ..Default::default()
-                });
-            }
-            continue;
-        }
-        let label = match failed {
-            Some(outcome) => {
-                // A provider with no `/models` endpoint is exactly the one a
-                // user must hand-type: say so on its row, once.
-                let mut label = format!("{}：{}", provider.name, outcome.short_tag());
-                if matches!(outcome, ProbeOutcome::NotFound) {
-                    label.push_str(&format!("（`/model {}/<id>` 手输）", provider.id));
-                }
-                label.push_str(current_marker);
-                label
-            }
-            None => format!("{}：没有已知模型{current_marker}", provider.name),
-        };
-        options.push(ModelOption {
-            id: provider.id.clone(),
-            label: Some(clip(&label, 48)),
-            disabled: true,
-            ..Default::default()
-        });
     }
     let mut notes: Vec<&str> = Vec::new();
     // One short status, never a paragraph: the config read itself failed.
     if config.read_failed {
         notes.push("_(读不到 config)_");
     }
-    // The process-provider rule, stated once and only when it is in force.
-    if enforced.is_some() {
-        notes.push(PROVIDER_RULE_NOTE);
+    if options.is_empty() {
+        notes.push("_(没有可用模型)_");
     }
+    // The provider axis is a config fact, stated once here (spec #922's
+    // correction: only a config edit + restart changes it).
+    notes.push(PROVIDER_RULE_NOTE);
     ModelScope {
-        id: PROVIDER_SCOPE.into(),
-        // Not a switch: the page names the provider and its pairs, and only the
-        // daemon's own provider is selectable.
-        title: "Provider".into(),
-        changeable: ChangeScope::NewThread,
-        pick: PickKind::Provider,
-        note: (!notes.is_empty()).then(|| notes.join("　")),
+        id: MODEL_SCOPE.into(),
+        title: "模型".into(),
+        changeable: ChangeScope::ThisTurn,
+        pick: PickKind::Model,
         options,
-        free_text: None,
-        // A Pending Session's pick is a creation fact (spec #922).
-        intro: Some("只在新会话生效".to_string()),
+        note: Some(notes.join("　")),
+        free_text: Some(format!("也可 `/model {}`", model_ref(channel, "<id>"))),
+        intro: None,
     }
+}
+
+/// The callback value of one model on the model page: the current channel plus
+/// the model id, quoted when the provider id needs it (a provider id may
+/// contain `/`, issue #908). `codex` is the fallback channel when none is
+/// known.
+fn model_ref(channel: &str, model: &str) -> String {
+    crate::backend::parsing::join_model(channel, model)
 }
 
 /// The current-model line the card shows (#910). A picker pick records the
@@ -1176,10 +906,6 @@ fn resolved_current(
         None => reference.clone(),
     };
     Some(ModelSelection { label, reference })
-}
-
-fn codex_ref(model: &str) -> String {
-    format!("{MODEL_PROVIDER}/{model}")
 }
 
 #[cfg(test)]
@@ -1410,25 +1136,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(unreadable.configured_provider(), None);
-    }
-
-    /// The short tags name what happened (2026-10-30): a bare `403` told a
-    /// user nothing, while the numeric statuses stay visible through `HTTP n`.
-    #[test]
-    fn probe_tags_are_user_readable() {
-        assert_eq!(ProbeOutcome::Unauthorized.short_tag(), "需要鉴权");
-        assert_eq!(ProbeOutcome::Forbidden.short_tag(), "无权列出模型");
-        assert_eq!(ProbeOutcome::NotFound.short_tag(), "不支持模型列表");
-        assert_eq!(ProbeOutcome::Network.short_tag(), "网络不通");
-        assert_eq!(ProbeOutcome::Timeout.short_tag(), "探测超时");
-        assert_eq!(ProbeOutcome::Http(500).short_tag(), "HTTP 500");
-        assert_eq!(ProbeOutcome::EnvKey.short_tag(), "env_key");
-        assert_eq!(ProbeOutcome::NoBaseUrl.short_tag(), "无 URL");
-        assert_eq!(ProbeOutcome::BadBaseUrl.short_tag(), "URL 无效");
-        assert_eq!(ProbeOutcome::UnsupportedScheme.short_tag(), "非 http(s)");
-        assert_eq!(ProbeOutcome::BadResponse.short_tag(), "响应无效");
-        assert_eq!(ProbeOutcome::Empty.short_tag(), "无模型");
-        assert_eq!(ProbeOutcome::LayerMismatch.short_tag(), "凭据跨层");
     }
 
     /// A provider's `Debug` shows at most scheme+host. A URL can carry a
@@ -1858,48 +1565,242 @@ mod tests {
         );
     }
 
-    /// A thread fact of the neutral `codex` bucket is not a channel: after a
-    /// picker pick the caller's resolved provider is what the provider list
-    /// should mark (and the pair that matches it is 「当前」).
+    /// One page, one scope (#931): no provider drill, page or pair row, even
+    /// when a caller still asks for the old `provider` scope. The config fact
+    /// is stated exactly once in the note.
     #[test]
-    fn a_neutral_thread_provider_falls_back_to_the_selection() {
-        let config = config_on(
-            "deepseek",
-            vec![provider(
-                "deepseek",
-                Some("http://127.0.0.1:1/v1".into()),
-                Some(TOKEN),
-                None,
-            )],
-        );
+    fn the_model_page_is_the_only_scope() {
+        let config = config_on("deepseek", vec![provider("deepseek", None, None, None)]);
         let mut probes = HashMap::new();
         probes.insert(
             "deepseek".into(),
             ProbeOutcome::Models(vec!["deepseek-flash".into()]),
         );
-        let query = ModelSurfaceQuery {
-            current: Some(ModelSelection {
-                label: "deepseek/deepseek-flash".into(),
-                reference: "deepseek/deepseek-flash".into(),
-            }),
+        for scope in [None, Some("provider"), Some("model")] {
+            let query = ModelSurfaceQuery { scope, ..query() };
+            let surface = build_surface(&catalog("gpt-5"), &config, &probes, Some("deepseek"), &query);
+            assert_eq!(surface.scopes.len(), 1, "one page, never a second scope");
+            let page = &surface.scopes[0];
+            assert_eq!(page.id, MODEL_SCOPE);
+            assert_eq!(page.title, "模型");
+            assert_eq!(page.pick, crate::backend::types::PickKind::Model);
+            assert_eq!(page.changeable, ChangeScope::ThisTurn);
+            assert!(
+                page.options
+                    .iter()
+                    .all(|option| option.pick.is_none() && !option.disabled),
+                "every row is a plain model pick: {:?}",
+                page.options
+            );
+            let note = page.note.as_deref().expect("the config-fact note");
+            assert_eq!(
+                note.matches(PROVIDER_RULE_NOTE).count(),
+                1,
+                "the config fact appears once: {note}"
+            );
+            assert!(note.contains("model_provider") && note.contains("重启 daemon"));
+            assert_eq!(
+                page.free_text.as_deref(),
+                Some("也可 `/model deepseek/<id>`"),
+                "the hand-type hint names the current channel"
+            );
+        }
+    }
+
+    /// A live thread's callback values name the **thread provider**, even when
+    /// the config's process provider is another one (#931 AC2).
+    #[test]
+    fn a_live_threads_options_name_the_thread_provider() {
+        let mut config = config_on(
+            "opencode-go",
+            vec![
+                provider("deepseek", None, None, None),
+                provider("opencode-go", None, None, None),
+            ],
+        );
+        config.default_model = Some("gpt-5-default".into());
+        let mut probes = HashMap::new();
+        probes.insert(
+            "deepseek".into(),
+            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
+        );
+        probes.insert(
+            "opencode-go".into(),
+            ProbeOutcome::Models(vec!["gpt-6-luna".into()]),
+        );
+        let surface = build_surface(&catalog("gpt-5"), &config, &probes, Some("deepseek"), &query());
+        let page = &surface.scopes[0];
+        let values: Vec<&str> = page
+            .options
+            .iter()
+            .map(|option| option.callback_value())
+            .collect();
+        assert_eq!(
+            values,
+            [
+                "deepseek/gpt-5",
+                "deepseek/gpt-5-default",
+                "deepseek/deepseek-flash",
+            ],
+            "catalog, config default and the thread provider's probed models"
+        );
+        assert!(
+            page.options.iter().all(|option| option.provider.is_none()),
+            "no probed row carries a provider callback field"
+        );
+        assert!(
+            !values.iter().any(|value| value.contains("gpt-6-luna")),
+            "another provider's models are not listed: {values:?}"
+        );
+    }
+
+    /// A Pending Session has no thread fact: its callback values name the
+    /// **config** provider (#931 AC2).
+    #[test]
+    fn a_pending_sessions_options_name_the_config_provider() {
+        let mut config = config_on("deepseek", vec![provider("deepseek", None, None, None)]);
+        config.default_model = Some("deepseek-v4-pro".into());
+        let mut probes = HashMap::new();
+        probes.insert(
+            "deepseek".into(),
+            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
+        );
+        let pending = ModelSurfaceQuery {
+            session_id: None,
+            ..ModelSurfaceQuery::default()
+        };
+        let surface = build_surface(&catalog("gpt-5"), &config, &probes, None, &pending);
+        let values: Vec<&str> = surface.scopes[0]
+            .options
+            .iter()
+            .map(|option| option.callback_value())
+            .collect();
+        assert_eq!(
+            values,
+            [
+                "deepseek/gpt-5",
+                "deepseek/deepseek-v4-pro",
+                "deepseek/deepseek-flash",
+            ]
+        );
+        assert_eq!(
+            surface.scopes[0].free_text.as_deref(),
+            Some("也可 `/model deepseek/<id>`")
+        );
+    }
+
+    /// A live thread whose model projection is still cold has no thread fact
+    /// either: the config provider is the honest channel (#931 AC2).
+    #[test]
+    fn a_cold_projection_uses_the_config_provider() {
+        let config = config_on("deepseek", vec![provider("deepseek", None, None, None)]);
+        let surface = build_surface(&catalog("gpt-5"), &config, &HashMap::new(), None, &query());
+        assert_eq!(surface.scopes[0].options[0].callback_value(), "deepseek/gpt-5");
+    }
+
+    /// No channel at all (`config/read` failed and no thread fact) falls back to
+    /// the neutral `codex` bucket and still says the config was unreadable
+    /// (#931 AC2).
+    #[test]
+    fn an_unknown_channel_falls_back_to_the_neutral_bucket() {
+        let mut unreadable = CodexModelConfig {
+            read_failed: true,
             ..Default::default()
         };
-        let surface = build_surface(&[], &config, &HashMap::new(), Some("codex"), &query);
+        unreadable.default_model = Some("gpt-5-default".into());
+        let surface = build_surface(&catalog("gpt-5"), &unreadable, &HashMap::new(), None, &query());
+        let page = &surface.scopes[0];
+        let values: Vec<&str> = page
+            .options
+            .iter()
+            .map(|option| option.callback_value())
+            .collect();
+        assert_eq!(values, ["codex/gpt-5", "codex/gpt-5-default"]);
         assert_eq!(
-            surface.current.as_ref().map(|current| current.reference.as_str()),
-            Some("deepseek/deepseek-flash"),
-            "a neutral thread fact does not rename the caller's selection"
+            page.free_text.as_deref(),
+            Some("也可 `/model codex/<id>`"),
+            "the hand-type hint names the neutral fallback"
         );
-        let mut providers_query = query;
-        providers_query.scope = Some(PROVIDER_SCOPE);
-        providers_query.session_id = None;
-        let providers = build_surface(&[], &config, &probes, Some("codex"), &providers_query);
-        let label = providers.scopes[0].options[0].display_label();
-        assert!(label.contains("当前"), "label: {label}");
+        let note = page.note.as_deref().unwrap();
+        assert!(note.contains("读不到 config"), "note: {note}");
 
-        // Issue #910: a picker pick records the neutral bucket, so the current
-        // line composes the thread's **real** provider (the same fact the footer
-        // shows) when that provider is configured.
+        // The thread fact outranks the failed config read: the daemon's own
+        // projection is the authority (issue #908).
+        let surface = build_surface(
+            &catalog("gpt-5"),
+            &unreadable,
+            &HashMap::new(),
+            Some("deepseek"),
+            &query(),
+        );
+        assert_eq!(
+            surface.scopes[0].options[0].callback_value(),
+            "deepseek/gpt-5",
+            "a known thread provider survives a failed config read"
+        );
+        assert!(
+            surface.scopes[0]
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("读不到 config")
+        );
+
+        // An empty catalog leaves the note's other half (and never a blank
+        // card).
+        let empty_config = CodexModelConfig {
+            read_failed: true,
+            ..Default::default()
+        };
+        let empty = build_surface(&[], &empty_config, &HashMap::new(), None, &query());
+        let note = empty.scopes[0].note.as_deref().unwrap();
+        assert!(note.contains("读不到 config"), "note: {note}");
+        assert!(note.contains("没有可用模型"), "note: {note}");
+        assert!(empty.scopes[0].free_text.is_some());
+    }
+
+    /// Only the current channel's `/models` group is listed; no other provider
+    /// appears, and a probed row is a plain model pick (no `provider` field).
+    #[test]
+    fn only_the_current_providers_models_are_listed() {
+        let mut deepseek = provider("deepseek", None, None, None);
+        deepseek.name = "DeepSeek".into();
+        let mut opencode = provider("opencode-go", None, None, None);
+        opencode.name = "OpenCode Go".into();
+        let config = config_on("deepseek", vec![deepseek, opencode]);
+        let mut probes = HashMap::new();
+        probes.insert(
+            "deepseek".into(),
+            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
+        );
+        probes.insert(
+            "opencode-go".into(),
+            ProbeOutcome::Models(vec!["gpt-6-luna".into()]),
+        );
+        let surface = build_surface(&[], &config, &probes, Some("deepseek"), &query());
+        let options = &surface.scopes[0].options;
+        assert_eq!(
+            options.len(),
+            1,
+            "only the current provider's models: {options:?}"
+        );
+        assert_eq!(
+            options[0].group.as_deref(),
+            Some("DeepSeek（/models）"),
+            "the group carries the configured display name"
+        );
+        assert_eq!(options[0].callback_value(), "deepseek/deepseek-flash");
+        assert_eq!(options[0].provider, None);
+        assert!(!options[0].disabled);
+    }
+
+    /// A thread fact of the neutral `codex` bucket is not a channel: the
+    /// current-model line falls back to the caller's resolved provider, and a
+    /// picker pick composes the thread's real provider (the same fact the
+    /// footer shows).
+    #[test]
+    fn a_neutral_thread_provider_does_not_rename_the_current_line() {
+        let config = config_on("deepseek", vec![provider("deepseek", None, None, None)]);
         let picker_pick = ModelSurfaceQuery {
             current: Some(ModelSelection {
                 label: "codex/gpt-custom@high".into(),
@@ -1907,6 +1808,9 @@ mod tests {
             }),
             ..Default::default()
         };
+
+        // A picker pick records the neutral bucket, so the current line
+        // composes the thread's **real** provider.
         let surface = build_surface(&[], &config, &HashMap::new(), Some("deepseek"), &picker_pick);
         let current = surface.current.expect("the current line stays");
         assert_eq!(current.reference, "deepseek/gpt-custom");
@@ -1915,7 +1819,7 @@ mod tests {
             "the label is composed with the real provider too"
         );
 
-        // A **failed config read** does not hide the thread's real provider: the
+        // A failed config read does not hide the thread's real provider: the
         // projection is the authority, not the config (issue #908).
         let unreadable = CodexModelConfig {
             read_failed: true,
@@ -1942,428 +1846,30 @@ mod tests {
         assert_eq!(surface.current.unwrap().reference, "codex/gpt-custom");
     }
 
-    /// A failed probe is a note on the model scope and a short tag on the
-    /// provider's own row — never an error, a blank scope, or a model button.
+    /// A failed probe adds no row and no prose: the model page has no provider
+    /// status rows any more (#931 AC1).
     #[test]
-    fn a_failed_probe_is_a_short_tag_on_the_provider_page() {
-        let config = config_on(
-            "opencode-go",
-            vec![provider(
-                "opencode-go",
-                Some("http://127.0.0.1:1/v1".into()),
-                Some(TOKEN),
-                None,
-            )],
-        );
-        let mut probes = HashMap::new();
-        probes.insert("opencode-go".into(), ProbeOutcome::Forbidden);
-
-        // The root page has no probe prose: only the catalog/current provider.
-        let surface = build_surface(&[], &config, &probes, Some("opencode-go"), &query());
-        let model = &surface.scopes[0];
-        assert!(
-            model
-                .note
-                .as_deref()
-                .is_none_or(|note| !note.contains("无权列出模型") && !note.contains("opencode-go")),
-            "no probe prose on the model page: {:?}",
-            model.note
-        );
-        assert!(
-            !model.options.iter().any(|option| option.disabled),
-            "no probe rows here either"
-        );
-
-        // The provider page lists it as a disabled row with a short tag, and
-        // marks it as the current provider (#908 AC1).
-        let pending_provider = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let provider_page = build_surface(&[], &config, &probes, Some("opencode-go"), &pending_provider);
-        let provider = &provider_page.scopes[0];
-        assert_eq!(provider.id, PROVIDER_SCOPE);
-        assert_eq!(provider.options.len(), 1, "the provider is listed");
-        assert!(provider.options[0].disabled, "never a bare provider button");
-        assert_eq!(provider.options[0].provider, None);
-        let label = provider.options[0].display_label();
-        assert!(
-            label.contains("opencode-go") && label.contains("无权列出模型"),
-            "the row carries the short tag: {label}"
-        );
-        assert!(
-            label.contains("当前"),
-            "the thread's provider is marked even without a known model: {label}"
-        );
-    }
-
-    fn provider_query() -> ModelSurfaceQuery<'static> {
-        let mut query = query();
-        query.scope = Some(PROVIDER_SCOPE);
-        query
-    }
-
-    /// When `config/read` itself fails, an empty provider list means "unknown",
-    /// not "the user configured none": the card says so instead of claiming an
-    /// empty config.
-    #[test]
-    fn an_unreadable_config_says_unknown_instead_of_empty() {
-        let config = CodexModelConfig {
-            read_failed: true,
-            ..Default::default()
-        };
-        // The root page names the failure in one line, alongside the catalog.
-        let root = build_surface(&[], &config, &HashMap::new(), None, &query());
-        assert_eq!(
-            root.scopes[0].note.as_deref(),
-            Some("配置读取失败：只显示内置目录"),
-            "the model page says the provider data is unknown"
-        );
-
-        let pending_provider = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let surface = build_surface(&[], &config, &HashMap::new(), None, &pending_provider);
-        let note = surface.scopes[0].note.as_deref().unwrap();
-        assert!(note.contains("读不到 config"), "note: {note}");
-        assert!(!note.contains("没有 provider"), "note: {note}");
-    }
-
-    /// An expired answer is re-probed **and** dropped from the cache: a drilled
-    /// click's cache-only read prunes it, and a subsequent probe only replaces
-    /// the requested provider's entry. Without pruning, one connection would
-    /// accumulate every provider/base-URL pair a project ever named.
-    #[tokio::test]
-    async fn an_expired_probe_is_dropped_and_reprobed() {
-        let server = crate::test_http::TestHttpServer::start().await;
-        server.route("GET", "/models", 200, r#"{"data":[{"id":"one"}]}"#);
-        let probes = ModelProbes::new();
-        let provider = provider("p", Some(server.base_url()), None, None);
-        let key = ModelProbes::cache_key(&provider);
-        assert_eq!(
-            probes.probe_all(std::slice::from_ref(&provider)).await.get("p"),
-            Some(&ProbeOutcome::Models(vec!["one".into()]))
-        );
-
-        // `PROBE_TTL` is minutes in production; expiry is simulated by moving
-        // the instants, which is the same state a later read would see. The
-        // unrelated key stands for an old project's endpoint.
-        let stale: ProbeCacheKey = (
-            "old".to_string(),
-            Some("http://old.example".to_string()),
-            None,
-            None,
-        );
-        {
-            let mut entries = probes.entries.lock().unwrap();
-            entries.insert(
-                stale.clone(),
-                ProbeEntry {
-                    at: Instant::now() - PROBE_TTL - Duration::from_secs(1),
-                    outcome: ProbeOutcome::Forbidden,
-                },
-            );
-            entries.get_mut(&key).unwrap().at = Instant::now() - PROBE_TTL - Duration::from_secs(1);
-        }
-
-        // The drilled page's cache-only read prunes both expired entries and
-        // returns nothing fresh.
-        assert!(
-            probes.cached(std::slice::from_ref(&provider)).is_empty(),
-            "an expired answer is not served"
-        );
-        assert!(
-            !probes.entries.lock().unwrap().contains_key(&stale),
-            "the cache-only read drops an unrelated expired entry"
-        );
-
-        probes.probe_all(std::slice::from_ref(&provider)).await;
-        assert_eq!(server.request_count(), 2, "a stale entry probes again");
-        let entries = probes.entries.lock().unwrap();
-        assert!(entries.contains_key(&key), "the re-probed entry is fresh");
-        assert_eq!(entries.len(), 1, "nothing expired survives the insert");
-    }
-
-    /// The model page's provider row names the page, never a switch (spec #922
-    /// correction, 2026-10-30): only the daemon's own provider is selectable,
-    /// so `切换 provider…` would promise an action the card cannot take.
-    #[test]
-    fn the_provider_row_names_the_provider_and_never_a_switch() {
-        let drill = |config: &CodexModelConfig, thread: Option<&str>, current: Option<&str>| {
-            let query = ModelSurfaceQuery {
-                current: current.map(|reference| ModelSelection {
-                    label: reference.to_string(),
-                    reference: reference.to_string(),
-                }),
-                ..Default::default()
-            };
-            build_surface(&[], config, &HashMap::new(), thread, &query).scopes[0]
-                .options
-                .iter()
-                .find(|option| option.pick == Some(crate::backend::types::PickKind::DrillDown))
-                .expect("the provider drill")
-                .display_label()
-                .to_string()
-        };
-        let config = config_on("opencode-go", Vec::new());
-        // A thread's known provider.
-        assert_eq!(drill(&config, Some("openai"), None), "Provider：openai…");
-        // A Pending Session's recorded pick.
-        assert_eq!(
-            drill(&config, None, Some("deepseek/deepseek-flash")),
-            "Provider：deepseek…"
-        );
-        // No resolved provider: the daemon's own provider still names the page.
-        assert_eq!(drill(&config, None, None), "Provider：opencode-go…");
-        // A neutral `codex/<id>` pick names no channel, so it is not shown.
-        assert_eq!(
-            drill(&config, Some("codex"), Some("codex/gpt-5")),
-            "Provider：opencode-go…"
-        );
-
-        // Nothing is known: a bare label, never an invented provider.
-        let unreadable = CodexModelConfig {
-            read_failed: true,
-            ..Default::default()
-        };
-        assert_eq!(drill(&unreadable, None, Some("codex/gpt-5")), "Provider…");
-    }
-
-    /// Spec #922: a Pending Session's provider page offers the **pairs** that
-    /// ride `thread/start`; a live thread's page is read-only — the current
-    /// provider plus the `/new` / later `/fork` note, with no rows to click.
-    #[test]
-    fn the_provider_page_is_selectable_only_on_a_pending_session() {
-        let config = config_on("deepseek", vec![provider("deepseek", None, None, None)]);
-        let mut probes = HashMap::new();
-        probes.insert(
-            "deepseek".into(),
-            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
-        );
-
-        // A Pending Session: the pair rides creation, no suffix on the row.
-        let pending_query = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let pending = build_surface(&[], &config, &probes, None, &pending_query);
-        let scope = &pending.scopes[0];
-        assert_eq!(scope.title, "Provider", "the page names a provider, not a switch");
-        assert_eq!(scope.changeable, ChangeScope::NewThread);
-        assert_eq!(scope.options[0].display_label(), "deepseek/deepseek-flash");
-        assert_eq!(scope.intro.as_deref(), Some("只在新会话生效"));
-        assert_eq!(
-            scope.note.as_deref(),
-            Some(PROVIDER_RULE_NOTE),
-            "one short rule, never a paragraph"
-        );
-
-        // A live thread: the current provider is stated, the rows are gone, and
-        // `/new` is the actionable remedy while `/fork` reads as a later one.
-        let live = provider_query();
-        let read_only = build_surface(&[], &config, &probes, Some("deepseek"), &live);
-        let scope = &read_only.scopes[0];
-        assert_eq!(scope.title, "Provider（仅新会话）");
-        assert_eq!(scope.changeable, ChangeScope::NewThread);
-        assert!(scope.options.is_empty(), "no clickable rows: {:?}", scope.options);
-        let note = scope.note.as_deref().expect("the read-only note");
-        assert!(
-            note.contains("当前 provider") && note.contains("deepseek"),
-            "{note}"
-        );
-        assert!(note.contains("/new") && note.contains("/fork"), "{note}");
-        assert!(
-            note.contains("后续版本") && note.contains("独立功能"),
-            "a `/fork` mention must read as a future capability: {note}"
-        );
-    }
-
-    /// Spec #922 correction (2026-10-30): Codex runs **one provider per
-    /// process**. Only the configured provider's pairs are selectable on a
-    /// Pending Session; every other configured provider is a disabled row that
-    /// names the config edit — never a pair that would create a thread whose
-    /// first turn is refused.
-    #[test]
-    fn only_the_configured_provider_is_selectable_on_a_pending_session() {
-        let mut opencode = provider("opencode-go", None, None, None);
-        opencode.name = "OpenCode Go".into();
-        let config = config_on(
-            "opencode-go",
-            vec![opencode, provider("deepseek", None, None, None)],
-        );
-        let mut probes = HashMap::new();
-        probes.insert(
-            "opencode-go".into(),
-            ProbeOutcome::Models(vec!["gpt-6-luna".into()]),
-        );
-        probes.insert(
-            "deepseek".into(),
-            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
-        );
-        let pending = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let surface = build_surface(&[], &config, &probes, None, &pending);
-        let scope = &surface.scopes[0];
-
-        let pairs: Vec<&crate::backend::types::ModelOption> = scope
-            .options
-            .iter()
-            .filter(|option| option.provider.is_some())
-            .collect();
-        assert_eq!(
-            pairs.len(),
-            1,
-            "only the configured provider is a creation pair: {:?}",
-            scope.options
-        );
-        assert_eq!(pairs[0].display_label(), "OpenCode Go/gpt-6-luna（当前）");
-
-        let deepseek = scope
-            .options
-            .iter()
-            .find(|option| option.id == "deepseek")
-            .expect("the other configured provider is still listed");
-        assert!(deepseek.disabled, "and never selectable: {deepseek:?}");
-        assert_eq!(deepseek.provider, None, "a mismatch row carries no pair");
-        let label = deepseek.display_label();
-        assert!(
-            label.contains("当前 provider 不是它") && label.contains("重启 daemon"),
-            "the row names the fix: {label}"
-        );
-        assert_eq!(
-            scope.note.as_deref(),
-            Some(PROVIDER_RULE_NOTE),
-            "the rule is stated once, in the scope note"
-        );
-
-        // The live page never lists a pair at all (creation-only, #922), so the
-        // rule does not apply there: no extra prose.
-        let live = provider_query();
-        let read_only = build_surface(&[], &config, &probes, Some("opencode-go"), &live);
-        assert!(read_only.scopes[0].options.is_empty());
-        assert!(
-            !read_only.scopes[0]
-                .note
-                .as_deref()
-                .unwrap_or_default()
-                .contains(PROVIDER_RULE_NOTE),
-            "the live note is the /new one, not the pending rule"
-        );
-    }
-
-    /// A provider with no `/models` endpoint is exactly the one a user has to
-    /// hand-type: its row says so, once and short (2026-10-30).
-    #[test]
-    fn a_404_provider_offers_the_hand_type_hint() {
+    fn a_failed_probe_adds_nothing_to_the_model_page() {
         let config = config_on("opencode-go", vec![provider("opencode-go", None, None, None)]);
         let mut probes = HashMap::new();
-        probes.insert("opencode-go".into(), ProbeOutcome::NotFound);
-        let pending = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let surface = build_surface(&[], &config, &probes, None, &pending);
-        let label = surface.scopes[0].options[0].display_label();
+        probes.insert("opencode-go".into(), ProbeOutcome::Forbidden);
+        let surface = build_surface(&[], &config, &probes, Some("opencode-go"), &query());
+        let page = &surface.scopes[0];
         assert!(
-            label.contains("不支持模型列表") && label.contains("/model opencode-go/<id>"),
-            "the row names the tag and the hand-typed form: {label}"
+            page.options.is_empty(),
+            "no row for a failed probe: {:?}",
+            page.options
         );
+        let note = page.note.as_deref().unwrap();
+        assert!(!note.contains("无权列出模型"), "no probe prose: {note}");
+        assert!(!note.contains("opencode-go"), "no provider row: {note}");
+        assert!(note.contains("没有可用模型"), "the page says so: {note}");
     }
 
-    /// When `config/read` failed the provider rule cannot be verified: the
-    /// surface's resolved current provider is the fallback, and when that is
-    /// unknown too the page keeps listing every provider as before.
+    /// #908: a provider id may itself contain `/`. Every ref built from it is
+    /// quoted so it round-trips, including the model page's callback values.
     #[test]
-    fn an_unknown_config_falls_back_to_the_current_provider() {
-        // A caller that kept provider data it could not re-read: the read
-        // failed, so the configured provider is unknown.
-        let unreadable = CodexModelConfig {
-            read_failed: true,
-            providers: vec![provider("a", None, None, None), provider("b", None, None, None)],
-            ..Default::default()
-        };
-        let pending = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let surface = build_surface(&[], &unreadable, &HashMap::new(), Some("b"), &pending);
-        let scope = &surface.scopes[0];
-        let a = scope.options.iter().find(|option| option.id == "a").unwrap();
-        assert!(
-            a.disabled && a.display_label().contains("当前 provider 不是它"),
-            "the resolved current provider limits the page: {:?}",
-            scope.options
-        );
-        let note = scope.note.as_deref().unwrap_or_default();
-        assert!(
-            note.contains("读不到 config") && note.contains("一次只用一个 provider"),
-            "both facts, in one line: {note}"
-        );
-
-        // No configured and no resolved provider: every row stays as before,
-        // with only the existing config note. (A resolved selection would be
-        // the fallback, so this query carries neither.)
-        let bare = ModelSurfaceQuery {
-            session_id: None,
-            scope: Some(PROVIDER_SCOPE),
-            ..Default::default()
-        };
-        let surface = build_surface(&[], &unreadable, &HashMap::new(), None, &bare);
-        let scope = &surface.scopes[0];
-        assert_eq!(scope.options.len(), 2, "every provider is still listed");
-        assert!(
-            scope
-                .options
-                .iter()
-                .all(|option| option.display_label().contains("没有已知模型")),
-            "an unverifiable rule reclassifies nothing: {:?}",
-            scope.options
-        );
-        assert_eq!(scope.note.as_deref(), Some("_(读不到 config)_"));
-    }
-
-    /// #908 AC1: a pair row labels the provider's configured **display name**
-    /// (its id when the config names none); the callback keeps the id + model
-    /// separately, so the label is presentation only.
-    #[test]
-    fn a_pair_row_shows_the_providers_display_name() {
-        let mut deepseek = provider("deepseek", None, None, None);
-        deepseek.name = "DeepSeek".into();
-        let config = config_on("deepseek", vec![deepseek]);
-        let mut probes = HashMap::new();
-        probes.insert(
-            "deepseek".into(),
-            ProbeOutcome::Models(vec!["deepseek-flash".into()]),
-        );
-
-        let pending_query = ModelSurfaceQuery {
-            session_id: None,
-            ..provider_query()
-        };
-        let surface = build_surface(&[], &config, &probes, None, &pending_query);
-        let option = &surface.scopes[0].options[0];
-        assert_eq!(option.display_label(), "DeepSeek/deepseek-flash");
-        assert_eq!(
-            option.provider.as_deref(),
-            Some("deepseek"),
-            "the callback carries the id, not the display name"
-        );
-        assert_eq!(
-            option.value.as_deref(),
-            Some("deepseek-flash"),
-            "the callback carries the bare model id"
-        );
-    }
-
-    /// #908: a provider id may itself contain `/`. Every reference cola
-    /// composes for the current pair must quote it (issue #910's gate finding),
-    /// or `parse_model` reads the wrong provider — and the current marker lands
-    /// on the wrong row.
-    #[test]
-    fn a_slashed_provider_id_resolves_its_current_pair() {
+    fn a_slashed_provider_id_round_trips_on_the_model_page() {
         let mut slashed = provider("foo/bar", None, None, None);
         slashed.name = "Foo Bar".into();
         let config = config_on("foo/bar", vec![slashed]);
@@ -2374,26 +1880,18 @@ mod tests {
                 label: "codex/gpt-x".into(),
                 reference: "codex/gpt-x".into(),
             }),
-            ..provider_query()
+            ..query()
         };
-
-        // The thread runs `foo/bar`, the pick was the neutral `codex` bucket:
-        // the resolved current pair names the real provider, quoted.
-        let pending = ModelSurfaceQuery {
-            session_id: None,
-            ..query
-        };
-        let surface = build_surface(&[], &config, &probes, Some("foo/bar"), &pending);
+        let surface = build_surface(&[], &config, &probes, Some("foo/bar"), &query);
         let option = &surface.scopes[0].options[0];
-        assert_eq!(option.display_label(), "Foo Bar/gpt-x（当前）");
-        assert_eq!(option.provider.as_deref(), Some("foo/bar"));
-        assert_eq!(option.value.as_deref(), Some("gpt-x"));
+        assert_eq!(option.callback_value(), "\"foo/bar\"/gpt-x");
+        assert_eq!(
+            surface.scopes[0].free_text.as_deref(),
+            Some("也可 `/model \"foo/bar\"/<id>`")
+        );
 
         let current = surface.current.as_ref().expect("the resolved current pair");
-        assert_eq!(
-            current.reference, "\"foo/bar\"/gpt-x",
-            "a slashed provider is quoted so the pair round-trips"
-        );
+        assert_eq!(current.reference, "\"foo/bar\"/gpt-x");
         assert_eq!(current.label, "\"foo/bar\"/gpt-x");
         let parsed = crate::backend::parsing::parse_model(&current.reference).expect("the pair round-trips");
         assert_eq!(parsed.provider_id, "foo/bar", "not `foo`");
@@ -2401,8 +1899,7 @@ mod tests {
     }
 
     /// Spec #922 decision 7: `[profiles.*]` is not a preset source. A layer
-    /// carrying one contributes no model row and no provider pair — the table is
-    /// simply ignored.
+    /// carrying one contributes no model row — the table is simply ignored.
     #[test]
     fn a_profiles_table_is_ignored() {
         let result = json!({
@@ -2424,14 +1921,9 @@ mod tests {
         assert_eq!(config.default_model.as_deref(), Some("top-level-model"));
         assert_eq!(config.providers.len(), 1);
 
-        // The model page has the config default and the drill only: no profile
-        // row, and no pair that a profile could have supplied.
         let surface = build_surface(&[], &config, &HashMap::new(), None, &ModelSurfaceQuery::default());
-        let labels: Vec<&str> = surface.scopes[0]
-            .options
-            .iter()
-            .map(|option| option.display_label())
-            .collect();
+        let page = &surface.scopes[0];
+        let labels: Vec<&str> = page.options.iter().map(|option| option.display_label()).collect();
         assert!(
             labels.iter().any(|label| label.contains("top-level-model")),
             "{labels:?}"
@@ -2442,17 +1934,21 @@ mod tests {
                 .any(|label| label.contains("fast") || label.contains("deepseek-flash")),
             "a profile contributes no model row: {labels:?}"
         );
+        assert_eq!(
+            page.options[0].callback_value(),
+            "deepseek/top-level-model",
+            "the config default names the config provider"
+        );
+    }
 
-        // The provider page lists DeepSeek as a status row with no pair: a
-        // profile did not give it one.
-        let provider_query = ModelSurfaceQuery {
-            scope: Some(PROVIDER_SCOPE),
-            ..Default::default()
-        };
-        let provider_page = build_surface(&[], &config, &HashMap::new(), None, &provider_query);
-        let option = &provider_page.scopes[0].options[0];
-        assert!(option.disabled, "no pair means a status row: {option:?}");
-        assert!(option.provider.is_none(), "{option:?}");
-        assert!(!option.display_label().contains("deepseek-flash"));
+    /// The built-in catalog plus a [`ProviderModels`] row per passed id.
+    fn catalog(model: &str) -> Vec<crate::backend::types::ProviderModels> {
+        vec![crate::backend::types::ProviderModels {
+            provider: MODEL_PROVIDER.into(),
+            models: vec![crate::backend::types::ModelOption {
+                id: model.into(),
+                ..Default::default()
+            }],
+        }]
     }
 }

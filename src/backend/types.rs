@@ -137,18 +137,15 @@ pub struct ModelOption {
     /// `None` sends `id` — OpenCode's provider page sends the provider id,
     /// its model page sends `provider/model`.
     pub value: Option<String>,
-    /// The section an option belongs to inside one scope (#908's grouped
-    /// provider scope: the built-in catalog must not render under a
-    /// provider). `None` leaves the option ungrouped.
+    /// The section an option belongs to inside one scope (#908: the built-in
+    /// catalog must render as its own group, never under a provider). `None`
+    /// leaves the option ungrouped.
     pub group: Option<String>,
-    /// A row that is **listed but cannot be picked** — a configured provider
-    /// with no known model has no valid pair to offer (#908 AC1 lists the
-    /// providers; #910 makes a bare provider unswitchable). The card renders it
-    /// as text, never a button.
+    /// A row that is **listed but cannot be picked** (#908 AC1: a status row
+    /// about a provider). The card renders it as text, never a button.
     pub disabled: bool,
     /// Overrides the scope's [`PickKind`] for this option, so one page can mix
-    /// concrete picks with a drill-down (Codex's `Provider：<id>…` row, #908).
-    /// `None` uses the scope's.
+    /// concrete picks with a drill-down. `None` uses the scope's.
     pub pick: Option<PickKind>,
 }
 
