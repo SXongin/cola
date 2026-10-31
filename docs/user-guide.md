@@ -276,17 +276,18 @@ default_client = "ada"           # which Agent Client is active (default: "defau
   settings: a thread created before the change keeps the policy it was created
   with, and a thread your TUI created and cola adopted keeps it too unless
   `apply_on_adopt = true`.
-- **A provider is creation-only.** `/new` (a Pending Session) is the only path
-  that chooses a provider today: it sends the `model` + `modelProvider` pair to
-  `thread/start` (`turn/start` has no such field). `/fork` is an independent
-  capability planned for a later version; it will send the pair to
-  `thread/fork`, and it is not a command today. A live thread's provider never
-  changes: `/model` with a different provider is refused without any request and
-  points at `/new`, naming `/fork` only as that later option. The provider page
-  on a live thread is read-only — the current provider plus that note, with no
-  clickable rows — while a Pending Session still offers the pairs its creation
-  will carry. A provider is never selectable without a model: the old model name
-  on a new provider is a 404.
+- **A provider is a config fact.** Codex runs one provider per daemon process:
+  the top-level `model_provider` of that daemon's `$CODEX_HOME/config.toml`
+  (default `~/.codex/config.toml`; `openai` when it names none). Changing it is
+  an edit to that file plus a daemon restart — never a card pick, never
+  `/model`, and never a creation parameter. `/new` sends only `model` to
+  `thread/start`; `/fork` is an independent capability planned for a later
+  version (`threadId` + the selected `model`, no provider), and it is not a
+  command today. Neither ever changes the channel, and a live thread's provider
+  never changes. `/model`'s refs name the current channel as
+  `<provider>/<model>`, with the neutral `codex/<id>` only when the channel is
+  unknown. cola never writes that file: it carries your provider credentials
+  and is shared with the daemon.
 - **`reasoning_summary` (codex only, default `auto`)** — how much of the model's
   reasoning is summarised into a Codex thread. cola sends it as
   `thread/start`'s `config.model_reasoning_summary`, and the card renders the
@@ -821,8 +822,9 @@ Notes:
   Codex client」 below.
   On OpenCode, `/model`'s value must exist on the server cola attaches to; Codex
   validates neither a catalog nor a typed id, so a typo surfaces as the
-  provider's own error on the next turn. Bare `/model` opens
-  the provider → model picker, whose intro shows the model the next message will
+  provider's own error on the next turn. Bare `/model` opens the picker —
+  OpenCode's provider → model levels, Codex's one model page — whose intro shows
+  the model the next message will
   actually run (the session's own selection, else `[opencode] model`, else what
   the server recorded). `/compact` and `/stop` need a real session and keep their
   "还没有会话" replies on a pending.
@@ -836,24 +838,37 @@ Notes:
 
 ### `/model` on a Codex client
 
-Codex's model axis is not a provider → model tree: a provider is a **creation
+Codex's model axis is not a provider → model tree: a provider is a **config
 fact**, a model is **per turn**, and the built-in catalog is **global**. Bare
-`/model` therefore shows one current line and **one model page**; a
-`Provider：<id>…` row at the bottom opens the provider page (the row names the
-provider it shows — it is not a switch). There is no
-「选择 provider（共 1 个）」 pseudo-level:
+`/model` therefore shows one current line and **one model page** — no provider
+page, no provider or pair row, and no 「选择 provider（共 1 个）」 pseudo-level:
 
 - **A pick is recorded, not switched.** `/model` records the choice as a
-  one-shot pending pair — a **Pending Model** (model plus its `/think` level, in
-  memory) — and answers 「已记录：将在下一条新消息生效」. The card shows two
+  one-shot pending **Pending Model** (model plus its `/think` level, in memory)
+  and answers 「已记录：将在下一条新消息生效」. The card shows two
   facts: **当前** — the thread's own `provider / model`, refreshed by the newest
   `thread/read` or `thread/settings/updated`, plus the thinking level cola last
   recorded for the session with `/think` (a peer's effort change is **not**
-  adopted, so the pair can refresh while the level stays cola's) — and
-  **待应用** — the recorded pair with 「下一条新消息生效」.
+  adopted, so the current line can refresh while the level stays cola's) — and
+  **待应用** — the recorded model ref on the current channel (with `@level` when
+  `/think` is pending) labelled 「下一条新消息生效」.
   A pick never rewrites the current line before the server has run it, so a
   picker opened after another client changed the thread shows that change, and
   the footer and the picker cannot disagree.
+- **The provider is a config fact, stated once on the page.** Codex runs one
+  provider per daemon process: the top-level `model_provider` of the daemon's
+  own `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`, `openai` when
+  it names none). Changing it is an edit to that file plus a daemon restart —
+  never a click and never `/model` — and cola never writes it. The page states
+  this once and lists only the current provider's models, as
+  `<provider>/<model>` refs.
+- **A ref naming another provider is refused while the channel is known.** A
+  typed `/model <provider>/<model>` whose provider differs from the live
+  thread's (or, on a Pending Session, the config's) sends **no request** and
+  says the provider is a config fact, naming both channels and pointing at
+  `model_provider` plus a restart. When the channel cannot be determined — a
+  failed `config/read`, no connection — the pick is recorded model-only and
+  Codex's own error on the next message is the fallback.
 - **The next new message applies it — once.** That turn's `turn/start` carries
   `model` + `effort`; when the turn is accepted the pick is **consumed**, and
   every later message carries no model and no effort: the thread's own default
@@ -876,26 +891,33 @@ provider it shows — it is not a switch). There is no
   effective-selection ladder as the model card), 待应用 for a live Codex thread
   when a pick is pending (`清除思考等级` for an explicit reset), then a short
   session summary (session, directory, agent, auto-accept). A Pending Session
-  shows its creation pair with 「将在会话创建时生效」 and no 待应用; OpenCode
+  shows its creation model with 「将在会话创建时生效」 and no 待应用; OpenCode
   has a current line and no pending line.
 - **A Pending Session's pick is a creation parameter.** Before the first message
-  there is no thread, so the pair is `thread/start`'s `model` + `modelProvider`
-  and the reply says 「将在会话创建时生效」 — never 待应用. `/think` there is the
-  same creation intent: it rides the first new turn once the thread exists. Both
-  are stored with the session rather than in the adapter's one-shot window, so a
-  restart keeps them until the first message creates the thread.
+  there is no thread, so the choice is `thread/start`'s `model` — no
+  `modelProvider` — and the reply says 「将在会话创建时生效」 — never 待应用.
+  `/think` there is the same creation intent: it rides the first new turn once
+  the thread exists. Both are stored with the session rather than in the
+  adapter's one-shot window, so a restart keeps them until the first message
+  creates the thread.
 - **「模型」** lists the model-only sources: `model/list`'s built-in
   catalog (grouped as 「内置目录（全局，未校验）」 — those ids name no provider and
   may run through any of them), the config's top-level `model` (配置默认), and
-  **the current provider's** `/models` ids. A pick is recorded, not sent on every
-  prompt: it reaches the next new message's `turn/start.model` once.
-- **An id outside every list is typed.** `/model codex/<id>` records it, and
-  `/model <provider>/<model>` records a pair. Codex validates neither one: only
-  the catalog's entries carry a display name, a context window and reasoning
-  levels, so a typo shows up as the provider's own error on the next message.
+  **the current provider's** `/models` ids. Every option's value — and the
+  hand-write hint — spells `<provider>/<model>`, with the current channel: the
+  thread's own provider on a live thread, the config's `model_provider` on a
+  Pending Session, and the neutral `codex/<id>` only when the channel cannot be
+  determined. A pick is recorded, not sent on every prompt: it reaches the next
+  new message's `turn/start.model` once.
+- **An id outside every list is typed.** `/model <provider>/<model>` — e.g.
+  `/model opencode-go/deepseek-v4-pro` — records that model on the current
+  channel, and `/model codex/<id>` is the neutral spelling for when the channel
+  is unknown. Codex validates neither one: only the catalog's entries carry a
+  display name, a context window and reasoning levels, so a typo shows up as the
+  provider's own error on the next message.
 - **`[profiles.*]` is not read.** Codex 0.134+ no longer reads it (a
   `--profile` layers `$CODEX_HOME/<name>.config.toml`), so cola ignores the
-  table: a profile neither adds a model row nor supplies a provider pair.
+  table: a profile neither adds a model row nor supplies a provider.
 
 **The `/models` probe is best effort, and its refusal is not an error.**
 `GET <base_url>/models` is not part of the Responses API — `wire_api =
@@ -903,64 +925,49 @@ provider it shows — it is not a switch). There is no
 that provider's own `experimental_bearer_token`, with 2 s per probe, and caches
 the answer: a definitive one (an auth refusal, no `/models` endpoint, `env_key`,
 or the decoded models) for three minutes, a **transient** one (a timeout, a
-network error) for about 20 seconds so the next open retries. The provider page
-shows the reason as a short tag on the provider row (`无权列出模型`, `探测超时`,
-…) — never a paragraph, and never on the model page. A provider whose probe
-answered 404 gets one extra short hint on its row, because it is exactly the one
-you have to hand-type: `/model <provider>/<id>`. The catalog and the config
-default are always
-there, and a card callback answers from the cache, so a first cold click may
-show the providers without their probed models until the next open fills them. The token is sent only in the
+network error) for about 20 seconds so the next open retries. Only the current
+provider's ids reach the model page — a failed probe contributes none — and the
+catalog and the config default are always
+there. A card callback answers from the cache, so a first cold click may omit
+the probed ids until the next open fills them. The token is sent only in the
 request's `Authorization` header: it never appears on a card, in a log line or in
 an error message.
 
-**Codex runs one provider per process.** The daemon's own top-level
-`model_provider` (`openai` when it names none) must equal the thread's provider:
-`thread/start` on any other one succeeds, but the first message is refused with
+**Codex runs one provider per process.** The daemon's top-level
+`model_provider` (`openai` when it names none) is the only channel a thread it
+creates can run: a thread whose provider differs is refused on every input with
 `ModelProviderMismatch` ("This chat uses X, but your current provider is Y").
-The config is the daemon's own file — `$CODEX_HOME/config.toml`, which defaults
-to `~/.codex/config.toml`. A Pending Session's provider page therefore offers
-**only** that provider's pairs; every other configured provider is a disabled row
-saying so, and the page states the rule once. Changing a provider is a config
-edit — `model_provider` in that file — plus a daemon restart, never a pick, and
-cola never writes it. When the config can be read, a creation on the wrong
-provider is refused by name before anything is created (a stale card or a typed
-`/model <provider>/<model>` included), naming both providers and the fix. When
-the config cannot be read, the creation proceeds and Codex's own mismatch is the
-fallback, while the page falls back to the provider the surface already resolves
-— a live thread's own provider, or a Pending Session's recorded pick — and when
-even that is unknown it lists every provider as before: it cannot enforce a rule
-it cannot see.
+That is why the card has no provider pick — it could only ever offer the channel
+the process already runs. The config is the daemon's own file —
+`$CODEX_HOME/config.toml`, which defaults to `~/.codex/config.toml`. Changing the
+channel is an edit to `model_provider` in that file plus a daemon restart, never
+a `/model`, and cola never writes it.
 
-**A provider is creation-only.** The provider page (the `Provider：<id>…` row)
-holds the configured pairs, labelled `provider/model`. A provider is chosen only
-when a thread is created: `/new` sends the pair to `thread/start`. `/fork` is an
-independent capability planned for a later version (it will use `thread/fork`);
-cola has no `/fork` command today, so typing it is submitted as an ordinary
-prompt. `turn/start` has no provider field, and a provider is never selectable
-without a model — the old model name on a new provider is a 404. So:
+**A provider is never selected.** `thread/start` and `thread/fork` carry no
+`modelProvider`, `turn/start` has no provider field, and no card row names one.
+`/new` sends only `model` to `thread/start`; `/fork` is an independent capability
+planned for a later version (it will use `thread/fork`, with `threadId` + the
+selected `model` and no provider), and cola has no `/fork` command today, so
+typing it is submitted as an ordinary prompt. So:
 
-- **A new thread takes the pair directly.** Pick a provider row on a Pending
-  Session (before its first message) and the pair rides `thread/start`.
-- **A live thread's provider cannot change.** The provider page on a live thread
-  is read-only: it shows the current provider and says the provider can only be
-  changed in a new session (with `/fork` as the later, independent option).
-  `/model` with a different provider is refused without any request — no
-  `turn/start`, no `thread/resume` — and points at `/new`, naming `/fork` only
-  as that later capability.
-- **A same-provider pick is just a model change.** A `codex/<id>` catalog/default
-  ref, or one of the thread's own provider's `/models` rows, is recorded and
-  rides the next new message — no resume, no reload, no thread change.
-- **`codex` is a reserved name.** The built-in catalog's ref is `codex/<id>` —
-  a shared neutral namespace, never a channel — so a `[model_providers.codex]`
-  cannot be selected: the provider section lists it as 「`codex` 是内置目录的保留名，
-  不能在这里选择」 and offers no pair (the pair value would collide with the
-  catalog's own). The classification is lexical, so a catalog pick never reads
-  your config.
+- **A pick is a model change only.** A catalog/default ref, or one of the
+  current provider's `/models` rows, is recorded and rides the next new message —
+  no resume, no reload, no thread change.
+- **A live thread's provider cannot change.** `/model` with a different provider
+  is refused without any request — no `turn/start`, no `thread/resume` — and
+  says the provider is a config fact, naming the config edit and the restart. It
+  never points at `/new`: a new session runs the same channel as this one.
+- **The neutral `codex` ref is not a channel.** `codex/<id>` is the fallback
+  spelling cola records when the channel is unknown — a shared neutral
+  namespace, never a real provider. A `[model_providers.codex]` entry therefore
+  contributes no selectable channel and no probed group, and once the real
+  channel is known the ref names it instead. The classification is lexical, so
+  a catalog pick never reads your config.
 
-`/model <provider>/<model>` follows the same rule: a different provider on a
-live thread is refused (never a silent thread change), while a Pending Session
-takes the pair at creation.
+A typed `/model <provider>/<model>` follows the same rule: the provider must
+name the current channel while the channel is determinable (it is refused
+otherwise, never silently re-pointed), and `codex/<id>` is the spelling to use
+when it is not.
 
 ## FAQ / troubleshooting
 

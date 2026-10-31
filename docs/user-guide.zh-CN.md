@@ -203,14 +203,15 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
   的默认值生效；`cola config show` 会打印文件里写了什么。这些是**线程**设置：
   改动之前创建的线程会保留它创建时的策略，你的 TUI 创建、被 cola 接管的线程
   也一样——除非 `apply_on_adopt = true`。
-- **provider 只在创建时选择。** 目前只有 `/new`（Pending Session）能选择
-  provider：它把 `model` + `modelProvider` 成对交给 `thread/start`
-  （`turn/start` 没有这个字段）。`/fork` 是后续版本才提供的独立功能，届时会把
-  这一对交给 `thread/fork`；现在它不是可用命令。活动线程的 provider 不会改变：
-  `/model` 选到不同 provider 时**不发送任何请求**，并提示 `/new`，只把 `/fork`
-  作为后续选项提及。活动线程的 provider 页是只读的——只显示当前 provider 与这条
-  说明，没有可点的 rows；Pending Session 仍提供创建时会带上的成对行。provider
-  不能离开模型单独选择：把旧模型名留在新 provider 上会 404。
+- **provider 是配置事实。** Codex 一个 daemon 进程只运行一个 provider：就是该
+  daemon 的 `$CODEX_HOME/config.toml`（默认 `~/.codex/config.toml`）顶层
+  `model_provider`（未设置时为 `openai`）。更换它是改这个文件、再重启 daemon
+  ——绝不是卡片点选，也绝不是 `/model` 或创建参数。`/new` 只把 `model` 交给
+  `thread/start`；`/fork` 是后续版本才提供的独立功能（`threadId` + 所选
+  `model`，不带 provider），现在不是可用命令。两者都不会更换渠道，活动线程的
+  provider 也不会改变。`/model` 的引用以 `<provider>/<model>` 命名当前渠道，
+  只有渠道未知时才退回中性的 `codex/<id>`。cola 从不写这个文件：它带有你的
+  provider 凭据，并与 daemon 共享。
 - **`reasoning_summary`（仅 codex，默认 `auto`）** —— 模型的思考过程有多大程度
   被总结成文字。cola 把它作为 `thread/start` 的
   `config.model_reasoning_summary` 发送，卡片会把结果渲染成可折叠的 💭 推理
@@ -655,8 +656,9 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
   创建前都会保留——见下文「Codex 客户端上的 `/model`」。
   在 OpenCode 上，`/model` 的值必须在 cola 连接的服务器上存在；Codex 既不校验
   内置目录也不校验手输的 id，拼错会在下一条消息上以 provider 自身的报错出现。
-  不带参数的 `/model` 打开
-  provider → model 选择卡片，其说明会显示下一条消息实际将运行的模型（会话
+  不带参数的 `/model` 打开选择卡片
+  （OpenCode 的 provider → model 两级、Codex 的单个模型页），其说明会显示下一条
+  消息实际将运行的模型（会话
   自身的选择，否则 `[opencode] model`，否则服务器记录的值）。`/compact` 与
   `/stop` 需要真实会话，对待建状态保持它们的「还没有会话」回复。
 - `/restart-opencode` 会重启 Owned Server 或 V2 Shared Service（`opencode service
@@ -667,21 +669,32 @@ daemon（并非 cola 所有）上创建一个临时线程并发起最小回合�
 
 ### Codex 客户端上的 `/model`
 
-Codex 的模型轴不是 provider → model 树：provider 是**创建时**事实，模型是
+Codex 的模型轴不是 provider → model 树：provider 是**配置事实**，模型是
 **每轮**事实，内置目录是**全局**的。因此不带参数的 `/model` 只有一行当前
-模型与**一个模型页**；底部的 `Provider：<id>…` 一行打开 provider 页（这一行只是
-点名当前的 provider，不是切换），不会出现
-「选择 provider（共 1 个）」这种伪层级：
+模型与**一个模型页**——没有 provider 页，也没有 provider 行或成对行，更不会
+出现「选择 provider（共 1 个）」这种伪层级：
 
 - **点选只是记录，不是立即切换。** `/model` 把选择记录成一次性的待应用
-  provider/model 对——也就是术语中的 **Pending Model**（模型加上它的 `/think`
-  等级，保存在内存）——并回复「已记录：将在下一条新消息生效」。卡片同时显示
+  **Pending Model**（模型加上它的 `/think` 等级，保存在内存）——并回复
+  「已记录：将在下一条新消息生效」。卡片同时显示
   两个事实：**当前**——线程自身的 `provider / model`（由最新的 `thread/read`
   或 `thread/settings/updated` 刷新），加上 cola 为会话最后记录的思考等级
-  （`/think`）；peer 修改的 effort **不会**被采纳，所以这一对可能刷新而等级
-  仍是 cola 的；**待应用**——记录下的那一对，标注「下一条新消息生效」。服务器
+  （`/think`）；peer 修改的 effort **不会**被采纳，所以当前行可能刷新而等级
+  仍是 cola 的；**待应用**——当前渠道上记录下的模型引用（`/think` 待应用时带
+  `@等级`），标注「下一条新消息生效」。服务器
   运行之前，当前行绝不会被改写，所以其他客户端改过线程后再打开卡片能看到那次
   变化，footer 与选择卡片不会各说一套。
+- **provider 是配置事实，页面只说一次。** Codex 一个 daemon 进程只运行一个
+  provider：daemon 自己那份 `$CODEX_HOME/config.toml`（默认
+  `~/.codex/config.toml`，未设置时为 `openai`）的顶层 `model_provider`。
+  更换它是改这个文件、再重启 daemon——绝不是一次点选，也绝不是 `/model`——
+  而且 cola 从不写它。页面只说明这一次，并只列出当前 provider 的模型，引用
+  形式为 `<provider>/<model>`。
+- **渠道可知时，指向其他 provider 的引用会被拒绝。** 手输的
+  `/model <provider>/<model>` 若 provider 与活动线程的（Pending Session 上则是
+  配置的）不同，**不发送任何请求**，并说明 provider 是配置事实、同时点名两个
+  渠道并指出 `model_provider` 与重启。渠道无法判定时（`config/read` 失败、未
+  连接），点选只按模型记录，由 Codex 在下一条消息上的报错兜底。
 - **下一个新消息生效，且只生效一次。** 那一轮的 `turn/start` 携带 `model` +
   `effort`；该轮被接受后选择即被**消费**，之后每条消息都不再携带模型与思考
   等级：线程自身的默认值就是事实，peer 后来的修改会被尊重，读回只刷新「当前」。
@@ -698,76 +711,68 @@ Codex 的模型轴不是 provider → model 树：provider 是**创建时**事�
 - **`/status` 是这两个事实的文本视图。** 它打印「当前」（与模型卡片相同的
   effective-selection 阶梯）；活动 Codex 线程有待应用选择时打印「待应用」
   （显式 reset 为「清除思考等级」）；最后是一行会话摘要（会话、目录、agent、
-  自动通过）。待建会话显示创建对，标注「将在会话创建时生效」，没有「待应用」；
+  自动通过）。待建会话显示创建模型，标注「将在会话创建时生效」，没有「待应用」；
   OpenCode 只显示当前行，没有待应用行。
-- **待建会话的选择是创建参数。** 第一条消息之前没有线程，所以这一对交给
-  `thread/start` 的 `model` + `modelProvider`，回复说「将在会话创建时生效」
-  ——绝不是「待应用」。那里的 `/think` 也是同一个创建意图：在线程建立后随
+- **待建会话的选择是创建参数。** 第一条消息之前没有线程，所以选择就是
+  `thread/start` 的 `model`——不带 `modelProvider`——回复说「将在会话创建时
+  生效」——绝不是「待应用」。那里的 `/think` 也是同一个创建意图：在线程建立后随
   第一条新轮生效。两者都随会话存储，而不在 adapter 的一次性窗口里，所以重启
   会保留它们，直到第一条消息创建线程。
 - **「模型」** 列出只与模型有关的来源：`model/list` 的内置目录
   （分组为「内置目录（全局，未校验）」——这些 id 不属于任何 provider，可以经
   任意一个运行）、配置顶层 `model`（配置默认），以及**当前 provider** 的
-  `/models` 返回的 id。点选只是记录，不会每条消息都发送：它只在下一个新消息的
+  `/models` 返回的 id。每个选项的值——以及手输提示——都写作
+  `<provider>/<model>`，provider 是当前渠道：活动线程用线程自身的 provider，
+  待建会话用配置的 `model_provider`，只有渠道无法判定时才退回中性的
+  `codex/<id>`。点选只是记录，不会每条消息都发送：它只在下一个新消息的
   `turn/start.model` 中出现一次。
-- **任何清单之外的 id 用文本输入。** `/model codex/<id>` 记录一个 id，
-  `/model <provider>/<model>` 记录一对。Codex 对两者都不校验：只有内置目录
+- **任何清单之外的 id 用文本输入。** `/model <provider>/<model>`——例如
+  `/model opencode-go/deepseek-v4-pro`——把该模型记录到当前渠道上，而
+  `/model codex/<id>` 是渠道未知时的中性写法。Codex 对两者都不校验：只有内置目录
   的条目带显示名、上下文窗口与思考等级，所以拼错会在下一条消息上以 provider
   自身的报错出现。
 - **`[profiles.*]` 不会被读取。** Codex 0.134+ 已不再读取它（`--profile` 会
   分层 `$CODEX_HOME/<name>.config.toml`），所以 cola 忽略该表：profile 既不
-  增加模型行，也不提供 provider 组合。
+  增加模型行，也不提供 provider。
 
 **`/models` 探测是尽力而为，它被拒绝也不算错误。** `GET <base_url>/models`
 不属于 Responses API——`wire_api = "responses"` 并不保证它存在。cola 用各
 `[model_providers.<id>]` 自己的 `experimental_bearer_token` 去问，每次探测
 2 秒，并缓存结果：确定性的答案（鉴权被拒、没有 `/models` 端点、`env_key`、或
 解析出的模型）缓存三分钟，**暂时性**失败（超时、网络错误）只缓存约 20 秒，
-下次打开就会重试。provider 页把原因作为行尾的短标签（`无权列出模型`、
-`探测超时`…），不是一段话，也不会出现在模型页上。探测返回 404 的 provider
-行尾会多一句手输提示——它正是需要手输的那一个：`/model <provider>/<id>`。
-内置目录与配置默认始终在，而卡片回调只从缓存作答，所以
-第一次冷点击可能只显示 provider、没有探测到的模型，下一次打开时补齐。token 只出现在请求的 `Authorization`
+下次打开就会重试。只有当前 provider 的 id 会进入模型页——探测失败就一个都不加
+——内置目录与配置默认始终在。卡片回调只从缓存作答，所以
+第一次冷点击可能缺少探测到的 id，下一次打开时补齐。token 只出现在请求的 `Authorization`
 头里：卡片、日志行与错误信息中都不会出现。
 
-**Codex 一次只用一个 provider。** daemon 自身顶层的 `model_provider`（未设置时
-为 `openai`）必须与线程的 provider 相同：用其他 provider 调 `thread/start` 仍会
-成功，但第一条消息会被 `ModelProviderMismatch` 拒绝（「This chat uses X, but your
-current provider is Y」）。配置文件就是 daemon 自己的那一份——
-`$CODEX_HOME/config.toml`，默认 `~/.codex/config.toml`。因此待建会话的 provider
-页**只**提供那个 provider 的成对行；其他已配置的 provider 都是说明原因、不可点
-的行，页面把这条规则说一次。换 provider 是改配置——该文件里的
-`model_provider`——再重启 daemon，绝不是一次点选，而且 cola 从不写这个文件。
-读得到配置时，在错误的 provider 上创建会话的请求会在创建任何东西之前就被按名
-拒绝（过期的卡片或手输的 `/model <provider>/<model>` 同样），并同时点名两个
-provider 与修复办法。读不到配置时，创建照常进行，由 Codex 自己的 mismatch 兜底；
-页面则回退到卡片已经解析出的 provider——活动线程自身的 provider，或待建会话
-记录的选择——连它也不知道时就照旧列出所有 provider：看不见的规则无法执行。
+**Codex 一次只用一个 provider。** daemon 自己顶层的 `model_provider`（未设置时
+为 `openai`）是它创建的线程唯一能运行的渠道：provider 不同的线程每次输入都会被
+`ModelProviderMismatch` 拒绝（「This chat uses X, but your current provider is
+Y」）。这就是卡片没有 provider 选择的原因——它能提供的永远只是进程已经在跑的
+那个渠道。配置文件就是 daemon 自己的那一份——`$CODEX_HOME/config.toml`，默认
+`~/.codex/config.toml`。换渠道是改该文件里的 `model_provider` 再重启 daemon，
+绝不是一次 `/model`，而且 cola 从不写这个文件。
 
-**provider 只在创建时选择。** provider 页（`Provider：<id>…` 那一行）列出配置好的
-成对行，标签为 `provider/model`。provider 只在线程创建时确定：`/new` 把这一对交给
-`thread/start`。`/fork` 是后续版本才提供的独立功能（届时使用 `thread/fork`）；
-cola 目前没有 `/fork` 命令，输入它会被当成普通消息提交。`turn/start`
-没有 provider 字段，而且 provider 永远不能离开模型单独选——把旧模型名留在新 provider
-上会 404。因此：
+**provider 从不被选择。** `thread/start` 与 `thread/fork` 都不带
+`modelProvider`，`turn/start` 没有 provider 字段，卡片上也没有任何行点名它。
+`/new` 只把 `model` 交给 `thread/start`；`/fork` 是后续版本才提供的独立功能
+（届时使用 `thread/fork`，带 `threadId` + 所选 `model`，不带 provider），
+cola 目前没有 `/fork` 命令，输入它会被当成普通消息提交。因此：
 
-- **新线程直接带走这一对。** 在待建会话（第一条消息之前）上点 provider 行，
-  这一对随 `thread/start` 发送。
-- **活动线程的 provider 不可变。** 活动线程的 provider 页是只读的：显示当前
-  provider，并说明只能在新会话中更换（`/fork` 是后续的独立选项）。`/model` 选到
-  不同 provider 时会被拒绝且**不发送任何请求**——没有 `turn/start`，也没有
-  `thread/resume`——并指向 `/new`，只把 `/fork` 作为后续能力提及。
-- **同一 provider 内的点选只是一次模型变更。** `codex/<id>` 目录/默认引用，或
-  线程当前 provider 自己 `/models` 返回的行，都只记录模型并随下一个新消息生效
-  ——不 resume、不重新加载、不改动线程。
-- **`codex` 是保留名。** 内置目录的引用是 `codex/<id>`——一个共享的中性命名
-  空间，永远不是一个渠道——所以 `[model_providers.codex]` 不能被选中：Provider
-  一栏把它列成「`codex` 是内置目录的保留名，不能在这里选择」，不提供任何组合
-  （组合值会和目录自身的引用撞车）。分类是纯字面的，因此目录点选从不读取你的
-  配置。
+- **点选只是一次模型变更。** 目录/默认引用，或当前 provider 自己 `/models`
+  返回的行，都只记录并随下一个新消息生效——不 resume、不重新加载、不改动线程。
+- **活动线程的 provider 不可变。** `/model` 选到不同 provider 时会被拒绝且
+  **不发送任何请求**——没有 `turn/start`，也没有 `thread/resume`——并说明
+  provider 是配置事实、点名配置修改与重启。它绝不会指向 `/new`：新会话跑的仍
+  是同一个渠道。
+- **中性的 `codex` 引用不是渠道。** `codex/<id>` 是渠道未知时 cola 记录的
+  回退写法——一个共享的中性命名空间，永远不是真实 provider。因此
+  `[model_providers.codex]` 不会贡献可选的渠道或探测分组，真实渠道已知后引用
+  会改用它。分类是纯字面的，因此目录点选从不读取你的配置。
 
-`/model <provider>/<model>` 遵循同一规则：活动线程上的不同 provider 会被拒绝
-（绝不静默改动线程），而 Pending Session 在创建时接受这一对。
+手输的 `/model <provider>/<model>` 遵循同一规则：渠道可判定时，provider 必须
+写当前渠道（否则拒绝，绝不静默改指），渠道不可判定时就用 `codex/<id>` 这个
+写法。
 
 ## FAQ / 故障排查
 
