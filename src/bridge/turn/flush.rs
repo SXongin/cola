@@ -223,6 +223,44 @@ async fn set_ending_write(cards: &CardsHandle, session_id: &str, ending: super::
     }
 }
 
+/// The two signatures the render gate compares against its own cache
+/// (`TurnState::last_header_sig` / `last_context_sig`), captured when the body
+/// carrying them was BUILT (see [`advance_sent_signatures`]).
+struct SentSignatures {
+    header: String,
+    context: (i64, Option<i64>),
+}
+
+/// Advance the render gate's signature cache to what `card_id` now shows.
+///
+/// The cache exists so a render pass only PATCHes when the header (its phase
+/// timer) or the footer's context segment actually moved. It is a cache of
+/// what the CARD SHOWS, so every card write owns it — not only the render pass
+/// that decides to write. A flush issued out of band (a question surfacing, a
+/// click's ack, a receipt landing) renders the new header itself, and a stale
+/// cache then made the next render tick re-send the identical body just to
+/// "discover" a header the card already carried. That repaint is the observable
+/// "the card refreshed for no reason" of issue #917 — and on a card rendering a
+/// free-text form it eats the answer being typed, because Feishu rebuilds
+/// `body.elements` on every update.
+///
+/// A card the session no longer tracks (a re-point won a race) is left alone:
+/// the signatures belong to the card that was written.
+async fn advance_sent_signatures(
+    cards: &CardsHandle,
+    session_id: &str,
+    card_id: &str,
+    sent: &SentSignatures,
+) {
+    let mut live = cards.cards.lock().await;
+    if let Some(card) = live.get_mut(session_id)
+        && card.card_message_id.as_deref() == Some(card_id)
+    {
+        card.last_header_sig = sent.header.clone();
+        card.last_context_sig = sent.context;
+    }
+}
+
 /// The terminal write's fate after an ending PATCH settled (spec #602, ticket
 /// #607). Delivered now reads [`EndingWrite::Delivered`]; a permanent refusal
 /// reads [`EndingWrite::Failed`]; a recoverable failure is still owed by the
@@ -681,7 +719,7 @@ pub(super) async fn flush_card_locked(
             return FlushOutcome::Unwritten;
         };
 
-        let (built, rendered, slice_from, slice_to) = {
+        let (built, rendered, slice_from, slice_to, sent_sigs) = {
             let mut cards = cards.cards.lock().await;
             let Some(card) = cards.get_mut(session_id) else {
                 return FlushOutcome::Unwritten;
@@ -706,7 +744,15 @@ pub(super) async fn flush_card_locked(
                     rendered_block(span, block)
                 })
                 .collect();
-            (built, rendered, slice_from, slice_to)
+            // What this body shows of the two signatures the render gate
+            // compares, captured under the SAME lock that built it: the write
+            // below advances the gate's cache to exactly what the card carries
+            // (see [`advance_sent_signatures`]).
+            let sent_sigs = SentSignatures {
+                header: card.acc.header_sig(),
+                context: card.acc.context_sig(),
+            };
+            (built, rendered, slice_from, slice_to, sent_sigs)
         };
 
         if card_is_live {
@@ -889,6 +935,11 @@ pub(super) async fn flush_card_locked(
                 // (delivered, owed at its own sequence, or refused) is what the
                 // notice gate reads (#607).
                 let ending = ending_write_for_patch(cards, &card_id, &built.card, delivered, refused);
+                // The body the card now carries is what the render gate must
+                // compare against — delivered, or owed a retry that lands it.
+                if !matches!(ending, super::state::EndingWrite::Failed) {
+                    advance_sent_signatures(cards, session_id, &card_id, &sent_sigs).await;
+                }
                 set_ending_write(cards, session_id, ending).await;
                 return flush_outcome(wrote, refused);
             }
@@ -905,7 +956,7 @@ pub(super) async fn flush_card_locked(
             // completion entry arrived. A terminal card that received one
             // still owes the handover PATCH.
             let handover = pending_split.iter().any(|split| split.handover);
-            let (finalized, should_patch) = if supplement_split_requested && !built.full {
+            let (finalized, should_patch, sent_sigs) = if supplement_split_requested && !built.full {
                 // The live slice still fits, but a supplement forces the split
                 // anyway: finalize the slice here and HAND IT OFF — the
                 // continuation carries only the receipts queued below and the
@@ -926,9 +977,16 @@ pub(super) async fn flush_card_locked(
                 let terminal = continues_an_ended_card && card.acc.card_state().is_terminal();
                 let state = terminal.then(|| card.acc.card_state().clone());
                 let finalized = card.acc.build_finalized_handoff(state);
-                (finalized, !terminal || handover)
+                // The handoff re-stamps the card's display state, so the
+                // signatures this body shows are captured after it — same lock,
+                // same body.
+                let sent_sigs = SentSignatures {
+                    header: card.acc.header_sig(),
+                    context: card.acc.context_sig(),
+                };
+                (finalized, !terminal || handover, sent_sigs)
             } else {
-                (built, true)
+                (built, true, sent_sigs)
             };
             // Persist the finalization BEFORE the send: a failed or cancelled
             // send must not leave the next flush thinking this card still
@@ -1127,6 +1185,11 @@ pub(super) async fn flush_card_locked(
                 .lock()
                 .await
                 .record(&card_id, &finalized.card, Vec::new());
+            // The finalized body the card now carries (or is owed) is what the
+            // render gate must compare against.
+            if should_patch && !refused {
+                advance_sent_signatures(cards, session_id, &card_id, &sent_sigs).await;
+            }
             if delivered {
                 // The fenced fallback covered THIS payload only (issue #886).
                 reset_card_fallback(cards, session_id).await;
@@ -1281,6 +1344,9 @@ pub(super) async fn flush_card_locked(
                     .lock()
                     .await
                     .record(&new_id, &built.card, rendered);
+                // The new card carries this body: the render gate's signature
+                // cache follows the card it now describes.
+                advance_sent_signatures(cards, session_id, &new_id, &sent_sigs).await;
                 // The send delivered the 承接 line (or the size-split slice):
                 // the staged Wake Watermark is user-visible now (ADR-0061).
                 drain_wake_watermark(cards, session_id, watermark).await;

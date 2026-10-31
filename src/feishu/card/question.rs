@@ -529,7 +529,7 @@ pub fn question_elements(
                         // the typed label to the toggled set (`reply: "custom"`),
                         // so the two never collide. A String field with no options
                         // always renders it — otherwise the field has no control.
-                        if q.custom_allowed() || (q.kind == FormFieldKind::String && q.options.is_empty()) {
+                        if renders_typed_input(q) {
                             elements.push(custom_answer_form(request_id, session_id, directory, i, multi));
                         }
 
@@ -627,6 +627,29 @@ fn question_value(
 /// fires.
 fn submit_name(name_prefix: &str, request_id: &str, session_id: &str, index: usize) -> String {
     format!("{name_prefix}|{request_id}|{session_id}|{index}")
+}
+
+/// Whether this field renders a free-text input the operator can be typing
+/// into: the custom-answer box, or a numeric field's form.
+///
+/// The render and the freeze that protects it (issue #917) read this ONE
+/// predicate. A card that shows such an input may carry unsubmitted text the
+/// client alone holds: Feishu rebuilds `body.elements` on every card update,
+/// so an input comes back empty after any PATCH — a repaint while the operator
+/// types eats their answer. The bridge therefore never repaints that card for
+/// a clock-only reason ([`crate::bridge::turn::state::StreamAccumulator::awaits_typed_answer`]).
+pub(crate) fn renders_typed_input(q: &crate::backend::types::QuestionInfo) -> bool {
+    use crate::backend::types::FormFieldKind;
+    match q.kind {
+        // No options at all: the input is the field's only control.
+        FormFieldKind::Number | FormFieldKind::Integer => true,
+        // The custom-answer form: allowed by the field (V1 leaves `custom`
+        // unset, which reads as allowed), or the field has no option to click.
+        FormFieldKind::String | FormFieldKind::Multiselect => {
+            q.custom_allowed() || (q.kind == FormFieldKind::String && q.options.is_empty())
+        }
+        FormFieldKind::Boolean | FormFieldKind::External => false,
+    }
 }
 
 /// A custom (free-text) answer input plus its submit button, one per field.
@@ -910,6 +933,55 @@ mod tests {
             elements.iter().all(|e| e["tag"] != "form"),
             "custom-disabled overflow question must not get an input form: {}",
             card
+        );
+    }
+
+    /// Issue #917: the predicate that RENDERS the free-text input and the one
+    /// that freezes the card's clock are the same, so a card cannot carry an
+    /// unprotected input (or be frozen with no input to protect).
+    #[test]
+    fn renders_typed_input_matches_the_fields_that_render_a_form() {
+        use crate::backend::types::{FormFieldKind, QuestionInfo, QuestionOption};
+        let q = |kind, options: usize, custom: Option<bool>| QuestionInfo {
+            question: "q".into(),
+            header: "h".into(),
+            options: (0..options)
+                .map(|i| QuestionOption {
+                    label: format!("/a{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            kind,
+            custom,
+            ..Default::default()
+        };
+        assert!(
+            renders_typed_input(&q(FormFieldKind::String, 0, None)),
+            "an optionless String renders only the input"
+        );
+        assert!(
+            renders_typed_input(&q(FormFieldKind::String, 2, Some(true))),
+            "custom allowed renders the input beside options"
+        );
+        assert!(renders_typed_input(&q(FormFieldKind::Multiselect, 2, Some(true))));
+        assert!(
+            !renders_typed_input(&q(FormFieldKind::String, 2, Some(false))),
+            "custom disabled: options only"
+        );
+        assert!(!renders_typed_input(&q(
+            FormFieldKind::Multiselect,
+            2,
+            Some(false)
+        )));
+        assert!(
+            !renders_typed_input(&q(FormFieldKind::Boolean, 0, None)),
+            "yes/no buttons, no input"
+        );
+        assert!(!renders_typed_input(&q(FormFieldKind::External, 0, None)));
+        assert!(renders_typed_input(&q(FormFieldKind::Number, 0, None)));
+        assert!(
+            renders_typed_input(&q(FormFieldKind::Integer, 2, Some(false))),
+            "a numeric field is its form whatever its options"
         );
     }
 

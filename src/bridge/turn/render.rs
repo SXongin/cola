@@ -23,7 +23,7 @@ use crate::bridge::handles::{
 use crate::bridge::span;
 use crate::bridge::tasks::TaskRunId;
 use crate::bridge::turn::state;
-use crate::bridge::turn::state::{LedgerCadence, PartSource, RenderedPart, StreamAccumulator};
+use crate::bridge::turn::state::{LedgerCadence, LedgerChange, PartSource, RenderedPart, StreamAccumulator};
 use crate::config::ThreadKey;
 use crate::feishu::card::compaction::same_row;
 use crate::feishu::card::ledger::{TaskCompletionEntry, TaskEnding, TaskKind, TaskOutput};
@@ -1439,10 +1439,13 @@ pub(super) fn commit_planned_entries(
 /// seconds — [`LedgerCadence`]).
 ///
 /// A Wake handover calls this on the OUTGOING card before its chain splits;
-/// Session Sync's in-place pass calls it on a yielded card. Returns whether the
-/// card changed at all: a terminal card that did still owes its handover PATCH,
-/// while one the read did not touch keeps the ending it shows, and a yielded
-/// card is only PATCHed for a real change.
+/// Session Sync's in-place pass calls it on a yielded card. Returns what the
+/// read moved, split ([`LedgerChange`]): `rows` is content — the list, a row's
+/// words, an activity's words, a committed completion entry — and `clock` is
+/// only a rendered number crossing `cadence`. A terminal card that moved still
+/// owes its handover PATCH; a yielded card is only PATCHed for a real change,
+/// and a clock-only one not even then when the card renders an unanswered
+/// free-text field (issue #917).
 #[allow(clippy::too_many_arguments)] // the read's ledger inputs: acc + read + gather + clock + cadence + endings + plans + capability
 pub(super) fn apply_ledger_read(
     acc: &mut StreamAccumulator,
@@ -1453,18 +1456,19 @@ pub(super) fn apply_ledger_read(
     endings: Endings<'_>,
     plans: Vec<PlannedEntry>,
     task_surface: bool,
-) -> bool {
+) -> LedgerChange {
     if !task_surface {
         // No Background Task surface: no ledger rows, no completion entries and
         // no `⚠️ 状态待确认` marker — the client declared the surface absent, so
         // the card renders no section rather than an empty one.
-        return false;
+        return LedgerChange::default();
     }
-    let mut changed = acc
-        .set_ledger_from_read(transcript, activities, now_ms, cadence)
-        .owes();
-    changed |= commit_planned_entries(acc, plans, endings);
-    changed
+    let mut change = acc.set_ledger_from_read(transcript, activities, now_ms, cadence);
+    // A committed entry is rendered content, whatever the ledger's clock did.
+    if commit_planned_entries(acc, plans, endings) {
+        change.rows = true;
+    }
+    change
 }
 
 /// Render the parts of this turn's assistant messages that haven't been
@@ -2588,7 +2592,7 @@ async fn render_and_flush_inner(
     // `subagent` rows and every live task panel (ADR-0060/0054). A change on
     // either must flush even when no part, header second or context figure
     // moved — the line is the only thing that changed.
-    let (ledger, liveness_changed) = {
+    let (ledger, liveness_changed, typed_answer) = {
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => {
@@ -2606,9 +2610,9 @@ async fn render_and_flush_inner(
                 if ledger.rows || liveness_changed {
                     card.acc.bump_progress_mark();
                 }
-                (ledger, liveness_changed)
+                (ledger, liveness_changed, card.acc.awaits_typed_answer())
             }
-            None => (super::state::LedgerChange::default(), false),
+            None => (super::state::LedgerChange::default(), false, false),
         }
     };
     let flush = if !mode.flushes() {
@@ -2620,7 +2624,12 @@ async fn render_and_flush_inner(
         || file_changed
         || header_changed
         || context_changed
-        || ledger.owes()
+        // A card that renders an unanswered free-text field is never repainted
+        // for a clock-only reason: Feishu rebuilds the body on every update, so
+        // the tick would wipe what the operator is typing (issue #917). The
+        // rows half is real content and still flushes.
+        || ledger.rows
+        || (ledger.clock && !typed_answer)
         || liveness_changed
     {
         Turn::flush_card(cards, session_id).await
@@ -9033,6 +9042,96 @@ Index: /x/src/main.rs
             platform.updated_cards().await.len(),
             2,
             "the typed change's own age seconds owe none"
+        );
+    }
+
+    /// Issue #917 (live path): a card rendering an unanswered free-text answer
+    /// field is not repainted by the render poll's ticks. The only per-second
+    /// cause on a live card is the header's phase timer, and a live block
+    /// awaiting the operator replaces that header with a static title — so
+    /// nothing owes a PATCH while the operator types. The first half measures
+    /// the tick WITHOUT the block (the aliveness contract, ADR-0014), which is
+    /// what proves the tick was live when the block arrived.
+    #[tokio::test]
+    async fn a_card_awaiting_a_typed_answer_is_not_repainted_by_render_ticks() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_typed";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_typed")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("继续")],
+            ),
+            message("msg_a", 2_000, vec![text_part("在做。")]),
+        ]);
+        let render = async || {
+            let _ = render_and_flush(
+                &cards,
+                &app.sessions_handle(),
+                &app.client,
+                &app.requests_handle(),
+                sid,
+                &transcript,
+            )
+            .await;
+        };
+
+        render().await;
+        let after_content = platform.updated_cards().await.len();
+        assert!(after_content > 0, "the first render sends the card");
+        // The phase timer ticks: a live card proves it is alive once a second.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        render().await;
+        assert_eq!(
+            platform.updated_cards().await.len(),
+            after_content + 1,
+            "the header's phase second owes its PATCH on a card with no input"
+        );
+
+        // The operator is typing a custom answer: the awaiting header is a
+        // static title, and neither tick below may repaint the card. (The flush
+        // that surfaced the block also advanced the gate's signature cache —
+        // without that, the very next tick re-sent the identical body, which is
+        // the #917 repaint.)
+        let request = crate::backend::types::QuestionRequest {
+            id: "que_typed".into(),
+            session_id: sid.into(),
+            questions: vec![crate::backend::types::QuestionInfo {
+                question: "备注一下".into(),
+                header: "备注".into(),
+                options: Vec::new(),
+                kind: crate::backend::types::FormFieldKind::String,
+                custom: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Turn::add_question(&cards, sid, &request, "/work", &[None], &[false]).await;
+        Turn::flush_card(&cards, sid).await;
+        let with_block = platform.updated_cards().await.len();
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        render().await;
+        render().await;
+        let updates = platform.updated_cards().await;
+        let headers: Vec<&str> = updates
+            .iter()
+            .map(|card| card["header"]["title"]["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            updates.len(),
+            with_block,
+            "a card with an unanswered typed answer is never repainted by a tick: {headers:?}"
         );
     }
 

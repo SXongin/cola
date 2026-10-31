@@ -2939,7 +2939,8 @@ impl Turn {
                     render::Endings::of(cards, session_id),
                     plans,
                     backend.background_tasks_supported(),
-                );
+                )
+                .owes();
             card.pending_split.push(state::PendingSplit {
                 reply_to: reply_to.to_string(),
                 kind,
@@ -3263,7 +3264,7 @@ impl Turn {
         };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        let (changed, settled, notice_at) = {
+        let (changed, typed_answer, settled, notice_at) = {
             // The same admission, re-checked under the write lock through the
             // module's lock-scoped helper: the returned card is still locked,
             // so the check and the write below share one lock.
@@ -3300,7 +3301,11 @@ impl Turn {
             } else {
                 card.acc.turn_started_at()
             };
-            (changed, settled, notice_at)
+            // Read under the same lock as the rows: whether the card renders an
+            // unanswered free-text field decides if the clock may repaint it
+            // (issue #917) — see the gate below.
+            let typed_answer = card.acc.awaits_typed_answer();
+            (changed, typed_answer, settled, notice_at)
         };
         if let Some(disposition) = settled {
             // The footer is refreshed one last time (ADR-0019): the card
@@ -3343,7 +3348,14 @@ impl Turn {
                 FlushOutcome::Unwritten => YieldedUpdate::Unchanged,
             };
         }
-        if !changed {
+        // Only the rows half is content. A clock-only move repaints the card —
+        // unless it renders an unanswered free-text field: Feishu rebuilds the
+        // body on every update, so the tick would wipe what the operator is
+        // typing (issue #917). Such a card's clock is the form itself: it is
+        // waiting on the operator, and the age of a background task proves
+        // nothing they need. The rows half still refreshes.
+        let owed = changed.rows || (changed.clock && !typed_answer);
+        if !owed {
             return YieldedUpdate::Unchanged;
         }
         // The guard (ADR-0060): a ledger-only refresh must never post a new
