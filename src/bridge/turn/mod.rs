@@ -3261,7 +3261,7 @@ impl Turn {
                 Some(card) if ownership::admits_ledger_refresh(card) => {
                     // A card rendering an unanswered free-text answer field is
                     // not refreshed: Feishu rebuilds the body on every update,
-                    // so the read would wipe what the operator is typing (issue
+                    // so the read would wipe what the Host is typing (issue
                     // #917). The read is not CONSUMED either — returning here
                     // before planning, before the child reads and before the
                     // apply keeps the delta on the transcript, so the first
@@ -4086,7 +4086,7 @@ impl Turn {
     /// watch: the message never landed) and the directory its status reads
     /// route under — or `None` when the card is no longer in that ending (a new
     /// Turn may have replaced it since the claim). The new live state is
-    /// flushed now, so the operator's click is visible before the follow's
+    /// flushed now, so the Host's click is visible before the follow's
     /// first sleep, then the out-of-turn [`follow`] is spawned: it takes the
     /// Session's guard — this path held none (ADR-0059) — and its window owns
     /// Busy→non-busy finalization, `/stop`, the graces and the silent exit when

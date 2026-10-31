@@ -759,7 +759,7 @@ pub(super) struct PendingQuestion {
 }
 
 impl PendingQuestion {
-    /// Whether this block renders a free-text input the operator may be typing
+    /// Whether this block renders a free-text input the Host may be typing
     /// into (issue #917): a still-open field with a custom-answer box or a
     /// numeric form. A finalized field renders no controls at all, so it never
     /// counts. The same predicate renders the form (`renders_typed_input`), so
@@ -2824,7 +2824,7 @@ impl StreamAccumulator {
     /// moment the block surfaced. The request poll can put a block on the card
     /// before the render poll has rendered the command and reasoning it belongs
     /// to, so a surfacing-time position would sit above its own request;
-    /// resolution time is what the operator saw when they clicked, and the
+    /// resolution time is what the Host saw when they clicked, and the
     /// keyed timeline puts anything the server ordered before that click above
     /// the receipt no matter when it rendered. `line` derives the receipt text
     /// from the block being resolved, so the residue always names the target it
@@ -3324,7 +3324,7 @@ impl StreamAccumulator {
 
     /// Which request kinds are live on the card — the header's awaiting state
     /// (ADR-0014). A permission and a question pending at once report `Both`,
-    /// so the title names exactly what the operator must resolve.
+    /// so the title names exactly what the Host must resolve.
     pub(super) fn awaiting_action(&self) -> AwaitingAction {
         let mut permission = false;
         let mut question = false;
@@ -3348,7 +3348,7 @@ impl StreamAccumulator {
     /// must not be repainted for background progress: Feishu rebuilds the body
     /// on every update and the unsubmitted text lives only in the client, so a
     /// ledger read (ADR-0060) or a clock tick would eat the answer as the
-    /// operator types it. A permission block has no input, and a receipt is
+    /// Host types it. A permission block has no input, and a receipt is
     /// already settled, so neither counts.
     pub(super) fn awaits_typed_answer(&self) -> bool {
         self.interactions.iter().any(|block| match block {
@@ -3358,7 +3358,7 @@ impl StreamAccumulator {
     }
 
     /// Progress inputs for the header (ADR-0014): which request kinds await the
-    /// operator, phase timer, and reasoning length. Elapsed is whole seconds so
+    /// Host, phase timer, and reasoning length. Elapsed is whole seconds so
     /// the header signature changes at most once per second — the flush
     /// throttle.
     pub(super) fn header_progress(&self) -> crate::feishu::card::HeaderProgress {

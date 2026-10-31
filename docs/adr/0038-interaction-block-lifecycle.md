@@ -1,6 +1,6 @@
 # Interaction blocks: inline on the live card, repainted through a card handle
 
-A pending Permission/Question is rendered inline on the card the operator is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
+A pending Permission/Question is rendered inline on the card the Host is already reading (an **Interaction Block**). Its updates were ad-hoc: discovery and first render came from the 3 s request poller; a click mostly repainted "the accumulator's current card" through a PATCH; a request resolved by another client was stripped from memory but never repainted; and a card that stopped being the accumulator's current card had no repaint path at all. Observed: a block clicked on an older card only toasted; a remotely-resolved block lingered on a finished turn's card forever; permission/answer disappearance lagged the click by one PATCH; a block whose turn ended froze in place. This ADR fixes the lifecycle: blocks stay inline and follow the live card, and every card showing a live block carries a handle that lets cola repaint it — cached last-rendered JSON plus a `request_id → message_id` registry — so a click updates the clicked card atomically in the callback ack and a remote resolution repaints within one sweep.
 
 ## Context
 
@@ -11,7 +11,7 @@ A pending Permission/Question is rendered inline on the card the operator is alr
   - Request resolved elsewhere (OpenChamber, CLI) → the sweep's vanished-block pass strips an inline block from the accumulator but no path repaints the hosting card (`resolve_vanished_inline`, `src/bridge/request/kind.rs:195`; `Turn::resolve_vanished_permissions`/`_questions`, `src/bridge/turn/mod.rs:1221-1247`). Standalone cards survive through `mark_stale_cards` (`src/bridge/pollers.rs:476`) and snapshot claims are rebuilt, but the inline case has no equivalent. While a turn runs, the header timer's ~1.5 s tick incidentally repaints the current card; after the turn ends nothing does — the block stays forever.
   - A new turn replaces the accumulator (`Turn::start`'s fresh accumulator, `src/bridge/turn/mod.rs:226-265`); any still-pending block on the old card is orphaned — a click replies (or 404s) but can neither repaint the old card nor find its section. `CardsHandle`'s card map keeps no per-message card JSON, so no code path can reconstruct it.
 - **The mechanisms that already work.** The question path's partial-answer branch returns a rebuilt card in the callback ack (`QuestionKind::handle_action`, `src/bridge/request/kind.rs:931`; its final answer/submit/reject branches instead clear the block with a PATCH), and Feishu applies an ack card to the clicked card atomically — this is why multi-select 已选 markers appear instantly. The callback payload carries the clicked message id (`open_message_id`, `src/feishu/ws.rs:369-381`), so cola can target the exact card. Session Snapshot claims already track a block to its host message and rebuild it in place (`src/bridge/snapshot_claims.rs:129-171`). Standalone request cards already have `sent_cards` + `mark_stale_cards` (`src/bridge/pollers.rs:476`).
-- **The operator's constraint.** A standalone request card was proposed and rejected: it fragments the message stream, and whichever card is newest, the other's live updates go out of view ("要么我最新看到的永远是这些独立卡……要么这个消息要拆得很碎").
+- **The Host's constraint.** A standalone request card was proposed and rejected: it fragments the message stream, and whichever card is newest, the other's live updates go out of view ("要么我最新看到的永远是这些独立卡……要么这个消息要拆得很碎").
 
 ## Decision
 
@@ -33,10 +33,10 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 
 ## Why
 
-- The block lives where the operator reads; a separate card splits the stream and moves live updates out of view (operator constraint).
+- The block lives where the Host reads; a separate card splits the stream and moves live updates out of view (Host constraint).
 - A single repaint path through the handle removes the whole class of "which code path repaints which card" bugs: every mutation of a block's presence or state goes through it, including the ones that used to repaint nothing.
 - The ack card is the only mechanism Feishu guarantees for refreshing the clicked card; a PATCH around a callback leaves the clicked card on its pre-answer state (the observation already recorded in the question path).
-- An Interaction Receipt makes resolved state readable and stale clicks unambiguous — the misunderstanding the operator reported.
+- An Interaction Receipt makes resolved state readable and stale clicks unambiguous — the misunderstanding the Host reported.
 - Parts render when their content lands, not in server order, so the timeline is keyed by the part's own start time: appending by discovery order moved a gated command and its reasoning below the receipt that resolved it.
 
 ## Consequences
@@ -48,7 +48,7 @@ A pending Permission/Question is rendered inline on the card the operator is alr
 
 ## Alternatives considered
 
-- **Standalone request cards** (one card per interaction; the streaming card only shows the waiting header): predictable per-message updates, but fragments the stream and moves the live interaction away from where the turn is read. Rejected by the operator.
+- **Standalone request cards** (one card per interaction; the streaming card only shows the waiting header): predictable per-message updates, but fragments the stream and moves the live interaction away from where the turn is read. Rejected by the Host.
 - **Pin blocks to the card where they first appeared**, repainting through the same handle: no re-hosting, but a still-pending request can sit above the newest card — the "scroll up to find the live thing" problem. Rejected.
 - **Retain the replaced accumulator and rebuild old cards from it**: heavier than caching the rendered JSON, and the split state (`render_from`) makes reconstruction error-prone. Rejected.
 - **No cache; toast-only clicks on stale cards**: leaves the observed "clicked, nothing changes" behavior in place. Rejected.
@@ -239,35 +239,40 @@ leftover count a second time and drop a still-claimed block. Rebuilds also stop
 naming the COUNT (`…另有待处理请求…`): the unclaimed requests are outside the
 claim registry, so how many survive cannot be observed from the snapshot.
 
-## Update (2026-10-31): a live form freezes the background repaints (#917)
+## Update (2026-10-31): a live form freezes the render pass (#917)
 
 Feishu rebuilds `body.elements` on every card update, and a form input's
 unsubmitted text lives only in the client — so **any** repaint of a card that
-renders a free-text answer field wipes what the operator typed. A card with an
+renders a free-text answer field wipes what the Host typed. A card with an
 unanswered typed answer (`StreamAccumulator::awaits_typed_answer`: a live
 question field with a custom-answer box or a numeric form) is therefore not
-repainted for **background progress**: the live header's per-second tick
-(ADR-0014), the ledger's rows and its completion entries, a task panel's
-activity, and the yielded ledger read as a whole (ADR-0060) stop owing a PATCH.
-This is the "a live block freezes the turn's content" rule reaching the write
-itself, not just the persisted mirror.
+written by the **render pass** at all: the live header's tick (ADR-0014), the
+ledger's rows and its completion entries, a task panel's activity, a file
+delivery and even a freshly rendered part stand down. The pass's own content is
+not special: a pass can render a part, pause for its reads and resume after a
+question landed, and the Host may already be typing (the gate's own view of
+"content" is the delta it found before those reads). This is the "a live block
+freezes the turn's content" rule reaching the write itself, not just the
+persisted mirror.
 
-The freeze is scoped to the background, and the read is **not consumed**: the
-pass plans no completion entry, applies no ledger, and spends no liveness read
-while the form waits, so the first pass after the answer finds the same delta
-and lands it — a read applied to a body nothing writes would make every later
-read see "no difference", and its entry would never reach a card or the durable
-record. The question of a mid-pass arrival is settled where it can be: the
-background-only write re-checks the form **under the card-write lock** the form's
-own flush also takes (`Turn::flush_card_unless_typing`), so a question surfacing
-while the pass gathered its reads either flushes first (and this write stands
-down) or lands after it. Inserting the block takes that same lock
-(`Turn::add_question` / `add_permission`), so "insert, then flush" is one ordered
-step against every card write: a background writer cannot build between the two. The turn's own content — a new part, a file delivery, the footer's
-context figure, a block's own state change (已选/✅) — still flushes, and so
-does the settlement, so the form never stalls the turn it is blocking on or
-hides a true end. A question answered only by clicking renders no input and
-keeps everything; a permission block never has one.
+Nothing is lost, because nothing is consumed: the pass plans no completion
+entry, applies no ledger, spends no liveness read, and does not build the card —
+the build is what advances `render_from`, so the first pass after the answer
+renders the whole backlog at once. (A read applied to a body nothing writes
+would make every later read see "no difference", and its entry would never
+reach a card or the durable record.)
+
+The form's own writes still land, because they are not the render pass: the
+block's arrival and a click's ack both write the card the Host is looking at
+(已选/✅ markers, a receipt), and the answer's resolution flushes; the settled
+wait lands too, since a true end is not progress. The form of a mid-pass
+arrival is handled where it can be: the guarded write re-checks the form **under
+the card-write lock** the form's own flush also takes
+(`Turn::flush_card_unless_typing`), and inserting the block takes that same lock
+(`Turn::add_question` / `add_permission`), so "insert, then flush" is one
+ordered step against every card write — the form's flush either lands first
+(this write stands down) or after it. A question answered only by clicking
+renders no input and keeps everything; a permission block never has one.
 
 One more write owns the render gate's header cache: a click's callback ack is
 the card's body, so a resolution that restamps the header advances the cache
