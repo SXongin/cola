@@ -24,12 +24,6 @@ pub struct PendingEntry {
     /// Per-session model override ("provider/model", `/model`).
     #[serde(default)]
     pub model: Option<String>,
-    /// The thread-level provider this new thread should start on (issue #910).
-    /// It has no per-turn form — `turn/start` has no provider field — so a
-    /// Pending Session is the only place it can wait: the first message
-    /// materialises the session with it as `thread/start.modelProvider`.
-    #[serde(default)]
-    pub provider: Option<String>,
     /// Per-session thinking level (`/think`).
     #[serde(default)]
     pub variant: Option<String>,
@@ -55,7 +49,6 @@ impl PendingEntry {
             title: None,
             agent: None,
             model: None,
-            provider: None,
             variant: None,
             auto_accept: false,
             topic_anchor: None,
@@ -95,13 +88,6 @@ pub struct SessionSettings {
     pub agent: Option<String>,
     /// Per-session model override (`/model`, "provider/model").
     pub model: Option<String>,
-    /// The thread-level provider a Pending Session will start on (issue #910).
-    /// Only a creation can apply it, so this is `None` for a live session —
-    /// there the thread's own `modelProvider` (the adapter's projection) is the
-    /// fact, and a live cross-provider pick is refused from the cache (no card,
-    /// no resume) rather than written here. [`SessionStore::set_settings`]
-    /// honours that: an entry ignores this field.
-    pub provider: Option<String>,
     /// Per-session thinking level (`/think`).
     pub variant: Option<String>,
     /// `/autoaccept` state.
@@ -184,12 +170,12 @@ struct CreationClaim {
     epoch: u64,
 }
 
-/// What a model/provider pair write did (issue #910).
+/// A mirror write's verdict (issue #910).
 ///
-/// Only [`Self::Applied`] means the pair is durable. Every other arm means
-/// **nothing was written**: the caller must say so, never claim the pair.
+/// Only [`Self::Applied`] means the pick is durable. Every other arm means
+/// **nothing was written**: the caller must say so, never claim the pick.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PairWrite {
+pub(crate) enum MirrorVerdict {
     /// Written. `cleared_variant` is the `/think` variant this write actually
     /// cleared (a CAS: a newer `/think` wins and nothing is cleared).
     Applied { cleared_variant: Option<String> },
@@ -201,27 +187,20 @@ pub(crate) enum PairWrite {
     /// nothing written.
     Changed,
     /// The conversation's session is being created right now: `thread/start`
-    /// already snapshotted the pending, so a pair written now would be claimed
+    /// already snapshotted the pending, so a model written now would be claimed
     /// but never applied.
     Creating,
 }
 
 /// One mirror write's fields (issue #910). Every writer — a model pick, a
-/// `/think` pick, a provider+model pair, the deferred record — goes through the
-/// same compare-and-set with the session gate; this names what it touches.
+/// `/think` pick, the deferred record — goes through the same compare-and-set
+/// with the session gate; this names what it touches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MirrorWrite<'a> {
     /// A `/model` pick: the model, plus the `/think` variant to clear when the
     /// new model does not declare it (ADR-0020).
     Model {
         model: &'a str,
-        clear_variant: Option<&'a str>,
-    },
-    /// A provider+model pair: the model, the pending's provider
-    /// (`thread/start`'s `modelProvider`), and the same `/think` clear.
-    Pair {
-        model: &'a str,
-        provider: &'a str,
         clear_variant: Option<&'a str>,
     },
     /// A durable generation's `/model` pick: the model and the session's own
@@ -251,11 +230,6 @@ fn apply_mirror_write(
         MirrorWrite::Model {
             model: new_model,
             clear_variant,
-        }
-        | MirrorWrite::Pair {
-            model: new_model,
-            clear_variant,
-            ..
         } => {
             *model = Some(new_model.to_string());
             let mut cleared = None;
@@ -291,13 +265,13 @@ fn apply_mirror_write(
 /// a **card callback**, the deferred save receipt it settles within its budget
 /// (ADR-0089). The mutation is in memory either way.
 pub(crate) struct MirrorWriteOutcome {
-    pub(crate) written: PairWrite,
+    pub(crate) written: MirrorVerdict,
     pub(crate) deferred: Option<crate::bridge::store_writer::DeferredWrite>,
 }
 
 impl MirrorWriteOutcome {
     /// No mutation happened: the CAS refused.
-    fn refused(written: PairWrite) -> Self {
+    fn refused(written: MirrorVerdict) -> Self {
         Self {
             written,
             deferred: None,
@@ -308,7 +282,7 @@ impl MirrorWriteOutcome {
 /// What claiming a thread's Pending Session for materialisation found.
 pub(crate) enum PendingClaim {
     /// Claimed, with the snapshot the creation will use and the claim's
-    /// generation (issue #910): no pair write can land on the pending until the
+    /// generation (issue #910): no mirror write can land on the pending until the
     /// claim is resolved, and `activate_created` resolves only this generation.
     Claimed(Box<PendingEntry>, u64),
     /// Another message is materialising this pending right now.
@@ -727,7 +701,6 @@ impl SessionStore {
                 session_id: None,
                 agent: p.agent.clone(),
                 model: p.model.clone(),
-                provider: p.provider.clone(),
                 variant: p.variant.clone(),
                 auto_accept: p.auto_accept,
             });
@@ -737,22 +710,19 @@ impl SessionStore {
             session_id: Some(e.session_id.clone()),
             agent: e.agent.clone(),
             model: e.model.clone(),
-            // A live session's provider is the thread's own fact, never a local
-            // choice: only a creation can take one (issue #910).
-            provider: None,
             variant: e.variant.clone(),
             auto_accept: e.auto_accept,
         })
     }
 
-    /// Write a provider+model **pair** onto the thread's Pending Session — and
+    /// Write a model **mirror** change onto the thread's Pending Session — and
     /// only there (issue #910). The entry is looked up under the lock the write
     /// takes, so a pending that materialised in between is
-    /// [`PendingPairWrite::NoPending`]: the pair must never fall through to the
-    /// live entry, whose provider a mirror write cannot change (the thread was
-    /// already created with the old one). `clear_variant` clears the `/think`
-    /// variant only if the entry still holds it — a concurrent `/think` wins —
-    /// and the cleared name is returned for the toast.
+    /// [`MirrorVerdict::Moved`]: the model must never fall through to the live
+    /// entry, whose thread may have started on a different model.
+    /// `clear_variant` clears the `/think` variant only if the entry still holds
+    /// it — a concurrent `/think` wins — and the cleared name is returned for
+    /// the toast.
     pub(crate) fn set_mirror_pending(
         &mut self,
         key: &ThreadKey,
@@ -765,32 +735,29 @@ impl SessionStore {
         // A claimed (materialising) pending cannot take a write: the creation
         // already snapshotted it, so claiming success here would lie.
         if self.creating.contains_key(key) {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Creating));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Creating));
         }
         let epoch_now = self.pending_epoch_for(key);
         let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
             // Materialised (or cleared) while the caller awaited its lookup:
             // never fall through to the live entry, whose thread was created
             // with the state the write could not reach.
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Moved));
         };
         // The pick classified a **specific** pending: `/new` (or another
-        // declaration) has a different identity, and a stale pair must never
+        // declaration) has a different identity, and a stale model must never
         // land on it — even when its model/variant happen to match, which they
         // commonly do on a fresh pending (issue #910).
         if epoch_now != expected_epoch {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Changed));
         }
         if pending.model.as_deref() != expected_model || pending.variant.as_deref() != expected_variant {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Changed));
         }
         let cleared_variant = apply_mirror_write(&mut pending.model, &mut pending.variant, write);
-        if let MirrorWrite::Pair { provider, .. } = write {
-            pending.provider = Some(provider.to_string());
-        }
         let deferred = self.save_mirror(deadline)?;
         Ok(MirrorWriteOutcome {
-            written: PairWrite::Applied { cleared_variant },
+            written: MirrorVerdict::Applied { cleared_variant },
             deferred,
         })
     }
@@ -799,9 +766,9 @@ impl SessionStore {
     /// in one lock that also re-verifies the mapping: the entry is found by
     /// `session_id`, and only when it is still the thread's target. A `/switch`
     /// remap, a delete/recreate or a newly declared pending is
-    /// [`PairWrite::Moved`] — the write never lands on the new mapping's entry.
+    /// [`MirrorVerdict::Moved`] — the write never lands on the new mapping's entry.
     /// The write is a compare-and-set on the state the caller read, so a newer
-    /// `/model` or `/think` is [`PairWrite::Changed`], never overwritten.
+    /// `/model` or `/think` is [`MirrorVerdict::Changed`], never overwritten.
     pub(crate) fn set_mirror_live(
         &mut self,
         key: &ThreadKey,
@@ -813,33 +780,33 @@ impl SessionStore {
     ) -> crate::error::Result<MirrorWriteOutcome> {
         let client_id = self.client_id.clone();
         if self.pending_for(key).is_some() {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Moved));
         }
         let Some(entry) = self
             .entries_mut()
             .iter_mut()
             .find(|e| e.client_id == client_id && e.session_id == session_id)
         else {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Moved));
         };
         if &entry.thread_key != key {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Moved));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Moved));
         }
         if entry.model.as_deref() != expected_model || entry.variant.as_deref() != expected_variant {
-            return Ok(MirrorWriteOutcome::refused(PairWrite::Changed));
+            return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Changed));
         }
         let cleared_variant = apply_mirror_write(&mut entry.model, &mut entry.variant, write);
         let deferred = self.save_mirror(deadline)?;
         Ok(MirrorWriteOutcome {
-            written: PairWrite::Applied { cleared_variant },
+            written: MirrorVerdict::Applied { cleared_variant },
             deferred,
         })
     }
 
     /// Claim the thread's Pending Session for materialisation, taking the
     /// snapshot the creation will use **under the same lock** (issue #910). A
-    /// pair write arriving in the window before `thread/start` then sees
-    /// [`PairWrite::Creating`] instead of claiming a pair the creation cannot
+    /// model write arriving in the window before `thread/start` then sees
+    /// [`MirrorVerdict::Creating`] instead of claiming a model the creation cannot
     /// apply. Released by [`Self::activate`] (success) or
     /// [`Self::unclaim_pending_creation`] (failure, so the next message retries).
     pub(crate) fn claim_pending_for_creation(&mut self, key: &ThreadKey) -> PendingClaim {
@@ -969,7 +936,7 @@ impl SessionStore {
     ///
     /// **Test-only** since issue #910: every production write is field-scoped
     /// ([`Self::set_agent`], [`Self::set_auto_accept`], the model mirror), so a
-    /// stale snapshot can never restore a recorded pair. It stays as the seeding
+    /// stale snapshot can never restore a recorded model. It stays as the seeding
     /// helper the round-trip tests describe.
     #[cfg(test)]
     pub fn set_settings(&mut self, key: &ThreadKey, settings: SessionSettings) -> crate::error::Result<bool> {
@@ -980,10 +947,6 @@ impl SessionStore {
             settings.variant.clone(),
             settings.auto_accept,
         );
-        // The provider has no entry mirror (issue #910): it is a creation-time
-        // pick, so only a Pending Session stores it. A live thread's provider
-        // is read from the server and changed by the confirmed resume path.
-        let provider = settings.provider.clone();
         let applied = if let Some(id) = settings.session_id.as_deref() {
             match self
                 .entries_mut()
@@ -998,7 +961,6 @@ impl SessionStore {
             }
         } else if let Some(p) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
             (p.agent, p.model, p.variant, p.auto_accept) = overrides;
-            p.provider = provider;
             true
         } else if let Some(e) = self
             .entries_mut()
@@ -1006,8 +968,7 @@ impl SessionStore {
             .find(|e| e.client_id == client_id && &e.thread_key == key)
         {
             // The pending materialised between the read and this write: the
-            // overrides belong on the session it created. The provider does
-            // not — a live session has no such mirror.
+            // overrides belong on the session it created.
             (e.agent, e.model, e.variant, e.auto_accept) = overrides;
             true
         } else {
@@ -1867,27 +1828,25 @@ mod tests {
                     epoch,
                     Some("stale"),
                     None,
-                    MirrorWrite::Pair {
+                    MirrorWrite::Model {
                         model: "deepseek/pro",
-                        provider: "deepseek",
                         clear_variant: None
                     },
                     None
                 )
                 .unwrap()
                 .written,
-            PairWrite::Changed
+            MirrorVerdict::Changed
         );
-        // While the pending exists, the pair lands and the CAS clear applies.
+        // While the pending exists, the model lands and the CAS clear applies.
         let written = store
             .set_mirror_pending(
                 &key,
                 epoch,
                 None,
                 Some("high"),
-                MirrorWrite::Pair {
+                MirrorWrite::Model {
                     model: "deepseek/pro",
-                    provider: "deepseek",
                     clear_variant: Some("high"),
                 },
                 None,
@@ -1896,13 +1855,12 @@ mod tests {
             .written;
         assert_eq!(
             written,
-            PairWrite::Applied {
+            MirrorVerdict::Applied {
                 cleared_variant: Some("high".into())
             }
         );
         let pending = store.pending_for(&key).unwrap();
         assert_eq!(pending.model.as_deref(), Some("deepseek/pro"));
-        assert_eq!(pending.provider.as_deref(), Some("deepseek"));
 
         // A claimed (materialising) pending refuses: the creation snapshotted it.
         match store.claim_pending_for_creation(&key) {
@@ -1926,7 +1884,7 @@ mod tests {
                 )
                 .unwrap()
                 .written,
-            PairWrite::Creating
+            MirrorVerdict::Creating
         );
         let claim = store
             .creating
@@ -1952,7 +1910,7 @@ mod tests {
                 )
                 .unwrap()
                 .written,
-            PairWrite::Moved
+            MirrorVerdict::Moved
         );
         assert_eq!(
             store.entry_for_session("ses_1").and_then(|e| e.model.as_deref()),
@@ -1963,7 +1921,7 @@ mod tests {
 
     /// Issue #910 (item 4): a materialisation claim is generation- and
     /// epoch-scoped. A replacement pending declared while the first creation runs
-    /// is **not** resolved by that creation's activation, and the pair saved on
+    /// is **not** resolved by that creation's activation, and the model saved on
     /// it survives.
     #[test]
     fn a_replacement_pending_survives_the_older_creations_activation() {
@@ -1980,7 +1938,6 @@ mod tests {
         // A replacement pending is declared while the creation is in flight.
         let mut replacement = make_pending("chat1", "root1", "/tmp/second");
         replacement.model = Some("deepseek/pro".into());
-        replacement.provider = Some("deepseek".into());
         store.set_pending(replacement).unwrap();
 
         // The older creation finishes and activates: the replacement survives.
@@ -1994,7 +1951,7 @@ mod tests {
         assert_eq!(
             replacement.model.as_deref(),
             Some("deepseek/pro"),
-            "the pair saved on the replacement is intact"
+            "the model saved on the replacement is intact"
         );
         // And the replacement can be claimed afresh (the older claim is gone).
         assert!(matches!(
@@ -2311,7 +2268,7 @@ mod tests {
     }
 
     /// Issue #910: a mirror write with **no** deadline is the pre-flight's —
-    /// blocking, so it returns only once the file carries the pair. A card
+    /// blocking, so it returns only once the file carries the model. A card
     /// callback's write instead hands back a receipt it settles on its own
     /// budget (ADR-0089), which is why a stalled disk answers nothing here.
     #[tokio::test]
@@ -2350,7 +2307,7 @@ mod tests {
             !std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .contains("deepseek/pro"),
-            "the pair must not be reported durable before it is"
+            "the model must not be reported durable before it is"
         );
 
         pause.release();
@@ -2358,7 +2315,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the blocking write returns once released");
         assert!(
-            matches!(outcome.unwrap(), PairWrite::Applied { .. }),
+            matches!(outcome.unwrap(), MirrorVerdict::Applied { .. }),
             "the write applied"
         );
         assert!(

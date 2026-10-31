@@ -1645,10 +1645,6 @@ mod tests {
             "catalog, config default and the thread provider's probed models"
         );
         assert!(
-            page.options.iter().all(|option| option.provider.is_none()),
-            "no probed row carries a provider callback field"
-        );
-        assert!(
             !values.iter().any(|value| value.contains("gpt-6-luna")),
             "another provider's models are not listed: {values:?}"
         );
@@ -1790,7 +1786,6 @@ mod tests {
             "the group carries the configured display name"
         );
         assert_eq!(options[0].callback_value(), "deepseek/deepseek-flash");
-        assert_eq!(options[0].provider, None);
         assert!(!options[0].disabled);
     }
 

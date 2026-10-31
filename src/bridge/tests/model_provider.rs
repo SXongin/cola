@@ -20,16 +20,15 @@ fn entry() -> crate::config::SessionEntry {
     crate::config::SessionEntry::new(key(), "ses_test", "/work/cola")
 }
 
-/// The callback a paired row sends: the bare model id plus the provider it
-/// pairs with (`ModelOption.provider` in the surface).
-fn paired_pick(provider: &str, model: &str) -> serde_json::Value {
+/// The callback a model row sends: one `provider/model` value (spec #930's
+/// card shape — there is no provider callback field any more).
+fn model_pick(provider: &str, model: &str) -> serde_json::Value {
     serde_json::json!({
         "action": "model",
         "level": "model",
         "chat_id": "chat_1",
         "thread_id": "chat_1",
-        "provider": provider,
-        "value": model,
+        "value": crate::backend::parsing::join_model(provider, model),
     })
 }
 
@@ -67,27 +66,26 @@ async fn command_text(
     platform.texts().await.join("\n")
 }
 
-/// Issue #910, item 2 (and the kept creation path): a Pending Session records
-/// the **pair**, and the first message carries both halves into one
-/// `thread/start`.
+/// Spec #930 acceptance 1: a Pending Session records the **model only**, and
+/// the first message carries it into `thread/start` — with no provider.
 #[tokio::test]
-async fn a_pending_sessions_pair_rides_thread_creation() {
+async fn a_pending_sessions_model_pick_rides_thread_creation() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    // A Pending Session's pair only exists on a client with a provider axis
-    // (Codex's shape); the mock defaults to OpenCode's, which has none.
-    backend.with_thread_provider(true);
-    let picks = backend.created_session_picks.clone();
+    // Only a client whose thread takes a creation model (Codex's shape) sends
+    // it in `thread/start`; the mock defaults to OpenCode's per-prompt path.
+    backend.with_codex_capabilities();
+    let picks = backend.created_session_models.clone();
     let prompt_models = backend.prompt_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
     let step = app
-        .host_action(paired_pick(PROVIDER, MODEL))
+        .host_action(model_pick(PROVIDER, MODEL))
         .await
-        .expect("paired pick");
+        .expect("model pick");
     assert!(step.card.is_none(), "a pending pick is toast-only");
     assert!(
         step.toast
@@ -105,7 +103,6 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
         .cloned()
         .expect("the pending survives");
     assert_eq!(pending.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
-    assert_eq!(pending.provider.as_deref(), Some(PROVIDER));
 
     app.handle_message(incoming(
         "msg_prompt".into(),
@@ -118,8 +115,8 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
     .await;
     assert_eq!(
         picks.lock().await.as_slice(),
-        &[(Some(PROVIDER.to_string()), Some(MODEL.to_string()))],
-        "one thread/start carries the pair"
+        &[Some(MODEL.to_string())],
+        "one thread/start carries the model"
     );
     assert_eq!(
         prompt_models.lock().await.as_slice(),
@@ -128,18 +125,17 @@ async fn a_pending_sessions_pair_rides_thread_creation() {
     );
 }
 
-/// Issue #906/#910: a Pending Session's pick through the **neutral bucket**
-/// (`codex/<id>`, the documented text form) names only the model at creation —
-/// `thread/start` must not carry the reserved namespace as `modelProvider`.
-/// A real provider pair still carries both halves (the test below).
+/// Spec #930: a Pending Session's pick through the **neutral bucket**
+/// (`codex/<id>`, the documented text form) is accepted and still names only
+/// the model at creation.
 #[tokio::test]
 async fn a_neutral_pending_pick_creates_the_thread_without_a_provider() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
-    let picks = backend.created_session_picks.clone();
+    backend.with_codex_capabilities();
+    let picks = backend.created_session_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
@@ -159,10 +155,6 @@ async fn a_neutral_pending_pick_creates_the_thread_without_a_provider() {
         .cloned()
         .expect("the pending survives");
     assert_eq!(pending.model.as_deref(), Some("codex/gpt-custom"));
-    assert_eq!(
-        pending.provider, None,
-        "the neutral namespace is not a creation provider"
-    );
 
     app.handle_message(incoming(
         "msg_prompt".into(),
@@ -175,15 +167,14 @@ async fn a_neutral_pending_pick_creates_the_thread_without_a_provider() {
     .await;
     assert_eq!(
         picks.lock().await.as_slice(),
-        &[(None, Some("gpt-custom".to_string()))],
+        &[Some("gpt-custom".to_string())],
         "thread/start takes the model only, never `modelProvider`"
     );
 }
 
-/// Spec #922: the **same** provider with another model is an ordinary pick on a
-/// live thread — no thread-level request and no refusal. On a thread-provider
-/// client it records a one-shot next-turn pending and leaves the thread's
-/// current pair alone.
+/// Spec #930: the **same** provider with another model is an ordinary pick on a
+/// live thread — no thread-level request and no refusal. On a next-turn client
+/// it records a one-shot pending and leaves the thread's current pair alone.
 #[tokio::test]
 async fn a_same_provider_pick_is_an_ordinary_model_pick() {
     let _wd = test_work_dir();
@@ -191,7 +182,7 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_known_thread_provider(Some("openai"));
     let pending = backend.pending_selections.clone();
     let (app, _platform) = build_app(cfg, backend).await;
@@ -200,7 +191,7 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
     seed_entry(&app, entry).await;
 
     let step = app
-        .host_action(paired_pick("openai", "gpt-5.1"))
+        .host_action(model_pick("openai", "gpt-5.1"))
         .await
         .expect("same-provider pick");
     assert!(step.card.is_none(), "no confirmation for a model pick");
@@ -219,7 +210,7 @@ async fn a_same_provider_pick_is_an_ordinary_model_pick() {
             .model
             .as_deref(),
         Some("openai/gpt-5.1-codex"),
-        "the live thread's current pair is untouched"
+        "the live thread's current model is untouched"
     );
     let pending = pending.lock().await;
     assert_eq!(
@@ -257,7 +248,7 @@ async fn a_stalled_writer_does_not_stall_a_model_pick_callback() {
 
     let started = std::time::Instant::now();
     let step = app
-        .host_action(paired_pick("openai", "gpt-5.1"))
+        .host_action(model_pick("openai", "gpt-5.1"))
         .await
         .expect("the click still answers");
     let elapsed = started.elapsed();
@@ -304,18 +295,17 @@ async fn a_stalled_writer_does_not_stall_a_model_pick_callback() {
     }
 }
 
-/// Spec #922: a provider pick on a live thread is refused **without any
-/// request** and names `/new` as the actionable remedy and `/fork` as a later,
-/// independent capability. Nothing is recorded, and no prompt/turn or resume is
-/// sent.
+/// Spec #930 acceptance 2: a pick naming another provider is refused
+/// **without any request**, with copy saying a provider is a config fact.
+/// Nothing is recorded, and no prompt/turn or resume is sent.
 #[tokio::test]
-async fn a_live_provider_pick_is_refused_and_points_at_new_and_fork() {
+async fn a_live_cross_provider_pick_is_refused_as_a_config_fact() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_known_thread_provider(Some("openai"));
     let prompts = backend.prompt_calls.clone();
     let resumes = backend.resume_calls.clone();
@@ -325,15 +315,18 @@ async fn a_live_provider_pick_is_refused_and_points_at_new_and_fork() {
     seed_entry(&app, entry).await;
 
     let step = app
-        .host_action(paired_pick(PROVIDER, MODEL))
+        .host_action(model_pick(PROVIDER, MODEL))
         .await
         .expect("provider pick");
     assert!(step.card.is_none(), "a refusal is a toast, not a card");
     let toast = step.toast.expect("the named refusal");
-    assert!(toast.contains("/new") && toast.contains("/fork"), "{toast}");
     assert!(
-        toast.contains("后续版本") && toast.contains("独立功能"),
-        "`/fork` must not read as a command available today: {toast}"
+        toast.contains("配置事实") && toast.contains("model_provider") && toast.contains("重启"),
+        "the refusal says provider is a config fact: {toast}"
+    );
+    assert!(
+        !toast.contains("/new") && !toast.contains("/fork"),
+        "a config fact is not a `/new` remedy: {toast}"
     );
     assert_eq!(
         app.sessions
@@ -351,28 +344,149 @@ async fn a_live_provider_pick_is_refused_and_points_at_new_and_fork() {
     assert!(resumes.lock().await.is_empty(), "no resume was sent");
 }
 
-/// Issue #910, item 6: a Pending Session's pair is one store write.
+/// Spec #930: a Pending Session's model pick is one store write, with no
+/// provider half written anywhere.
 #[tokio::test]
-async fn a_pending_pair_is_saved_in_one_write() {
+async fn a_pending_model_pick_is_saved_to_disk() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let sessions = dir.path().join("sessions.json");
     let cfg = test_config(&sessions);
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
-    app.host_action(paired_pick(PROVIDER, MODEL))
+    app.host_action(model_pick(PROVIDER, MODEL))
         .await
-        .expect("paired pick");
+        .expect("model pick");
 
     let reloaded =
         crate::bridge::session::SessionStore::for_client(sessions.clone(), crate::config::DEFAULT_CLIENT_ID)
             .expect("the store reloads");
     let pending = reloaded.pending_for(&key()).expect("the pending is on disk");
     assert_eq!(pending.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
-    assert_eq!(pending.provider.as_deref(), Some(PROVIDER));
+}
+
+/// Spec #930 acceptance 2 (Pending Session): the cached `config/read` provider
+/// is the current channel, so a different prefix is refused **before any
+/// request** — the config-fact copy, never a creation pair.
+#[tokio::test]
+async fn a_pending_text_pick_refuses_a_different_cached_provider() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_configured_provider(Some("openai"));
+    let prompts = backend.prompt_calls.clone();
+    let resumes = backend.resume_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform.texts().await.join("\n");
+    assert!(
+        reply.contains("配置事实") && reply.contains("openai") && reply.contains("deepseek"),
+        "the refusal names the config channel: {reply}"
+    );
+    assert!(!reply.contains("Model:"), "nothing was recorded: {reply}");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.clone()),
+        None,
+        "the refused pick leaves the pending untouched"
+    );
+    assert!(prompts.lock().await.is_empty(), "no turn was submitted");
+    assert!(resumes.lock().await.is_empty(), "no request was sent");
+}
+
+/// Spec #930 acceptance 1 (Pending Session): a prefix that names the cached
+/// config provider is accepted and records the model only.
+#[tokio::test]
+async fn a_pending_text_pick_accepts_the_cached_provider() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_configured_provider(Some("openai"));
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform.texts().await.join("\n");
+    assert!(reply.contains("Model: openai/gpt-5.1"), "{reply}");
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.clone())
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the pick records the model only"
+    );
+}
+
+/// Spec #930 acceptance 3/4: with no cached config provider the channel is
+/// unknown, so the pick is **not blocked** — it records model-only and the
+/// server's own model error is the fallback.
+#[tokio::test]
+async fn a_pending_text_pick_without_a_cached_provider_records_model_only() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_codex_capabilities();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform.texts().await.join("\n");
+    assert!(
+        reply.contains("Model: deepseek/deepseek-v4-pro"),
+        "an unknown channel does not block: {reply}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.clone())
+            .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the model-only pick is recorded"
+    );
 }
 
 /// Finding (record-first): a session that materialises while the pending's
@@ -394,7 +508,7 @@ async fn a_pending_that_materialises_is_not_reported_saved() {
     seed_pending(&app, pending).await;
 
     let app_for_pick = app.clone();
-    let pick = tokio::spawn(async move { app_for_pick.host_action(paired_pick(PROVIDER, MODEL)).await });
+    let pick = tokio::spawn(async move { app_for_pick.host_action(model_pick(PROVIDER, MODEL)).await });
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         assert!(tokio::time::Instant::now() < deadline, "the lookup never started");
@@ -410,7 +524,7 @@ async fn a_pending_that_materialises_is_not_reported_saved() {
     let step = pick.await.expect("the pick joins").expect("a pick result");
     let toast = step.toast.unwrap_or_default();
     assert!(
-        toast.contains("保存失败"),
+        toast.contains("状态已变化"),
         "a vanished pending is an honest failure: {toast}"
     );
     assert_eq!(
@@ -423,21 +537,21 @@ async fn a_pending_that_materialises_is_not_reported_saved() {
             .model
             .as_deref(),
         Some("openai/gpt-5.1-codex"),
-        "the pair never falls through to the live entry"
+        "the model never falls through to the live entry"
     );
 }
 
-/// Finding: the creation claim makes a pair write during materialisation an
-/// honest failure, never a pair the creation cannot apply.
+/// Finding: the creation claim makes a model write during materialisation an
+/// honest failure, never a model the creation cannot apply.
 #[tokio::test]
-async fn a_pair_write_during_materialisation_fails_honestly() {
+async fn a_model_write_during_materialisation_fails_honestly() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let backend = MockBackend::new(realistic_parts());
     let gate = backend.hold_create_session();
     let entered = backend.create_session_gate_entered.clone();
-    let picks = backend.created_session_picks.clone();
+    let picks = backend.created_session_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     let mut live = entry();
     live.model = Some("openai/gpt-5.1-codex".into());
@@ -455,9 +569,9 @@ async fn a_pair_write_during_materialisation_fails_honestly() {
     }
 
     let step = app
-        .host_action(paired_pick(PROVIDER, MODEL))
+        .host_action(model_pick(PROVIDER, MODEL))
         .await
-        .expect("paired pick during creation");
+        .expect("model pick during creation");
     let toast = step.toast.unwrap_or_default();
     assert!(
         toast.contains("正在创建") || toast.contains("状态已变化"),
@@ -465,15 +579,15 @@ async fn a_pair_write_during_materialisation_fails_honestly() {
     );
     assert!(
         !toast.contains("新线程创建时生效"),
-        "it must not claim the pair will apply at creation: {toast}"
+        "it must not claim the model will apply at creation: {toast}"
     );
 
     gate.add_permits(1);
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(
         picks.lock().await.as_slice(),
-        &[(None, Some("m".to_string()))],
-        "the thread was created without the provider the click could not save"
+        &[None],
+        "the thread was created without the model the click could not save"
     );
 }
 
@@ -501,7 +615,6 @@ async fn a_replacement_pending_survives_the_older_creation() {
     }
     let mut replacement = PendingEntry::new(key(), "/work/second");
     replacement.model = Some("deepseek/deepseek-v4-pro".into());
-    replacement.provider = Some(PROVIDER.into());
     app.sessions
         .lock()
         .await
@@ -524,7 +637,7 @@ async fn a_replacement_pending_survives_the_older_creation() {
 /// Extra finding: a `/agent` pick updates only its own field — it must not
 /// restore a stale model/variant snapshot over a recorded switch.
 #[tokio::test]
-async fn an_agent_pick_keeps_the_recorded_pair() {
+async fn an_agent_pick_keeps_the_recorded_model() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -548,7 +661,7 @@ async fn an_agent_pick_keeps_the_recorded_pair() {
     assert_eq!(
         stored.model.as_deref(),
         Some("deepseek/deepseek-v4-pro"),
-        "the recorded pair is untouched"
+        "the recorded model is untouched"
     );
     assert_eq!(stored.variant.as_deref(), Some("low"));
 }
@@ -643,9 +756,9 @@ async fn a_newer_selection_during_a_parked_creation_wins() {
     assert!(store.entry_for_session("ses_test").is_none());
 }
 
-/// Spec #922: the `/model <provider>/<model>` text form obeys the same rule —
-/// a different provider on a live thread is refused **without recording**, and
-/// the reply names `/new` (actionable) and `/fork` (a later capability).
+/// Spec #930 acceptance 2: the `/model <provider>/<model>` text form obeys the
+/// same rule — a different provider on a live thread is refused **without
+/// recording and without any request**, with copy saying it is a config fact.
 #[tokio::test]
 async fn the_model_text_form_refuses_a_live_provider_change() {
     let _wd = test_work_dir();
@@ -653,7 +766,7 @@ async fn the_model_text_form_refuses_a_live_provider_change() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_known_thread_provider(Some("openai"));
     let prompts = backend.prompt_calls.clone();
     let resumes = backend.resume_calls.clone();
@@ -671,10 +784,13 @@ async fn the_model_text_form_refuses_a_live_provider_change() {
     )
     .await;
     let text = platform.texts().await.join("\n");
-    assert!(text.contains("/new") && text.contains("/fork"), "{text}");
     assert!(
-        text.contains("后续版本") && text.contains("独立功能"),
-        "`/fork` must not read as a command available today: {text}"
+        text.contains("配置事实") && text.contains("model_provider") && text.contains("重启"),
+        "the refusal says provider is a config fact: {text}"
+    );
+    assert!(
+        !text.contains("/new") && !text.contains("/fork"),
+        "a config fact is not a `/new` remedy: {text}"
     );
     assert_eq!(
         app.sessions
@@ -696,18 +812,17 @@ async fn the_model_text_form_refuses_a_live_provider_change() {
     assert!(resumes.lock().await.is_empty(), "no resume was sent");
 }
 
-/// Issue #910, item 1: a client without a thread-level provider axis (OpenCode)
-/// records **no** provider on a Pending Session — the pair is the model ref
-/// alone — so the creation body it sends is unchanged.
+/// Spec #930: a client whose thread selection rides each prompt (OpenCode)
+/// records the model on the Pending Session and sends it per prompt; its
+/// creation body stays unchanged — no provider, no creation model.
 #[tokio::test]
-async fn a_pending_pick_records_no_provider_without_the_axis() {
+async fn a_pending_pick_stays_model_only_without_thread_creation() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let mut backend = MockBackend::new(realistic_parts());
-    // OpenCode's shape: the provider rides each prompt, not the thread.
-    backend.with_thread_provider(false);
-    let picks = backend.created_session_picks.clone();
+    let backend = MockBackend::new(realistic_parts());
+    // OpenCode's shape: the model rides each prompt, not the thread.
+    let picks = backend.created_session_models.clone();
     let prompt_models = backend.prompt_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_entry(&app, entry()).await;
@@ -729,10 +844,6 @@ async fn a_pending_pick_records_no_provider_without_the_axis() {
         .cloned()
         .expect("the pending survives");
     assert_eq!(pending.model.as_deref(), Some("deepseek/deepseek-v4-pro"));
-    assert_eq!(
-        pending.provider, None,
-        "a client without the axis records no thread-level provider"
-    );
 
     app.handle_message(incoming(
         "msg_prompt".into(),
@@ -746,8 +857,8 @@ async fn a_pending_pick_records_no_provider_without_the_axis() {
     let picks = picks.lock().await.clone();
     assert_eq!(picks.len(), 1, "one creation: {picks:?}");
     assert_eq!(
-        picks[0].0, None,
-        "no thread-level provider reaches the creation input: {picks:?}"
+        picks[0], None,
+        "no creation model reaches this client's create body: {picks:?}"
     );
     // The model never rode the creation body on this client (main's shape):
     // it is applied to the created session and the first turn carries it.
@@ -848,7 +959,7 @@ async fn a_same_provider_pick_is_recorded_when_the_cache_knows_it() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_known_thread_provider(Some("openai"));
     let pending = backend.pending_selections.clone();
     let (app, platform) = build_app(cfg, backend).await;
@@ -914,7 +1025,7 @@ async fn the_model_card_shows_the_adapters_pending_for_a_live_thread() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_known_thread_provider(Some("openai"));
     let queries = backend.model_surface_queries.clone();
     let (app, _platform) = build_app(cfg, backend).await;
@@ -950,7 +1061,7 @@ async fn the_model_card_names_an_effort_only_pending_without_a_thread_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     backend
         .pending_selections
         .lock()
@@ -979,7 +1090,7 @@ async fn a_pending_session_has_no_next_turn_pending_on_the_model_card() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     let queries = backend.model_surface_queries.clone();
     let (app, platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
@@ -1019,7 +1130,7 @@ async fn an_unattachable_pending_seam_fails_the_pick_instead_of_claiming_success
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_known_thread_provider(Some("openai"))
         .with_models(vec![crate::backend::types::ProviderModels {
             provider: "openai".into(),
@@ -1129,12 +1240,12 @@ async fn an_unattachable_pending_seam_fails_the_pick_instead_of_claiming_success
 /// thread-provider client — the adapter's pending owns the next turn — or a
 /// later prompt would re-send the stored creation pair.
 #[tokio::test]
-async fn a_materialised_store_pair_is_not_resent_when_the_adapter_holds_a_pending() {
+async fn a_materialised_store_model_is_not_resent_when_the_adapter_holds_a_pending() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     let prompt_models = backend.prompt_models.clone();
     let prompt_variants = backend.prompt_variants.clone();
     backend.pending_selections.lock().await.insert(
@@ -1159,7 +1270,7 @@ async fn a_materialised_store_pair_is_not_resent_when_the_adapter_holds_a_pendin
     assert_eq!(
         prompt_models.lock().await.as_slice(),
         &[None],
-        "the stored creation pair is not re-sent; the adapter pending is"
+        "the stored creation model is not re-sent; the adapter pending is"
     );
     assert_eq!(
         prompt_variants.lock().await.as_slice(),
@@ -1177,7 +1288,7 @@ async fn a_pending_effort_does_not_move_the_mirror_while_the_adapter_holds_it() 
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     let prompt_models = backend.prompt_models.clone();
     let pending = backend.pending_selections.clone();
     let (app, _platform) = build_app(cfg, backend).await;
@@ -1351,7 +1462,7 @@ async fn a_pending_replaced_during_the_pick_is_not_overwritten() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_models(vec![crate::backend::types::ProviderModels {
             provider: PROVIDER.into(),
             models: vec![model_option(MODEL, &["low"])],
@@ -1423,7 +1534,6 @@ async fn a_pending_replaced_during_the_pick_is_not_overwritten() {
         .cloned()
         .expect("the replacement survives");
     assert_eq!(pending.model, None, "the replacement keeps its model");
-    assert_eq!(pending.provider, None, "and its provider");
     assert_eq!(
         pending.variant.as_deref(),
         Some("high"),
@@ -1518,7 +1628,7 @@ async fn a_prompt_waits_for_an_in_flight_durable_switch() {
 /// recorded pair lands while the command's approval sweep is parked, and the
 /// whole-snapshot write must not restore the model it read before that.
 #[tokio::test]
-async fn a_delayed_autoaccept_keeps_a_recorded_pair() {
+async fn a_delayed_autoaccept_keeps_a_recorded_model() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2171,33 +2281,31 @@ async fn an_unobserved_previous_and_a_model_less_read_are_unknown() {
     assert_eq!(active.variant, None);
 }
 
-/// Issue #908: a provider id may itself contain `/` (a quoted TOML key). The
-/// card's pair carries the provider and model as separate fields, so the pair
-/// is built from them and round-trips to (`foo/bar`, `gpt`) — never `foo` +
-/// `bar/gpt`.
+/// Issue #908 / spec #930: a provider id may itself contain `/` (a quoted TOML
+/// key). The text form's quoted provider (`"foo/bar"/gpt`) round-trips to
+/// (`foo/bar`, `gpt`) — never `foo` + `bar/gpt` — and a Pending Session caches
+/// that provider so the same prefix is accepted while another is refused.
 #[tokio::test]
-async fn a_slashed_provider_id_round_trips_through_a_card_pair() {
+async fn a_slashed_provider_id_round_trips_through_the_text_form() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
-    let picks = backend.created_session_picks.clone();
+    backend
+        .with_codex_capabilities()
+        .with_configured_provider(Some("foo/bar"));
+    let picks = backend.created_session_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
-    let step = app
-        .host_action(serde_json::json!({
-            "action": "model",
-            "level": "model",
-            "chat_id": "chat_1",
-            "thread_id": "chat_1",
-            "provider": "foo/bar",
-            "value": "gpt",
-        }))
-        .await
-        .expect("paired pick");
-    assert!(step.card.is_none(), "a pending pick is toast-only");
+    send_command_in(
+        &app,
+        "/model \"foo/bar\"/gpt",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
 
     let pending = app
         .sessions
@@ -2205,8 +2313,7 @@ async fn a_slashed_provider_id_round_trips_through_a_card_pair() {
         .await
         .pending_for(&key())
         .cloned()
-        .expect("the pair is recorded");
-    assert_eq!(pending.provider.as_deref(), Some("foo/bar"));
+        .expect("the model is recorded");
     let reference = pending.model.clone().expect("the model ref");
     let parsed = crate::backend::parsing::parse_model(&reference).expect("the ref parses");
     assert_eq!(parsed.provider_id, "foo/bar", "the whole provider id survives");
@@ -2223,20 +2330,20 @@ async fn a_slashed_provider_id_round_trips_through_a_card_pair() {
     .await;
     assert_eq!(
         picks.lock().await.as_slice(),
-        &[(Some("foo/bar".to_string()), Some("gpt".to_string()))],
-        "the creation carries the same pair"
+        &[Some("gpt".to_string())],
+        "the creation carries the model only"
     );
 }
 
-/// Spec #922 decision 2: `/status` shows the live thread's current pair and the
-/// adapter's next-turn pending when one exists.
+/// Spec #922 decision 2: `/status` shows the live thread's current model and
+/// the adapter's next-turn pending when one exists.
 #[tokio::test]
-async fn status_shows_the_live_current_and_pending_pair() {
+async fn status_shows_the_live_current_and_pending_model() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     backend.pending_selections.lock().await.insert(
         "ses_test".into(),
         (Some("openai/gpt-new".into()), Some("high".into())),
@@ -2264,7 +2371,7 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_models(vec![crate::backend::types::ProviderModels {
             provider: "openai".into(),
             models: vec![
@@ -2342,7 +2449,7 @@ async fn status_after_an_accepted_pick_reports_the_thread_model() {
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
     backend
-        .with_thread_provider(true)
+        .with_codex_capabilities()
         .with_session_model(crate::backend::types::SessionModel {
             provider_id: "openai".into(),
             id: "gpt-accepted".into(),
@@ -2371,7 +2478,7 @@ async fn status_shows_an_effort_only_pending_without_a_thread_model() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     backend
         .pending_selections
         .lock()
@@ -2399,14 +2506,14 @@ async fn status_shows_an_effort_only_pending_without_a_thread_model() {
     );
 }
 
-/// A Pending Session's `/status` shows its creation pair and never 待应用.
+/// A Pending Session's `/status` shows its creation model and never 待应用.
 #[tokio::test]
-async fn status_shows_a_pending_sessions_creation_pair_only() {
+async fn status_shows_a_pending_sessions_creation_model_only() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     let (app, platform) = build_app(cfg, backend).await;
     let mut pending = PendingEntry::new(key(), "/work/cola");
     pending.model = Some("openai/gpt-creation".into());
@@ -2462,7 +2569,7 @@ async fn a_failed_mirror_write_keeps_the_applied_effort_for_a_retry() {
     let sessions = dir.path().join("sessions.json");
     let cfg = test_config(&sessions);
     let mut backend = MockBackend::new(realistic_parts());
-    backend.with_thread_provider(true);
+    backend.with_codex_capabilities();
     backend
         .applied_efforts
         .lock()

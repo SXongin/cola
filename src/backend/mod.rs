@@ -503,14 +503,27 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         Ok(())
     }
 
-    /// Whether this client has a **thread-level provider axis** (Codex's
-    /// `modelProvider`): only such a client can carry a provider into
-    /// `thread/start` or `thread/fork`. A live thread's provider is
-    /// creation-only — never `thread/resume`, never a per-turn field. The
-    /// default answers `false` — a client whose provider rides each prompt
-    /// (OpenCode) has nothing to record, and its create body must stay exactly
-    /// as it was.
-    fn has_thread_provider(&self) -> bool {
+    /// Whether this client owns a **one-shot next-turn pending** for its model
+    /// and `/think` level (Codex's `turn/start.model` + `effort`) instead of
+    /// sending a per-prompt mirror (OpenCode's `prompt.model`). The bridge uses
+    /// it to know which side records a live pick and where the 待应用 line
+    /// comes from; it says nothing about whether the client knows a
+    /// thread-level provider.
+    ///
+    /// The default answers `false` — a client whose selection rides each prompt
+    /// has no next-turn window to record.
+    fn owns_next_turn_pending(&self) -> bool {
+        false
+    }
+
+    /// Whether this client tracks a **thread-level provider fact** (Codex's
+    /// `modelProvider`): the adapter's projection knows which provider a live
+    /// thread runs, which is the fact a `/model` pick validates against and a
+    /// provider surface names. It does not mean a provider can ride
+    /// `thread/start` or `thread/resume` — a provider is a config fact
+    /// (spec #930). The default answers `false` — a client whose provider
+    /// rides each prompt (OpenCode) has no such thread fact.
+    fn tracks_thread_provider(&self) -> bool {
         false
     }
 
@@ -541,10 +554,20 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// The thread-level provider this client's **own cache** holds for the
     /// session, when it knows one (Codex's ordered thread fact). Cache-only: no
     /// RPC, so a card callback can decide whether a provider comparison is
-    /// relevant without a request. A live thread's provider is creation-only:
-    /// the cache decides whether a pick is same-provider, and a different
-    /// provider is refused without any request. `None` means unknown.
+    /// relevant without a request. The cache decides whether a live pick names
+    /// the thread's own provider, and a different provider is refused without
+    /// any request. `None` means unknown — which must **not** be treated as a
+    /// mismatch (spec #930's accepted residual limit).
     async fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
+    /// The provider this client's configuration names (`config/read`'s
+    /// top-level `model_provider`), when the adapter has cached a successful
+    /// read. Cache-only: no RPC on the pick path, because a `/model` pick must
+    /// be decided without a request. `None` means unknown (no read yet, or the
+    /// last read failed), and an unknown channel never blocks a pick.
+    fn configured_provider(&self) -> Option<String> {
         None
     }
 
@@ -923,7 +946,6 @@ mod core_only_client {
                 id: None,
                 agent: None,
                 model: None,
-                provider: None,
                 location: directory.map(|directory| crate::backend::types::Location {
                     directory: directory.to_string(),
                 }),
@@ -1108,6 +1130,9 @@ mod core_only_client {
         assert!(!client.keeps_session_selection());
         assert!(!client.reuse_continues_an_admitted_turn());
         assert!(!client.resume_supported());
+        assert!(!client.owns_next_turn_pending());
+        assert!(!client.tracks_thread_provider());
+        assert_eq!(client.configured_provider(), None);
         client.resume("ses_core").await.unwrap();
         client.switch_session_model("ses_core", &model).await.unwrap();
         client.switch_session_agent("ses_core", "build").await.unwrap();

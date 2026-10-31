@@ -794,7 +794,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/version\nShow the running cola's version and build provenance (no network).\n- Release build (built at a clean release tag): `cola 0.7.0`\n- crates.io install (`cargo install colark`): `cola 0.8.1 (crates.io)`\n- Dev build (local or untagged): `cola 0.7.0-dev <branch>@<sha> ⚠` — ⚠ means the source tree had uncommitted changes at build time\nUpdate checks compare only the release version, so a dev build is never reported outdated by its dev marker.\nCLI equivalent: `cola --version`."
         }
         "status" => {
-            "/status\nShow this conversation's current model and thinking level, the next-turn pending pick (if any), and a short session summary (session, directory, agent, auto-accept). On a Pending Session the creation pair is shown instead of a 待应用 line. Codex's live pending is one-shot: it applies to the next new message. A model/level pick does not change 当前 until that turn runs.\nExample: `/status`"
+            "/status\nShow this conversation's current model and thinking level, the next-turn pending pick (if any), and a short session summary (session, directory, agent, auto-accept). On a Pending Session the creation model is shown instead of a 待应用 line. Codex's live pending is one-shot: it applies to the next new message. A model/level pick does not change 当前 until that turn runs.\nExample: `/status`"
         }
         "help" => {
             "/help [command]\nList all commands, or show detailed help for one.\nExample: `/help model`"
@@ -1450,11 +1450,11 @@ pub(crate) async fn handle_command(
             // per-prompt model. Validate the shape up front so a typo gets
             // immediate feedback instead of a silent no-op.
             //
-            // The text form obeys the same rule as the card (spec #922): a
-            // different provider on a live thread is **never recorded** — it is
-            // refused without a request and points at `/new`, with `/fork`
-            // named only as a later capability. A Pending Session takes the
-            // pair at creation.
+            // The text form obeys the same rule as the card (spec #930): a
+            // provider other than the current channel is refused **before any
+            // request** when the channel is determinable — a provider is a
+            // config fact. An unknown channel does not block: the model is
+            // recorded model-only and the server's own error is the fallback.
             let Some(parsed) = crate::backend::parsing::parse_model(&name) else {
                 handles
                     .flow
@@ -1519,21 +1519,13 @@ pub(crate) async fn handle_command(
                                 .await
                         }
                         // The thread became a Pending Session while the pick
-                        // was classified: the pair is a creation fact there, so
-                        // record **both** halves — a model-only write would drop
-                        // the provider.
+                        // was classified: record the model only; its provider
+                        // is the daemon's config fact, not a creation field.
                         PickTarget::Pending(epoch) => {
                             handles
                                 .flow
                                 .sessions
-                                .pick_pending_pair(
-                                    &handles.flow.backend,
-                                    &thread_key,
-                                    epoch,
-                                    &parsed.provider_id,
-                                    &name,
-                                    None,
-                                )
+                                .pick_pending_model(&handles.flow.backend, &thread_key, epoch, &name, None)
                                 .await
                         }
                     };
@@ -1547,11 +1539,8 @@ pub(crate) async fn handle_command(
                                 let extra = cleared_variant
                                     .map(|v| format!("（已清除思考等级 `{v}`）"))
                                     .unwrap_or_default();
-                                format!(
-                                    "Provider: {}（模型 {name}，将在会话创建时生效）{extra}",
-                                    parsed.provider_id
-                                )
-                            } else if handles.flow.backend.has_thread_provider() {
+                                format!("Model: {name}（将在会话创建时生效）{extra}")
+                            } else if handles.flow.backend.owns_next_turn_pending() {
                                 let extra = cleared_variant
                                     .map(|v| format!("（已清除思考等级 `{v}`：新模型不支持）"))
                                     .unwrap_or_default();
@@ -1779,7 +1768,7 @@ pub(crate) async fn handle_command(
         Command::Status => {
             // A text-only read (spec #922 decision 2): current + pending + a
             // compact session summary. The pending line is Codex's live
-            // one-shot selection; a Pending Session shows its creation pair
+            // one-shot selection; a Pending Session shows its creation model
             // instead and never 待应用.
             let Some(settings) = handles.flow.sessions.session_settings(&thread_key).await else {
                 handles
@@ -1804,9 +1793,9 @@ pub(crate) async fn handle_command(
             let mut lines = Vec::new();
             match settings.session_id.as_deref() {
                 None => {
-                    let pair = settings.model.as_deref().unwrap_or("未选择");
+                    let model = settings.model.as_deref().unwrap_or("未选择");
                     lines.push(format!(
-                        "当前：{pair}{}（将在会话创建时生效）",
+                        "当前：{model}{}（将在会话创建时生效）",
                         at_level(settings.variant.as_deref())
                     ));
                 }
@@ -1828,7 +1817,7 @@ pub(crate) async fn handle_command(
                         })
                         .unwrap_or_else(|| "未知".to_string());
                     lines.push(format!("当前：{current_line}"));
-                    if handles.flow.backend.has_thread_provider()
+                    if handles.flow.backend.owns_next_turn_pending()
                         && let Some(pending) = pending_label(&handles.flow.backend, session_id).await
                     {
                         lines.push(format!("待应用：{pending}（下一条新消息生效）"));

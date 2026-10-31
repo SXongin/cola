@@ -229,6 +229,10 @@ pub(crate) struct CodexLifecycle {
     /// connection this lifecycle attaches, so a liveness-probe replacement
     /// keeps a pick the user just made. A process restart drops it.
     pub(crate) pending: Arc<super::backend::PendingSelections>,
+    /// The config provider the last successful `config/read` named (spec
+    /// #930), shared by every connection and answerable while detached. A
+    /// process restart drops it (the next `/model` read fills it).
+    pub(crate) provider_fact: Arc<super::backend::ProviderFact>,
     /// The current connection. A `tokio` mutex because the attach pass holds it
     /// across the handshake's await.
     attached: tokio::sync::Mutex<Option<Attachment>>,
@@ -256,6 +260,7 @@ impl CodexLifecycle {
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
             pending: Arc::new(super::backend::PendingSelections::default()),
+            provider_fact: Arc::new(super::backend::ProviderFact::default()),
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
@@ -366,6 +371,7 @@ impl CodexLifecycle {
                 .with_tasks(self.tasks.clone())
                 .with_authorship(self.authored.clone())
                 .with_pending(self.pending.clone())
+                .with_provider_fact(self.provider_fact.clone())
                 .with_thread_settings(super::threads::ThreadSettings::from(&self.settings));
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
@@ -1598,9 +1604,10 @@ mod tests {
     }
 
     /// The bridge talks to the lifecycle wrapper, never to the attached
-    /// `CodexClient`, so every Codex capability #910 added must be forwarded
-    /// here. A missing forward silently turns a provider pick into an
-    /// OpenCode-shaped per-turn pick (and skips the switch entirely).
+    /// `CodexClient`, so every Codex capability must be forwarded here. A
+    /// missing forward silently turns a pick into an OpenCode-shaped per-turn
+    /// one (and skips the next-turn pending), or makes the provider validation
+    /// look unknown.
     #[tokio::test]
     async fn the_lifecycle_forwards_the_codex_provider_capabilities() {
         let fixture = Fixture::new();
@@ -1618,12 +1625,15 @@ mod tests {
             AttachOutcome::Attached
         );
 
-        assert!(crate::backend::Backend::has_thread_provider(&lifecycle));
+        assert!(crate::backend::Backend::owns_next_turn_pending(&lifecycle));
+        assert!(crate::backend::Backend::tracks_thread_provider(&lifecycle));
         assert!(crate::backend::Backend::is_neutral_provider(&lifecycle, "codex"));
         assert_eq!(
             crate::backend::Backend::known_thread_provider(&lifecycle, "thread-1").await,
             None
         );
+        // No `config/read` has run yet: unknown, not a guessed provider.
+        assert_eq!(crate::backend::Backend::configured_provider(&lifecycle), None);
     }
 
     /// Spec #922 whole-branch review: the pending seam is fallible. An

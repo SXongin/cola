@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use crate::bridge::tasks::TasksHandle;
 use crate::config::{ActiveClient, ClientKind};
 
-use super::backend::{Projections, SkillCatalog};
+use super::backend::{Projections, ProviderFact, SkillCatalog};
 use super::error::{CodexError, Result};
 use super::schema::{PINNED_VERSION, SurfaceProbe};
 use super::threads::{ThreadSettings, Threads};
@@ -69,6 +69,10 @@ pub(crate) struct CodexOptions {
     /// lifecycle builds (spec #922). A bare client leaves it `None` and gets
     /// its own store.
     pub(crate) pending: Option<Arc<super::backend::PendingSelections>>,
+    /// The config-provider fact shared with every other attachment the
+    /// lifecycle builds (spec #930). A bare client leaves it `None` and gets
+    /// its own cache.
+    pub(crate) provider_fact: Option<Arc<ProviderFact>>,
 }
 
 impl CodexOptions {
@@ -80,6 +84,7 @@ impl CodexOptions {
             authored: super::authorship::Authorship::in_memory(),
             thread_settings: ThreadSettings::default(),
             pending: None,
+            provider_fact: None,
         }
     }
 
@@ -106,6 +111,13 @@ impl CodexOptions {
     /// (spec #922), so a replacement attachment keeps a pick the user made.
     pub(crate) fn with_pending(mut self, pending: Arc<super::backend::PendingSelections>) -> Self {
         self.pending = Some(pending);
+        self
+    }
+
+    /// Carry the lifecycle's cached config-provider fact into this connection
+    /// (spec #930), so a replacement attachment keeps the pick path's channel.
+    pub(crate) fn with_provider_fact(mut self, provider_fact: Arc<ProviderFact>) -> Self {
+        self.provider_fact = Some(provider_fact);
         self
     }
 }
@@ -277,6 +289,9 @@ pub(crate) struct CodexClient {
     /// clones so re-opening `/model` on one connection reuses what it already
     /// learned, including failures.
     pub(crate) model_probes: Arc<super::model_surface::ModelProbes>,
+    /// The last successful `config/read` provider (spec #930), shared with the
+    /// lifecycle so the pick path can validate a text prefix without a request.
+    pub(crate) provider_fact: Arc<ProviderFact>,
     server: ServerInfo,
 }
 
@@ -368,6 +383,10 @@ impl CodexClient {
             authored: options.authored.clone(),
             skills: Arc::new(SkillCatalog::default()),
             model_probes: Arc::new(super::model_surface::ModelProbes::new()),
+            provider_fact: options
+                .provider_fact
+                .clone()
+                .unwrap_or_else(|| Arc::new(ProviderFact::default())),
             server: ServerInfo {
                 user_agent,
                 version,

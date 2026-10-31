@@ -346,31 +346,24 @@ impl From<&crate::config::CodexConfig> for ThreadSettings {
     }
 }
 
-/// The model/provider a thread is created with (issue #910, spec #922).
+/// The model a thread is created with (spec #930).
 ///
-/// `modelProvider` is a **creation-only** fact: `thread/start` accepts it, while
-/// `turn/start` has no such field — so a provider never rides a turn, and cola
-/// must never invent one there. The model is the turn's own field *and* a
-/// creation field; when a Pending Session chooses a provider, the two go in one
-/// creation call.
+/// The provider is **not** a creation field any more: Codex's daemon runs one
+/// provider per process, so the thread always takes the config's own
+/// `model_provider`. `turn/start` has no provider field either, so cola never
+/// sends one there.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ThreadModel<'a> {
     /// `thread/start`'s `model`: the model id the new thread runs.
     pub(crate) model: Option<&'a str>,
-    /// `thread/start`'s `modelProvider`: the configured
-    /// `[model_providers.<id>]` channel.
-    pub(crate) provider: Option<&'a str>,
 }
 
 impl ThreadModel<'_> {
-    /// Merge the pair into a request's params. An unset half sends nothing, so
-    /// the daemon's own default stays in force.
+    /// Merge the model into a request's params. An unset model sends nothing,
+    /// so the daemon's own default stays in force.
     fn add_params(self, params: &mut Value) {
         if let Some(model) = self.model {
             params["model"] = json!(model);
-        }
-        if let Some(provider) = self.provider {
-            params["modelProvider"] = json!(provider);
         }
     }
 }
@@ -551,10 +544,9 @@ impl Threads {
     ///
     /// The configured sandbox/approval pair and reasoning summary ride along:
     /// cola creates this thread, so it owns the choice (issues #898, #900).
-    /// `model` is the Pending Session's chosen model/provider pair (issue #910):
-    /// a thread's provider can only be chosen when it is created
-    /// (`thread/start`); `thread/fork` is the protocol's other creation path.
-    /// Unset halves send nothing.
+    /// `model` is the Pending Session's chosen model (spec #930): a provider is
+    /// a config fact, so it never rides creation. An unset model sends
+    /// nothing.
     pub(crate) async fn start(&self, cwd: Option<&str>, model: ThreadModel<'_>) -> Result<Thread> {
         let mut params = json!({});
         if let Some(cwd) = cwd {
@@ -1057,12 +1049,10 @@ mod tests {
         assert_eq!(params[1]["approvalPolicy"], "never");
     }
 
-    /// Issue #910: a new thread takes its provider at creation. The pair — a
-    /// Pending Session's provider + model — goes in ONE `thread/start`, because
-    /// a provider has no other creation path and `turn/start` has no provider
-    /// field at all.
+    /// Spec #930: a new thread takes its model at creation, and **never** a
+    /// provider — the daemon's config owns that fact.
     #[tokio::test]
-    async fn thread_start_carries_the_chosen_model_and_provider() {
+    async fn thread_start_carries_the_chosen_model_without_a_provider() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
         let client = connect(&url).await;
 
@@ -1072,7 +1062,6 @@ mod tests {
                 Some("/work/cola"),
                 ThreadModel {
                     model: Some("deepseek-v4-pro"),
-                    provider: Some("deepseek"),
                 },
             )
             .await
@@ -1082,11 +1071,13 @@ mod tests {
         assert_eq!(params.len(), 1, "one thread/start: {params:?}");
         assert_eq!(params[0]["cwd"], "/work/cola");
         assert_eq!(params[0]["model"], "deepseek-v4-pro");
-        assert_eq!(params[0]["modelProvider"], "deepseek");
+        assert!(
+            params[0].get("modelProvider").is_none(),
+            "a provider is a config fact, never a creation field: {params:?}"
+        );
         assert_eq!(
-            thread.model_provider.as_deref(),
-            Some("deepseek"),
-            "the response is the thread the server now holds"
+            thread.model_provider, None,
+            "the server named no provider because none was sent"
         );
     }
 

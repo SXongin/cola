@@ -819,7 +819,7 @@ impl Turn {
         // and the bridge must neither re-send a stale mirror nor send the
         // stored `/think` level on every later prompt. The footer still
         // captures the effort this turn will carry, read from the same pending.
-        let next_turn_pending = handles.backend.has_thread_provider();
+        let next_turn_pending = handles.backend.owns_next_turn_pending();
         self.turn_variant = if next_turn_pending {
             handles.backend.pending_variant(&self.session_id).await
         } else {
@@ -878,7 +878,7 @@ impl Turn {
         thread_key: &crate::config::ThreadKey,
         session_id: &str,
     ) {
-        if !handles.backend.has_thread_provider() {
+        if !handles.backend.owns_next_turn_pending() {
             return;
         }
         let gate = handles.sessions.session_gates.gate(session_id);

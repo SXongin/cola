@@ -2356,17 +2356,19 @@ async fn a_live_provider_pick_is_refused_with_no_request() {
         "level": "model",
         "chat_id": "chat_1",
         "thread_id": "chat_1",
-        "provider": "deepseek",
-        "value": "deepseek-v4-pro",
+        "value": "deepseek/deepseek-v4-pro",
     });
     server.clear_calls();
     let step = app.host_action(pick).await.expect("provider pick");
     assert!(step.card.is_none(), "a refusal is a toast, not a card");
     let toast = step.toast.expect("the named refusal");
-    assert!(toast.contains("/new") && toast.contains("/fork"), "{toast}");
     assert!(
-        toast.contains("后续版本") && toast.contains("独立功能"),
-        "`/fork` must not read as a command available today: {toast}"
+        toast.contains("配置事实") && toast.contains("model_provider") && toast.contains("重启"),
+        "the refusal says provider is a config fact: {toast}"
+    );
+    assert!(
+        !toast.contains("/new") && !toast.contains("/fork"),
+        "a config fact is not a `/new` remedy: {toast}"
     );
     assert_eq!(server.resume_calls(), 1, "the click sent no resume");
     assert_eq!(
@@ -2376,12 +2378,11 @@ async fn a_live_provider_pick_is_refused_with_no_request() {
     );
 }
 
-/// Spec #922: a provider pick on a live Codex thread whose projection is
-/// **cold** is still decided from the cache — the refusal needs no request at
-/// all, not even the `thread/read` that classifying the pick would have issued
-/// (an ack path must not probe).
+/// Spec #930 acceptance 3/4: when the channel is **undeterminable** (a cold
+/// projection), a pick is not blocked: it is recorded model-only, sends no
+/// request, and the server's own model error is the fallback.
 #[tokio::test]
-async fn a_cold_projection_provider_pick_sends_no_request() {
+async fn an_unknown_channel_pick_is_recorded_model_only_with_no_request() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
@@ -2394,8 +2395,9 @@ async fn a_cold_projection_provider_pick_sends_no_request() {
     ));
     server.set_thread_model("thread-1", Some("gpt-5.1-codex"), Some("openai"));
     // Nothing adopts the thread, so the adapter's projection holds no provider
-    // fact for it; the cache-only refusal must not probe.
+    // fact for it; deciding the pick must not probe.
     let client = codex_client(&url).await;
+    let pending_client = client.clone();
 
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
@@ -2423,13 +2425,18 @@ async fn a_cold_projection_provider_pick_sends_no_request() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        reply.contains("/new") && reply.contains("/fork"),
-        "the refusal names the remedies: {reply}"
+        reply.contains("Model: deepseek/deepseek-v4-pro"),
+        "an unknown channel records the model-only pick: {reply}"
+    );
+    assert_eq!(
+        pending_client.pending_model("thread-1").await.as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the pick is the next turn's pending model"
     );
     assert_eq!(
         server.call_log(),
         Vec::<String>::new(),
-        "a gated-off pick on a cold projection sends no request"
+        "deciding an unknown-channel pick sends no request"
     );
 }
 
@@ -2544,31 +2551,6 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
     let client = codex_client(&url).await;
     client.transcript("thread-1").await.expect("adopt the thread");
     server.wait_for_subscribers("thread-1", 1).await;
-    // The user opens `/model` first: the surface must list the configured id as
-    // reserved, never as a selectable pair.
-    let surface = crate::backend::Backend::model_surface(
-        &client,
-        crate::backend::types::ModelSurfaceQuery {
-            // Page 2 on a Pending Session: the provider list is selectable there.
-            session_id: None,
-            directory: Some("/work/cola"),
-            scope: Some("provider"),
-            ..Default::default()
-        },
-    )
-    .await;
-    let reserved = surface.scopes[0]
-        .options
-        .iter()
-        .find(|option| option.id == "codex")
-        .expect("the configured id is listed");
-    assert!(reserved.disabled, "but never selectable: {reserved:?}");
-    assert!(
-        reserved.display_label().contains("保留名"),
-        "the row explains the reservation: {}",
-        reserved.display_label()
-    );
-
     let pending_client = client.clone();
     let platform = Arc::new(RecordingPlatform::new());
     let app = Arc::new(App::new(cfg, Arc::new(client), platform.clone()).unwrap());
