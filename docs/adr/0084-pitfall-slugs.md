@@ -22,7 +22,7 @@ every other document cites it by *pitfall* + that slug (e.g. *pitfall attach*),
 never by a position. The list keeps an order for reading, and that order is free
 to change; so is the number of items.
 
-The eight slugs:
+The slugs:
 
 | slug | the trap |
 | --- | --- |
@@ -33,6 +33,7 @@ The eight slugs:
 | `mentions` | `@_user_N` tokens must be resolved before a prompt sees them |
 | `child-session-permissions` | a subagent's permission carries the child session id, so the card needs the parent walk |
 | `card-budgets` | the 3000-char element budget is cola's, not Feishu's |
+| `card-repaints` | any card PATCH rebuilds the body and wipes a live form's unsubmitted text; every write must advance the render gate's signature cache |
 | `info-probe` | V1's catch-all answers 200 `text/html`, so the status alone cannot classify a server |
 
 Renaming a slug is the one breaking change, and it is deliberate: a rename means

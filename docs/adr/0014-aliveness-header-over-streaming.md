@@ -26,3 +26,20 @@ shows "⏳ 等待你的授权", a question-only wait "⏳ 等待你的回答", a
 "⏳ 等待你的授权/回答" only when both are live at once (`AwaitingAction`). The
 decision itself is unchanged — a paused turn still says what it waits on, and
 the header still re-flushes only when its text changes.
+## Update (2026-10-31): the signature cache belongs to every card write
+
+The flush gate throttles by comparing the accumulator's header signature with
+the signature the card last showed (`TurnState::last_header_sig`, plus the same
+shape for the footer's context segment). Only the render pass advanced those
+caches. Every other flush — a question surfacing, a click's ack, a receipt
+landing — rendered the new header itself and left the cache stale, so the very
+next render tick PATCHed a body identical to the one the card already carried,
+just to "discover" a header that had changed before the flush. Each card write
+now advances the cache to the body it built (`advance_sent_signatures`,
+`src/bridge/turn/flush.rs`), so the tick stays a real second's change (#917).
+
+The tick still stops while the turn waits on the operator, since the awaiting
+title is a static string; a card that renders an unanswered free-text answer is
+additionally never repainted for a clock-only cause (ADR-0038's 2026-10-31
+update, ADR-0060's 2026-10-31 amendment) — the repaint would wipe the text being
+typed.
