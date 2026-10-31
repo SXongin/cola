@@ -2313,6 +2313,32 @@ impl Turn {
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
     }
 
+    /// Flush a pass whose only causes are **background progress** (issue #917):
+    /// the card renders an unanswered free-text answer field, whose form a
+    /// repaint would wipe, so the write is skipped. The check runs UNDER the
+    /// card-write lock the flush shares, so a question that surfaced while the
+    /// pass gathered its reads cannot slip between the check and the build —
+    /// the sequence is "add the block, then flush it", and this write can only
+    /// land before that flush or not at all.
+    ///
+    /// A pass that already applied its ledger before this skip leaves the read
+    /// on the accumulator: the form's own flush builds from it, so nothing is
+    /// lost.
+    pub(crate) async fn flush_card_unless_typing(cards: &CardsHandle, session_id: &str) -> FlushOutcome {
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
+        if cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.awaits_typed_answer())
+        {
+            return FlushOutcome::Unwritten;
+        }
+        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
+    }
+
     /// Record that `card_message_id` is now `session_id`'s live card
     /// (ADR-0063): the durable fact Session Sync's reap needs after a restart.
     /// Every path that sends a card INTO the Session tracks it — a Turn's
@@ -3289,6 +3315,23 @@ impl Turn {
                 return YieldedUpdate::Unchanged;
             };
             let anchor = card.acc.turn_anchor().cloned();
+            // The read's own settle decision judges the true end (ADR-0059):
+            // only a read whose Wakes are answered and that retired the last
+            // Background Task settles, and the ending is the one disposition
+            // table's quiet mapping (#540): a settled failure or a deliberate
+            // stop dominates ✅. A Waiting card always carries an anchor (the
+            // yield is only decided from one), so the anchorless Unreceived
+            // decision cannot arise here; a Running read keeps observing.
+            let settled = Disposition::of_quiet_settle(transcript.settle(anchor.as_ref()), stopped);
+            // The typed-answer check again, now under the write lock the write
+            // below shares: a question that surfaced while this pass spent its
+            // reads brings its form onto the card, and this read must neither
+            // repaint that form nor consume itself for a body nothing will
+            // write (issue #917). The admission block above covers the common
+            // case early, before the reads.
+            if settled.is_none() && card.acc.awaits_typed_answer() {
+                return YieldedUpdate::Unchanged;
+            }
             let changed = render::apply_ledger_read(
                 &mut card.acc,
                 transcript,
@@ -3299,14 +3342,6 @@ impl Turn {
                 plans,
                 backend.background_tasks_supported(),
             );
-            // The read's own settle decision judges the true end (ADR-0059):
-            // only a read whose Wakes are answered and that retired the last
-            // Background Task settles, and the ending is the one disposition
-            // table's quiet mapping (#540): a settled failure or a deliberate
-            // stop dominates ✅. A Waiting card always carries an anchor (the
-            // yield is only decided from one), so the anchorless Unreceived
-            // decision cannot arise here; a Running read keeps observing.
-            let settled = Disposition::of_quiet_settle(transcript.settle(anchor.as_ref()), stopped);
             if let Some(disposition) = &settled {
                 card.acc.apply_ending(disposition);
             }

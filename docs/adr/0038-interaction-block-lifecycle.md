@@ -257,7 +257,11 @@ pass plans no completion entry, applies no ledger, and spends no liveness read
 while the form waits, so the first pass after the answer finds the same delta
 and lands it — a read applied to a body nothing writes would make every later
 read see "no difference", and its entry would never reach a card or the durable
-record. The turn's own content — a new part, a file delivery, the footer's
+record. The question of a mid-pass arrival is settled where it can be: the
+background-only write re-checks the form **under the card-write lock** the form's
+own flush also takes (`Turn::flush_card_unless_typing`), so a question surfacing
+while the pass gathered its reads either flushes first (and this write stands
+down) or lands after it. The turn's own content — a new part, a file delivery, the footer's
 context figure, a block's own state change (已选/✅) — still flushes, and so
 does the settlement, so the form never stalls the turn it is blocking on or
 hides a true end. A question answered only by clicking renders no input and

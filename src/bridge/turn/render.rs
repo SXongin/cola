@@ -2638,29 +2638,19 @@ async fn render_and_flush_inner(
             None => (super::state::LedgerChange::default(), false),
         }
     };
-    // The pass sampled `typing` before its network reads (so it could skip
-    // them). A question can surface meanwhile: re-read the fact, and let the
-    // background causes stand down for a form that arrived mid-pass too. The
-    // form's own flush builds from this accumulator, so it carries whatever
-    // the pass applied — suppressing this write loses nothing.
-    let typing = typing
-        || cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|card| card.acc.awaits_typed_answer());
     let flush = if !mode.flushes() {
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
         FlushOutcome::Unwritten
-    } else if changed
-        || file_changed
-        || header_changed
-        || context_changed
-        || (!typing && (ledger.owes() || liveness_changed || entries_changed))
-    {
+    } else if changed || file_changed || header_changed || context_changed {
         Turn::flush_card(cards, session_id).await
+    } else if ledger.owes() || liveness_changed || entries_changed {
+        // Background progress only. A question can surface while this pass
+        // gathered its reads, so the typed-answer check runs under the write
+        // lock the flush itself shares (`flush_card_unless_typing`) — a form
+        // added mid-pass must never be repainted by a background cause
+        // (issue #917). `typing` above only saved this pass its reads.
+        Turn::flush_card_unless_typing(cards, session_id).await
     } else {
         // Nothing this pass did owed a card write: no carrier, so nothing a
         // caller may read as accepted (review, PR #595).
