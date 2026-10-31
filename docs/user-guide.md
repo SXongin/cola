@@ -866,9 +866,12 @@ page, no provider or pair row, and no 「选择 provider（共 1 个）」 pseud
   typed `/model <provider>/<model>` whose provider differs from the live
   thread's (or, on a Pending Session, the config's) sends **no request** and
   says the provider is a config fact, naming both channels and pointing at
-  `model_provider` plus a restart. When the channel cannot be determined — a
-  failed `config/read`, no connection — the pick is recorded model-only and
-  Codex's own error on the next message is the fallback.
+  `model_provider` plus a restart. The neutral `codex/<id>` is exempt: it names
+  no channel, so it is accepted whether or not the channel is known and the
+  server resolves the real provider. When the channel cannot be determined — a
+  failed `config/read`, no connection — a click and a typed ref are alike
+  recorded model-only, and Codex's own error on the next message is the
+  fallback.
 - **The next new message applies it — once.** That turn's `turn/start` carries
   `model` + `effort`; when the turn is accepted the pick is **consumed**, and
   every later message carries no model and no effort: the thread's own default
@@ -911,10 +914,11 @@ page, no provider or pair row, and no 「选择 provider（共 1 个）」 pseud
   new message's `turn/start.model` once.
 - **An id outside every list is typed.** `/model <provider>/<model>` — e.g.
   `/model opencode-go/deepseek-v4-pro` — records that model on the current
-  channel, and `/model codex/<id>` is the neutral spelling for when the channel
-  is unknown. Codex validates neither one: only the catalog's entries carry a
-  display name, a context window and reasoning levels, so a typo shows up as the
-  provider's own error on the next message.
+  channel, and `/model codex/<id>` is the neutral spelling: it names no channel,
+  so it is accepted whether or not the channel is known, and the server resolves
+  the real provider. Codex validates neither one: only the catalog's entries
+  carry a display name, a context window and reasoning levels, so a typo shows
+  up as the provider's own error on the next message.
 - **`[profiles.*]` is not read.** Codex 0.134+ no longer reads it (a
   `--profile` layers `$CODEX_HOME/<name>.config.toml`), so cola ignores the
   table: a profile neither adds a model row nor supplies a provider.
@@ -960,14 +964,17 @@ typing it is submitted as an ordinary prompt. So:
 - **The neutral `codex` ref is not a channel.** `codex/<id>` is the fallback
   spelling cola records when the channel is unknown — a shared neutral
   namespace, never a real provider. A `[model_providers.codex]` entry therefore
-  contributes no selectable channel and no probed group, and once the real
-  channel is known the ref names it instead. The classification is lexical, so
+  contributes no selectable channel and no probed group. The neutral ref is
+  accepted as input on a known channel too (it names no channel, so the pick is
+  recorded and the server resolves the provider), and the thread read then shows
+  the real channel on the current line. The classification is lexical, so
   a catalog pick never reads your config.
 
 A typed `/model <provider>/<model>` follows the same rule: the provider must
 name the current channel while the channel is determinable (it is refused
-otherwise, never silently re-pointed), and `codex/<id>` is the spelling to use
-when it is not.
+otherwise, never silently re-pointed), except for the neutral `codex/<id>`,
+which is always accepted — it names no channel, so it is the spelling to use
+when the channel is unknown and stays valid when it is known.
 
 ## FAQ / troubleshooting
 
