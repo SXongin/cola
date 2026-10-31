@@ -76,6 +76,25 @@ pub(crate) fn parse_model(spec: &str) -> Option<ModelInfo> {
     })
 }
 
+/// Re-express `spec` through the neutral provider when its validation fact has
+/// expired. The boolean says whether normalization occurred, letting callers
+/// preserve that generation decision beside a pending mirror write.
+pub(crate) fn model_spec_for_provider_generation(
+    spec: &str,
+    expected_generation: Option<u64>,
+    current_generation: u64,
+    neutral_provider: Option<&str>,
+) -> (String, bool) {
+    let stale = expected_generation.is_some_and(|expected| expected != current_generation);
+    if stale
+        && let Some(neutral_provider) = neutral_provider
+        && let Some(model) = parse_model(spec)
+    {
+        return (join_model(neutral_provider, &model.id), true);
+    }
+    (spec.to_string(), false)
+}
+
 /// The quoted-provider form of [`join_model`]: `"foo/bar"/gpt`. `\\` and `\"`
 /// are the only escapes (a provider id is a config key, not free text).
 fn quoted_provider(spec: &str) -> Option<(String, &str)> {
@@ -153,6 +172,23 @@ mod tests {
 
         assert!(parse_model("\"unterminated/x").is_none());
         assert!(parse_model("\"/x").is_none());
+    }
+
+    #[test]
+    fn stale_provider_fact_keeps_the_model_in_the_neutral_bucket() {
+        assert_eq!(
+            model_spec_for_provider_generation("openai/gpt-5.1", Some(3), 4, Some("codex")),
+            ("codex/gpt-5.1".to_string(), true)
+        );
+        assert_eq!(
+            model_spec_for_provider_generation("\"foo/bar\"/gpt", Some(3), 4, Some("codex")),
+            ("codex/gpt".to_string(), true),
+            "a quoted provider is dropped without losing the model id"
+        );
+        assert_eq!(
+            model_spec_for_provider_generation("openai/gpt-5.1", Some(3), 3, Some("codex")),
+            ("openai/gpt-5.1".to_string(), false)
+        );
     }
 
     #[test]

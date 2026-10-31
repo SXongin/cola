@@ -24,6 +24,10 @@ pub struct PendingEntry {
     /// Per-session model override ("provider/model", `/model`).
     #[serde(default)]
     pub model: Option<String>,
+    /// Provider-fact generation that validated `model`. In-memory only: a
+    /// persisted pending from another process cannot reuse a cache generation.
+    #[serde(skip)]
+    pub model_provider_generation: Option<u64>,
     /// Per-session thinking level (`/think`).
     #[serde(default)]
     pub variant: Option<String>,
@@ -49,6 +53,7 @@ impl PendingEntry {
             title: None,
             agent: None,
             model: None,
+            model_provider_generation: None,
             variant: None,
             auto_accept: false,
             topic_anchor: None,
@@ -723,6 +728,7 @@ impl SessionStore {
     /// `clear_variant` clears the `/think` variant only if the entry still holds
     /// it — a concurrent `/think` wins — and the cleared name is returned for
     /// the toast.
+    #[allow(clippy::too_many_arguments)] // pending identity, mirror CAS and provider generation are one write
     pub(crate) fn set_mirror_pending(
         &mut self,
         key: &ThreadKey,
@@ -730,6 +736,7 @@ impl SessionStore {
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
         write: MirrorWrite<'_>,
+        model_provider_generation: Option<u64>,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<MirrorWriteOutcome> {
         // A claimed (materialising) pending cannot take a write: the creation
@@ -755,6 +762,12 @@ impl SessionStore {
             return Ok(MirrorWriteOutcome::refused(MirrorVerdict::Changed));
         }
         let cleared_variant = apply_mirror_write(&mut pending.model, &mut pending.variant, write);
+        if matches!(
+            write,
+            MirrorWrite::Model { .. } | MirrorWrite::ModelWithVariant { .. }
+        ) {
+            pending.model_provider_generation = model_provider_generation;
+        }
         let deferred = self.save_mirror(deadline)?;
         Ok(MirrorWriteOutcome {
             written: MirrorVerdict::Applied { cleared_variant },
@@ -961,6 +974,7 @@ impl SessionStore {
             }
         } else if let Some(p) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
             (p.agent, p.model, p.variant, p.auto_accept) = overrides;
+            p.model_provider_generation = None;
             true
         } else if let Some(e) = self
             .entries_mut()
@@ -1832,6 +1846,7 @@ mod tests {
                         model: "deepseek/pro",
                         clear_variant: None
                     },
+                    None,
                     None
                 )
                 .unwrap()
@@ -1849,6 +1864,7 @@ mod tests {
                     model: "deepseek/pro",
                     clear_variant: Some("high"),
                 },
+                None,
                 None,
             )
             .unwrap()
@@ -1880,6 +1896,7 @@ mod tests {
                         model: "openai/x",
                         clear_variant: None
                     },
+                    None,
                     None
                 )
                 .unwrap()
@@ -1906,6 +1923,7 @@ mod tests {
                         model: "deepseek/pro",
                         clear_variant: None
                     },
+                    None,
                     None
                 )
                 .unwrap()

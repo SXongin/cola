@@ -3300,9 +3300,16 @@ impl Backend for CodexLifecycle {
         model: &str,
         variant: Option<&str>,
         expected_generation: Option<u64>,
+        current_provider: Option<&str>,
     ) -> Result<()> {
-        self.record_pending_model_if_current_generation(session_id, model, variant, expected_generation)
-            .await
+        self.record_pending_model_if_current_generation(
+            session_id,
+            model,
+            variant,
+            expected_generation,
+            current_provider,
+        )
+        .await
     }
 
     async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) -> Result<()> {
@@ -3359,13 +3366,7 @@ impl Backend for CodexLifecycle {
         &self,
         session_id: &str,
     ) -> crate::backend::types::ProviderFactSnapshot {
-        match self.attached_client().await {
-            Some(client) => Backend::known_thread_provider_fact(&client, session_id).await,
-            None => {
-                let fact = self.configured_provider_fact_snapshot();
-                fact.snapshot(None)
-            }
-        }
+        self.thread_provider_fact_snapshot(session_id).await
     }
 
     fn new_session_input(&self, directory: Option<&str>) -> CreateSessionInput {
@@ -3545,7 +3546,11 @@ impl Backend for CodexLifecycle {
     }
 
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface {
-        match self.attached_client().await {
+        // Card reads must not queue behind `ensure_attached`'s liveness probe,
+        // which holds the attachment mutex. The snapshot is bounded by the
+        // provider-fact generation; a later replacement only leaves this read
+        // working against its old, now-untrusted client cache.
+        match self.provider_fact_client_snapshot() {
             Some(client) => Backend::model_surface(&client, query).await,
             None => unattached_surface(&query),
         }
