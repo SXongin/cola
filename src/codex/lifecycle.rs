@@ -230,11 +230,12 @@ pub(crate) struct CodexLifecycle {
     /// keeps a pick the user just made. A process restart drops it.
     pub(crate) pending: Arc<super::backend::PendingSelections>,
     /// The `model_provider` each successful `config/read` named, keyed by the
-    /// read's exact directory (spec #930). Shared with the attached
-    /// connection and cleared whenever that connection is dropped or replaced,
-    /// so a prior daemon's fact never validates a pick; the next `/model` read
-    /// repopulates it.
-    pub(crate) configured_provider_fact: Arc<super::backend::ConfiguredProviderFact>,
+    /// read's exact directory (spec #930). The attached connection gets a
+    /// snapshot Arc; invalidation replaces this Arc whenever that connection is
+    /// dropped or replaced. A late read can then only write to the orphaned
+    /// prior-generation cache, never validate a pick; the next `/model` read
+    /// repopulates the new cache.
+    pub(crate) configured_provider_fact: std::sync::RwLock<Arc<super::backend::ConfiguredProviderFact>>,
     /// The current connection. A `tokio` mutex because the attach pass holds it
     /// across the handshake's await.
     attached: tokio::sync::Mutex<Option<Attachment>>,
@@ -262,7 +263,9 @@ impl CodexLifecycle {
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
             pending: Arc::new(super::backend::PendingSelections::default()),
-            configured_provider_fact: Arc::new(super::backend::ConfiguredProviderFact::default()),
+            configured_provider_fact: std::sync::RwLock::new(Arc::new(
+                super::backend::ConfiguredProviderFact::default(),
+            )),
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
@@ -288,6 +291,27 @@ impl CodexLifecycle {
             .await
             .as_ref()
             .map(|attachment| attachment.client.clone())
+    }
+
+    /// Snapshot the cache for the current attachment. A client keeps this Arc;
+    /// invalidation swaps in a fresh one, so an old connection's in-flight
+    /// `model_surface` can only write to its now-orphaned cache.
+    fn configured_provider_fact_snapshot(&self) -> Arc<super::backend::ConfiguredProviderFact> {
+        self.configured_provider_fact
+            .read()
+            .expect("codex configured provider fact cache")
+            .clone()
+    }
+
+    /// Invalidate the current attachment's config facts by replacing the cache
+    /// instance, never clearing it in place. Reads already holding the old Arc
+    /// cannot repopulate the cache used by subsequent picks.
+    fn invalidate_configured_provider_fact(&self) {
+        *self
+            .configured_provider_fact
+            .write()
+            .expect("codex configured provider fact cache") =
+            Arc::new(super::backend::ConfiguredProviderFact::default());
     }
 
     /// The control socket the lifecycle targets, rendered as the neutral base
@@ -373,7 +397,7 @@ impl CodexLifecycle {
                 .with_tasks(self.tasks.clone())
                 .with_authorship(self.authored.clone())
                 .with_pending(self.pending.clone())
-                .with_configured_provider_fact(self.configured_provider_fact.clone())
+                .with_configured_provider_fact(self.configured_provider_fact_snapshot())
                 .with_thread_settings(super::threads::ThreadSettings::from(&self.settings));
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
@@ -1016,7 +1040,7 @@ impl ServerLifecycle for CodexLifecycle {
                 slot.take();
                 // The cached config provider described the connection just
                 // dropped; a replacement daemon may run a different one.
-                self.configured_provider_fact.clear();
+                self.invalidate_configured_provider_fact();
             }
         }
 
@@ -1025,11 +1049,11 @@ impl ServerLifecycle for CodexLifecycle {
             .map_err(client_error)?;
         self.report_clients(&discovered.clients);
 
-        // Gone or replaced: drop the stale connection. The cached config
-        // provider must not outlive the daemon it was read from, so the next
-        // attach starts with the channel unknown until its own `/model` read.
+        // Gone or replaced: drop the stale connection. Replace the config
+        // cache so its in-flight reads can only write to an orphaned cache; the
+        // next attach starts unknown until its own `/model` read.
         self.attached.lock().await.take();
-        self.configured_provider_fact.clear();
+        self.invalidate_configured_provider_fact();
 
         // A discovered daemon is dialled; one behind a stale socket fails here
         // as unreachable (`Serverless`), which is exactly the case the start
@@ -1668,7 +1692,7 @@ mod tests {
             AttachOutcome::Attached
         );
         lifecycle
-            .configured_provider_fact
+            .configured_provider_fact_snapshot()
             .record(Some("/work/cola"), Some("openai"));
         assert_eq!(
             crate::backend::Backend::configured_provider(&lifecycle, "/work/cola"),
@@ -1677,6 +1701,7 @@ mod tests {
 
         // The attached connection goes away (daemon restart / replacement).
         lifecycle.attached.lock().await.take();
+        lifecycle.invalidate_configured_provider_fact();
         assert_eq!(
             lifecycle
                 .ensure_attached(request(&never_busy))
@@ -1688,6 +1713,32 @@ mod tests {
             crate::backend::Backend::configured_provider(&lifecycle, "/work/cola"),
             None,
             "a prior daemon's fact must not survive the replacement"
+        );
+    }
+
+    /// A surface read captures the cache instance before its RPC. If that
+    /// attachment is invalidated before the RPC completes, its late write must
+    /// stay on the orphaned cache and remain invisible to the current pick path.
+    #[test]
+    fn a_late_surface_read_cannot_repopulate_an_invalidated_cache() {
+        let fixture = Fixture::new();
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
+        let captured_by_old_client = lifecycle.configured_provider_fact_snapshot();
+
+        lifecycle.invalidate_configured_provider_fact();
+        // Deterministically model the old model_surface finishing its config
+        // read after detach/replacement and recording to the Arc it captured.
+        captured_by_old_client.record(Some("/work/cola"), Some("stale-provider"));
+
+        assert_eq!(
+            crate::backend::Backend::configured_provider(&lifecycle, "/work/cola"),
+            None,
+            "the current cache remains unknown after an old read finishes"
+        );
+        assert_eq!(
+            captured_by_old_client.get("/work/cola").as_deref(),
+            Some("stale-provider"),
+            "the late write only reached the old, orphaned cache"
         );
     }
 

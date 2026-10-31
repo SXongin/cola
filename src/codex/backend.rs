@@ -201,14 +201,6 @@ impl ConfiguredProviderFact {
             .find(|(entry, _)| entry == directory)
             .map(|(_, provider)| provider.clone())
     }
-
-    /// Forget every cached directory, e.g. when the attached daemon changes.
-    pub(crate) fn clear(&self) {
-        self.by_directory
-            .lock()
-            .expect("codex configured provider fact")
-            .clear();
-    }
 }
 
 /// The in-memory next-turn selections shared by every connection the lifecycle
@@ -3210,11 +3202,14 @@ impl Backend for CodexLifecycle {
     }
 
     /// The cached config provider is shared with the attached connection and
-    /// keyed by its `config/read` directory. The attach pass clears it on a
-    /// replacement, so a fact from a prior daemon process never validates a
-    /// pick.
+    /// keyed by its `config/read` directory. The attach pass swaps it out on a
+    /// replacement; an old client's late read only reaches its orphaned Arc,
+    /// so a prior daemon process never validates a pick.
     fn configured_provider(&self, directory: &str) -> Option<String> {
-        self.configured_provider_fact.get(directory)
+        self.configured_provider_fact
+            .read()
+            .expect("codex configured provider fact cache")
+            .get(directory)
     }
 
     /// The pending next-turn selection lives on the attached client (it must
@@ -5982,8 +5977,8 @@ mod tests {
     }
 
     /// The cache is keyed by exact directory, drops directory-less reads, keeps
-    /// its bounded set warm for repeats, and can be cleared when the attached
-    /// daemon changes (spec #930).
+    /// its bounded set warm for repeats (spec #930). Attachment invalidation
+    /// replaces the Arc rather than mutating this cache in place.
     #[test]
     fn configured_provider_facts_are_directory_scoped() {
         let fact = ConfiguredProviderFact::default();
@@ -6004,9 +5999,6 @@ mod tests {
             Some("openai".to_string()),
             "a failed read keeps the last known fact for that directory"
         );
-
-        fact.clear();
-        assert_eq!(fact.get("/work/a"), None, "a clear invalidates every entry");
     }
 
     /// The cap evicts the coldest directory, never another directory's fact.
