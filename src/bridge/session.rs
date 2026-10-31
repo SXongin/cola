@@ -24,10 +24,12 @@ pub struct PendingEntry {
     /// Per-session model override ("provider/model", `/model`).
     #[serde(default)]
     pub model: Option<String>,
-    /// Provider-fact generation that validated `model`. In-memory only: a
-    /// persisted pending from another process cannot reuse a cache generation.
+    /// Cache generation that validated this model prefix. It identifies the
+    /// provider fact used by `/model`, not a generation of the config value.
+    /// In-memory only: after restart the fact is unknown and materialisation
+    /// falls back to the neutral model ref.
     #[serde(skip)]
-    pub model_provider_generation: Option<u64>,
+    pub validated_provider_fact_generation: Option<u64>,
     /// Per-session thinking level (`/think`).
     #[serde(default)]
     pub variant: Option<String>,
@@ -53,7 +55,7 @@ impl PendingEntry {
             title: None,
             agent: None,
             model: None,
-            model_provider_generation: None,
+            validated_provider_fact_generation: None,
             variant: None,
             auto_accept: false,
             topic_anchor: None,
@@ -736,7 +738,7 @@ impl SessionStore {
         expected_model: Option<&str>,
         expected_variant: Option<&str>,
         write: MirrorWrite<'_>,
-        model_provider_generation: Option<u64>,
+        validated_provider_fact_generation: Option<u64>,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<MirrorWriteOutcome> {
         // A claimed (materialising) pending cannot take a write: the creation
@@ -766,7 +768,7 @@ impl SessionStore {
             write,
             MirrorWrite::Model { .. } | MirrorWrite::ModelWithVariant { .. }
         ) {
-            pending.model_provider_generation = model_provider_generation;
+            pending.validated_provider_fact_generation = validated_provider_fact_generation;
         }
         let deferred = self.save_mirror(deadline)?;
         Ok(MirrorWriteOutcome {
@@ -775,7 +777,7 @@ impl SessionStore {
         })
     }
 
-    /// Write a model/provider mirror change onto a **live** entry (issue #910),
+    /// Write a model/variant mirror change onto a **live** entry (issue #910),
     /// in one lock that also re-verifies the mapping: the entry is found by
     /// `session_id`, and only when it is still the thread's target. A `/switch`
     /// remap, a delete/recreate or a newly declared pending is
@@ -974,7 +976,7 @@ impl SessionStore {
             }
         } else if let Some(p) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) {
             (p.agent, p.model, p.variant, p.auto_accept) = overrides;
-            p.model_provider_generation = None;
+            p.validated_provider_fact_generation = None;
             true
         } else if let Some(e) = self
             .entries_mut()
