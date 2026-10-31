@@ -342,19 +342,6 @@ pub fn build_switch_card(
     let page = window.page;
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
-    // Search form (ADR-0022): keyword-prefilled; the scope rides its submit so
-    // a scoped search survives the round trip (ADR-0052).
-    elements.push(search_form(
-        "switch_search",
-        "switchsearch",
-        "switch",
-        thread_key,
-        Some(scope),
-        "🔍 搜索标题 / 目录 / ID",
-        keyword,
-        &[],
-    ));
-
     // The scope toggle: in `Directory` view show 全部, in `All` view show
     // 本目录 (ADR-0022). `All` from a fresh conversation has no directory, so
     // the 本目录 button is hidden there. The keyword rides along so a scoped
@@ -456,6 +443,23 @@ pub fn build_switch_card(
     ) {
         elements.push(pager);
     }
+
+    // Search form last (issue #917): the Feishu Android client scrolls the
+    // message's bottom to the keyboard's top when an input takes focus, so an
+    // input with more than about half a screen of card below it is pushed off
+    // the top of the screen. Rows and pager above the box keep that drop small.
+    // ADR-0022: keyword-prefilled; the scope rides its submit so a scoped
+    // search survives the round trip (ADR-0052).
+    elements.push(search_form(
+        "switch_search",
+        "switchsearch",
+        "switch",
+        thread_key,
+        Some(scope),
+        "🔍 搜索标题 / 目录 / ID",
+        keyword,
+        &[],
+    ));
 
     // Footer: "＋new" creates a fresh session in the current project. It keeps
     // the active filter (ADR-0052), so the refreshed list stays where it was.
@@ -575,7 +579,12 @@ pub fn build_child_card(
     let window = page_window(total, page);
     let mut elements: Vec<serde_json::Value> = Vec::new();
 
-    elements.push(search_form(
+    // Search form last (issue #917): the Feishu Android client scrolls the
+    // message's bottom to the keyboard's top when an input takes focus, so an
+    // input with more than about half a screen of card below it is pushed off
+    // the top of the screen. The rows and pager above the box keep that drop
+    // small. ADR-0022: keyword-prefilled.
+    let form = search_form(
         "sub_search",
         "subsearch",
         "sub",
@@ -584,7 +593,7 @@ pub fn build_child_card(
         "🔍 搜索标题 / 目录 / ID",
         keyword,
         &[],
-    ));
+    );
 
     // A conversation with no Active Session, an Active Session with no
     // children, and an empty search all land here: one plain line, never an
@@ -597,6 +606,7 @@ pub fn build_child_card(
             "_(无匹配子会话)_"
         };
         elements.push(json!({ "tag": "markdown", "content": hint }));
+        elements.push(form);
         return card_shell("🧩 子会话", "blue", elements);
     }
 
@@ -628,6 +638,8 @@ pub fn build_child_card(
     ) {
         elements.push(pager);
     }
+
+    elements.push(form);
 
     card_shell("🧩 子会话", "blue", elements)
 }
@@ -746,19 +758,6 @@ pub fn build_dir_card(
     // reach a directory the Recent Directories union does not carry.
     elements.push(browse_entry_button(thread_key));
 
-    if total > CARD_PAGE_SIZE || !keyword.is_empty() {
-        elements.push(search_form(
-            "dir_search",
-            "dirsearch",
-            "dir",
-            thread_key,
-            None,
-            "🔍 搜索目录路径",
-            keyword,
-            &[],
-        ));
-    }
-
     if dirs.is_empty() {
         let hint = if keyword.is_empty() {
             "_(还没有最近目录。用 `/dir <路径>` 或 `/new` 创建会话。)_"
@@ -804,6 +803,24 @@ pub fn build_dir_card(
         &[],
     ) {
         elements.push(pager);
+    }
+
+    // Search form last (ADR-0051, issue #917): the Feishu Android client
+    // scrolls the message's bottom to the keyboard's top when an input takes
+    // focus, so an input with more than about half a screen of card below it is
+    // pushed off the top of the screen. It renders when the list outgrows a
+    // page or `keyword` is non-empty, so a narrowed result stays refinable.
+    if total > CARD_PAGE_SIZE || !keyword.is_empty() {
+        elements.push(search_form(
+            "dir_search",
+            "dirsearch",
+            "dir",
+            thread_key,
+            None,
+            "🔍 搜索目录路径",
+            keyword,
+            &[],
+        ));
     }
 
     card_shell("📂 最近目录", "blue", elements)
@@ -2469,6 +2486,59 @@ mod tests {
         assert!(
             dir_search_form(&build_dir_card(&key, &short, None, "p1", 1)).is_some(),
             "an active keyword keeps the box under the cap"
+        );
+    }
+
+    /// Issue #917: every list card puts its search box at the card's END. The
+    /// Feishu Android client scrolls the message's bottom to the keyboard's top
+    /// when an input takes focus, so rows or a pager below the box push it off
+    /// the top of the screen (measured: ~10 card lines below an input is
+    /// enough). The androids' order, not the form's contents, is the subject.
+    #[test]
+    fn list_cards_keep_the_search_box_at_the_end() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+
+        // `/dir`: nothing follows the search box.
+        let dirs: Vec<String> = (1..=7).map(|i| format!("/work/p{i}")).collect();
+        let card = build_dir_card(&key, &dirs, None, "", 1);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements.last().unwrap()["name"],
+            "dir_search",
+            "the dir search box is last: {card}"
+        );
+
+        // `/switch`: only the ＋new footer follows it.
+        let sessions = vec![crate::backend::types::SessionListInfo {
+            id: "ses_alpha01".into(),
+            title: "重写登录".into(),
+            directory: "/work/auth".into(),
+            parent_id: None,
+            agent: None,
+            model: None,
+            time: None,
+        }];
+        let card = build_switch_card(&key, &sessions, "", SwitchScope::All, 1, None, None, &[]);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements[elements.len() - 2]["name"],
+            "switch_search",
+            "the switch search box sits just above the footer: {card}"
+        );
+        assert!(
+            elements.last().unwrap()["text"]["content"]
+                .as_str()
+                .is_some_and(|t| t.contains("新建会话")),
+            "the footer stays last: {card}"
+        );
+
+        // `/sub` with no children: the form follows the empty-state hint.
+        let card = build_child_card(&key, &[], &std::collections::HashMap::new(), "", 1, 0);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements.last().unwrap()["name"],
+            "sub_search",
+            "the sub search box is last: {card}"
         );
     }
 
