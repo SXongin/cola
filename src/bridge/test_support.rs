@@ -1703,7 +1703,10 @@ pub struct MockBackend {
     /// pick makes) until the returned semaphore is released, so a test can
     /// interleave a store change with the awaited catalog read.
     pub model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
-    /// Counts `model_surface` calls that reached [`Self::model_surface_gate`].
+    /// Holds **only the next** `model_surface` call, so a test can park an
+    /// older pick's catalog lookup while a newer pick completes.
+    pub next_model_surface_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Counts `model_surface` calls that reached the gate.
     pub model_surface_gate_entered: Arc<std::sync::atomic::AtomicUsize>,
     /// Holds the next durable `switch_session_model` calls (V2 semantics)
     /// until released, so a test can prove a pick runs its RPCs outside the
@@ -2065,6 +2068,7 @@ impl MockBackend {
             transcript_gate: std::sync::Mutex::new(None),
             transcript_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             model_surface_gate: std::sync::Mutex::new(None),
+            next_model_surface_gate: std::sync::Mutex::new(None),
             model_surface_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             switch_model_gate: std::sync::Mutex::new(None),
             switch_model_gate_entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -2490,6 +2494,15 @@ impl MockBackend {
     pub(crate) fn hold_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
         let gate = Arc::new(tokio::sync::Semaphore::new(0));
         *self.model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Hold **only the next** `model_surface` call. A concurrent second call
+    /// proceeds, so a test can let a newer pick finish while an older one's
+    /// catalog lookup is parked.
+    pub(crate) fn hold_next_model_surface(&self) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *self.next_model_surface_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -3491,10 +3504,16 @@ impl crate::backend::Backend for MockBackend {
                 ack_budget: query.ack_budget,
             });
         let gate = self
-            .model_surface_gate
+            .next_model_surface_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .take()
+            .or_else(|| {
+                self.model_surface_gate
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            });
         if let Some(gate) = gate {
             self.model_surface_gate_entered
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

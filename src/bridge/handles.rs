@@ -277,6 +277,16 @@ impl SessionsHandle {
         self.default_auto_accept
     }
 
+    /// The sequence key a pick uses: its session id, or a thread-scoped key for
+    /// a Pending Session (which has no session yet). The key only orders picks;
+    /// it never addresses the store.
+    fn pick_target_key(thread_key: &ThreadKey, session_id: Option<&str>) -> String {
+        match session_id {
+            Some(session_id) => session_id.to_string(),
+            None => format!("pending:{}:{}", thread_key.chat_id, thread_key.thread_id),
+        }
+    }
+
     /// Make the effort an accepted turn actually applied the current mirror
     /// fact. Compare-and-set against the pair read here, so a newer pick that
     /// moved the mirror wins. Returns whether the record may be removed: a
@@ -942,10 +952,19 @@ impl SessionsHandle {
             // Replaced while this pick was classified (or awaited its lookup).
             return Ok(PickOutcome::StateChanged);
         }
+        // The pending's pair and a model-only pick share one sequence, so an
+        // older lookup finishing after a newer pending pick cannot overwrite
+        // it (gate review).
+        let pick_gate = self.session_gates.gate(&Self::pick_target_key(thread_key, None));
+        let pick_seq = pick_gate.begin_pick();
         let mut variant = settings.variant.clone();
         let cleared = self
             .clear_variant_for_model(backend, &mut variant, model_spec)
             .await;
+        let _held = pick_gate.enter().await;
+        if !pick_gate.is_latest_pick(pick_seq) {
+            return Ok(PickOutcome::StateChanged);
+        }
         // A client without a thread-level provider axis (OpenCode) has nothing
         // to record: the pair's model is all that exists there, and its create
         // payload must stay provider-free (issue #910). The **neutral bucket**
@@ -1260,6 +1279,12 @@ impl SessionsHandle {
         {
             return Ok(PickOutcome::StateChanged);
         }
+        // Capture this pick before the catalog lookup: an older lookup that
+        // finishes after a newer pick must not overwrite it (gate review).
+        let pick_gate = self
+            .session_gates
+            .gate(&Self::pick_target_key(thread_key, snapshot.session_id.as_deref()));
+        let pick_seq = pick_gate.begin_pick();
         // A Pending Session has no session to switch: the `/think` clear (a
         // catalog read, outside any gate) and one pending-only CAS, bound to
         // the pending this read saw.
@@ -1269,6 +1294,10 @@ impl SessionsHandle {
             let cleared = self
                 .clear_variant_for_model(backend, &mut probe, model_spec)
                 .await;
+            let _held = pick_gate.enter().await;
+            if !pick_gate.is_latest_pick(pick_seq) {
+                return Ok(PickOutcome::StateChanged);
+            }
             let outcome = {
                 let mut store = self.store.lock().await;
                 store.set_mirror_pending(
@@ -1306,8 +1335,12 @@ impl SessionsHandle {
                 let cleared = self
                     .clear_variant_for_model(backend, &mut probe, model_spec)
                     .await;
-                let gate = self.session_gates.gate(&session_id);
-                let _held = gate.enter().await;
+                let _held = pick_gate.enter().await;
+                if !pick_gate.is_latest_pick(pick_seq) {
+                    // A newer `/model` or `/think` started while this catalog
+                    // read ran: it wins, and this one records nothing.
+                    return Ok(PickOutcome::StateChanged);
+                }
                 let Some(current) = self.session_settings(thread_key).await else {
                     return Ok(PickOutcome::NoTarget);
                 };
@@ -1336,8 +1369,10 @@ impl SessionsHandle {
             let cleared = self
                 .clear_variant_for_model(backend, &mut probe, model_spec)
                 .await;
-            let gate = self.session_gates.gate(&session_id);
-            let _held = gate.enter().await;
+            let _held = pick_gate.enter().await;
+            if !pick_gate.is_latest_pick(pick_seq) {
+                return Ok(PickOutcome::StateChanged);
+            }
             let Some(current) = self.session_settings(thread_key).await else {
                 return Ok(PickOutcome::NoTarget);
             };
@@ -1379,12 +1414,16 @@ impl SessionsHandle {
         // (`Backend::prompt` has no total response bound), so a pick — an ack
         // path — takes it with a bound instead of waiting behind a slow turn
         // (issue #910).
-        let switch = self.session_gates.gate(&session_id);
         let _switching = crate::bridge::session_gates::acquire_switch_bounded(
-            &switch,
+            &pick_gate,
             crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
         )
         .await?;
+        if !pick_gate.is_latest_pick(pick_seq) {
+            // A newer pick started while this one waited for the server's
+            // switch point; it owns the session's next selection.
+            return Ok(PickOutcome::StateChanged);
+        }
         let Some(base) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
@@ -1445,7 +1484,7 @@ impl SessionsHandle {
         // The mirror write is inside the same step, compare-and-set against the
         // state this pick read when it took the point.
         let written = {
-            let _held = switch.enter().await;
+            let _held = pick_gate.enter().await;
             let Some(current) = self.session_settings(thread_key).await else {
                 return Ok(PickOutcome::NoTarget);
             };
@@ -1526,7 +1565,17 @@ impl SessionsHandle {
         let Some((snapshot, pending_epoch)) = self.settings_and_pending_epoch(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
+        // A `/think` takes the same pick sequence as `/model`, so overlapping
+        // picks for one target apply in start order (gate review).
+        let pick_gate = self
+            .session_gates
+            .gate(&Self::pick_target_key(thread_key, snapshot.session_id.as_deref()));
+        let pick_seq = pick_gate.begin_pick();
         let Some(session_id) = snapshot.session_id.clone() else {
+            let _held = pick_gate.enter().await;
+            if !pick_gate.is_latest_pick(pick_seq) {
+                return Ok(PickOutcome::StateChanged);
+            }
             let written = self
                 .store
                 .lock()
@@ -1549,12 +1598,14 @@ impl SessionsHandle {
             // gate, so settings and the next prompt never wait on a server call
             // (issue #910). Ordering `/think` behind a `/model` (and back) is
             // what keeps the server and the mirror agreeing on the last pick.
-            let switch = self.session_gates.gate(&session_id);
             let _switching = crate::bridge::session_gates::acquire_switch_bounded(
-                &switch,
+                &pick_gate,
                 crate::bridge::session_gates::SWITCH_SETTLE_BOUND,
             )
             .await?;
+            if !pick_gate.is_latest_pick(pick_seq) {
+                return Ok(PickOutcome::StateChanged);
+            }
             let Some(base) = self.session_settings(thread_key).await else {
                 return Ok(PickOutcome::NoTarget);
             };
@@ -1610,7 +1661,7 @@ impl SessionsHandle {
                 }
             }
             let written = {
-                let _held = switch.enter().await;
+                let _held = pick_gate.enter().await;
                 self.store
                     .lock()
                     .await
@@ -1626,8 +1677,10 @@ impl SessionsHandle {
             };
             return Ok(pair_write_outcome(written));
         }
-        let gate = self.session_gates.gate(&session_id);
-        let _held = gate.enter().await;
+        let _held = pick_gate.enter().await;
+        if !pick_gate.is_latest_pick(pick_seq) {
+            return Ok(PickOutcome::StateChanged);
+        }
         let Some(current) = self.session_settings(thread_key).await else {
             return Ok(PickOutcome::NoTarget);
         };
