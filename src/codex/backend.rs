@@ -6107,6 +6107,11 @@ mod tests {
         // Touch the first entry, then add one more: the coldest is now index 1.
         fact.record(Some("/work/0"), Some("openai"));
         fact.record(Some("/work/last"), Some("openai"));
+        assert_eq!(
+            fact.by_directory.lock().expect("configured provider facts").len(),
+            MAX_CONFIGURED_PROVIDER_DIRECTORIES,
+            "the fact cache must remain capped"
+        );
         assert_eq!(fact.get("/work/0"), Some("openai".to_string()));
         assert_eq!(fact.get("/work/1"), None, "the coldest entry was evicted");
         assert_eq!(fact.get("/work/last"), Some("openai".to_string()));

@@ -2755,7 +2755,7 @@ impl App {
         if self.client.tracks_thread_provider() {
             self.normalize_pending_model_provider(&mut pending);
         }
-        let model_generation_at_activation = pending.model_provider_generation;
+        let model_generation_at_activation = pending.validated_provider_fact_generation;
         let model_before_activation = pending.model.clone();
         let variant_before_activation = pending.variant.clone();
         let entry = pending.into_entry(session.id.clone());
@@ -2838,13 +2838,13 @@ impl App {
         };
         let (model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
             model,
-            Some(pending.model_provider_generation.unwrap_or_default()),
+            Some(pending.validated_provider_fact_generation.unwrap_or_default()),
             self.client.provider_fact_generation(),
             self.client.neutral_provider_id(),
         );
         if stale {
             pending.model = Some(model);
-            pending.model_provider_generation = None;
+            pending.validated_provider_fact_generation = None;
         }
     }
 
@@ -4869,7 +4869,12 @@ impl App {
         // things — #910).
         let level = value.get("level").and_then(|v| v.as_str()).unwrap_or("");
         if level == crate::feishu::card::picker::PICKER_LEVEL_PROVIDER {
-            let back = picked != crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS;
+            // A Codex callback from a pre-#931 provider card is stale: its
+            // one-page surface has no provider navigation and must not render a
+            // back button that loops to the same model page. OpenCode continues
+            // to expose its real provider→model navigation tree.
+            let back = core.client.has_provider_navigation()
+                && picked != crate::feishu::card::picker::PICKER_BACK_TO_PROVIDERS;
             let (scope, selected) = if back {
                 (Some("provider"), Some(picked.as_str()))
             } else {

@@ -950,6 +950,13 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     /// serves probe answers from cache only); OpenCode ignores it.
     async fn model_surface(&self, query: ModelSurfaceQuery<'_>) -> ModelSurface;
 
+    /// Whether a `/model` provider option opens a real provider→model page.
+    /// Codex's provider is a config fact, so stale provider-navigation clicks
+    /// must not render an OpenCode-style back button there.
+    fn has_provider_navigation(&self) -> bool {
+        false
+    }
+
     /// Available models grouped by provider (`GET /provider`), for the `/model`
     /// card picker. Empty on failure (the card degrades to a text prompt).
     /// Kept for a client's own surface mapping and the `/think` variant read;

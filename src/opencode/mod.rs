@@ -250,6 +250,10 @@ impl Backend for OpenCodeBackend {
         OpenCodeBackend::model_surface(self, query).await
     }
 
+    fn has_provider_navigation(&self) -> bool {
+        true
+    }
+
     async fn session_info(&self, session_id: &str, directory: Option<&str>) -> Result<SessionInfo> {
         OpenCodeBackend::session_info(self, session_id, directory).await
     }

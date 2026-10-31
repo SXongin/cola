@@ -363,6 +363,10 @@ async fn model_picker_back_button_returns_to_providers() {
             models: vec![model_option("gpt-4o", &[])],
         },
     ]);
+    assert!(
+        crate::backend::Backend::has_provider_navigation(&backend),
+        "the OpenCode-shaped mock still exposes provider navigation"
+    );
     let (app, _platform) = build_app(cfg, backend).await;
     let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
     seed_entry(
@@ -786,6 +790,81 @@ async fn flat_model_surface_skips_the_provider_page_and_picks_the_model() {
         prompt_models.lock().await.as_slice(),
         &[Some("codex/gpt-5.1-codex".to_string())],
         "the picked ref is what the next turn carries"
+    );
+}
+
+/// An old Codex card may still send the provider-navigation level after the
+/// client switched to its one-page model surface. Rebuild the current page but
+/// do not attach an OpenCode-style back button that loops to the same page.
+#[tokio::test]
+async fn stale_codex_provider_navigation_has_no_back_button() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_model_surface(crate::backend::types::ModelSurface {
+            current: None,
+            scopes: vec![crate::backend::types::ModelScope {
+                id: "model".into(),
+                title: "模型".into(),
+                changeable: crate::backend::types::ChangeScope::ThisTurn,
+                pick: crate::backend::types::PickKind::Model,
+                options: vec![crate::backend::types::ModelOption {
+                    id: "gpt-5.1".into(),
+                    value: Some("openai/gpt-5.1".into()),
+                    ..Default::default()
+                }],
+                note: None,
+                free_text: None,
+                intro: None,
+            }],
+        });
+    let (app, _platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/work/cola".into(),
+            agent: None,
+            model: Some("openai/gpt-5.1".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    let result = app
+        .host_action(serde_json::json!({
+            "action": "model",
+            "level": crate::feishu::card::picker::PICKER_LEVEL_PROVIDER,
+            "chat_id": "chat_1",
+            "thread_id": "chat_1",
+            "value": "openai",
+        }))
+        .await
+        .expect("stale provider-navigation callback");
+    let card = result.card.expect("the callback rebuilds the current model page");
+    let rendered = card.to_string();
+    assert!(
+        rendered.contains("openai/gpt-5.1"),
+        "the model page stays usable: {rendered}"
+    );
+    assert!(
+        !rendered.contains("返回全部 provider") && !rendered.contains("__providers__"),
+        "a flat Codex surface has no provider page to return to: {rendered}"
+    );
+    assert!(
+        crate::bridge::test_support::card_buttons(&card)
+            .iter()
+            .all(|button| button["value"]["level"] != "provider"),
+        "the rebuilt page has no navigation button that can loop: {rendered}"
     );
 }
 

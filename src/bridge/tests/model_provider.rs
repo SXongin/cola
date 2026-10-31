@@ -683,7 +683,7 @@ async fn a_pending_mirror_write_cas_corrects_a_generation_change_after_check() {
         "the post-write CAS removes the provider prefix"
     );
     assert_eq!(
-        pending.model_provider_generation, None,
+        pending.validated_provider_fact_generation, None,
         "the corrected ref is not attributed to the replaced generation"
     );
 }
@@ -704,7 +704,7 @@ async fn pending_materialisation_neutralizes_a_stale_provider_generation() {
 
     let mut pending = PendingEntry::new(key(), "/work/cola");
     pending.model = Some("openai/gpt-5.1".into());
-    pending.model_provider_generation = Some(1);
+    pending.validated_provider_fact_generation = Some(1);
     seed_pending(&app, pending).await;
     generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -751,7 +751,7 @@ async fn activation_cas_corrects_a_provider_generation_change() {
     *app.materialise_before_activation.lock().await = Some(activation_gate.clone());
     let mut pending = PendingEntry::new(key(), "/work/cola");
     pending.model = Some("openai/gpt-5.1".into());
-    pending.model_provider_generation = Some(1);
+    pending.validated_provider_fact_generation = Some(1);
     seed_pending(&app, pending).await;
 
     let app_for_prompt = app.clone();

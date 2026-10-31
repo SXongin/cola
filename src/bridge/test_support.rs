@@ -1804,6 +1804,9 @@ pub struct MockBackend {
     /// The configured default model served by `configured_default_model` (the
     /// second rung of the `/think` effective-model resolution).
     pub default_model: Option<crate::backend::types::ModelInfo>,
+    /// Whether `/model` exposes a provider→model navigation tree (OpenCode's
+    /// shape). Codex's one-page surface has no stale provider drill target.
+    pub provider_navigation: bool,
     /// Whether this client owns a one-shot next-turn pending (Codex's shape):
     /// the mock defaults to OpenCode's per-prompt selection.
     pub next_turn_pending: bool,
@@ -2111,6 +2114,7 @@ impl MockBackend {
             model_surface_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             model_surface: None,
             default_model: None,
+            provider_navigation: true,
             next_turn_pending: false,
             tracks_thread_provider: false,
             known_thread_provider: None,
@@ -2286,6 +2290,7 @@ impl MockBackend {
     pub(crate) fn with_codex_capabilities(&mut self) -> &mut Self {
         self.next_turn_pending = true;
         self.tracks_thread_provider = true;
+        self.provider_navigation = false;
         self.provider_fact_generation
             .store(1, std::sync::atomic::Ordering::SeqCst);
         self
@@ -3137,6 +3142,10 @@ impl crate::backend::Backend for MockBackend {
 
     fn tracks_thread_provider(&self) -> bool {
         self.tracks_thread_provider
+    }
+
+    fn has_provider_navigation(&self) -> bool {
+        self.provider_navigation
     }
 
     /// The mock's neutral catalog bucket is Codex's (`codex`), so an
