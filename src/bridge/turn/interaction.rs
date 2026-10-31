@@ -251,9 +251,11 @@ impl Turn {
     ///
     /// Only the header: a surgical edit re-renders a block and the header, not
     /// the footer's context segment, so that half's cache stays the flush's.
-    pub(crate) async fn mark_header_shown(cards: &CardsHandle, session_id: &str) {
+    pub(crate) async fn mark_header_shown(cards: &CardsHandle, session_id: &str, card_id: &str) {
         let mut live = cards.cards.lock().await;
-        if let Some(card) = live.get_mut(session_id) {
+        if let Some(card) = live.get_mut(session_id)
+            && card.card_message_id.as_deref() == Some(card_id)
+        {
             card.last_header_sig = card.acc.header_sig();
         }
     }

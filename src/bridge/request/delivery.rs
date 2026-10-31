@@ -322,23 +322,42 @@ pub(crate) async fn resolve_blocks(
             handles.forget(id);
         }
     }
-    // Whether every card this resolution wrote now carries the post-resolution
-    // header: the eager repaints above must have landed before the render gate's
-    // cache may claim it, or a failed PATCH would leave the old block showing
-    // with no retry. A click's ack is the callback's own body and is delivered
-    // by construction (ADR-0038, rule 3), so it does not gate this.
-    let mut repainted = true;
+    // Which cards now carry the post-resolution header, so the render gate's
+    // cache may claim it for the card it describes. The eager repaints above
+    // must have landed — a failed PATCH leaves the old block showing and needs
+    // the next tick's retry. A click's ack is the callback's own body and is
+    // delivered by construction (ADR-0038, rule 3), so it counts as written.
+    let mut written: std::collections::HashSet<String> = patches.iter().map(|(id, _)| id.clone()).collect();
+    let clicked_written = match origin {
+        Origin::Click { clicked: Some(id) } if ack.is_some() => Some(id.to_string()),
+        _ => None,
+    };
     for (message_id, card) in patches {
         if let Err(e) = cards.feishu.update_message(&message_id, &card).await {
-            repainted = false;
+            written.remove(&message_id);
             tracing::warn!("resolved block repaint failed on {}: {}", message_id, e);
         }
     }
-    if post_resolution_header.is_some() && repainted {
-        // The ack carried that header instead of a flush, so the render gate's
-        // cache must follow — otherwise the next render tick re-sends the
-        // identical body and wipes an unsubmitted form answer (issue #917).
-        Turn::mark_header_shown(cards, host.as_deref().unwrap_or(session_id)).await;
+    if post_resolution_header.is_some() {
+        let session = host.as_deref().unwrap_or(session_id);
+        // The card the cache describes, read AFTER the writes: a card that did
+        // not carry the header must not have its signature advanced, or its
+        // receipt would wait for a content flush. `mark_header_shown` fences
+        // the card id again under its own lock, so a re-point in between
+        // cannot make the cache describe a card that never got it.
+        let current = {
+            let live = cards.cards.lock().await;
+            live.get(session)
+                .and_then(|card| card.card_message_id().map(str::to_string))
+        };
+        if let Some(current) = current
+            && (written.contains(&current) || clicked_written.as_deref() == Some(&current))
+        {
+            // The ack/re-patch carried that header instead of a flush, so the
+            // cache follows — otherwise the next render tick re-sends the
+            // identical body and wipes an unsubmitted form answer (issue #917).
+            Turn::mark_header_shown(cards, session, &current).await;
+        }
     }
     // The settlement rendered (or found nothing to render): release the
     // in-flight claim, so a standalone copy of the same request is left to

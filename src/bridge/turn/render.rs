@@ -2638,6 +2638,18 @@ async fn render_and_flush_inner(
             None => (super::state::LedgerChange::default(), false),
         }
     };
+    // The pass sampled `typing` before its network reads (so it could skip
+    // them). A question can surface meanwhile: re-read the fact, and let the
+    // background causes stand down for a form that arrived mid-pass too. The
+    // form's own flush builds from this accumulator, so it carries whatever
+    // the pass applied — suppressing this write loses nothing.
+    let typing = typing
+        || cards
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.awaits_typed_answer());
     let flush = if !mode.flushes() {
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
@@ -2646,9 +2658,7 @@ async fn render_and_flush_inner(
         || file_changed
         || header_changed
         || context_changed
-        || ledger.owes()
-        || liveness_changed
-        || entries_changed
+        || (!typing && (ledger.owes() || liveness_changed || entries_changed))
     {
         Turn::flush_card(cards, session_id).await
     } else {
