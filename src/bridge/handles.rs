@@ -275,12 +275,9 @@ pub(crate) enum ModelPickDecision {
     /// re-verified at the write.
     Record {
         target: PickTarget,
-        /// The provider-fact generation used for prefix validation. When it is
-        /// stale at the write, the model is stored through the neutral bucket.
-        provider_generation: Option<u64>,
-        /// The known thread/config provider, used only to render a neutral
-        /// model pick on the same still-current generation.
-        current_provider: Option<String>,
+        /// The provider and its generation used for prefix validation. When it
+        /// is stale at the write, the model is stored through the neutral bucket.
+        provider_fact: Option<crate::backend::types::ProviderFactSnapshot>,
     },
     /// The named provider differs from a determinable current channel: say why,
     /// record nothing and send nothing.
@@ -964,7 +961,7 @@ impl SessionsHandle {
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         expected_epoch: u64,
-        expected_provider_generation: Option<u64>,
+        provider_fact: Option<crate::backend::types::ProviderFactSnapshot>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
@@ -998,8 +995,11 @@ impl SessionsHandle {
             // Catalog/variant validation may have awaited while the daemon
             // attachment changed. A stale channel is no longer attributable:
             // retain only the model id in Codex's neutral bucket.
-            let (model_spec, stale_before_write) =
-                model_spec_for_current_provider_generation(backend, expected_provider_generation, model_spec);
+            let (model_spec, stale_before_write) = model_spec_for_current_provider_generation(
+                backend,
+                provider_fact.as_ref().map(|fact| fact.generation),
+                model_spec,
+            );
             let first = store.set_mirror_pending(
                 thread_key,
                 expected_epoch,
@@ -1010,7 +1010,7 @@ impl SessionsHandle {
                     clear_variant: cleared.as_deref(),
                 },
                 (!stale_before_write)
-                    .then_some(expected_provider_generation)
+                    .then(|| provider_fact.as_ref().map(|fact| fact.generation))
                     .flatten(),
                 deadline,
             )?;
@@ -1026,12 +1026,14 @@ impl SessionsHandle {
                 _ => None,
             };
             if let Some(cleared_variant) = cleared_variant
-                && expected_provider_generation
+                && provider_fact
+                    .as_ref()
+                    .map(|fact| fact.generation)
                     .is_some_and(|generation| backend.provider_fact_generation() != generation)
             {
                 let (neutral_model, _) = model_spec_for_current_provider_generation(
                     backend,
-                    expected_provider_generation,
+                    provider_fact.as_ref().map(|fact| fact.generation),
                     model_spec.as_str(),
                 );
                 let variant_after_write = if cleared_variant.is_some() {
@@ -1075,6 +1077,39 @@ impl SessionsHandle {
             | crate::bridge::session::MirrorVerdict::Moved
             | crate::bridge::session::MirrorVerdict::Changed => PickOutcome::StateChanged,
         })
+    }
+
+    /// CAS-correct a created Session's model mirror after materialisation found
+    /// that its validating provider generation expired during activation. A
+    /// newer `/model` pick wins because the write compares both mirrored fields.
+    pub(crate) async fn correct_created_model_if_unchanged(
+        &self,
+        thread_key: &ThreadKey,
+        session_id: &str,
+        expected_model: &str,
+        expected_variant: Option<&str>,
+        neutral_model: &str,
+    ) -> crate::error::Result<bool> {
+        let gate = self.session_gates.gate(session_id);
+        let _held = gate.enter().await;
+        let outcome = {
+            let mut store = self.store.lock().await;
+            store.set_mirror_live(
+                thread_key,
+                session_id,
+                Some(expected_model),
+                expected_variant,
+                crate::bridge::session::MirrorWrite::Model {
+                    model: neutral_model,
+                    clear_variant: None,
+                },
+                None,
+            )?
+        };
+        Ok(matches!(
+            settle_mirror(outcome, None).await?,
+            crate::bridge::session::MirrorVerdict::Applied { .. }
+        ))
     }
 
     /// Claim the thread's Pending Session for materialisation (issue #910): the
@@ -1175,8 +1210,7 @@ impl SessionsHandle {
             };
             return ModelPickDecision::Record {
                 target,
-                provider_generation: Some(fact.generation),
-                current_provider: fact.provider_id,
+                provider_fact: Some(fact),
             };
         }
         let Some(session_id) = settings.session_id else {
@@ -1194,8 +1228,7 @@ impl SessionsHandle {
             }
             return ModelPickDecision::Record {
                 target,
-                provider_generation: Some(fact.generation),
-                current_provider: fact.provider_id,
+                provider_fact: Some(fact),
             };
         };
         if backend.tracks_thread_provider() {
@@ -1212,14 +1245,12 @@ impl SessionsHandle {
             }
             return ModelPickDecision::Record {
                 target,
-                provider_generation: Some(fact.generation),
-                current_provider: fact.provider_id,
+                provider_fact: Some(fact),
             };
         }
         ModelPickDecision::Record {
             target: PickTarget::Live(session_id),
-            provider_generation: None,
-            current_provider: None,
+            provider_fact: None,
         }
     }
 
@@ -1385,8 +1416,7 @@ impl SessionsHandle {
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
-        expected_provider_generation: Option<u64>,
-        current_provider: Option<&str>,
+        provider_fact: Option<crate::backend::types::ProviderFactSnapshot>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
@@ -1407,7 +1437,7 @@ impl SessionsHandle {
                     backend,
                     thread_key,
                     pending_epoch.unwrap_or_default(),
-                    expected_provider_generation,
+                    provider_fact,
                     model_spec,
                     deadline,
                 )
@@ -1469,7 +1499,7 @@ impl SessionsHandle {
                 }
                 let (model_spec, _) = model_spec_for_current_provider_generation(
                     backend,
-                    expected_provider_generation,
+                    provider_fact.as_ref().map(|fact| fact.generation),
                     model_spec,
                 );
                 backend
@@ -1477,8 +1507,7 @@ impl SessionsHandle {
                         &session_id,
                         &model_spec,
                         probe.as_deref(),
-                        expected_provider_generation,
-                        current_provider,
+                        provider_fact,
                     )
                     .await?;
                 return Ok(PickOutcome::Applied {

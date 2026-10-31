@@ -489,6 +489,12 @@ pub struct App {
     /// it on; production has no switch and always stats.
     #[cfg(test)]
     pub(crate) check_missing_directories: std::sync::atomic::AtomicBool,
+    /// Test seam that pauses a Pending Session after its final provider-fact
+    /// normalization and before activation persists the new SessionEntry.
+    #[cfg(test)]
+    pub(crate) materialise_before_activation: Arc<tokio::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    #[cfg(test)]
+    pub(crate) materialise_activation_entered: Arc<tokio::sync::Notify>,
 }
 
 impl Deref for App {
@@ -1558,6 +1564,10 @@ impl App {
             turn_diff_sends: Arc::new(std::sync::Mutex::new(indexmap::IndexMap::new())),
             #[cfg(test)]
             check_missing_directories: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            materialise_before_activation: Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(test)]
+            materialise_activation_entered: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2745,16 +2755,71 @@ impl App {
         if self.client.tracks_thread_provider() {
             self.normalize_pending_model_provider(&mut pending);
         }
+        let model_generation_at_activation = pending.model_provider_generation;
+        let model_before_activation = pending.model.clone();
+        let variant_before_activation = pending.variant.clone();
         let entry = pending.into_entry(session.id.clone());
         let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
         // invalidated: `/switch` must see the just-created session. Scoped to
         // this creation's generation (issue #910): a thread that moved on while
         // we ran is not overwritten, and a replacement pending survives.
+        #[cfg(test)]
+        if let Some(gate) = self.materialise_before_activation.lock().await.clone() {
+            self.materialise_activation_entered.notify_one();
+            let permit = gate.acquire().await.expect("activation test gate closed");
+            permit.forget();
+        }
         if !self.activate_created(entry, generation).await? {
             return Err(crate::error::BridgeError::State(
                 "the thread moved on while its session was being created".to_string(),
             ));
+        }
+        if self.client.tracks_thread_provider()
+            && let Some(original_model) = model_before_activation.as_deref()
+        {
+            let expected_generation = Some(model_generation_at_activation.unwrap_or_default());
+            let mut stored_model = original_model.to_string();
+            // Activation persists the entry under the SessionStore lock. A
+            // provider generation can change while it waits there, so correct
+            // the now-live mirror afterwards with a model/variant CAS. Retry a
+            // few fact swaps without making a config read; churn ultimately
+            // converges to the neutral model ref.
+            for _ in 0..3 {
+                let generation_before = self.client.provider_fact_generation();
+                let (neutral_model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
+                    original_model,
+                    expected_generation,
+                    generation_before,
+                    self.client.neutral_provider_id(),
+                );
+                if stale && neutral_model != stored_model {
+                    match self
+                        .sessions_handle()
+                        .correct_created_model_if_unchanged(
+                            &thread_key,
+                            &session.id,
+                            &stored_model,
+                            variant_before_activation.as_deref(),
+                            &neutral_model,
+                        )
+                        .await
+                    {
+                        Ok(true) => stored_model = neutral_model,
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::warn!(
+                                session = %session.id,
+                                "materialise: could not correct a stale provider model ref: {error}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if self.client.provider_fact_generation() == generation_before {
+                    break;
+                }
+            }
         }
         // ADR-0041 + ADR-0023: a pending topic's cover still says
         // 「下一条消息创建」. Move its record onto the new session and re-render
@@ -4848,7 +4913,7 @@ impl App {
             };
         };
         use crate::bridge::handles::{ModelPickDecision, PickTarget};
-        let (target, pending_target, provider_generation, current_provider) = match core
+        let (target, pending_target, provider_fact) = match core
             .sessions_handle()
             .model_pick_decision(&core.client, thread_key, &parsed.provider_id)
             .await
@@ -4861,11 +4926,10 @@ impl App {
             }
             ModelPickDecision::Record {
                 target,
-                provider_generation,
-                current_provider,
+                provider_fact,
             } => {
                 let pending = matches!(target, PickTarget::Pending(_));
-                (target, pending, provider_generation, current_provider)
+                (target, pending, provider_fact)
             }
         };
         // The toast must say where a pick applies: a Pending Session's model
@@ -4876,8 +4940,7 @@ impl App {
                 core.pick_model_expecting(
                     thread_key,
                     Some(&session_id),
-                    provider_generation,
-                    current_provider.as_deref(),
+                    provider_fact,
                     picked,
                     Some(deadline),
                 )
@@ -4889,7 +4952,7 @@ impl App {
                         &core.client,
                         thread_key,
                         epoch,
-                        provider_generation,
+                        provider_fact,
                         picked,
                         Some(deadline),
                     )

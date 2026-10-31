@@ -437,9 +437,9 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         session_id: &str,
         model: &str,
         variant: Option<&str>,
-        expected_generation: Option<u64>,
-        current_provider: Option<&str>,
+        provider_fact: Option<crate::backend::types::ProviderFactSnapshot>,
     ) -> Result<()> {
+        let expected_generation = provider_fact.as_ref().map(|fact| fact.generation);
         let (mut model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
             model,
             expected_generation,
@@ -447,7 +447,9 @@ pub trait Backend: ServerLifecycle + Send + Sync {
             self.neutral_provider_id(),
         );
         if !stale
-            && let Some(provider) = current_provider
+            && let Some(provider) = provider_fact
+                .as_ref()
+                .and_then(|fact| fact.provider_id.as_deref())
             && let Some(parsed) = crate::backend::parsing::parse_model(&model)
             && self.is_neutral_provider(&parsed.provider_id)
         {
