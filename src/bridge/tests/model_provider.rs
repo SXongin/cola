@@ -173,6 +173,48 @@ async fn a_neutral_pending_pick_creates_the_thread_without_a_provider() {
     );
 }
 
+/// Spec #931 AC2 / #933 AC3: `codex/<id>` is accepted even when the channel is
+/// known, but a Pending Session's stored ref names its cached config provider.
+#[tokio::test]
+async fn a_neutral_pending_pick_uses_the_known_config_provider_for_its_ref() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_configured_provider("/work/cola", "openai");
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
+
+    send_command_in(
+        &app,
+        "/model codex/gpt-custom",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    assert!(
+        platform
+            .texts()
+            .await
+            .join("\n")
+            .contains("Model: codex/gpt-custom"),
+        "the neutral input remains accepted"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.as_deref()),
+        Some("openai/gpt-custom"),
+        "the Pending Session ref names its known current provider"
+    );
+}
+
 /// Spec #930: the **same** provider with another model is an ordinary pick on a
 /// live thread — no thread-level request and no refusal. On a next-turn client
 /// it records a one-shot pending and leaves the thread's current pair alone.

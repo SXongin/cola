@@ -256,14 +256,15 @@ fn provider_refusal(current: &str, picked: &str) -> String {
 /// daemon's current channel; the next turn resolves the actual provider.
 fn model_spec_for_current_provider_generation(
     backend: &Arc<dyn crate::backend::Backend>,
-    expected_generation: Option<u64>,
+    provider_fact: Option<&crate::backend::types::ProviderFactSnapshot>,
     model_spec: &str,
 ) -> (String, bool) {
     crate::backend::parsing::model_spec_for_provider_generation(
         model_spec,
-        expected_generation,
+        provider_fact.map(|fact| fact.generation),
         backend.provider_fact_generation(),
         backend.neutral_provider_id(),
+        provider_fact.and_then(|fact| fact.provider_id.as_deref()),
     )
 }
 
@@ -995,11 +996,8 @@ impl SessionsHandle {
             // Catalog/variant validation may have awaited while the daemon
             // attachment changed. A stale channel is no longer attributable:
             // retain only the model id in Codex's neutral bucket.
-            let (model_spec, stale_before_write) = model_spec_for_current_provider_generation(
-                backend,
-                provider_fact.as_ref().map(|fact| fact.generation),
-                model_spec,
-            );
+            let (model_spec, stale_before_write) =
+                model_spec_for_current_provider_generation(backend, provider_fact.as_ref(), model_spec);
             let first = store.set_mirror_pending(
                 thread_key,
                 expected_epoch,
@@ -1033,7 +1031,7 @@ impl SessionsHandle {
             {
                 let (neutral_model, _) = model_spec_for_current_provider_generation(
                     backend,
-                    provider_fact.as_ref().map(|fact| fact.generation),
+                    provider_fact.as_ref(),
                     model_spec.as_str(),
                 );
                 let variant_after_write = if cleared_variant.is_some() {
@@ -1497,11 +1495,8 @@ impl SessionsHandle {
                     // read ran: the newer command wins, retry.
                     return Ok(PickOutcome::StateChanged);
                 }
-                let (model_spec, _) = model_spec_for_current_provider_generation(
-                    backend,
-                    provider_fact.as_ref().map(|fact| fact.generation),
-                    model_spec,
-                );
+                let (model_spec, _) =
+                    model_spec_for_current_provider_generation(backend, provider_fact.as_ref(), model_spec);
                 backend
                     .record_pending_model_for_generation(
                         &session_id,

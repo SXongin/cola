@@ -84,6 +84,7 @@ pub(crate) fn model_spec_for_provider_generation(
     expected_generation: Option<u64>,
     current_generation: u64,
     neutral_provider: Option<&str>,
+    current_provider: Option<&str>,
 ) -> (String, bool) {
     let stale = expected_generation.is_some_and(|expected| expected != current_generation);
     if stale
@@ -91,6 +92,13 @@ pub(crate) fn model_spec_for_provider_generation(
         && let Some(model) = parse_model(spec)
     {
         return (join_model(neutral_provider, &model.id), true);
+    }
+    if let (Some(neutral_provider), Some(current_provider)) = (neutral_provider, current_provider)
+        && current_provider != neutral_provider
+        && let Some(model) = parse_model(spec)
+        && model.provider_id == neutral_provider
+    {
+        return (join_model(current_provider, &model.id), false);
     }
     (spec.to_string(), false)
 }
@@ -177,17 +185,27 @@ mod tests {
     #[test]
     fn stale_provider_fact_keeps_the_model_in_the_neutral_bucket() {
         assert_eq!(
-            model_spec_for_provider_generation("openai/gpt-5.1", Some(3), 4, Some("codex")),
+            model_spec_for_provider_generation("openai/gpt-5.1", Some(3), 4, Some("codex"), None),
             ("codex/gpt-5.1".to_string(), true)
         );
         assert_eq!(
-            model_spec_for_provider_generation("\"foo/bar\"/gpt", Some(3), 4, Some("codex")),
+            model_spec_for_provider_generation("\"foo/bar\"/gpt", Some(3), 4, Some("codex"), None),
             ("codex/gpt".to_string(), true),
             "a quoted provider is dropped without losing the model id"
         );
         assert_eq!(
-            model_spec_for_provider_generation("openai/gpt-5.1", Some(3), 3, Some("codex")),
+            model_spec_for_provider_generation("openai/gpt-5.1", Some(3), 3, Some("codex"), None),
             ("openai/gpt-5.1".to_string(), false)
+        );
+        assert_eq!(
+            model_spec_for_provider_generation("codex/gpt-x", Some(3), 3, Some("codex"), Some("openai")),
+            ("openai/gpt-x".to_string(), false),
+            "a neutral ref adopts the known current provider"
+        );
+        assert_eq!(
+            model_spec_for_provider_generation("codex/gpt-x", Some(3), 3, Some("codex"), None),
+            ("codex/gpt-x".to_string(), false),
+            "an unknown current provider keeps the neutral ref"
         );
     }
 
