@@ -1814,6 +1814,9 @@ pub struct MockBackend {
     /// What `configured_provider` answers, keyed by the exact `config/read`
     /// directory (the cache-only config fact).
     pub configured_providers: std::collections::HashMap<String, String>,
+    /// Current provider-fact cache generation (a test seam for a daemon
+    /// replacement between pick validation and its write).
+    pub provider_fact_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
@@ -2107,6 +2110,7 @@ impl MockBackend {
             tracks_thread_provider: false,
             known_thread_provider: None,
             configured_providers: std::collections::HashMap::new(),
+            provider_fact_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             applied_efforts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             pending_error: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2275,6 +2279,8 @@ impl MockBackend {
     pub(crate) fn with_codex_capabilities(&mut self) -> &mut Self {
         self.next_turn_pending = true;
         self.tracks_thread_provider = true;
+        self.provider_fact_generation
+            .store(1, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3126,8 +3132,34 @@ impl crate::backend::Backend for MockBackend {
         self.known_thread_provider.clone()
     }
 
+    async fn known_thread_provider_fact(
+        &self,
+        session_id: &str,
+    ) -> crate::backend::types::ProviderFactSnapshot {
+        crate::backend::types::ProviderFactSnapshot {
+            provider_id: self.known_thread_provider(session_id).await,
+            generation: self.provider_fact_generation(),
+        }
+    }
+
     fn configured_provider(&self, directory: &str) -> Option<String> {
         self.configured_providers.get(directory).cloned()
+    }
+
+    fn configured_provider_fact(&self, directory: &str) -> crate::backend::types::ProviderFactSnapshot {
+        crate::backend::types::ProviderFactSnapshot {
+            provider_id: self.configured_provider(directory),
+            generation: self.provider_fact_generation(),
+        }
+    }
+
+    fn provider_fact_generation(&self) -> u64 {
+        self.provider_fact_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn neutral_provider_id(&self) -> Option<&'static str> {
+        self.tracks_thread_provider.then_some("codex")
     }
 
     async fn record_pending_model(

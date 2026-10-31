@@ -296,7 +296,7 @@ impl CodexLifecycle {
     /// Snapshot the cache for the current attachment. A client keeps this Arc;
     /// invalidation swaps in a fresh one, so an old connection's in-flight
     /// `model_surface` can only write to its now-orphaned cache.
-    fn configured_provider_fact_snapshot(&self) -> Arc<super::backend::ConfiguredProviderFact> {
+    pub(crate) fn configured_provider_fact_snapshot(&self) -> Arc<super::backend::ConfiguredProviderFact> {
         self.configured_provider_fact
             .read()
             .expect("codex configured provider fact cache")
@@ -312,6 +312,33 @@ impl CodexLifecycle {
             .write()
             .expect("codex configured provider fact cache") =
             Arc::new(super::backend::ConfiguredProviderFact::default());
+    }
+
+    /// Commit a live pending pick while serialized with attachment replacement.
+    /// A stale/detached generation records the model in the neutral bucket in
+    /// lifecycle-owned pending state, which survives the replacement.
+    pub(crate) async fn record_pending_model_if_current_generation(
+        &self,
+        session_id: &str,
+        model: &str,
+        variant: Option<&str>,
+        expected_generation: Option<u64>,
+    ) -> crate::error::Result<()> {
+        let attached = self.attached.lock().await;
+        if let Some(client) = attached.as_ref().map(|attachment| &attachment.client)
+            && expected_generation.is_none_or(|generation| {
+                crate::backend::Backend::provider_fact_generation(client) == generation
+            })
+        {
+            return crate::backend::Backend::record_pending_model(client, session_id, model, variant).await;
+        }
+
+        let neutral = crate::backend::parsing::parse_model(model)
+            .map(|parsed| crate::backend::parsing::join_model("codex", &parsed.id))
+            .unwrap_or_else(|| model.to_string());
+        self.pending
+            .record_pending_model(session_id, &neutral, variant, None);
+        Ok(())
     }
 
     /// The control socket the lifecycle targets, rendered as the neutral base
@@ -1003,6 +1030,7 @@ impl ServerLifecycle for CodexLifecycle {
         // liveness probe drops the attachment and falls through to a re-attach,
         // which is what turns a stale socket into "unattached". The probe is a
         // read-only call in the pinned contract, never a signal to the daemon.
+        let mut provider_fact_invalidated = false;
         let identity = discovery::socket_identity(&self.environment.socket()).map_err(client_error)?;
         if let Some(identity) = identity {
             let mut slot = self.attached.lock().await;
@@ -1041,6 +1069,7 @@ impl ServerLifecycle for CodexLifecycle {
                 // The cached config provider described the connection just
                 // dropped; a replacement daemon may run a different one.
                 self.invalidate_configured_provider_fact();
+                provider_fact_invalidated = true;
             }
         }
 
@@ -1053,7 +1082,9 @@ impl ServerLifecycle for CodexLifecycle {
         // cache so its in-flight reads can only write to an orphaned cache; the
         // next attach starts unknown until its own `/model` read.
         self.attached.lock().await.take();
-        self.invalidate_configured_provider_fact();
+        if !provider_fact_invalidated {
+            self.invalidate_configured_provider_fact();
+        }
 
         // A discovered daemon is dialled; one behind a stale socket fails here
         // as unreachable (`Serverless`), which is exactly the case the start

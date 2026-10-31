@@ -147,6 +147,8 @@ impl Drop for PendingGuard {
 /// entry only makes that directory's channel "unknown", which records a
 /// model-only pick and lets the server answer (spec #930's residual limit).
 const MAX_CONFIGURED_PROVIDER_DIRECTORIES: usize = 8;
+static NEXT_CONFIGURED_PROVIDER_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 /// The `model_provider` each successful `config/read` named, keyed by the
 /// **exact directory** that read was scoped to (spec #930).
@@ -161,11 +163,21 @@ const MAX_CONFIGURED_PROVIDER_DIRECTORIES: usize = 8;
 /// from a prior daemon process can never validate a pick after a restart. A
 /// liveness-probe replacement clears it too (conservative: the next `/model`
 /// read repopulates it). Cache-only: the pick path never reads config.
-#[derive(Default)]
 pub(crate) struct ConfiguredProviderFact {
+    generation: u64,
     /// Least-recently-recorded first; a repeat read moves its directory to the
     /// back so the cap evicts the coldest entry.
     by_directory: Mutex<Vec<(String, String)>>,
+}
+
+impl Default for ConfiguredProviderFact {
+    fn default() -> Self {
+        Self {
+            generation: NEXT_CONFIGURED_PROVIDER_GENERATION
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            by_directory: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl ConfiguredProviderFact {
@@ -201,6 +213,23 @@ impl ConfiguredProviderFact {
             .find(|(entry, _)| entry == directory)
             .map(|(_, provider)| provider.clone())
     }
+
+    /// The immutable generation identifies this cache even after the lifecycle
+    /// has replaced its current Arc.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Pair a provider value with this cache's generation.
+    pub(crate) fn snapshot(
+        &self,
+        provider_id: Option<String>,
+    ) -> crate::backend::types::ProviderFactSnapshot {
+        crate::backend::types::ProviderFactSnapshot {
+            provider_id,
+            generation: self.generation,
+        }
+    }
 }
 
 /// The in-memory next-turn selections shared by every connection the lifecycle
@@ -227,7 +256,7 @@ impl PendingSelections {
         self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
     }
 
-    fn record_pending_model(
+    pub(crate) fn record_pending_model(
         &self,
         thread_id: &str,
         spec: &str,
@@ -2411,6 +2440,19 @@ impl Backend for CodexClient {
         self.configured_provider_fact.get(directory)
     }
 
+    fn configured_provider_fact(&self, directory: &str) -> crate::backend::types::ProviderFactSnapshot {
+        self.configured_provider_fact
+            .snapshot(self.configured_provider_fact.get(directory))
+    }
+
+    fn provider_fact_generation(&self) -> u64 {
+        self.configured_provider_fact.generation()
+    }
+
+    fn neutral_provider_id(&self) -> Option<&'static str> {
+        Some(MODEL_PROVIDER)
+    }
+
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
     /// bucket is not a channel, so it reads as unknown. A cold projection is
     /// unknown — deciding whether a provider comparison is relevant must not
@@ -2420,6 +2462,18 @@ impl Backend for CodexClient {
             .model(session_id)
             .map(|model| model.provider_id)
             .filter(|provider| provider != MODEL_PROVIDER)
+    }
+
+    async fn known_thread_provider_fact(
+        &self,
+        session_id: &str,
+    ) -> crate::backend::types::ProviderFactSnapshot {
+        self.configured_provider_fact.snapshot(
+            self.projections
+                .model(session_id)
+                .map(|model| model.provider_id)
+                .filter(|provider| provider != MODEL_PROVIDER),
+        )
     }
 
     /// Record the next new turn's selection (spec #922). Codex has no durable
@@ -3212,12 +3266,43 @@ impl Backend for CodexLifecycle {
             .get(directory)
     }
 
+    fn configured_provider_fact(&self, directory: &str) -> crate::backend::types::ProviderFactSnapshot {
+        let fact = self
+            .configured_provider_fact
+            .read()
+            .expect("codex configured provider fact cache")
+            .clone();
+        fact.snapshot(fact.get(directory))
+    }
+
+    fn provider_fact_generation(&self) -> u64 {
+        self.configured_provider_fact
+            .read()
+            .expect("codex configured provider fact cache")
+            .generation()
+    }
+
+    fn neutral_provider_id(&self) -> Option<&'static str> {
+        Some(MODEL_PROVIDER)
+    }
+
     /// The pending next-turn selection lives on the attached client (it must
     /// travel with the connection's projections), so the wrapper delegates. A
     /// missing attachment is a named error: `/model` and `/think` must not
     /// report a recorded pick the adapter never received.
     async fn record_pending_model(&self, session_id: &str, model: &str, variant: Option<&str>) -> Result<()> {
         Backend::record_pending_model(&self.current().await?, session_id, model, variant).await
+    }
+
+    async fn record_pending_model_for_generation(
+        &self,
+        session_id: &str,
+        model: &str,
+        variant: Option<&str>,
+        expected_generation: Option<u64>,
+    ) -> Result<()> {
+        self.record_pending_model_if_current_generation(session_id, model, variant, expected_generation)
+            .await
     }
 
     async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) -> Result<()> {
@@ -3267,6 +3352,19 @@ impl Backend for CodexLifecycle {
         match self.attached_client().await {
             Some(client) => Backend::known_thread_provider(&client, session_id).await,
             None => None,
+        }
+    }
+
+    async fn known_thread_provider_fact(
+        &self,
+        session_id: &str,
+    ) -> crate::backend::types::ProviderFactSnapshot {
+        match self.attached_client().await {
+            Some(client) => Backend::known_thread_provider_fact(&client, session_id).await,
+            None => {
+                let fact = self.configured_provider_fact_snapshot();
+                fact.snapshot(None)
+            }
         }
     }
 

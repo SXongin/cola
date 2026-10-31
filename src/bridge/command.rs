@@ -1498,7 +1498,10 @@ pub(crate) async fn handle_command(
                 crate::bridge::handles::ModelPickDecision::Refuse(text) => {
                     handles.flow.platform.reply_text(message_id, &text).await?;
                 }
-                crate::bridge::handles::ModelPickDecision::Record { target } => {
+                crate::bridge::handles::ModelPickDecision::Record {
+                    target,
+                    provider_generation,
+                } => {
                     use crate::bridge::handles::PickTarget;
                     let pending = matches!(target, PickTarget::Pending(_));
                     let outcome = match target {
@@ -1513,6 +1516,7 @@ pub(crate) async fn handle_command(
                                     &handles.flow.backend,
                                     &thread_key,
                                     Some(&session_id),
+                                    provider_generation,
                                     &name,
                                     None,
                                 )
@@ -1525,7 +1529,14 @@ pub(crate) async fn handle_command(
                             handles
                                 .flow
                                 .sessions
-                                .pick_pending_model(&handles.flow.backend, &thread_key, epoch, &name, None)
+                                .pick_pending_model(
+                                    &handles.flow.backend,
+                                    &thread_key,
+                                    epoch,
+                                    provider_generation,
+                                    &name,
+                                    None,
+                                )
                                 .await
                         }
                     };
