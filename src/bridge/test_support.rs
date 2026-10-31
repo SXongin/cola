@@ -1817,6 +1817,11 @@ pub struct MockBackend {
     /// Current provider-fact cache generation (a test seam for a daemon
     /// replacement between pick validation and its write).
     pub provider_fact_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Count of generation snapshots, for deterministic replacement races.
+    provider_fact_generation_reads: Arc<std::sync::atomic::AtomicUsize>,
+    /// Bump the generation immediately after this snapshot returns its old
+    /// value (zero disables the seam).
+    provider_generation_change_after_snapshot: Arc<std::sync::atomic::AtomicUsize>,
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
@@ -2111,6 +2116,8 @@ impl MockBackend {
             known_thread_provider: None,
             configured_providers: std::collections::HashMap::new(),
             provider_fact_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            provider_fact_generation_reads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            provider_generation_change_after_snapshot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             applied_efforts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             pending_error: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2295,6 +2302,17 @@ impl MockBackend {
     pub(crate) fn with_configured_provider(&mut self, directory: &str, provider: &str) -> &mut Self {
         self.configured_providers
             .insert(directory.to_string(), provider.to_string());
+        self
+    }
+
+    /// Deterministically race a provider snapshot against replacement: the
+    /// selected read returns its old generation, then advances the current one
+    /// before the caller continues.
+    pub(crate) fn change_provider_generation_after_snapshot(&mut self, read: usize) -> &mut Self {
+        self.provider_fact_generation_reads
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.provider_generation_change_after_snapshot
+            .store(read, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3154,8 +3172,22 @@ impl crate::backend::Backend for MockBackend {
     }
 
     fn provider_fact_generation(&self) -> u64 {
-        self.provider_fact_generation
-            .load(std::sync::atomic::Ordering::SeqCst)
+        let generation = self
+            .provider_fact_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let read = self
+            .provider_fact_generation_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if read
+            == self
+                .provider_generation_change_after_snapshot
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.provider_fact_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        generation
     }
 
     fn neutral_provider_id(&self) -> Option<&'static str> {

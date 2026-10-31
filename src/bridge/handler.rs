@@ -2682,6 +2682,7 @@ impl App {
         // selection is per-prompt (OpenCode) keeps applying the pending model
         // after creation, so its create body stays byte-identical.
         if self.client.tracks_thread_provider() {
+            self.normalize_pending_model_provider(&mut pending);
             input.model = pending
                 .model
                 .as_deref()
@@ -2703,6 +2704,12 @@ impl App {
             return Err(crate::error::BridgeError::State(
                 "the thread moved on while its session was being created".to_string(),
             ));
+        }
+        // `thread/start` is async and the daemon may have been replaced while
+        // it ran. Revalidate before applying picks and again before copying the
+        // ref into the durable SessionEntry.
+        if self.client.tracks_thread_provider() {
+            self.normalize_pending_model_provider(&mut pending);
         }
         // ADR-0041 + V2's durable selection: the pending's picks become
         // session switches now that a session exists (and on V1 the same
@@ -2735,6 +2742,9 @@ impl App {
                 )
                 .await;
         }
+        if self.client.tracks_thread_provider() {
+            self.normalize_pending_model_provider(&mut pending);
+        }
         let entry = pending.into_entry(session.id.clone());
         let thread_key = entry.thread_key.clone();
         // The core wrapper (not the raw store) so the session-list cache is
@@ -2752,6 +2762,25 @@ impl App {
         // card. No-op for lobby pendings and fallback-rooted topics.
         crate::bridge::topic::claim_pending_cover(&self.topic_handles(), &thread_key, &session.id).await;
         Ok(session.id)
+    }
+
+    /// A Pending Session's model ref is only provider-attributed while the
+    /// cache generation that validated it remains current. Persisted pendings
+    /// have no generation, so they intentionally fall back to the neutral ref.
+    fn normalize_pending_model_provider(&self, pending: &mut PendingEntry) {
+        let Some(model) = pending.model.as_deref() else {
+            return;
+        };
+        let (model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
+            model,
+            Some(pending.model_provider_generation.unwrap_or_default()),
+            self.client.provider_fact_generation(),
+            self.client.neutral_provider_id(),
+        );
+        if stale {
+            pending.model = Some(model);
+            pending.model_provider_generation = None;
+        }
     }
 
     /// Apply a Pending Session's picks to the session it just created, through
@@ -4819,7 +4848,7 @@ impl App {
             };
         };
         use crate::bridge::handles::{ModelPickDecision, PickTarget};
-        let (target, pending_target, provider_generation) = match core
+        let (target, pending_target, provider_generation, current_provider) = match core
             .sessions_handle()
             .model_pick_decision(&core.client, thread_key, &parsed.provider_id)
             .await
@@ -4833,9 +4862,10 @@ impl App {
             ModelPickDecision::Record {
                 target,
                 provider_generation,
+                current_provider,
             } => {
                 let pending = matches!(target, PickTarget::Pending(_));
-                (target, pending, provider_generation)
+                (target, pending, provider_generation, current_provider)
             }
         };
         // The toast must say where a pick applies: a Pending Session's model
@@ -4847,6 +4877,7 @@ impl App {
                     thread_key,
                     Some(&session_id),
                     provider_generation,
+                    current_provider.as_deref(),
                     picked,
                     Some(deadline),
                 )

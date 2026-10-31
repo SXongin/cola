@@ -258,16 +258,13 @@ fn model_spec_for_current_provider_generation(
     backend: &Arc<dyn crate::backend::Backend>,
     expected_generation: Option<u64>,
     model_spec: &str,
-) -> String {
-    let stale =
-        expected_generation.is_some_and(|generation| backend.provider_fact_generation() != generation);
-    if stale
-        && let Some(neutral_provider) = backend.neutral_provider_id()
-        && let Some(model) = crate::backend::parsing::parse_model(model_spec)
-    {
-        return crate::backend::parsing::join_model(neutral_provider, &model.id);
-    }
-    model_spec.to_string()
+) -> (String, bool) {
+    crate::backend::parsing::model_spec_for_provider_generation(
+        model_spec,
+        expected_generation,
+        backend.provider_fact_generation(),
+        backend.neutral_provider_id(),
+    )
 }
 
 /// What a `/model` pick needs before it is recorded (spec #930): the card form
@@ -281,6 +278,9 @@ pub(crate) enum ModelPickDecision {
         /// The provider-fact generation used for prefix validation. When it is
         /// stale at the write, the model is stored through the neutral bucket.
         provider_generation: Option<u64>,
+        /// The known thread/config provider, used only to render a neutral
+        /// model pick on the same still-current generation.
+        current_provider: Option<String>,
     },
     /// The named provider differs from a determinable current channel: say why,
     /// record nothing and send nothing.
@@ -998,9 +998,9 @@ impl SessionsHandle {
             // Catalog/variant validation may have awaited while the daemon
             // attachment changed. A stale channel is no longer attributable:
             // retain only the model id in Codex's neutral bucket.
-            let model_spec =
+            let (model_spec, stale_before_write) =
                 model_spec_for_current_provider_generation(backend, expected_provider_generation, model_spec);
-            store.set_mirror_pending(
+            let first = store.set_mirror_pending(
                 thread_key,
                 expected_epoch,
                 settings.model.as_deref(),
@@ -1009,8 +1009,61 @@ impl SessionsHandle {
                     model: &model_spec,
                     clear_variant: cleared.as_deref(),
                 },
+                (!stale_before_write)
+                    .then_some(expected_provider_generation)
+                    .flatten(),
                 deadline,
-            )?
+            )?;
+
+            // The lifecycle fact can be replaced independently of the session
+            // store. Re-check after the mirror mutation; if replacement won
+            // between the pre-check and this write, CAS the neutral ref over
+            // exactly the model/variant this pick just wrote.
+            let cleared_variant = match &first.written {
+                crate::bridge::session::MirrorVerdict::Applied { cleared_variant } => {
+                    Some(cleared_variant.clone())
+                }
+                _ => None,
+            };
+            if let Some(cleared_variant) = cleared_variant
+                && expected_provider_generation
+                    .is_some_and(|generation| backend.provider_fact_generation() != generation)
+            {
+                let (neutral_model, _) = model_spec_for_current_provider_generation(
+                    backend,
+                    expected_provider_generation,
+                    model_spec.as_str(),
+                );
+                let variant_after_write = if cleared_variant.is_some() {
+                    None
+                } else {
+                    settings.variant.as_deref()
+                };
+                let corrected = store.set_mirror_pending(
+                    thread_key,
+                    expected_epoch,
+                    Some(&model_spec),
+                    variant_after_write,
+                    crate::bridge::session::MirrorWrite::Model {
+                        model: &neutral_model,
+                        clear_variant: None,
+                    },
+                    None,
+                    deadline,
+                )?;
+                let written = match corrected.written {
+                    crate::bridge::session::MirrorVerdict::Applied { .. } => {
+                        crate::bridge::session::MirrorVerdict::Applied { cleared_variant }
+                    }
+                    other => other,
+                };
+                crate::bridge::session::MirrorWriteOutcome {
+                    written,
+                    deferred: corrected.deferred,
+                }
+            } else {
+                first
+            }
         };
         Ok(match settle_mirror(outcome, deadline).await? {
             crate::bridge::session::MirrorVerdict::Applied { cleared_variant } => {
@@ -1107,13 +1160,23 @@ impl SessionsHandle {
         };
         if backend.is_neutral_provider(provider) {
             // The neutral catalog bucket names no channel: never compared to
-            // the thread's provider, and accepted everywhere.
+            // the thread's provider, and accepted everywhere. Keep a matching
+            // fact only to preserve the existing provider-aware pending display.
+            let (target, fact) = if let Some(session_id) = settings.session_id.as_deref() {
+                (
+                    PickTarget::Live(session_id.to_string()),
+                    backend.known_thread_provider_fact(session_id).await,
+                )
+            } else {
+                (
+                    PickTarget::Pending(pending_epoch.unwrap_or_default()),
+                    backend.configured_provider_fact(&settings.directory),
+                )
+            };
             return ModelPickDecision::Record {
-                target: match settings.session_id {
-                    Some(session_id) => PickTarget::Live(session_id),
-                    None => PickTarget::Pending(pending_epoch.unwrap_or_default()),
-                },
-                provider_generation: None,
+                target,
+                provider_generation: Some(fact.generation),
+                current_provider: fact.provider_id,
             };
         }
         let Some(session_id) = settings.session_id else {
@@ -1123,15 +1186,16 @@ impl SessionsHandle {
             // eventual write to the same cache generation.
             let fact = backend.configured_provider_fact(&settings.directory);
             let target = PickTarget::Pending(pending_epoch.unwrap_or_default());
-            if let Some(configured) = fact.provider_id
+            if let Some(configured) = fact.provider_id.as_deref()
                 && configured != provider
                 && backend.provider_fact_generation() == fact.generation
             {
-                return ModelPickDecision::Refuse(provider_refusal(&configured, provider));
+                return ModelPickDecision::Refuse(provider_refusal(configured, provider));
             }
             return ModelPickDecision::Record {
                 target,
                 provider_generation: Some(fact.generation),
+                current_provider: fact.provider_id,
             };
         };
         if backend.tracks_thread_provider() {
@@ -1140,20 +1204,22 @@ impl SessionsHandle {
             // is already stale, treat the channel as unknown, not a mismatch.
             let fact = backend.known_thread_provider_fact(&session_id).await;
             let target = PickTarget::Live(session_id);
-            if let Some(current) = fact.provider_id
+            if let Some(current) = fact.provider_id.as_deref()
                 && current != provider
                 && backend.provider_fact_generation() == fact.generation
             {
-                return ModelPickDecision::Refuse(provider_refusal(&current, provider));
+                return ModelPickDecision::Refuse(provider_refusal(current, provider));
             }
             return ModelPickDecision::Record {
                 target,
                 provider_generation: Some(fact.generation),
+                current_provider: fact.provider_id,
             };
         }
         ModelPickDecision::Record {
             target: PickTarget::Live(session_id),
             provider_generation: None,
+            current_provider: None,
         }
     }
 
@@ -1313,12 +1379,14 @@ impl SessionsHandle {
     /// (another client may have changed it); a failed selection read means
     /// unknown, and since the switch replaces the whole ref, the variant is
     /// dropped rather than revived from the mirror.
+    #[allow(clippy::too_many_arguments)] // the provider-fact token is part of the model-pick CAS
     pub(crate) async fn pick_model_expecting(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         expected_provider_generation: Option<u64>,
+        current_provider: Option<&str>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
@@ -1333,41 +1401,28 @@ impl SessionsHandle {
         {
             return Ok(PickOutcome::StateChanged);
         }
+        if snapshot.session_id.is_none() {
+            return self
+                .pick_pending_model(
+                    backend,
+                    thread_key,
+                    pending_epoch.unwrap_or_default(),
+                    expected_provider_generation,
+                    model_spec,
+                    deadline,
+                )
+                .await;
+        }
         // Capture this pick before the catalog lookup: an older lookup that
         // finishes after a newer pick must not overwrite it (gate review).
         let pick_gate = self
             .session_gates
             .gate(&Self::pick_target_key(thread_key, snapshot.session_id.as_deref()));
         let pick_seq = pick_gate.begin_pick();
-        // A Pending Session has no session to switch: the `/think` clear (a
-        // catalog read, outside any gate) and one pending-only CAS, bound to
-        // the pending this read saw.
-        let Some(session_id) = snapshot.session_id.clone() else {
-            let expected_epoch = pending_epoch.unwrap_or_default();
-            let mut probe = snapshot.variant.clone();
-            let cleared = self
-                .clear_variant_for_model(backend, &mut probe, model_spec)
-                .await;
-            let _held = pick_gate.enter().await;
-            if !pick_gate.is_latest_pick(pick_seq) {
-                return Ok(PickOutcome::StateChanged);
-            }
-            let outcome = {
-                let mut store = self.store.lock().await;
-                store.set_mirror_pending(
-                    thread_key,
-                    expected_epoch,
-                    snapshot.model.as_deref(),
-                    snapshot.variant.as_deref(),
-                    MirrorWrite::Model {
-                        model: model_spec,
-                        clear_variant: cleared.as_deref(),
-                    },
-                    deadline,
-                )?
-            };
-            return Ok(mirror_verdict(settle_mirror(outcome, deadline).await?));
-        };
+        let session_id = snapshot
+            .session_id
+            .clone()
+            .expect("live target after the Pending Session branch");
         if !backend.keeps_session_selection() {
             // V1: the mirror is the whole decision. The clear is a catalog read
             // outside the gate; the state gate makes the write a
@@ -1412,7 +1467,7 @@ impl SessionsHandle {
                     // read ran: the newer command wins, retry.
                     return Ok(PickOutcome::StateChanged);
                 }
-                let model_spec = model_spec_for_current_provider_generation(
+                let (model_spec, _) = model_spec_for_current_provider_generation(
                     backend,
                     expected_provider_generation,
                     model_spec,
@@ -1423,6 +1478,7 @@ impl SessionsHandle {
                         &model_spec,
                         probe.as_deref(),
                         expected_provider_generation,
+                        current_provider,
                     )
                     .await?;
                 return Ok(PickOutcome::Applied {
@@ -1650,6 +1706,7 @@ impl SessionsHandle {
                     snapshot.model.as_deref(),
                     snapshot.variant.as_deref(),
                     MirrorWrite::Variant(variant.as_deref()),
+                    None,
                     None,
                 )?
                 .written;

@@ -438,18 +438,21 @@ pub trait Backend: ServerLifecycle + Send + Sync {
         model: &str,
         variant: Option<&str>,
         expected_generation: Option<u64>,
+        current_provider: Option<&str>,
     ) -> Result<()> {
-        let model =
-            if expected_generation.is_some_and(|generation| self.provider_fact_generation() != generation) {
-                self.neutral_provider_id()
-                    .and_then(|provider| {
-                        crate::backend::parsing::parse_model(model)
-                            .map(|parsed| crate::backend::parsing::join_model(provider, &parsed.id))
-                    })
-                    .unwrap_or_else(|| model.to_string())
-            } else {
-                model.to_string()
-            };
+        let (mut model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
+            model,
+            expected_generation,
+            self.provider_fact_generation(),
+            self.neutral_provider_id(),
+        );
+        if !stale
+            && let Some(provider) = current_provider
+            && let Some(parsed) = crate::backend::parsing::parse_model(&model)
+            && self.is_neutral_provider(&parsed.provider_id)
+        {
+            model = crate::backend::parsing::join_model(provider, &parsed.id);
+        }
         self.record_pending_model(session_id, &model, variant).await
     }
 

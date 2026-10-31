@@ -728,6 +728,7 @@ impl SharedCore {
         thread_key: &ThreadKey,
         expected_session: Option<&str>,
         expected_provider_generation: Option<u64>,
+        current_provider: Option<&str>,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<crate::bridge::handles::PickOutcome> {
@@ -737,6 +738,7 @@ impl SharedCore {
                 thread_key,
                 expected_session,
                 expected_provider_generation,
+                current_provider,
                 model_spec,
                 deadline,
             )

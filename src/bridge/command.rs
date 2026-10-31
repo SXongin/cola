@@ -1501,6 +1501,7 @@ pub(crate) async fn handle_command(
                 crate::bridge::handles::ModelPickDecision::Record {
                     target,
                     provider_generation,
+                    current_provider,
                 } => {
                     use crate::bridge::handles::PickTarget;
                     let pending = matches!(target, PickTarget::Pending(_));
@@ -1517,6 +1518,7 @@ pub(crate) async fn handle_command(
                                     &thread_key,
                                     Some(&session_id),
                                     provider_generation,
+                                    current_provider.as_deref(),
                                     &name,
                                     None,
                                 )
