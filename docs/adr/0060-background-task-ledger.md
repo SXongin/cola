@@ -327,3 +327,22 @@ the ledger write), so widening the caller adds no new write path.
 The Completion Notice keeps the rule that a chain cola did not start owes
 none: an external follow's card carries no Turn clock, and its 有新消息 send
 was its notification (ADR-0059's 2026-10-08 amendment).
+
+## Amendment (2026-10-31, #917): a card with an unanswered typed answer keeps its clock
+
+The yielded second exists to prove the wait is alive — "cola is still waiting,
+and here is how long". It stops when the card renders a free-text answer field
+nobody has submitted yet (`StreamAccumulator::awaits_typed_answer`): Feishu
+rebuilds `body.elements` on every card update, so a tick's PATCH wipes the text
+the operator is typing, and that text lives only in the client. A clock that
+kept repainting a card holding a half-typed answer is the observable "it
+refreshes by itself" of issue #917.
+
+The freeze is scoped to the **clock half** of a ledger read. `apply_ledger_read`
+returns both halves (`LedgerChange`): rows — membership, a row's words, an
+activity's fragment, a committed completion entry — are content and still
+refresh, as does the settlement that ends the wait. Only a rendered second
+crossing its cadence is dropped, for the yielded read and for the live path's
+whole-minute clock alike. A click-only question renders no input and keeps its
+second; so does every card that carries no unanswered form at all, which is the
+aliveness contract unchanged.

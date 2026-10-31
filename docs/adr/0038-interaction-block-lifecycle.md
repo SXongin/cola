@@ -238,3 +238,20 @@ it from the post-resolution claim set — otherwise the ladder would subtract th
 leftover count a second time and drop a still-claimed block. Rebuilds also stop
 naming the COUNT (`…另有待处理请求…`): the unclaimed requests are outside the
 claim registry, so how many survive cannot be observed from the snapshot.
+
+## Update (2026-10-31): a live form freezes the clock-only repaints (#917)
+
+Feishu rebuilds `body.elements` on every card update, and a form input's
+unsubmitted text lives only in the client — so **any** repaint of a card that
+renders a free-text answer field wipes what the operator typed. A card with an
+unanswered typed answer (`StreamAccumulator::awaits_typed_answer`: a live
+question field with a custom-answer box or a numeric form) is therefore never
+repainted for a clock-only reason: the live header's per-second tick (ADR-0014)
+or the yielded ledger's rendered second (ADR-0060) no longer owe a PATCH. This
+is the "a live block freezes the turn's content" rule reaching the write itself,
+not just the persisted mirror.
+
+The freeze is scoped to clocks: rendered content, an interaction's state
+(已选/✅), a completion entry and the settlement still flush, so the form never
+stalls the turn it is blocking on. A question answered only by clicking renders
+no input and keeps its clock, and a permission block never has one.

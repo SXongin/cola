@@ -137,6 +137,17 @@ and the map from the old numbers.
   (`src/feishu/card/mod.rs`) are **cola's own** budgets, not Feishu limits, and
   the doc comment there holds the evidence. A tool panel deliberately exceeds
   3000 chars, so its size is not a bug and splitting it buys nothing.
+- **`card-repaints`** — every card PATCH rebuilds `body.elements`, and a form
+  input's unsubmitted text lives only in the client, so **any** repaint wipes
+  what the operator is typing (issue #917). Two rules follow. A card that
+  renders an unanswered free-text answer field (`awaits_typed_answer`) is never
+  repainted for a **clock-only** cause — the live header's second or the yielded
+  ledger's rendered second (`LedgerCadence`); content, interactive state and
+  settlement still flush. And every card write must advance the render gate's
+  signature cache (`advance_sent_signatures`, `src/bridge/turn/flush.rs`): the
+  cache records what the card last SHOWED, so an out-of-band flush that renders
+  a new header without updating it makes the next render tick re-PATCH an
+  identical body — the "it refreshed by itself and ate my text" report.
 - **`info-probe`** — the generation is probed with `GET /api/info`, and the
   status alone cannot classify it: V1's web-UI catch-all serves `index.html` for
   every unknown path, so V1 answers 200 `text/html`. The rule — 200 + V2's JSON
