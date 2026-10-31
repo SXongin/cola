@@ -142,6 +142,33 @@ impl Drop for PendingGuard {
     }
 }
 
+/// The provider a successful `config/read` named, cached for the pick path
+/// (spec #930). Shared by every connection the lifecycle attaches, exactly like
+/// [`PendingSelections`], so a liveness-probe replacement does not lose a fact
+/// the user's `/model` card just read. Cache-only: a `/model` pick must decide
+/// whether its provider prefix matches the current channel without a request.
+#[derive(Default)]
+pub(crate) struct ProviderFact {
+    provider: Mutex<Option<String>>,
+}
+
+impl ProviderFact {
+    /// Remember a successful read's provider. An unknown answer (`None`, e.g. a
+    /// failed read) leaves the last known fact in place: the daemon's config
+    /// cannot have changed without a restart.
+    pub(crate) fn record(&self, provider: Option<&str>) {
+        let Some(provider) = provider.map(str::trim).filter(|provider| !provider.is_empty()) else {
+            return;
+        };
+        *self.provider.lock().expect("codex provider fact") = Some(provider.to_string());
+    }
+
+    /// The cached provider, or `None` when no read has succeeded yet.
+    pub(crate) fn get(&self) -> Option<String> {
+        self.provider.lock().expect("codex provider fact").clone()
+    }
+}
+
 /// The in-memory next-turn selections shared by every connection the lifecycle
 /// attaches (spec #922). A liveness-probe replacement drops the old
 /// `CodexClient` and builds a new one, but must not drop a pick the user just
@@ -2115,7 +2142,6 @@ fn neutral_session_input(directory: Option<&str>) -> CreateSessionInput {
         id: None,
         agent: None,
         model: None,
-        provider: None,
         location: directory.map(|directory| Location {
             directory: directory.to_string(),
         }),
@@ -2253,55 +2279,13 @@ impl Backend for CodexClient {
             .as_ref()
             .map(|location| location.directory.as_str())
             .filter(|directory| !directory.is_empty());
-        // Codex runs **one provider per process** (spec #922 correction,
-        // 2026-10-30): `thread/start { modelProvider }` on any other provider
-        // creates the thread, then refuses its first `turn/start` with
-        // `ModelProviderMismatch`. Refuse that by name here, before the
-        // request — no orphan thread, and a remedy the user can act on. The
-        // text form and a stale card both land here, so neither can carry an
-        // unusable pair past this check.
-        if let Some(requested) = input.provider.as_deref() {
-            // Bounded, and best-effort: a config read that fails must not
-            // block creation — Codex's own refusal is then the fallback.
-            match super::model_surface::read_config(
-                self.connection(),
-                cwd,
-                super::model_surface::CONFIG_READ_TIMEOUT,
-            )
-            .await
-            {
-                Ok(config) => {
-                    if let Some(configured) = config.configured_provider()
-                        && configured != requested
-                    {
-                        return Err(BridgeError::Client {
-                            client: "codex",
-                            detail: format!(
-                                "this Codex daemon's config sets model_provider = \"{configured}\", \
-                                 so a thread cannot be created on provider `{requested}`: Codex \
-                                 refuses every turn on a thread whose provider differs from the \
-                                 running config. Change model_provider in the daemon's config.toml \
-                                 ($CODEX_HOME/config.toml, default ~/.codex/config.toml) to \
-                                 `{requested}` and restart the daemon, or pick a model on \
-                                 `{configured}`."
-                            ),
-                        });
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    requested = %requested,
-                    "codex config/read failed before thread/start; creating the thread anyway \
-                     (Codex will refuse a mismatched provider itself): {error}"
-                ),
-            }
-        }
         let observed_stamp = self.projections.next_model_stamp();
-        // A Pending Session's provider/model pair is a creation fact (issue
-        // #910): `thread/start` takes both, and the provider has no other
-        // creation path.
+        // Creation carries the model only (spec #930): Codex's daemon runs one
+        // provider per process, and `modelProvider` is no longer a creation
+        // field cola sends. There is no config pre-flight: there is no
+        // provider choice left to validate.
         let thread_model = super::threads::ThreadModel {
             model: input.model.as_ref().map(|model| model.id.as_str()),
-            provider: input.provider.as_deref(),
         };
         let thread = self
             .threads()
@@ -2369,7 +2353,11 @@ impl Backend for CodexClient {
          或把配置改为 `start_server = \"auto\"`。"
     }
 
-    fn has_thread_provider(&self) -> bool {
+    fn owns_next_turn_pending(&self) -> bool {
+        true
+    }
+
+    fn tracks_thread_provider(&self) -> bool {
         true
     }
 
@@ -2380,6 +2368,13 @@ impl Backend for CodexClient {
     /// stays lexical, with no config read on the pick path (ADR-0092).
     fn is_neutral_provider(&self, provider: &str) -> bool {
         provider == MODEL_PROVIDER
+    }
+
+    /// The provider the last successful `config/read` named, cached by the
+    /// `/model` surface this client rendered. Cache-only: a pick must never
+    /// cost a request (spec #930).
+    fn configured_provider(&self) -> Option<String> {
+        self.provider_fact.get()
     }
 
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
@@ -2991,6 +2986,12 @@ impl Backend for CodexClient {
                     ..Default::default()
                 }
             });
+            // A successful read is the pick path's cached channel fact: a text
+            // `/model <provider>/<model>` can then reject a wrong prefix without
+            // a request (spec #930). An unknown read leaves the last fact alone.
+            if !config.read_failed {
+                self.provider_fact.record(config.configured_provider());
+            }
             (catalog, config)
         };
         let probes = if fast {
@@ -3151,14 +3152,25 @@ impl Backend for CodexLifecycle {
          或把配置改为 `start_server = \"auto\"`。"
     }
 
-    // The provider axis is a property of the *client kind*, so the wrapper can
-    // answer it without a connection (issue #910 follow-up).
-    fn has_thread_provider(&self) -> bool {
+    // Both capabilities are properties of the *client kind*, so the wrapper can
+    // answer them without a connection (issue #910 follow-up).
+    fn owns_next_turn_pending(&self) -> bool {
+        true
+    }
+
+    fn tracks_thread_provider(&self) -> bool {
         true
     }
 
     fn is_neutral_provider(&self, provider: &str) -> bool {
         provider == MODEL_PROVIDER
+    }
+
+    /// The cached config provider is shared with every connection this
+    /// lifecycle attaches (like the pending store), so it survives a
+    /// liveness-probe replacement and answers without a request.
+    fn configured_provider(&self) -> Option<String> {
+        self.provider_fact.get()
     }
 
     /// The pending next-turn selection lives on the attached client (it must
@@ -5646,10 +5658,6 @@ mod tests {
                 .expect("the current provider's probed group");
             assert_eq!(probed.id, "gpt-5.1-codex");
             assert_eq!(probed.callback_value(), "opencode-go/gpt-5.1-codex");
-            assert_eq!(
-                probed.provider, None,
-                "a probed row carries no provider callback field"
-            );
 
             assert!(
                 model.free_text.as_deref().unwrap().contains("opencode-go/<id>"),
@@ -5740,11 +5748,11 @@ mod tests {
         );
     }
 
-    /// Issue #908: a pair the bridge recorded but the thread has not run yet is
+    /// Issue #908: a model the bridge recorded but the thread has not run yet is
     /// **not** the current line. The current line is the thread's own pair; the
     /// recorded one is shown as 待应用, so the footer and the card agree.
     #[tokio::test]
-    async fn a_recorded_pair_is_pending_not_current() {
+    async fn a_recorded_model_is_pending_not_current() {
         use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
 
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
@@ -5878,10 +5886,6 @@ mod tests {
         );
         assert_eq!(probed_rows[0].callback_value(), "deepseek/deepseek-flash");
         assert_eq!(probed_rows[1].callback_value(), "deepseek/deepseek-v4-pro");
-        assert!(
-            probed_rows.iter().all(|option| option.provider.is_none()),
-            "a probed row carries no provider callback field"
-        );
         assert!(probed_rows.iter().all(|option| !option.disabled));
         assert!(
             !model.options.iter().any(|option| option
@@ -8408,26 +8412,18 @@ mod tests {
         server.wait_for_subscribers("thread-1", 1).await;
     }
 
-    /// Issue #910 acceptance 2: a Pending Session's provider + model pair is a
-    /// `thread/start` fact. `create_session` is the one path that carries it,
-    /// so a new thread starts on the chosen channel with the chosen model.
-    ///
-    /// Spec #922 correction (2026-10-30): the pair is only accepted on the
-    /// provider the daemon's own `model_provider` names.
+    /// Spec #930: creation carries the model only. `thread/start` has no
+    /// `modelProvider` (a provider is a config fact), and creation performs no
+    /// `config/read` pre-flight — there is no provider choice to validate.
     #[tokio::test]
-    async fn create_session_sends_the_chosen_model_and_provider() {
+    async fn create_session_sends_the_chosen_model_without_a_provider() {
         let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.set_config_read(json!({
-            "config": { "model_provider": "deepseek" },
-            "layers": []
-        }));
         let client = connect(&url).await;
 
         let input = crate::backend::types::CreateSessionInput {
             id: None,
             agent: None,
-            model: crate::backend::parsing::parse_model("codex/deepseek-v4-pro"),
-            provider: Some("deepseek".into()),
+            model: crate::backend::parsing::parse_model("deepseek/deepseek-v4-pro"),
             location: Some(crate::backend::types::Location {
                 directory: "/work/cola".into(),
             }),
@@ -8438,127 +8434,23 @@ mod tests {
         assert_eq!(params.len(), 1, "one thread/start: {params:?}");
         assert_eq!(params[0]["cwd"], "/work/cola");
         assert_eq!(
-            params[0]["modelProvider"], "deepseek",
-            "the provider is a creation fact: {params:?}"
-        );
-        assert_eq!(
             params[0]["model"], "deepseek-v4-pro",
-            "the paired model rides the same call: {params:?}"
+            "the chosen model rides the creation: {params:?}"
+        );
+        assert!(
+            params[0].get("modelProvider").is_none(),
+            "a provider is a config fact, never a creation field: {params:?}"
         );
         assert_eq!(
-            client
-                .projections
-                .model(&session.id)
-                .map(|model| model.provider_id),
-            Some("deepseek".to_string()),
-            "the created thread's ordered fact names the chosen provider"
+            server.config_read_calls(),
+            0,
+            "creation performs no config pre-flight"
         );
-        let read = server.config_read_params();
         assert_eq!(
-            read[0]["cwd"], "/work/cola",
-            "the pre-flight read is scoped to the creation directory: {read:?}"
+            client.projections.model(&session.id).map(|model| model.model_id),
+            Some("deepseek-v4-pro".to_string()),
+            "the created thread's ordered fact names the model"
         );
-
-        // The daemon is configured for another provider now: the picker alone
-        // still sends only the provider, but only a matching one is accepted.
-        server.set_config_read(json!({
-            "config": { "model_provider": "openai" },
-            "layers": []
-        }));
-        let input = crate::backend::types::CreateSessionInput {
-            id: None,
-            agent: None,
-            model: None,
-            provider: Some("openai".into()),
-            location: None,
-        };
-        Backend::create_session(&client, &input).await.expect("create");
-        let params = server.start_params();
-        assert_eq!(params[1], json!({ "modelProvider": "openai" }));
-    }
-
-    /// Spec #922 correction (2026-10-30): Codex refuses every turn on a thread
-    /// whose `modelProvider` differs from the daemon's own `model_provider`, so
-    /// a mismatched creation is refused **by name before `thread/start`** — no
-    /// orphan thread, and a remedy the user can act on.
-    #[tokio::test]
-    async fn create_session_refuses_a_provider_the_daemon_is_not_on() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        server.set_config_read(json!({
-            "config": { "model_provider": "opencode-go" },
-            "layers": []
-        }));
-        let client = connect(&url).await;
-
-        let input = crate::backend::types::CreateSessionInput {
-            id: None,
-            agent: None,
-            model: crate::backend::parsing::parse_model("deepseek/deepseek-flash"),
-            provider: Some("deepseek".into()),
-            location: Some(crate::backend::types::Location {
-                directory: "/work/cola".into(),
-            }),
-        };
-        let error = Backend::create_session(&client, &input)
-            .await
-            .expect_err("a mismatch is refused");
-        let text = error.to_string();
-        assert!(
-            text.starts_with("codex error:"),
-            "the adapter's named error shape: {text}"
-        );
-        for expected in [
-            "opencode-go",
-            "deepseek",
-            "model_provider",
-            "$CODEX_HOME/config.toml",
-            "restart the daemon",
-        ] {
-            assert!(text.contains(expected), "{expected:?} is in {text}");
-        }
-        assert!(
-            server.start_params().is_empty(),
-            "no thread was created: {:?}",
-            server.start_params()
-        );
-    }
-
-    /// A failed `config/read` must not block creation: the pre-flight is
-    /// best-effort, and Codex's own refusal is the fallback. The read is
-    /// bounded, so a wedged config read costs the creation that bound only —
-    /// the fake holds its answer far past the bound, so an unbounded read would
-    /// take the whole delay and fail the wall-clock assert.
-    #[tokio::test]
-    async fn create_session_proceeds_when_the_config_read_fails() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
-        // Test-config timeout is 200 ms; the answer is held far past it, so a
-        // pre-flight that waited for the answer could not return under the
-        // bound asserted below.
-        server.set_config_read_delay(Duration::from_secs(5));
-        let client = connect(&url).await;
-
-        let started = Instant::now();
-        let input = crate::backend::types::CreateSessionInput {
-            id: None,
-            agent: None,
-            model: None,
-            provider: Some("deepseek".into()),
-            location: None,
-        };
-        Backend::create_session(&client, &input).await.expect("create");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= crate::codex::model_surface::CONFIG_READ_TIMEOUT,
-            "the config read was really attempted, not skipped: {elapsed:?}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the pre-flight read is bounded at {:?}, well under the fake's 5s answer: \
-             it took {elapsed:?}",
-            crate::codex::model_surface::CONFIG_READ_TIMEOUT
-        );
-        assert_eq!(server.config_read_calls(), 1, "the read was attempted");
-        assert_eq!(server.start_params().len(), 1, "the thread is created anyway");
     }
 
     /// Issue #910 (extra finding): the subscription epoch counter never restarts,

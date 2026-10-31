@@ -316,7 +316,6 @@ impl OpenCodeBackend {
             id: None,
             agent: None,
             model: self.model.clone(),
-            provider: None,
             location: directory.map(|d| Location {
                 directory: d.to_string(),
             }),

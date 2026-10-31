@@ -260,6 +260,90 @@ async fn model_card_button_records_override() {
     assert_eq!(entry.model.as_deref(), Some("opencode/deepseek-v4-flash"));
 }
 
+/// Spec #930 acceptance 8/9 (OpenCode regression): its provider → model
+/// selection is real per-prompt state, so `/model <other-provider>/<model>`
+/// still changes both and is never refused as a "config fact".
+#[tokio::test]
+async fn opencode_text_model_still_changes_provider_and_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_models(vec![
+        crate::backend::types::ProviderModels {
+            provider: "opencode-go".into(),
+            models: vec![model_option("deepseek-v4-flash", &[])],
+        },
+        crate::backend::types::ProviderModels {
+            provider: "openrouter".into(),
+            models: vec![model_option("gpt-4o", &[])],
+        },
+    ]);
+    let prompt_models = backend.prompt_models.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+    seed_entry(
+        &app,
+        crate::config::SessionEntry {
+            client_id: crate::config::DEFAULT_CLIENT_ID.into(),
+            thread_key: key.clone(),
+            session_id: "ses_test".into(),
+            directory: "/tmp/aa".into(),
+            agent: None,
+            model: Some("opencode-go/deepseek-v4-flash".into()),
+            auto_accept: false,
+            topic_anchor: None,
+            topic_root: None,
+            variant: None,
+        },
+    )
+    .await;
+
+    send_command_in(
+        &app,
+        "/model openrouter/gpt-4o",
+        key.clone(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let text = platform.texts().await.join("\n");
+    assert!(text.contains("Model: openrouter/gpt-4o"), "{text}");
+    assert!(
+        !text.contains("配置事实"),
+        "OpenCode's provider is a real per-prompt choice: {text}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key)
+            .cloned()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("openrouter/gpt-4o"),
+        "the mirror names the new provider and model"
+    );
+
+    // The next prompt carries the selection per turn (OpenCode's shape).
+    app.handle_message(incoming(
+        "msg_prompt".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "hi".into(),
+        None,
+    ))
+    .await;
+    assert_eq!(
+        prompt_models.lock().await.as_slice(),
+        &[Some("openrouter/gpt-4o".to_string())],
+        "the provider/model rides the next prompt"
+    );
+}
+
 /// The model picker's back button (level `provider`, `__providers__`)
 /// returns to the full provider list, now carrying the session's current
 /// model line.

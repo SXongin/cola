@@ -8,7 +8,7 @@ use crate::backend::{PromptSkill, SkillInfo, TaskRetirementEnding};
 use crate::bridge::access::{Access, Decision, DenyReason};
 use crate::bridge::command;
 use crate::bridge::core::SharedCore;
-use crate::bridge::handles::{PickOutcome, PickReply, classify_pick};
+use crate::bridge::handles::{PickReply, classify_pick};
 use crate::bridge::session::PendingEntry;
 use crate::bridge::span;
 use crate::bridge::turn::PromptContext;
@@ -2515,7 +2515,7 @@ impl App {
                 // its adapter (spec #922): a steer carries no model field, and
                 // its fallback `turn/start` reads the adapter's pending. Sending
                 // the stored mirror here would re-send a consumed pick.
-                let next_turn_pending = self.client.has_thread_provider();
+                let next_turn_pending = self.client.owns_next_turn_pending();
                 let model = if next_turn_pending {
                     None
                 } else {
@@ -2677,21 +2677,11 @@ impl App {
         message_id: &str,
     ) -> crate::error::Result<String> {
         let mut input = self.client.new_session_input(Some(&pending.directory));
-        // A provider pick is a **creation** fact (spec #922): a Codex thread's
-        // provider is chosen only by `thread/start` (or, later, `thread/fork`);
-        // a live thread never resumes with one. It pairs with the model chosen
-        // beside it. `input.provider` stays `None` for a client with no
-        // provider axis, so OpenCode's create body is byte-identical.
-        if pending.provider.is_some() {
-            input.provider = pending.provider.clone();
-            input.model = pending
-                .model
-                .as_deref()
-                .and_then(crate::backend::parsing::parse_model);
-        } else if self.client.has_thread_provider() {
-            // A neutral-bucket pick (or any pairless pick on a provider-axis
-            // client) names only the model at creation: `thread/start` takes the
-            // bare id and must not carry `modelProvider` (issue #906).
+        // A Codex thread takes the model at creation; the provider is a config
+        // fact and never a creation field (spec #930). A client whose thread
+        // selection is per-prompt (OpenCode) keeps applying the pending model
+        // after creation, so its create body stays byte-identical.
+        if self.client.tracks_thread_provider() {
             input.model = pending
                 .model
                 .as_deref()
@@ -2808,8 +2798,8 @@ impl App {
         // Session's level therefore becomes the new thread's first **new** turn
         // pending (spec #922): it rides that `turn/start.effort` once, never
         // every later prompt. No model pending is recorded: the thread already
-        // started on the creation pair, so the card shows no 待应用.
-        if self.client.has_thread_provider()
+        // started on the creation model, so the card shows no 待应用.
+        if self.client.owns_next_turn_pending()
             && pending.variant.is_some()
             && let Err(e) = self
                 .client
@@ -4804,56 +4794,63 @@ impl App {
             return Some(Self::picker_pages_result(core, &thread_key, cards).await);
         }
 
-        // A **paired** pick names a provider *and* the model it must run
-        // (issue #910): a probed provider model, or a row of the provider
-        // scope. The path is decided by whether that provider differs from the
-        // thread's, never by which scope the row came from — a bare provider is
-        // not a valid pick.
-        let paired = value
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .filter(|provider| !provider.is_empty());
-        if let Some(provider) = paired {
-            return Some(
-                self.pick_paired_model(core, &thread_key, provider, &picked, store_deadline)
-                    .await,
-            );
-        }
-
         Some(
-            self.pick_model_ref(core, &thread_key, None, &picked, store_deadline)
+            self.pick_model_ref(core, &thread_key, &picked, store_deadline)
                 .await,
         )
     }
 
     /// A concrete **model-only** pick: record the override (and on a durable
     /// generation switch the session's model), carrying or clearing the
-    /// `/think` variant (ADR-0020), same as the `/model` text form. Nothing
-    /// thread-level happens: this is the same-provider path of issue #910.
+    /// `/think` variant (ADR-0020), same as the `/model` text form. The named
+    /// provider must name the current channel (or the neutral bucket, or be
+    /// unknown); a different one is refused before any request (spec #930).
     async fn pick_model_ref(
         &self,
         core: &Arc<SharedCore>,
         thread_key: &ThreadKey,
-        expected_session: Option<&str>,
         picked: &str,
         deadline: tokio::time::Instant,
     ) -> CardActionResult {
-        if crate::backend::parsing::parse_model(picked).is_none() {
+        let Some(parsed) = crate::backend::parsing::parse_model(picked) else {
             return CardActionResult {
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
             };
-        }
-        // The toast must say where a pick applies: a Pending Session's pair rides
-        // `thread/start`, while a live thread's is the next new turn (spec
-        // #922). `expected_session` is Some only on the live same-provider path.
-        let pending_target = core
-            .session_settings(thread_key)
+        };
+        use crate::bridge::handles::{ModelPickDecision, PickTarget};
+        let (target, pending_target) = match core
+            .sessions_handle()
+            .model_pick_decision(&core.client, thread_key, &parsed.provider_id)
             .await
-            .is_some_and(|settings| settings.session_id.is_none());
+        {
+            ModelPickDecision::Refuse(text) => {
+                return CardActionResult {
+                    card: None,
+                    toast: Some(text),
+                };
+            }
+            ModelPickDecision::Record { target } => {
+                let pending = matches!(target, PickTarget::Pending(_));
+                (target, pending)
+            }
+        };
+        // The toast must say where a pick applies: a Pending Session's model
+        // rides `thread/start`, while a live thread's is the next new turn
+        // (spec #922).
+        let outcome = match target {
+            PickTarget::Live(session_id) => {
+                core.pick_model_expecting(thread_key, Some(&session_id), picked, Some(deadline))
+                    .await
+            }
+            PickTarget::Pending(epoch) => {
+                core.sessions_handle()
+                    .pick_pending_model(&core.client, thread_key, epoch, picked, Some(deadline))
+                    .await
+            }
+        };
         let cleared_variant = match classify_pick(
-            core.pick_model_expecting(thread_key, expected_session, picked, Some(deadline))
-                .await,
+            outcome,
             "模型",
             crate::bridge::display::feishu_side_label(thread_key),
         ) {
@@ -4872,7 +4869,7 @@ impl App {
         // next-turn pending, not an applied switch (spec #922).
         let toast = if pending_target {
             format!("Model: {picked}（将在会话创建时生效）{extra}")
-        } else if core.client.has_thread_provider() {
+        } else if core.client.owns_next_turn_pending() {
             format!("Model: {picked}（已记录：将在下一条新消息生效）{extra}")
         } else {
             format!("Model: {picked}（下一条消息开始生效）{extra}")
@@ -4880,144 +4877,6 @@ impl App {
         CardActionResult {
             card: None,
             toast: Some(toast),
-        }
-    }
-
-    /// A **provider + model pair**. A provider is creation-only (spec #922):
-    /// only a Pending Session accepts it (it rides `thread/start`), while a
-    /// live thread's provider never changes. A live cross-provider pick is
-    /// refused from the cache with no request and points at `/new`; `/fork` is
-    /// the later, independent capability. A pick whose provider is the thread's
-    /// own is an ordinary model pick — no confirmation card, no resume.
-    async fn pick_paired_model(
-        &self,
-        core: &Arc<SharedCore>,
-        thread_key: &ThreadKey,
-        provider: &str,
-        model: &str,
-        deadline: tokio::time::Instant,
-    ) -> CardActionResult {
-        if model.trim().is_empty() {
-            // The pair is what makes the switch safe: the old model name on a
-            // new provider is a 404.
-            return CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "provider `{provider}` 需要同时选择模型（可点同一行的 model）"
-                )),
-            };
-        }
-        // Built from the two known fields, never re-parsed from a joined
-        // string: a provider id may itself contain `/` (issue #908).
-        let spec = crate::backend::parsing::join_model(provider, model);
-        let Some((settings, pending_epoch)) = core
-            .sessions_handle()
-            .settings_and_pending_epoch(thread_key)
-            .await
-        else {
-            return CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "{}还没有会话",
-                    crate::bridge::display::feishu_side_label(thread_key)
-                )),
-            };
-        };
-        // A Pending Session takes both halves at creation: `thread/start` carries
-        // `model` + `modelProvider` in one call.
-        if settings.session_id.is_none() {
-            return self
-                .save_pending_pair(
-                    core,
-                    thread_key,
-                    pending_epoch.unwrap_or_default(),
-                    provider,
-                    &spec,
-                    deadline,
-                )
-                .await;
-        }
-        // The rule is shared with the `/model` text form: a model-only pick is
-        // recorded; a live thread's different provider is refused from the cache
-        // with no request; nothing unclassifiable is recorded.
-        use crate::bridge::handles::{ModelPickDecision, PickTarget};
-        match core
-            .sessions_handle()
-            .model_pick_decision(&core.client, thread_key, provider)
-            .await
-        {
-            ModelPickDecision::Record { target } => match target {
-                PickTarget::Live(session_id) => {
-                    self.pick_model_ref(core, thread_key, Some(&session_id), &spec, deadline)
-                        .await
-                }
-                // The thread became a Pending Session while the pick was
-                // classified: record the pair (its provider is a creation
-                // fact), never a model-only write that drops it.
-                PickTarget::Pending(epoch) => {
-                    self.save_pending_pair(core, thread_key, epoch, provider, &spec, deadline)
-                        .await
-                }
-            },
-            ModelPickDecision::Refuse(text) => CardActionResult {
-                card: None,
-                toast: Some(text),
-            },
-        }
-    }
-
-    /// Record a Pending Session's provider + model pair (issue #910). Both
-    /// halves are stored — the model mirror names the pair, the pending carries
-    /// the provider for `thread/start` — and a write that did **not** land is
-    /// reported as a failure: a click that could not be saved must never answer
-    /// "Applied".
-    async fn save_pending_pair(
-        &self,
-        core: &Arc<SharedCore>,
-        thread_key: &ThreadKey,
-        expected_epoch: u64,
-        provider: &str,
-        spec: &str,
-        deadline: tokio::time::Instant,
-    ) -> CardActionResult {
-        // One write for both halves: a partial pair would be applied at thread
-        // creation, and the model is what makes the provider safe (issue #910).
-        match core
-            .sessions_handle()
-            .pick_pending_pair(
-                &core.client,
-                thread_key,
-                expected_epoch,
-                provider,
-                spec,
-                Some(deadline),
-            )
-            .await
-        {
-            Ok(PickOutcome::Applied { cleared_variant }) => CardActionResult {
-                card: None,
-                toast: Some(format!(
-                    "Provider: {provider}（模型 {spec}，将在会话创建时生效）{}",
-                    cleared_variant
-                        .map(|v| format!("（已清除思考等级 `{v}`）"))
-                        .unwrap_or_default()
-                )),
-            },
-            Ok(PickOutcome::StateChanged) => CardActionResult {
-                card: None,
-                toast: Some(
-                    "⚠️ 保存失败：会话正在创建或状态已变化，这次选择没有生效（可稍后在会话里重选）"
-                        .to_string(),
-                ),
-            },
-            Ok(_) => CardActionResult {
-                card: None,
-                toast: Some("⚠️ 保存失败：会话状态已变化，这次选择没有生效".to_string()),
-            },
-            Err(error) => CardActionResult {
-                card: None,
-                toast: Some(format!("⚠️ 保存失败：{error}")),
-            },
         }
     }
 

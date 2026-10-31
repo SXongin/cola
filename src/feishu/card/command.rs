@@ -803,7 +803,7 @@ pub(crate) async fn model_surface(
     // pick is a creation fact. Every other client keeps its per-prompt mirror.
     let pending = match settings
         .as_ref()
-        .filter(|_| handles.flow.backend.has_thread_provider())
+        .filter(|_| handles.flow.backend.owns_next_turn_pending())
         .and_then(|settings| settings.session_id.as_deref())
     {
         Some(session_id) => pending_label(&handles.flow.backend, session_id).await,

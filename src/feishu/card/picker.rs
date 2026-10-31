@@ -5,16 +5,12 @@ use super::shell::card_shell;
 use super::truncate_md;
 use super::with_callback_field;
 
-/// One picker option: the button's label, the callback value a click sends, and
-/// the provider a **model preset** pairs with (issue #910). The provider is an
-/// extra callback field, emitted only when set, so every other card's bytes are
-/// unchanged.
+/// One picker option: the button's label and the callback value a click sends.
 #[derive(Clone, Debug, Default)]
 struct PickerOption {
     label: String,
     value: String,
-    provider: Option<String>,
-    /// Listed, but not selectable (no valid pair to pick): a text row.
+    /// Listed, but not selectable: a text row.
     disabled: bool,
 }
 
@@ -23,7 +19,6 @@ impl From<(String, String)> for PickerOption {
         Self {
             label,
             value,
-            provider: None,
             disabled: false,
         }
     }
@@ -34,7 +29,6 @@ fn picker_option(option: &crate::backend::types::ModelOption) -> PickerOption {
     PickerOption {
         label: option.display_label().to_string(),
         value: option.callback_value().to_string(),
-        provider: option.provider.clone(),
         disabled: option.disabled,
     }
 }
@@ -79,13 +73,6 @@ pub(crate) const PICKER_BACK_TO_PROVIDERS: &str = "__providers__";
 /// handler's comparison cannot typo-silently break navigation.
 pub(crate) const PICKER_LEVEL_PROVIDER: &str = "provider";
 
-/// The callback `level` of a **provider selection** button (Codex's
-/// thread-level `modelProvider`, issue #910). It is deliberately not
-/// [`PICKER_LEVEL_PROVIDER`]: a click here switches a thread's channel, while
-/// that one drills into a provider's models — the same scope *name*, two
-/// different actions.
-pub(crate) const PICKER_LEVEL_PROVIDER_PICK: &str = "provider_switch";
-
 /// The callback `level` of a concrete model-ref button. A fixed tag, never the
 /// scope id: a scope's name is its identity, not a command, so no client's
 /// naming can turn a model pick into navigation.
@@ -98,7 +85,6 @@ fn scope_level(scope: &crate::backend::types::ModelScope) -> &str {
     use crate::backend::types::PickKind;
     match scope.pick {
         PickKind::DrillDown => PICKER_LEVEL_PROVIDER,
-        PickKind::Provider => PICKER_LEVEL_PROVIDER_PICK,
         PickKind::Model => PICKER_LEVEL_MODEL,
     }
 }
@@ -112,7 +98,6 @@ fn option_level(
     use crate::backend::types::PickKind;
     match option.pick.unwrap_or(scope.pick) {
         PickKind::DrillDown => PICKER_LEVEL_PROVIDER,
-        PickKind::Provider => PICKER_LEVEL_PROVIDER_PICK,
         PickKind::Model => PICKER_LEVEL_MODEL,
     }
 }
@@ -199,10 +184,8 @@ fn back_button(
     })
 }
 
-/// One option button: its label, its callback value, the `level` the handler
-/// dispatches on, and — for a model preset that pairs a model with a provider
-/// (#910) — that provider as an extra `provider` field. The field is omitted
-/// when unset, so every card without a pairing keeps its exact bytes.
+/// One option button: its label, its callback value and the `level` the handler
+/// dispatches on.
 fn option_button(
     thread_key: &crate::config::ThreadKey,
     action: &str,
@@ -218,9 +201,6 @@ fn option_button(
     });
     if let Some(l) = level {
         payload["level"] = json!(l);
-    }
-    if let Some(provider) = &option.provider {
-        payload["provider"] = json!(provider);
     }
     json!({
         "tag": "button",
@@ -523,10 +503,7 @@ fn grouped_page_windows<'a>(
     let mut rows = 0usize;
     let mut current_group: Option<&str> = None;
     for option in &scope.options {
-        let option_bytes = 200
-            + option.display_label().len() * 2
-            + option.callback_value().len()
-            + option.provider.as_deref().map_or(0, str::len);
+        let option_bytes = 200 + option.display_label().len() * 2 + option.callback_value().len();
         let mut group_changed = option.group.as_deref() != current_group;
         let mut heading_bytes = if group_changed {
             option.group.as_deref().map_or(0, |group| 100 + group.len())
@@ -649,11 +626,7 @@ fn chunk_picker_cards(
     // JSON) + the callback VALUE, which for a `/skill` row is the skill's exact
     // id — an unbudgeted id would let the card exceed Feishu's limit (spec #652,
     // ticket #655).
-    let button_bytes = |option: &PickerOption| {
-        200 + option.label.len() * 2
-            + option.value.len()
-            + option.provider.as_deref().map_or(0, |provider| provider.len())
-    };
+    let button_bytes = |option: &PickerOption| 200 + option.label.len() * 2 + option.value.len();
     while start < options.len() {
         // Estimate JSON bytes like the streaming splitter; bound the button
         // COUNT by the picker budget, not the streaming 150-component constant —
@@ -1818,14 +1791,6 @@ mod tests {
         serde_json::from_str(json).expect("the pinned card JSON parses")
     }
 
-    /// Every button element of one card, in render order.
-    fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
-        card["body"]["elements"]
-            .as_array()
-            .map(|elements| elements.iter().filter(|e| e["tag"] == "button").collect())
-            .unwrap_or_default()
-    }
-
     /// The OpenCode provider page is pinned byte-for-byte: any drift in the
     /// header, the current-model line, the intro or a button's callback payload
     /// fails, not just the fields one assertion happens to name.
@@ -2116,64 +2081,5 @@ mod tests {
             );
         }
         assert_eq!(total_buttons, 90, "every option keeps a button");
-    }
-
-    /// Issue #910: the callback tag follows the surface's declared pick kind,
-    /// not the scope id — a provider *selection* is not OpenCode's drill-down,
-    /// even though both scopes are named `provider`.
-    #[test]
-    fn a_provider_selection_is_not_a_provider_drill_down() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut pick = scope(
-            "provider",
-            "Provider（线程级：新线程 / resume）",
-            vec![ModelOption::new("deepseek")],
-        );
-        pick.pick = crate::backend::types::PickKind::Provider;
-        let cards = build_model_surface_cards(&key, &surface(None, vec![pick]), false);
-        let button = card_buttons(&cards[0]);
-        assert_eq!(button.len(), 1);
-        assert_eq!(button[0]["value"]["level"], PICKER_LEVEL_PROVIDER_PICK);
-        assert_eq!(button[0]["value"]["value"], "deepseek");
-
-        // The drill-down tag is unchanged, so OpenCode's navigation still works.
-        let drill = provider_scope("provider", "选择模型", vec![ModelOption::new("opencode")]);
-        let cards = build_model_surface_cards(&key, &surface(None, vec![drill]), false);
-        assert_eq!(
-            card_buttons(&cards[0])[0]["value"]["level"],
-            PICKER_LEVEL_PROVIDER
-        );
-    }
-
-    /// Issue #910: a paired option's provider rides the callback, and only
-    /// there — a model option without a pairing emits no such field, so every
-    /// other card's bytes stay identical.
-    #[test]
-    fn a_paired_provider_rides_the_model_button() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let model = scope(
-            "model",
-            "模型",
-            vec![
-                ModelOption {
-                    id: "deepseek-flash".into(),
-                    value: Some("codex/deepseek-flash".into()),
-                    provider: Some("deepseek".into()),
-                    ..Default::default()
-                },
-                ModelOption {
-                    id: "gpt-5.1".into(),
-                    value: Some("codex/gpt-5.1".into()),
-                    ..Default::default()
-                },
-            ],
-        );
-        let cards = build_model_surface_cards(&key, &surface(None, vec![model]), false);
-        let buttons = card_buttons(&cards[0]);
-        assert_eq!(buttons[0]["value"]["provider"], "deepseek");
-        assert!(
-            buttons[1]["value"].get("provider").is_none(),
-            "an unpaired model pick carries no provider field"
-        );
     }
 }

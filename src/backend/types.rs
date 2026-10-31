@@ -119,11 +119,6 @@ pub struct ModelOption {
     /// The option's identity in its scope — a model id on a model page, a
     /// provider id on a provider page.
     pub id: String,
-    /// The provider this option applies **together with** its model, when the
-    /// client declares such a pair (a Codex provider's `/models` row carries
-    /// `model` + `model_provider`). `None` means "the model only" — the pick
-    /// leaves the thread's provider as it is (issue #910).
-    pub provider: Option<String>,
     /// The model's declared variants (e.g. `["low", "medium", "high"]`),
     /// empty when it declares none. `GET /provider` serializes each model's
     /// variants as a Record keyed by variant id (`model.variants` →
@@ -171,11 +166,10 @@ impl ModelOption {
 
 /// What a pick on a scope's options does when the bridge receives it.
 ///
-/// It is stated by the surface rather than inferred from the scope id: Codex's
-/// `provider` scope is a **selection** (a thread-level provider), while
-/// OpenCode's is **navigation** (drill into that provider's models), and both
-/// are legitimately named `provider` (issues #908, #910). The card carries the
-/// distinction as the button's callback `level`.
+/// It is stated by the surface rather than inferred from the scope id: a
+/// `provider` scope can mean **navigation** (drill into that provider's
+/// models, OpenCode) and a model scope means a concrete selection. The card
+/// carries the distinction as the button's callback `level`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PickKind {
     /// A concrete model ref (`provider/model`) for the next turn — the default,
@@ -186,9 +180,6 @@ pub enum PickKind {
     /// surface, naming this scope and the tapped option (OpenCode's provider →
     /// model flow).
     DrillDown,
-    /// A thread-level provider id (Codex's `modelProvider`): applied when a
-    /// thread is created, or by resuming it — never per turn.
-    Provider,
 }
 
 /// What one axis of a client's model surface can offer, and where it may
@@ -363,14 +354,6 @@ pub struct CreateSessionInput {
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelInfo>,
-    /// The thread-level provider the new session must start on, when a client
-    /// has that axis (Codex's `thread/start.modelProvider`). It is paired with
-    /// [`Self::model`] — a Pending Session's provider pick rides the thread's
-    /// creation together with the model chosen beside it (issue #910). `None`
-    /// means the client's configured default; a client without the axis
-    /// (OpenCode) never sets it, so its create body is byte-identical.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<Location>,
 }
@@ -802,12 +785,11 @@ mod tests {
         assert!(SessionStatus::Retry.is_live());
     }
 
-    /// Issue #910: a client without a thread-level provider axis (OpenCode)
-    /// sends the creation body it always did. The `provider` field is **absent**
-    /// — not `null` — so the payload is byte-identical to before the field
-    /// existed, while the model's own `providerID` still travels inside the ref.
+    /// A creation body carries no provider field at all: a provider is a
+    /// config fact (spec #930), never a per-creation choice. The model's own
+    /// `providerID` still travels inside the ref.
     #[test]
-    fn a_create_session_input_without_a_provider_has_no_provider_key() {
+    fn a_create_session_input_has_no_provider_key() {
         let body = serde_json::to_value(CreateSessionInput {
             id: None,
             agent: None,
@@ -816,7 +798,6 @@ mod tests {
                 provider_id: "openai".into(),
                 variant: None,
             }),
-            provider: None,
             location: None,
         })
         .unwrap();

@@ -60,9 +60,9 @@ use crate::feishu;
 #[derive(Clone)]
 pub(crate) struct SessionsHandle {
     pub(crate) store: Arc<Mutex<SessionStore>>,
-    /// The per-session model/provider serialization points (issue #910): the
-    /// `/model` and `/think` writes take their session's gate and re-read before
-    /// writing, so a delayed pick cannot overwrite a switch's pair.
+    /// The per-session model/thinking-level serialization points (issue #910):
+    /// the `/model` and `/think` writes take their session's gate and re-read
+    /// before writing, so a delayed pick cannot overwrite a switch's model.
     pub(crate) session_gates: crate::bridge::session_gates::SessionGates,
     /// The 30 s session-list cache (`/switch`/`/attach`), invalidated by
     /// the write paths below. Private: [`Self::cached_session_list`] and
@@ -187,14 +187,14 @@ fn same_selection(
 
 /// A mirror write's outcome as the surface's pick result (issue #910): only an
 /// applied write is a pick; every refused arm says the state moved.
-fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome {
+fn mirror_verdict(written: crate::bridge::session::MirrorVerdict) -> PickOutcome {
     match written {
-        crate::bridge::session::PairWrite::Applied { cleared_variant, .. } => {
+        crate::bridge::session::MirrorVerdict::Applied { cleared_variant, .. } => {
             PickOutcome::Applied { cleared_variant }
         }
-        crate::bridge::session::PairWrite::Creating
-        | crate::bridge::session::PairWrite::Moved
-        | crate::bridge::session::PairWrite::Changed => PickOutcome::StateChanged,
+        crate::bridge::session::MirrorVerdict::Creating
+        | crate::bridge::session::MirrorVerdict::Moved
+        | crate::bridge::session::MirrorVerdict::Changed => PickOutcome::StateChanged,
     }
 }
 
@@ -207,14 +207,14 @@ fn pair_write_outcome(written: crate::bridge::session::PairWrite) -> PickOutcome
 async fn settle_mirror(
     outcome: crate::bridge::session::MirrorWriteOutcome,
     deadline: Option<tokio::time::Instant>,
-) -> crate::error::Result<crate::bridge::session::PairWrite> {
+) -> crate::error::Result<crate::bridge::session::MirrorVerdict> {
     if let (Some(receipt), Some(deadline)) = (outcome.deferred, deadline) {
         match receipt.settle_until(deadline).await {
             Some(Ok(())) => {}
             Some(Err(error)) => return Err(error.into()),
             None => {
                 // The write outlived the callback's bound; it still lands. The
-                // pair is already in memory, so the next message uses it even
+                // model is already in memory, so the next message uses it even
                 // though the click's confirmation raced the file.
                 tracing::warn!("mirror write still in flight at the card deadline");
             }
@@ -232,27 +232,34 @@ pub(crate) enum PickTarget {
     Live(String),
     /// The thread's Pending Session, identified by the store's pending epoch
     /// ([`crate::bridge::session::SessionStore::pending_epoch_for`]): a pick
-    /// there records the **pair** (its provider is a creation fact), and the
-    /// write refuses if `/new` replaced the pending in the meantime.
+    /// there records the **model only**, and the write refuses if `/new`
+    /// replaced the pending in the meantime.
     Pending(u64),
 }
 
-/// The refusal a provider pick on a live thread gets (spec #922): a provider is
-/// a creation fact, so `/new` is the actionable remedy. `/fork` is named as the
-/// independent capability it will become, never as a command to type today —
-/// cola has no `/fork` command yet (typing it is submitted as a prompt). Both
-/// the card toast and the text `/model` reply use this message.
-const PROVIDER_CREATION_ONLY: &str =
-    "provider 只能在新会话中选择：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。";
+/// The refusal a pick naming a provider other than the current channel gets
+/// (spec #930): a provider is a config fact, changed only by editing the
+/// daemon's config and restarting it. Both the card toast and the text
+/// `/model` reply use this message.
+const PROVIDER_IS_A_CONFIG_FACT: &str = "provider 是配置事实：由 Codex daemon 的 `$CODEX_HOME/config.toml`（`model_provider`）决定，改配置并重启 daemon 才能更换；`/model` 只换当前 provider 下的模型。";
 
-/// What a `/model` pick needs before it is recorded (issue #910): the card form
+/// Name both sides of a refused provider pick, so the user can see which
+/// channel the daemon really runs.
+fn provider_refusal(current: &str, picked: &str) -> String {
+    format!(
+        "{PROVIDER_IS_A_CONFIG_FACT}\n当前 provider：`{current}`；`{picked}` 只能改配置并重启 daemon 后使用。"
+    )
+}
+
+/// What a `/model` pick needs before it is recorded (spec #930): the card form
 /// and the text form (`/model <provider>/<model>`) obey one rule.
 pub(crate) enum ModelPickDecision {
-    /// A model-only pick (the provider is the thread's own): record it for
-    /// `target`, re-verified at the write.
+    /// A model-only pick (the provider names the current channel, the neutral
+    /// `codex` bucket, or is simply unknown): record it for `target`,
+    /// re-verified at the write.
     Record { target: PickTarget },
-    /// Not permitted (a different provider on a live thread) or not
-    /// classifiable: say why, record nothing.
+    /// The named provider differs from a determinable current channel: say why,
+    /// record nothing and send nothing.
     Refuse(String),
 }
 
@@ -288,7 +295,7 @@ impl SessionsHandle {
     }
 
     /// Make the effort an accepted turn actually applied the current mirror
-    /// fact. Compare-and-set against the pair read here, so a newer pick that
+    /// fact. Compare-and-set against the model read here, so a newer pick that
     /// moved the mirror wins. Returns whether the record may be removed: a
     /// store/persist failure keeps it for the next turn's retry. A missing
     /// mapping is terminal (nothing to write), so it also returns `true`.
@@ -676,7 +683,7 @@ impl SessionsHandle {
         // no model (spec #922). The accepted `/think` level stays on the
         // settings, so attach it here.
         if let Some(session_id) = settings.session_id.as_deref()
-            && backend.has_thread_provider()
+            && backend.tracks_thread_provider()
             && let Ok(Ok(info)) = tokio::time::timeout(
                 SESSION_INFO_TIMEOUT,
                 backend.session_info(
@@ -730,7 +737,7 @@ impl SessionsHandle {
 
     /// The model the NEXT turn will actually run, as `(provider, model)`.
     /// [`Self::effective_selection`]'s variant-blind view for the callers that
-    /// only need the pair.
+    /// only need the provider/model pair.
     pub(crate) async fn effective_model(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -834,7 +841,7 @@ impl SessionsHandle {
         provider: &str,
         model: &str,
     ) -> Option<Vec<String>> {
-        let (scope, selected) = if backend.has_thread_provider() {
+        let (scope, selected) = if backend.tracks_thread_provider() {
             (None, None)
         } else {
             (Some("provider"), Some(provider))
@@ -920,23 +927,19 @@ impl SessionsHandle {
         Ok(cleared)
     }
 
-    /// Apply a provider + model **pair** to a Pending Session in ONE store write
-    /// (issue #910): the model mirror (which names the pair), the thread-level
-    /// provider `thread/start` will carry, and the `/think` clear rule
-    /// (ADR-0020). The two halves must never be split across writes — a partial
-    /// pair would be applied at thread creation, and the model is the half that
-    /// makes the provider safe. `NoTarget` for a live session: a live thread's
-    /// provider is creation-only (spec #922), so this mirror never carries one.
+    /// Apply a **model-only** pick to a Pending Session in one store write
+    /// (spec #930): the model mirror and the `/think` clear rule (ADR-0020).
+    /// The provider is never written — it is a config fact, and a Pending
+    /// Session's creation takes only the model.
     ///
     /// `expected_epoch` is the pending the caller classified: a replacement
     /// pending (`/new`, `/dir`, the new-thread card) is an honest refusal, never
-    /// a pair written onto the replacement (issue #910).
-    pub(crate) async fn pick_pending_pair(
+    /// a model written onto the replacement (issue #910).
+    pub(crate) async fn pick_pending_model(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
         thread_key: &ThreadKey,
         expected_epoch: u64,
-        provider: &str,
         model_spec: &str,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::error::Result<PickOutcome> {
@@ -952,8 +955,8 @@ impl SessionsHandle {
             // Replaced while this pick was classified (or awaited its lookup).
             return Ok(PickOutcome::StateChanged);
         }
-        // The pending's pair and a model-only pick share one sequence, so an
-        // older lookup finishing after a newer pending pick cannot overwrite
+        // A pending model pick shares one sequence with every other pending
+        // pick, so an older lookup finishing after a newer one cannot overwrite
         // it (gate review).
         let pick_gate = self.session_gates.gate(&Self::pick_target_key(thread_key, None));
         let pick_seq = pick_gate.begin_pick();
@@ -965,23 +968,6 @@ impl SessionsHandle {
         if !pick_gate.is_latest_pick(pick_seq) {
             return Ok(PickOutcome::StateChanged);
         }
-        // A client without a thread-level provider axis (OpenCode) has nothing
-        // to record: the pair's model is all that exists there, and its create
-        // payload must stay provider-free (issue #910). The **neutral bucket**
-        // (`codex`) is not a channel either: recording it as `modelProvider`
-        // would send a reserved namespace to `thread/start` (#906's text form).
-        let write = if backend.has_thread_provider() && !backend.is_neutral_provider(provider) {
-            crate::bridge::session::MirrorWrite::Pair {
-                model: model_spec,
-                provider,
-                clear_variant: cleared.as_deref(),
-            }
-        } else {
-            crate::bridge::session::MirrorWrite::Model {
-                model: model_spec,
-                clear_variant: cleared.as_deref(),
-            }
-        };
         let outcome = {
             let mut store = self.store.lock().await;
             store.set_mirror_pending(
@@ -989,25 +975,28 @@ impl SessionsHandle {
                 expected_epoch,
                 settings.model.as_deref(),
                 settings.variant.as_deref(),
-                write,
+                crate::bridge::session::MirrorWrite::Model {
+                    model: model_spec,
+                    clear_variant: cleared.as_deref(),
+                },
                 deadline,
             )?
         };
         Ok(match settle_mirror(outcome, deadline).await? {
-            crate::bridge::session::PairWrite::Applied { cleared_variant } => {
+            crate::bridge::session::MirrorVerdict::Applied { cleared_variant } => {
                 PickOutcome::Applied { cleared_variant }
             }
             // A materialising pending, a vanished one, or a newer pick: honest
-            // "state changed" (never a claimed pair the creation cannot apply).
-            crate::bridge::session::PairWrite::Creating
-            | crate::bridge::session::PairWrite::Moved
-            | crate::bridge::session::PairWrite::Changed => PickOutcome::StateChanged,
+            // "state changed" (never a claimed model the creation cannot apply).
+            crate::bridge::session::MirrorVerdict::Creating
+            | crate::bridge::session::MirrorVerdict::Moved
+            | crate::bridge::session::MirrorVerdict::Changed => PickOutcome::StateChanged,
         })
     }
 
     /// Claim the thread's Pending Session for materialisation (issue #910): the
-    /// snapshot and the claim are taken under one lock, so a pair write in the
-    /// window before `thread/start` cannot claim a pair the creation will not
+    /// snapshot and the claim are taken under one lock, so a model write in the
+    /// window before `thread/start` cannot claim a model the creation will not
     /// apply.
     pub(crate) async fn claim_pending_for_creation(
         &self,
@@ -1062,10 +1051,15 @@ impl SessionsHandle {
         self.store.lock().await.set_agent(thread_key, session_id, agent)
     }
 
-    /// The rule both `/model` forms share (issue #910, spec #922): a model-only
-    /// pick is recorded directly; a provider pick on a live thread is refused
-    /// without any request, because a provider is creation-only. A Pending
-    /// Session is `Record` (the pair rides `thread/start`).
+    /// The rule both `/model` forms share (spec #930): a model-only pick is
+    /// recorded directly, but a provider other than the current channel is
+    /// refused **before any request** when that channel is determinable.
+    ///
+    /// The channel comes from the client's cache — the live thread's ordered
+    /// provider fact, or a Pending Session's cached `configured_provider`. An
+    /// unknown channel does not block: the model is recorded model-only and the
+    /// server's own model error is the fallback (the accepted residual limit).
+    /// The neutral `codex` bucket names no channel, so it is always accepted.
     pub(crate) async fn model_pick_decision(
         &self,
         backend: &Arc<dyn crate::backend::Backend>,
@@ -1079,24 +1073,39 @@ impl SessionsHandle {
                 "⚠️ 会话状态已变化（可能刚切换/创建），这次操作没有生效，请重试。".to_string(),
             );
         };
-        let Some(session_id) = settings.session_id.clone() else {
-            // A Pending Session: its pair rides `thread/start`, so the provider
-            // is a creation fact there.
+        if backend.is_neutral_provider(provider) {
+            // The neutral catalog bucket names no channel: never compared to
+            // the thread's provider, and accepted everywhere.
             return ModelPickDecision::Record {
-                target: PickTarget::Pending(pending_epoch.unwrap_or_default()),
+                target: match settings.session_id {
+                    Some(session_id) => PickTarget::Live(session_id),
+                    None => PickTarget::Pending(pending_epoch.unwrap_or_default()),
+                },
+            };
+        }
+        let Some(session_id) = settings.session_id else {
+            // A Pending Session: the cached config/read provider is the current
+            // channel. Without a cached read it is unknown — record, never
+            // block (spec #930's residual limit).
+            return match backend.configured_provider() {
+                Some(configured) if configured != provider => {
+                    ModelPickDecision::Refuse(provider_refusal(&configured, provider))
+                }
+                _ => ModelPickDecision::Record {
+                    target: PickTarget::Pending(pending_epoch.unwrap_or_default()),
+                },
             };
         };
-        // A live thread's provider is creation-only (spec #922): only a
-        // same-provider pick (or the neutral catalog bucket, which names no
-        // channel) may be recorded. The thread's own provider comes from the
-        // **cache**, so a refusal never sends a request — a cold projection is
-        // unknown, and an unknown provider is refused rather than probed.
-        if backend.has_thread_provider() && !backend.is_neutral_provider(provider) {
+        if backend.tracks_thread_provider() {
             return match backend.known_thread_provider(&session_id).await {
-                Some(current) if current == provider => ModelPickDecision::Record {
+                Some(current) if current != provider => {
+                    ModelPickDecision::Refuse(provider_refusal(&current, provider))
+                }
+                // Same provider, or unknown: record. Unknown must not block —
+                // the server's own refusal is the fallback (spec #930).
+                _ => ModelPickDecision::Record {
                     target: PickTarget::Live(session_id),
                 },
-                _ => ModelPickDecision::Refuse(PROVIDER_CREATION_ONLY.to_string()),
             };
         }
         ModelPickDecision::Record {
@@ -1312,7 +1321,7 @@ impl SessionsHandle {
                     deadline,
                 )?
             };
-            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
+            return Ok(mirror_verdict(settle_mirror(outcome, deadline).await?));
         };
         if !backend.keeps_session_selection() {
             // V1: the mirror is the whole decision. The clear is a catalog read
@@ -1322,10 +1331,10 @@ impl SessionsHandle {
             // A client with a thread-level provider axis (Codex) instead has a
             // one-shot next-turn window (spec #922). `/model` records the
             // pending in the adapter and **must not** write the store: the
-            // thread's current pair and effort stay the last accepted fact until
+            // thread's current model and effort stay the last accepted fact until
             // a new turn runs. The effort the pick keeps is the pending one when
             // a pick is already waiting, else the last accepted level.
-            if backend.has_thread_provider() {
+            if backend.owns_next_turn_pending() {
                 let intended_before = if backend.has_pending_selection(&session_id).await {
                     backend.pending_variant(&session_id).await
                 } else {
@@ -1396,7 +1405,7 @@ impl SessionsHandle {
                     deadline,
                 )?
             };
-            return Ok(pair_write_outcome(settle_mirror(outcome, deadline).await?));
+            return Ok(mirror_verdict(settle_mirror(outcome, deadline).await?));
         }
         // A durable generation's selection is server state (V2): the selection
         // read, the `/think` clear and `switch_session_model` are RPCs, and they
@@ -1510,7 +1519,7 @@ impl SessionsHandle {
             };
             settle_mirror(outcome, deadline).await?
         };
-        Ok(match pair_write_outcome(written) {
+        Ok(match mirror_verdict(written) {
             // A durable generation's clear happens on the session (the write
             // carries only the surviving variant): report it from there.
             PickOutcome::Applied {
@@ -1589,7 +1598,7 @@ impl SessionsHandle {
                     None,
                 )?
                 .written;
-            return Ok(pair_write_outcome(written));
+            return Ok(mirror_verdict(written));
         };
         if backend.keeps_session_selection() {
             // A durable generation's selection is server state: resolving it and
@@ -1675,7 +1684,7 @@ impl SessionsHandle {
                     )?
                     .written
             };
-            return Ok(pair_write_outcome(written));
+            return Ok(mirror_verdict(written));
         }
         let _held = pick_gate.enter().await;
         if !pick_gate.is_latest_pick(pick_seq) {
@@ -1695,7 +1704,7 @@ impl SessionsHandle {
         // as applied for the bridge to commit once (spec #922). The mirror
         // itself keeps the last accepted level until then, so 当前 never shows
         // an unaccepted 待应用 value.
-        if backend.has_thread_provider() {
+        if backend.owns_next_turn_pending() {
             backend
                 .record_pending_variant(&session_id, variant.as_deref())
                 .await?;
@@ -1716,7 +1725,7 @@ impl SessionsHandle {
                 None,
             )?
             .written;
-        Ok(pair_write_outcome(written))
+        Ok(mirror_verdict(written))
     }
 
     /// Apply an `/agent` pick: `agent: None` clears it (back to the server's
@@ -2480,9 +2489,9 @@ pub(crate) struct TurnHandles {
     /// The one owner of the on-disk layout (ADR-0090 §6). A Turn's flows reach
     /// the pid record, the restart notice and the Terminal Log root through it.
     pub(crate) layout: crate::state::StateLayout,
-    /// The per-session model/provider serialization points (issue #910): the
-    /// pre-flight takes its session's gate before deciding the pair the prompt
-    /// will run with.
+    /// The per-session model/thinking-level serialization points (issue #910):
+    /// the pre-flight takes its session's gate before deciding the selection
+    /// the prompt will run with.
     pub(crate) session_gates: crate::bridge::session_gates::SessionGates,
 }
 

@@ -1804,12 +1804,15 @@ pub struct MockBackend {
     /// The configured default model served by `configured_default_model` (the
     /// second rung of the `/think` effective-model resolution).
     pub default_model: Option<crate::backend::types::ModelInfo>,
-    /// Whether this client has a thread-level provider axis (issue #910): the
-    /// mock defaults to OpenCode's shape, so a Pending Session records no
-    /// provider and the create payload stays provider-free.
-    pub thread_provider: bool,
-    /// What `known_thread_provider` answers (the cache-only provider fact).
+    /// Whether this client owns a one-shot next-turn pending (Codex's shape):
+    /// the mock defaults to OpenCode's per-prompt selection.
+    pub next_turn_pending: bool,
+    /// Whether this client tracks a thread-level provider fact (Codex's shape).
+    pub tracks_thread_provider: bool,
+    /// What `known_thread_provider` answers (the cache-only thread fact).
     pub known_thread_provider: Option<String>,
+    /// What `configured_provider` answers (the cache-only config fact).
+    pub configured_provider: Option<String>,
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
@@ -1818,10 +1821,9 @@ pub struct MockBackend {
     /// When set, `record_pending_model` / `record_pending_variant` fail with
     /// this message, modelling a lifecycle with no attached client.
     pub pending_error: Arc<tokio::sync::Mutex<Option<String>>>,
-    /// Every `create_session` call's thread-level provider and model id (issue
-    /// #910): a Pending Session's creation picks.
-    #[allow(clippy::type_complexity)]
-    pub created_session_picks: Arc<tokio::sync::Mutex<Vec<(Option<String>, Option<String>)>>>,
+    /// Every `create_session` call's model id: a Pending Session's creation
+    /// pick. There is no provider half (spec #930).
+    pub created_session_models: Arc<tokio::sync::Mutex<Vec<Option<String>>>>,
     /// The context-window size `model_context_window` reports; `None`
     /// simulates a server that reports none (ADR-0044's used-only fallback).
     pub context_window: Option<i64>,
@@ -2100,12 +2102,14 @@ impl MockBackend {
             model_surface_queries: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             model_surface: None,
             default_model: None,
-            thread_provider: false,
+            next_turn_pending: false,
+            tracks_thread_provider: false,
             known_thread_provider: None,
+            configured_provider: None,
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             applied_efforts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             pending_error: Arc::new(tokio::sync::Mutex::new(None)),
-            created_session_picks: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            created_session_models: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             context_window: Some(100_000),
             context_window_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_model: None,
@@ -2265,15 +2269,23 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: the client has a thread-level provider axis (Codex's shape).
-    pub(crate) fn with_thread_provider(&mut self, provider: bool) -> &mut Self {
-        self.thread_provider = provider;
+    /// Scenario: the client is Codex-shaped — it owns a one-shot next-turn
+    /// pending *and* tracks a thread-level provider fact.
+    pub(crate) fn with_codex_capabilities(&mut self) -> &mut Self {
+        self.next_turn_pending = true;
+        self.tracks_thread_provider = true;
         self
     }
 
     /// Scenario: the client's cache-only thread provider fact.
     pub(crate) fn with_known_thread_provider(&mut self, provider: Option<&str>) -> &mut Self {
         self.known_thread_provider = provider.map(str::to_string);
+        self
+    }
+
+    /// Scenario: the client's cache-only configured provider fact.
+    pub(crate) fn with_configured_provider(&mut self, provider: Option<&str>) -> &mut Self {
+        self.configured_provider = provider.map(str::to_string);
         self
     }
 
@@ -2982,12 +2994,10 @@ impl crate::backend::Backend for MockBackend {
         crate::backend::types::CreateSessionInput {
             id: None,
             agent: None,
-            model: Some(crate::backend::types::ModelInfo {
-                id: "m".into(),
-                provider_id: "p".into(),
-                variant: None,
-            }),
-            provider: None,
+            // OpenCode-shaped by default: its selection rides each prompt, so
+            // the creation body names no model (a Codex-shaped client has the
+            // bridge set the Pending Session's model here instead).
+            model: None,
             location: directory.map(|d| crate::backend::types::Location {
                 directory: d.to_string(),
             }),
@@ -3002,10 +3012,10 @@ impl crate::backend::Backend for MockBackend {
             .lock()
             .await
             .push(input.location.as_ref().map(|l| l.directory.clone()));
-        self.created_session_picks.lock().await.push((
-            input.provider.clone(),
-            input.model.as_ref().map(|model| model.id.clone()),
-        ));
+        self.created_session_models
+            .lock()
+            .await
+            .push(input.model.as_ref().map(|model| model.id.clone()));
         let gate = self
             .create_session_gate
             .lock()
@@ -3094,8 +3104,12 @@ impl crate::backend::Backend for MockBackend {
         "请启动 OpenChamber（或手动 `opencode serve`），或把配置改为 `start_server = \"auto\"`。"
     }
 
-    fn has_thread_provider(&self) -> bool {
-        self.thread_provider
+    fn owns_next_turn_pending(&self) -> bool {
+        self.next_turn_pending
+    }
+
+    fn tracks_thread_provider(&self) -> bool {
+        self.tracks_thread_provider
     }
 
     /// The mock's neutral catalog bucket is Codex's (`codex`), so an
@@ -3107,6 +3121,10 @@ impl crate::backend::Backend for MockBackend {
 
     async fn known_thread_provider(&self, _session_id: &str) -> Option<String> {
         self.known_thread_provider.clone()
+    }
+
+    fn configured_provider(&self) -> Option<String> {
+        self.configured_provider.clone()
     }
 
     async fn record_pending_model(
