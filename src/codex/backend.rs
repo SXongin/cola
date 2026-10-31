@@ -292,6 +292,21 @@ impl PendingSelections {
             .get(thread_id)
             .cloned()
     }
+
+    /// Forget every entry a deleted thread owned: its next-turn pending and
+    /// any applied effort still waiting for the bridge. A deleted thread can
+    /// never accept a turn, so retaining either would leak state onto a future
+    /// thread that reuses the id.
+    fn forget(&self, thread_id: &str) {
+        self.pending
+            .lock()
+            .expect("codex pending selections")
+            .remove(thread_id);
+        self.applied
+            .lock()
+            .expect("codex applied efforts")
+            .remove(thread_id);
+    }
 }
 
 /// One thread's projection and the state of its subscription.
@@ -1100,6 +1115,10 @@ impl Projections {
                 .lock()
                 .expect("codex diff snapshots")
                 .remove(thread_id);
+            // A deleted thread keeps no next-turn pending or applied effort:
+            // nothing can consume them, and a re-created id must not inherit
+            // them (gate review).
+            self.pending.forget(thread_id);
         }
         self.cwds.lock().expect("codex thread cwds").remove(thread_id);
         self.releases
@@ -8631,6 +8650,49 @@ mod tests {
             Some(SubscriptionState::Live),
             "an old epoch cannot evict the re-created subscription"
         );
+    }
+
+    /// Spec #922 gate review: a deleted thread keeps no next-turn pending or
+    /// applied effort. Nothing can consume them, and a re-created id must not
+    /// inherit them.
+    #[tokio::test]
+    async fn deleting_a_thread_forgets_its_pending_and_applied_effort() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a thread to delete",
+        ));
+        let client = connect(&url).await;
+        client
+            .record_pending_model("thread-1", "openai/gpt-5.1", Some("high"))
+            .await
+            .expect("the pending model");
+        client
+            .projections
+            .pending
+            .record_applied_effort("thread-1", Some("high".into()));
+        assert!(client.projections.pending.has_pending("thread-1"));
+        assert_eq!(
+            client.projections.pending.applied_effort("thread-1"),
+            Some(Some("high".into()))
+        );
+
+        Backend::delete_session(&client, "thread-1")
+            .await
+            .expect("the delete");
+
+        assert!(
+            !client.projections.pending.has_pending("thread-1"),
+            "a deleted thread keeps no pending"
+        );
+        assert_eq!(
+            client.projections.pending.applied_effort("thread-1"),
+            None,
+            "a deleted thread keeps no applied effort"
+        );
+        assert_eq!(server.deleted_threads(), vec!["thread-1".to_string()]);
     }
 
     /// Ordinary subscription loss invalidates the model fact too: while cola

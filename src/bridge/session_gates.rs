@@ -86,6 +86,13 @@ pub(crate) struct SessionGate {
     /// Callers queued on [`Self::switch`] (test-only).
     #[cfg(test)]
     switch_waiting: std::sync::atomic::AtomicUsize,
+    /// The latest `/model` or `/think` pick that started for this session. A
+    /// pick captures this counter before its catalog lookup and refuses to
+    /// write if a newer pick started meanwhile, so an older lookup finishing
+    /// last cannot overwrite the newer choice. An in-flight pick holds this
+    /// gate's `Arc`, so overlapping picks share the counter even though the
+    /// registry keeps only weak references.
+    pick_seq: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SessionGate {
@@ -154,6 +161,19 @@ impl SessionGate {
     #[cfg(test)]
     pub(crate) fn switch_waiting(&self) -> usize {
         self.switch_waiting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stamp the start of this session's next pick and return its sequence.
+    /// Called before a catalog lookup, so a pick that finishes later can tell
+    /// a newer pick already started.
+    pub(crate) fn begin_pick(&self) -> u64 {
+        self.pick_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    }
+
+    /// Whether `seq` is still the latest pick for this session. The write that
+    /// applies the pick checks this under the session's gate.
+    pub(crate) fn is_latest_pick(&self, seq: u64) -> bool {
+        self.pick_seq.load(std::sync::atomic::Ordering::SeqCst) == seq
     }
 }
 

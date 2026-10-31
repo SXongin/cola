@@ -2,6 +2,27 @@
 /// model or effort to name, only the clear the next turn will apply.
 pub(crate) const PENDING_CLEAR_LABEL: &str = "清除思考等级";
 
+/// The display value for a live thread's next-turn pending selection, shared
+/// by `/status` and the model card so they cannot drift. A pending model is
+/// its adapter reference; an effort-only pending with no thread model fact
+/// shows the level itself; a reset-only marker shows the clear. `None` when
+/// nothing is pending.
+pub(crate) async fn pending_label(
+    backend: &std::sync::Arc<dyn crate::backend::Backend>,
+    session_id: &str,
+) -> Option<String> {
+    if let Some(model) = backend.pending_model(session_id).await {
+        return Some(model);
+    }
+    if !backend.has_pending_selection(session_id).await {
+        return None;
+    }
+    match backend.pending_variant(session_id).await {
+        Some(level) => Some(format!("思考等级 {level}")),
+        None => Some(PENDING_CLEAR_LABEL.to_string()),
+    }
+}
+
 /// Parsed slash command from user message text.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -1808,22 +1829,9 @@ pub(crate) async fn handle_command(
                         .unwrap_or_else(|| "未知".to_string());
                     lines.push(format!("当前：{current_line}"));
                     if handles.flow.backend.has_thread_provider()
-                        && handles.flow.backend.has_pending_selection(session_id).await
+                        && let Some(pending) = pending_label(&handles.flow.backend, session_id).await
                     {
-                        let pending = match handles.flow.backend.pending_model(session_id).await {
-                            Some(model) => Some(model),
-                            // A reset-only marker has neither a model nor an
-                            // effort; an effort-only pending with no thread
-                            // fact has nothing to display, so only the former
-                            // becomes the clear label.
-                            None if handles.flow.backend.pending_variant(session_id).await.is_none() => {
-                                Some(PENDING_CLEAR_LABEL.to_string())
-                            }
-                            None => None,
-                        };
-                        if let Some(pending) = pending {
-                            lines.push(format!("待应用：{pending}（下一条新消息生效）"));
-                        }
+                        lines.push(format!("待应用：{pending}（下一条新消息生效）"));
                     }
                 }
             }

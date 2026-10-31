@@ -23,7 +23,7 @@
 
 use serde_json::Value;
 
-use crate::bridge::command::{PENDING_CLEAR_LABEL, help_text, matches_keyword};
+use crate::bridge::command::{help_text, matches_keyword, pending_label};
 use crate::bridge::display::feishu_side_label;
 use crate::bridge::handles::CommandHandles;
 use crate::config::ThreadKey;
@@ -806,25 +806,7 @@ pub(crate) async fn model_surface(
         .filter(|_| handles.flow.backend.has_thread_provider())
         .and_then(|settings| settings.session_id.as_deref())
     {
-        Some(session_id) => {
-            let backend = &handles.flow.backend;
-            match backend.pending_model(session_id).await {
-                Some(pending) => Some(pending),
-                // An explicit `/think --reset` is a pending clear marker with
-                // no model or effort to name. It is still a next-turn pending,
-                // so the card says what the new turn will apply instead of
-                // silently omitting the 待应用 line (spec #922). An effort-only
-                // pending also lacks a display when no thread fact anchors it;
-                // its variant tells the two apart, so only a marker with
-                // neither model nor effort becomes the clear label.
-                None if backend.has_pending_selection(session_id).await
-                    && backend.pending_variant(session_id).await.is_none() =>
-                {
-                    Some(PENDING_CLEAR_LABEL.to_string())
-                }
-                None => None,
-            }
-        }
+        Some(session_id) => pending_label(&handles.flow.backend, session_id).await,
         None => None,
     };
     let session_id = settings.as_ref().and_then(|s| s.session_id.as_deref());

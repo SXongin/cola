@@ -942,6 +942,35 @@ async fn the_model_card_shows_the_adapters_pending_for_a_live_thread() {
     );
 }
 
+/// Spec #922 gate review: the model card names an effort-only pending even
+/// when no thread model fact can anchor a composed reference.
+#[tokio::test]
+async fn the_model_card_names_an_effort_only_pending_without_a_thread_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    backend
+        .pending_selections
+        .lock()
+        .await
+        .insert("ses_test".into(), (None, Some("high".into())));
+    let queries = backend.model_surface_queries.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    let handles = app.command_handles();
+    crate::feishu::card::command::model_surface(&handles, &key(), None, None, None).await;
+    let recorded = queries.lock().await;
+    let last = recorded.last().expect("the model-surface read");
+    assert_eq!(
+        last.pending.as_deref(),
+        Some("思考等级 high"),
+        "the card names the level when no model can anchor it"
+    );
+}
+
 /// Spec #922: a Pending Session's pick is a creation fact. The model card must
 /// show no 待应用 state for it.
 #[tokio::test]
@@ -2226,6 +2255,83 @@ async fn status_shows_the_live_current_and_pending_pair() {
     assert!(text.contains("会话：`ses_test`"), "{text}");
 }
 
+/// Spec #922 gate review: an older pick whose catalog lookup finishes after a
+/// newer pick started must not overwrite it.
+#[tokio::test]
+async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_thread_provider(true)
+        .with_models(vec![crate::backend::types::ProviderModels {
+            provider: "openai".into(),
+            models: vec![
+                model_option("model-a", &["low"]),
+                model_option("model-b", &["low"]),
+            ],
+        }]);
+    let gate = backend.hold_next_model_surface();
+    let entered = backend.model_surface_gate_entered.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let mut entry = entry();
+    entry.model = Some("openai/model-old".into());
+    entry.variant = Some("high".into());
+    seed_entry(&app, entry).await;
+
+    let handles = app.turn_handles();
+    let sessions = handles.sessions.clone();
+    let backend = handles.backend.clone();
+    let earlier = tokio::spawn({
+        let sessions = sessions.clone();
+        let backend = backend.clone();
+        async move {
+            sessions
+                .pick_model_expecting(&backend, &key(), Some("ses_test"), "openai/model-a", None)
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while entered.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the earlier catalog lookup never started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The later pick records while the earlier lookup is still parked.
+    let later = sessions
+        .pick_model_expecting(&backend, &key(), Some("ses_test"), "openai/model-b", None)
+        .await
+        .expect("the later pick");
+    assert!(
+        matches!(later, crate::bridge::handles::PickOutcome::Applied { .. }),
+        "the later pick applies: {later:?}"
+    );
+    assert_eq!(
+        backend.pending_model("ses_test").await.as_deref(),
+        Some("openai/model-b@high")
+    );
+
+    gate.add_permits(1);
+    let earlier = earlier
+        .await
+        .expect("the earlier pick joins")
+        .expect("the earlier pick result");
+    assert_eq!(
+        earlier,
+        crate::bridge::handles::PickOutcome::StateChanged,
+        "the stale earlier pick records nothing"
+    );
+    assert_eq!(
+        backend.pending_model("ses_test").await.as_deref(),
+        Some("openai/model-b@high"),
+        "the newer pick still owns the pending"
+    );
+}
+
 /// Spec #922 gate review: after a pending model is accepted the thread fact is
 /// the model the session runs, so `/status` reports it rather than the mirror
 /// that still names the previous pick.
@@ -2254,6 +2360,43 @@ async fn status_after_an_accepted_pick_reports_the_thread_model() {
     );
     assert!(!text.contains("gpt-stale"), "{text}");
     assert!(!text.contains("待应用"), "{text}");
+}
+
+/// Spec #922 gate review: an effort-only pending with no thread model fact has
+/// no composed reference, but `/status` still names the level; a reset-only
+/// marker names the clear.
+#[tokio::test]
+async fn status_shows_an_effort_only_pending_without_a_thread_model() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_thread_provider(true);
+    backend
+        .pending_selections
+        .lock()
+        .await
+        .insert("ses_test".into(), (None, Some("high".into())));
+    let pending = backend.pending_selections.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_entry(&app, entry()).await;
+
+    let text = command_text(&app, &platform, "/status", "msg_status_effort").await;
+    assert!(
+        text.contains("当前：未知"),
+        "there is no thread model fact: {text}"
+    );
+    assert!(
+        text.contains("待应用：思考等级 high（下一条新消息生效）"),
+        "an effort-only pending names its level: {text}"
+    );
+
+    pending.lock().await.insert("ses_test".into(), (None, None));
+    let text = command_text(&app, &platform, "/status", "msg_status_clear").await;
+    assert!(
+        text.contains("待应用：清除思考等级（下一条新消息生效）"),
+        "a reset-only pending names the clear: {text}"
+    );
 }
 
 /// A Pending Session's `/status` shows its creation pair and never 待应用.
