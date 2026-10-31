@@ -2580,26 +2580,35 @@ async fn render_and_flush_inner(
     // no unanswered typed answer" a fact this pass can act on: a question
     // cannot land between the check and the build, and a pass that stands down
     // has APPLIED nothing, so nothing is consumed (issue #917).
-    if mode.flushes() {
-        let write_lock = cards.write_lock(session_id).await;
-        let _guard = write_lock.lock().await;
-        if cards
+    // The guard is held through the apply AND the build below: it is the
+    // write lock a question's insertion and the form's own flush take, so a
+    // form cannot appear between "no form on the card" and this pass's build.
+    let write_lock = if mode.flushes() {
+        Some(cards.write_lock(session_id).await)
+    } else {
+        None
+    };
+    let _write_guard = match &write_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if mode.flushes()
+        && cards
             .cards
             .lock()
             .await
             .get(session_id)
             .is_some_and(|card| card.acc.awaits_typed_answer())
-        {
-            return Some(RenderPass {
-                stats: RenderStats {
-                    new_parts,
-                    text_len,
-                    reasoning_len,
-                    new_content: changed,
-                },
-                flush: FlushOutcome::Unwritten,
-            });
-        }
+    {
+        return Some(RenderPass {
+            stats: RenderStats {
+                new_parts,
+                text_len,
+                reasoning_len,
+                new_content: changed,
+            },
+            flush: FlushOutcome::Unwritten,
+        });
     }
     let entries_changed = {
         let mut live = cards.cards.lock().await;
@@ -9268,6 +9277,66 @@ Index: /x/src/main.rs
             updates.len(),
             before,
             "the click's ack is the card's body: no tick may re-send it: {headers:?}"
+        );
+    }
+
+    /// Issue #917: the render pass holds the session's card-write lock across
+    /// its apply and its build — that is what makes "the card renders no
+    /// unanswered typed answer" a fact the pass can act on, against an
+    /// insertion that takes the same lock. Pinned directly: while the pass is
+    /// parked in its PATCH, a second acquisition cannot take the lock.
+    #[tokio::test]
+    async fn a_parked_pass_holds_the_card_write_lock_through_its_patch() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_lock_hold";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_lock_hold")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+
+        let transcript = SessionTranscript::new(vec![
+            typed_message(
+                "msg_cola_anchor",
+                MessageRole::User,
+                Some(1_000),
+                vec![text_part("继续")],
+            ),
+            message("msg_a", 2_000, vec![text_part("在做。")]),
+        ]);
+        let (entered, release) = platform.pause("update", "om_lock_hold");
+        let parked = {
+            let app = Arc::clone(&app);
+            let cards = cards.clone();
+            let transcript = transcript.clone();
+            let sid = sid.to_string();
+            tokio::spawn(async move {
+                let _ = render_and_flush(
+                    &cards,
+                    &app.sessions_handle(),
+                    &app.client,
+                    &app.requests_handle(),
+                    &sid,
+                    &transcript,
+                )
+                .await;
+            })
+        };
+        entered.notified().await;
+
+        let lock = cards.write_lock(sid).await;
+        assert!(
+            lock.try_lock().is_err(),
+            "the pass holds the write lock while its PATCH is in flight"
+        );
+        release.notify_one();
+        parked.await.unwrap();
+        assert!(
+            lock.try_lock().is_ok(),
+            "the lock is released once the pass is done"
         );
     }
 
