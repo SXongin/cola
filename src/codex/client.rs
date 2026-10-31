@@ -21,7 +21,7 @@ use serde_json::{Value, json};
 use crate::bridge::tasks::TasksHandle;
 use crate::config::{ActiveClient, ClientKind};
 
-use super::backend::{Projections, ProviderFact, SkillCatalog};
+use super::backend::{ConfiguredProviderFact, Projections, SkillCatalog};
 use super::error::{CodexError, Result};
 use super::schema::{PINNED_VERSION, SurfaceProbe};
 use super::threads::{ThreadSettings, Threads};
@@ -72,7 +72,7 @@ pub(crate) struct CodexOptions {
     /// The config-provider fact shared with every other attachment the
     /// lifecycle builds (spec #930). A bare client leaves it `None` and gets
     /// its own cache.
-    pub(crate) provider_fact: Option<Arc<ProviderFact>>,
+    pub(crate) configured_provider_fact: Option<Arc<ConfiguredProviderFact>>,
 }
 
 impl CodexOptions {
@@ -84,7 +84,7 @@ impl CodexOptions {
             authored: super::authorship::Authorship::in_memory(),
             thread_settings: ThreadSettings::default(),
             pending: None,
-            provider_fact: None,
+            configured_provider_fact: None,
         }
     }
 
@@ -116,8 +116,11 @@ impl CodexOptions {
 
     /// Carry the lifecycle's cached config-provider fact into this connection
     /// (spec #930), so a replacement attachment keeps the pick path's channel.
-    pub(crate) fn with_provider_fact(mut self, provider_fact: Arc<ProviderFact>) -> Self {
-        self.provider_fact = Some(provider_fact);
+    pub(crate) fn with_configured_provider_fact(
+        mut self,
+        configured_provider_fact: Arc<ConfiguredProviderFact>,
+    ) -> Self {
+        self.configured_provider_fact = Some(configured_provider_fact);
         self
     }
 }
@@ -291,7 +294,7 @@ pub(crate) struct CodexClient {
     pub(crate) model_probes: Arc<super::model_surface::ModelProbes>,
     /// The last successful `config/read` provider (spec #930), shared with the
     /// lifecycle so the pick path can validate a text prefix without a request.
-    pub(crate) provider_fact: Arc<ProviderFact>,
+    pub(crate) configured_provider_fact: Arc<ConfiguredProviderFact>,
     server: ServerInfo,
 }
 
@@ -383,10 +386,10 @@ impl CodexClient {
             authored: options.authored.clone(),
             skills: Arc::new(SkillCatalog::default()),
             model_probes: Arc::new(super::model_surface::ModelProbes::new()),
-            provider_fact: options
-                .provider_fact
+            configured_provider_fact: options
+                .configured_provider_fact
                 .clone()
-                .unwrap_or_else(|| Arc::new(ProviderFact::default())),
+                .unwrap_or_else(|| Arc::new(ConfiguredProviderFact::default())),
             server: ServerInfo {
                 user_agent,
                 version,

@@ -563,11 +563,12 @@ pub trait Backend: ServerLifecycle + Send + Sync {
     }
 
     /// The provider this client's configuration names (`config/read`'s
-    /// top-level `model_provider`), when the adapter has cached a successful
-    /// read. Cache-only: no RPC on the pick path, because a `/model` pick must
-    /// be decided without a request. `None` means unknown (no read yet, or the
-    /// last read failed), and an unknown channel never blocks a pick.
-    fn configured_provider(&self) -> Option<String> {
+    /// top-level `model_provider`) **for the exact `directory`** a successful
+    /// read was scoped to. Cache-only: no RPC on the pick path, because a
+    /// `/model` pick must be decided without a request. `None` means unknown
+    /// (no read for that directory, a failed read, or the fact was invalidated
+    /// by a new attachment), and an unknown channel never blocks a pick.
+    fn configured_provider(&self, _directory: &str) -> Option<String> {
         None
     }
 
@@ -1132,7 +1133,7 @@ mod core_only_client {
         assert!(!client.resume_supported());
         assert!(!client.owns_next_turn_pending());
         assert!(!client.tracks_thread_provider());
-        assert_eq!(client.configured_provider(), None);
+        assert_eq!(client.configured_provider("/work/cola"), None);
         client.resume("ses_core").await.unwrap();
         client.switch_session_model("ses_core", &model).await.unwrap();
         client.switch_session_agent("ses_core", "build").await.unwrap();

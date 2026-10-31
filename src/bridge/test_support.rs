@@ -1811,8 +1811,9 @@ pub struct MockBackend {
     pub tracks_thread_provider: bool,
     /// What `known_thread_provider` answers (the cache-only thread fact).
     pub known_thread_provider: Option<String>,
-    /// What `configured_provider` answers (the cache-only config fact).
-    pub configured_provider: Option<String>,
+    /// What `configured_provider` answers, keyed by the exact `config/read`
+    /// directory (the cache-only config fact).
+    pub configured_providers: std::collections::HashMap<String, String>,
     /// Per-session one-shot next-turn selections (spec #922): the model ref
     /// and effort a live thread's next new turn will carry.
     pub pending_selections: PendingSelections,
@@ -2105,7 +2106,7 @@ impl MockBackend {
             next_turn_pending: false,
             tracks_thread_provider: false,
             known_thread_provider: None,
-            configured_provider: None,
+            configured_providers: std::collections::HashMap::new(),
             pending_selections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             applied_efforts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             pending_error: Arc::new(tokio::sync::Mutex::new(None)),
@@ -2283,9 +2284,11 @@ impl MockBackend {
         self
     }
 
-    /// Scenario: the client's cache-only configured provider fact.
-    pub(crate) fn with_configured_provider(&mut self, provider: Option<&str>) -> &mut Self {
-        self.configured_provider = provider.map(str::to_string);
+    /// Scenario: the client's cache-only configured provider fact for exactly
+    /// `directory`.
+    pub(crate) fn with_configured_provider(&mut self, directory: &str, provider: &str) -> &mut Self {
+        self.configured_providers
+            .insert(directory.to_string(), provider.to_string());
         self
     }
 
@@ -3123,8 +3126,8 @@ impl crate::backend::Backend for MockBackend {
         self.known_thread_provider.clone()
     }
 
-    fn configured_provider(&self) -> Option<String> {
-        self.configured_provider.clone()
+    fn configured_provider(&self, directory: &str) -> Option<String> {
+        self.configured_providers.get(directory).cloned()
     }
 
     async fn record_pending_model(

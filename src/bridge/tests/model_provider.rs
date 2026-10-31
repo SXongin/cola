@@ -1,10 +1,11 @@
-//! `/model`'s model/provider picks (issue #910, spec #922).
+//! `/model`'s model-only picks (spec #930).
 //!
-//! A provider is **creation-only**: a Pending Session records the pair that
-//! rides `thread/start`, while a live thread's provider pick is refused without
-//! any request and points at `/new` / `/fork`. A pick whose provider is the
-//! thread's own is an ordinary model pick — it rides `turn/start.model` and sends
-//! no `thread/resume`.
+//! A provider is a **config fact**: a pick records only the model, and a
+//! Pending Session's first `thread/start` carries only `model`. A prefix other
+//! than the cached current channel is refused before any request; an unknown
+//! channel (no cache for this directory, a cold projection) records model-only
+//! and lets the server's model error answer. OpenCode's per-prompt
+//! `provider/model` selection is unchanged.
 
 use crate::bridge::session::PendingEntry;
 use crate::bridge::test_support::*;
@@ -379,7 +380,7 @@ async fn a_pending_text_pick_refuses_a_different_cached_provider() {
     let mut backend = MockBackend::new(realistic_parts());
     backend
         .with_codex_capabilities()
-        .with_configured_provider(Some("openai"));
+        .with_configured_provider("/work/cola", "openai");
     let prompts = backend.prompt_calls.clone();
     let resumes = backend.resume_calls.clone();
     let (app, platform) = build_app(cfg, backend).await;
@@ -423,7 +424,7 @@ async fn a_pending_text_pick_accepts_the_cached_provider() {
     let mut backend = MockBackend::new(realistic_parts());
     backend
         .with_codex_capabilities()
-        .with_configured_provider(Some("openai"));
+        .with_configured_provider("/work/cola", "openai");
     let (app, platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;
 
@@ -486,6 +487,91 @@ async fn a_pending_text_pick_without_a_cached_provider_records_model_only() {
             .as_deref(),
         Some("deepseek/deepseek-v4-pro"),
         "the model-only pick is recorded"
+    );
+}
+
+/// Spec #930 correctness: `config/read` is project-scoped. A provider cached
+/// for directory A must not refuse a pick in directory B — B's channel is
+/// unknown, so the pick is recorded model-only rather than blocked.
+#[tokio::test]
+async fn a_cached_provider_does_not_leak_to_another_directory() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        // Project A is on `openai`; project B has no cached fact.
+        .with_configured_provider("/work/a", "openai");
+    let prompts = backend.prompt_calls.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/b")).await;
+
+    send_command_in(
+        &app,
+        "/model deepseek/deepseek-v4-pro",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform.texts().await.join("\n");
+    assert!(
+        reply.contains("Model: deepseek/deepseek-v4-pro"),
+        "A's provider must not refuse B's pick: {reply}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.clone())
+            .as_deref(),
+        Some("deepseek/deepseek-v4-pro"),
+        "the unattributed channel records model-only"
+    );
+    assert!(prompts.lock().await.is_empty(), "no turn was submitted");
+}
+
+/// Spec #930 correctness, the other direction: a fact cached for B must not
+/// validate (or refuse) a pick in A. With A unknown, the pick is recorded
+/// model-only even though it differs from B's provider.
+#[tokio::test]
+async fn another_directorys_cached_provider_does_not_validate_a_pick() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend
+        .with_codex_capabilities()
+        .with_configured_provider("/work/b", "deepseek");
+    let (app, platform) = build_app(cfg, backend).await;
+    seed_pending(&app, PendingEntry::new(key(), "/work/a")).await;
+
+    send_command_in(
+        &app,
+        "/model openai/gpt-5.1",
+        key(),
+        "msg_model",
+        crate::config::ConversationKind::P2p,
+    )
+    .await;
+
+    let reply = platform.texts().await.join("\n");
+    assert!(
+        reply.contains("Model: openai/gpt-5.1"),
+        "B's provider must not decide A's pick: {reply}"
+    );
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .pending_for(&key())
+            .and_then(|pending| pending.model.clone())
+            .as_deref(),
+        Some("openai/gpt-5.1"),
+        "the unattributed channel records model-only"
     );
 }
 
@@ -2293,7 +2379,7 @@ async fn a_slashed_provider_id_round_trips_through_the_text_form() {
     let mut backend = MockBackend::new(realistic_parts());
     backend
         .with_codex_capabilities()
-        .with_configured_provider(Some("foo/bar"));
+        .with_configured_provider("/work/cola", "foo/bar");
     let picks = backend.created_session_models.clone();
     let (app, _platform) = build_app(cfg, backend).await;
     seed_pending(&app, PendingEntry::new(key(), "/work/cola")).await;

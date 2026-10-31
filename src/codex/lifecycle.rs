@@ -229,10 +229,12 @@ pub(crate) struct CodexLifecycle {
     /// connection this lifecycle attaches, so a liveness-probe replacement
     /// keeps a pick the user just made. A process restart drops it.
     pub(crate) pending: Arc<super::backend::PendingSelections>,
-    /// The config provider the last successful `config/read` named (spec
-    /// #930), shared by every connection and answerable while detached. A
-    /// process restart drops it (the next `/model` read fills it).
-    pub(crate) provider_fact: Arc<super::backend::ProviderFact>,
+    /// The `model_provider` each successful `config/read` named, keyed by the
+    /// read's exact directory (spec #930). Shared with the attached
+    /// connection and cleared whenever that connection is dropped or replaced,
+    /// so a prior daemon's fact never validates a pick; the next `/model` read
+    /// repopulates it.
+    pub(crate) configured_provider_fact: Arc<super::backend::ConfiguredProviderFact>,
     /// The current connection. A `tokio` mutex because the attach pass holds it
     /// across the handshake's await.
     attached: tokio::sync::Mutex<Option<Attachment>>,
@@ -260,7 +262,7 @@ impl CodexLifecycle {
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
             pending: Arc::new(super::backend::PendingSelections::default()),
-            provider_fact: Arc::new(super::backend::ProviderFact::default()),
+            configured_provider_fact: Arc::new(super::backend::ConfiguredProviderFact::default()),
             attached: tokio::sync::Mutex::new(None),
             pass: tokio::sync::Mutex::new(()),
             reported_embedded: AtomicI32::new(0),
@@ -371,7 +373,7 @@ impl CodexLifecycle {
                 .with_tasks(self.tasks.clone())
                 .with_authorship(self.authored.clone())
                 .with_pending(self.pending.clone())
-                .with_provider_fact(self.provider_fact.clone())
+                .with_configured_provider_fact(self.configured_provider_fact.clone())
                 .with_thread_settings(super::threads::ThreadSettings::from(&self.settings));
             let dialed = CodexClient::connect(&options, probe.as_ref()).await;
             // Test-only: a replacement can land between the connection attempt
@@ -1012,6 +1014,9 @@ impl ServerLifecycle for CodexLifecycle {
                 // names: forget it. Nothing is sent to the daemon — it is not
                 // cola's to stop.
                 slot.take();
+                // The cached config provider described the connection just
+                // dropped; a replacement daemon may run a different one.
+                self.configured_provider_fact.clear();
             }
         }
 
@@ -1020,8 +1025,11 @@ impl ServerLifecycle for CodexLifecycle {
             .map_err(client_error)?;
         self.report_clients(&discovered.clients);
 
-        // Gone or replaced: drop the stale connection.
+        // Gone or replaced: drop the stale connection. The cached config
+        // provider must not outlive the daemon it was read from, so the next
+        // attach starts with the channel unknown until its own `/model` read.
         self.attached.lock().await.take();
+        self.configured_provider_fact.clear();
 
         // A discovered daemon is dialled; one behind a stale socket fails here
         // as unreachable (`Serverless`), which is exactly the case the start
@@ -1633,7 +1641,54 @@ mod tests {
             None
         );
         // No `config/read` has run yet: unknown, not a guessed provider.
-        assert_eq!(crate::backend::Backend::configured_provider(&lifecycle), None);
+        assert_eq!(
+            crate::backend::Backend::configured_provider(&lifecycle, "/work/cola"),
+            None
+        );
+    }
+
+    /// Spec #930: a config provider read from one daemon generation must not
+    /// validate a pick after the connection is replaced (a restart, a dead
+    /// socket, or a liveness replacement). Re-attaching clears the cache; the
+    /// next `/model` read repopulates it.
+    #[tokio::test]
+    async fn reattaching_forgets_the_cached_configured_provider() {
+        let fixture = Fixture::new();
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let lifecycle = fixture.lifecycle_with(crate::config::CodexConfig {
+            start_server: crate::config::ServerStartPolicy::Auto,
+            ..crate::config::CodexConfig::default()
+        });
+        let never_busy = || false;
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("attaches"),
+            AttachOutcome::Attached
+        );
+        lifecycle
+            .configured_provider_fact
+            .record(Some("/work/cola"), Some("openai"));
+        assert_eq!(
+            crate::backend::Backend::configured_provider(&lifecycle, "/work/cola"),
+            Some("openai".to_string())
+        );
+
+        // The attached connection goes away (daemon restart / replacement).
+        lifecycle.attached.lock().await.take();
+        assert_eq!(
+            lifecycle
+                .ensure_attached(request(&never_busy))
+                .await
+                .expect("re-attaches"),
+            AttachOutcome::Attached
+        );
+        assert_eq!(
+            crate::backend::Backend::configured_provider(&lifecycle, "/work/cola"),
+            None,
+            "a prior daemon's fact must not survive the replacement"
+        );
     }
 
     /// Spec #922 whole-branch review: the pending seam is fallible. An

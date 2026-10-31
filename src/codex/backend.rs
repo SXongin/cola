@@ -142,30 +142,72 @@ impl Drop for PendingGuard {
     }
 }
 
-/// The provider a successful `config/read` named, cached for the pick path
-/// (spec #930). Shared by every connection the lifecycle attaches, exactly like
-/// [`PendingSelections`], so a liveness-probe replacement does not lose a fact
-/// the user's `/model` card just read. Cache-only: a `/model` pick must decide
-/// whether its provider prefix matches the current channel without a request.
+/// How many `config/read` directories the pick path remembers. The cache is a
+/// convenience for validating a typed prefix, not a source of truth: evicting an
+/// entry only makes that directory's channel "unknown", which records a
+/// model-only pick and lets the server answer (spec #930's residual limit).
+const MAX_CONFIGURED_PROVIDER_DIRECTORIES: usize = 8;
+
+/// The `model_provider` each successful `config/read` named, keyed by the
+/// **exact directory** that read was scoped to (spec #930).
+///
+/// Codex resolves project config layers, so `model_provider` may differ by
+/// project. A provider cached for project A must therefore never validate a
+/// pick in project B: lookups only match the same directory, and anything else
+/// is "channel unknown" → model-only, non-blocking.
+///
+/// The fact is per attached daemon generation. The lifecycle clears the map
+/// whenever it installs a replacement connection or detaches, so a fact read
+/// from a prior daemon process can never validate a pick after a restart. A
+/// liveness-probe replacement clears it too (conservative: the next `/model`
+/// read repopulates it). Cache-only: the pick path never reads config.
 #[derive(Default)]
-pub(crate) struct ProviderFact {
-    provider: Mutex<Option<String>>,
+pub(crate) struct ConfiguredProviderFact {
+    /// Least-recently-recorded first; a repeat read moves its directory to the
+    /// back so the cap evicts the coldest entry.
+    by_directory: Mutex<Vec<(String, String)>>,
 }
 
-impl ProviderFact {
-    /// Remember a successful read's provider. An unknown answer (`None`, e.g. a
-    /// failed read) leaves the last known fact in place: the daemon's config
-    /// cannot have changed without a restart.
-    pub(crate) fn record(&self, provider: Option<&str>) {
+impl ConfiguredProviderFact {
+    /// Remember a successful read's provider for `directory`. A read outside a
+    /// directory, a failed read, or an empty provider writes nothing: a fact
+    /// that cannot be attributed to a session's directory must stay unknown.
+    pub(crate) fn record(&self, directory: Option<&str>, provider: Option<&str>) {
+        let Some(directory) = directory.map(str::trim).filter(|directory| !directory.is_empty()) else {
+            return;
+        };
         let Some(provider) = provider.map(str::trim).filter(|provider| !provider.is_empty()) else {
             return;
         };
-        *self.provider.lock().expect("codex provider fact") = Some(provider.to_string());
+        let mut entries = self.by_directory.lock().expect("codex configured provider fact");
+        entries.retain(|(entry, _)| entry != directory);
+        entries.push((directory.to_string(), provider.to_string()));
+        if entries.len() > MAX_CONFIGURED_PROVIDER_DIRECTORIES {
+            entries.remove(0);
+        }
     }
 
-    /// The cached provider, or `None` when no read has succeeded yet.
-    pub(crate) fn get(&self) -> Option<String> {
-        self.provider.lock().expect("codex provider fact").clone()
+    /// The provider cached for exactly `directory`. A different directory, an
+    /// empty one, or nothing recorded is unknown.
+    pub(crate) fn get(&self, directory: &str) -> Option<String> {
+        let directory = directory.trim();
+        if directory.is_empty() {
+            return None;
+        }
+        self.by_directory
+            .lock()
+            .expect("codex configured provider fact")
+            .iter()
+            .find(|(entry, _)| entry == directory)
+            .map(|(_, provider)| provider.clone())
+    }
+
+    /// Forget every cached directory, e.g. when the attached daemon changes.
+    pub(crate) fn clear(&self) {
+        self.by_directory
+            .lock()
+            .expect("codex configured provider fact")
+            .clear();
     }
 }
 
@@ -2370,11 +2412,11 @@ impl Backend for CodexClient {
         provider == MODEL_PROVIDER
     }
 
-    /// The provider the last successful `config/read` named, cached by the
-    /// `/model` surface this client rendered. Cache-only: a pick must never
-    /// cost a request (spec #930).
-    fn configured_provider(&self) -> Option<String> {
-        self.provider_fact.get()
+    /// The provider the last successful `config/read` named for the session's
+    /// own directory, cached by the `/model` surface this client rendered.
+    /// Cache-only: a pick must never cost a request (spec #930).
+    fn configured_provider(&self, directory: &str) -> Option<String> {
+        self.configured_provider_fact.get(directory)
     }
 
     /// The ordered thread fact, cache-only (issue #910): the neutral `codex`
@@ -2990,7 +3032,8 @@ impl Backend for CodexClient {
             // `/model <provider>/<model>` can then reject a wrong prefix without
             // a request (spec #930). An unknown read leaves the last fact alone.
             if !config.read_failed {
-                self.provider_fact.record(config.configured_provider());
+                self.configured_provider_fact
+                    .record(query.directory, config.configured_provider());
             }
             (catalog, config)
         };
@@ -3166,11 +3209,12 @@ impl Backend for CodexLifecycle {
         provider == MODEL_PROVIDER
     }
 
-    /// The cached config provider is shared with every connection this
-    /// lifecycle attaches (like the pending store), so it survives a
-    /// liveness-probe replacement and answers without a request.
-    fn configured_provider(&self) -> Option<String> {
-        self.provider_fact.get()
+    /// The cached config provider is shared with the attached connection and
+    /// keyed by its `config/read` directory. The attach pass clears it on a
+    /// replacement, so a fact from a prior daemon process never validates a
+    /// pick.
+    fn configured_provider(&self, directory: &str) -> Option<String> {
+        self.configured_provider_fact.get(directory)
     }
 
     /// The pending next-turn selection lives on the attached client (it must
@@ -5922,6 +5966,62 @@ mod tests {
         let again = Backend::model_surface(&client, query()).await;
         assert_eq!(again.scopes.len(), 1);
         assert_eq!(probed.request_count(), 1, "the probe answer was cached");
+
+        // The config fact is cached for the read's own directory only: another
+        // project's pick must see "unknown", never this project's provider.
+        assert_eq!(
+            Backend::configured_provider(&client, "/work/cola"),
+            Some("deepseek".to_string()),
+            "the read's directory keeps its provider"
+        );
+        assert_eq!(
+            Backend::configured_provider(&client, "/work/other"),
+            None,
+            "another directory is unknown"
+        );
+    }
+
+    /// The cache is keyed by exact directory, drops directory-less reads, keeps
+    /// its bounded set warm for repeats, and can be cleared when the attached
+    /// daemon changes (spec #930).
+    #[test]
+    fn configured_provider_facts_are_directory_scoped() {
+        let fact = ConfiguredProviderFact::default();
+        fact.record(Some("/work/a"), Some("openai"));
+        fact.record(Some("/work/b"), Some("deepseek"));
+        assert_eq!(fact.get("/work/a"), Some("openai".to_string()));
+        assert_eq!(fact.get("/work/b"), Some("deepseek".to_string()));
+        assert_eq!(fact.get("/work/c"), None, "unattributed is unknown");
+        assert_eq!(fact.get(""), None, "an empty directory is unknown");
+
+        // A read outside a directory cannot be attributed to any project.
+        fact.record(None, Some("openai"));
+        assert_eq!(fact.get("/work/c"), None);
+        // A failed read writes nothing.
+        fact.record(Some("/work/a"), None);
+        assert_eq!(
+            fact.get("/work/a"),
+            Some("openai".to_string()),
+            "a failed read keeps the last known fact for that directory"
+        );
+
+        fact.clear();
+        assert_eq!(fact.get("/work/a"), None, "a clear invalidates every entry");
+    }
+
+    /// The cap evicts the coldest directory, never another directory's fact.
+    #[test]
+    fn configured_provider_facts_are_bounded() {
+        let fact = ConfiguredProviderFact::default();
+        for index in 0..MAX_CONFIGURED_PROVIDER_DIRECTORIES {
+            fact.record(Some(&format!("/work/{index}")), Some("openai"));
+        }
+        // Touch the first entry, then add one more: the coldest is now index 1.
+        fact.record(Some("/work/0"), Some("openai"));
+        fact.record(Some("/work/last"), Some("openai"));
+        assert_eq!(fact.get("/work/0"), Some("openai".to_string()));
+        assert_eq!(fact.get("/work/1"), None, "the coldest entry was evicted");
+        assert_eq!(fact.get("/work/last"), Some("openai".to_string()));
     }
 
     /// The context-free read (`/think`'s variant lookup: no session, no
