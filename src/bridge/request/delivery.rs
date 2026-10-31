@@ -251,6 +251,13 @@ pub(crate) async fn resolve_blocks(
     };
     let post_resolution_header =
         Turn::resolve_interactions(cards, host.as_deref().unwrap_or(session_id), ids, &residue_mode).await;
+    if post_resolution_header.is_some() {
+        // The ack (and every eager PATCH below) carries that post-resolution
+        // header, so the render gate's cache follows here too — otherwise the
+        // next render tick re-sends the identical body and wipes an
+        // unsubmitted form answer (issue #917).
+        Turn::mark_header_shown(cards, host.as_deref().unwrap_or(session_id)).await;
+    }
     // 2. The card handles: every card that rendered one of the blocks is
     //    edited from its cache. The clicked card's edit is the ack; any other
     //    card's edit is patched so its controls do not linger.

@@ -3348,14 +3348,13 @@ impl Turn {
                 FlushOutcome::Unwritten => YieldedUpdate::Unchanged,
             };
         }
-        // Only the rows half is content. A clock-only move repaints the card —
-        // unless it renders an unanswered free-text field: Feishu rebuilds the
-        // body on every update, so the tick would wipe what the operator is
-        // typing (issue #917). Such a card's clock is the form itself: it is
-        // waiting on the operator, and the age of a background task proves
-        // nothing they need. The rows half still refreshes.
-        let owed = changed.rows || (changed.clock && !typed_answer);
-        if !owed {
+        // Only the ledger's own halves are frozen here — the rows AND the
+        // clock. Feishu rebuilds the body on every update, so a background
+        // task's row joining or leaving wipes what the operator is typing just
+        // as surely as its age ticking (issue #917). Deferred, not dropped: the
+        // acc keeps the read, so the answer's own flush renders it. A settled
+        // wait is content and still lands above.
+        if typed_answer || !changed.owes() {
             return YieldedUpdate::Unchanged;
         }
         // The guard (ADR-0060): a ledger-only refresh must never post a new
