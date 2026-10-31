@@ -143,14 +143,16 @@ and the map from the old numbers.
   renders an unanswered free-text answer field (`awaits_typed_answer`) is never
   repainted for **background progress** — the live header's second, the
   ledger's rows, its clock and its completion entries, a task panel's activity,
-  the yielded read as a whole; the read is deferred on the accumulator, never
-  dropped, and the turn's own content and the settlement still flush. And every
-  card write must advance the render gate's signature cache: the flush does it
+  the yielded read as a whole. The read must not be **consumed** either: plan
+  no entry, apply no ledger, spend no liveness read while the form waits, or
+  every later read sees "no difference" and the fact never reaches a card. The
+  turn's own content and the settlement still flush. And every card write must
+  advance the render gate's signature cache: the flush does it
   (`advance_sent_signatures`, `src/bridge/turn/flush.rs`) and so must an
   out-of-band write that restamps the header (`Turn::mark_header_shown` for a
-  click's ack). The cache records what the card last SHOWED, so a stale one
-  makes the next render tick re-PATCH an identical body — the "it refreshed by
-  itself and ate my text" report.
+  click's ack, once the eager patches landed). The cache records what the card
+  last SHOWED, so a stale one makes the next render tick re-PATCH an identical
+  body — the "it refreshed by itself and ate my text" report.
 - **`info-probe`** — the generation is probed with `GET /api/info`, and the
   status alone cannot classify it: V1's web-UI catch-all serves `index.html` for
   every unknown path, so V1 answers 200 `text/html`. The rule — 200 + V2's JSON

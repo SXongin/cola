@@ -5796,23 +5796,103 @@ async fn a_typed_answer_freezes_the_yielded_ledger() {
         &patches[before..]
     );
 
-    // The answer's own flush renders what the wait kept: the ledger row is
-    // there with its fragment, so the freeze defers the read, never drops it.
-    let cards = app.cards_handle();
+    // The read was not consumed: once the answer resolves, the next Session
+    // Sync pass finds the same delta and lands it — no manual flush, so this
+    // half exercises the real carrier (and its durable record) too.
     let receipt = |_: &str| "✅ 已回答".to_string();
     Turn::resolve_interactions(
-        &cards,
+        &app.cards_handle(),
         "ses_test",
         &["que_typed".into()],
         &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
     )
     .await;
-    Turn::flush_card(&cards, "ses_test").await;
-    let card = platform.updated_cards().await.last().cloned().unwrap();
-    assert!(
-        ledger_activity(&card, "· subagent：**review the diff**").is_some(),
-        "the frozen ledger lands with the answer: {card}"
+    wait_for_card_update(
+        &platform,
+        "the deferred ledger landing",
+        CardUpdates::Latest,
+        |card| ledger_activity(card, "· subagent：**review the diff**").is_some(),
+    )
+    .await;
+}
+
+/// Issue #917 (live path): a background row joining does not repaint a live
+/// card whose operator is typing a custom answer, and the read is not consumed
+/// — the row lands on the first render after the answer. The shell's own clock
+/// is frozen (`frozen_start`), so the ledger's membership is the only thing
+/// the second read moves.
+#[tokio::test]
+async fn a_typed_answer_freezes_the_live_ledger_rows() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    // Both launches are already on the timeline (rendered, so the second read
+    // adds no part); only the first shell is a live task at first.
+    let timeline = vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建"),
+        assistant(2_000, "已经交给后台了。"),
+        background_launch(
+            2_000,
+            "shell",
+            "call_bg",
+            serde_json::json!({ "command": "gh run watch" }),
+        ),
+        background_launch(
+            2_100,
+            "shell",
+            "call_bg2",
+            serde_json::json!({ "command": "gh pr checks" }),
+        ),
+    ];
+    let one = SessionTranscript::new(timeline.clone())
+        .with_background_tasks(vec![live_shell(frozen_start(now), "call_bg")]);
+    let (_dir, app, backend, platform) = scripted_app(vec![one], Some(SessionStatus::Busy)).await;
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建"));
+    wait_for_card_update(&platform, "the live ledger row", CardUpdates::Latest, |card| {
+        card_text(card).contains("· shell：**gh run watch**")
+    })
+    .await;
+
+    // The operator is typing a custom answer on the live card.
+    add_question_block(&app, "ses_test", "/work", true).await;
+    Turn::flush_card(&app.cards_handle(), "ses_test").await;
+    let before = platform.updated_cards().await.len();
+
+    // A second background task starts: its row joining is background progress.
+    script_transcript(
+        &backend,
+        vec![SessionTranscript::new(timeline).with_background_tasks(vec![
+            live_shell(frozen_start(now), "call_bg"),
+            live_shell(now - 10_000, "call_bg2"),
+        ])],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let updates = platform.updated_cards().await;
+    assert_eq!(
+        updates.len(),
+        before,
+        "a row joining must not repaint a card with an unanswered typed answer: {:?}",
+        &updates[before..]
     );
+    assert_eq!(
+        Turn::card_state(&app.cards_handle(), "ses_test").await,
+        Some(CardState::Streaming),
+        "the turn is still live, so the freeze is the render pass's, not a yield"
+    );
+
+    // The answer lands the deferred read: the row appears.
+    let receipt = |_: &str| "✅ 已回答".to_string();
+    Turn::resolve_interactions(
+        &app.cards_handle(),
+        "ses_test",
+        &["que_typed".into()],
+        &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+    )
+    .await;
+    wait_for_card_update(&platform, "the deferred live row", CardUpdates::Latest, |card| {
+        card_text(card).contains("· shell：**gh pr checks**")
+    })
+    .await;
 }
 
 /// The other half of issue #917's rule: the freeze is scoped to a card that

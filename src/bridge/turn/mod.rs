@@ -3232,15 +3232,32 @@ impl Turn {
         let (admitted, mut plans) = {
             let live = cards.cards.lock().await;
             match live.get(session_id) {
-                Some(card) if ownership::admits_ledger_refresh(card) => (
-                    true,
-                    render::plan_ledger_entries(
-                        &card.acc,
-                        transcript,
-                        card.acc.turn_anchor(),
-                        render::Endings::of(cards, session_id),
-                    ),
-                ),
+                Some(card) if ownership::admits_ledger_refresh(card) => {
+                    // A card rendering an unanswered free-text answer field is
+                    // not refreshed: Feishu rebuilds the body on every update,
+                    // so the read would wipe what the operator is typing (issue
+                    // #917). The read is not CONSUMED either — returning here
+                    // before planning, before the child reads and before the
+                    // apply keeps the delta on the transcript, so the first
+                    // read after the answer finds it and lands it. A settled
+                    // wait is the exception: the true end is content, not
+                    // progress, and falls through to settle below.
+                    if card.acc.awaits_typed_answer()
+                        && Disposition::of_quiet_settle(transcript.settle(card.acc.turn_anchor()), stopped)
+                            .is_none()
+                    {
+                        return YieldedUpdate::Unchanged;
+                    }
+                    (
+                        true,
+                        render::plan_ledger_entries(
+                            &card.acc,
+                            transcript,
+                            card.acc.turn_anchor(),
+                            render::Endings::of(cards, session_id),
+                        ),
+                    )
+                }
                 _ => (false, Vec::new()),
             }
         };
@@ -3264,7 +3281,7 @@ impl Turn {
         };
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;
-        let (changed, typed_answer, settled, notice_at) = {
+        let (changed, settled, notice_at) = {
             // The same admission, re-checked under the write lock through the
             // module's lock-scoped helper: the returned card is still locked,
             // so the check and the write below share one lock.
@@ -3301,11 +3318,7 @@ impl Turn {
             } else {
                 card.acc.turn_started_at()
             };
-            // Read under the same lock as the rows: whether the card renders an
-            // unanswered free-text field decides if the clock may repaint it
-            // (issue #917) — see the gate below.
-            let typed_answer = card.acc.awaits_typed_answer();
-            (changed, typed_answer, settled, notice_at)
+            (changed, settled, notice_at)
         };
         if let Some(disposition) = settled {
             // The footer is refreshed one last time (ADR-0019): the card
@@ -3348,13 +3361,7 @@ impl Turn {
                 FlushOutcome::Unwritten => YieldedUpdate::Unchanged,
             };
         }
-        // Only the ledger's own halves are frozen here — the rows AND the
-        // clock. Feishu rebuilds the body on every update, so a background
-        // task's row joining or leaving wipes what the operator is typing just
-        // as surely as its age ticking (issue #917). Deferred, not dropped: the
-        // acc keeps the read, so the answer's own flush renders it. A settled
-        // wait is content and still lands above.
-        if typed_answer || !changed.owes() {
+        if !changed.owes() {
             return YieldedUpdate::Unchanged;
         }
         // The guard (ADR-0060): a ledger-only refresh must never post a new

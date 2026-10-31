@@ -2462,7 +2462,7 @@ async fn render_and_flush_inner(
     // OpenCode auto-renames sessions after a turn; follow the server's live
     // title so the card subtitle doesn't stay on the "new session" default.
     refresh_session_title(cards, sessions, backend, session_id).await;
-    let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans) = {
+    let (changed, header_changed, new_parts, text_len, reasoning_len, anchor, mut plans, typing) = {
         let mut live = cards.cards.lock().await;
         let card = live.get_mut(session_id)?;
         let before = card.acc.rendered_part_count();
@@ -2472,16 +2472,29 @@ async fn render_and_flush_inner(
         // this lock below. `render_turn_parts` re-runs the same idempotent
         // capture.
         card.acc.capture_turn_anchor(transcript);
+        // A card rendering an unanswered free-text answer field is not
+        // repainted for background progress (issue #917) — and the read must
+        // not be CONSUMED either: an entry inserted (and a ledger clock
+        // advanced) for a body that is never written would leave the next read
+        // seeing no difference to carry, so the fact would never reach a card
+        // or the durable record. So while the form waits, this pass plans and
+        // applies nothing; the first read after the answer finds the same delta
+        // and lands it.
+        let typing = card.acc.awaits_typed_answer();
         // The completion entries this read owes (spec #593): planned here
         // (pure), their output tails read below, committed before the flush —
         // the live path must render the retirement entry on the very read that
         // observed it.
-        let plans = plan_ledger_entries(
-            &card.acc,
-            transcript,
-            card.acc.turn_anchor(),
-            Endings::of(cards, session_id),
-        );
+        let plans = if typing {
+            Vec::new()
+        } else {
+            plan_ledger_entries(
+                &card.acc,
+                transcript,
+                card.acc.turn_anchor(),
+                Endings::of(cards, session_id),
+            )
+        };
         // The durable delivered frontier, read under the SAME lock that renders:
         // the session-scoped compaction walk skips every position it has already
         // passed, so a row an earlier card surfaced is never replayed onto this
@@ -2516,6 +2529,7 @@ async fn render_and_flush_inner(
             card.acc.reasoning().len(),
             anchor,
             plans,
+            typing,
         )
     };
     // Resolve every newly rendered File Content's card delivery (ADR-0076)
@@ -2586,13 +2600,22 @@ async fn render_and_flush_inner(
     // most once this render, while a render that names no child at all (V1, a
     // session with no live task) spends no request. The fragment's age is
     // measured at the build clock.
-    let (panel_children, liveness) =
-        gather_render_liveness(cards, backend, requests, session_id, transcript).await;
-    // Apply that ONE gather to both surfaces under one lock: the ledger's
-    // `subagent` rows and every live task panel (ADR-0060/0054). A change on
-    // either must flush even when no part, header second or context figure
-    // moved — the line is the only thing that changed.
-    let (ledger, liveness_changed, typed_answer) = {
+    // The ledger and the live task panels are the BACKGROUND's own progress: a
+    // card rendering an unanswered free-text answer field is not repainted for
+    // them (issue #917), and the read is not consumed either — applying it to a
+    // body nothing will write would make the next read see no difference to
+    // carry. So the child gather and the apply are skipped together while the
+    // form waits; the first read after the answer rebuilds both from the
+    // transcript.
+    let (ledger, liveness_changed) = if typing {
+        (super::state::LedgerChange::default(), false)
+    } else {
+        let (panel_children, liveness) =
+            gather_render_liveness(cards, backend, requests, session_id, transcript).await;
+        // Apply that ONE gather to both surfaces under one lock: the ledger's
+        // `subagent` rows and every live task panel (ADR-0060/0054). A change on
+        // either must flush even when no part, header second or context figure
+        // moved — the line is the only thing that changed.
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => {
@@ -2610,9 +2633,9 @@ async fn render_and_flush_inner(
                 if ledger.rows || liveness_changed {
                     card.acc.bump_progress_mark();
                 }
-                (ledger, liveness_changed, card.acc.awaits_typed_answer())
+                (ledger, liveness_changed)
             }
-            None => (super::state::LedgerChange::default(), false, false),
+            None => (super::state::LedgerChange::default(), false),
         }
     };
     let flush = if !mode.flushes() {
@@ -2623,14 +2646,9 @@ async fn render_and_flush_inner(
         || file_changed
         || header_changed
         || context_changed
-        // A card that renders an unanswered free-text field is not repainted by
-        // background progress: Feishu rebuilds the body on every update, so any
-        // such repaint wipes what the operator is typing (issue #917). The
-        // ledger's live rows, its rendered clock and a task panel's activity are
-        // the background's own progress — deferred, not dropped: the acc keeps
-        // them, so the answer's own flush (or the next content) renders them.
-        || (!typed_answer
-            && (entries_changed || ledger.rows || ledger.clock || liveness_changed))
+        || ledger.owes()
+        || liveness_changed
+        || entries_changed
     {
         Turn::flush_card(cards, session_id).await
     } else {

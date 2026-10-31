@@ -339,10 +339,13 @@ that kept repainting a card holding a half-typed answer is the observable "it
 refreshes by itself" of issue #917.
 
 The freeze covers the **whole ledger read**, not only its clock: rows
-(membership, a row's words, an activity's fragment) and a committed completion
-entry repaint the card just as surely as a rendered second does. It defers,
-never drops — `set_ledger_from_read` keeps the read on the accumulator, so the
-answer's own flush renders it — and the settlement that ends the wait is not a
-ledger read and still lands (`YieldedUpdate::Settled`). A click-only question
+(membership, a row's words, an activity's fragment) and a completion entry
+repaint the card just as surely as a rendered second does. And the read is
+**not consumed while frozen**: `refresh_yielded_ledger` returns before planning
+its entries, before its child reads and before `apply_ledger_read`, so nothing
+is marked shown and nothing is advanced — the first pass after the answer finds
+the same delta and lands it (the "deferred, then landed on the very next read"
+half is pinned by a test). The settlement that ends the wait is not ledger
+progress and still lands (`YieldedUpdate::Settled`). A click-only question
 renders no input and keeps its second; so does every card that carries no
 unanswered form at all, which is the aliveness contract unchanged.
