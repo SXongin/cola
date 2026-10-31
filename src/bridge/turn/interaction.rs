@@ -62,6 +62,13 @@ impl Turn {
         p: &crate::backend::types::PermissionRequest,
         directory: &str,
     ) -> bool {
+        // Inserting a block is a card-surface mutation that must not interleave
+        // with a flush: a background write that already passed its typed-answer
+        // check would otherwise build between the insert and the flow's own
+        // flush, repainting a form the operator is about to type into (issue
+        // #917). The write lock is the flush's own, so the pair is ordered.
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
         let block = state::InteractionBlock::Permission(state::PendingPermission {
             session_id: p.session_id.clone().unwrap_or_default(),
             request_id: p.request_id.clone(),
@@ -87,6 +94,10 @@ impl Turn {
         answers: &[Option<Vec<String>>],
         done: &[bool],
     ) -> bool {
+        // Same lock as `add_permission`: the block's arrival and the flow's
+        // flush are one ordered step against every card write (issue #917).
+        let write_lock = cards.write_lock(session_id).await;
+        let _guard = write_lock.lock().await;
         let block = state::InteractionBlock::Question(state::PendingQuestion {
             request_id: q.id.clone(),
             session_id: q.session_id.clone(),

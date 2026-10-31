@@ -37,6 +37,9 @@ next render tick PATCHed a body identical to the one the card already carried,
 just to "discover" a header that had changed before the flush. Each card write
 now advances the cache to the body it built (`advance_sent_signatures`,
 `src/bridge/turn/flush.rs`), so the tick stays a real second's change (#917).
+The render pass itself no longer pre-advances it: a write that was suppressed
+(frozen behind a typed answer) or refused then still owes its PATCH, and the
+next pass retries instead of believing a header the card never showed.
 
 The tick still stops while the turn waits on the operator, since the awaiting
 title is a static string; a card that renders an unanswered free-text answer is

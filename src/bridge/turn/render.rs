@@ -2515,12 +2515,11 @@ async fn render_and_flush_inner(
         // Re-flush when the header changed even without new content: the
         // progress timer keeps ticking, so an idle turn still proves it is
         // alive (ADR-0014). Whole-second timestamps bound this to at most one
-        // flush per second.
-        let sig = card.acc.header_sig();
-        let header_changed = sig != card.last_header_sig;
-        if header_changed {
-            card.last_header_sig = sig;
-        }
+        // flush per second. The cache itself is advanced by the WRITE that
+        // carries the body (`advance_sent_signatures`): advancing it here would
+        // record a header a suppressed or refused write never sent, and this
+        // pass would then never retry it (issue #917's frozen form included).
+        let header_changed = card.acc.header_sig() != card.last_header_sig;
         (
             changed,
             header_changed,
@@ -2581,9 +2580,11 @@ async fn render_and_flush_inner(
         let mut live = cards.cards.lock().await;
         match live.get_mut(session_id) {
             Some(card) => {
-                let sig = card.acc.context_sig();
-                let changed = card.last_context_sig != sig;
-                card.last_context_sig = sig;
+                // The write advances the cache with the body it sends
+                // (`advance_sent_signatures`): advancing it here would record a
+                // footer a suppressed or refused write never sent, and this pass
+                // would then never retry it (issue #917).
+                let changed = card.last_context_sig != card.acc.context_sig();
                 if changed {
                     card.acc.bump_progress_mark();
                 }
@@ -2642,9 +2643,9 @@ async fn render_and_flush_inner(
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
         FlushOutcome::Unwritten
-    } else if changed || file_changed || header_changed || context_changed {
+    } else if changed || file_changed {
         Turn::flush_card(cards, session_id).await
-    } else if ledger.owes() || liveness_changed || entries_changed {
+    } else if header_changed || context_changed || ledger.owes() || liveness_changed || entries_changed {
         // Background progress only. A question can surface while this pass
         // gathered its reads, so the typed-answer check runs under the write
         // lock the flush itself shares (`flush_card_unless_typing`) — a form

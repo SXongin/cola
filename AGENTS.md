@@ -149,6 +149,10 @@ and the map from the old numbers.
   Re-check under the card-write lock at the apply/write boundary too
   (`Turn::flush_card_unless_typing`, and the yielded refresh's second check):
   a question that surfaces mid-pass brings a form this pass must not repaint.
+  Block insertion takes that lock as well (`Turn::add_question`), so "insert,
+  then flush" is ordered against every card write. Every clock-derived cause —
+  the header second, the context footer, the ledger, the panel activity, the
+  completion entry — goes through that guarded write.
   The turn's own content and the settlement still flush. And every card write must
   advance the render gate's signature cache: the flush does it
   (`advance_sent_signatures`, `src/bridge/turn/flush.rs`) and so must an

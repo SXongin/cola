@@ -261,7 +261,9 @@ record. The question of a mid-pass arrival is settled where it can be: the
 background-only write re-checks the form **under the card-write lock** the form's
 own flush also takes (`Turn::flush_card_unless_typing`), so a question surfacing
 while the pass gathered its reads either flushes first (and this write stands
-down) or lands after it. The turn's own content — a new part, a file delivery, the footer's
+down) or lands after it. Inserting the block takes that same lock
+(`Turn::add_question` / `add_permission`), so "insert, then flush" is one ordered
+step against every card write: a background writer cannot build between the two. The turn's own content — a new part, a file delivery, the footer's
 context figure, a block's own state change (已选/✅) — still flushes, and so
 does the settlement, so the form never stalls the turn it is blocking on or
 hides a true end. A question answered only by clicking renders no input and
