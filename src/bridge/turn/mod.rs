@@ -2313,32 +2313,6 @@ impl Turn {
         flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
     }
 
-    /// Flush a pass whose only causes are **background progress** (issue #917):
-    /// the card renders an unanswered free-text answer field, whose form a
-    /// repaint would wipe, so the write is skipped. The check runs UNDER the
-    /// card-write lock the flush shares, so a question that surfaced while the
-    /// pass gathered its reads cannot slip between the check and the build —
-    /// the sequence is "add the block, then flush it", and this write can only
-    /// land before that flush or not at all.
-    ///
-    /// A pass that already applied its ledger before this skip leaves the read
-    /// on the accumulator: the form's own flush builds from it, so nothing is
-    /// lost.
-    pub(crate) async fn flush_card_unless_typing(cards: &CardsHandle, session_id: &str) -> FlushOutcome {
-        let write_lock = cards.write_lock(session_id).await;
-        let _guard = write_lock.lock().await;
-        if cards
-            .cards
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|card| card.acc.awaits_typed_answer())
-        {
-            return FlushOutcome::Unwritten;
-        }
-        flush::flush_card_locked(cards, session_id, flush::SplitPolicy::Allow).await
-    }
-
     /// Record that `card_message_id` is now `session_id`'s live card
     /// (ADR-0063): the durable fact Session Sync's reap needs after a restart.
     /// Every path that sends a card INTO the Session tracks it — a Turn's

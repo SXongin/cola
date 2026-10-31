@@ -266,12 +266,13 @@ The form's own writes still land, because they are not the render pass: the
 block's arrival and a click's ack both write the card the Host is looking at
 (已选/✅ markers, a receipt), and the answer's resolution flushes; the settled
 wait lands too, since a true end is not progress. The form of a mid-pass
-arrival is handled where it can be: the guarded write re-checks the form **under
-the card-write lock** the form's own flush also takes
-(`Turn::flush_card_unless_typing`), and inserting the block takes that same lock
-(`Turn::add_question` / `add_permission`), so "insert, then flush" is one
-ordered step against every card write — the form's flush either lands first
-(this write stands down) or after it. A question answered only by clicking
+arrival is handled where it can be: the pass's apply (entries, footer, ledger,
+panel activity), its form check and its build share ONE card-write-lock
+acquisition — the lock a question's block insertion also takes
+(`Turn::add_question` / `add_permission`) — so a question cannot land between
+the check and the build, and "insert, then flush" is one ordered step against
+every card write: the form's flush either lands first (the pass stands down,
+having applied nothing) or after it. A question answered only by clicking
 renders no input and keeps everything; a permission block never has one.
 
 One more write owns the render gate's header cache: a click's callback ack is
