@@ -875,22 +875,6 @@ pub(crate) fn build_skill_card(
     let window = &pages[page - 1];
 
     let mut elements: Vec<serde_json::Value> = Vec::new();
-    // The search box appears once the list outgrows a page — by the row cap OR
-    // the byte budget, both of which drive `pages` — or a keyword is active (so
-    // a narrowed result stays refinable and clearable) — ADR-0051's
-    // conditional-visibility rule.
-    if total_pages > 1 || !keyword.is_empty() {
-        elements.push(super::session::search_form(
-            "skill_search",
-            "skillsearch",
-            "skill",
-            thread_key,
-            None,
-            "🔍 搜索技能名称 / ID / 描述",
-            keyword,
-            &callback_fields,
-        ));
-    }
 
     let mut intro = error.map(|e| format!("{e}\n")).unwrap_or_default();
     if total == 0 {
@@ -935,6 +919,25 @@ pub(crate) fn build_skill_card(
         &callback_fields,
     ) {
         elements.push(pager);
+    }
+
+    // Search box last (ADR-0051, issue #917): the Feishu Android client scrolls
+    // the message's bottom to the keyboard's top when an input takes focus, so
+    // an input with more than about half a screen of card below it is pushed
+    // off the top of the screen. It appears once the list outgrows a page — by
+    // the row cap OR the byte budget, both of which drive `pages` — or a
+    // keyword is active (so a narrowed result stays refinable and clearable).
+    if total_pages > 1 || !keyword.is_empty() {
+        elements.push(super::session::search_form(
+            "skill_search",
+            "skillsearch",
+            "skill",
+            thread_key,
+            None,
+            "🔍 搜索技能名称 / ID / 描述",
+            keyword,
+            &callback_fields,
+        ));
     }
 
     card_shell("🧩 选择技能", "blue", elements)
@@ -1421,6 +1424,23 @@ mod tests {
         assert!(
             !text.contains("\"value\":\"explore\""),
             "no filtered agent leaks into options: {text}"
+        );
+    }
+
+    /// Issue #917: the picker's search box is the card's LAST element, so no
+    /// row or pager sits below the input the client scrolls into view when it
+    /// takes focus (Android scrolls the message's bottom to the keyboard's top,
+    /// and ~10 card lines below an input pushes it off-screen).
+    #[test]
+    fn the_skill_cards_search_box_is_last() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let skills = [skill("alpha", "Alpha", None)];
+        let card = build_skill_card(&key, &skills, "alp", 1, "p2p", "msg_src", None);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            elements.last().unwrap()["name"],
+            "skill_search",
+            "the skill search box is last: {card}"
         );
     }
 
