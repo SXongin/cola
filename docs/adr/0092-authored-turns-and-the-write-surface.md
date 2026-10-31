@@ -697,3 +697,81 @@ cola never writes that file: changing a provider stays the user's config edit
 plus a daemon restart, and there is still no live provider-switch path.
 Decision 5's creation-only rule is unchanged; this only narrows *which*
 creation a daemon will accept.
+
+## Amendment (2026-10-31, spec #930): the provider is a config fact
+
+The provider amendments above still described a provider as something a
+**creation** names: `thread/start` and `thread/fork` took a `modelProvider`, and
+the card kept a whole provider axis — a `Provider：<id>…` drill, a read-only
+provider page, a Pending Session's pair page, `PROVIDER_SCOPE` / pair rows /
+disabled provider rows, and a creation-time config pre-flight. The
+one-provider-per-process rule recorded above had already made that axis inert:
+the thread's provider must equal the daemon config's top-level `model_provider`,
+so a page could only ever offer the channel the process already ran — while the
+copy still told the user to change provider with `/new`, which changed nothing.
+
+**1. A provider is a config fact, not a pick.** Codex runs **one provider per
+daemon process**. It is the top-level `model_provider` of the daemon's own
+`$CODEX_HOME/config.toml` (default `~/.codex/config.toml`; `openai` when the file
+names none). Changing it is an edit to that file plus a daemon restart — never a
+card click, a typed `/model`, or a creation parameter. cola never writes that
+file: it carries the provider credentials and is shared with the daemon.
+
+**2. A model ref names the current channel.** The model page's option values and
+its hand-write hint are `<provider>/<model>`, where the provider is the **current
+channel**: a live thread's own `modelProvider` fact, or the config's
+`model_provider` for a Pending Session and a cold projection. The neutral
+`codex/<id>` survives only as the **fallback** for when the channel cannot be
+determined — `config/read` failed, or no client is attached. A bare model id is
+not a spelling of the ref: an id may itself contain `/` (`openrouter/openai/o3`),
+so it cannot be told apart from `provider/model` (`src/backend/parsing.rs`), and
+the display surfaces (the footer, `/status`, the current line) already spell
+`provider/model` — a typed ref has to be copy-pasteable from what the card shows.
+
+**3. Creation carries no `modelProvider`.** A Pending Session's first
+`thread/start` sends `cwd`, `model` and the configured overrides, and nothing
+else; a pick there records the model only. `CreateSessionInput.provider`,
+`ThreadModel.provider` and the creation-time config pre-flight are deleted:
+`thread/start` no longer selects a provider, so there is nothing for a
+pre-flight to refuse. `/fork` (`thread/fork`) follows the same rule when it
+lands (#926/#927): `threadId` + the selected `model`, never a provider pair.
+
+**4. The card has no provider axis.** `/model` renders exactly one page: the
+built-in catalog, the config default, and the current channel's `/models` ids,
+with one note stating the config fact once. The provider page, the
+`Provider：<id>…` drill row, the Pending Session's pair page, `PROVIDER_SCOPE`,
+`PickKind::Provider`, `PICKER_LEVEL_PROVIDER_PICK`, the pair rows and the
+disabled provider rows are removed. A live thread's 「待应用」 line,
+`/status` and `/think` keep their display. #908's two-page split therefore
+survives only for OpenCode; #906 AC1's one page returns for Codex.
+
+**5. A typed ref still has to name the current channel.** `/model
+<provider>/<model>` is validated against the channel when it is determinable —
+a live thread from its cached projection (no request), a Pending Session from
+the cached `config/read` — and a different provider is refused **before
+anything is sent**, naming the config edit and the restart (the same message the
+card's stale pick gets, `PROVIDER_IS_A_CONFIG_FACT` in `handles.rs`).
+`codex/<id>` stays valid when the channel is unknown. When the channel cannot be
+determined the pick is **not** blocked: it is recorded as model-only and Codex's
+own model error is the fallback — the trade the creation path already makes for
+an unreadable config. That is this amendment's accepted residual limit: with a
+cold cache, a typed wrong prefix is not caught before the request. OpenCode is
+unchanged: its `provider/model` is a real per-prompt selection, so `/model`
+still switches provider there.
+
+**6. `/new` is no longer a provider-change entry point.** A Pending Session — and
+`/fork`, when it lands — can change the **model**, never the channel. The copy
+that said "the provider can only be changed in a new session, use `/new`" is
+gone from both sites (`handles.rs`, `model_surface.rs`); the model page's rule
+note is the one place the config fact is stated.
+
+**Superseded.** The provider halves of the earlier amendments: the second scope
+of decision 2 and the pair rule of decision 5 in the 2026-10-29 (#906)
+amendment, decisions 3–5 of the first 2026-10-30 (#922) amendment (a Pending
+Session's pair, the creation-only provider, the `NewThread` provider scope), and
+the provider-scope sentences of the #910 reserved-namespace amendment. The
+**reserved namespace itself still stands**: `codex` can never name a real
+channel, whatever the fallback ref spells. The measurements those sections rest
+on — the one-provider-per-process rule, the failed `resume` reload,
+`[profiles.*]` being unread — are unchanged; what is gone is any path that
+selects a provider.
