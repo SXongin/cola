@@ -762,13 +762,17 @@ impl PendingQuestion {
     /// Whether this block renders a free-text input the Host may be typing
     /// into (issue #917): a still-open field with a custom-answer box or a
     /// numeric form. A finalized field renders no controls at all, so it never
-    /// counts. The same predicate renders the form (`renders_typed_input`), so
-    /// the card and the freeze cannot disagree about which cards have an input.
+    /// counts, and the card only ever renders ONE open question at a time (the
+    /// first unanswered one; the rest fold), so only that one can hold
+    /// unsubmitted text. The same predicate renders the form
+    /// (`renders_typed_input`), so the card and the freeze cannot disagree
+    /// about which cards have an input.
     pub(super) fn awaits_typed_answer(&self) -> bool {
-        self.questions.iter().enumerate().any(|(i, q)| {
-            !self.done.get(i).copied().unwrap_or(false)
-                && crate::feishu::card::question::renders_typed_input(q)
-        })
+        self.questions
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !self.done.get(*i).copied().unwrap_or(false))
+            .is_some_and(|(_, q)| crate::feishu::card::question::renders_typed_input(q))
     }
 }
 
@@ -7819,6 +7823,50 @@ mod tests {
         // Resolving the request leaves its receipt behind — no controls.
         assert!(acc.dismiss_interaction("q"));
         assert!(!acc.awaits_typed_answer());
+    }
+
+    /// Issue #917: the card folds every question but the first unanswered one,
+    /// so only THAT field can hold unsubmitted text. A typed field sitting
+    /// folded behind an open button-only question must not freeze the clock.
+    #[test]
+    fn awaits_typed_answer_reads_only_the_open_question() {
+        use crate::backend::types::{FormFieldKind, QuestionInfo};
+        let boolean = QuestionInfo {
+            question: "确定吗".into(),
+            header: "确认".into(),
+            kind: FormFieldKind::Boolean,
+            ..Default::default()
+        };
+        let typed = QuestionInfo {
+            question: "备注?".into(),
+            header: "备注".into(),
+            kind: FormFieldKind::String,
+            ..Default::default()
+        };
+        let block = |done: &[bool]| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: "q".into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![boolean.clone(), typed.clone()],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None, None],
+                done: done.to_vec(),
+            })
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(block(&[false, false]));
+        assert!(
+            !acc.awaits_typed_answer(),
+            "the open boolean question renders buttons; the typed one is folded"
+        );
+        acc.interactions.clear();
+        acc.add_interaction(block(&[true, false]));
+        assert!(
+            acc.awaits_typed_answer(),
+            "answering the first question opens the typed one"
+        );
     }
 
     /// The header signature carries the phase label, and flips to a title
