@@ -5602,6 +5602,83 @@ async fn an_unconfirmed_row_renders_no_activity_and_recovers_it() {
     );
 }
 
+/// Issue #917 (the live task panels): while a typed answer waits, a child's
+/// change of activity repaints neither its ledger row nor its live panel. The
+/// pass applies neither while the form waits, so the change is deferred and
+/// lands on the first render after the answer.
+#[tokio::test]
+async fn a_typed_answer_freezes_the_live_task_panel_activity() {
+    let _wd = test_work_dir();
+    let now = chrono::Utc::now().timestamp_millis();
+    let transcript = SessionTranscript::new(vec![
+        user("msg_cola_anchor", 1_000, "跑一下构建并审阅"),
+        background_launch(
+            2_000,
+            "shell",
+            "call_bg",
+            serde_json::json!({ "command": "gh run watch" }),
+        ),
+        background_launch(
+            2_100,
+            "subagent",
+            "call_sub",
+            serde_json::json!({ "description": "review the diff" }),
+        ),
+    ])
+    .with_background_tasks(vec![
+        live_shell(frozen_start(now), "call_bg"),
+        live_subagent(now - 30_000, "call_sub"),
+    ]);
+    let (_dir, app, backend, platform) = scripted_app(vec![transcript], Some(SessionStatus::Busy)).await;
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 5_000, "bash")])
+        .await;
+    let _turn = spawn_turn(&app, ctx("ses_test", "跑一下构建并审阅"));
+    wait_for_card_update(
+        &platform,
+        "the live subagent activity",
+        CardUpdates::Latest,
+        |card| {
+            ledger_activity(card, "· subagent：**review the diff**")
+                .is_some_and(|activity| activity.starts_with("bash "))
+        },
+    )
+    .await;
+
+    // The operator is typing a custom answer on the live card.
+    add_question_block(&app, "ses_test", "/work", true).await;
+    Turn::flush_card(&app.cards_handle(), "ses_test").await;
+    let before = platform.updated_cards().await.len();
+
+    // The child switches tools: its fragment's word and clock both move.
+    backend
+        .given_transcript_after_build("ses_call_sub", vec![child_running_tool(now - 2_000, "edit")])
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let updates = platform.updated_cards().await;
+    assert_eq!(
+        updates.len(),
+        before,
+        "a child's activity must not repaint a card with an unanswered typed answer: {:?}",
+        &updates[before..]
+    );
+
+    // The answer resumes the read: the new activity lands.
+    let receipt = |_: &str| "✅ 已回答".to_string();
+    Turn::resolve_interactions(
+        &app.cards_handle(),
+        "ses_test",
+        &["que_typed".into()],
+        &crate::bridge::turn::InlineResidue::PerBlock(&receipt),
+    )
+    .await;
+    wait_for_card_update(&platform, "the deferred activity", CardUpdates::Latest, |card| {
+        ledger_activity(card, "· subagent：**review the diff**")
+            .is_some_and(|activity| activity.starts_with("edit "))
+    })
+    .await;
+}
+
 /// Acceptance 6 (spec #501): a retiring subagent's activity leaves WITH its
 /// row — the completion entry appears, and the fragment is nowhere on the card
 /// afterwards (no ghost).
