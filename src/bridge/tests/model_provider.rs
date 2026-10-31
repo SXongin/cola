@@ -595,12 +595,11 @@ async fn a_pending_pick_becomes_neutral_if_its_provider_generation_changes() {
         .sessions_handle()
         .model_pick_decision(&app.client, &key(), "openai")
         .await;
-    let (target, provider_generation) = match decision {
+    let (target, provider_fact) = match decision {
         crate::bridge::handles::ModelPickDecision::Record {
             target,
-            provider_generation: Some(generation),
-            current_provider: _,
-        } => (target, generation),
+            provider_fact: Some(fact),
+        } => (target, fact),
         _ => panic!("the known current provider should pass validation"),
     };
     let crate::bridge::handles::PickTarget::Pending(epoch) = target else {
@@ -616,7 +615,7 @@ async fn a_pending_pick_becomes_neutral_if_its_provider_generation_changes() {
             &app.client,
             &key(),
             epoch,
-            Some(provider_generation),
+            Some(provider_fact),
             "openai/gpt-5.1",
             None,
         )
@@ -735,6 +734,59 @@ async fn pending_materialisation_neutralizes_a_stale_provider_generation() {
     );
 }
 
+/// Spec #933 round 5: hold activation after the final pre-activation
+/// normalization, replace the provider generation, and release activation.
+/// The post-write CAS must correct the persisted SessionEntry to neutral.
+#[tokio::test]
+async fn activation_cas_corrects_a_provider_generation_change() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.with_codex_capabilities();
+    let generation = backend.provider_fact_generation.clone();
+    let created_models = backend.created_session_models.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let activation_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    *app.materialise_before_activation.lock().await = Some(activation_gate.clone());
+    let mut pending = PendingEntry::new(key(), "/work/cola");
+    pending.model = Some("openai/gpt-5.1".into());
+    pending.model_provider_generation = Some(1);
+    seed_pending(&app, pending).await;
+
+    let app_for_prompt = app.clone();
+    let prompt_task = tokio::spawn(async move {
+        app_for_prompt
+            .handle_message(incoming(
+                "msg_prompt".into(),
+                "chat_1".into(),
+                "p2p".into(),
+                None,
+                "hi".into(),
+                None,
+            ))
+            .await;
+    });
+    app.materialise_activation_entered.notified().await;
+
+    // The last pre-activation normalization saw generation 1. Replace it while
+    // activation is parked immediately before the SessionStore write.
+    generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    activation_gate.add_permits(1);
+    prompt_task.await.expect("prompt/materialisation task joins");
+
+    assert_eq!(created_models.lock().await.as_slice(), &[Some("gpt-5.1".into())]);
+    assert_eq!(
+        app.sessions
+            .lock()
+            .await
+            .get_active(&key())
+            .and_then(|entry| entry.model.as_deref()),
+        Some("codex/gpt-5.1"),
+        "the post-activation CAS persisted only the neutral ref"
+    );
+}
+
 /// The same generation guard covers a live thread: let variant validation
 /// pause the pick after its provider decision, replace the fact generation,
 /// then verify the adapter pending carries the neutral ref.
@@ -761,12 +813,11 @@ async fn a_live_pick_becomes_neutral_if_its_provider_generation_changes() {
         .sessions_handle()
         .model_pick_decision(&app.client, &key(), "openai")
         .await;
-    let (target, provider_generation, current_provider) = match decision {
+    let (target, provider_fact) = match decision {
         crate::bridge::handles::ModelPickDecision::Record {
             target,
-            provider_generation: Some(generation),
-            current_provider,
-        } => (target, generation, current_provider),
+            provider_fact: Some(fact),
+        } => (target, fact),
         _ => panic!("the known current provider should pass validation"),
     };
     let crate::bridge::handles::PickTarget::Live(session_id) = target else {
@@ -781,8 +832,7 @@ async fn a_live_pick_becomes_neutral_if_its_provider_generation_changes() {
                 &backend,
                 &key(),
                 Some(&session_id),
-                Some(provider_generation),
-                current_provider.as_deref(),
+                Some(provider_fact),
                 "openai/gpt-5.1",
                 None,
             )
@@ -2006,7 +2056,6 @@ async fn a_delayed_autoaccept_keeps_a_recorded_model() {
             &key(),
             Some("ses_test"),
             None,
-            None,
             "deepseek/deepseek-v4-pro",
             None,
         )
@@ -2724,15 +2773,7 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
         let backend = backend.clone();
         async move {
             sessions
-                .pick_model_expecting(
-                    &backend,
-                    &key(),
-                    Some("ses_test"),
-                    None,
-                    None,
-                    "openai/model-a",
-                    None,
-                )
+                .pick_model_expecting(&backend, &key(), Some("ses_test"), None, "openai/model-a", None)
                 .await
         }
     });
@@ -2747,15 +2788,7 @@ async fn a_later_model_pick_wins_over_a_slower_earlier_lookup() {
 
     // The later pick records while the earlier lookup is still parked.
     let later = sessions
-        .pick_model_expecting(
-            &backend,
-            &key(),
-            Some("ses_test"),
-            None,
-            None,
-            "openai/model-b",
-            None,
-        )
+        .pick_model_expecting(&backend, &key(), Some("ses_test"), None, "openai/model-b", None)
         .await
         .expect("the later pick");
     assert!(

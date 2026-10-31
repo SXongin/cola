@@ -3299,17 +3299,10 @@ impl Backend for CodexLifecycle {
         session_id: &str,
         model: &str,
         variant: Option<&str>,
-        expected_generation: Option<u64>,
-        current_provider: Option<&str>,
+        provider_fact: Option<crate::backend::types::ProviderFactSnapshot>,
     ) -> Result<()> {
-        self.record_pending_model_if_current_generation(
-            session_id,
-            model,
-            variant,
-            expected_generation,
-            current_provider,
-        )
-        .await
+        self.record_pending_model_if_current_generation(session_id, model, variant, provider_fact)
+            .await
     }
 
     async fn record_pending_variant(&self, session_id: &str, variant: Option<&str>) -> Result<()> {

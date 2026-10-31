@@ -356,14 +356,13 @@ impl CodexLifecycle {
         session_id: &str,
         model: &str,
         variant: Option<&str>,
-        expected_generation: Option<u64>,
-        current_provider: Option<&str>,
+        provider_fact: Option<crate::backend::types::ProviderFactSnapshot>,
     ) -> crate::error::Result<()> {
         let _provider_fact = self.provider_fact_gate.lock().await;
         let current_generation = self.configured_provider_fact_snapshot().generation();
         let (model, stale) = crate::backend::parsing::model_spec_for_provider_generation(
             model,
-            expected_generation,
+            provider_fact.as_ref().map(|fact| fact.generation),
             current_generation,
             Some("codex"),
         );
@@ -371,7 +370,11 @@ impl CodexLifecycle {
             session_id,
             &model,
             variant,
-            (!stale).then(|| current_provider.map(str::to_string)).flatten(),
+            if stale {
+                None
+            } else {
+                provider_fact.and_then(|fact| fact.provider_id)
+            },
         );
         Ok(())
     }
@@ -1795,7 +1798,10 @@ mod tests {
     async fn live_pick_recording_does_not_wait_for_the_attachment_mutex() {
         let fixture = Fixture::new();
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
-        let generation = crate::backend::Backend::provider_fact_generation(&lifecycle);
+        let provider_fact = crate::backend::types::ProviderFactSnapshot {
+            provider_id: Some("openai".to_string()),
+            generation: crate::backend::Backend::provider_fact_generation(&lifecycle),
+        };
         let _attachment_guard = lifecycle.attached.lock().await;
 
         tokio::time::timeout(
@@ -1804,8 +1810,7 @@ mod tests {
                 "thread-1",
                 "openai/gpt-5.1",
                 None,
-                Some(generation),
-                Some("openai"),
+                Some(provider_fact),
             ),
         )
         .await
