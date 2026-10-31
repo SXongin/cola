@@ -163,6 +163,17 @@ and the map from the old numbers.
   last SHOWED, so a stale one makes the next render tick re-PATCH an identical
   body — the "it refreshed by itself and ate my text" report. The render pass
   never pre-advances it, so a suppressed or refused write still owes its PATCH.
+- **`card-inputs`** — a typed card input (`form` + `input`, the only free-text
+  component Feishu has) must sit at the card's **end**: the Android client
+  scrolls the **message's bottom** to the keyboard's top when an input takes
+  focus, so more than about half a screen of card below the box pushes it off
+  the top of the screen — the box is on screen but the caret and the typed text
+  are not. It is layout, not a repaint race (static, never-patched cards
+  reproduce it, and one box stays bad while its neighbours behave), and a
+  **folded** panel below the input costs only its header. Hence one open
+  question at a time (`question_elements`), search forms after the rows and
+  pager (`search_form` call sites), and a folded receipt log on the snapshot
+  card (#917, ADR-0093).
 - **`info-probe`** — the generation is probed with `GET /api/info`, and the
   status alone cannot classify it: V1's web-UI catch-all serves `index.html` for
   every unknown path, so V1 answers 200 `text/html`. The rule — 200 + V2's JSON
