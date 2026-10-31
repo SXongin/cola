@@ -251,13 +251,6 @@ pub(crate) async fn resolve_blocks(
     };
     let post_resolution_header =
         Turn::resolve_interactions(cards, host.as_deref().unwrap_or(session_id), ids, &residue_mode).await;
-    if post_resolution_header.is_some() {
-        // The ack (and every eager PATCH below) carries that post-resolution
-        // header, so the render gate's cache follows here too — otherwise the
-        // next render tick re-sends the identical body and wipes an
-        // unsubmitted form answer (issue #917).
-        Turn::mark_header_shown(cards, host.as_deref().unwrap_or(session_id)).await;
-    }
     // 2. The card handles: every card that rendered one of the blocks is
     //    edited from its cache. The clicked card's edit is the ack; any other
     //    card's edit is patched so its controls do not linger.
@@ -329,10 +322,23 @@ pub(crate) async fn resolve_blocks(
             handles.forget(id);
         }
     }
+    // Whether every card this resolution wrote now carries the post-resolution
+    // header: the eager repaints above must have landed before the render gate's
+    // cache may claim it, or a failed PATCH would leave the old block showing
+    // with no retry. A click's ack is the callback's own body and is delivered
+    // by construction (ADR-0038, rule 3), so it does not gate this.
+    let mut repainted = true;
     for (message_id, card) in patches {
         if let Err(e) = cards.feishu.update_message(&message_id, &card).await {
+            repainted = false;
             tracing::warn!("resolved block repaint failed on {}: {}", message_id, e);
         }
+    }
+    if post_resolution_header.is_some() && repainted {
+        // The ack carried that header instead of a flush, so the render gate's
+        // cache must follow — otherwise the next render tick re-sends the
+        // identical body and wipes an unsubmitted form answer (issue #917).
+        Turn::mark_header_shown(cards, host.as_deref().unwrap_or(session_id)).await;
     }
     // The settlement rendered (or found nothing to render): release the
     // in-flight claim, so a standalone copy of the same request is left to
