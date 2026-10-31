@@ -583,8 +583,15 @@ impl SnapshotBuild<'_> {
         if let Some(notice) = pending_overflow_notice(pending_overflow) {
             elements.push(json!({ "tag": "markdown", "content": notice }));
         }
+        // Receipts fold (issue #917): the Feishu Android client scrolls the
+        // message's bottom to the keyboard's top when an input takes focus, so
+        // a receipt log below a pending question pushes that question's input
+        // off the top of the screen (measured: ~10 card lines below an input is
+        // enough). A folded panel costs one header line; up to two receipts stay
+        // inline, where folding would only hide them.
+        let mut receipts: Vec<serde_json::Value> = Vec::new();
         if pass.omitted_receipts > 0 {
-            elements.push(json!({
+            receipts.push(json!({
                 "tag": "markdown",
                 "content": format!(
                     "…更早的 {} 条处理回执已省略（超出单卡容量）",
@@ -593,9 +600,19 @@ impl SnapshotBuild<'_> {
             }));
         }
         for line in pass.receipts {
-            elements.push(json!({ "tag": "markdown", "content": line }));
+            receipts.push(json!({ "tag": "markdown", "content": line }));
         }
-        let has_receipts = pass.omitted_receipts > 0 || !pass.receipts.is_empty();
+        let has_receipts = !receipts.is_empty();
+        let folded_receipts = receipts.len() > 2;
+        if folded_receipts {
+            elements.push(crate::feishu::card::shell::collapsible_panel_elements(
+                &format!("✅ 处理回执（{} 条）", pass.receipts.len()),
+                std::mem::take(&mut receipts),
+                None,
+            ));
+        } else {
+            elements.extend(receipts);
+        }
         let has_tail = pass.omitted_tail > 0 || !pass.tail.is_empty();
         if (!pendings.is_empty() || pending_overflow.any() || has_receipts) && has_tail {
             elements.push(json!({ "tag": "hr" }));
@@ -1442,6 +1459,116 @@ mod tests {
             "the dropped entry is named: {s}"
         );
         assert!(!s.contains("巨巨巨"), "an entry that cannot fit is not carried");
+    }
+
+    /// Issue #917: a receipt log long enough to push a pending question's input
+    /// off the phone screen folds into ONE panel; a short log stays inline,
+    /// where folding would only hide it.
+    #[test]
+    fn a_long_receipt_log_folds_into_one_panel() {
+        let receipts: Vec<String> = (0..5).map(|i| format!("回执{i}：已由其他客户端处理")).collect();
+        let d = data(Some(crate::backend::types::SessionStatus::Idle), vec![], vec![]);
+        let card =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &receipts, None);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let panel = elements
+            .iter()
+            .find(|e| e["tag"] == "collapsible_panel")
+            .expect("a long receipt log folds into one panel");
+        assert_eq!(panel["header"]["title"]["content"], "✅ 处理回执（5 条）");
+        assert_eq!(panel["elements"].as_array().unwrap().len(), 5);
+        assert!(
+            !elements.iter().any(|e| {
+                e["tag"] == "markdown" && e["content"].as_str().is_some_and(|c| c.starts_with("回执0"))
+            }),
+            "the receipts are folded, not spelled out below the pending blocks: {card}"
+        );
+
+        let short = ["回执0：已由其他客户端处理".to_string()];
+        let card =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &short, None);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            elements.iter().any(|e| {
+                e["tag"] == "markdown" && e["content"] == "回执0：已由其他客户端处理"
+            }),
+            "a short log stays inline: {card}"
+        );
+    }
+
+    /// The pending question's input stays above the folded log: the fold is
+    /// there to keep that input near the card's bottom (#917), so a test that
+    /// never combines the two would miss a reordering regression.
+    #[test]
+    fn a_pending_questions_input_stays_above_the_folded_receipts() {
+        let receipts: Vec<String> = (0..5).map(|i| format!("回执{i}")).collect();
+        let d = data(
+            Some(crate::backend::types::SessionStatus::Idle),
+            vec![PendingRequest::Question(question("req_q", "ses_adopted"))],
+            vec![],
+        );
+        let card =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &receipts, None);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let form_at = elements
+            .iter()
+            .position(|e| e["tag"] == "form")
+            .expect("the pending question renders its form");
+        let panel_at = elements
+            .iter()
+            .position(|e| {
+                e["tag"] == "collapsible_panel"
+                    && e["header"]["title"]["content"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("处理回执"))
+            })
+            .expect("a long receipt log folds");
+        assert!(
+            form_at < panel_at,
+            "the input must stay above the folded log: {card}"
+        );
+    }
+
+    /// Every receipt evicted leaves only the omission line: it stays a plain
+    /// markdown (a panel with nothing but that line would be an empty fold) and
+    /// the tail still gets its divider.
+    #[test]
+    fn fully_evicted_receipts_render_the_omission_line_inline() {
+        let receipts: Vec<String> = (0..4)
+            .map(|i| format!("回执{i}：{}", "已由其他客户端处理。".repeat(2000)))
+            .collect();
+        let d = data(
+            Some(crate::backend::types::SessionStatus::Idle),
+            vec![],
+            (0..2)
+                .map(|i| tail(MessageRole::User, i * 1000, &format!("第{i}条短消息")))
+                .collect(),
+        );
+        let card =
+            build_snapshot_card_with_state("接管", "t", &d, &SnapshotQuestionState::new(), &receipts, None);
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert!(
+            elements.iter().any(|e| {
+                e["tag"] == "markdown"
+                    && e["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("条处理回执已省略"))
+            }),
+            "the eviction notice is a plain line: {card}"
+        );
+        assert!(
+            !elements.iter().any(|e| {
+                e["tag"] == "collapsible_panel"
+                    && e["header"]["title"]["content"]
+                        .as_str()
+                        .is_some_and(|t| t.contains("处理回执"))
+            }),
+            "an all-evicted log does not fold into an empty panel: {card}"
+        );
+        assert!(
+            elements.iter().any(|e| e["tag"] == "hr"),
+            "the tail keeps its divider: {card}"
+        );
     }
 
     /// Receipts are residue, not conversation: when the card is over budget the
