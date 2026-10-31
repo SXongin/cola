@@ -41,7 +41,7 @@ The render pass itself no longer pre-advances it: a write that was suppressed
 (frozen behind a typed answer) or refused then still owes its PATCH, and the
 next pass retries instead of believing a header the card never showed.
 
-The tick still stops while the turn waits on the operator, since the awaiting
+The tick still stops while the turn waits on the Host, since the awaiting
 title is a static string; a card that renders an unanswered free-text answer is
 additionally never repainted for background progress at all (ADR-0038's
 2026-10-31 update, ADR-0060's 2026-10-31 amendment) — the repaint would wipe the

@@ -65,7 +65,7 @@ impl Turn {
         // Inserting a block is a card-surface mutation that must not interleave
         // with a flush: a background write that already passed its typed-answer
         // check would otherwise build between the insert and the flow's own
-        // flush, repainting a form the operator is about to type into (issue
+        // flush, repainting a form the Host is about to type into (issue
         // #917). The write lock is the flush's own, so the pair is ordered.
         let write_lock = cards.write_lock(session_id).await;
         let _guard = write_lock.lock().await;

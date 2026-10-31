@@ -334,7 +334,7 @@ The yielded read exists to prove the wait is alive — "cola is still waiting,
 and here is how long". It stops when the card renders a free-text answer field
 nobody has submitted yet (`StreamAccumulator::awaits_typed_answer`): Feishu
 rebuilds `body.elements` on every card update, so the read's PATCH wipes the
-text the operator is typing, and that text lives only in the client. A clock
+text the Host is typing, and that text lives only in the client. A clock
 that kept repainting a card holding a half-typed answer is the observable "it
 refreshes by itself" of issue #917.
 

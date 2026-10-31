@@ -2643,14 +2643,22 @@ async fn render_and_flush_inner(
         // A settling render (#604) leaves the card write to finalization, which
         // renders and flushes this same read: no carrier here.
         FlushOutcome::Unwritten
-    } else if changed || file_changed {
-        Turn::flush_card(cards, session_id).await
-    } else if header_changed || context_changed || ledger.owes() || liveness_changed || entries_changed {
-        // Background progress only. A question can surface while this pass
-        // gathered its reads, so the typed-answer check runs under the write
-        // lock the flush itself shares (`flush_card_unless_typing`) — a form
-        // added mid-pass must never be repainted by a background cause
-        // (issue #917). `typing` above only saved this pass its reads.
+    } else if changed
+        || file_changed
+        || header_changed
+        || context_changed
+        || ledger.owes()
+        || liveness_changed
+        || entries_changed
+    {
+        // The render pass writes NOTHING while the card renders an unanswered
+        // free-text answer (issue #917) — content included, because a pass can
+        // render a part, pause for its reads, and resume after a question
+        // landed and the Host started typing. The check runs under the write
+        // lock the flush itself shares (`flush_card_unless_typing`), and the
+        // form's own flush (its arrival, or its answer) is the write that
+        // lands. A suppressed pass consumes nothing: the build is what advances
+        // `render_from`, so the next pass after the answer renders it all.
         Turn::flush_card_unless_typing(cards, session_id).await
     } else {
         // Nothing this pass did owed a card write: no carrier, so nothing a
@@ -9067,8 +9075,8 @@ Index: /x/src/main.rs
     /// Issue #917 (live path): a card rendering an unanswered free-text answer
     /// field is not repainted by the render poll's ticks. The only per-second
     /// cause on a live card is the header's phase timer, and a live block
-    /// awaiting the operator replaces that header with a static title — so
-    /// nothing owes a PATCH while the operator types. The first half measures
+    /// awaiting the Host replaces that header with a static title — so
+    /// nothing owes a PATCH while the Host types. The first half measures
     /// the tick WITHOUT the block (the aliveness contract, ADR-0014), which is
     /// what proves the tick was live when the block arrived.
     #[tokio::test]
@@ -9117,7 +9125,7 @@ Index: /x/src/main.rs
             "the header's phase second owes its PATCH on a card with no input"
         );
 
-        // The operator is typing a custom answer: the awaiting header is a
+        // The Host is typing a custom answer: the awaiting header is a
         // static title, and neither tick below may repaint the card. (The flush
         // that surfaced the block also advanced the gate's signature cache —
         // without that, the very next tick re-sent the identical body, which is
@@ -9240,6 +9248,90 @@ Index: /x/src/main.rs
             before,
             "the click's ack is the card's body: no tick may re-send it: {headers:?}"
         );
+    }
+
+    /// Issue #917 (the cache, isolated): a click's ack is a card write of its
+    /// own, so the render gate's header cache must follow it on ANY card — the
+    /// typed-answer freeze above would mask a missing advance (it suppresses
+    /// the very repaint this test watches for), so this card carries a
+    /// permission only.
+    #[tokio::test]
+    async fn a_click_ack_leaves_no_repaint_on_a_card_without_a_form() {
+        let _wd = test_work_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(&dir.path().join("sessions.json"));
+        let backend = Arc::new(MockBackend::new(realistic_parts()));
+        let platform = Arc::new(RecordingPlatform::new());
+        let app = Arc::new(App::new(cfg, backend.clone(), platform.clone()).unwrap());
+        let sid = "ses_ack";
+        let cards = app.core.cards_handle();
+        Turn::seed_card(&cards, sid, Some("om_ack")).await;
+        Turn::set_turn_anchor(&cards, sid, &turn_anchor(0)).await;
+        Turn::add_permission(
+            &cards,
+            sid,
+            &crate::backend::types::PermissionRequest {
+                request_id: "per_1".into(),
+                session_id: Some(sid.into()),
+                permission: Some("bash".into()),
+                patterns: vec!["ls -la".into()],
+                metadata: None,
+                always: Vec::new(),
+                always_supported: true,
+            },
+            "/work",
+        )
+        .await;
+        Turn::flush_card(&cards, sid).await;
+        assert!(!cards_live_question(&app, sid).await, "no typed answer here");
+        let before = platform.updated_cards().await.len();
+
+        app.host_action(serde_json::json!({
+            "action": "perm",
+            "reply": "once",
+            "session_id": sid,
+            "directory": "/work",
+            "request_id": "per_1",
+            "open_message_id": "om_ack",
+            "perm_label": "✅ 已允许一次",
+            "perm_color": "green",
+            "perm_body": "bash",
+        }))
+        .await
+        .expect("a card-action result");
+
+        // The ack carried the lifted header; the next tick must find nothing.
+        let transcript = SessionTranscript::default();
+        let _ = render_and_flush(
+            &cards,
+            &app.sessions_handle(),
+            &app.client,
+            &app.requests_handle(),
+            sid,
+            &transcript,
+        )
+        .await;
+        let updates = platform.updated_cards().await;
+        let headers: Vec<&str> = updates
+            .iter()
+            .map(|card| card["header"]["title"]["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            updates.len(),
+            before,
+            "the ack is the card's body: no tick may re-send it: {headers:?}"
+        );
+    }
+
+    /// Whether `session_id`'s card renders an unanswered typed answer.
+    async fn cards_live_question(app: &Arc<App>, session_id: &str) -> bool {
+        app.core
+            .cards_handle()
+            .cards
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|card| card.acc.awaits_typed_answer())
     }
 
     /// A child-session transcript whose newest part is a running tool — the

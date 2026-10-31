@@ -629,13 +629,13 @@ fn submit_name(name_prefix: &str, request_id: &str, session_id: &str, index: usi
     format!("{name_prefix}|{request_id}|{session_id}|{index}")
 }
 
-/// Whether this field renders a free-text input the operator can be typing
+/// Whether this field renders a free-text input the Host can be typing
 /// into: the custom-answer box, or a numeric field's form.
 ///
 /// The render and the freeze that protects it (issue #917) read this ONE
 /// predicate. A card that shows such an input may carry unsubmitted text the
 /// client alone holds: Feishu rebuilds `body.elements` on every card update,
-/// so an input comes back empty after any PATCH — a repaint while the operator
+/// so an input comes back empty after any PATCH — a repaint while the Host
 /// types eats their answer. The bridge therefore never repaints that card for
 /// background progress ([`crate::bridge::turn::state::StreamAccumulator::awaits_typed_answer`]).
 pub(crate) fn renders_typed_input(q: &crate::backend::types::QuestionInfo) -> bool {

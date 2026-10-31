@@ -5645,7 +5645,7 @@ async fn a_typed_answer_freezes_the_live_task_panel_activity() {
     )
     .await;
 
-    // The operator is typing a custom answer on the live card.
+    // The Host is typing a custom answer on the live card.
     add_question_block(&app, "ses_test", "/work", true).await;
     Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let before = platform.updated_cards().await.len();
@@ -5799,7 +5799,7 @@ async fn a_yielded_rows_activity_age_advances_on_the_rendered_second() {
 }
 
 /// The poller's inline question block, as a card renders it. `typed` picks the
-/// field the operator answers by typing — a V1 question's `custom` is unset,
+/// field the Host answers by typing — a V1 question's `custom` is unset,
 /// which reads as allowed, so its block renders the custom-answer form (issue
 /// #917's input) — or one answered by clicking its single option.
 async fn add_question_block(app: &Arc<App>, session_id: &str, directory: &str, typed: bool) {
@@ -5838,7 +5838,7 @@ async fn add_question_block(app: &Arc<App>, session_id: &str, directory: &str, t
 /// Issue #917: a card that renders an unanswered free-text answer field is
 /// frozen against the yielded ledger — no PATCH at all, not even one whose only
 /// difference is a background task's row or age. Feishu rebuilds the whole body
-/// on every update, so any repaint wipes what the operator typed; the card
+/// on every update, so any repaint wipes what the Host typed; the card
 /// looks settled (the turn is over, the AI is quiet) while a task's age ticks
 /// once a second and its fragment arrives once.
 ///
@@ -5855,7 +5855,7 @@ async fn a_typed_answer_freezes_the_yielded_ledger() {
         .await;
     yield_waiting_card(&app, &platform, 2).await;
 
-    // The operator is typing a custom answer on the waiting card.
+    // The Host is typing a custom answer on the waiting card.
     add_question_block(&app, "ses_test", "/work", true).await;
     Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let before = patches_to(&platform, "om_waiting").await.len();
@@ -5894,7 +5894,7 @@ async fn a_typed_answer_freezes_the_yielded_ledger() {
 }
 
 /// Issue #917 (live path): a background row joining does not repaint a live
-/// card whose operator is typing a custom answer, and the read is not consumed
+/// card whose Host is typing a custom answer, and the read is not consumed
 /// — the row lands on the first render after the answer. The shell's own clock
 /// is frozen (`frozen_start`), so the ledger's membership is the only thing
 /// the second read moves.
@@ -5929,7 +5929,7 @@ async fn a_typed_answer_freezes_the_live_ledger_rows() {
     })
     .await;
 
-    // The operator is typing a custom answer on the live card.
+    // The Host is typing a custom answer on the live card.
     add_question_block(&app, "ses_test", "/work", true).await;
     Turn::flush_card(&app.cards_handle(), "ses_test").await;
     let before = platform.updated_cards().await.len();

@@ -139,13 +139,18 @@ and the map from the old numbers.
   3000 chars, so its size is not a bug and splitting it buys nothing.
 - **`card-repaints`** — every card PATCH rebuilds `body.elements`, and a form
   input's unsubmitted text lives only in the client, so **any** repaint wipes
-  what the operator is typing (issue #917). Two rules follow. A card that
+  what the Host is typing (issue #917). Two rules follow. A card that
   renders an unanswered free-text answer field (`awaits_typed_answer`) is never
   repainted for **background progress** — the live header's second, the
   ledger's rows, its clock and its completion entries, a task panel's activity,
   the yielded read as a whole. The read must not be **consumed** either: plan
   no entry, apply no ledger, spend no liveness read while the form waits, or
-  every later read sees "no difference" and the fact never reaches a card.
+  every later read sees "no difference" and the fact never reaches a card. The
+  render pass writes nothing at all while the form waits — not even rendered
+  content, since a pass can pause for its reads and resume after the form
+  landed; the form's own flush (its arrival or its answer) is the write that
+  lands, and the suppressed pass consumed nothing because the build is what
+  advances `render_from`.
   Re-check under the card-write lock at the apply/write boundary too
   (`Turn::flush_card_unless_typing`, and the yielded refresh's second check):
   a question that surfaces mid-pass brings a form this pass must not repaint.
