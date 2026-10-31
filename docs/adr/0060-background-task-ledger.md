@@ -345,7 +345,9 @@ repaint the card just as surely as a rendered second does. And the read is
 its entries, before its child reads and before `apply_ledger_read`, so nothing
 is marked shown and nothing is advanced — the first pass after the answer finds
 the same delta and lands it (the "deferred, then landed on the very next read"
-half is pinned by a test). The settlement that ends the wait is not ledger
+half is pinned by a test). The check is made twice: early, to spend no read at
+all, and again under the card-write lock before the apply, so a question
+surfaced while those reads ran still keeps its form out of this pass. The settlement that ends the wait is not ledger
 progress and still lands (`YieldedUpdate::Settled`). A click-only question
 renders no input and keeps its second; so does every card that carries no
 unanswered form at all, which is the aliveness contract unchanged.

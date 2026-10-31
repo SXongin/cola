@@ -145,8 +145,11 @@ and the map from the old numbers.
   ledger's rows, its clock and its completion entries, a task panel's activity,
   the yielded read as a whole. The read must not be **consumed** either: plan
   no entry, apply no ledger, spend no liveness read while the form waits, or
-  every later read sees "no difference" and the fact never reaches a card. The
-  turn's own content and the settlement still flush. And every card write must
+  every later read sees "no difference" and the fact never reaches a card.
+  Re-check under the card-write lock at the apply/write boundary too
+  (`Turn::flush_card_unless_typing`, and the yielded refresh's second check):
+  a question that surfaces mid-pass brings a form this pass must not repaint.
+  The turn's own content and the settlement still flush. And every card write must
   advance the render gate's signature cache: the flush does it
   (`advance_sent_signatures`, `src/bridge/turn/flush.rs`) and so must an
   out-of-band write that restamps the header (`Turn::mark_header_shown` for a
