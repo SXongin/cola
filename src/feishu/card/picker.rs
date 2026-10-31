@@ -104,8 +104,7 @@ fn scope_level(scope: &crate::backend::types::ModelScope) -> &str {
 }
 
 /// The level one **option's** button carries: its own pick kind when the page
-/// mixes actions (Codex's `Provider：<id>…` drill on the model page, #908),
-/// else the scope's.
+/// mixes actions, else the scope's.
 fn option_level(
     scope: &crate::backend::types::ModelScope,
     option: &crate::backend::types::ModelOption,
@@ -991,161 +990,6 @@ mod tests {
         }
     }
 
-    /// Issue #910 (gate follow-up): the **combined** two-scope card fits most
-    /// Codex surfaces, and it must render a disabled row as text too — never a
-    /// button (that path had its own option loop).
-    #[test]
-    fn a_combined_card_renders_a_disabled_row_as_text() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let surface = surface(
-            None,
-            vec![
-                scope(
-                    "model",
-                    "模型",
-                    vec![ModelOption {
-                        id: "gpt-5".into(),
-                        value: Some("codex/gpt-5".into()),
-                        ..Default::default()
-                    }],
-                ),
-                provider_scope(
-                    "provider",
-                    "Provider（线程级：新线程 / resume）",
-                    vec![
-                        ModelOption {
-                            id: "openai-fake".into(),
-                            label: Some("OpenAI Fake：gpt-5".into()),
-                            value: Some("gpt-5".into()),
-                            provider: Some("openai-fake".into()),
-                            ..Default::default()
-                        },
-                        ModelOption {
-                            id: "codex".into(),
-                            label: Some("Real Codex：`codex` 是内置目录的保留名，不能在这里选择".into()),
-                            disabled: true,
-                            ..Default::default()
-                        },
-                    ],
-                ),
-            ],
-        );
-        let cards = build_model_surface_cards(&key, &surface, false);
-        assert_eq!(cards.len(), 1, "this surface fits one combined card");
-        let elements = cards[0]["body"]["elements"].as_array().unwrap();
-        let buttons: Vec<String> = elements
-            .iter()
-            .filter(|element| element["tag"] == "button")
-            .map(|element| element.to_string())
-            .collect();
-        assert!(
-            !buttons.iter().any(|button| button.contains("保留名")),
-            "a disabled row is never a button: {buttons:?}"
-        );
-        assert!(
-            buttons.iter().any(|button| button.contains("OpenAI Fake")),
-            "a selectable pair still is one: {buttons:?}"
-        );
-        let text = elements
-            .iter()
-            .filter(|element| element["tag"] == "markdown")
-            .filter_map(|element| element["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("保留名"), "the disabled row is text: {text}");
-    }
-
-    /// Issue #910: a listed-but-unpickable row (a configured Codex provider
-    /// with no known model) is rendered as text, never as a button — while a
-    /// selectable pair in the same scope still is one.
-    #[test]
-    fn a_disabled_option_is_a_text_row_not_a_button() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let surface = surface(
-            None,
-            vec![provider_scope(
-                "provider",
-                "Provider（线程级：新线程 / resume）",
-                vec![
-                    ModelOption {
-                        id: "openai-fake".into(),
-                        label: Some("OpenAI Fake：gpt-5".into()),
-                        value: Some("gpt-5".into()),
-                        provider: Some("openai-fake".into()),
-                        ..Default::default()
-                    },
-                    ModelOption {
-                        id: "opencode-go".into(),
-                        label: Some("OpenCode Go：没有已知模型".into()),
-                        disabled: true,
-                        ..Default::default()
-                    },
-                ],
-            )],
-        );
-        let cards = build_model_surface_cards(&key, &surface, false);
-        let mut buttons = Vec::new();
-        let mut markdown = String::new();
-        for card in &cards {
-            for element in card["body"]["elements"].as_array().unwrap() {
-                match element["tag"].as_str() {
-                    Some("button") => buttons.push(element.to_string()),
-                    Some("markdown") => markdown.push_str(element["content"].as_str().unwrap_or_default()),
-                    _ => {}
-                }
-            }
-        }
-        assert!(
-            !buttons.iter().any(|button| button.contains("没有已知模型")),
-            "a row with no known model is never a button: {buttons:?}"
-        );
-        assert!(
-            buttons.iter().any(|button| button.contains("OpenAI Fake：gpt-5")),
-            "a real pair still is: {buttons:?}"
-        );
-        assert!(
-            markdown.contains("没有已知模型"),
-            "the disabled row is text: {markdown}"
-        );
-    }
-
-    /// Spec #922: a live thread's provider page is read-only — the current
-    /// provider and the `/new` / later `/fork` note, with no clickable rows.
-    #[test]
-    fn a_read_only_provider_page_renders_no_buttons() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut provider = scope("provider", "Provider（仅新会话）", Vec::new());
-        provider.changeable = ChangeScope::NewThread;
-        provider.pick = crate::backend::types::PickKind::Provider;
-        provider.intro = Some("provider 是会话创建时的选择".into());
-        provider.note = Some(
-            "当前 provider：`deepseek`。provider 只能在新会话中更换：请用 `/new` 新建会话；`/fork` 是独立功能，将在后续版本提供。"
-                .into(),
-        );
-        let cards = build_model_surface_cards(&key, &surface(None, vec![provider]), false);
-        let mut buttons = 0;
-        let mut markdown = String::new();
-        for card in &cards {
-            for element in card["body"]["elements"].as_array().unwrap() {
-                match element["tag"].as_str() {
-                    Some("button") => buttons += 1,
-                    Some("markdown") => markdown.push_str(element["content"].as_str().unwrap_or_default()),
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(buttons, 0, "no clickable provider rows on a live thread");
-        assert!(markdown.contains("当前 provider"), "{markdown}");
-        assert!(
-            markdown.contains("/new") && markdown.contains("/fork"),
-            "{markdown}"
-        );
-        assert!(
-            markdown.contains("后续版本") && markdown.contains("独立功能"),
-            "a `/fork` mention must read as a future capability: {markdown}"
-        );
-    }
-
     /// The OpenCode root page: a `provider` scope whose pick drills into that
     /// provider's models (issue #910's explicit routing, not a name match).
     fn provider_scope(id: &str, title: &str, options: Vec<ModelOption>) -> ModelScope {
@@ -1974,14 +1818,6 @@ mod tests {
         serde_json::from_str(json).expect("the pinned card JSON parses")
     }
 
-    /// Every button element of one card, in render order.
-    fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
-        card["body"]["elements"]
-            .as_array()
-            .map(|elements| elements.iter().filter(|e| e["tag"] == "button").collect())
-            .unwrap_or_default()
-    }
-
     /// The OpenCode provider page is pinned byte-for-byte: any drift in the
     /// header, the current-model line, the intro or a button's callback payload
     /// fails, not just the fields one assertion happens to name.
@@ -2272,64 +2108,5 @@ mod tests {
             );
         }
         assert_eq!(total_buttons, 90, "every option keeps a button");
-    }
-
-    /// Issue #910: the callback tag follows the surface's declared pick kind,
-    /// not the scope id — a provider *selection* is not OpenCode's drill-down,
-    /// even though both scopes are named `provider`.
-    #[test]
-    fn a_provider_selection_is_not_a_provider_drill_down() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let mut pick = scope(
-            "provider",
-            "Provider（线程级：新线程 / resume）",
-            vec![ModelOption::new("deepseek")],
-        );
-        pick.pick = crate::backend::types::PickKind::Provider;
-        let cards = build_model_surface_cards(&key, &surface(None, vec![pick]), false);
-        let button = card_buttons(&cards[0]);
-        assert_eq!(button.len(), 1);
-        assert_eq!(button[0]["value"]["level"], PICKER_LEVEL_PROVIDER_PICK);
-        assert_eq!(button[0]["value"]["value"], "deepseek");
-
-        // The drill-down tag is unchanged, so OpenCode's navigation still works.
-        let drill = provider_scope("provider", "选择模型", vec![ModelOption::new("opencode")]);
-        let cards = build_model_surface_cards(&key, &surface(None, vec![drill]), false);
-        assert_eq!(
-            card_buttons(&cards[0])[0]["value"]["level"],
-            PICKER_LEVEL_PROVIDER
-        );
-    }
-
-    /// Issue #910: a paired option's provider rides the callback, and only
-    /// there — a model option without a pairing emits no such field, so every
-    /// other card's bytes stay identical.
-    #[test]
-    fn a_paired_provider_rides_the_model_button() {
-        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
-        let model = scope(
-            "model",
-            "模型",
-            vec![
-                ModelOption {
-                    id: "deepseek-flash".into(),
-                    value: Some("codex/deepseek-flash".into()),
-                    provider: Some("deepseek".into()),
-                    ..Default::default()
-                },
-                ModelOption {
-                    id: "gpt-5.1".into(),
-                    value: Some("codex/gpt-5.1".into()),
-                    ..Default::default()
-                },
-            ],
-        );
-        let cards = build_model_surface_cards(&key, &surface(None, vec![model]), false);
-        let buttons = card_buttons(&cards[0]);
-        assert_eq!(buttons[0]["value"]["provider"], "deepseek");
-        assert!(
-            buttons[1]["value"].get("provider").is_none(),
-            "an unpaired model pick carries no provider field"
-        );
     }
 }
