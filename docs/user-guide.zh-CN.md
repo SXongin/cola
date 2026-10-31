@@ -693,8 +693,10 @@ Codex 的模型轴不是 provider → model 树：provider 是**配置事实**�
 - **渠道可知时，指向其他 provider 的引用会被拒绝。** 手输的
   `/model <provider>/<model>` 若 provider 与活动线程的（Pending Session 上则是
   配置的）不同，**不发送任何请求**，并说明 provider 是配置事实、同时点名两个
-  渠道并指出 `model_provider` 与重启。渠道无法判定时（`config/read` 失败、未
-  连接），点选只按模型记录，由 Codex 在下一条消息上的报错兜底。
+  渠道并指出 `model_provider` 与重启。中性的 `codex/<id>` 例外：它不点名任何
+  渠道，所以无论渠道是否已知都会被接受，由服务器解析真实 provider。渠道无法
+  判定时（`config/read` 失败、未连接），点选和手输的 ref 都只按模型记录，由
+  Codex 在下一条消息上的报错兜底。
 - **下一个新消息生效，且只生效一次。** 那一轮的 `turn/start` 携带 `model` +
   `effort`；该轮被接受后选择即被**消费**，之后每条消息都不再携带模型与思考
   等级：线程自身的默认值就是事实，peer 后来的修改会被尊重，读回只刷新「当前」。
@@ -727,8 +729,9 @@ Codex 的模型轴不是 provider → model 树：provider 是**配置事实**�
   `codex/<id>`。点选只是记录，不会每条消息都发送：它只在下一个新消息的
   `turn/start.model` 中出现一次。
 - **任何清单之外的 id 用文本输入。** `/model <provider>/<model>`——例如
-  `/model opencode-go/deepseek-v4-pro`——把该模型记录到当前渠道上，而
-  `/model codex/<id>` 是渠道未知时的中性写法。Codex 对两者都不校验：只有内置目录
+  `/model opencode-go/deepseek-v4-pro`——把该模型记录到当前渠道上；中性的
+  `/model codex/<id>` 不点名任何渠道，所以无论渠道是否已知都会被接受，由
+  服务器解析真实 provider。Codex 对两者都不校验：只有内置目录
   的条目带显示名、上下文窗口与思考等级，所以拼错会在下一条消息上以 provider
   自身的报错出现。
 - **`[profiles.*]` 不会被读取。** Codex 0.134+ 已不再读取它（`--profile` 会
@@ -765,14 +768,16 @@ cola 目前没有 `/fork` 命令，输入它会被当成普通消息提交。因
   **不发送任何请求**——没有 `turn/start`，也没有 `thread/resume`——并说明
   provider 是配置事实、点名配置修改与重启。它绝不会指向 `/new`：新会话跑的仍
   是同一个渠道。
-- **中性的 `codex` 引用不是渠道。** `codex/<id>` 是渠道未知时 cola 记录的
-  回退写法——一个共享的中性命名空间，永远不是真实 provider。因此
-  `[model_providers.codex]` 不会贡献可选的渠道或探测分组，真实渠道已知后引用
-  会改用它。分类是纯字面的，因此目录点选从不读取你的配置。
+- **中性的 `codex` 引用不是渠道。** `codex/<id>` 是渠道未知时 cola 记录的回退
+  写法——一个共享的中性命名空间，永远不是真实 provider。因此
+  `[model_providers.codex]` 不会贡献可选的渠道或探测分组。中性引用在渠道已知时
+  也照样被接受：它不点名渠道，点选或手输都只按模型记录，由服务器决定真实
+  provider，线程读回后当前行显示真实渠道。分类是纯字面的，因此目录点选从不
+  读取你的配置。
 
 手输的 `/model <provider>/<model>` 遵循同一规则：渠道可判定时，provider 必须
-写当前渠道（否则拒绝，绝不静默改指），渠道不可判定时就用 `codex/<id>` 这个
-写法。
+写当前渠道（否则拒绝，绝不静默改指），但中性的 `codex/<id>` 例外——它总是被
+接受：不点名渠道，渠道未知时就用它，渠道已知时也依然有效。
 
 ## FAQ / 故障排查
 

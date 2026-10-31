@@ -727,6 +727,8 @@ not a spelling of the ref: an id may itself contain `/` (`openrouter/openai/o3`)
 so it cannot be told apart from `provider/model` (`src/backend/parsing.rs`), and
 the display surfaces (the footer, `/status`, the current line) already spell
 `provider/model` — a typed ref has to be copy-pasteable from what the card shows.
+The fallback is a *spelling* rule, not an input restriction: a typed or clicked
+`codex/<id>` names no channel and is accepted on a known one too (decision 5).
 
 **3. Creation carries no `modelProvider`.** A Pending Session's first
 `thread/start` sends `cwd`, `model` and the configured overrides, and nothing
@@ -745,19 +747,24 @@ disabled provider rows are removed. A live thread's 「待应用」 line,
 `/status` and `/think` keep their display. #908's two-page split therefore
 survives only for OpenCode; #906 AC1's one page returns for Codex.
 
-**5. A typed ref still has to name the current channel.** `/model
-<provider>/<model>` is validated against the channel when it is determinable —
-a live thread from its cached projection (no request), a Pending Session from
-the cached `config/read` — and a different provider is refused **before
-anything is sent**, naming the config edit and the restart (the same message the
-card's stale pick gets, `PROVIDER_IS_A_CONFIG_FACT` in `handles.rs`).
-`codex/<id>` stays valid when the channel is unknown. When the channel cannot be
-determined the pick is **not** blocked: it is recorded as model-only and Codex's
-own model error is the fallback — the trade the creation path already makes for
-an unreadable config. That is this amendment's accepted residual limit: with a
-cold cache, a typed wrong prefix is not caught before the request. OpenCode is
-unchanged: its `provider/model` is a real per-prompt selection, so `/model`
-still switches provider there.
+**5. A typed ref must name the current channel — unless it is the neutral
+bucket.** `/model <provider>/<model>` is validated against the channel when it
+is determinable — a live thread from its cached projection (no request), a
+Pending Session from the cached `config/read` — and a different provider is
+refused **before anything is sent**, naming the config edit and the restart (the
+same message the card's stale pick gets, `PROVIDER_IS_A_CONFIG_FACT` in
+`handles.rs`). The neutral `codex` bucket is exempt: it names no channel, so
+`model_pick_decision` skips the comparison and records it whether or not the
+channel is known, and the server resolves the real provider at the turn. A
+typed `/model codex/<id>` is therefore a valid input on a known channel — it is
+the same reference the card records when the channel is unknown, not a claim
+about which channel runs the model. When the channel cannot be determined a
+ref naming any other provider is **not** blocked: a click and a typed ref are
+alike recorded as model-only, and Codex's own model error is the fallback — the
+trade the creation path already makes for an unreadable config. That is this
+amendment's accepted residual limit: with a cold cache, a typed wrong prefix is
+not caught before the request. OpenCode is unchanged: its `provider/model` is a
+real per-prompt selection, so `/model` still switches provider there.
 
 **6. `/new` is no longer a provider-change entry point.** A Pending Session — and
 `/fork`, when it lands — can change the **model**, never the channel. The copy
