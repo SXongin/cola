@@ -1056,8 +1056,10 @@ impl SessionsHandle {
     /// refused **before any request** when that channel is determinable.
     ///
     /// The channel comes from the client's cache — the live thread's ordered
-    /// provider fact, or a Pending Session's cached `configured_provider`. An
-    /// unknown channel does not block: the model is recorded model-only and the
+    /// provider fact, or a Pending Session's `configured_provider` **for that
+    /// session's own directory** (Codex resolves project config layers, so a
+    /// fact read for another directory is not attributable here). An unknown
+    /// channel does not block: the model is recorded model-only and the
     /// server's own model error is the fallback (the accepted residual limit).
     /// The neutral `codex` bucket names no channel, so it is always accepted.
     pub(crate) async fn model_pick_decision(
@@ -1087,7 +1089,7 @@ impl SessionsHandle {
             // A Pending Session: the cached config/read provider is the current
             // channel. Without a cached read it is unknown — record, never
             // block (spec #930's residual limit).
-            return match backend.configured_provider() {
+            return match backend.configured_provider(&settings.directory) {
                 Some(configured) if configured != provider => {
                     ModelPickDecision::Refuse(provider_refusal(&configured, provider))
                 }
