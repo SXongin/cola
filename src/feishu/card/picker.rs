@@ -1818,6 +1818,14 @@ mod tests {
         serde_json::from_str(json).expect("the pinned card JSON parses")
     }
 
+    /// Every button element of one card, in render order.
+    fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()
+            .map(|elements| elements.iter().filter(|e| e["tag"] == "button").collect())
+            .unwrap_or_default()
+    }
+
     /// The OpenCode provider page is pinned byte-for-byte: any drift in the
     /// header, the current-model line, the intro or a button's callback payload
     /// fails, not just the fields one assertion happens to name.
@@ -2108,5 +2116,64 @@ mod tests {
             );
         }
         assert_eq!(total_buttons, 90, "every option keeps a button");
+    }
+
+    /// Issue #910: the callback tag follows the surface's declared pick kind,
+    /// not the scope id — a provider *selection* is not OpenCode's drill-down,
+    /// even though both scopes are named `provider`.
+    #[test]
+    fn a_provider_selection_is_not_a_provider_drill_down() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let mut pick = scope(
+            "provider",
+            "Provider（线程级：新线程 / resume）",
+            vec![ModelOption::new("deepseek")],
+        );
+        pick.pick = crate::backend::types::PickKind::Provider;
+        let cards = build_model_surface_cards(&key, &surface(None, vec![pick]), false);
+        let button = card_buttons(&cards[0]);
+        assert_eq!(button.len(), 1);
+        assert_eq!(button[0]["value"]["level"], PICKER_LEVEL_PROVIDER_PICK);
+        assert_eq!(button[0]["value"]["value"], "deepseek");
+
+        // The drill-down tag is unchanged, so OpenCode's navigation still works.
+        let drill = provider_scope("provider", "选择模型", vec![ModelOption::new("opencode")]);
+        let cards = build_model_surface_cards(&key, &surface(None, vec![drill]), false);
+        assert_eq!(
+            card_buttons(&cards[0])[0]["value"]["level"],
+            PICKER_LEVEL_PROVIDER
+        );
+    }
+
+    /// Issue #910: a paired option's provider rides the callback, and only
+    /// there — a model option without a pairing emits no such field, so every
+    /// other card's bytes stay identical.
+    #[test]
+    fn a_paired_provider_rides_the_model_button() {
+        let key = crate::config::ThreadKey::new("chat_1".into(), "chat_1".into());
+        let model = scope(
+            "model",
+            "模型",
+            vec![
+                ModelOption {
+                    id: "deepseek-flash".into(),
+                    value: Some("codex/deepseek-flash".into()),
+                    provider: Some("deepseek".into()),
+                    ..Default::default()
+                },
+                ModelOption {
+                    id: "gpt-5.1".into(),
+                    value: Some("codex/gpt-5.1".into()),
+                    ..Default::default()
+                },
+            ],
+        );
+        let cards = build_model_surface_cards(&key, &surface(None, vec![model]), false);
+        let buttons = card_buttons(&cards[0]);
+        assert_eq!(buttons[0]["value"]["provider"], "deepseek");
+        assert!(
+            buttons[1]["value"].get("provider").is_none(),
+            "an unpaired model pick carries no provider field"
+        );
     }
 }
