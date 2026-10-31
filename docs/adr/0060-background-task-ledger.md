@@ -328,21 +328,21 @@ The Completion Notice keeps the rule that a chain cola did not start owes
 none: an external follow's card carries no Turn clock, and its 有新消息 send
 was its notification (ADR-0059's 2026-10-08 amendment).
 
-## Amendment (2026-10-31, #917): a card with an unanswered typed answer keeps its clock
+## Amendment (2026-10-31, #917): a card with an unanswered typed answer stops refreshing
 
-The yielded second exists to prove the wait is alive — "cola is still waiting,
+The yielded read exists to prove the wait is alive — "cola is still waiting,
 and here is how long". It stops when the card renders a free-text answer field
 nobody has submitted yet (`StreamAccumulator::awaits_typed_answer`): Feishu
-rebuilds `body.elements` on every card update, so a tick's PATCH wipes the text
-the operator is typing, and that text lives only in the client. A clock that
-kept repainting a card holding a half-typed answer is the observable "it
+rebuilds `body.elements` on every card update, so the read's PATCH wipes the
+text the operator is typing, and that text lives only in the client. A clock
+that kept repainting a card holding a half-typed answer is the observable "it
 refreshes by itself" of issue #917.
 
-The freeze is scoped to the **clock half** of a ledger read. `apply_ledger_read`
-returns both halves (`LedgerChange`): rows — membership, a row's words, an
-activity's fragment, a committed completion entry — are content and still
-refresh, as does the settlement that ends the wait. Only a rendered second
-crossing its cadence is dropped, for the yielded read and for the live path's
-whole-minute clock alike. A click-only question renders no input and keeps its
-second; so does every card that carries no unanswered form at all, which is the
-aliveness contract unchanged.
+The freeze covers the **whole ledger read**, not only its clock: rows
+(membership, a row's words, an activity's fragment) and a committed completion
+entry repaint the card just as surely as a rendered second does. It defers,
+never drops — `set_ledger_from_read` keeps the read on the accumulator, so the
+answer's own flush renders it — and the settlement that ends the wait is not a
+ledger read and still lands (`YieldedUpdate::Settled`). A click-only question
+renders no input and keeps its second; so does every card that carries no
+unanswered form at all, which is the aliveness contract unchanged.

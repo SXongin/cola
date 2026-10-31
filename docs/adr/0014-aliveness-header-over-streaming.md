@@ -40,6 +40,6 @@ now advances the cache to the body it built (`advance_sent_signatures`,
 
 The tick still stops while the turn waits on the operator, since the awaiting
 title is a static string; a card that renders an unanswered free-text answer is
-additionally never repainted for a clock-only cause (ADR-0038's 2026-10-31
-update, ADR-0060's 2026-10-31 amendment) — the repaint would wipe the text being
-typed.
+additionally never repainted for background progress at all (ADR-0038's
+2026-10-31 update, ADR-0060's 2026-10-31 amendment) — the repaint would wipe the
+text being typed.
