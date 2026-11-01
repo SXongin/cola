@@ -1,7 +1,7 @@
 use crate::backend::{ContentBlock, FileContent, ToolCall, ToolStatus};
 
 use super::lang::{PLAIN_TEXT, language_for_path};
-use super::sanitize::CardMarkdown;
+use super::sanitize::{CardMarkdown, serialized_len};
 use super::shell::{collapsible_panel, fmt_elapsed, panel_time_suffix};
 use super::{
     AwaitingAction, clip_md, exceeds_md_budget, fenced_block_bytes, fenced_block_overhead, fenced_code,
@@ -36,6 +36,12 @@ const PREVIEW_TRUNCATION_NOTE: &str = "_（预览已截断，打开查看完整�
 /// [`PREVIEW_TRUNCATION_NOTE`] it names no way-in: the 「📂 打开」 button opens
 /// the file's CURRENT content, not the diff that changed it.
 pub(crate) const DIFF_TRUNCATION_NOTE: &str = "_（改动过长，已截断）_";
+
+/// The line a Codex search's raw-JSON fallback appends under a body its budget
+/// CLIPPED. The opaque `results` value can exceed the panel budget; the fenced
+/// body clips bare ([`clip_fenced_body`]) so the enclosing fence survives, and
+/// this line is the reader's only signal that the payload was cut.
+const SEARCH_TRUNCATION_NOTE: &str = "_（搜索结果过长，已截断）_";
 
 /// The budget for a file-editing panel's diff BODY, measured in the bytes the
 /// body occupies once the card serializes it (its JSON-escaped form) — NOT in
@@ -1415,14 +1421,7 @@ fn diff_panel(diff: EditDiff) -> (Option<String>, BodyStyle, String) {
 /// still running) renders no Output at all: an empty Output beside the query
 /// would claim the search returned nothing.
 fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyle, String)> {
-    if !is_codex_web_search(tool) {
-        return None;
-    }
-    let results = tool
-        .metadata()
-        .and_then(|metadata| metadata.get("results"))
-        .filter(|value| !value.is_null())
-        .or_else(|| tool.call().output.raw.as_ref().filter(|value| !value.is_null()))?;
+    let results = codex_search_results(tool)?;
     if let Some(entries) = codex_search_entries(results) {
         if entries.is_empty() && tool.is_live() {
             return None;
@@ -1431,12 +1430,37 @@ fn codex_web_search_output(tool: &ToolPanel) -> Option<(Option<String>, BodyStyl
         return Some((header, BodyStyle::Markdown, search_result_list(&entries)));
     }
     // The value is a string (a provider's own message) or a shape the schema
-    // reserves the right to change: show it, don't interpret it.
-    let body = match results {
+    // reserves the right to change: show it, don't interpret it. It clips BARE
+    // before the fence, because the `…` `truncate_md` appends directly before a
+    // closing fence stops Feishu rendering the block as code at all (#788).
+    let body = codex_search_raw_body(results);
+    Some((
+        None,
+        BodyStyle::Code(Some("json")),
+        clip_fenced_body(&body, Some("json"), TOOL_OUTPUT_MAX_CHARS),
+    ))
+}
+
+/// The opaque `results` a shape-gated Codex search carries: its metadata first,
+/// then the raw output (the adapter writes both; the fallback covers a call from
+/// before the field existed). `None` while the search has no results yet.
+fn codex_search_results(tool: &ToolPanel) -> Option<&serde_json::Value> {
+    if !is_codex_web_search(tool) {
+        return None;
+    }
+    tool.metadata()
+        .and_then(|metadata| metadata.get("results"))
+        .filter(|value| !value.is_null())
+        .or_else(|| tool.call().output.raw.as_ref().filter(|value| !value.is_null()))
+}
+
+/// The raw-JSON body for a `results` value the card cannot confirm: a JSON
+/// string's own text, otherwise its pretty-printed JSON.
+fn codex_search_raw_body(results: &serde_json::Value) -> String {
+    match results {
         serde_json::Value::String(text) => text.clone(),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
-    };
-    Some((None, BodyStyle::Code(Some("json")), body))
+    }
 }
 
 /// Whether a panel's body is a file-editing DIFF ([`BodyStyle::Code`] from an
@@ -1490,13 +1514,28 @@ fn diff_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
         .map(|_| DIFF_TRUNCATION_NOTE)
 }
 
+/// The note a Codex search's raw-JSON fallback appends under a body its budget
+/// CLIPPED ([`SEARCH_TRUNCATION_NOTE`]): the body clips bare, so without this
+/// line a cut payload would look complete. `None` for a recognized result list
+/// (its compact list always fits) and for a body that fits.
+fn codex_search_truncation_note(tool: &ToolPanel) -> Option<&'static str> {
+    let results = codex_search_results(tool)?;
+    if codex_search_entries(results).is_some() {
+        return None;
+    }
+    let body = codex_search_raw_body(results);
+    (!fenced_body_fits(&body, Some("json"), TOOL_OUTPUT_MAX_CHARS)).then_some(SEARCH_TRUNCATION_NOTE)
+}
+
 /// The note a panel appends under a body its budget clipped: a `read`/`write`
 /// preview's way-in note, or a file-editing diff's bare clip signal. One
 /// function, because the render and the size estimate must agree on exactly one
 /// note (a panel never carries both: a tool is either an editing tool or it
 /// isn't).
 fn truncation_note(tool: &ToolPanel, session_id: Option<&str>) -> Option<&'static str> {
-    preview_truncation_note(tool, session_id).or_else(|| diff_truncation_note(tool))
+    preview_truncation_note(tool, session_id)
+        .or_else(|| diff_truncation_note(tool))
+        .or_else(|| codex_search_truncation_note(tool))
 }
 
 /// Whether a `read`/`write` panel's rendered body is clipped by its own budget
@@ -1660,8 +1699,10 @@ pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
             .unwrap_or(0);
         let body = truncate_md(&body, TOOL_OUTPUT_MAX_CHARS);
         let body = match style {
-            // A result list is markdown by construction: no fence at all.
-            BodyStyle::Markdown => json_escaped_len(&body),
+            // A result list is markdown by construction: no fence at all, and
+            // it goes through the card's sanitizer, which expands `<` outside
+            // code — charge what the element actually carries.
+            BodyStyle::Markdown => serialized_len(&body),
             // The raw fallback is always fenced, its `json` tag included.
             BodyStyle::Code(lang) => {
                 json_escaped_len(&body) + fenced_overhead(&body) + fence_lang_bytes(lang)
@@ -8322,12 +8363,48 @@ excerpt two";
             "the count header and the markdown body are both charged"
         );
 
+        // The sanitizer expands `<` outside code, so the estimate must charge
+        // what the element carries, not the raw markdown length.
+        let escaped = codex_web_search_panel(json!([
+            {"title": "a<b", "url": "https://a.example/<x>"},
+        ]));
+        let escaped_body = "1. [a<b](https://a.example/<x>)";
+        assert_eq!(
+            panel_output_estimate(&escaped),
+            header.len() + serialized_len(escaped_body),
+            "the sanitizer's `<` expansion is charged"
+        );
+        assert!(
+            serialized_len(escaped_body) > escaped_body.len(),
+            "the expansion is real"
+        );
+
         let raw = codex_web_search_panel(json!([{"foo": 1}]));
         let raw_body = "[\n  {\n    \"foo\": 1\n  }\n]";
         assert_eq!(
             panel_output_estimate(&raw),
             json_escaped_len(raw_body) + fence_lang_bytes(Some("json")),
             "the raw fallback also charges its json fence tag"
+        );
+    }
+
+    /// Opaque results beyond the panel budget clip BARE inside the `json`
+    /// fence and say so: a `…` immediately before a closing fence stops Feishu
+    /// rendering the block as code at all (#788), so the body must not get one.
+    #[test]
+    fn codex_web_search_long_raw_json_keeps_its_fence_and_says_it_clipped() {
+        let tool = codex_web_search_panel(json!({"blob": "x".repeat(4_000)}));
+        assert_eq!(
+            truncation_note(&tool, None),
+            Some(SEARCH_TRUNCATION_NOTE),
+            "the clip is announced"
+        );
+        let md = panel_md(tool);
+        assert!(md.contains("```json"), "fenced: {md}");
+        assert!(!md.contains('…'), "the body clips bare: {md}");
+        assert!(
+            md.contains(&format!("```\n\n{SEARCH_TRUNCATION_NOTE}")),
+            "the fence closes bare, then the note: {md}"
         );
     }
 
