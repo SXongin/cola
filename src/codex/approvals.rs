@@ -2657,9 +2657,12 @@ mod tests {
         let path = directory.path().join("app-server.sock");
         let server = FakeServer::unix(&path, "codex-tui/0.163.0 (test)").await;
         let endpoint = Endpoint::parse(&format!("unix://{}", path.display())).expect("endpoint");
-        let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
-            .await
-            .expect("attach to the scripted server");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_proxy_binary(crate::codex::test_server::proxy_helper()),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach to the scripted server");
 
         server.request_to_all(
             "item/commandExecution/requestApproval",

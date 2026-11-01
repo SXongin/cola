@@ -1425,9 +1425,12 @@ mod tests {
             "a real thread",
         ));
         let endpoint = Endpoint::Unix(socket);
-        let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
-            .await
-            .expect("attach");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_proxy_binary(crate::codex::test_server::proxy_helper()),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach");
         let Adoption::Subscribed(mut subscription) = client.threads().adopt("thread-1").await.expect("adopt")
         else {
             panic!("must subscribe");
