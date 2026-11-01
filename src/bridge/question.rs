@@ -93,15 +93,13 @@ impl QuestionState {
 
     /// The question the card renders open (ADR-0093, issue #917 part 3): the
     /// reader's chosen one while it is still unanswered, otherwise the first
-    /// unanswered one. `None` when every question is finalized. The renderer
-    /// and the typed-answer freeze read this ONE predicate, so the card and the
-    /// freeze cannot disagree about which field is open.
+    /// unanswered one. `None` when every question is finalized. Delegates to
+    /// the renderer's own resolver ([`crate::feishu::card::question::open_index`])
+    /// so the state, the card and the typed-answer freeze cannot disagree about
+    /// which question is open.
     pub(crate) fn open(&self) -> Option<usize> {
-        let unanswered = |i: usize| self.answers.get(i).is_none_or(Option::is_none);
-        if self.open < self.answers.len() && unanswered(self.open) {
-            return Some(self.open);
-        }
-        (0..self.answers.len()).find(|i| unanswered(*i))
+        let done: Vec<bool> = self.answers.iter().map(Option::is_some).collect();
+        crate::feishu::card::question::open_index(done.len(), &done, self.open)
     }
 
     /// Record the text a switch submit carried for question `index`. A draft
