@@ -337,6 +337,8 @@ pub fn question_elements(
     directory: &str,
     answered: &[Option<Vec<String>>],
     done: &[bool],
+    open: usize,
+    drafts: &[String],
 ) -> Vec<serde_json::Value> {
     use crate::backend::types::FormFieldKind;
 
@@ -368,20 +370,26 @@ pub fn question_elements(
         // the keyboard's top when a card input takes focus, so an input with
         // more than about half a screen of content BELOW it is pushed off the
         // top of the screen — unreadable, and the typed text stays invisible.
-        // Keep exactly one question open at a time: the first unanswered one
-        // renders its controls, and every other unanswered one folds into a
-        // collapsible panel, whose folded cost is its header line (measured:
-        // folded content does not push the input away). A single-question ask —
-        // the common case — is unchanged.
-        let current = questions
-            .iter()
-            .enumerate()
-            .find(|(i, _)| !is_done(*i))
-            .map(|(i, _)| i);
+        // Exactly one question is open at a time: it renders its controls, and
+        // every other unanswered one folds into a collapsible panel, whose
+        // folded cost is its header line (measured: folded content does not
+        // push the input away). A single-question ask — the common case — is
+        // unchanged.
+        //
+        // One root-level form owns the whole block (issue #917 part 3), so a
+        // switch between questions is a form SUBMIT: the text typed into the
+        // open question's box rides along in `form_value` and becomes that
+        // question's draft, instead of being wiped by the repaint that opens
+        // another one. Feishu rejects a `form` nested in a `collapsible_panel`
+        // (ErrCode 200621), so the panel cannot own the switch: the form wraps
+        // the panels (the legal direction) and the switch button—a submit—lives
+        // inside the folded panel's body.
+        let current = open_index(questions.len(), done, open);
+        let mut form: Vec<serde_json::Value> = Vec::new();
         for (i, q) in questions.iter().enumerate() {
             let multi = q.is_multi();
             let finalized = is_done(i);
-            let block_start = elements.len();
+            let block_start = form.len();
 
             // Per-question heading: number + text + status, option bullets while
             // the question is still open (so the full option list reads together
@@ -421,8 +429,12 @@ pub fn question_elements(
                 heading.push_str(&format!("\n👉 已选：{}", q.display_values(values).join("、")));
             }
             let heading = md.clean(&heading);
-            elements.push(json!({ "tag": "markdown", "content": heading }));
+            form.push(json!({ "tag": "markdown", "content": heading }));
 
+            // Only the open question renders a typed box: it is the card's one
+            // input (ADR-0093), and a single input keeps `form_value` — and so
+            // the switch's draft — unambiguous.
+            let is_open = Some(i) == current;
             if finalized {
                 // Answered / confirmed: no controls, just the 已选 line above.
             } else {
@@ -432,7 +444,7 @@ pub fn question_elements(
                     FormFieldKind::External => {
                         let mut value = question_value(request_id, session_id, directory, i, "answer");
                         value["answer"] = json!("true");
-                        elements.push(json!({
+                        form.push(json!({
                             "tag": "button",
                             "text": { "tag": "plain_text", "content": "✅ 我已了解" },
                             "type": "primary",
@@ -447,7 +459,7 @@ pub fn question_elements(
                         {
                             let mut value = question_value(request_id, session_id, directory, i, "answer");
                             value["answer"] = json!(answer);
-                            elements.push(json!({
+                            form.push(json!({
                                 "tag": "button",
                                 "text": { "tag": "plain_text", "content": label },
                                 "type": button_type,
@@ -459,7 +471,15 @@ pub fn question_elements(
                     // submit is its only control, and the text is parsed into the
                     // field's number at reply time.
                     FormFieldKind::Number | FormFieldKind::Integer => {
-                        elements.push(number_answer_form(request_id, session_id, directory, i));
+                        if is_open {
+                            form.extend(number_answer_elements(
+                                request_id,
+                                session_id,
+                                directory,
+                                i,
+                                draft_of(drafts, i),
+                            ));
+                        }
                     }
                     // String / Multiselect: an option picker when the field
                     // declares options (the question tool always does) plus the
@@ -476,7 +496,7 @@ pub fn question_elements(
                                     })
                                 })
                                 .collect();
-                            elements.push(json!({
+                            form.push(json!({
                                 "tag": "overflow",
                                 "width": "fill",
                                 "options": options,
@@ -495,7 +515,7 @@ pub fn question_elements(
                                 let mut value =
                                     question_value(request_id, session_id, directory, i, "answer");
                                 value["answer"] = json!(opt.answer_value());
-                                elements.push(json!({
+                                form.push(json!({
                                     "tag": "button",
                                     "text": {
                                         "tag": "plain_text",
@@ -525,7 +545,7 @@ pub fn question_elements(
                                 let mut payload =
                                     question_value(request_id, session_id, directory, i, "answer");
                                 payload["answer"] = json!(value);
-                                elements.push(json!({
+                                form.push(json!({
                                     "tag": "button",
                                     "text": {
                                         "tag": "plain_text",
@@ -544,8 +564,15 @@ pub fn question_elements(
                         // the typed label to the toggled set (`reply: "custom"`),
                         // so the two never collide. A String field with no options
                         // always renders it — otherwise the field has no control.
-                        if renders_typed_input(q) {
-                            elements.push(custom_answer_form(request_id, session_id, directory, i, multi));
+                        if is_open && renders_typed_input(q) {
+                            form.extend(custom_answer_elements(
+                                request_id,
+                                session_id,
+                                directory,
+                                i,
+                                multi,
+                                draft_of(drafts, i),
+                            ));
                         }
 
                         // Multi-select: the commit action sits right under its own
@@ -553,7 +580,7 @@ pub fn question_elements(
                         // locks the toggled set (empty allowed — "不选") and
                         // collapses the question to 已选.
                         if multi {
-                            elements.push(json!({
+                            form.push(json!({
                                 "tag": "button",
                                 "text": { "tag": "plain_text", "content": "✅ 确定该题" },
                                 "type": "primary",
@@ -566,60 +593,97 @@ pub fn question_elements(
 
             // Fold every unanswered question but the open one (issue #917).
             // The block built above is exactly what the expanded question shows,
-            // except the typed form: Feishu rejects a `form` nested in a
-            // `collapsible_panel` (ErrCode 200621 "type of element is not
-            // supported tag: form"), and the open question owns the card's only
-            // input anyway. A panel left with no clickable control (an
-            // input-only field) says what to do instead of showing nothing.
-            let mut block: Vec<serde_json::Value> = elements.split_off(block_start);
-            if !finalized && Some(i) != current {
-                block.retain(|e| e["tag"] != "form");
-                if !block
-                    .iter()
-                    .any(|e| e["tag"] == "button" || e["tag"] == "overflow")
-                {
-                    block.push(json!({
-                        "tag": "markdown",
-                        "content": "_（回答完当前问题后，这里才能作答）_",
-                    }));
-                }
-                elements.push(super::shell::collapsible_panel_elements(
+            // except the typed box, which only the open question renders. The
+            // panel's body carries the switch: a form SUBMIT inside the panel
+            // (legal — the panel, not the form, may be the nested one), so the
+            // open question's typed text travels with it.
+            let mut block: Vec<serde_json::Value> = form.split_off(block_start);
+            if !finalized && !is_open {
+                block.push(switch_button(request_id, session_id, i));
+                form.push(super::shell::collapsible_panel_elements(
                     &format!("{}. {}", i + 1, question_label(q, 40)),
                     std::mem::take(&mut block),
                     Some(&format!("question_{i}")),
                 ));
             } else {
-                elements.append(&mut block);
+                form.append(&mut block);
             }
 
             // A divider separates question blocks so options never mix visually.
             if i + 1 < questions.len() {
-                elements.push(json!({ "tag": "hr" }));
+                form.push(json!({ "tag": "hr" }));
             }
         }
-    }
 
-    // Submit appears only when something is picked while questions remain open
-    // ("跳过剩余"). A multi-select question is finalized by its own 确定该题
-    // button, so there is no separate bottom submit for the multi-select case.
-    let answered_count = done.iter().filter(|d| **d).count();
-    if answered_count > 0 && answered_count < questions.len() {
+        // Submit appears only when something is picked while questions remain
+        // open ("跳过剩余"). A multi-select question is finalized by its own
+        // 确定该题 button, so there is no separate bottom submit for it.
+        let answered_count = done.iter().filter(|d| **d).count();
+        if answered_count > 0 && answered_count < questions.len() {
+            form.push(json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": "✅ 提交（跳过剩余）" },
+                "type": "primary",
+                "value": {
+                    "action": "question",
+                    "reply": "submit",
+                    "request_id": request_id,
+                    "session_id": session_id,
+                    "directory": directory,
+                },
+            }));
+        }
+        form.push(question_reject_button(request_id, session_id, directory));
         elements.push(json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": "✅ 提交（跳过剩余）" },
-            "type": "primary",
-            "value": {
-                "action": "question",
-                "reply": "submit",
-                "request_id": request_id,
-                "session_id": session_id,
-                "directory": directory,
-            },
+            "tag": "form",
+            "name": format!("form_{request_id}"),
+            "elements": form,
         }));
+    } else {
+        // Nothing to collect: the reason's copy above and the decline control.
+        // No form — there is no field an answer could be typed into.
+        elements.push(question_reject_button(request_id, session_id, directory));
     }
-    elements.push(question_reject_button(request_id, session_id, directory));
 
     elements
+}
+
+/// The question the card renders open: `chosen` while it is still unanswered,
+/// otherwise the first unanswered one; `None` when every question is finalized.
+/// The renderer and the typed-answer freeze read this ONE predicate, so they
+/// cannot disagree about which question is open (issue #917).
+pub(crate) fn open_index(n: usize, done: &[bool], chosen: usize) -> Option<usize> {
+    let is_done = |i: usize| done.get(i).copied().unwrap_or(false);
+    if chosen < n && !is_done(chosen) {
+        return Some(chosen);
+    }
+    (0..n).find(|i| !is_done(*i))
+}
+
+/// The unsubmitted text recorded for question `index`, or an empty seed.
+fn draft_of(drafts: &[String], index: usize) -> &str {
+    drafts.get(index).map(String::as_str).unwrap_or("")
+}
+
+/// The switch control a folded question carries: a form SUBMIT that names the
+/// question to open. It rides the button `name` ("open|req|ses|qi") because a
+/// form submit does not deliver the button `value`; the directory stays out of
+/// it, exactly like `submit_name` (Feishu caps `name` at 100 chars).
+fn switch_button(request_id: &str, session_id: &str, index: usize) -> serde_json::Value {
+    json!({
+        "tag": "button",
+        "text": { "tag": "plain_text", "content": "▸ 作答这道题" },
+        "type": "default",
+        "form_action_type": "submit",
+        "name": submit_name("open", request_id, session_id, index),
+        "value": {
+            "action": "question",
+            "reply": "open",
+            "request_id": request_id,
+            "session_id": session_id,
+            "question_index": index,
+        },
+    })
 }
 
 /// The reject control every question block carries. One builder, so the
@@ -695,89 +759,89 @@ pub(crate) fn renders_typed_input(q: &crate::backend::types::QuestionInfo) -> bo
     }
 }
 
-/// A custom (free-text) answer input plus its submit button, one per field.
+/// A custom (free-text) answer input plus its submit button, one per question.
 /// Single-select submits a replacement; a multi-select ADDS the typed label to
 /// the toggled set. The typed text arrives in `action.form_value` and is
 /// injected by ws.rs.
-fn custom_answer_form(
+///
+/// Both elements belong to the card's ONE root-level form (issue #917 part 3):
+/// the input and its submit are siblings there, not a form of their own. The
+/// input is seeded with the question's recorded draft, so a switch between
+/// questions does not lose text the Host typed.
+fn custom_answer_elements(
     request_id: &str,
     session_id: &str,
     directory: &str,
     index: usize,
     multi: bool,
-) -> serde_json::Value {
+    draft: &str,
+) -> Vec<serde_json::Value> {
     let (reply, name_prefix) = if multi {
         ("custom", "submitm")
     } else {
         ("answer", "submit")
     };
-    let mut value = question_value(request_id, session_id, directory, index, reply);
-    value["question_index"] = json!(index);
-    json!({
-        "tag": "form",
-        "name": format!("form_{}", index),
-        "elements": [
-            {
-                "tag": "input",
-                "name": format!("custom_{}", index),
-                // Multiline box instead of the default single line: the
-                // single-line input is a cramped one-row strip that types
-                // poorly on both PC and mobile. rows:1 starts it at one line;
-                // auto_resize grows it with the text (Feishu's docs say
-                // PC-only, but mobile grows too in practice). Callbacks arrive
-                // unchanged via `action.form_value`.
-                "input_type": "multiline_text",
-                "rows": 1,
-                "auto_resize": true,
-                "max_rows": 8,
-                "placeholder": { "tag": "plain_text", "content": "✍️ 输入自定义答案" },
-                "max_length": 500,
-                "width": "fill",
-            },
-            {
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": "✍️ 自定义" },
-                "type": "default",
-                "form_action_type": "submit",
-                "name": submit_name(name_prefix, request_id, session_id, index),
-                "value": value,
-            },
-        ],
-    })
+    let value = question_value(request_id, session_id, directory, index, reply);
+    let input = answer_input(&format!("custom_{index}"), "✍️ 输入自定义答案", 500, draft);
+    vec![
+        input,
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "✍️ 自定义" },
+            "type": "default",
+            "form_action_type": "submit",
+            "name": submit_name(name_prefix, request_id, session_id, index),
+            "value": value,
+        }),
+    ]
 }
 
-/// A numeric field's answer form: one single-line input plus its submit. The
-/// typed text is parsed into the field's number at reply time; a value that
-/// cannot parse is left unanswered rather than posted as an invalid answer.
-fn number_answer_form(
+/// One answer box, seeded with a draft when there is one. Multiline instead of
+/// the default single line: the single-line input is a cramped one-row strip
+/// that types poorly on both PC and mobile — the card therefore always renders
+/// it as `multiline_text`. `rows:1` starts it at one line; `auto_resize` grows
+/// it with the text (Feishu's docs say PC-only, but mobile grows too in
+/// practice). Callbacks arrive unchanged via `action.form_value`.
+fn answer_input(name: &str, placeholder: &str, max_length: usize, draft: &str) -> serde_json::Value {
+    let mut input = json!({
+        "tag": "input",
+        "name": name,
+        "input_type": "multiline_text",
+        "rows": 1,
+        "auto_resize": true,
+        "max_rows": 8,
+        "placeholder": { "tag": "plain_text", "content": placeholder },
+        "max_length": max_length,
+        "width": "fill",
+    });
+    if !draft.is_empty() {
+        input["default_value"] = json!(draft);
+    }
+    input
+}
+
+/// A numeric field's answer box plus its submit: the typed text is parsed into
+/// the field's number at reply time, and a value that cannot parse is left
+/// unanswered rather than posted as an invalid answer.
+fn number_answer_elements(
     request_id: &str,
     session_id: &str,
     directory: &str,
     index: usize,
-) -> serde_json::Value {
+    draft: &str,
+) -> Vec<serde_json::Value> {
     let value = question_value(request_id, session_id, directory, index, "answer");
-    json!({
-        "tag": "form",
-        "name": format!("form_{}", index),
-        "elements": [
-            {
-                "tag": "input",
-                "name": format!("custom_{}", index),
-                "input_type": "text",
-                "placeholder": { "tag": "plain_text", "content": "✍️ 输入数字" },
-                "max_length": 40,
-                "width": "fill",
-            },
-            {
-                "tag": "button",
-                "text": { "tag": "plain_text", "content": "✅ 确定" },
-                "type": "primary",
-                "form_action_type": "submit",
-                "name": submit_name("submit", request_id, session_id, index),
-                "value": value,
-            },
-        ],
-    })
+    vec![
+        answer_input(&format!("custom_{index}"), "✍️ 输入数字", 40, draft),
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "✅ 确定" },
+            "type": "primary",
+            "form_action_type": "submit",
+            "name": submit_name("submit", request_id, session_id, index),
+            "value": value,
+        }),
+    ]
 }
 
 /// Display label for a Custom Answer button: whitespace (newlines included)
@@ -797,6 +861,7 @@ fn custom_answer_label(raw: &str) -> String {
 /// Build the interactive question card (JSON 2.0): a header plus the question
 /// body elements from `question_elements`. V2 forms carry their own title; V1
 /// questions have none and get the generic header.
+#[allow(clippy::too_many_arguments)] // routing, fields, and the paint it renders
 pub fn build_question_card(
     title: &str,
     request_id: &str,
@@ -805,9 +870,11 @@ pub fn build_question_card(
     directory: &str,
     answered: &[Option<Vec<String>>],
     done: &[bool],
+    open: usize,
+    drafts: &[String],
 ) -> serde_json::Value {
     let elements = question_elements(
-        "", None, request_id, session_id, questions, directory, answered, done,
+        "", None, request_id, session_id, questions, directory, answered, done, open, drafts,
     );
     let header = if title.is_empty() {
         "❓ AI 想问你".to_string()
@@ -826,7 +893,18 @@ pub fn build_uncollectable_card(
     session_id: &str,
     directory: &str,
 ) -> serde_json::Value {
-    let elements = question_elements("", Some(reason), request_id, session_id, &[], directory, &[], &[]);
+    let elements = question_elements(
+        "",
+        Some(reason),
+        request_id,
+        session_id,
+        &[],
+        directory,
+        &[],
+        &[],
+        0,
+        &[],
+    );
     card_shell(UNCOLLECTABLE_HEADER, "orange", elements)
 }
 
@@ -863,6 +941,8 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
         let text = card.to_string();
         assert!(
@@ -871,12 +951,24 @@ mod tests {
             text
         );
 
-        // JSON 2.0: buttons live directly in body.elements (no v1 action row).
+        // JSON 2.0: the block is ONE root-level form (issue #917 part 3), so the
+        // option buttons, the open question's input and its submit are siblings
+        // inside it.
         assert_eq!(card["schema"].as_str().unwrap(), "2.0");
-        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(
+            card["body"]["elements"][0]["tag"], "form",
+            "the whole question block is one form: {card}"
+        );
+        let elements = form_elements(&card);
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_0"),
+            "the open question's box is inside the form: {card}"
+        );
         let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
-        // one button per option + a reject button
-        assert_eq!(buttons.len(), 3);
+        // one button per option + the custom submit + a reject button
+        assert_eq!(buttons.len(), 4);
 
         let a_btn = buttons.iter().find(|b| b["text"]["content"] == "/a").unwrap();
         let value = &a_btn["value"];
@@ -921,8 +1013,10 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let overflow = elements
             .iter()
             .find(|e| e["tag"] == "overflow")
@@ -935,11 +1029,15 @@ mod tests {
         // The overflow carries the routing payload for the reply.
         assert_eq!(overflow["value"]["request_id"], "que_1");
         assert_eq!(overflow["value"]["reply"], "answer");
-        // No raw option buttons for the collapsed question (the form's submit
-        // button is nested inside the form element, not a top-level button).
+        // No raw option buttons for the collapsed question: only its custom
+        // submit and the reject remain.
         let buttons: Vec<_> = elements.iter().filter(|e| e["tag"] == "button").collect();
-        assert_eq!(buttons.len(), 1, "only the reject button remains");
-        assert_eq!(buttons[0]["value"]["reply"], "reject");
+        assert_eq!(buttons.len(), 2, "custom submit + reject: {card}");
+        let reject = buttons
+            .iter()
+            .find(|b| b["value"]["reply"] == "reject")
+            .expect("reject button stays");
+        assert_eq!(reject["value"]["request_id"], "que_1");
     }
 
     #[test]
@@ -952,29 +1050,42 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let form = elements
-            .iter()
-            .find(|e| e["tag"] == "form")
-            .expect("overflow question still gets a custom-answer form");
-        assert_eq!(form["name"], "form_0");
+        let form = &card["body"]["elements"][0];
+        assert_eq!(form["tag"], "form", "one root-level form: {card}");
+        assert_eq!(form["name"], "form_que_1");
         assert!(form.to_string().contains("form_action_type"));
+        assert!(
+            form.to_string().contains("\"tag\":\"input\""),
+            "the overflow question still gets its answer box: {card}"
+        );
     }
 
     #[test]
     fn question_card_overflow_custom_disabled_has_no_form() {
         let mut q = many_option_question();
         q.custom = Some(false);
-        let card = build_question_card("", "que_1", "ses_1", &[q], "/tmp/proj/lib", &[None], &[false]);
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[q],
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+            0,
+            &[],
+        );
+        let elements = form_elements(&card);
         assert!(
             elements.iter().any(|e| e["tag"] == "overflow"),
             "overflow picker still rendered"
         );
         assert!(
-            elements.iter().all(|e| e["tag"] != "form"),
-            "custom-disabled overflow question must not get an input form: {}",
+            elements.iter().all(|e| e["tag"] != "input"),
+            "custom-disabled overflow question must not get an input: {}",
             card
         );
     }
@@ -1050,23 +1161,29 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let form = elements
+        let form = &card["body"]["elements"][0];
+        assert_eq!(form["tag"], "form", "one root-level form: {card}");
+        assert_eq!(form["name"], "form_que_1");
+        let input = form_elements(&card)
             .iter()
-            .find(|e| e["tag"] == "form")
-            .expect("custom-allowed question gets an input form");
-        assert_eq!(form["name"], "form_0");
-        assert!(form.to_string().contains("input"), "form needs an input");
-        assert!(form.to_string().contains("form_action_type"));
+            .find(|e| e["tag"] == "input")
+            .expect("custom-allowed question gets an input inside the form")
+            .clone();
         // The custom-answer box is a multiline textarea (better typing on both
         // PC and mobile than the default single-line input). rows:1 starts it
         // compact; auto_resize grows it with the text.
-        let input = form["elements"].as_array().unwrap()[0].clone();
-        assert_eq!(input["tag"], "input");
         assert_eq!(input["input_type"], "multiline_text");
         assert_eq!(input["rows"], 1);
         assert_eq!(input["auto_resize"], true);
+        assert!(
+            form_elements(&card)
+                .iter()
+                .any(|e| e["form_action_type"] == "submit"),
+            "the box has its submit beside it: {card}"
+        );
     }
 
     #[test]
@@ -1091,11 +1208,13 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         assert!(
-            elements.iter().all(|e| e["tag"] != "form"),
-            "custom-disabled question must not get an input form: {}",
+            elements.iter().all(|e| e["tag"] != "input"),
+            "custom-disabled question must not get an input: {}",
             card
         );
     }
@@ -1122,8 +1241,10 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         // The per-question 确定该题 button commits the toggled selection.
         let confirm = elements
             .iter()
@@ -1137,15 +1258,19 @@ mod tests {
             .find(|e| e["tag"] == "button" && e["value"]["answer"] == "苹果")
             .expect("option toggle button missing");
         assert_eq!(opt["value"]["reply"], "answer");
-        // Multi-select now supports a custom answer too (reply "custom" adds it).
-        let form = elements
-            .iter()
-            .find(|e| e["tag"] == "form")
-            .expect("multi-select custom-allowed question gets an input form");
+        // Multi-select supports a custom answer too (reply "custom" adds it):
+        // the input and its submit sit in the same root form.
         assert!(
-            form.to_string().contains("\"reply\":\"custom\""),
-            "multi-select custom form must reply with custom: {}",
-            form
+            elements
+                .iter()
+                .any(|e| e["tag"] == "button" && e["value"]["reply"] == "custom"),
+            "multi-select custom submit must reply with custom: {card}"
+        );
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_0"),
+            "multi-select custom box missing: {card}"
         );
     }
 
@@ -1174,8 +1299,10 @@ mod tests {
             "/tmp/proj/lib",
             &answered,
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let chip = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["value"]["answer"] == "自定\n答案")
@@ -1236,8 +1363,10 @@ mod tests {
             "/tmp/proj/lib",
             &answered,
             &[false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         assert!(
             elements
                 .iter()
@@ -1270,6 +1399,8 @@ mod tests {
             "/tmp/proj/lib",
             &[Some(vec!["苹果".to_string()])],
             &[true],
+            0,
+            &[],
         );
         let text = card.to_string();
         assert!(text.contains("已选：苹果"), "selection missing: {}", text);
@@ -1317,6 +1448,8 @@ mod tests {
             "/tmp/proj/lib",
             &[None, None],
             &[false, false],
+            0,
+            &[],
         );
         let text = card.to_string();
         // The header is used as the per-question title so blocks read distinctly.
@@ -1328,9 +1461,8 @@ mod tests {
             text
         );
         assert!(text.contains("选水果"), "q2 question body missing: {}", text);
-        // A divider separates the two question blocks.
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let hr = elements.iter().filter(|e| e["tag"] == "hr").count();
+        // A divider separates the two question blocks (inside the one form).
+        let hr = form_elements(&card).iter().filter(|e| e["tag"] == "hr").count();
         assert_eq!(hr, 1, "one divider between two questions: {}", card);
         // The multi-select's confirm button is grouped right under ITS own
         // options and before the reject button — no separate bottom submit for
@@ -1380,18 +1512,56 @@ mod tests {
         }
     }
 
-    /// Every element the card renders, folded panel bodies included, so a test
-    /// can assert on a control wherever the fold put it (issue #917 keeps one
-    /// question open and folds the rest).
+    /// Every element the card renders, form and folded panel bodies included,
+    /// in document order, so a test can assert on a control wherever the
+    /// structure put it (issue #917: one root-level form, one open question,
+    /// the rest folded).
     fn all_elements(card: &serde_json::Value) -> Vec<serde_json::Value> {
-        let mut out = Vec::new();
-        for e in card["body"]["elements"].as_array().into_iter().flatten() {
-            out.push(e.clone());
-            if e["tag"] == "collapsible_panel" {
-                out.extend(e["elements"].as_array().into_iter().flatten().cloned());
+        fn walk(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    walk(item, out);
+                }
+                return;
+            }
+            if value["tag"].is_string() {
+                out.push(value.clone());
+            }
+            if let Some(inner) = value["elements"].as_array() {
+                for item in inner {
+                    walk(item, out);
+                }
             }
         }
+        let mut out = Vec::new();
+        walk(&card["body"]["elements"], &mut out);
         out
+    }
+
+    /// The card's ONE root-level form's elements: the whole question block lives
+    /// inside it (issue #917 part 3), so "where the controls are" is always here.
+    fn form_elements(card: &serde_json::Value) -> &Vec<serde_json::Value> {
+        card["body"]["elements"]
+            .as_array()
+            .expect("card body")
+            .iter()
+            .find(|e| e["tag"] == "form")
+            .expect("the question block is one root-level form")["elements"]
+            .as_array()
+            .expect("form elements")
+    }
+
+    /// How many elements with `tag` the card JSON holds anywhere — the simplest
+    /// way to say "exactly one input on this card".
+    fn count_tag(value: &serde_json::Value, tag: &str) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                usize::from(map.get("tag").and_then(|t| t.as_str()) == Some(tag))
+                    + map.values().map(|v| count_tag(v, tag)).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(|v| count_tag(v, tag)).sum(),
+            _ => 0,
+        }
     }
 
     #[test]
@@ -1404,6 +1574,8 @@ mod tests {
             &[],
             "/w",
             &[],
+            &[],
+            0,
             &[],
         );
         let text = serde_json::to_string(&elements).expect("elements serialize");
@@ -1426,7 +1598,18 @@ mod tests {
 
     #[test]
     fn a_question_title_renders_in_the_block_for_inline_surfaces() {
-        let elements = question_elements("把文件写入工作区？", None, "req_1", "ses_1", &[], "/w", &[], &[]);
+        let elements = question_elements(
+            "把文件写入工作区？",
+            None,
+            "req_1",
+            "ses_1",
+            &[],
+            "/w",
+            &[],
+            &[],
+            0,
+            &[],
+        );
         let text = serde_json::to_string(&elements).expect("elements serialize");
         assert!(
             text.contains("把文件写入工作区？"),
@@ -1719,13 +1902,15 @@ mod tests {
                 "/tmp/proj",
                 &[None],
                 &[false],
+                0,
+                &[],
             )
         };
 
         // The option button displays the LABEL and submits the VALUE.
         let card = one(string_field);
         assert_eq!(card["header"]["title"]["content"], "❓ Questions");
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let option = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "目录 A")
@@ -1734,7 +1919,7 @@ mod tests {
 
         // Boolean: 是 / 否 with boolean answer values.
         let card = one(boolean);
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let yes = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 是")
@@ -1747,18 +1932,17 @@ mod tests {
             .expect("boolean 否 button missing");
         assert_eq!(no["value"]["answer"], "false");
 
-        // Number: an input form whose submit routes as an answer.
+        // Number: an input plus its submit inside the root form.
         let card = one(integer);
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let number_form = elements
-            .iter()
-            .find(|e| e["tag"] == "form" && e["value"].is_null())
-            .expect("numeric form missing");
         assert!(
-            number_form.to_string().contains("输入数字"),
-            "numeric placeholder missing: {number_form}"
+            card.to_string().contains("输入数字"),
+            "numeric placeholder missing: {card}"
         );
-        let number_button = &number_form["elements"][1];
+        let elements = form_elements(&card);
+        let number_button = elements
+            .iter()
+            .find(|e| e["tag"] == "button" && e["form_action_type"] == "submit")
+            .expect("numeric submit missing");
         assert_eq!(number_button["value"]["question_index"], 0);
         assert_eq!(number_button["value"]["reply"], "answer");
 
@@ -1769,7 +1953,7 @@ mod tests {
             text.contains("https://example.com/x"),
             "external link missing: {text}"
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let ack = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["text"]["content"] == "✅ 我已了解")
@@ -1796,13 +1980,23 @@ mod tests {
             ..Default::default()
         };
         let answered = vec![Some(vec!["apple".to_string(), "自定\n答案".to_string()])];
-        let card = build_question_card("", "frm_1", "ses_1", &[field], "/tmp/proj", &answered, &[false]);
+        let card = build_question_card(
+            "",
+            "frm_1",
+            "ses_1",
+            &[field],
+            "/tmp/proj",
+            &answered,
+            &[false],
+            0,
+            &[],
+        );
         let text = card.to_string();
         assert!(
             text.contains("已选：苹果、自定 答案"),
             "display labels must replace submitted values: {text}"
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let custom = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["value"]["answer"] == "自定\n答案")
@@ -1874,8 +2068,10 @@ mod tests {
             "/tmp/proj/lib",
             &[None, None, None],
             &[false, false, false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let panels: Vec<_> = elements
             .iter()
             .filter(|e| e["tag"] == "collapsible_panel")
@@ -1884,24 +2080,46 @@ mod tests {
         assert!(panels.iter().all(|p| p["expanded"] == json!(false)));
         assert_eq!(panels[0]["header"]["title"]["content"], "2. 问题 2");
         assert_eq!(panels[1]["header"]["title"]["content"], "3. 问题 3");
-        // The open question's controls (including its input) are on the card;
-        // a folded question keeps its controls but never a form — Feishu rejects
-        // a form nested in a collapsible panel (ErrCode 200621).
-        let top_level = elements.iter().map(|e| e.to_string()).collect::<String>();
-        assert!(
-            top_level.contains("form_0"),
-            "open question has its input: {card}"
+        // The whole block is ONE root-level form (issue #917 part 3), so the
+        // panels — which may not hold a form themselves (ErrCode 200621) — sit
+        // inside it, and the card carries exactly one input: the open
+        // question's box.
+        assert_eq!(
+            card["body"]["elements"][0]["tag"], "form",
+            "the block is one form: {card}"
+        );
+        assert_eq!(
+            count_tag(&card, "input"),
+            1,
+            "only the open question renders a box: {card}"
         );
         assert!(
-            !elements
+            elements
                 .iter()
-                .any(|e| e["tag"] == "form" && e["name"] == "form_1"),
-            "the folded question's input stays off the card: {card}"
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_0"),
+            "the open question has its input: {card}"
         );
         for panel in &panels {
             assert!(
                 !panel.to_string().contains("\"tag\":\"form\""),
                 "Feishu rejects a form nested in a collapsible panel (200621): {panel}"
+            );
+            assert!(
+                !panel.to_string().contains("\"tag\":\"input\""),
+                "a folded question carries no box: {panel}"
+            );
+            // The switch is a form SUBMIT, so the open question's draft rides
+            // along with it.
+            let switch = panel["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["tag"] == "button" && e["value"]["reply"] == "open")
+                .expect("a folded question offers its switch");
+            assert_eq!(switch["form_action_type"], "submit");
+            assert_eq!(
+                switch["name"],
+                format!("open|que_1|ses_1|{}", switch["value"]["question_index"])
             );
         }
         // The reject control stays last, below the open question.
@@ -1927,8 +2145,10 @@ mod tests {
             "/tmp/proj/lib",
             &[None, None],
             &[false, false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let panel = elements
             .iter()
             .find(|e| e["tag"] == "collapsible_panel")
@@ -1938,20 +2158,19 @@ mod tests {
             "no form nested in a panel: {panel}"
         );
         assert!(
-            panel["elements"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|e| e["tag"] == "markdown"
-                    && e["content"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("回答完当前问题后"))),
+            !panel.to_string().contains("\"tag\":\"input\""),
+            "a folded numeric field carries no box: {panel}"
+        );
+        assert!(
+            panel["elements"].as_array().unwrap().iter().any(|e| {
+                e["tag"] == "button" && e["value"]["reply"] == "open" && e["value"]["question_index"] == 1
+            }),
             "the fold says how to reach it: {panel}"
         );
         assert!(
             elements
                 .iter()
-                .any(|e| e["tag"] == "form" && e["name"] == "form_0"),
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_0"),
             "the open string question keeps the only input: {card}"
         );
     }
@@ -1975,8 +2194,10 @@ mod tests {
             "/tmp/proj/lib",
             &[None, None],
             &[false, false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let panel = elements
             .iter()
             .find(|e| e["tag"] == "collapsible_panel")
@@ -1986,19 +2207,23 @@ mod tests {
             "no form nested in a panel: {panel}"
         );
         assert!(
-            panel["elements"].as_array().unwrap().iter().any(|e| {
-                e["tag"] == "markdown"
-                    && e["content"]
-                        .as_str()
-                        .is_some_and(|c| c.contains("回答完当前问题后"))
-            }),
-            "a control-less fold says how to reach it: {panel}"
+            panel["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| { e["tag"] == "button" && e["value"]["reply"] == "open" }),
+            "a control-less fold offers its switch: {panel}"
         );
         assert!(
             elements
                 .iter()
-                .any(|e| e["tag"] == "form" && e["name"] == "form_0"),
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_0"),
             "the open question still renders its input: {card}"
+        );
+        assert_eq!(
+            count_tag(&card, "input"),
+            1,
+            "the folded question renders no second box: {card}"
         );
     }
 
@@ -2021,21 +2246,23 @@ mod tests {
             "/tmp/proj/lib",
             &[Some(vec!["/a1".into()]), None],
             &[true, false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
-        let form = elements
+        let elements = form_elements(&card);
+        let submit = elements
             .iter()
-            .find(|e| e["tag"] == "form")
-            .expect("the numeric field is the open one");
-        assert_eq!(form["name"], "form_1");
-        let submit = form["elements"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["tag"] == "button")
-            .expect("the form has its submit");
+            .find(|e| e["tag"] == "button" && e["form_action_type"] == "submit")
+            .expect("the open question has its submit");
+        assert_eq!(submit["name"], "submit|que_1|ses_1|1");
         assert_eq!(submit["value"]["question_index"], 1);
         assert_eq!(submit["value"]["reply"], "answer");
+        assert!(
+            elements
+                .iter()
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_1"),
+            "the box is named for ITS question: {card}"
+        );
     }
 
     /// Answering the open question moves the fold: the next unanswered question
@@ -2050,8 +2277,10 @@ mod tests {
             "/tmp/proj/lib",
             &[Some(vec!["/a1".into()]), None, None],
             &[true, false, false],
+            0,
+            &[],
         );
-        let elements = card["body"]["elements"].as_array().unwrap();
+        let elements = form_elements(&card);
         let panels: Vec<_> = elements
             .iter()
             .filter(|e| e["tag"] == "collapsible_panel")
@@ -2061,7 +2290,7 @@ mod tests {
         assert!(
             elements
                 .iter()
-                .any(|e| e["tag"] == "form" && e["name"] == "form_1"),
+                .any(|e| e["tag"] == "input" && e["name"] == "custom_1"),
             "question 2 is open and renders its input: {card}"
         );
         assert!(
@@ -2072,8 +2301,79 @@ mod tests {
         );
     }
 
+    /// Issue #917 part 3: the reader picks the open question, and the text
+    /// typed into the previous one is seeded back into its box.
+    #[test]
+    fn a_switch_opens_the_chosen_question_and_seeds_its_draft() {
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[string_question(1), string_question(2)],
+            "/tmp/proj/lib",
+            &[None, None],
+            &[false, false],
+            1,
+            &["草稿一".to_string(), "草稿二".to_string()],
+        );
+        let elements = form_elements(&card);
+        let input = elements
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("the open question renders its box");
+        assert_eq!(input["name"], "custom_1", "the box belongs to question 2");
+        assert_eq!(
+            input["default_value"], "草稿二",
+            "the draft is seeded back into the box"
+        );
+        // Question 1 folded, and its panel offers the way back.
+        let panel = elements
+            .iter()
+            .find(|e| e["tag"] == "collapsible_panel")
+            .expect("question 1 folds");
+        assert_eq!(panel["header"]["title"]["content"], "1. 问题 1");
+        let switch = panel["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["tag"] == "button" && e["value"]["reply"] == "open")
+            .expect("the folded question offers its switch");
+        assert_eq!(switch["value"]["question_index"], 0);
+        assert_eq!(switch["name"], "open|que_1|ses_1|0");
+        assert_eq!(
+            switch["form_action_type"], "submit",
+            "the switch must submit the form so the draft travels with it"
+        );
+    }
+
+    /// An empty draft is not a `default_value`: the box renders its
+    /// placeholder instead of an empty seeded value.
+    #[test]
+    fn an_empty_draft_renders_no_default_value() {
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[string_question(1)],
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+            0,
+            &[String::new()],
+        );
+        let input = form_elements(&card)
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("the open question renders its box")
+            .clone();
+        assert!(
+            input.get("default_value").is_none(),
+            "no draft, no seeded value: {input}"
+        );
+    }
+
     /// One question — the common ask — keeps today's flat layout: no fold, no
-    /// extra tap.
+    /// switch, no extra tap.
     #[test]
     fn a_single_question_card_does_not_fold() {
         let card = build_question_card(
@@ -2084,10 +2384,14 @@ mod tests {
             "/tmp/proj/lib",
             &[None],
             &[false],
+            0,
+            &[],
         );
         let elements = card["body"]["elements"].as_array().unwrap();
         assert!(
-            elements.iter().all(|e| e["tag"] != "collapsible_panel"),
+            !all_elements(&card)
+                .iter()
+                .any(|e| e["tag"] == "collapsible_panel"),
             "a one-question card has nothing to fold: {card}"
         );
         assert!(elements.iter().any(|e| e["tag"] == "form"));

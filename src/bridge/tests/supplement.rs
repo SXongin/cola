@@ -1386,6 +1386,8 @@ async fn supplement_split_migrates_a_pending_question() {
         "/work",
         &[None, None],
         &[false; 2],
+        0,
+        &[],
     )
     .await;
     app.inflight.lock().await.insert("ses_test".to_string());

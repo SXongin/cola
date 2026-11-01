@@ -86,6 +86,7 @@ impl Turn {
     /// Add a question's inline block to `session_id`'s card, carrying the
     /// display state the flow restored for it (ADR-0038, rule 1). Returns false
     /// when the card already carries the request, or the card session is gone.
+    #[allow(clippy::too_many_arguments)] // the block's paint, in its four parts
     pub(crate) async fn add_question(
         cards: &CardsHandle,
         session_id: &str,
@@ -93,6 +94,8 @@ impl Turn {
         directory: &str,
         answers: &[Option<Vec<String>>],
         done: &[bool],
+        open: usize,
+        drafts: &[String],
     ) -> bool {
         // Same lock as `add_permission`: the block's arrival and the flow's
         // flush are one ordered step against every card write (issue #917).
@@ -107,6 +110,8 @@ impl Turn {
             directory: directory.to_string(),
             answers: answers.to_vec(),
             done: done.to_vec(),
+            open,
+            drafts: drafts.to_vec(),
         });
         match cards.cards.lock().await.get_mut(session_id) {
             Some(card) => card.acc.add_interaction(block),
@@ -114,18 +119,22 @@ impl Turn {
         }
     }
 
-    /// Replace a question block's display state (the live 已选/✅ markers) in
-    /// place. Returns false when the card has no question block for the request
-    /// or the card session is gone.
+    /// Replace a question block's display state (the live 已选/✅ markers, the
+    /// open question and its typed drafts) in place. Returns false when the
+    /// card has no question block for the request or the card session is gone.
     pub(crate) async fn update_question_state(
         cards: &CardsHandle,
         session_id: &str,
         request_id: &str,
         answers: &[Option<Vec<String>>],
         done: &[bool],
+        open: usize,
+        drafts: &[String],
     ) -> bool {
         match cards.cards.lock().await.get_mut(session_id) {
-            Some(card) => card.acc.update_question_state(request_id, answers, done),
+            Some(card) => card
+                .acc
+                .update_question_state(request_id, answers, done, open, drafts),
             None => false,
         }
     }

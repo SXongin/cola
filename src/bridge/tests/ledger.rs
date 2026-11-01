@@ -5831,6 +5831,8 @@ async fn add_question_block(app: &Arc<App>, session_id: &str, directory: &str, t
         directory,
         &[None],
         &[false],
+        0,
+        &[],
     )
     .await;
 }

@@ -756,23 +756,29 @@ pub(super) struct PendingQuestion {
     /// Whether each question is finalized (single-select answered, multi-select
     /// confirmed) — its controls collapse to a static 已选 line.
     pub(super) done: Vec<bool>,
+    /// The question the reader last switched to (issue #917 part 3): rendered
+    /// open while it is still unanswered, otherwise the first unanswered one
+    /// resolves it (`question::open_index`). Mirrors the flow's
+    /// [`crate::bridge::question::QuestionState::open`].
+    pub(super) open: usize,
+    /// The unsubmitted text per question, seeded into the open question's box
+    /// as `default_value` so a switch does not lose what was typed.
+    pub(super) drafts: Vec<String>,
 }
 
 impl PendingQuestion {
     /// Whether this block renders a free-text input the Host may be typing
-    /// into (issue #917): a still-open field with a custom-answer box or a
-    /// numeric form. A finalized field renders no controls at all, so it never
-    /// counts, and the card only ever renders ONE open question at a time (the
-    /// first unanswered one; the rest fold), so only that one can hold
-    /// unsubmitted text. The same predicate renders the form
-    /// (`renders_typed_input`), so the card and the freeze cannot disagree
-    /// about which cards have an input.
+    /// into (issue #917): the OPEN question, while it is unanswered and has a
+    /// custom-answer box or a numeric form. A finalized field renders no
+    /// controls at all, so it never counts, and the card only ever renders ONE
+    /// open question at a time (the rest fold), so only that one can hold
+    /// unsubmitted text. The same predicate resolves the open question
+    /// (`question::open_index`) and renders the input (`renders_typed_input`),
+    /// so the card and the freeze cannot disagree.
     pub(super) fn awaits_typed_answer(&self) -> bool {
-        self.questions
-            .iter()
-            .enumerate()
-            .find(|(i, _)| !self.done.get(*i).copied().unwrap_or(false))
-            .is_some_and(|(_, q)| crate::feishu::card::question::renders_typed_input(q))
+        crate::feishu::card::question::open_index(self.questions.len(), &self.done, self.open)
+            .and_then(|i| self.questions.get(i))
+            .is_some_and(crate::feishu::card::question::renders_typed_input)
     }
 }
 
@@ -3253,14 +3259,16 @@ impl StreamAccumulator {
             .collect()
     }
 
-    /// Replace a question block's display state (the live 已选/✅ markers) in
-    /// place. Returns false when the card has no question block for the
-    /// request.
+    /// Replace a question block's display state (the live 已选/✅ markers, the
+    /// open question and its drafts) in place. Returns false when the card has
+    /// no question block for the request.
     pub(super) fn update_question_state(
         &mut self,
         request_id: &str,
         answers: &[Option<Vec<String>>],
         done: &[bool],
+        open: usize,
+        drafts: &[String],
     ) -> bool {
         match self
             .interactions
@@ -3270,6 +3278,8 @@ impl StreamAccumulator {
             Some(InteractionBlock::Question(q)) => {
                 q.answers = answers.to_vec();
                 q.done = done.to_vec();
+                q.open = open;
+                q.drafts = drafts.to_vec();
                 true
             }
             _ => false,
@@ -4927,6 +4937,8 @@ impl StreamAccumulator {
                             &q.directory,
                             &q.answers,
                             &q.done,
+                            q.open,
+                            &q.drafts,
                         ) {
                             builder = builder.with_element(el);
                         }
@@ -7793,6 +7805,8 @@ mod tests {
                 directory: "/w".into(),
                 answers: vec![None],
                 done: vec![done],
+                open: 0,
+                drafts: vec![String::new()],
             })
         };
         assert!(!acc.awaits_typed_answer(), "no block, no input");
@@ -7853,6 +7867,8 @@ mod tests {
                 directory: "/w".into(),
                 answers: vec![None, None],
                 done: done.to_vec(),
+                open: 0,
+                drafts: vec![String::new(); 2],
             })
         };
         let mut acc = StreamAccumulator::new("test");
@@ -7866,6 +7882,53 @@ mod tests {
         assert!(
             acc.awaits_typed_answer(),
             "answering the first question opens the typed one"
+        );
+    }
+
+    /// Issue #917 part 3: which question is open is the reader's choice, so the
+    /// freeze must read THAT one — not the first unanswered one.
+    #[test]
+    fn awaits_typed_answer_follows_the_switched_open_question() {
+        use crate::backend::types::{FormFieldKind, QuestionInfo};
+        let typed = QuestionInfo {
+            question: "备注?".into(),
+            header: "备注".into(),
+            kind: FormFieldKind::String,
+            ..Default::default()
+        };
+        let boolean = QuestionInfo {
+            question: "确定吗".into(),
+            header: "确认".into(),
+            kind: FormFieldKind::Boolean,
+            ..Default::default()
+        };
+        let block = |open: usize| {
+            InteractionBlock::Question(PendingQuestion {
+                request_id: "q".into(),
+                session_id: "s".into(),
+                title: String::new(),
+                questions: vec![typed.clone(), boolean.clone()],
+                uncollectable: None,
+                directory: "/w".into(),
+                answers: vec![None, None],
+                done: vec![false, false],
+                open,
+                drafts: vec![String::new(); 2],
+            })
+        };
+        let mut acc = StreamAccumulator::new("test");
+        acc.add_interaction(block(0));
+        assert!(
+            acc.awaits_typed_answer(),
+            "the typed question is open, its box must be protected"
+        );
+        // A switch to the boolean question renders no box: background repaints
+        // are safe again.
+        acc.interactions.clear();
+        acc.add_interaction(block(1));
+        assert!(
+            !acc.awaits_typed_answer(),
+            "the open question renders buttons only"
         );
     }
 
@@ -7901,6 +7964,8 @@ mod tests {
             directory: "/w".into(),
             answers: vec![None],
             done: vec![false],
+            open: 0,
+            drafts: vec![String::new()],
         });
         acc.add_interaction(question);
         assert_eq!(acc.awaiting_action(), AwaitingAction::Question);

@@ -428,6 +428,8 @@ pub(super) async fn refresh_question_block(
     directory: &str,
     display: &[Option<Vec<String>>],
     done: &[bool],
+    open: usize,
+    drafts: &[String],
 ) -> Option<serde_json::Value> {
     Turn::update_question_state(
         cards,
@@ -435,6 +437,8 @@ pub(super) async fn refresh_question_block(
         req_id,
         display,
         done,
+        open,
+        drafts,
     )
     .await;
     let message_id = clicked?;
@@ -447,6 +451,8 @@ pub(super) async fn refresh_question_block(
         directory,
         display,
         done,
+        open,
+        drafts,
     );
     cards
         .card_handles

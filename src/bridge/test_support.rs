@@ -4636,6 +4636,33 @@ pub(crate) fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> 
     out
 }
 
+/// Every `input` element anywhere on the card, in document order — the question
+/// card's boxes sit inside its one root-level form (issue #917 part 3), so a
+/// top-level scan would miss them.
+pub(crate) fn card_inputs(card: &serde_json::Value) -> Vec<&serde_json::Value> {
+    fn walk<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("tag").and_then(|t| t.as_str()) == Some("input") {
+                    out.push(value);
+                }
+                for v in map.values() {
+                    walk(v, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(card, &mut out);
+    out
+}
+
 /// A card's header title, for Done/Streaming/topic assertions.
 pub(crate) fn card_header(card: &serde_json::Value) -> &str {
     card["header"]["title"]["content"].as_str().unwrap_or("")
@@ -4840,6 +4867,8 @@ async fn seed_inline_request(
                 directory,
                 &vec![None; q.questions.len()],
                 &vec![false; q.questions.len()],
+                0,
+                &[],
             )
             .await;
         }

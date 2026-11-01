@@ -2035,3 +2035,91 @@ async fn inline_question_click_after_remote_resolution_gets_receipt() {
             .is_empty()
     );
 }
+
+/// Issue #917 part 3 — lossless switching: the folded question's 作答这道题 is a
+/// form submit, so the text typed into the open question's box travels with it.
+/// Switching must never answer anything, and the next card seeds each box from
+/// the draft the switch carried.
+#[tokio::test]
+async fn switching_questions_carries_the_typed_draft() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+    let typed = |n: usize| crate::backend::types::QuestionInfo {
+        question: format!("问题 {n}"),
+        header: format!("h{n}"),
+        options: vec![crate::backend::types::QuestionOption {
+            label: format!("/a{n}"),
+            description: String::new(),
+            ..Default::default()
+        }],
+        kind: crate::backend::types::FormFieldKind::String,
+        custom: None,
+        ..Default::default()
+    };
+    app.question
+        .remember_question(
+            &crate::backend::types::QuestionRequest {
+                id: "que_switch".into(),
+                session_id: "ses_1".into(),
+                questions: vec![typed(1), typed(2)],
+                ..Default::default()
+            },
+            "/work",
+        )
+        .await;
+
+    let switch = |target: u64, from: u64, draft: &str| {
+        let mut value = serde_json::json!({
+            "action": "question",
+            "reply": "open",
+            "request_id": "que_switch",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": target,
+        });
+        value["form_value"] = serde_json::Value::Object(serde_json::Map::from_iter([(
+            format!("custom_{from}"),
+            serde_json::json!(draft),
+        )]));
+        value
+    };
+
+    // Switch to question 2 while question 1 holds typed text.
+    let first = app
+        .host_action(switch(1, 0, "打到一半"))
+        .await
+        .expect("the switch returns a card");
+    assert_eq!(first.toast.as_deref(), Some("已切到第 2 题"));
+    let card = first.card.expect("a repainted card");
+    let text = card_text(&card);
+    assert!(text.contains("**2. h2**"), "question 2 is open: {text}");
+    // Question 2's box is the card's only input, and it starts empty.
+    let inputs: Vec<_> = card_inputs(&card);
+    assert_eq!(inputs.len(), 1, "one box at a time: {text}");
+    assert_eq!(inputs[0]["name"], "custom_1");
+    assert!(inputs[0].get("default_value").is_none(), "{text}");
+    // No answer was recorded and no reply was sent.
+    assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
+
+    // Switch back: the text typed into question 1 comes back with it.
+    let second = app.host_action(switch(0, 1, "")).await.expect("a card");
+    assert_eq!(second.toast.as_deref(), Some("已切到第 1 题"));
+    let card = second.card.expect("a repainted card");
+    let inputs = card_inputs(&card);
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["name"], "custom_0");
+    assert_eq!(
+        inputs[0]["default_value"], "打到一半",
+        "the draft is seeded back: {}",
+        card
+    );
+    assert_eq!(
+        backend.reply_question_calls.lock().await.len(),
+        0,
+        "switching must never answer the request"
+    );
+}

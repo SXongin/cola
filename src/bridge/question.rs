@@ -22,16 +22,58 @@ pub struct QuestionState {
     /// counts as answered — the request can only auto-submit once every
     /// question is finalized (single-select clicked, multi-select confirmed).
     toggles: Vec<Option<Vec<String>>>,
+    /// The question the reader last switched to (issue #917 part 3). The card
+    /// renders exactly one question open at a time (ADR-0093), and the switch
+    /// submit picks which — the first unanswered one until the reader chooses.
+    /// Only honoured while that question is still unanswered, so answering it
+    /// opens the next one instead of leaving a finalized question "open".
+    open: usize,
+    /// Unsubmitted text the reader typed into each question's custom-answer box
+    /// before switching away. Feishu keeps an input's text in the client only —
+    /// every repaint rebuilds `body.elements` — so a switch (a submit, so the
+    /// text arrives with it) records it here and the next render seeds the box
+    /// with `default_value`. Cleared when the question is answered, since a
+    /// finalized question renders no input.
+    drafts: Vec<String>,
+}
+
+/// What a question block paints: the display selection per slot, which
+/// questions are finalized, which one is open and the unsubmitted draft in its
+/// box. One value so every render seam (standalone card, inline block, snapshot
+/// block, the clicked card's ack) passes the same four facts in one piece.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub(crate) struct QuestionPaint {
+    pub display: Vec<Option<Vec<String>>>,
+    pub done: Vec<bool>,
+    pub open: usize,
+    pub drafts: Vec<String>,
+}
+
+impl QuestionPaint {
+    /// The state of a request nothing was remembered for (a restart, or a
+    /// snapshot of a request whose state was never seeded): all open, first
+    /// question shown.
+    pub(crate) fn blank(n: usize) -> Self {
+        Self {
+            display: vec![None; n],
+            done: vec![false; n],
+            open: 0,
+            drafts: vec![String::new(); n],
+        }
+    }
 }
 
 impl QuestionState {
     pub(crate) fn new(request: crate::backend::types::QuestionRequest, dir: String) -> Self {
         let slots = vec![None; request.questions.len()];
+        let drafts = vec![String::new(); request.questions.len()];
         Self {
             request,
             dir,
             answers: slots.clone(),
             toggles: slots,
+            open: 0,
+            drafts,
         }
     }
 
@@ -43,11 +85,60 @@ impl QuestionState {
         self.dir = dir.to_string();
         self.answers.resize(request.questions.len(), None);
         self.toggles.resize(request.questions.len(), None);
+        self.drafts.resize(request.questions.len(), String::new());
+        if self.open >= request.questions.len() {
+            self.open = 0;
+        }
+    }
+
+    /// The question the card renders open (ADR-0093, issue #917 part 3): the
+    /// reader's chosen one while it is still unanswered, otherwise the first
+    /// unanswered one. `None` when every question is finalized. The renderer
+    /// and the typed-answer freeze read this ONE predicate, so the card and the
+    /// freeze cannot disagree about which field is open.
+    pub(crate) fn open(&self) -> Option<usize> {
+        let unanswered = |i: usize| self.answers.get(i).is_none_or(Option::is_none);
+        if self.open < self.answers.len() && unanswered(self.open) {
+            return Some(self.open);
+        }
+        (0..self.answers.len()).find(|i| unanswered(*i))
+    }
+
+    /// Record the text a switch submit carried for question `index`. A draft
+    /// for a finalized question is dropped: the reader cannot be typing into a
+    /// field the card no longer renders.
+    pub(crate) fn record_draft(&mut self, index: usize, text: &str) {
+        if index >= self.drafts.len() || self.answers[index].is_some() {
+            return;
+        }
+        self.drafts[index] = text.to_string();
+    }
+
+    /// Open question `target` (the switch submit's destination). Refused — with
+    /// no state change — for an out-of-range or already-finalized question,
+    /// which only a stale card can name. Returns whether the card must repaint.
+    pub(crate) fn switch_open(&mut self, target: usize) -> bool {
+        if target >= self.answers.len() || self.answers[target].is_some() || self.open() == Some(target) {
+            return false;
+        }
+        self.open = target;
+        true
     }
 
     /// The full request, for rebuilding its card with partial answers.
     pub(crate) fn request(&self) -> &crate::backend::types::QuestionRequest {
         &self.request
+    }
+
+    /// Everything the card paints, in one value (see [`QuestionPaint`]).
+    pub(crate) fn paint(&self) -> QuestionPaint {
+        let (_, display, done) = self.merge();
+        QuestionPaint {
+            display,
+            done,
+            open: self.open,
+            drafts: self.drafts.clone(),
+        }
     }
 
     /// The owning directory, used as the delivery fallback when a card
@@ -73,6 +164,10 @@ impl QuestionState {
     pub(crate) fn record_answer(&mut self, index: usize, answer: &str) {
         if index < self.answers.len() {
             self.answers[index] = Some(vec![answer.to_string()]);
+            // The typed text (if any) is now the answer: the card renders no
+            // input for a finalized question, so a kept draft could only
+            // resurface as a stale box.
+            self.drafts[index].clear();
         }
     }
 
@@ -108,6 +203,11 @@ impl QuestionState {
         if !set.iter().any(|l| l == answer) {
             set.push(answer.to_string());
         }
+        // The typed text is now a selected entry, so the box starts empty for
+        // the next custom answer instead of re-offering what was just added.
+        if let Some(draft) = self.drafts.get_mut(index) {
+            draft.clear();
+        }
     }
 
     /// Lock the live toggles of question `index` into its final answer (empty
@@ -118,6 +218,9 @@ impl QuestionState {
             return;
         }
         self.answers[index] = Some(self.toggles[index].take().unwrap_or_default());
+        if let Some(draft) = self.drafts.get_mut(index) {
+            draft.clear();
+        }
     }
 
     /// Whether `answer` is currently in the live toggles for one question.
@@ -485,5 +588,76 @@ mod tests {
         assert_eq!(action_toast("confirm", 2, None), "已确定该题，还有 2 题未答");
         // A single-select click keeps its remaining-questions count.
         assert_eq!(action_toast("answer", 1, None), "已记录答案，还有 1 题未答");
+    }
+
+    /// Issue #917 part 3: the reader picks which question is open, and the
+    /// card keeps the text typed into the one they switched away from.
+    #[test]
+    fn switching_moves_the_open_question_and_keeps_the_draft() {
+        let mut state = state_with(&[false, false, false]);
+        assert_eq!(state.open(), Some(0), "the first unanswered one opens");
+        state.record_draft(0, "草稿一");
+        assert!(state.switch_open(2), "a fold switches to its question");
+        assert_eq!(state.open(), Some(2));
+        assert_eq!(state.paint().drafts[0], "草稿一", "the draft survives");
+        // Switching to the question already open changes nothing.
+        assert!(!state.switch_open(2));
+        // Answering the open one opens the next unanswered, not question 0.
+        state.record_answer(2, "/a3");
+        assert_eq!(state.open(), Some(0), "0 is still unanswered");
+        state.record_answer(0, "/a1");
+        assert_eq!(state.open(), Some(1), "the first unanswered one");
+        state.record_answer(1, "/a2");
+        assert_eq!(state.open(), None, "nothing left to open");
+    }
+
+    /// A stale card can name a finalized question, an index past the end, or
+    /// the open one: every one of those is a no-op with no repaint.
+    #[test]
+    fn switch_open_refuses_a_done_out_of_range_or_current_target() {
+        let mut state = state_with(&[false, false]);
+        state.record_answer(1, "b");
+        assert!(!state.switch_open(1), "an answered question cannot open");
+        assert!(!state.switch_open(9), "an index past the end cannot open");
+        assert!(!state.switch_open(0), "question 0 is already open");
+        assert_eq!(state.open(), Some(0));
+    }
+
+    /// The draft belongs to an UNANSWERED question: a stale submit for a
+    /// finalized one must not seed a box the card no longer renders.
+    #[test]
+    fn a_draft_is_recorded_only_while_its_question_is_open() {
+        let mut state = state_with(&[false, false]);
+        state.record_draft(1, "草稿");
+        assert_eq!(state.paint().drafts[1], "草稿");
+        state.record_answer(1, "b");
+        assert_eq!(
+            state.paint().drafts[1],
+            "",
+            "answering clears the draft: the question renders no box"
+        );
+        state.record_draft(1, "迟到");
+        assert_eq!(state.paint().drafts[1], "", "a done question takes no draft");
+    }
+
+    /// A typed custom answer is CONSUMED by its submit: single-select locks it
+    /// as the answer, a multi-select adds it to the selection. Either way the
+    /// box must come back empty rather than re-offering the text.
+    #[test]
+    fn a_submitted_typed_answer_clears_its_draft() {
+        let mut state = state_with(&[false, true]);
+        state.record_draft(0, "自定一");
+        state.record_answer(0, "自定一");
+        assert_eq!(state.paint().drafts[0], "");
+        state.record_draft(1, "自定二");
+        state.record_append(1, "自定二");
+        assert_eq!(state.paint().drafts[1], "", "the added entry is the answer");
+        // A toggle is not a submission: the box keeps what was typed.
+        state.record_draft(1, "还在打");
+        state.record_toggle(1, "苹果");
+        assert_eq!(state.paint().drafts[1], "还在打");
+        // Confirming locks the selection, so the unsubmitted text goes too.
+        state.confirm(1);
+        assert_eq!(state.paint().drafts[1], "");
     }
 }
