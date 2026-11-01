@@ -67,6 +67,12 @@ const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// How often the readiness loop re-reads the socket path.
 const SOCKET_READY_STEP: Duration = Duration::from_millis(100);
 
+/// How often the Windows readiness loop asks the management CLI whether a
+/// daemon answers, when the socket identity did not change. Windows may reuse
+/// a freed file index for a re-created socket, so identity alone is not proof.
+#[cfg(windows)]
+const WINDOWS_READY_PROBE_STEP: Duration = Duration::from_secs(1);
+
 /// Everything discovery needs to know about the machine, passed explicitly so a
 /// test never has to mutate the process environment.
 ///
@@ -148,17 +154,21 @@ fn resolve_home(from_env: Option<PathBuf>, home_dir: Option<PathBuf>) -> Result<
 }
 
 /// The identity of the control socket on disk, used to notice that a daemon was
-/// replaced under the same path (a restart gives the daemon a new runtime
-/// directory, so its socket's identity changes).
+/// replaced under the same path.
 ///
 /// Unix reads the target's `(device, inode)` from `std::fs::metadata`, which
 /// **follows** the published symlink: the identity belongs to the socket the
-/// link names, not to the link itself. Windows has no link to follow — the
-/// published path *is* the socket — and reads the same file object's
-/// `(volume serial number, file index)`.
+/// link names, not to the link itself. A restart re-links the path into a fresh
+/// runtime directory, so the identity changes.
+///
+/// Windows has no link to follow — the published path *is* the socket — and
+/// reads the same file object's `(volume serial number, file index)`. Those two
+/// fields are what Microsoft documents as reusable after the last handle
+/// closes, so a re-created socket is *not* guaranteed a new identity; [`start`]
+/// therefore also accepts a successful `daemon version` report on Windows.
 ///
 /// A build with neither (an unsupported platform) is a named failure, not a
-/// panic and not a silent "absent" (ADR-0090's open question 4).
+/// panic and not a silent "absent".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SocketIdentity {
     #[cfg(unix)]
@@ -169,6 +179,15 @@ pub(crate) struct SocketIdentity {
     volume_serial_number: u32,
     #[cfg(windows)]
     file_index: u64,
+}
+
+/// A control path that exists but cannot be used, as the adapter's named error.
+/// One constructor keeps the message shape the same on every platform.
+fn unusable_socket(path: &Path, detail: impl std::fmt::Display) -> CodexError {
+    CodexError::DaemonSocket {
+        socket: path.display().to_string(),
+        detail: detail.to_string(),
+    }
 }
 
 /// Read the control socket's identity, following a link in the path. `Ok(None)`
@@ -183,18 +202,13 @@ pub(crate) fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(CodexError::DaemonSocket {
-                    socket: path.display().to_string(),
-                    detail: error.to_string(),
-                });
-            }
+            Err(error) => return Err(unusable_socket(path, error)),
         };
         if !metadata.file_type().is_socket() {
-            return Err(CodexError::DaemonSocket {
-                socket: path.display().to_string(),
-                detail: "the path exists but is not a unix domain socket".to_string(),
-            });
+            return Err(unusable_socket(
+                path,
+                "the path exists but is not a unix domain socket",
+            ));
         }
         Ok(Some(SocketIdentity {
             device: metadata.dev(),
@@ -214,6 +228,13 @@ pub(crate) fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
     }
 }
 
+/// `FILE_FLAG_BACKUP_SEMANTICS` also opens directories; with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` it opens a reparse point itself.
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
 /// The Windows identity: the volume serial number and file index of the object
 /// the published path names.
 ///
@@ -222,80 +243,104 @@ pub(crate) fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
 /// issue #63010), so this reads the same `BY_HANDLE_FILE_INFORMATION` fields
 /// through `winapi-util`'s safe wrapper. The handle is opened exactly as
 /// `std::fs::metadata` opens one: attributes only, so no read permission is
-/// required. The reparse-point fallback mirrors `std`'s own `stat`: the AF_UNIX
-/// socket file *is* an NTFS reparse point, and opening it without
-/// `FILE_FLAG_OPEN_REPARSE_POINT` can fail with `ERROR_CANT_ACCESS_FILE`.
+/// required.
+///
+/// Windows exposes no stable "is an AF_UNIX socket" predicate (the socket is an
+/// NTFS reparse point whose tag belongs to `afunix.sys`), so a regular file at
+/// the path is identified too; the dial is the proof that it is a socket. A
+/// directory is rejected because it cannot be one.
 #[cfg(windows)]
 fn windows_socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-
-    match std::fs::metadata(path) {
-        Ok(_) => {}
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(CodexError::DaemonSocket {
-                socket: path.display().to_string(),
-                detail: error.to_string(),
-            });
-        }
+        Err(error) => return Err(unusable_socket(path, error)),
+    };
+    if metadata.is_dir() {
+        return Err(unusable_socket(
+            path,
+            "the path exists but is a directory, not a unix domain socket",
+        ));
     }
 
-    let open = |flags: u32| {
-        std::fs::OpenOptions::new()
-            .access_mode(0)
-            .custom_flags(flags)
-            .open(path)
-    };
-    let file = match open(FILE_FLAG_BACKUP_SEMANTICS) {
-        Ok(file) => file,
-        // `std::fs::metadata` succeeded, so the path exists; the object may
-        // only be reachable as a reparse point.
-        Err(_) => open(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).map_err(|error| {
-            CodexError::DaemonSocket {
-                socket: path.display().to_string(),
-                detail: error.to_string(),
-            }
-        })?,
-    };
-    let info = winapi_util::file::information(&file).map_err(|error| CodexError::DaemonSocket {
-        socket: path.display().to_string(),
-        detail: error.to_string(),
-    })?;
+    let file = open_attribute_handle(path).map_err(|error| unusable_socket(path, error))?;
+    let info = winapi_util::file::information(&file).map_err(|error| unusable_socket(path, error))?;
     Ok(Some(SocketIdentity {
         volume_serial_number: info.volume_serial_number() as u32,
         file_index: info.file_index(),
     }))
 }
 
-/// Check the resolved control-socket path against the platform's AF_UNIX
-/// address budget.
-///
-/// Windows stores the path in `sun_path` verbatim, so the path plus its NUL
-/// terminator must fit 108 bytes. Elsewhere the published path is a link into
-/// a short runtime directory and is not what the kernel stores, so the check is
-/// a no-op.
+/// Open the object at `path` for its metadata only.
 #[cfg(windows)]
-pub(crate) fn check_socket_budget(socket: &Path) -> Result<()> {
+fn open_attribute_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    open_attribute_handle_with(|flags| {
+        std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(flags)
+            .open(path)
+    })
+}
+
+/// Try the plain attributes-only open, then the reparse-point form.
+///
+/// This mirrors `std`'s own `stat`: the AF_UNIX socket file is an NTFS reparse
+/// point, and opening it without `FILE_FLAG_OPEN_REPARSE_POINT` can fail with
+/// `ERROR_CANT_ACCESS_FILE`. Factored over the opener so the retry is testable
+/// without a real socket (stable `std` cannot bind one on Windows).
+#[cfg(windows)]
+fn open_attribute_handle_with(
+    mut open: impl FnMut(u32) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<std::fs::File> {
+    match open(FILE_FLAG_BACKUP_SEMANTICS) {
+        Ok(file) => Ok(file),
+        Err(_) => open(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT),
+    }
+}
+
+/// Check a resolved control-socket path against an AF_UNIX address budget.
+///
+/// The path must be UTF-8 and shorter than `limit` bytes; the terminating NUL
+/// is included in `limit` (the kernel copies the path verbatim, then the
+/// NUL-terminated string must fit `sun_path`). This is pure so the boundary and
+/// the non-UTF-8 arm are pinned on any platform.
+#[cfg(any(windows, test))]
+fn socket_path_budget(socket: &Path, limit: usize) -> Result<()> {
     let Some(text) = socket.to_str() else {
-        return Err(CodexError::DaemonSocket {
-            socket: socket.display().to_string(),
-            detail: "a Windows unix-socket address must be valid UTF-8".to_string(),
-        });
+        return Err(unusable_socket(
+            socket,
+            "the path is not valid UTF-8, which a unix-socket address requires",
+        ));
     };
     let length = text.len();
-    if length >= WINDOWS_SOCKET_PATH_LIMIT {
+    if length >= limit {
         return Err(CodexError::ControlSocketPathTooLong {
             path: socket.display().to_string(),
             length,
-            limit: WINDOWS_SOCKET_PATH_LIMIT,
+            limit,
         });
     }
     Ok(())
 }
 
+/// Enforce the Windows `sun_path` budget before a dial.
+///
+/// Windows stores the path in `sun_path` verbatim, so the path plus its NUL
+/// terminator must fit [`WINDOWS_SOCKET_PATH_LIMIT`]. Enforced before anything
+/// is spawned, so a long `CODEX_HOME` is a named precondition failure rather
+/// than a failed connect.
+#[cfg(windows)]
+pub(crate) fn check_socket_budget(socket: &Path) -> Result<()> {
+    socket_path_budget(socket, WINDOWS_SOCKET_PATH_LIMIT)
+}
+
+/// A no-op on Unix: the spec's measured behaviour is that Codex publishes the
+/// socket as a symlink into a short runtime directory (`/tmp/codex-daemon-<uid>
+/// /<hash>`) on both Linux and macOS, so the path passed here is not the address
+/// the kernel stores. Windows is the only platform that binds at the published
+/// path, and it is checked above.
 #[cfg(not(windows))]
 pub(crate) fn check_socket_budget(_socket: &Path) -> Result<()> {
     Ok(())
@@ -593,9 +638,15 @@ fn parse_info(stdout: &[u8]) -> Result<DaemonInfo> {
 ///
 /// A cold start is recognised by the control socket's identity *changing*: a
 /// daemon that crashed can leave its Unix socket path behind, and treating that
-/// corpse as the new daemon would report a dead server as started. Codex
-/// re-links the path into a fresh runtime directory, so a successful cold start
-/// always produces a new identity.
+/// corpse as the new daemon would report a dead server as started. On Unix
+/// Codex re-links the path into a fresh runtime directory, so a successful cold
+/// start always produces a new identity.
+///
+/// Windows stores the socket at the published path, and its `(volume serial
+/// number, file index)` pair may be reused once the old file is gone, so an
+/// unchanged identity is not proof that no daemon started. The Windows loop
+/// therefore also accepts a successful `daemon version` report as the start
+/// signal: a corpse behind the path cannot answer it.
 ///
 /// The command is idempotent, though, and the identity can change *before* it
 /// runs (a replacement appearing while a failed dial was being decided): then
@@ -624,11 +675,23 @@ pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon>
         )));
     }
     let deadline = tokio::time::Instant::now() + environment.socket_ready_timeout;
+    #[cfg(windows)]
+    let mut next_version_probe = tokio::time::Instant::now() + WINDOWS_READY_PROBE_STEP;
     loop {
         if let Some(identity) = socket_identity(&socket)?
             && Some(identity) != before
         {
             return discovered_after_start(environment).await;
+        }
+        // Windows: a re-created socket can reuse the old file index, so ask the
+        // daemon itself. Only a live server answers `daemon version`; the old
+        // corpse behind a leftover path does not.
+        #[cfg(windows)]
+        if tokio::time::Instant::now() >= next_version_probe {
+            next_version_probe = tokio::time::Instant::now() + WINDOWS_READY_PROBE_STEP;
+            if daemon_version(environment).await.is_ok() {
+                return discovered_after_start(environment).await;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             // `daemon start` is **idempotent**: a daemon that appeared between
@@ -1377,7 +1440,9 @@ mod tests {
 
         let home = linked.join("codex-home");
         let environment = Environment {
-            home: home.clone(),
+            // Route the symlinked home through the resolver the daemon uses, so
+            // this exercises the code where canonicalisation could sneak in.
+            home: resolve_home(Some(home.clone()), Some(real.clone())).expect("an absolute home"),
             cli: PathBuf::from("codex"),
             version_timeout: VERSION_TIMEOUT,
             start_timeout: START_TIMEOUT,
@@ -1404,6 +1469,49 @@ mod tests {
         );
     }
 
+    /// The budget is `sun_path` **including** the NUL: 107 bytes fit, 108 do
+    /// not. The check is limit-parameterised so the primary platform pins the
+    /// boundary even though only Windows uses it in production.
+    #[test]
+    fn the_socket_path_budget_is_the_sun_path_limit() {
+        let fits = "x".repeat(107);
+        assert!(socket_path_budget(Path::new(&fits), 108).is_ok());
+
+        for length in [108, 109] {
+            let too_long = "x".repeat(length);
+            let path = Path::new(&too_long);
+            let error = socket_path_budget(path, 108).expect_err("over budget");
+            let message = error.to_string();
+            let CodexError::ControlSocketPathTooLong {
+                path: reported,
+                length: reported_length,
+                limit,
+            } = &error
+            else {
+                panic!("expected a named budget error, got {error}");
+            };
+            assert_eq!(*limit, 108);
+            assert_eq!(*reported_length, length);
+            assert_eq!(*reported, path.display().to_string());
+            assert!(message.contains(&limit.to_string()), "{message}");
+            assert!(message.contains("CODEX_HOME"), "{message}");
+        }
+    }
+
+    /// A Windows socket address cannot carry arbitrary bytes, so a non-UTF-8
+    /// path is a named failure rather than a length check on a lossy string.
+    /// Pinned on Unix, where such an `OsString` is constructible.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_socket_path_is_a_named_failure() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+        let error = socket_path_budget(&path, 108).expect_err("not UTF-8");
+        assert!(matches!(error, CodexError::DaemonSocket { .. }), "{error}");
+        assert!(error.to_string().contains("UTF-8"), "{error}");
+    }
+
     /// The Windows identity is the same `(volume serial number, file index)`
     /// pair for a file under two names; a rename is not a replacement.
     #[cfg(windows)]
@@ -1424,33 +1532,116 @@ mod tests {
         );
     }
 
-    /// On Windows the published path is the socket itself, so an absent path is
-    /// absent and a re-created one is a new object — the replacement a dial
-    /// must not attach through.
+    /// On Windows the published path is the socket itself, so a replacement is
+    /// a different object at the same name. The old file is **renamed aside**
+    /// rather than deleted first, so it still occupies its MFT record and the
+    /// new file cannot reuse the old index; that keeps the assertion
+    /// deterministic even though Microsoft documents the pair as reusable.
     #[cfg(windows)]
     #[test]
-    fn an_absent_windows_control_path_is_absent_and_a_recreated_one_is_a_replacement() {
+    fn a_windows_replacement_is_a_different_identity() {
         let directory = tempfile::tempdir().expect("tempdir");
         let socket = directory.path().join("app-server-control.sock");
         assert_eq!(socket_identity(&socket).expect("absence is not an error"), None);
 
-        std::fs::write(&socket, b"").expect("create the socket path");
+        std::fs::write(&socket, b"").expect("create the control path");
         let first = socket_identity(&socket).expect("identity").expect("a file");
-        std::fs::remove_file(&socket).expect("remove the socket path");
-        std::fs::write(&socket, b"").expect("re-create the socket path");
-        let second = socket_identity(&socket)
-            .expect("identity")
-            .expect("the re-created file");
+        let retired = directory.path().join("retired.sock");
+        std::fs::rename(&socket, &retired).expect("retire the old object");
+        assert_eq!(
+            socket_identity(&retired)
+                .expect("identity")
+                .expect("the retired object"),
+            first,
+            "a rename keeps the identity"
+        );
+
+        std::fs::write(&socket, b"").expect("create the replacement");
+        let second = socket_identity(&socket).expect("identity").expect("a file");
         assert_ne!(first, second, "a re-created path is a replacement");
     }
 
-    /// A path over the Windows `sun_path` budget fails by name before the
-    /// management CLI can be spawned: the fake CLI below does not exist, so a
-    /// spawn-first implementation would surface its own error instead.
+    /// A directory cannot be a unix socket. This is the one type distinction
+    /// Windows can make without a nightly-only socket predicate.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_at_the_windows_control_path_is_a_named_failure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("app-server-control.sock");
+        std::fs::create_dir(&socket).expect("create the directory");
+        let error = socket_identity(&socket).expect_err("a directory is not a socket");
+        assert!(matches!(error, CodexError::DaemonSocket { .. }), "{error}");
+    }
+
+    /// The reparse-point retry is the path a real AF_UNIX socket takes. Stable
+    /// `std` cannot bind one on Windows, so the retry is pinned through its
+    /// opener: a plain-open failure must retry with
+    /// `FILE_FLAG_OPEN_REPARSE_POINT`, and a success must not.
+    #[cfg(windows)]
+    #[test]
+    fn the_reparse_point_fallback_runs_only_when_the_plain_open_fails() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("object");
+        std::fs::write(&path, b"").expect("write the file");
+
+        let mut flags = Vec::new();
+        let file = open_attribute_handle_with(|flag| {
+            flags.push(flag);
+            if flags.len() == 1 {
+                // ERROR_CANT_ACCESS_FILE, the error `std`'s own `stat` retries.
+                Err(std::io::Error::from_raw_os_error(0x2ee))
+            } else {
+                std::fs::File::open(&path)
+            }
+        })
+        .expect("the fallback opens the object");
+        drop(file);
+        assert_eq!(
+            flags,
+            vec![
+                FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            ]
+        );
+
+        let mut attempts = 0;
+        let _file = open_attribute_handle_with(|_| {
+            attempts += 1;
+            std::fs::File::open(&path)
+        })
+        .expect("the plain open succeeds");
+        assert_eq!(attempts, 1, "a successful plain open is not retried");
+    }
+
+    /// Windows is a supported discovery platform now: an existing control
+    /// object yields a running daemon (a silent management report degrades to
+    /// the package fallback), never `UnsupportedPlatform`.
     #[cfg(windows)]
     #[tokio::test]
-    async fn a_codex_home_over_the_socket_budget_fails_before_any_command_runs() {
-        let home = PathBuf::from(r"C:\").join("x".repeat(80));
+    async fn discovery_reads_a_windows_control_path_instead_of_refusing_the_platform() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let environment = Environment {
+            home: directory.path().join("codex-home"),
+            cli: PathBuf::from("this-codex-does-not-exist"),
+            version_timeout: VERSION_TIMEOUT,
+            start_timeout: START_TIMEOUT,
+            socket_ready_timeout: SOCKET_READY_TIMEOUT,
+        };
+        let socket = environment.socket();
+        std::fs::create_dir_all(socket.parent().expect("control dir")).expect("control dir");
+        std::fs::write(&socket, b"").expect("create the control path");
+
+        let found = discover(&environment).await.expect("Windows is supported");
+        assert!(found.daemon.daemon().is_some(), "the path is a daemon");
+        assert!(found.socket.is_some(), "the path has an identity");
+    }
+
+    /// A path over the Windows `sun_path` budget fails by name, with the
+    /// resolved path and the instruction to shorten `CODEX_HOME`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_codex_home_over_the_socket_budget_is_a_named_failure() {
+        let home = std::env::temp_dir().join("x".repeat(80));
         let environment = Environment {
             home,
             cli: PathBuf::from("this-codex-must-never-be-spawned"),
@@ -1466,7 +1657,11 @@ mod tests {
 
         let error = discover(&environment).await.expect_err("over budget");
         let message = error.to_string();
-        assert!(message.contains("108"), "{message}");
+        let CodexError::ControlSocketPathTooLong { path, length, limit } = &error else {
+            panic!("expected a named path-budget error, got {error}");
+        };
+        assert_eq!(*limit, WINDOWS_SOCKET_PATH_LIMIT);
+        assert!(message.contains(&limit.to_string()), "{message}");
         assert!(
             message.contains(&socket.display().to_string()),
             "the resolved path is in the message: {message}"
@@ -1475,12 +1670,39 @@ mod tests {
             message.contains("CODEX_HOME"),
             "the instruction names the setting: {message}"
         );
-        let CodexError::ControlSocketPathTooLong { path, length, limit } = &error else {
-            panic!("expected a named path-budget error, got {error}");
-        };
-        assert_eq!(*limit, WINDOWS_SOCKET_PATH_LIMIT);
         assert_eq!(*length, socket.to_str().expect("a UTF-8 path").len());
         assert_eq!(*path, socket.display().to_string());
+    }
+
+    /// `start` is where "before anything is spawned" is the actual guarantee.
+    /// The control path exists (a regular file, Windows's lax identity shape),
+    /// so a budget check moved after `run_cli` would surface the failing spawn
+    /// instead of the budget error; the configured CLI deliberately does not
+    /// exist.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn start_rejects_an_over_budget_home_before_spawning_the_launcher() {
+        let home = std::env::temp_dir().join("y".repeat(80));
+        let environment = Environment {
+            home,
+            cli: PathBuf::from("this-codex-must-never-be-spawned"),
+            version_timeout: VERSION_TIMEOUT,
+            start_timeout: START_TIMEOUT,
+            socket_ready_timeout: SOCKET_READY_TIMEOUT,
+        };
+        let socket = environment.socket();
+        assert!(
+            socket.as_os_str().len() >= WINDOWS_SOCKET_PATH_LIMIT,
+            "the fixture must overflow the budget"
+        );
+        std::fs::create_dir_all(socket.parent().expect("control dir")).expect("control dir");
+        std::fs::write(&socket, b"").expect("create the control path");
+
+        let error = start(&environment).await.expect_err("over budget");
+        assert!(
+            matches!(error, CodexError::ControlSocketPathTooLong { .. }),
+            "{error}"
+        );
     }
 
     /// The explicit opt-out is the decisive signal, on a TUI only.
