@@ -89,10 +89,12 @@ are free.
   non-submit click carries no `form_value`, and its repaint rebuilds the box.
   That is unchanged from before this decision; only a **switch** preserves a
   draft.
-- A catch-up repaint rebuilds `body.elements`. What that costs is the INPUT's
-  text (client-only); the fold state of the panels is not part of the body —
-  their stable `element_id` is what lets a rebuild keep it. A repaint is therefore
-  acceptable only when no typed box is open.
+- A catch-up repaint rebuilds `body.elements`, which recreates every input and
+  loses the text the client alone holds — the cost is what makes the "no typed
+  box open" gate necessary. Whether the panels' client-side fold state survives
+  the rebuild is a device observation: the builder sends `expanded: false` on
+  every build and relies on the stable `element_id` for the client to keep it,
+  which is not measured.
 - Two small rules the state keeps so a callback cannot shape the card: a stored
   draft is capped at its box's own `max_length` (500 for free text, 40 for a
   number), because that limit is enforced by the client alone; and a numeric

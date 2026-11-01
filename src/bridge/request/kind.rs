@@ -1432,6 +1432,10 @@ impl RequestKind for QuestionKind {
                         "green",
                         &qa_completion_body(&snapshot.fields, &snapshot.answers),
                     );
+                    // This click answered the last question: a claimed snapshot
+                    // must repaint (or, when its liveness check is unknown, must
+                    // not keep dead buttons).
+                    r.mutated = true;
                     r.toast = Some("已回答".to_string());
                     settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                     // Re-served verbatim to a losing double-click.
@@ -1710,6 +1714,7 @@ impl RequestKind for QuestionKind {
                     "green",
                     &qa_completion_body(&snapshot.fields, &snapshot.answers),
                 );
+                r.mutated = true;
                 r.toast = Some("已提交".to_string());
                 settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
@@ -1780,6 +1785,7 @@ impl RequestKind for QuestionKind {
                 )
                 .await;
                 let mut r = result_card("🚫 已拒绝回答", "red", "已拒绝回答 AI 的问题。");
+                r.mutated = true;
                 r.toast = Some("已拒绝回答".to_string());
                 settle_ack(&handles.cards, host, session_id, inline, cached, &mut r).await;
                 // Re-served verbatim to a losing double-click.
