@@ -80,3 +80,10 @@ the card's bottom:
 - The residual: a card that legitimately needs many folded panels, or several
   pending blocks in one snapshot card, can still approach the threshold. The
   fix is to keep the distance small, not to assume any single element is safe.
+- A device tap-through of a real four-question card (Android 14 / Feishu 8.4.9,
+  2026-11-01, after the fix shipped) showed **no jump in normal use**. One case
+  still jumps: the reader deliberately drags the box to the screen's very
+  bottom, leaving only a few pixels visible but still tappable — the rule
+  protects a box the reader can see and put a caret in, not one they have just
+  scrolled half off the screen. The reporter agreed that is out of scope. Do not
+  treat it as a regression of this decision.
