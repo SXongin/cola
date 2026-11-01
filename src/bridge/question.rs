@@ -221,7 +221,10 @@ impl QuestionState {
     /// present. Removing the last label reverts the slot to `None` (the
     /// question is open again).
     pub(crate) fn record_toggle(&mut self, index: usize, answer: &str) {
-        if index >= self.toggles.len() {
+        // A finalized question renders no toggles: a late click landing on it
+        // must not move a hidden slot (and must not count as a mutation, or the
+        // snapshot would repaint and recreate an open box).
+        if index >= self.toggles.len() || self.answers[index].is_some() {
             return;
         }
         let empty = {
@@ -243,7 +246,7 @@ impl QuestionState {
     /// duplicate is a no-op). Removal has its own affordance: the rendered
     /// Custom Answer button re-enters as a normal toggle (`reply: "answer"`).
     pub(crate) fn record_append(&mut self, index: usize, answer: &str) {
-        if index >= self.toggles.len() {
+        if index >= self.toggles.len() || self.answers[index].is_some() {
             return;
         }
         let set = self.toggles[index].get_or_insert_with(Vec::new);
@@ -602,11 +605,15 @@ mod tests {
         // Confirming with nothing toggled is the "不选" path: an empty answer.
         state.confirm(0);
         assert_eq!(state.answers, vec![Some(Vec::new())]);
-        // A stale second confirm must not overwrite the locked answer.
+        let revision = state.revision();
+        // A finalized question's toggles are dead: a late click must not move a
+        // hidden slot (that hidden move is what made a stale click look like a
+        // mutation and repaint the card), and a stale confirm stays a no-op.
         state.record_toggle(0, "苹果");
         state.confirm(0);
         assert_eq!(state.answers, vec![Some(Vec::new())]);
-        assert_eq!(state.toggles, vec![Some(vec!["苹果".to_string()])]);
+        assert_eq!(state.toggles, vec![None], "a done question takes no toggles");
+        assert_eq!(state.revision(), revision, "and nothing counts as a change");
     }
 
     #[test]

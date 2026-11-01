@@ -929,15 +929,16 @@ async fn stale_confirm_on_done_multi_select_is_a_no_op() {
     assert_eq!(r1.toast.as_deref(), Some("已确定该题，还有 1 题未答"));
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
-    // A stale second confirm on Q1 must NOT wipe 苹果 with an empty set.
+    // A stale second confirm on Q1 must NOT wipe 苹果 with an empty set — and
+    // must not repaint the card at all: Q0 is still open with a box the Host
+    // may be typing into, and a rebuild would recreate it empty.
     let r2 = app.host_action(confirm(1)).await.expect("result");
     assert_eq!(r2.toast.as_deref(), Some("已确定该题，还有 1 题未答"));
-    let c2 = r2.card.as_ref().expect("re-rendered card").to_string();
     assert!(
-        c2.contains("已选：苹果"),
-        "stale confirm wiped the answer: {}",
-        c2
+        r2.card.is_none(),
+        "a click that changed nothing must not replace the card"
     );
+    assert!(!r2.mutated, "and reports no change");
     assert_eq!(backend.reply_question_calls.lock().await.len(), 0);
 
     // Answer Q0 → both done → submits with 苹果 intact.
@@ -2125,6 +2126,26 @@ async fn switching_questions_carries_the_typed_draft() {
         0,
         "switching must never answer the request"
     );
+
+    // Clearing the box and switching away must CLEAR the draft, not leave the
+    // old text to be seeded back: a client may send no `form_value` at all for
+    // an empty box.
+    let cleared = serde_json::json!({
+        "schema": "2.0",
+        "event": { "action": { "tag": "button", "name": "open|que_switch|ses_1|1|0" } }
+    });
+    let cleared = crate::feishu::ws::extract_card_action_value(cleared.to_string().as_bytes())
+        .expect("a name-only switch decodes");
+    let away = app.host_action(cleared).await.expect("an ack");
+    assert_eq!(away.toast.as_deref(), Some("已切到第 2 题"));
+    let back = app.host_action(switch(0, 1, "")).await.expect("an ack");
+    let card = back.card.expect("a repaint");
+    let inputs = card_inputs(&card);
+    assert!(
+        inputs[0].get("default_value").is_none(),
+        "an emptied box stays empty after switching back: {}",
+        card
+    );
 }
 
 /// The same switch, but on the STREAMING card: the clicked card's ack is the
@@ -2379,23 +2400,24 @@ async fn a_stale_switch_on_a_claimed_snapshot_does_not_rebuild_the_card() {
     // A switch carries the box it was submitted with. Both callbacks omit the
     // directory, so the wrapper's liveness check takes its "unknown → still
     // pending" arm, which is the branch that used to rebuild unconditionally.
-    let switch = |target: u64, draft: &str| {
+    let switch = |target: u64, from: u64, draft: &str| {
         let mut value = serde_json::json!({
             "action": "question",
             "reply": "open",
             "request_id": "que_snap",
             "session_id": "ses_snap",
             "question_index": target,
+            "from_index": from,
         });
         value["form_value"] = serde_json::Value::Object(serde_json::Map::from_iter([(
-            "custom_0".to_string(),
+            format!("custom_{from}"),
             serde_json::json!(draft),
         )]));
         value
     };
 
     // The first switch changes the state, so the snapshot IS repainted.
-    let first = app.host_action(switch(1, "草稿")).await.expect("an ack");
+    let first = app.host_action(switch(1, 0, "草稿")).await.expect("an ack");
     assert_eq!(first.toast.as_deref(), Some("已切到第 2 题"));
     let rebuilt = first.card.expect("state changed: the snapshot mirrors it");
     assert!(
@@ -2405,7 +2427,7 @@ async fn a_stale_switch_on_a_claimed_snapshot_does_not_rebuild_the_card() {
     );
 
     // The duplicate arrives late with the same (now stale) box.
-    let stale = app.host_action(switch(1, "草稿")).await.expect("an ack");
+    let stale = app.host_action(switch(1, 0, "草稿")).await.expect("an ack");
     assert_eq!(stale.toast.as_deref(), Some("已按最新的选择更新"));
     assert!(
         stale.card.is_none(),
