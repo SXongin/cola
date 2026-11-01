@@ -9173,7 +9173,14 @@ Index: /x/src/main.rs
             }],
             ..Default::default()
         };
-        Turn::add_question(&cards, sid, &request, "/work", &[None], &[false], 0, &[]).await;
+        Turn::add_question(
+            &cards,
+            sid,
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+        )
+        .await;
         Turn::flush_card(&cards, sid).await;
         let with_block = platform.updated_cards().await.len();
 
@@ -9238,7 +9245,14 @@ Index: /x/src/main.rs
             }],
             ..Default::default()
         };
-        Turn::add_question(&cards, sid, &request, "/work", &[None], &[false], 0, &[]).await;
+        Turn::add_question(
+            &cards,
+            sid,
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+        )
+        .await;
         Turn::flush_card(&cards, sid).await;
         let before = platform.updated_cards().await.len();
 
@@ -9391,7 +9405,14 @@ Index: /x/src/main.rs
             }],
             ..Default::default()
         };
-        Turn::add_question(&cards, sid, &request, "/work", &[None], &[false], 0, &[]).await;
+        Turn::add_question(
+            &cards,
+            sid,
+            &request,
+            "/work",
+            &crate::bridge::question::QuestionPaint::blank(1),
+        )
+        .await;
         Turn::flush_card(&cards, sid).await;
         let with_form = platform.updated_cards().await.len();
 

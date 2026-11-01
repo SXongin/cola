@@ -2171,10 +2171,12 @@ async fn an_inline_switch_repaints_the_clicked_card_and_moves_the_block() {
         "ses_q",
         &request,
         "/work",
-        &[None, None],
-        &[false, false],
-        0,
-        &["打到一半".to_string(), String::new()],
+        &crate::bridge::question::QuestionPaint {
+            display: vec![None, None],
+            done: vec![false, false],
+            open: 0,
+            drafts: vec!["打到一半".to_string(), String::new()],
+        },
     )
     .await;
     Turn::flush_card(&app.cards_handle(), "ses_q").await;

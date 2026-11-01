@@ -676,9 +676,11 @@ fn draft_of(drafts: &[String], index: usize) -> &str {
 }
 
 /// The switch control a folded question carries: a form SUBMIT that names the
-/// question to open. It rides the button `name` ("open|req|ses|qi") because a
-/// form submit does not deliver the button `value`; the directory stays out of
-/// it, exactly like `submit_name` (Feishu caps `name` at 100 chars).
+/// question to open. It rides the button `name` ("open|req|ses|qi|from") because
+/// a form submit does not deliver the button `value`; `from` is the question
+/// whose box the switch rode, which the guard needs even when an empty box
+/// delivers no `form_value`. The directory stays out, exactly like
+/// `submit_name` (Feishu caps `name` at 100 chars).
 fn switch_button(request_id: &str, session_id: &str, index: usize, from: usize) -> serde_json::Value {
     json!({
         "tag": "button",
