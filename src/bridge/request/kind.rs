@@ -1831,7 +1831,10 @@ fn switch_toast(target: usize, applied: SwitchApplied, done: &[bool]) -> String 
     match applied {
         SwitchApplied::Opened => format!("已切到第 {} 题", target + 1),
         SwitchApplied::Stale => "已按最新的选择更新".to_string(),
-        SwitchApplied::Refused if done.get(target).copied().unwrap_or(true) => "这道题已经答完".to_string(),
+        // An index past the end can only come from a stale card: it names no
+        // question, so it cannot be called answered.
+        SwitchApplied::Refused if target >= done.len() => "已更新到最新状态".to_string(),
+        SwitchApplied::Refused if done[target] => "这道题已经答完".to_string(),
         SwitchApplied::Refused => format!("已经停在第 {} 题", target + 1),
     }
 }
