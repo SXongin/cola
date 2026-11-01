@@ -319,6 +319,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "winapi-util",
  "zip",
 ]
 

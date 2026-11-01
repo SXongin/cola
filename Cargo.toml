@@ -86,4 +86,8 @@ tar = "0.4"
 # Safe handle-identity comparison (`opened_stays_beneath`): the stable
 # `MetadataExt` volume/file-index accessors are still nightly-only.
 same-file = "1"
+# The Codex control socket's identity is the same `(volume serial number, file
+# index)` pair; `winapi-util` reads it through a safe wrapper so `discovery.rs`
+# needs no `unsafe` block.
+winapi-util = "0.1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
