@@ -582,3 +582,20 @@ body and its folded header say.
 
 Not in this amendment: the turn-level diff product and its red/green/HTML presentation (another
 spec).
+
+## Amendment (2026-11-01, #902): the Codex arms extend §8, with a second count source
+
+ADR-0042's amendment puts Codex's `codex/file_change` in the tailored set, so
+§8's way-in and #793's folded multi-file title apply to it too:
+
+- A single change names its file and carries the button — a rename names and
+  opens its destination, a delete still names the removed file but carries no
+  button.
+- A multi-file change counts the INPUT `changes`, not the deduped paths of the
+  parsed `EditDiff`: a rename or binary entry may record no hunk and still
+  belongs to the fold. The totals still come from the parsed hunks, so a patch
+  with no hunk reads `+0 −0` (omitted on a failed call, whose change is
+  unknown).
+
+The `edit` / `apply_patch` / `patch` rules above are unchanged: their count and
+totals still come from one `EditDiff`.
