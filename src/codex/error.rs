@@ -34,10 +34,17 @@ pub(crate) enum CodexError {
     /// No usable `codex` binary was found to run `app-server proxy`. The
     /// adapter's dial path resolves the binary in a fixed order (the daemon's
     /// reported `managedCodexPath`, the managed package under `CODEX_HOME`,
-    /// then `codex` on `PATH`); this names every step it tried so a
+    /// then the configured CLI / `PATH`); this names every step it tried so a
     /// misconfiguration is actionable rather than a bare spawn failure.
     #[error("cannot find an executable codex binary to run `app-server proxy`; tried: {tried}")]
     ProxyBinary { tried: String },
+
+    /// The resolved proxy binary could not be started. This is a
+    /// **configuration** failure, not evidence that the daemon is gone: the
+    /// attach path must report it instead of falling through to
+    /// `app-server daemon start` (which would launch against a live daemon).
+    #[error("could not start the codex app-server proxy `{binary}`: {detail}")]
+    ProxySpawn { binary: String, detail: String },
 
     /// The connection or handshake did not answer inside the budget. A wedged
     /// server must not hold cola's boot.

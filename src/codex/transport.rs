@@ -9,20 +9,29 @@
 //! the child's stdin/stdout. `client_async` over a boxed `AsyncRead +
 //! AsyncWrite` keeps one client type for every byte stream underneath.
 //!
+//! A **daemon** close is observed as EOF on the child's stdout; the reader loop
+//! then closes the connection. The child does not necessarily exit — the real
+//! proxy's two copy directions are joined, so it waits for stdin EOF as well as
+//! the socket's. The reverse direction is therefore explicit: closing the
+//! connection (the last handle dropping, a protocol fault, an overflowed
+//! decision queue) terminates and reaps the child. A child that exits on its
+//! own also closes the connection. Either way every waiter fails by name and
+//! [`ServerEvent::Closed`] reaches the decision stream.
+//!
 //! `Endpoint::WebSocket` remains for a TUI's own `ws://` listener and the
 //! hermetic tests; the daemon cannot serve it. It is test/live-only in
 //! practice.
 //!
-//! The proxy child's lifetime is the connection's: dropping the last
-//! [`RpcConnection`] kills and reaps it, and the child exiting for any reason
-//! closes the connection exactly like a socket close, so every waiter fails by
-//! name and [`ServerEvent::Closed`] reaches the decision stream.
-//!
 //! The shipped control socket under `$CODEX_HOME/app-server-control/` is a
-//! **symlink** into `/tmp/codex-daemon-0/<hash>` on Unix (ADR-0090's amendment,
-//! question 4). The path is handed to the proxy verbatim and never
-//! canonicalised: the OS follows the link at connect time, so a daemon that
-//! re-points it is picked up on the next attach.
+//! **symlink** into `/tmp/codex-daemon-0/<hash>` on Unix (spec #948). The path
+//! is handed to the proxy verbatim and never canonicalised: the OS follows the
+//! link at connect time, so a daemon that re-points it is picked up on the
+//! next attach.
+//!
+//! On Windows the production dial is that same proxy child over the same
+//! AF_UNIX path; only the hermetic fixture substitutes a TCP target for its
+//! fake daemon, because stable Rust cannot bind an AF_UNIX socket there. The
+//! real AF_UNIX-on-Windows proof belongs to the tier-1 job (#953).
 //!
 //! # One reader loop, fanned out
 //!
@@ -56,9 +65,9 @@ use std::time::Duration;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -317,11 +326,10 @@ impl RpcConnection {
     /// Dial the endpoint and complete the WebSocket handshake, bounded by
     /// `timeout` so a wedged server cannot hold cola's boot.
     ///
-    /// A `unix://` endpoint needs a proxy binary; dialling one without it is a
-    /// named failure rather than silently falling back to some `codex` on the
-    /// machine. Production paths call [`Self::open_with_proxy`] with the binary
-    /// `discovery::resolve_proxy_binary` resolved; this `ws://`-only shorthand
-    /// is the test seam.
+    /// The test shorthand for [`Self::open_with_proxy`] with no proxy binary:
+    /// it dials a `ws://` endpoint, and pins the named failure a `unix://`
+    /// dial without a binary must produce. Production paths always supply the
+    /// binary `discovery::resolve_proxy_binary` resolved.
     #[cfg(test)]
     pub(crate) async fn open(endpoint: &Endpoint, timeout: Duration) -> Result<Self> {
         Self::open_with_proxy(endpoint, timeout, None).await
@@ -341,7 +349,7 @@ impl RpcConnection {
     }
 
     async fn open_inner(endpoint: &Endpoint, proxy_binary: Option<&Path>) -> Result<Self> {
-        let connection = match endpoint {
+        Ok(match endpoint {
             Endpoint::Unix(path) => {
                 let binary = proxy_binary.ok_or_else(|| CodexError::ProxyBinary {
                     tried: format!(
@@ -377,9 +385,7 @@ impl RpcConnection {
                         })?;
                 Self::start_with_proxy(Self::handshake(raw, Box::new(stream)).await?, None)
             }
-        };
-
-        Ok(connection)
+        })
     }
 
     async fn handshake(url: &str, stream: BoxedStream) -> Result<Socket> {
@@ -654,8 +660,9 @@ impl RpcConnection {
 ///
 /// The proxy is Codex's own relay to the control socket (spec #948): cola never
 /// speaks the unix domain socket itself, which is why this transport works on
-/// Windows too. Stderr is dropped: the proxy speaks raw bytes on stdout, and a
-/// diagnostic there must not be mistaken for a frame.
+/// Windows too. Stdout is the byte stream; stderr carries the proxy's own
+/// diagnostics (a rejected `--sock`, a connect failure) and is drained to the
+/// log so the operator is not left with only an exit status.
 async fn spawn_proxy(binary: &Path, socket: &Path) -> Result<(ChildIo, Child)> {
     let mut command = Command::new(binary);
     command
@@ -665,21 +672,31 @@ async fn spawn_proxy(binary: &Path, socket: &Path) -> Result<(ChildIo, Child)> {
         .arg(socket)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        // Belt and braces for a runtime that is going away mid-handshake: the
-        // explicit guard below is the normal path, this covers its absence.
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| CodexError::Transport {
-        context: format!(
-            "spawn `{} app-server proxy --sock {}`",
-            binary.display(),
-            socket.display()
-        ),
+        .stderr(Stdio::piped());
+    // A failure here is a configuration fault (a binary the OS cannot start),
+    // never evidence that the daemon vanished: it deliberately has its own
+    // variant so the attach path cannot turn it into `Unreachable`.
+    let mut child = command.spawn().map_err(|error| CodexError::ProxySpawn {
+        binary: binary.display().to_string(),
         detail: error.to_string(),
     })?;
     let stdin = child.stdin.take().expect("the proxy child's stdin is piped");
     let stdout = child.stdout.take().expect("the proxy child's stdout is piped");
+    if let Some(stderr) = child.stderr.take() {
+        watch_proxy_stderr(stderr);
+    }
     Ok((ChildIo { stdin, stdout }, child))
+}
+
+/// Drain the proxy child's stderr to the log. Its only writer is `codex`'s own
+/// diagnostics on a failure; without this the operator sees a bare exit code.
+fn watch_proxy_stderr(stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!("codex app-server proxy: {line}");
+        }
+    });
 }
 
 /// The proxy child's stdin/stdout as one duplex byte stream.
@@ -722,8 +739,13 @@ impl AsyncWrite for ChildIo {
     }
 }
 
-/// Owns the child until the connection takes it over; dropping it kills the
-/// process, which is what happens when the handshake fails or is cancelled.
+/// Owns the proxy child until the connection takes it over. Dropping it kills
+/// and reaps the process, which is what must happen when the handshake fails,
+/// times out, or is cancelled: no [`ConnectionInner`] exists yet to own it.
+///
+/// This is deliberately the **only** kill mechanism before the handshake
+/// completes — no `kill_on_drop` backstop — so a test can prove the guard is
+/// what reaps a child stranded mid-handshake.
 struct ProxyGuard(Option<Child>);
 
 impl ProxyGuard {
@@ -734,6 +756,20 @@ impl ProxyGuard {
     fn take(&mut self) -> Child {
         self.0.take().expect("the proxy child is taken once")
     }
+
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("the proxy child is owned")
+    }
+
+    /// Kill and reap now. Used by the watcher's terminate edge.
+    async fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+            if let Err(error) = child.wait().await {
+                tracing::warn!("codex app-server proxy could not be reaped: {error}");
+            }
+        }
+    }
 }
 
 impl Drop for ProxyGuard {
@@ -743,7 +779,8 @@ impl Drop for ProxyGuard {
         };
         // `start_kill` is synchronous and needs no runtime; reaping does. When
         // the runtime is already gone there is nothing left that could wait,
-        // and `kill_on_drop` has signalled the child already.
+        // but the signal itself still guarantees the child is not left
+        // running.
         let _ = child.start_kill();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
@@ -755,21 +792,26 @@ impl Drop for ProxyGuard {
 
 /// Watch the proxy child: its exit of **any** kind is the connection's close,
 /// and the terminate edge (last handle dropped, or the connection closed for a
-/// protocol error) kills and reaps it.
-fn watch_proxy(mut child: Child, terminate: Arc<tokio::sync::Notify>, inner: Weak<ConnectionInner>) {
+/// protocol error) kills and reaps it. Owning the child through
+/// [`ProxyGuard`] also covers the watcher being cancelled at runtime
+/// shutdown.
+fn watch_proxy(child: Child, terminate: Arc<tokio::sync::Notify>, inner: Weak<ConnectionInner>) {
     tokio::spawn(async move {
+        let mut child = ProxyGuard::new(child);
         tokio::select! {
             biased;
-            _ = terminate.notified() => {
-                let _ = child.start_kill();
-                if let Err(error) = child.wait().await {
-                    tracing::debug!("codex app-server proxy could not be reaped: {error}");
-                }
-            }
-            status = child.wait() => {
+            _ = terminate.notified() => child.kill_and_reap().await,
+            status = child.child().wait() => {
                 match status {
-                    Ok(status) => tracing::debug!("codex app-server proxy exited: {status}"),
-                    Err(error) => tracing::debug!("codex app-server proxy wait failed: {error}"),
+                    Ok(status) if status.success() => {
+                        tracing::debug!("codex app-server proxy exited: {status}");
+                    }
+                    Ok(status) => {
+                        tracing::warn!("codex app-server proxy exited unsuccessfully: {status}");
+                    }
+                    Err(error) => {
+                        tracing::warn!("codex app-server proxy wait failed: {error}");
+                    }
                 }
             }
         }
@@ -1145,10 +1187,88 @@ mod tests {
         );
     }
 
-    /// A proxy that exits before the handshake is a transport failure, and no
-    /// child is left behind (the handshake-failure guard reaps it).
+    /// Closing the connection while the daemon stays healthy is the one path
+    /// where only `close()`'s terminate edge can reap the child: the real
+    /// proxy waits for both stdin EOF *and* socket EOF, and the daemon's socket
+    /// never ends here. A non-JSON frame closes the connection, and the child
+    /// must be gone even though the `RpcConnection` handle is still alive.
     #[tokio::test]
-    async fn a_proxy_that_exits_before_the_handshake_is_reaped() {
+    async fn a_protocol_fault_kills_the_proxy_child_while_the_daemon_lives() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+
+        let failed = connection
+            .request("test/malformed", json!({}))
+            .await
+            .expect_err("a non-JSON frame fails the request");
+        assert!(
+            matches!(failed, CodexError::NoResponse(_) | CodexError::Transport { .. }),
+            "the waiter fails by name: {failed}"
+        );
+        assert!(connection.closed(), "the connection is closed");
+
+        // Deliberately keep `connection` alive: the terminate edge, not the
+        // last-handle drop, is what must reap the child.
+        wait_for_pid_to_disappear(pid).await;
+        drop(connection);
+    }
+
+    /// A handshake that times out strands a real child mid-handshake: no
+    /// `ConnectionInner` exists yet, and the real proxy keeps running while its
+    /// socket side stays open. The handshake-failure guard must kill and reap
+    /// it. The fake daemon here accepts and never answers, and the relay
+    /// fixture does not exit on its own, so removing the guard leaves the pid
+    /// alive and this test fails.
+    #[tokio::test]
+    async fn a_timed_out_handshake_kills_and_reaps_the_proxy_child() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent daemon");
+        let address = listener.local_addr().expect("address");
+        let target = PathBuf::from(format!("tcp://{address}"));
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            // Accept and hold the connection open: a fixture that saw EOF would
+            // exit by itself and hide a missing reap.
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = held.await;
+                drop(stream);
+            }
+        });
+
+        let dial = {
+            let target = target.clone();
+            tokio::spawn(async move {
+                RpcConnection::open_with_proxy(
+                    &Endpoint::Unix(target),
+                    Duration::from_millis(500),
+                    Some(&crate::codex::test_server::proxy_helper()),
+                )
+                .await
+            })
+        };
+        let pid = wait_for_proxy_child(&target).await;
+        assert!(crate::process::alive(pid as i32), "the proxy child runs");
+
+        let error = dial
+            .await
+            .expect("the dial task did not panic")
+            .err()
+            .expect("a silent daemon cannot complete the handshake");
+        assert!(
+            matches!(error, CodexError::Timeout(_)),
+            "the handshake times out by name: {error}"
+        );
+        wait_for_pid_to_disappear(pid).await;
+        let _ = release.send(());
+    }
+
+    /// A proxy that exits before the handshake is a transport failure. This
+    /// says nothing about reaping (the fixture exits itself); the timeout test
+    /// above is the one that proves the guard.
+    #[tokio::test]
+    async fn an_immediately_exiting_proxy_cannot_handshake() {
         let error = RpcConnection::open_with_proxy(
             &Endpoint::Unix(PathBuf::from("exit")),
             Duration::from_secs(5),
@@ -1161,6 +1281,21 @@ mod tests {
             matches!(error, CodexError::Transport { .. } | CodexError::Timeout(_)),
             "the failure is the transport's: {error}"
         );
+    }
+
+    async fn wait_for_proxy_child(target: &Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = crate::codex::test_server::find_proxy_child(target) {
+                return pid as u32;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the proxy fixture never started for {}",
+                target.display()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     async fn wait_for_pid_to_disappear(pid: u32) {

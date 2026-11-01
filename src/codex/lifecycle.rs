@@ -1551,6 +1551,11 @@ mod tests {
         root: tempfile::TempDir,
         environment: Environment,
         cli: FakeCodex,
+        /// The path the fake CLI reports as `managedCodexPath`, holding a real
+        /// proxy relay. It is installed **only** there, so a test that attaches
+        /// proves the resolution actually honours the daemon's report (a
+        /// package-path copy would mask broken wiring).
+        managed_binary: PathBuf,
         daemon_socket: PathBuf,
         daemon_pid: PathBuf,
         probe_binaries: Arc<Mutex<Vec<PathBuf>>>,
@@ -1570,12 +1575,12 @@ mod tests {
             let daemon_pid = root.path().join("fake-daemon.pid");
             let control = home.join(discovery::CONTROL_DIR).join(discovery::CONTROL_SOCKET);
             // The dial now spawns `codex app-server proxy`, so the fake
-            // daemon's managed binary must be a real relay. Place it at the
-            // path the fake CLI reports and at the managed package path, so
-            // resolution finds it without ever searching the host's `PATH`.
+            // daemon's managed binary must be a real relay. It is installed at
+            // exactly the path the fake CLI reports, and nowhere else: the
+            // managed package path stays absent, so resolution has to honour
+            // `managedCodexPath` rather than quietly find a copy.
             let managed = root.path().join("managed-codex");
             crate::codex::test_server::install_proxy_helper(&managed);
-            crate::codex::test_server::install_proxy_helper(&home.join(discovery::MANAGED_BINARY));
             let cli = FakeCodex::write(
                 root.path(),
                 &control,
@@ -1594,6 +1599,7 @@ mod tests {
                 root,
                 environment,
                 cli,
+                managed_binary: managed,
                 daemon_socket,
                 daemon_pid,
                 probe_binaries: Arc::new(Mutex::new(Vec::new())),
@@ -1601,9 +1607,9 @@ mod tests {
         }
 
         /// The resolver's winning candidate for this fixture: the fake
-        /// daemon's managed binary, which is a real proxy relay.
+        /// daemon's reported managed binary, which is a real proxy relay.
         fn proxy_binary(&self) -> PathBuf {
-            self.root.path().join("managed-codex")
+            self.managed_binary.clone()
         }
 
         fn lifecycle(&self, start_server: crate::config::ServerStartPolicy) -> CodexLifecycle {
@@ -2309,6 +2315,45 @@ mod tests {
         );
     }
 
+    /// A proxy binary that cannot be executed is a **configuration** failure,
+    /// not evidence that the daemon is gone. Reading it as `Unreachable` would
+    /// let `auto` run `app-server daemon start` against a live daemon on every
+    /// pass while logging that the daemon vanished.
+    #[tokio::test]
+    async fn an_unrunnable_proxy_binary_is_not_a_dead_daemon() {
+        let fixture = Fixture::new();
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        fixture.link_daemon();
+        // The reported managed binary passes the executable predicate but has
+        // no runnable format, so the spawn itself is what fails.
+        std::fs::remove_file(&fixture.managed_binary).expect("remove the relay");
+        std::fs::write(&fixture.managed_binary, b"not an executable format\n").expect("write junk");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fixture.managed_binary, std::fs::Permissions::from_mode(0o755))
+                .expect("keep the execute bit");
+        }
+
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let never_busy = || false;
+        let error = lifecycle
+            .ensure_attached(request(&never_busy))
+            .await
+            .expect_err("an unrunnable proxy binary is loud");
+        assert!(
+            error
+                .to_string()
+                .contains("could not start the codex app-server proxy"),
+            "the failure names the proxy binary: {error}"
+        );
+        assert_eq!(
+            fixture.cli.starts(),
+            0,
+            "a spawn failure must not trigger `daemon start`: {:?}",
+            fixture.cli.invocations()
+        );
+    }
+
     /// A daemon that disappears is unattached on the next pass — and nothing is
     /// reaped, on any path (the poll pass included).
     #[tokio::test]
@@ -2866,15 +2911,7 @@ mod tests {
         );
         assert_eq!(
             report.runtime_binary.as_deref(),
-            Some(
-                fixture
-                    .root
-                    .path()
-                    .join("managed-codex")
-                    .display()
-                    .to_string()
-                    .as_str()
-            ),
+            Some(fixture.managed_binary.display().to_string().as_str()),
             "the daemon's own managed binary is reported"
         );
         assert!(server.connections() >= 1);

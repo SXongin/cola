@@ -14,9 +14,7 @@
 //!
 //! Compiled only for tests.
 
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -87,155 +85,101 @@ pub(crate) fn socket_tempdir() -> tempfile::TempDir {
     .expect("a temp base that keeps a codex fixture's control socket inside `sun_path`")
 }
 
-/// The source of the test proxy, compiled once by [`proxy_helper`].
-///
-/// It is a real `codex app-server proxy` stand-in: it relays raw bytes between
-/// stdio and the `--sock` target, exits when the socket side ends, and exits
-/// immediately for the sentinel `--sock exit`. On unix the target is an AF_UNIX
-/// path; a `tcp://HOST:PORT` target is relayed over TCP on every platform, so
-/// the Windows suite (where stable Rust cannot bind an AF_UNIX socket) can
-/// still drive the real child-lifecycle path. Std only: it is compiled with
-/// `rustc` because a test cannot add a binary target to the crate.
-const PROXY_HELPER_SOURCE: &str = r#"
-use std::io::{Read, Write};
-
-fn main() {
-    let arguments: Vec<String> = std::env::args().collect();
-    let socket = arguments
-        .iter()
-        .position(|argument| argument == "--sock")
-        .and_then(|index| arguments.get(index + 1))
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!("proxy fixture: no --sock");
-            std::process::exit(64);
-        });
-    if socket == "exit" {
-        std::process::exit(3);
-    }
-    if let Err(error) = run(&socket) {
-        eprintln!("proxy fixture: {error}");
-        std::process::exit(65);
-    }
-}
-
-#[cfg(unix)]
-fn run(socket: &str) -> std::io::Result<()> {
-    if let Some(address) = socket.strip_prefix("tcp://") {
-        return relay(std::net::TcpStream::connect(address)?);
-    }
-    relay(std::os::unix::net::UnixStream::connect(socket)?)
-}
-
-#[cfg(not(unix))]
-fn run(socket: &str) -> std::io::Result<()> {
-    let address = socket.strip_prefix("tcp://").unwrap_or(socket);
-    relay(std::net::TcpStream::connect(address)?)
-}
-
-trait Relay: Read + Write + Send + 'static {
-    fn duplicate(&self) -> std::io::Result<Self>
-    where
-        Self: Sized;
-}
-
-#[cfg(unix)]
-impl Relay for std::os::unix::net::UnixStream {
-    fn duplicate(&self) -> std::io::Result<Self> {
-        self.try_clone()
-    }
-}
-
-impl Relay for std::net::TcpStream {
-    fn duplicate(&self) -> std::io::Result<Self> {
-        self.try_clone()
-    }
-}
-
-fn pump<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<()> {
-    // `std::io::copy` into `stdout` would buffer binary WebSocket frames in
-    // the line writer until a newline that a frame never carries; flush each
-    // chunk instead, exactly like a raw byte relay.
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(());
-        }
-        writer.write_all(&buffer[..read])?;
-        writer.flush()?;
-    }
-}
-
-fn relay<S: Relay>(stream: S) -> std::io::Result<()> {
-    let mut writer = stream.duplicate()?;
-    std::thread::spawn(move || {
-        let _ = pump(std::io::stdin(), &mut writer);
-    });
-    let _ = pump(stream, std::io::stdout());
-    std::process::exit(0);
-}
-"#;
+/// The source of the test proxy, compiled once by [`proxy_helper`]. Kept as a
+/// real file (not a string literal) so it is reviewable and formatted like
+/// code; `include_str!` embeds it verbatim.
+const PROXY_HELPER_SOURCE: &str = include_str!("fixtures/proxy_fixture.rs");
 
 static PROXY_HELPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// A real binary that behaves as `codex app-server proxy --sock <target>`.
 ///
-/// Compiled once per test process with `rustc` (a test cannot declare a
-/// binary target), then reused by every proxy test. The temp root is leaked on
-/// purpose: it lives as long as the process, and dropping it would delete the
-/// executable a running child may still map.
+/// Compiled once per test process with `rustc` (a test cannot declare a binary
+/// target), then reused by every proxy test. Used with the crate's edition and
+/// without lint suppression, and **probed by execution** before it is accepted:
+/// that rejects a noexec temp base and a `rustc` that built a foreign target
+/// with a named error instead of an opaque `EACCES`/exec-format failure later.
+///
+/// The temp root is leaked on purpose: it lives as long as the process, and
+/// dropping it would delete the executable a running child may still map.
 pub(crate) fn proxy_helper() -> PathBuf {
     PROXY_HELPER
         .get_or_init(|| {
-            let root = socket_tempdir_or_tempdir();
-            let source = root.path().join("proxy-fixture.rs");
-            let binary = root
-                .path()
-                .join(if cfg!(windows) { "codex.exe" } else { "codex" });
-            std::fs::write(&source, PROXY_HELPER_SOURCE).expect("write the proxy fixture source");
-            let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
-            let output = std::process::Command::new(rustc)
-                // The test process's own cwd can be a deleted temporary
-                // directory another test left behind; rustc refuses to start
-                // without a working directory, so pin a live one.
-                .current_dir(root.path())
-                .arg("--edition=2021")
-                .arg("-O")
-                .arg("-A")
-                .arg("warnings")
-                .arg("-o")
-                .arg(&binary)
-                .arg(&source)
-                .output()
-                .expect("run rustc for the proxy fixture");
-            assert!(
-                output.status.success(),
-                "compile the proxy fixture: {}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+            let mut failures = Vec::new();
+            for base in proxy_fixture_bases() {
+                match build_proxy_fixture(&base) {
+                    Ok(binary) => return binary,
+                    Err(error) => failures.push(format!("{}: {error}", base.display())),
+                }
+            }
+            panic!(
+                "cannot build a runnable codex proxy fixture on this host (rustc may have built \
+                 a foreign target, or every temp base refuses execution): {}",
+                failures.join("; ")
             );
-            std::mem::forget(root);
-            binary
         })
         .clone()
 }
 
-/// A temp root for the proxy fixture: the socket-shaped short base where a
-/// unix socket could live, else the platform temp directory (the fixture
-/// itself needs no `sun_path` room).
-fn socket_tempdir_or_tempdir() -> tempfile::TempDir {
-    #[cfg(unix)]
-    {
-        socket_tempdir()
+/// Candidate roots for the compiled fixture, in order: the platform temp
+/// directory, then the short Unix bases. A base that refuses execution is
+/// retried against the next one.
+fn proxy_fixture_bases() -> Vec<PathBuf> {
+    let mut bases = vec![
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/var/tmp"),
+    ];
+    bases.dedup();
+    bases
+}
+
+/// Compile the fixture under `base` and prove it can be executed there.
+fn build_proxy_fixture(base: &Path) -> std::result::Result<PathBuf, String> {
+    let root = tempfile::Builder::new()
+        .prefix("cola-proxy")
+        .tempdir_in(base)
+        .map_err(|error| format!("no temp dir: {error}"))?;
+    let source = root.path().join("proxy_fixture.rs");
+    let binary = root
+        .path()
+        .join(if cfg!(windows) { "codex.exe" } else { "codex" });
+    std::fs::write(&source, PROXY_HELPER_SOURCE).map_err(|error| format!("write source: {error}"))?;
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let output = std::process::Command::new(rustc)
+        // The test process's own cwd can be a deleted temporary directory
+        // another test left behind; rustc refuses to start without a working
+        // directory, so pin a live one.
+        .current_dir(root.path())
+        .arg("--edition=2024")
+        .arg("-D")
+        .arg("warnings")
+        .arg("-O")
+        .arg("-o")
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .map_err(|error| format!("run rustc: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "compile failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-    #[cfg(not(unix))]
+    // Prove the binary is executable **here** and is the target this test
+    // process can run: the sentinel exits 3 without touching a socket.
+    match std::process::Command::new(&binary)
+        .arg("--sock")
+        .arg("exit")
+        .status()
     {
-        tempfile::Builder::new()
-            .prefix("cola-proxy")
-            .tempdir()
-            .expect("proxy fixture tempdir")
+        Ok(status) if status.code() == Some(3) => {}
+        Ok(status) => return Err(format!("fixture probe exited with {status}")),
+        Err(error) => return Err(format!("fixture probe cannot execute: {error}")),
     }
+    std::mem::forget(root);
+    Ok(binary)
 }
 
 /// Copy the proxy fixture to `path`, so a fake CLI can report it as the managed
@@ -255,22 +199,22 @@ pub(crate) fn install_proxy_helper(path: &Path) {
     if std::fs::hard_link(&helper, path).is_err() {
         std::fs::copy(&helper, path).expect("copy the proxy fixture");
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .expect("make the installed proxy fixture executable");
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the installed proxy fixture executable");
 }
 
 /// A fake daemon the proxy-transport tests dial.
 ///
-/// On unix it is a real AF_UNIX socket behind the shipped control-socket shape
-/// — a **symlink** (ADR-0090 amendment, question 4), which proves the proxy
-/// receives the path and the OS follows the link rather than a canonicalised
-/// string. On Windows, where stable Rust cannot bind an AF_UNIX socket, the
-/// proxy's real child lifecycle is still exercised against a TCP daemon through
-/// the same `--sock` argument (the fixture relay reads a `tcp://` target).
+/// **Unix:** a real AF_UNIX socket behind the shipped control-socket shape — a
+/// **symlink** (spec #948), which proves the proxy receives the path and the OS
+/// follows the link rather than a canonicalised string.
+///
+/// **Windows:** stable Rust cannot bind an AF_UNIX socket, so the fake daemon
+/// is a TCP listener and the fixture relay is handed a `tcp://HOST:PORT`
+/// target instead. That exercises the same spawned-child, handshake, close and
+/// reap paths, but it is **not** the AF_UNIX-on-Windows proof; that belongs to
+/// #953's tier-1 job with a real Codex binary. No test here claims otherwise.
 ///
 /// The platform split lives here, in the test-only fixtures, so
 /// `transport.rs` contains no `cfg(unix)`.
@@ -301,7 +245,7 @@ impl ProxyDaemon {
             let address = url.strip_prefix("ws://").expect("a TCP endpoint");
             Self {
                 server,
-                endpoint: crate::codex::transport::Endpoint::Unix(PathBuf::from(format!("tcp://{address}"))),
+                endpoint: tcp_proxy_target(address),
                 _root: None,
             }
         }
@@ -316,6 +260,46 @@ impl ProxyDaemon {
         .await
         .expect("dial through the real proxy child")
     }
+}
+
+/// A fixture-only target: production `Endpoint::Unix` always names an AF_UNIX
+/// path, while the Windows test fake hands the relay a `tcp://` address because
+/// stable Rust cannot bind AF_UNIX there. Named for what it is so it cannot be
+/// mistaken for a production endpoint.
+#[cfg(not(unix))]
+fn tcp_proxy_target(address: &str) -> crate::codex::transport::Endpoint {
+    crate::codex::transport::Endpoint::Unix(PathBuf::from(format!("tcp://{address}")))
+}
+
+/// Find the live proxy fixture process dialling `target`, if any. The identity
+/// is the fixture's unique `--sock` argument, so a parallel test's child cannot
+/// be mistaken for it. Test-only, used to prove a child was reaped.
+pub(crate) fn find_proxy_child(target: &Path) -> Option<i32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let wanted = target.display().to_string();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .without_tasks()
+            .with_cmd(UpdateKind::Always),
+    );
+    system
+        .processes()
+        .values()
+        .find(|process| {
+            let arguments: Vec<String> = process
+                .cmd()
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect();
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "--sock" && pair[1] == wanted)
+        })
+        .map(|process| process.pid().as_u32() as i32)
 }
 
 /// A scripted `codex` CLI for discovery and lifecycle tests.
