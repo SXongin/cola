@@ -92,6 +92,7 @@ pub(super) fn failed_result_card(inline: bool, body: &str, toast: &str) -> CardA
 /// elsewhere" paths look identical.
 pub(super) fn already_handled_result(kind: &str, inline: bool, toast: &str) -> CardActionResult {
     let mut r = CardActionResult {
+        mutated: false,
         card: Some(crate::feishu::card::notify::build_resolved_elsewhere_card(
             kind, "",
         )),
@@ -417,7 +418,7 @@ pub(super) async fn settle_ack(
 /// clicked card's cached JSON, whose refreshed copy is the callback ack. One
 /// seam, so the two cannot drift. Returns the refreshed clicked card when a
 /// handle carries the block.
-#[allow(clippy::too_many_arguments)] // the display state is what the seam keeps in step
+#[allow(clippy::too_many_arguments)] // the request, its routing and the seam's locks
 pub(super) async fn refresh_question_block(
     cards: &CardsHandle,
     host: &Option<String>,
@@ -426,10 +427,7 @@ pub(super) async fn refresh_question_block(
     req_id: &str,
     request: &crate::backend::types::QuestionRequest,
     directory: &str,
-    display: &[Option<Vec<String>>],
-    done: &[bool],
-    open: usize,
-    drafts: &[String],
+    flow: &crate::bridge::request::flow::RequestFlow,
 ) -> Option<serde_json::Value> {
     // The same lock the render pass takes (issue #917): applying the new paint
     // to the accumulator and building the ack must not interleave with a flush
@@ -438,14 +436,20 @@ pub(super) async fn refresh_question_block(
     // freeze then keeping it there.
     let write_lock = cards.write_lock(host.as_deref().unwrap_or(session_id)).await;
     let _guard = write_lock.lock().await;
+    // Read the paint HERE, not from the caller: a callback that captured it
+    // earlier can be overtaken by a concurrent click (an answer committing
+    // while a switch waits for this lock), and applying the older paint would
+    // restore the state that click already moved past. Under the lock, the
+    // newest paint is what both the accumulator and the ack get.
+    let paint = flow.with_question_state(req_id, |state| state.paint()).await?;
     Turn::update_question_state(
         cards,
         host.as_deref().unwrap_or(session_id),
         req_id,
-        display,
-        done,
-        open,
-        drafts,
+        &paint.display,
+        &paint.done,
+        paint.open,
+        &paint.drafts,
     )
     .await;
     let message_id = clicked?;
@@ -456,10 +460,10 @@ pub(super) async fn refresh_question_block(
         &request.session_id,
         &request.questions,
         directory,
-        display,
-        done,
-        open,
-        drafts,
+        &paint.display,
+        &paint.done,
+        paint.open,
+        &paint.drafts,
     );
     cards
         .card_handles

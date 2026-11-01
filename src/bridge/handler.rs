@@ -540,6 +540,14 @@ impl crate::bridge::EventSink for App {
 pub struct CardActionResult {
     pub card: Option<serde_json::Value>,
     pub toast: Option<String>,
+    /// Whether THIS callback changed the request's state.
+    ///
+    /// A Session Snapshot repaints only for a click that changed something: a
+    /// rebuild replaces `body.elements`, which recreates every input and erases
+    /// text the client alone holds. A state diff cannot answer that — a click
+    /// that did nothing still sees the state another click just changed — so the
+    /// handler reports it here, under the lock it mutated under.
+    pub mutated: bool,
 }
 
 /// Everything a terminal card's recovery click needs once its claim is held:
@@ -581,6 +589,7 @@ const NESTED_TOPIC_REJECTION: &str = "话题里不能开话题，请回主对话
 
 fn reject_nested_topic(thread_key: &ThreadKey) -> Option<CardActionResult> {
     (thread_key.thread_id != thread_key.chat_id).then(|| CardActionResult {
+        mutated: false,
         card: None,
         toast: Some(NESTED_TOPIC_REJECTION.to_string()),
     })
@@ -1422,6 +1431,7 @@ async fn open_topic_from_card(
     }
     let Some(open_message_id) = open_message_id else {
         return Err(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
         });
@@ -1442,6 +1452,7 @@ async fn open_topic_from_card(
     {
         Ok(_opened) => Ok(display),
         Err(crate::bridge::topic::OpenTopicError::NoThreadId) => Err(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(
                 "当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。"
@@ -1451,6 +1462,7 @@ async fn open_topic_from_card(
         Err(crate::bridge::topic::OpenTopicError::Failed(e)) => {
             tracing::warn!("dir card topic: create topic failed: {}", e);
             Err(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("创建话题失败".to_string()),
             })
@@ -2183,6 +2195,7 @@ impl App {
         };
         tracing::info!("refused card action from {principal:?} ({reason:?})");
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(denial_text(&reason).to_string()),
         })
@@ -3141,6 +3154,7 @@ impl App {
 
         match op {
             "page" => Some(CardActionResult {
+                mutated: false,
                 card: Some(
                     self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
                         .await,
@@ -3153,6 +3167,7 @@ impl App {
                 // parsed it. Rebuild the card in that scope at page 1, keeping
                 // the keyword so a scoped search survives the toggle (ADR-0052).
                 Some(CardActionResult {
+                    mutated: false,
                     card: Some(
                         self.build_switch_card_for(core, &thread_key, &keyword, scope, 1)
                             .await,
@@ -3179,6 +3194,7 @@ impl App {
                 };
                 if let Some(refusal) = child_refusal {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: None,
                         toast: Some(refusal),
                     });
@@ -3192,6 +3208,7 @@ impl App {
                 };
                 if already_active {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: Some(
                             self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
                                 .await,
@@ -3213,6 +3230,7 @@ impl App {
                     {
                         let owner_label = owner_label(core, &owner_key).await;
                         return Some(CardActionResult {
+                            mutated: false,
                             card: Some(crate::feishu::card::session::build_force_confirm_card(
                                 &thread_key,
                                 &target,
@@ -3247,6 +3265,7 @@ impl App {
                 )
             }
             "back" => Some(CardActionResult {
+                mutated: false,
                 card: Some(
                     self.build_switch_card_for(core, &thread_key, &keyword, scope, page)
                         .await,
@@ -3272,6 +3291,7 @@ impl App {
                     // is no refreshed card to show.
                     Ok(None) => {
                         return Some(CardActionResult {
+                            mutated: false,
                             card: None,
                             toast: Some(CARD_STORE_TIMEOUT.to_string()),
                         });
@@ -3283,6 +3303,7 @@ impl App {
                     }
                 };
                 Some(CardActionResult {
+                    mutated: false,
                     card: card_before(
                         deadline,
                         self.build_switch_card_for(core, &thread_key, &keyword, scope, page),
@@ -3297,6 +3318,7 @@ impl App {
                 // It always lands on page 1; the keyword is the typed one.
                 core.invalidate_session_list_cache().await;
                 Some(CardActionResult {
+                    mutated: false,
                     card: Some(
                         self.build_switch_card_for(core, &thread_key, &keyword, scope, 1)
                             .await,
@@ -3324,6 +3346,7 @@ impl App {
                 }
                 let Some(open_message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: None,
                         toast: Some("无法创建话题（缺少卡片消息引用）".to_string()),
                     });
@@ -3333,6 +3356,7 @@ impl App {
                 let target = sessions.iter().find(|s| s.id == session_id)?.clone();
                 if target.is_child() {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: None,
                         toast: Some("子任务会话不支持接管".to_string()),
                     });
@@ -3347,6 +3371,7 @@ impl App {
                     {
                         let owner_label = owner_label(core, &owner_key).await;
                         return Some(CardActionResult {
+                            mutated: false,
                             card: Some(crate::feishu::card::session::build_force_confirm_card(
                                 &thread_key,
                                 &target,
@@ -3507,6 +3532,7 @@ impl App {
             .await;
         }
         CardActionResult {
+            mutated: false,
             card: Some(card),
             toast: Some(format!(
                 "已{verb}「{}」",
@@ -3542,6 +3568,7 @@ impl App {
             Ok(opened) => opened.thread_id,
             Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
                 return CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("创建话题失败（未返回 thread_id）".to_string()),
                 };
@@ -3549,6 +3576,7 @@ impl App {
             Err(crate::bridge::topic::OpenTopicError::Failed(e)) => {
                 tracing::warn!("switch card topic_adopt: create topic failed: {}", e);
                 return CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("创建话题失败".to_string()),
                 };
@@ -3561,6 +3589,7 @@ impl App {
             thread_key.chat_id
         );
         CardActionResult {
+            mutated: false,
             card: Some(
                 self.build_switch_card_for(core, thread_key, keyword, scope, page)
                     .await,
@@ -3595,11 +3624,13 @@ impl App {
             "search" => {
                 core.invalidate_session_list_cache().await;
                 Some(CardActionResult {
+                    mutated: false,
                     card: Some(self.build_child_card_for(core, &thread_key, &keyword, 1).await),
                     toast: None,
                 })
             }
             "page" => Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_child_card_for(core, &thread_key, &keyword, page).await),
                 toast: None,
             }),
@@ -3683,12 +3714,14 @@ impl App {
         // page 1; a flip rebuilds the payload's page.
         if op == "search" {
             return Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_dir_card_for(core, &thread_key, &keyword, 1).await),
                 toast: None,
             });
         }
         if op == "page" {
             return Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                 toast: None,
             });
@@ -3697,6 +3730,7 @@ impl App {
         // filesystem browse card in place.
         if op == "browse" {
             return Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_dir_browse_for_start(core, &thread_key).await),
                 toast: None,
             });
@@ -3704,6 +3738,7 @@ impl App {
         // ADR-0078: ← 最近目录 on the browse card swaps back in place.
         if op == "recent" {
             return Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_dir_card_for(core, &thread_key, "", 1).await),
                 toast: None,
             });
@@ -3715,6 +3750,7 @@ impl App {
             .to_string();
         if directory.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -3731,6 +3767,7 @@ impl App {
                     .and_then(|store| store.current_directory(&thread_key));
                 if current_dir.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: card_before(
                             deadline,
                             self.build_dir_card_for(core, &thread_key, &keyword, page),
@@ -3742,6 +3779,7 @@ impl App {
                 Some(
                     match declare_pending_dir(core, &thread_key, &directory, deadline).await {
                         Some(toast) => CardActionResult {
+                            mutated: false,
                             card: card_before(
                                 deadline,
                                 self.build_dir_card_for(core, &thread_key, &keyword, page),
@@ -3750,6 +3788,7 @@ impl App {
                             toast: Some(toast),
                         },
                         None => CardActionResult {
+                            mutated: false,
                             card: None,
                             toast: Some(CARD_STORE_TIMEOUT.to_string()),
                         },
@@ -3769,6 +3808,7 @@ impl App {
                 let open_message_id = value.get("open_message_id").and_then(|v| v.as_str());
                 match open_topic_from_card(core, &thread_key, open_message_id, directory).await {
                     Ok(display) => Some(CardActionResult {
+                        mutated: false,
                         card: Some(self.build_dir_card_for(core, &thread_key, &keyword, page).await),
                         toast: Some(format!("已建话题（{display}）——下一条消息创建会话")),
                     }),
@@ -3776,6 +3816,7 @@ impl App {
                 }
             }
             _ => Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             }),
@@ -3870,6 +3911,7 @@ impl App {
         };
         match op {
             "go" => Some(CardActionResult {
+                mutated: false,
                 card: Some(
                     self.build_dir_browse_for(
                         core,
@@ -3885,6 +3927,7 @@ impl App {
                 toast: None,
             }),
             "filter" => Some(CardActionResult {
+                mutated: false,
                 card: Some(
                     self.build_dir_browse_for(core, &thread_key, BrowseView { page: 1, ..base })
                         .await,
@@ -3897,14 +3940,17 @@ impl App {
             // verbatim. `go` cannot serve it: a drill-down deliberately clears
             // the filter and returns to page 1.
             "restore" => Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_dir_browse_for(core, &thread_key, base).await),
                 toast: None,
             }),
             "page" => Some(CardActionResult {
+                mutated: false,
                 card: Some(self.build_dir_browse_for(core, &thread_key, base).await),
                 toast: None,
             }),
             "show_hidden" => Some(CardActionResult {
+                mutated: false,
                 card: Some(
                     self.build_dir_browse_for(
                         core,
@@ -3923,6 +3969,7 @@ impl App {
             "topic" => {
                 let Some(directory) = resolve_browse_dir(&target) else {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: None,
                         toast: Some(format!("目录不存在：{target}")),
                     });
@@ -3930,6 +3977,7 @@ impl App {
                 let open_message_id = value.get("open_message_id").and_then(|v| v.as_str());
                 match open_topic_from_card(core, &thread_key, open_message_id, directory.clone()).await {
                     Ok(display) => Some(CardActionResult {
+                        mutated: false,
                         card: Some(
                             self.build_dir_browse_for(
                                 core,
@@ -3947,6 +3995,7 @@ impl App {
                 }
             }
             _ => Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             }),
@@ -4018,6 +4067,7 @@ impl App {
             .to_string();
         if path.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -4027,6 +4077,7 @@ impl App {
         // controls: say so, and leave the card standing.
         if session_id.is_some() && thread_key.chat_id.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(format!("⚠️ 打不开 `{path}`：会话已不在。")),
             });
@@ -4099,12 +4150,14 @@ impl App {
                 .filter(|id| !id.is_empty())
             else {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("无法翻页：找不到文件查看卡。".to_string()),
                 });
             };
             let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(busy.to_string()),
                 });
@@ -4132,6 +4185,7 @@ impl App {
             };
             tokio::spawn(async move { app.run_viewer_page(page).await });
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(busy.to_string()),
             });
@@ -4146,12 +4200,14 @@ impl App {
                 .filter(|id| !id.is_empty())
             else {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("无法重新读取：找不到文件查看卡。".to_string()),
                 });
             };
             let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("正在重新读取…".to_string()),
                 });
@@ -4202,6 +4258,7 @@ impl App {
                 .await;
             });
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("正在重新读取…".to_string()),
             });
@@ -4216,6 +4273,7 @@ impl App {
         // Pager flips are handled above with their own bounded background path.
         if !op.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -4226,12 +4284,14 @@ impl App {
             .filter(|id| !id.is_empty())
         else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无法打开文件：找不到文件浏览卡。".to_string()),
             });
         };
         let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, open_message_id) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("正在打开文件…".to_string()),
             });
@@ -4262,6 +4322,7 @@ impl App {
             .await;
         });
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在打开文件…".to_string()),
         })
@@ -4729,6 +4790,7 @@ impl App {
             match tokio::time::timeout_at(deadline, core.sessions.lock()).await {
                 Ok(store) if store.get_active(thread_key).is_some() => {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: None,
                         toast: Some(crate::bridge::command::TOPIC_SELECTION_REJECTION.to_string()),
                     });
@@ -4737,6 +4799,7 @@ impl App {
                 // one-session rule must not be bypassed by a slow store.
                 Err(_) => {
                     return Some(CardActionResult {
+                        mutated: false,
                         card: None,
                         toast: Some(CARD_STORE_TIMEOUT.to_string()),
                     });
@@ -4760,12 +4823,14 @@ impl App {
             // unusable, exactly as an absent directory reads.
             Ok(Err(_)) | Ok(Ok(None)) => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(format!("目录不存在：{}", view.dir)),
                 });
             }
             Err(_) => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(CARD_STORE_TIMEOUT.to_string()),
                 });
@@ -4785,6 +4850,7 @@ impl App {
         };
         if current_dir.is_some_and(|current| crate::bridge::command::same_dir(&current, &directory)) {
             return Some(CardActionResult {
+                mutated: false,
                 card: card_before(deadline, self.build_dir_browse_for(core, thread_key, settled)).await,
                 toast: Some("已在当前目录".to_string()),
             });
@@ -4792,10 +4858,12 @@ impl App {
         Some(
             match declare_pending_dir(core, thread_key, &directory, deadline).await {
                 Some(toast) => CardActionResult {
+                    mutated: false,
                     card: card_before(deadline, self.build_dir_browse_for(core, thread_key, settled)).await,
                     toast: Some(toast),
                 },
                 None => CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(CARD_STORE_TIMEOUT.to_string()),
                 },
@@ -4832,6 +4900,7 @@ impl App {
             PickReply::Applied { .. } => {}
             PickReply::Failed(text) => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(text),
                 });
@@ -4840,6 +4909,7 @@ impl App {
         let (card, _error) =
             crate::feishu::card::command::agent_card(&core.command_handles(), &thread_key).await;
         Some(CardActionResult {
+            mutated: false,
             card,
             toast: Some(if clear {
                 "已清除 Agent（回到服务器默认）".to_string()
@@ -4925,6 +4995,7 @@ impl App {
     ) -> CardActionResult {
         let Some(parsed) = crate::backend::parsing::parse_model(picked) else {
             return CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("模型格式应为 <provider>/<model>".to_string()),
             };
@@ -4937,6 +5008,7 @@ impl App {
         {
             ModelPickDecision::Refuse(text) => {
                 return CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(text),
                 };
@@ -4984,6 +5056,7 @@ impl App {
             PickReply::Applied { cleared_variant } => cleared_variant,
             PickReply::Failed(text) => {
                 return CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(text),
                 };
@@ -5002,6 +5075,7 @@ impl App {
             format!("Model: {picked}（下一条消息开始生效）{extra}")
         };
         CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(toast),
         }
@@ -5030,6 +5104,7 @@ impl App {
         let thread_key = thread_key_from_value(value);
         let Some(settings) = core.session_settings(&thread_key).await else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(format!(
                     "{}还没有会话",
@@ -5043,6 +5118,7 @@ impl App {
             && !variants.iter().any(|v| v == &picked)
         {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(format!("当前模型 `{provider}/{model}` 不支持思考等级 `{picked}`")),
             });
@@ -5056,6 +5132,7 @@ impl App {
             PickReply::Applied { .. } => {}
             PickReply::Failed(text) => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(text),
                 });
@@ -5064,6 +5141,7 @@ impl App {
         let (card, _error) =
             crate::feishu::card::command::think_card(&core.command_handles(), &thread_key).await;
         Some(CardActionResult {
+            mutated: false,
             card,
             toast: Some(if clear {
                 "已清除思考等级（回到模型默认）".to_string()
@@ -5086,6 +5164,7 @@ impl App {
             let _ = core.feishu.send_card("chat_id", &thread_key.chat_id, card).await;
         }
         CardActionResult {
+            mutated: false,
             card: first.cloned(),
             toast: None,
         }
@@ -5113,6 +5192,7 @@ impl App {
         let thread_key = thread_key_from_value(value);
         if thread_key.chat_id.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("这张卡片缺少会话信息，无法操作。".to_string()),
             });
@@ -5124,6 +5204,7 @@ impl App {
             .and_then(crate::bridge::terminal::TerminalOp::parse);
         let Some(op) = op else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("未知的终端操作。".to_string()),
             });
@@ -5144,6 +5225,7 @@ impl App {
             crate::bridge::terminal::TerminalControlOutcome::NotPastCap => "命令尚未到达时限。",
         };
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(toast.to_string()),
         })
@@ -5159,6 +5241,7 @@ impl App {
         let thread_key = thread_key_from_value(value);
         if thread_key.chat_id.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("这张卡片缺少会话信息，无法操作。".to_string()),
             });
@@ -5168,6 +5251,7 @@ impl App {
         // the card it was clicked on, which is where its reader is looking.
         let Some(message_id) = value.get("open_message_id").and_then(|v| v.as_str()) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("这条操作缺少消息位置，无法重跑。".to_string()),
             });
@@ -5210,6 +5294,7 @@ impl App {
             }
         };
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(toast.to_string()),
         })
@@ -5292,6 +5377,7 @@ impl App {
             .await;
         });
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(toast),
         })
@@ -5343,6 +5429,7 @@ impl App {
             .build_skill_card_for(&thread_key, &keyword, page, &chat_type, &reply_message_id)
             .await;
         CardActionResult {
+            mutated: false,
             card: Some(card),
             toast: None,
         }
@@ -5384,6 +5471,7 @@ impl App {
             .await
         else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(format!(
                     "{}还没有会话",
@@ -5417,6 +5505,7 @@ impl App {
             Ok(true) => {}
             Ok(false) => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("会话状态已变化（可能刚切换/创建），这次操作没有生效。".to_string()),
                 });
@@ -5450,6 +5539,7 @@ impl App {
             .map(|s| s.auto_accept)
             .unwrap_or(false);
         Some(CardActionResult {
+            mutated: false,
             card: Some(crate::feishu::card::picker::build_autoaccept_card(
                 &thread_key,
                 current_on,
@@ -5554,6 +5644,7 @@ impl App {
             .to_string();
         if session_id.is_empty() || message_id.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -5566,6 +5657,7 @@ impl App {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(state) = sends.get(&key) {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(turn_diff_state_toast(*state).to_string()),
                 });
@@ -5573,6 +5665,7 @@ impl App {
         }
         let Some(claim) = self.claim_turn_diff(&key) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("正在生成完整 diff…".to_string()),
             });
@@ -5589,6 +5682,7 @@ impl App {
             app.run_turn_diff_delivery(click).await;
         });
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在生成完整 diff…".to_string()),
         })
@@ -5810,6 +5904,7 @@ impl App {
             .filter(|id| !id.is_empty());
         if path.is_empty() || message_id.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -5833,6 +5928,7 @@ impl App {
         };
         if thread_key.chat_id.is_empty() {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(format!("⚠️ 无法发送 `{path}`：会话已不在。")),
             });
@@ -5866,6 +5962,7 @@ impl App {
             .copied();
         if let Some(status) = prior_transfer {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some(match status {
                     ViewerFileTransferStatus::Sent => "文件已发送".to_string(),
@@ -5875,6 +5972,7 @@ impl App {
         }
         let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, message_id) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("正在发送文件…".to_string()),
             });
@@ -5888,6 +5986,7 @@ impl App {
                 .await;
         });
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在发送文件…".to_string()),
         })
@@ -6223,6 +6322,7 @@ impl App {
     ) -> Option<CardActionResult> {
         let Some(request) = TerminalCardRequest::from_value(value) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -6230,6 +6330,7 @@ impl App {
         let thread_key = thread_key_from_value(value);
         let Some(in_flight_guard) = self.claim_viewer_action(&thread_key, &request.message_id) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("正在发送完整输出…".to_string()),
             });
@@ -6240,6 +6341,7 @@ impl App {
             app.run_terminal_full_output(request).await;
         });
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在发送完整输出…".to_string()),
         })
@@ -6525,6 +6627,7 @@ impl App {
     async fn handle_terminal_ask_ai(self: &Arc<Self>, value: &serde_json::Value) -> Option<CardActionResult> {
         let Some(request) = TerminalAskAiRequest::from_value(value) else {
             return Some(CardActionResult {
+                mutated: false,
                 card: None,
                 toast: Some("无效操作".to_string()),
             });
@@ -6539,18 +6642,21 @@ impl App {
             crate::bridge::terminal::AskAiClaim::Accepted(guard) => (guard, "🤖 正在把终端输出提交给 AI…"),
             crate::bridge::terminal::AskAiClaim::InFlight => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("正在提交给 AI…".to_string()),
                 });
             }
             crate::bridge::terminal::AskAiClaim::AlreadySubmitted => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("这份输出已经提交给 AI 了。".to_string()),
                 });
             }
             crate::bridge::terminal::AskAiClaim::Stale => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some("这张终端卡片的操作已过期。".to_string()),
                 });
@@ -6561,6 +6667,7 @@ impl App {
             // toast says which failure it is, so the reader knows to re-run.
             crate::bridge::terminal::AskAiClaim::Unverifiable => {
                 return Some(CardActionResult {
+                    mutated: false,
                     card: None,
                     toast: Some(
                         "⚠️ 找不到这次运行的记录，无法确认它是否仍是最新的，因此没有提交（避免把旧输出交给 AI）。"
@@ -6574,6 +6681,7 @@ impl App {
             app.run_terminal_ask_ai(request, guard).await;
         });
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some(toast.to_string()),
         })
@@ -6682,6 +6790,7 @@ impl App {
             .instrument(span),
         );
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在重试...".to_string()),
         })
@@ -6726,6 +6835,7 @@ impl App {
             .instrument(span),
         );
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在清理...".to_string()),
         })
@@ -7029,6 +7139,7 @@ impl App {
             .instrument(span),
         );
         Some(CardActionResult {
+            mutated: false,
             card: None,
             toast: Some("正在重新发起...".to_string()),
         })

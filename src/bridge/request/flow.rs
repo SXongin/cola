@@ -1844,24 +1844,6 @@ impl RequestFlow {
                 None => false,
             };
 
-        // A snapshot repaint must MIRROR a state change, not merely accompany a
-        // click: Feishu rebuilds every input when the card's body is replaced,
-        // so a rebuild on a click that changed nothing wipes whatever the Host
-        // has typed into the block's box. Captured before the click mutates it.
-        let state_before = match claimed_message.as_deref() {
-            Some(message_id) => {
-                let pending = handles
-                    .requests
-                    .snapshot_claims
-                    .lock()
-                    .await
-                    .host_pending(message_id)
-                    .unwrap_or_default();
-                Some(self.live_snapshot_state(&pending).await)
-            }
-            None => None,
-        };
-
         let mut r = self
             .kind
             .handle_action(
@@ -1915,11 +1897,14 @@ impl RequestFlow {
                     .host_pending(&message_id)
                     .unwrap_or_default();
                 let state = handles.requests.question.live_snapshot_state(&pending).await;
-                // A repaint mirrors a state change. A click that left the state
-                // alone (a stale or dropped switch, a double-click) must not
-                // rebuild: Feishu recreates every input, so the rebuild would
-                // erase text the Host has typed into the open box.
-                if state_before.as_ref() != Some(&state) {
+                // A repaint mirrors a change THIS click made, as the handler
+                // reported it. A click that changed nothing (a stale or dropped
+                // switch, a double-click) must not rebuild: Feishu recreates
+                // every input, so the rebuild would erase text the Host has
+                // typed into the open box. Comparing state instead cannot tell
+                // the two apart — a no-op click still sees what another click
+                // just changed.
+                if result.mutated {
                     result.card = handles
                         .requests
                         .snapshot_claims
