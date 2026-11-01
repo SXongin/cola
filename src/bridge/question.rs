@@ -198,10 +198,17 @@ impl QuestionState {
         self.request.questions.get(index).is_some_and(|q| q.is_multi())
     }
 
-    /// Record a single-select answer (replaces any previous one).
+    /// Record a single-select answer (replaces any previous one). The revision
+    /// moves only when the slot really changed: a duplicate click must not look
+    /// like a mutation, or the snapshot would repaint for it and recreate every
+    /// input on the card.
     pub(crate) fn record_answer(&mut self, index: usize, answer: &str) {
         if index < self.answers.len() {
-            self.answers[index] = Some(vec![answer.to_string()]);
+            let next = vec![answer.to_string()];
+            if self.answers[index].as_ref() == Some(&next) {
+                return;
+            }
+            self.answers[index] = Some(next);
             // The typed text (if any) is now the answer: the card renders no
             // input for a finalized question, so a kept draft could only
             // resurface as a stale box.
@@ -240,15 +247,20 @@ impl QuestionState {
             return;
         }
         let set = self.toggles[index].get_or_insert_with(Vec::new);
-        if !set.iter().any(|l| l == answer) {
+        let added = !set.iter().any(|l| l == answer);
+        if added {
             set.push(answer.to_string());
         }
         // The typed text is now a selected entry, so the box starts empty for
         // the next custom answer instead of re-offering what was just added.
+        let cleared = self.drafts.get(index).is_some_and(|draft| !draft.is_empty());
         if let Some(draft) = self.drafts.get_mut(index) {
             draft.clear();
         }
-        self.revision += 1;
+        // A deduped add with nothing to clear changed nothing.
+        if added || cleared {
+            self.revision += 1;
+        }
     }
 
     /// Lock the live toggles of question `index` into its final answer (empty

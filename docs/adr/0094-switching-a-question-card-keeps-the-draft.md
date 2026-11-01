@@ -51,9 +51,9 @@ still unanswered, otherwise the first unanswered one — and is the ONE predicat
 both the renderer and the typed-answer freeze read, so the card and the freeze
 cannot disagree about which question is open.
 
-The switch name's last segment is the question whose box it rode: a submit may
-deliver no `form_value` at all (an empty box), and the guard below needs to know
-which box was on screen.
+The switch name's last segment is the question whose box it rode: a client may
+deliver no `form_value` at all, and the guard below needs to know which box was
+on screen even then.
 
 **2. A draft rides the switch, keyed by its own name.** The submit carries the
 open question's box, so the handler files the text under the input's name
@@ -78,9 +78,9 @@ are free.
   block holds exactly one, and a `collapsible_panel` never gets one (200621). An
   uncollectable block has none — there is nothing to type, and its decline is a
   plain button. A Session Snapshot can carry several pending blocks, so it
-  carries one form **per block**: that shape predates this decision, which is
-  why several sibling forms on one card are known to be accepted (before this
-  change each question's form held its own input).
+  carries one form **per block**: the shape predates this decision (each
+  question's form held its own input before), so several sibling forms on one
+  card are assumed to be accepted — not measured on their own.
 - The switch is a user-initiated repaint, and it saves the draft before painting.
   It writes through `refresh_question_block`, never the render pass, so ADR-0093's
   freeze — which stands down for no background paint while a box is open — cannot
@@ -89,9 +89,10 @@ are free.
   non-submit click carries no `form_value`, and its repaint rebuilds the box.
   That is unchanged from before this decision; only a **switch** preserves a
   draft.
-- A catch-up repaint rebuilds `body.elements`, so it also collapses any panel
-  the reader had expanded (client-side state, ADR-0093). That is the visible cost
-  of the path; the alternative is a card that never catches up.
+- A catch-up repaint rebuilds `body.elements`. What that costs is the INPUT's
+  text (client-only); the fold state of the panels is not part of the body —
+  their stable `element_id` is what lets a rebuild keep it. A repaint is therefore
+  acceptable only when no typed box is open.
 - Two small rules the state keeps so a callback cannot shape the card: a stored
   draft is capped at its box's own `max_length` (500 for free text, 40 for a
   number), because that limit is enforced by the client alone; and a numeric

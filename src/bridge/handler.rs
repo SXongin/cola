@@ -540,13 +540,14 @@ impl crate::bridge::EventSink for App {
 pub struct CardActionResult {
     pub card: Option<serde_json::Value>,
     pub toast: Option<String>,
-    /// Whether THIS callback changed the request's state.
+    /// Whether THIS callback changed the QUESTION state it was given.
     ///
     /// A Session Snapshot repaints only for a click that changed something: a
     /// rebuild replaces `body.elements`, which recreates every input and erases
     /// text the client alone holds. A state diff cannot answer that — a click
     /// that did nothing still sees the state another click just changed — so the
-    /// handler reports it here, under the lock it mutated under.
+    /// question handler reports it here, under the lock it mutated under. Every
+    /// other kind leaves it false: their settlements take the resolve branch.
     pub mutated: bool,
 }
 
