@@ -177,18 +177,23 @@ same boundary and the same id-plus-shape gate:
   `metadata.changes[].diff` is the bare hunk body per file, so
   `codex_file_change_diff` takes the path from the change entry (one change) and
   joins several behind `Index:` lines, then reuses the existing `EditDiff`
-  parser, diff budget, clip note and count header. A single change also names
-  its file and carries the 「📂 打开」 button; several name the count and totals
-  in the folded title and carry no button.
+  parser, diff budget, clip note and count header. The file count is the
+  input's `changes` count, so an entry that records no diff is still named. A
+  single change also names its file and carries the 「📂 打开」 button (a rename
+  opens its destination, a delete carries none); several name the count and
+  totals in the folded title and carry no button.
 - `codex/web_search` reads the adapter's `metadata.results`, which the pinned
   app-server schema calls **opaque JSON** ("new result fields and result types
   can pass through without a Codex release"). Only one subset is a presentation
   contract: an array whose every entry carries a non-empty `url` (an optional
   `title` names it) renders as `🔎 N 条结果` and the shared numbered list, with
-  excerpts dropped. Every other value is shown as raw JSON in a `json` fence, so
-  an unrecognized shape is never dropped and never guessed into a result list.
-  A search with no results yet renders no Output section rather than an empty
-  one beside the query.
+  excerpts dropped. Every other value is shown inside a `json` fence — a JSON
+  string's own text, otherwise its pretty-printed JSON — so an unrecognized
+  shape is never dropped and never guessed into a result list. A search with no
+  results yet renders no Output section rather than an empty one beside the
+  query. This is not the generic "any valid JSON → pretty-print" fallback
+  rejected above: it applies to exactly one adapter-owned id and that item's own
+  payload, and no other tool's rendering changes.
 
 `codex/image` stays unchanged, and a third-party tool that squats either id with
 a partial input shape still falls through to the opaque path.
