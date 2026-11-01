@@ -451,6 +451,10 @@ impl CodexLifecycle {
                 };
             }
             let identity = discovery::socket_identity(&current.daemon.socket)?;
+            // The identity pair is proof of sameness on Unix. Windows may reuse
+            // a freed file index for a re-created socket, so here a match is
+            // necessary but not sufficient; #949's dial proof (the proxy
+            // connecting to the server the path names now) settles it.
             if identity != Some(current.identity) {
                 // The path moved after the pass that paired this daemon with
                 // its socket: probing it now would pair one daemon's binary
