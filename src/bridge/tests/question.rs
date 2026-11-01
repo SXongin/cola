@@ -2130,9 +2130,11 @@ async fn switching_questions_carries_the_typed_draft() {
     // Clearing the box and switching away must CLEAR the draft, not leave the
     // old text to be seeded back: a client may send no `form_value` at all for
     // an empty box.
+    // The measured client sends `custom_0: ""` for an empty box (pinned in
+    // `ws.rs`); this is the defensive shape — a form payload without the box.
     let cleared = serde_json::json!({
         "schema": "2.0",
-        "event": { "action": { "tag": "button", "name": "open|que_switch|ses_1|1|0" } }
+        "event": { "action": { "tag": "button", "name": "open|que_switch|ses_1|1|0", "form_value": {} } }
     });
     let cleared = crate::feishu::ws::extract_card_action_value(cleared.to_string().as_bytes())
         .expect("a name-only switch decodes");

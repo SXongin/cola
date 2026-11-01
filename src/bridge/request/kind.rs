@@ -1569,10 +1569,15 @@ impl RequestKind for QuestionKind {
                         if stale {
                             return (SwitchApplied::Stale, false);
                         }
-                        // A submit whose payload carries no text for the box it
-                        // rode is an EMPTY box: record the clear explicitly, or
-                        // the old draft would be seeded back later.
+                        // A submit that carries a form payload WITHOUT the box
+                        // it rode had that box emptied: record the clear, or the
+                        // old draft would be seeded back. A callback with no
+                        // `form_value` at all is a value-only client (ADR-0094),
+                        // which never carried the text — clearing would erase a
+                        // draft that client did not touch.
+                        let carries_form = value.get("form_value").is_some();
                         if let Some(from) = from
+                            && carries_form
                             && !drafts.iter().any(|(index, _)| *index == from)
                         {
                             state.record_draft(from, "");
