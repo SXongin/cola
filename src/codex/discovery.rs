@@ -455,7 +455,8 @@ pub(crate) struct EmbeddedClient {
 /// client is attached to the one runtime cola mirrors. An argv match is not
 /// proof — a TUI started before the control symlink was re-pointed still names
 /// the path while remaining connected to the old daemon — so [`prove_attachments`]
-/// settles it from the process's open descriptors where the OS exposes them.
+/// settles it from the platform's own evidence (Linux open descriptors, macOS
+/// `lsof` peer addresses) where the OS exposes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachedClient {
     pub(crate) pid: i32,
@@ -471,9 +472,10 @@ pub(crate) struct AttachedClient {
 /// A TUI launched with neither `--remote` nor `--no-daemon` normally attaches to
 /// the shared daemon — but one started **before** the daemon appeared fell back
 /// to its own embedded server and stays there. The process's argv cannot tell
-/// the two apart. On Linux the open descriptors can, and [`prove_attachments`]
-/// upgrades a live connection to [`AttachedClient`]; where that evidence is
-/// unavailable the state stays **unverified**, never assumed.
+/// the two apart. Where the platform exposes socket evidence — Linux open
+/// descriptors, macOS `lsof` peer addresses — [`prove_attachments`] upgrades a
+/// live connection to [`AttachedClient`]; where that evidence is unavailable
+/// (Windows has none) the state stays **unverified**, never assumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UnverifiedClient {
     pub(crate) pid: i32,
@@ -1242,19 +1244,53 @@ fn endpoint_matches(endpoint: &str, daemon: &Path) -> bool {
 #[cfg(target_os = "linux")]
 const SS_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Upgrade local clients to **attached** only when their open descriptors prove
-/// a live connection to `daemon` (ADR-0090 decision 3, ticket #883).
+/// How long one `lsof` query gets to answer.
+#[cfg(target_os = "macos")]
+const LSOF_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A platform probe's outcome with a human-readable reason, not the crate's
+/// [`Result`] alias: a missing `lsof` is report evidence, never a `CodexError`.
+#[cfg(any(target_os = "macos", test))]
+type ProbeResult<T> = std::result::Result<T, String>;
+
+/// Upgrade local clients to **attached** only when the platform's prover saw a
+/// live connection to `daemon` (ADR-0090 decision 3, ticket #883, spec #948's
+/// per-platform proof rule).
 ///
-/// On Linux, `/proc/<pid>/fd/*` exposes each open socket's inode, and
-/// `ss -x -e` pairs a socket with the filesystem inode of the socket at the
-/// other end. Comparing the latter to the daemon control socket's own inode
-/// proves the client is connected to *this* daemon: if the control-socket
-/// symlink is re-pointed after the client connected, the old connection no
-/// longer matches the new path and the client stays unverified. Where `/proc`,
-/// `ss`, or the descriptor table is unavailable, every client stays unverified —
-/// argv is never promoted to proof.
-#[cfg(target_os = "linux")]
+/// This is the one entry point; what can be proved differs by platform, and a
+/// prover that cannot produce evidence never promotes argv:
+///
+/// - **Linux** — `/proc/<pid>/fd/*` exposes each open socket's inode, and
+///   `ss -x -e` pairs it with the socket at the other end. A client is attached
+///   when one of its sockets' peer inode is the daemon control socket's inode.
+///   Where `/proc`, `ss`, or the descriptor table is unavailable (including a
+///   `ss` that exits non-zero), the client stays unverified.
+/// - **macOS** — `lsof -U -a -p <pid>` reports each unix socket's NAME and
+///   DEVICE address. A client is attached when one of its peer addresses
+///   (`->0x<addr>`) is a kernel address of one of the daemon's sockets bound to
+///   its control path (`0x<addr>`). A missing `lsof`, a non-zero exit, a
+///   timeout, or no pairing leaves the client unverified.
+/// - **Windows (and every other platform)** — there is no prover. The argv may
+///   name the daemon, but no descriptor or peer-address evidence exists, so the
+///   client stays unverified and its detail says the attachment is not
+///   hard-proven. Argv alone is never `Attached`.
 pub(crate) async fn prove_attachments(clients: &mut LocalClients, daemon: &Path) {
+    #[cfg(target_os = "linux")]
+    prove_linux(clients, daemon).await;
+    #[cfg(target_os = "macos")]
+    prove_macos(clients, daemon).await;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    prove_unsupported(clients, daemon).await;
+}
+
+/// The Linux prover: open socket inodes plus `ss -x -e` peer inodes.
+///
+/// It proves a client holds a live connection to **this** daemon, not merely
+/// that its argv names the path: if the control-socket symlink is re-pointed
+/// after the client connected, the old connection no longer matches the new
+/// inode and the client stays unverified.
+#[cfg(target_os = "linux")]
+async fn prove_linux(clients: &mut LocalClients, daemon: &Path) {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(metadata) = std::fs::metadata(daemon) else {
@@ -1299,10 +1335,372 @@ pub(crate) async fn prove_attachments(clients: &mut LocalClients, daemon: &Path)
     clients.attached.sort_by_key(|client| client.pid);
 }
 
-/// Non-Linux platforms expose no equivalent descriptor evidence here; never
-/// promote argv to proof.
-#[cfg(not(target_os = "linux"))]
-pub(crate) async fn prove_attachments(_clients: &mut LocalClients, _daemon: &Path) {}
+/// The evidence the macOS prover collected, or why `lsof` could not produce it.
+///
+/// Kept separate from the `lsof` invocation so the classification — match,
+/// no match, missing tool, failure, timeout — is testable on every platform.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct LsofEvidence {
+    /// The daemon's socket kernel addresses, or why they could not be read.
+    daemon: ProbeResult<Vec<String>>,
+    /// Each candidate client pid and its peer addresses, or why they could not
+    /// be read.
+    clients: Vec<(i32, ProbeResult<Vec<String>>)>,
+}
+
+/// The macOS prover: pair a client's peer kernel address with the daemon's
+/// socket address through `lsof`.
+///
+/// This proves a live unix-socket connection to the daemon behind `daemon`
+/// (following the control symlink to the socket the daemon actually bound).
+/// It cannot pin a reused pid the way Linux's start time does; `lsof` describes
+/// the process currently holding the id.
+#[cfg(target_os = "macos")]
+async fn prove_macos(clients: &mut LocalClients, daemon: &Path) {
+    if clients.unverified.is_empty() {
+        return;
+    }
+    let evidence = collect_lsof_evidence(&clients.unverified, daemon).await;
+    apply_lsof_evidence(clients, daemon, evidence);
+}
+
+/// Run the `lsof` queries the macOS prover needs, keeping each failure as a
+/// reason for the report rather than turning it into an error.
+#[cfg(target_os = "macos")]
+async fn collect_lsof_evidence(clients: &[UnverifiedClient], daemon: &Path) -> LsofEvidence {
+    let daemon_addresses = daemon_socket_addresses(daemon).await;
+    if daemon_addresses.is_err() {
+        // Every client gets the same reason; scanning each pid would only
+        // repeat a failure that already applies to all of them.
+        return LsofEvidence {
+            daemon: daemon_addresses,
+            clients: Vec::new(),
+        };
+    }
+    let mut evidence = Vec::with_capacity(clients.len());
+    for client in clients {
+        evidence.push((
+            client.pid,
+            lsof_unix_sockets(client.pid)
+                .await
+                .map(|output| lsof_peer_addresses(&output)),
+        ));
+    }
+    LsofEvidence {
+        daemon: daemon_addresses,
+        clients: evidence,
+    }
+}
+
+/// The kernel address(es) of the daemon's sockets bound to its control path,
+/// from the pid(s) that hold that socket open.
+///
+/// `daemon` is normally a symlink into the daemon's runtime directory, and the
+/// socket is bound at the target, so the path is canonicalised before the
+/// `lsof` path query. The pid query is the only way to name a daemon cola does
+/// not own — cola deliberately keeps no daemon pid (ADR-0090 decision 3).
+///
+/// A connected client's `->0x<addr>` names the peer it connected to. On Darwin
+/// that is the *accepted* socket's kernel address, not the listener's, so the
+/// accepted sockets bound to the control path are collected too: both inherit
+/// the listener's path and both are evidence of this daemon.
+#[cfg(target_os = "macos")]
+async fn daemon_socket_addresses(daemon: &Path) -> ProbeResult<Vec<String>> {
+    let target = std::fs::canonicalize(daemon).unwrap_or_else(|_| daemon.to_path_buf());
+    // Query the published path first (the name the user's daemon is described
+    // by), then the physical path if that selected nothing. On macOS the
+    // control path is normally a symlink and `/tmp` is itself a symlink, so
+    // lsof and this process need not spell the socket the same way.
+    let mut pids = lsof_pids_for_path(daemon).await?;
+    if pids.is_empty() && target.as_path() != daemon {
+        pids = lsof_pids_for_path(&target).await?;
+    }
+    let mut addresses = Vec::new();
+    for pid in pids {
+        let output = lsof_unix_sockets(pid).await?;
+        addresses.extend(lsof_daemon_addresses(&output, &target));
+    }
+    addresses.sort();
+    addresses.dedup();
+    Ok(addresses)
+}
+
+/// The pids `lsof` reports as holding `path` open. An empty match is not an
+/// error; a non-zero exit with no output means no process matched.
+#[cfg(target_os = "macos")]
+async fn lsof_pids_for_path(path: &Path) -> ProbeResult<Vec<i32>> {
+    let path = path.to_string_lossy();
+    let run = run_lsof(&["-t", "-U", "-a", "--", path.as_ref()]).await?;
+    if !run.output.status.success() {
+        if run.output.status.code() == Some(1)
+            && String::from_utf8_lossy(&run.output.stdout).trim().is_empty()
+        {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "`{} -t -U -a -- {}` exited with {}: {}",
+            run.program,
+            path,
+            run.output.status,
+            first_line(&run.output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect())
+}
+
+/// One candidate client's `lsof -U -a -p <pid>` output.
+#[cfg(target_os = "macos")]
+async fn lsof_unix_sockets(pid: i32) -> ProbeResult<String> {
+    let pid = pid.to_string();
+    let run = run_lsof(&["-U", "-a", "-p", &pid]).await?;
+    if !run.output.status.success() {
+        return Err(format!(
+            "`{} -U -a -p {pid}` exited with {}: {}",
+            run.program,
+            run.output.status,
+            first_line(&run.output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&run.output.stdout).into_owned())
+}
+
+/// One `lsof` invocation and the program that answered.
+#[cfg(target_os = "macos")]
+struct LsofRun {
+    program: &'static str,
+    output: std::process::Output,
+}
+
+/// Run `lsof` from the usual places, bounded by [`LSOF_TIMEOUT`].
+///
+/// A missing binary is not fatal: the next candidate is tried, and every miss
+/// becomes a named reason. A present binary that exits non-zero is returned to
+/// the caller, which decides whether no match or a failure is the right read.
+#[cfg(target_os = "macos")]
+async fn run_lsof(arguments: &[&str]) -> ProbeResult<LsofRun> {
+    let mut missing = Vec::new();
+    for program in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"] {
+        let attempt = tokio::time::timeout(
+            LSOF_TIMEOUT,
+            tokio::process::Command::new(program).args(arguments).output(),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(output)) => return Ok(LsofRun { program, output }),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(format!("`{program}` is not installed"));
+            }
+            Ok(Err(error)) => return Err(format!("`{program}` could not run: {error}")),
+            Err(_) => {
+                return Err(format!(
+                    "`{program} {}` did not answer within {LSOF_TIMEOUT:?}",
+                    arguments.join(" ")
+                ));
+            }
+        }
+    }
+    Err(format!("`lsof` is unavailable ({})", missing.join("; ")))
+}
+
+/// Classify the collected `lsof` evidence: promote only a client whose peer
+/// address is one of the daemon's socket addresses; everything else stays
+/// unverified with the specific reason in `detail`.
+#[cfg(any(target_os = "macos", test))]
+fn apply_lsof_evidence(clients: &mut LocalClients, daemon: &Path, evidence: LsofEvidence) {
+    let unverified = std::mem::take(&mut clients.unverified);
+    let daemon_addresses = match evidence.daemon {
+        Ok(addresses) if !addresses.is_empty() => addresses,
+        Ok(_) => {
+            mark_unproven(
+                clients,
+                unverified,
+                &format!(
+                    "`lsof` found no unix socket bound to the daemon path at {}",
+                    daemon.display()
+                ),
+            );
+            return;
+        }
+        Err(reason) => {
+            mark_unproven(
+                clients,
+                unverified,
+                &format!("`lsof` could not report the daemon's socket address: {reason}"),
+            );
+            return;
+        }
+    };
+    let mut attached = Vec::new();
+    let mut still_unverified = Vec::new();
+    for client in unverified {
+        let peers = evidence
+            .clients
+            .iter()
+            .find(|(pid, _)| *pid == client.pid)
+            .map(|(_, peers)| peers);
+        match peers {
+            Some(Ok(peers)) if peers.iter().any(|peer| daemon_addresses.contains(peer)) => {
+                attached.push(AttachedClient {
+                    pid: client.pid,
+                    binary: client.binary,
+                    endpoint: client
+                        .endpoint
+                        .unwrap_or_else(|| format!("unix://{}", daemon.display())),
+                    detail: format!(
+                        "holds a live unix-socket connection to the daemon at {} (peer {})",
+                        daemon.display(),
+                        peers
+                            .iter()
+                            .find(|peer| daemon_addresses.contains(peer))
+                            .cloned()
+                            .unwrap_or_default()
+                    ),
+                });
+            }
+            Some(Ok(peers)) => {
+                let mut client = client;
+                let listed = if peers.is_empty() {
+                    "none".to_string()
+                } else {
+                    peers.join(", ")
+                };
+                client.detail = format!(
+                    "`lsof` shows no live connection to the daemon at {} (client peer addresses: \
+                     {listed})",
+                    daemon.display()
+                );
+                still_unverified.push(client);
+            }
+            Some(Err(reason)) => {
+                let mut client = client;
+                client.detail = format!("attachment is not hard-proven: {reason}");
+                still_unverified.push(client);
+            }
+            None => {
+                let mut client = client;
+                client.detail = "attachment is not hard-proven: `lsof` produced no evidence for \
+                                 this process"
+                    .to_string();
+                still_unverified.push(client);
+            }
+        }
+    }
+    attached.sort_by_key(|client| client.pid);
+    still_unverified.sort_by_key(|client| client.pid);
+    clients.attached = attached;
+    clients.unverified = still_unverified;
+}
+
+/// Leave every candidate unverified with `reason` in its detail.
+#[cfg(any(target_os = "macos", test))]
+fn mark_unproven(clients: &mut LocalClients, mut unverified: Vec<UnverifiedClient>, reason: &str) {
+    for client in &mut unverified {
+        client.detail = format!("attachment is not hard-proven: {reason}");
+    }
+    unverified.sort_by_key(|client| client.pid);
+    clients.unverified = unverified;
+}
+
+/// One `lsof` row's whitespace tokens, when the row is a unix socket.
+///
+/// The columns are `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME`, so
+/// `TYPE` is token 4 and `DEVICE` is token 5. A path with spaces only lengthens
+/// `NAME` (tokens 8..), which the callers join or scan.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_unix_tokens(line: &str) -> Option<Vec<&str>> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    (tokens.len() >= 9 && tokens[4] == "unix").then_some(tokens)
+}
+
+/// The pure half of the macOS report: the peer addresses `->0x<addr>` on
+/// `lsof` rows, normalised for comparison.
+///
+/// A client's connected socket renders `->0x<addr>` in NAME; the DEVICE
+/// column's `0x…` and a socket path must never be read as a peer.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_peer_addresses(output: &str) -> Vec<String> {
+    let mut peers = Vec::new();
+    for line in output.lines() {
+        let Some(tokens) = lsof_unix_tokens(line) else {
+            continue;
+        };
+        for token in &tokens[8..] {
+            if let Some(peer) = token.strip_prefix("->").and_then(normalized_unix_address) {
+                peers.push(peer);
+            }
+        }
+    }
+    peers
+}
+
+/// The pure half of the macOS report: the daemon's socket addresses (DEVICE)
+/// for rows bound to its control path.
+///
+/// A listener's NAME is the bound path and its DEVICE is the local kernel
+/// address. Accepted stream sockets inherit the path, so their DEVICE is
+/// collected too — that is the address a client's `->0x<addr>` names. The
+/// ticket's bare `0x<addr>` listener spelling is accepted as well. A row whose
+/// NAME is a peer arrow or another path contributes nothing.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_daemon_addresses(output: &str, daemon: &Path) -> Vec<String> {
+    let raw = daemon.to_string_lossy().into_owned();
+    let target = std::fs::canonicalize(daemon)
+        .unwrap_or_else(|_| daemon.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut addresses = Vec::new();
+    for line in output.lines() {
+        let Some(tokens) = lsof_unix_tokens(line) else {
+            continue;
+        };
+        let Some(device) = normalized_unix_address(tokens[5]) else {
+            continue;
+        };
+        let name = tokens[8..].join(" ");
+        if is_daemon_path(&name, &raw, &target) || normalized_unix_address(&name).is_some() {
+            addresses.push(device);
+        }
+    }
+    addresses
+}
+
+/// Whether `name` is the daemon's bound path.
+///
+/// `daemon` may be the control symlink while lsof reports the physical path (or
+/// the other way round); on macOS `/tmp` is itself a symlink to `/private/tmp`,
+/// so the rendered path need not equal either spelling byte-for-byte.
+#[cfg(any(target_os = "macos", test))]
+fn is_daemon_path(name: &str, raw: &str, target: &str) -> bool {
+    name == raw
+        || name == target
+        || std::fs::canonicalize(name).is_ok_and(|resolved| resolved.to_string_lossy() == target)
+}
+
+/// Normalise `0x<hex>` to a lowercase, unpadded spelling so two renderings of
+/// the same kernel address compare equal.
+#[cfg(any(target_os = "macos", test))]
+fn normalized_unix_address(token: &str) -> Option<String> {
+    let value = u64::from_str_radix(token.strip_prefix("0x")?, 16).ok()?;
+    Some(format!("0x{value:x}"))
+}
+
+/// No prover exists outside Linux and macOS. The argv may name the daemon, but
+/// there is no descriptor or peer-address evidence to promote it.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+async fn prove_unsupported(clients: &mut LocalClients, daemon: &Path) {
+    let platform = if cfg!(windows) { "Windows" } else { "This platform" };
+    for client in &mut clients.unverified {
+        client.detail = format!(
+            "argv names the daemon at {}, but {platform} has no unix-socket descriptor or \
+             peer-address evidence, so the attachment is not hard-proven",
+            daemon.display()
+        );
+    }
+}
 
 /// The kernel's established unix-socket pairs as `(filesystem inode, peer
 /// socket inode)`.
@@ -1450,6 +1848,20 @@ mod tests {
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_string).collect()
+    }
+
+    /// One unverified candidate, as a process scan would have produced it.
+    fn unverified_client(pid: i32, endpoint: Option<String>, detail: &str) -> LocalClients {
+        LocalClients {
+            unverified: vec![UnverifiedClient {
+                pid,
+                binary: "codex".into(),
+                endpoint,
+                detail: detail.into(),
+                start_time: process_start_time(pid),
+            }],
+            ..LocalClients::default()
+        }
     }
 
     /// The pure resolver is where `CODEX_HOME` is honoured: the variable wins
@@ -2255,6 +2667,280 @@ mod tests {
             "a mismatched start time means the pid may be reused"
         );
         assert_eq!(clients.unverified.len(), 1);
+    }
+
+    /// The macOS parser reads the NAME peer arrow for the client and the
+    /// DEVICE address of sockets bound to the daemon path for the daemon. A
+    /// different path's DEVICE and the peer arrow are never daemon addresses,
+    /// and both renderings of the same address normalise.
+    #[test]
+    fn lsof_peer_and_daemon_addresses_come_from_their_own_columns() {
+        let output = "\
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+codex 42 me 10u unix 0x00000000000000aa 0t0 123 ->0x00000000000000bb
+codex 42 me 11u unix 0x00000000000000BB 0t0 124 /tmp/control.sock
+codex 42 me 12u unix 0x00000000000000cc 0t0 125 /tmp/control.sock
+codex 42 me 13u unix 0x00000000000000dd 0t0 126 /tmp/other.sock
+codex 42 me 14u unix 0x00000000000000ee 0t0 127 0x00000000000000FF
+";
+        assert_eq!(lsof_peer_addresses(output), vec!["0xbb"]);
+        assert_eq!(
+            lsof_daemon_addresses(output, Path::new("/tmp/control.sock")),
+            vec!["0xbb", "0xcc", "0xee"]
+        );
+    }
+
+    /// A symlinked control path and the physical path lsof reports are the
+    /// same daemon, including macOS's `/tmp` → `/private/tmp` spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_daemon_path_matches_the_physical_spelling() {
+        let root = tempfile::tempdir().expect("temp root");
+        let physical = root.path().join("physical.sock");
+        std::fs::write(&physical, b"").expect("write the socket stand-in");
+        let link = root.path().join("link.sock");
+        std::os::unix::fs::symlink(&physical, &link).expect("symlink");
+        let raw = link.to_string_lossy().into_owned();
+        let target = std::fs::canonicalize(&physical)
+            .expect("canonical physical path")
+            .to_string_lossy()
+            .into_owned();
+        assert!(is_daemon_path(&raw, &raw, &target));
+        assert!(is_daemon_path(&target, &raw, &target));
+        assert!(!is_daemon_path("/tmp/another.sock", &raw, &target));
+    }
+
+    /// The positive macOS case: a client's peer address is one of the daemon's
+    /// socket addresses, so the client is promoted with the evidence named.
+    #[test]
+    fn a_matching_lsof_peer_address_promotes_the_client() {
+        let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
+        let mut clients = unverified_client(9, Some(format!("unix://{}", daemon.display())), "argv");
+        apply_lsof_evidence(
+            &mut clients,
+            daemon,
+            LsofEvidence {
+                daemon: Ok(vec!["0xbb".into()]),
+                clients: vec![(9, Ok(vec!["0xaa".into(), "0xbb".into()]))],
+            },
+        );
+        assert_eq!(clients.attached.len(), 1);
+        assert_eq!(clients.attached[0].pid, 9);
+        assert_eq!(
+            clients.attached[0].endpoint,
+            format!("unix://{}", daemon.display())
+        );
+        assert!(
+            clients.attached[0].detail.contains("live unix-socket connection"),
+            "{}",
+            clients.attached[0].detail
+        );
+        assert!(clients.attached[0].detail.contains("0xbb"));
+        assert!(clients.unverified.is_empty());
+    }
+
+    /// The acceptance case argv cannot settle: a `--remote` that names the
+    /// daemon, with no matching peer address, stays **unverified**. No path
+    /// through the prover turns argv into `Attached`.
+    #[test]
+    fn an_argv_match_without_a_paired_address_stays_unverified() {
+        let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
+        let Some(Observation::Unverified(client)) = observe_client(
+            11,
+            "codex",
+            &args("codex --remote unix:///tmp/codex-daemon-0/app-server-control.sock"),
+            Some(daemon),
+        ) else {
+            panic!("an argv match is unverified, not proven attached");
+        };
+        let mut clients = LocalClients {
+            unverified: vec![client],
+            ..LocalClients::default()
+        };
+        apply_lsof_evidence(
+            &mut clients,
+            daemon,
+            LsofEvidence {
+                daemon: Ok(vec!["0xaa".into()]),
+                clients: vec![(11, Ok(vec!["0xbb".into()]))],
+            },
+        );
+        assert!(clients.attached.is_empty(), "argv is never proof");
+        assert_eq!(clients.unverified.len(), 1);
+        assert!(
+            clients.unverified[0].detail.contains("no live connection"),
+            "{}",
+            clients.unverified[0].detail
+        );
+    }
+
+    /// A missing, failing or timed-out `lsof` is a **reason in the detail**,
+    /// not an error and not a promotion: the client stays unverified and
+    /// `cola doctor` can still render a warning.
+    #[test]
+    fn lsof_missing_or_failing_leaves_the_client_unverified_with_the_reason() {
+        let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
+        for reason in [
+            "`lsof` is unavailable (`lsof` is not installed)",
+            "`lsof -U -a -p 9` exited with exit status: 1: permission denied",
+            "`lsof -U -a -p 9` did not answer within 2s",
+        ] {
+            let mut clients = unverified_client(9, Some(format!("unix://{}", daemon.display())), "argv");
+            apply_lsof_evidence(
+                &mut clients,
+                daemon,
+                LsofEvidence {
+                    daemon: Err(reason.to_string()),
+                    clients: Vec::new(),
+                },
+            );
+            assert!(clients.attached.is_empty(), "{reason}");
+            assert_eq!(clients.unverified.len(), 1, "{reason}");
+            assert!(
+                clients.unverified[0].detail.contains(reason),
+                "{}",
+                clients.unverified[0].detail
+            );
+            assert!(
+                clients.unverified[0].detail.contains("not hard-proven"),
+                "{}",
+                clients.unverified[0].detail
+            );
+        }
+    }
+
+    /// A failure on one client's scan only affects that client; a daemon with
+    /// no discoverable listener proves nothing for anyone.
+    #[test]
+    fn lsof_scoping_failures_never_promote_anyone() {
+        let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
+        let mut clients = unverified_client(9, Some(format!("unix://{}", daemon.display())), "argv");
+        apply_lsof_evidence(
+            &mut clients,
+            daemon,
+            LsofEvidence {
+                daemon: Ok(vec!["0xbb".into()]),
+                clients: vec![(9, Err("`lsof` is unavailable".into()))],
+            },
+        );
+        assert!(clients.attached.is_empty());
+        assert!(
+            clients.unverified[0].detail.contains("`lsof` is unavailable"),
+            "{}",
+            clients.unverified[0].detail
+        );
+
+        let mut clients = unverified_client(9, Some(format!("unix://{}", daemon.display())), "argv");
+        apply_lsof_evidence(
+            &mut clients,
+            daemon,
+            LsofEvidence {
+                daemon: Ok(Vec::new()),
+                clients: Vec::new(),
+            },
+        );
+        assert!(clients.attached.is_empty());
+        assert!(
+            clients.unverified[0]
+                .detail
+                .contains("found no unix socket bound to the daemon path"),
+            "{}",
+            clients.unverified[0].detail
+        );
+    }
+
+    /// The same real scan on every platform: a listener this process owns but
+    /// has never connected to proves nothing. Linux reads descriptors, macOS
+    /// `lsof`, and Windows has no prover — all three keep the argv-only client
+    /// unverified.
+    #[tokio::test]
+    async fn a_remote_match_without_a_connection_stays_unverified() {
+        #[cfg(unix)]
+        let (daemon, _listener) = {
+            let root = crate::codex::test_server::socket_tempdir();
+            let daemon = root.path().join("app-server-control.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&daemon).expect("bind the daemon socket");
+            (daemon, listener)
+        };
+        #[cfg(not(unix))]
+        let daemon = std::env::temp_dir().join("cola-app-server-control.sock");
+        let pid = std::process::id() as i32;
+        let mut clients = unverified_client(
+            pid,
+            Some(format!("unix://{}", daemon.display())),
+            "its `--remote` names the daemon, but argv is not proof of a live connection",
+        );
+        prove_attachments(&mut clients, &daemon).await;
+        assert!(
+            clients.attached.is_empty(),
+            "argv alone must never be Attached: {:?}",
+            clients.attached
+        );
+        assert_eq!(clients.unverified.len(), 1);
+        assert!(!clients.unverified[0].detail.is_empty());
+    }
+
+    /// Windows has no prover: argv is never promoted, and the detail says the
+    /// attachment is not hard-proven instead of pretending to have evidence.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_never_promotes_argv_to_attached() {
+        let daemon = Path::new(r"C:\codex-home\app-server-control\app-server-control.sock");
+        let mut clients = unverified_client(9, Some(format!("unix://{}", daemon.display())), "argv");
+        prove_attachments(&mut clients, &daemon).await;
+        assert!(clients.attached.is_empty());
+        assert_eq!(clients.unverified.len(), 1);
+        assert!(
+            clients.unverified[0].detail.contains("not hard-proven"),
+            "{}",
+            clients.unverified[0].detail
+        );
+        assert!(
+            clients.unverified[0].detail.contains("Windows"),
+            "{}",
+            clients.unverified[0].detail
+        );
+    }
+
+    /// The macOS end-to-end proof (CI only; the Linux suite compiles it out):
+    /// a live connection this process holds is paired through `lsof`, and the
+    /// same process with no connection is not promoted.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_live_lsof_connection_is_proven_and_no_connection_is_not() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let root = crate::codex::test_server::socket_tempdir();
+        let connected = root.path().join("connected.sock");
+        let listener = UnixListener::bind(&connected).expect("bind connected");
+        let client = UnixStream::connect(&connected).expect("connect connected");
+        let accepted = listener.accept().expect("accept connected");
+        let pid = std::process::id() as i32;
+
+        let mut clients = unverified_client(pid, Some(format!("unix://{}", connected.display())), "argv");
+        prove_attachments(&mut clients, &connected).await;
+        assert_eq!(
+            clients.attached.len(),
+            1,
+            "the live lsof peer is proven: {:?}",
+            clients.unverified
+        );
+        assert_eq!(clients.attached[0].pid, pid);
+        assert!(clients.unverified.is_empty());
+
+        drop(client);
+        drop(accepted);
+        let idle = root.path().join("idle.sock");
+        let _idle_listener = UnixListener::bind(&idle).expect("bind idle");
+        let mut clients = unverified_client(pid, Some(format!("unix://{}", idle.display())), "argv");
+        prove_attachments(&mut clients, &idle).await;
+        assert!(
+            clients.attached.is_empty(),
+            "no connection means no proof: {:?}",
+            clients.attached
+        );
+        assert_eq!(clients.unverified.len(), 1);
+        assert!(!clients.unverified[0].detail.is_empty());
     }
 
     /// The start-time pin reads a real process and refuses a missing one.
