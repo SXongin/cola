@@ -1579,6 +1579,9 @@ pub struct MockBackend {
     /// Number of initial `reply_permission` calls to fail with a genuine
     /// (non-404) error — tests the guard rollback that lets the user retry.
     pub fail_reply_permission_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// The next N question replies fail with a transport-shaped error (not a
+    /// 404): the request stays live, so the click can be retried.
+    pub fail_reply_question_count: Arc<std::sync::atomic::AtomicUsize>,
     /// When true, `reply_question`/`reject_question` report the request as
     /// already gone (404), like a question resolved elsewhere.
     pub reply_question_not_found: bool,
@@ -2048,6 +2051,7 @@ impl MockBackend {
             replied_permissions: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
             reply_permission_not_found: false,
             fail_reply_permission_count: std::sync::atomic::AtomicUsize::new(0).into(),
+            fail_reply_question_count: std::sync::atomic::AtomicUsize::new(0).into(),
             reply_question_not_found: false,
             extra_permissions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             session_titles: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -2614,6 +2618,14 @@ impl MockBackend {
     /// reports it gone (404) instead of succeeding.
     pub(crate) fn question_resolved_elsewhere(&mut self) -> &mut Self {
         self.reply_question_not_found = true;
+        self
+    }
+
+    /// Scenario: the next `times` question replies fail like a dropped
+    /// connection — the request stays pending, so the click can be retried.
+    pub(crate) fn fail_next_question_reply(&mut self, times: usize) -> &mut Self {
+        self.fail_reply_question_count
+            .store(times, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -3707,7 +3719,19 @@ impl crate::backend::Backend for MockBackend {
             })
             .collect();
         self.record_question_reply(request_id, positional, answers.to_vec())
-            .await
+            .await?;
+        if self
+            .fail_reply_question_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.fail_reply_question_count
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::error::BridgeError::OpenCode(
+                "simulated question reply failure".into(),
+            ));
+        }
+        Ok(())
     }
 
     async fn reject_question(
