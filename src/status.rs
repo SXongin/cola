@@ -929,15 +929,19 @@ fn local_client_check(report: &ClientReport) -> Check {
             .map(|client| format!("PID {} ({})：{}", client.pid, client.binary, client.detail))
             .collect::<Vec<_>>()
             .join("；");
+        let proof_hint = if cfg!(target_os = "macos") {
+            "在有 `lsof` 的 macOS 上，持有到该 socket 的连接可由客户端 socket 的 peer 地址证实"
+        } else if cfg!(target_os = "linux") {
+            "在有 `/proc` 与 `ss` 的 Linux 上，以 `codex --remote unix://…` 启动且持有连接时，\
+             可由打开的描述符证实"
+        } else {
+            "此平台没有 unix socket 描述符或 peer 地址证据，因此共享状态只能保持 unverified"
+        };
         return Check::warn(
             "Codex 本地客户端",
             format!(
-                "{listed}。无法证明它已连接到共享 daemon；在有 `/proc` 与 `ss` 的 Linux 上，\
-                 以 `codex --remote unix://{}` 启动可由打开的描述符证实",
-                report
-                    .endpoint
-                    .strip_prefix("unix://")
-                    .unwrap_or(&report.endpoint)
+                "{listed}。无法证明它已连接到共享 daemon；{proof_hint}（daemon: {}）",
+                report.endpoint
             ),
         );
     }
@@ -1634,6 +1638,38 @@ kind = "codex"
             local.detail.contains("无法证明它已连接到共享 daemon"),
             "{}",
             local.detail
+        );
+    }
+
+    /// A platform prover that could not run is still only a warning: `lsof`
+    /// missing on macOS must not fail `cola doctor`.
+    #[test]
+    fn a_prover_failure_is_a_warning_not_a_doctor_failure() {
+        let report = codex_report(
+            ClientState::Attached,
+            vec![UserClient {
+                pid: 9,
+                binary: "codex".into(),
+                state: UserClientState::Unverified,
+                detail: "attachment is not hard-proven: `lsof` is unavailable".into(),
+            }],
+        );
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Warn);
+        assert!(local.detail.contains("`lsof` is unavailable"), "{}", local.detail);
+        assert!(
+            doctor_ok(&checks),
+            "a missing prover is never a failure: {checks:?}"
         );
     }
 

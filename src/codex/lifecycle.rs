@@ -1230,8 +1230,9 @@ impl ServerLifecycle for CodexLifecycle {
         };
         let daemon = discovered.daemon.daemon().cloned();
         if let Some(daemon) = &daemon {
-            // An argv match is not proof; settle it from the clients' open
-            // descriptors where the OS exposes them.
+            // An argv match is not proof; settle it from the platform's socket
+            // evidence where the OS exposes it, and leave it unverified where
+            // it does not (Windows has no prover).
             discovery::prove_attachments(&mut discovered.clients, &daemon.socket).await;
         }
         report.detail = match &daemon {
