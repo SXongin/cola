@@ -439,6 +439,38 @@ mod tests {
             workflow.contains("model: ${{ env.GATE_MODEL }}"),
             "the Codex step must read the shared model"
         );
+        // The VALUES move with the workflow's own comment (they are provider
+        // configuration, not an ADR pin), and this pins them so a revert cannot
+        // leave the suite green: the gate's endpoint, its model, and the ONE
+        // secret both halves read — a preflight on one key with the action on
+        // another would pass the check and 401 only when Codex runs.
+        assert!(
+            workflow.contains("\n      GATE_ENDPOINT: https://api.deepseek.com/responses\n"),
+            "the gate's endpoint must be DeepSeek's own Responses API"
+        );
+        assert!(
+            workflow.contains("\n      GATE_MODEL: deepseek-flash\n"),
+            "the gate's model must be deepseek-flash"
+        );
+        let secret_reads = workflow.matches("secrets.DEEPSEEK_API_KEY").count();
+        assert_eq!(
+            secret_reads, 2,
+            "the preflight and the action must read the same secret"
+        );
+        assert!(
+            workflow.contains("DEEPSEEK_API_KEY is empty"),
+            "the empty-key message must name the secret it wants"
+        );
+        assert!(
+            !workflow.contains("secrets.OPENCODE_API_KEY"),
+            "no step may still read the retired OpenCode key"
+        );
+        // The action's `drop-sudo` fails on the ubuntu-26.04 image (2026-11-01),
+        // so the job runs on the image that still works.
+        assert!(
+            workflow.contains("\n    runs-on: ubuntu-24.04\n"),
+            "the gate must run on the image its sandbox works on"
+        );
         // The key must not ride the command line: curl reads it from a config
         // file the step removes.
         assert!(
