@@ -4613,54 +4613,44 @@ pub(crate) async fn wait_for_transcript_reads(backend: &Arc<MockBackend>, sessio
 /// and action blocks) — for assertions on a button's `value` payload or label
 /// without string-matching the card's JSON dump.
 pub(crate) fn card_buttons(card: &serde_json::Value) -> Vec<&serde_json::Value> {
-    fn walk<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
+    card_tags(card, "button")
+}
+
+/// Every element anywhere on the card carrying `tag`, in document order —
+/// elements nest in forms, panels and column sets, so a top-level scan misses
+/// most controls.
+pub(crate) fn card_tags<'a>(card: &'a serde_json::Value, tag: &str) -> Vec<&'a serde_json::Value> {
+    fn walk<'a>(value: &'a serde_json::Value, tag: &str, out: &mut Vec<&'a serde_json::Value>) {
         match value {
             serde_json::Value::Object(map) => {
-                if map.get("tag").and_then(|t| t.as_str()) == Some("button") {
+                if map.get("tag").and_then(|t| t.as_str()) == Some(tag) {
                     out.push(value);
                 }
                 for v in map.values() {
-                    walk(v, out);
+                    walk(v, tag, out);
                 }
             }
             serde_json::Value::Array(items) => {
                 for v in items {
-                    walk(v, out);
+                    walk(v, tag, out);
                 }
             }
             _ => {}
         }
     }
     let mut out = Vec::new();
-    walk(card, &mut out);
+    walk(card, tag, &mut out);
     out
 }
 
 /// Every `input` element anywhere on the card, in document order — the question
 /// card's boxes sit inside its one root-level form (issue #917 part 3), so a
 /// top-level scan would miss them.
+/// Every `input` element anywhere on the card, in document order — the question
+/// card's boxes sit inside its one root-level form (issue #917 part 3), so a
+/// top-level scan would miss them.
 pub(crate) fn card_inputs(card: &serde_json::Value) -> Vec<&serde_json::Value> {
-    fn walk<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a serde_json::Value>) {
-        match value {
-            serde_json::Value::Object(map) => {
-                if map.get("tag").and_then(|t| t.as_str()) == Some("input") {
-                    out.push(value);
-                }
-                for v in map.values() {
-                    walk(v, out);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for v in items {
-                    walk(v, out);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut out = Vec::new();
-    walk(card, &mut out);
-    out
+    card_tags(card, "input")
 }
 
 /// A card's header title, for Done/Streaming/topic assertions.

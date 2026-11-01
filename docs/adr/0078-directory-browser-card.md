@@ -33,6 +33,12 @@ same 切换到这里 / 建话题 node actions the Recent Directories rows carry.
   controls** — inside a form, only the submit button fires its callback, so the
   clickable rows must sit outside it. The browse card's one form (path input +
   optional filter input + three submit buttons) is a sibling of the rows.
+  (2026-11-01, #917: the "only the submit button fires" half is wrong as a
+  general claim — a **non-submit** button inside a form does fire, delivering its
+  `value` and no `form_value`; and a form may wrap a `collapsible_panel`. The
+  layout above stands on the other two facts: a form cannot wrap the rows
+  usefully when a `form` may not nest in a panel, and the drill-down needs the
+  card's own structure. ADR-0094 measures both halves.)
 - **The cards are stateless** (ADR-0052): the browsed directory, the hidden
   toggle, the child filter and the page all round-trip in the button payload,
   and nothing is persisted per thread.

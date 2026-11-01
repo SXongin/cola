@@ -790,7 +790,12 @@ fn custom_answer_elements(
         ("answer", "submit")
     };
     let value = question_value(request_id, session_id, directory, index, reply);
-    let input = answer_input(&format!("custom_{index}"), "✍️ 输入自定义答案", 500, draft);
+    let input = answer_input(
+        &format!("custom_{index}"),
+        "✍️ 输入自定义答案",
+        CUSTOM_INPUT_MAX_CHARS,
+        draft,
+    );
     vec![
         input,
         json!({
