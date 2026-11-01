@@ -798,10 +798,14 @@ fn custom_answer_elements(
 
 /// One answer box, seeded with a draft when there is one. Multiline instead of
 /// the default single line: the single-line input is a cramped one-row strip
-/// that types poorly on both PC and mobile — the card therefore always renders
-/// it as `multiline_text`. `rows:1` starts it at one line; `auto_resize` grows
-/// it with the text (Feishu's docs say PC-only, but mobile grows too in
-/// practice). Callbacks arrive unchanged via `action.form_value`.
+/// that types poorly on both PC and mobile — the card therefore renders a
+/// free-text answer as `multiline_text`. `rows:1` starts it at one line;
+/// `auto_resize` grows it with the text (Feishu's docs say PC-only, but mobile
+/// grows too in practice). Callbacks arrive unchanged via `action.form_value`.
+///
+/// A NUMBER/INTEGER field does not use this: its value is parsed as a number,
+/// and a multiline box makes a trailing newline (Return) an ordinary edit, so
+/// it keeps the single-line `text` input (issue #917 part 3 review).
 fn answer_input(name: &str, placeholder: &str, max_length: usize, draft: &str) -> serde_json::Value {
     let mut input = json!({
         "tag": "input",
@@ -812,6 +816,24 @@ fn answer_input(name: &str, placeholder: &str, max_length: usize, draft: &str) -
         "max_rows": 8,
         "placeholder": { "tag": "plain_text", "content": placeholder },
         "max_length": max_length,
+        "width": "fill",
+    });
+    if !draft.is_empty() {
+        input["default_value"] = json!(draft);
+    }
+    input
+}
+
+/// A numeric field's answer box: single-line `text`, never `multiline_text`, so
+/// Return cannot put a newline into a value that is parsed as a number. It still
+/// seeds a draft, so a switch does not lose a half-typed number.
+fn number_input(name: &str, draft: &str) -> serde_json::Value {
+    let mut input = json!({
+        "tag": "input",
+        "name": name,
+        "input_type": "text",
+        "placeholder": { "tag": "plain_text", "content": "✍️ 输入数字" },
+        "max_length": 40,
         "width": "fill",
     });
     if !draft.is_empty() {
@@ -832,7 +854,7 @@ fn number_answer_elements(
 ) -> Vec<serde_json::Value> {
     let value = question_value(request_id, session_id, directory, index, "answer");
     vec![
-        answer_input(&format!("custom_{index}"), "✍️ 输入数字", 40, draft),
+        number_input(&format!("custom_{index}"), draft),
         json!({
             "tag": "button",
             "text": { "tag": "plain_text", "content": "✅ 确定" },
@@ -1939,6 +1961,15 @@ mod tests {
             "numeric placeholder missing: {card}"
         );
         let elements = form_elements(&card);
+        let number_input = elements
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("numeric input missing");
+        assert_eq!(
+            number_input["input_type"], "text",
+            "a numeric field keeps the single-line input: a multiline box makes \
+             Return an ordinary edit and '42\\n' would not parse: {card}"
+        );
         let number_button = elements
             .iter()
             .find(|e| e["tag"] == "button" && e["form_action_type"] == "submit")
@@ -2370,6 +2401,73 @@ mod tests {
             input.get("default_value").is_none(),
             "no draft, no seeded value: {input}"
         );
+    }
+
+    /// Issue #917 part 3, ADR-0094 decision 3: only the two intentional submits
+    /// (the open question's answer box, and a folded question's switch) may
+    /// carry the form action. An option, a multi-select confirm, the skip submit
+    /// or the reject button that accidentally submitted the form would let
+    /// `form_value` overwrite an option's answer in `ws.rs`.
+    #[test]
+    fn only_the_answer_box_and_the_switch_submit_the_form() {
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[
+                crate::backend::types::QuestionInfo {
+                    question: "选水果".into(),
+                    header: "水果".into(),
+                    options: vec![crate::backend::types::QuestionOption {
+                        label: "苹果".into(),
+                        ..Default::default()
+                    }],
+                    kind: crate::backend::types::FormFieldKind::Multiselect,
+                    custom: None,
+                    ..Default::default()
+                },
+                many_option_question(),
+            ],
+            "/tmp/proj/lib",
+            &[None, None],
+            &[false, false],
+            0,
+            &[String::new(), String::new()],
+        );
+        let mut submits: Vec<String> = all_elements(&card)
+            .iter()
+            .filter(|e| e["tag"] == "button" && e["form_action_type"] == "submit")
+            .map(|e| e["text"]["content"].as_str().unwrap_or("").to_string())
+            .collect();
+        submits.sort();
+        let mut expected = vec!["✍️ 自定义".to_string(), "▸ 作答这道题".to_string()];
+        expected.sort();
+        assert_eq!(
+            submits, expected,
+            "only the answer box and the switch may submit the form: {card}"
+        );
+        // The controls that must stay non-submit are all present on this card.
+        let elements = all_elements(&card);
+        let labels: Vec<&str> = elements
+            .iter()
+            .filter_map(|e| e["text"]["content"].as_str())
+            .collect();
+        for required in ["苹果", "✅ 确定该题", "🚫 无法回答"] {
+            assert!(
+                labels.contains(&required),
+                "the card must show the non-submit control {required}: {card}"
+            );
+        }
+        // And none of them is a submit.
+        for element in all_elements(&card) {
+            let label = element["text"]["content"].as_str().unwrap_or("");
+            if ["苹果", "✅ 确定该题", "🚫 无法回答"].contains(&label) {
+                assert!(
+                    element.get("form_action_type").is_none(),
+                    "{label} must not submit the form: {element}"
+                );
+            }
+        }
     }
 
     /// One question — the common ask — keeps today's flat layout: no fold, no

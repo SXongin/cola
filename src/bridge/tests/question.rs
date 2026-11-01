@@ -2072,20 +2072,23 @@ async fn switching_questions_carries_the_typed_draft() {
         )
         .await;
 
+    // The REAL callback: a form submit carries no `value` (the probe in ADR-0094
+    // measured that), so the routing rides the button `name` and ws.rs rebuilds
+    // it — including the directory re-resolution the handler does when the name
+    // cannot carry one.
     let switch = |target: u64, from: u64, draft: &str| {
-        let mut value = serde_json::json!({
-            "action": "question",
-            "reply": "open",
-            "request_id": "que_switch",
-            "session_id": "ses_1",
-            "directory": "/work",
-            "question_index": target,
+        let payload = serde_json::json!({
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": format!("open|que_switch|ses_1|{target}"),
+                    "form_value": { format!("custom_{from}"): draft },
+                }
+            }
         });
-        value["form_value"] = serde_json::Value::Object(serde_json::Map::from_iter([(
-            format!("custom_{from}"),
-            serde_json::json!(draft),
-        )]));
-        value
+        crate::feishu::ws::extract_card_action_value(payload.to_string().as_bytes())
+            .expect("the name-only switch decodes")
     };
 
     // Switch to question 2 while question 1 holds typed text.
@@ -2121,5 +2124,112 @@ async fn switching_questions_carries_the_typed_draft() {
         backend.reply_question_calls.lock().await.len(),
         0,
         "switching must never answer the request"
+    );
+}
+
+/// The same switch, but on the STREAMING card: the clicked card's ack is the
+/// repaint, and the block in the accumulator must carry the new open question
+/// and the drafts — otherwise the next render tick reverts the card.
+#[tokio::test]
+async fn an_inline_switch_repaints_the_clicked_card_and_moves_the_block() {
+    use crate::bridge::test_support::*;
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+    seed_session(&app, "ses_q", "/work").await;
+
+    let typed = |n: usize| crate::backend::types::QuestionInfo {
+        question: format!("问题 {n}"),
+        header: format!("h{n}"),
+        options: vec![crate::backend::types::QuestionOption {
+            label: format!("/a{n}"),
+            description: String::new(),
+            ..Default::default()
+        }],
+        kind: crate::backend::types::FormFieldKind::String,
+        custom: None,
+        ..Default::default()
+    };
+    let request = crate::backend::types::QuestionRequest {
+        id: "que_inline".into(),
+        session_id: "ses_q".into(),
+        questions: vec![typed(1), typed(2)],
+        ..Default::default()
+    };
+
+    let cards = app.cards_handle();
+    Turn::seed_card(&cards, "ses_q", Some("om_q")).await;
+    Turn::set_title(&cards, "ses_q", "问题回合").await;
+    Turn::set_card_state(&cards, "ses_q", crate::feishu::card::CardState::Done).await;
+    Turn::push_text(&cards, "ses_q", "回合的内容。").await;
+    Turn::set_reply_target(&cards, "ses_q", "msg_1").await;
+    Turn::add_question(
+        &cards,
+        "ses_q",
+        &request,
+        "/work",
+        &[None, None],
+        &[false, false],
+        0,
+        &["打到一半".to_string(), String::new()],
+    )
+    .await;
+    Turn::flush_card(&app.cards_handle(), "ses_q").await;
+    app.question.remember_question(&request, "/work").await;
+
+    let switch = |target: u64, from: u64, draft: &str| {
+        let mut value = serde_json::json!({
+            "action": "question",
+            "reply": "open",
+            "request_id": "que_inline",
+            "session_id": "ses_q",
+            "directory": "/work",
+            "question_index": target,
+            "open_message_id": "om_q",
+        });
+        value["form_value"] = serde_json::Value::Object(serde_json::Map::from_iter([(
+            format!("custom_{from}"),
+            serde_json::json!(draft),
+        )]));
+        value
+    };
+
+    let first = app.host_action(switch(1, 0, "打到一半")).await.expect("a card");
+    let card = first.card.as_ref().expect("the ack carries the repaint");
+    let text = card_text(card);
+    assert!(text.contains("**2. h2**"), "question 2 opened: {text}");
+    assert!(
+        card_inputs(card).iter().all(|i| i["name"] == "custom_1"),
+        "the ack shows the new open question's box: {text}"
+    );
+    assert_eq!(
+        backend.reply_question_calls.lock().await.len(),
+        0,
+        "an inline switch never replies"
+    );
+
+    // The accumulator moved with it: a fresh build of the card (the next render
+    // tick) still shows question 2 open and question 1's draft.
+    let card = Turn::ack_card(&app.cards_handle(), "ses_q")
+        .await
+        .expect("the accumulator still carries the block");
+    let text = card_text(&card);
+    assert!(
+        card_inputs(&card).iter().all(|i| i["name"] == "custom_1"),
+        "the block kept the switch: {text}"
+    );
+
+    // Switch back: the draft returns with it, from the state, not the ack.
+    let second = app.host_action(switch(0, 1, "")).await.expect("a card");
+    let card = second.card.expect("the ack carries the repaint");
+    let inputs = card_inputs(&card);
+    assert_eq!(inputs.len(), 1, "one box at a time: {card}");
+    assert_eq!(inputs[0]["name"], "custom_0", "question 1 is open again: {card}");
+    assert_eq!(
+        inputs[0]["default_value"], "打到一半",
+        "the draft came back on the inline card: {card}"
     );
 }
