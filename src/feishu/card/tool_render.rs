@@ -1448,10 +1448,13 @@ fn codex_search_results(tool: &ToolPanel) -> Option<&serde_json::Value> {
     if !is_codex_web_search(tool) {
         return None;
     }
-    tool.metadata()
+    let results = tool
+        .metadata()
         .and_then(|metadata| metadata.get("results"))
         .filter(|value| !value.is_null())
-        .or_else(|| tool.call().output.raw.as_ref().filter(|value| !value.is_null()))
+        .or_else(|| tool.call().output.raw.as_ref().filter(|value| !value.is_null()))?;
+    // A provider's empty message is no result, not an empty Output.
+    (!results.as_str().is_some_and(|text| text.trim().is_empty())).then_some(results)
 }
 
 /// The raw-JSON body for a `results` value the card cannot confirm: a JSON
@@ -3102,18 +3105,21 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         },
         // Codex's `fileChange` names its targets in `changes[].path` (one entry
         // per file), not in a top-level `path`. A rename names its destination
-        // (`movePath`) — the same file the folded title and the button name. A
-        // payload where any entry lacks a usable path is rendered generically
-        // rather than silently reporting a partial file list. Backticks are
+        // (`movePath`) — the same file the folded title and the button name.
+        // Gated on the adapter's whole shape like every other `codex/` arm: a
+        // payload missing `kind`, or with an unusable path, is rendered
+        // generically rather than reporting a partial file list. Backticks are
         // flattened (`permission_target`'s rule) so a path cannot break the
         // inline code span it sits in.
-        "codex/file_change" => match codex_change_paths(Some(input)).as_deref() {
-            None | Some([]) => generic_tool_input(obj),
-            Some([only]) => format!("📄 {}", inline_code(only)),
-            Some([first, rest @ ..]) => {
-                format!("📄 {} 等 {} 个文件", inline_code(first), rest.len() + 1)
+        "codex/file_change" if file_change_shape(Some(input)) => {
+            match codex_change_paths(Some(input)).as_deref() {
+                None | Some([]) => generic_tool_input(obj),
+                Some([only]) => format!("📄 {}", inline_code(only)),
+                Some([first, rest @ ..]) => {
+                    format!("📄 {} 等 {} 个文件", inline_code(first), rest.len() + 1)
+                }
             }
-        },
+        }
         // Codex's `imageView`: the file it looked at. Unlike a `read` there is
         // no preview body to fold, so the panel only names it — with the same
         // backtick flattening as a file change's path.
@@ -8044,7 +8050,10 @@ Index: /a/one.rs
         assert_eq!(
             format_tool_input(
                 "codex/file_change",
-                &json!({"changes": [{"path": "a.rs"}, {"path": "b.rs"}]})
+                &json!({"changes": [
+                    {"path": "a.rs", "kind": {"type": "update"}},
+                    {"path": "b.rs", "kind": {"type": "add"}},
+                ]})
             ),
             "📄 `a.rs` 等 2 个文件"
         );
@@ -8064,6 +8073,13 @@ Index: /a/one.rs
             partial.starts_with("- changes:"),
             "a malformed entry takes the generic shape, not a partial list: {partial}"
         );
+        // The adapter always writes `kind`; a payload without it is not the
+        // adapter's shape and stays opaque (ADR-0042).
+        let no_kind = format_tool_input("codex/file_change", &json!({"changes": [{"path": "a.rs"}]}));
+        assert!(
+            no_kind.starts_with("- changes:"),
+            "a missing kind takes the generic shape: {no_kind}"
+        );
         let blank = format_tool_input(
             "codex/file_change",
             &json!({"changes": [{"path": "a.rs"}, {"path": "  "}]}),
@@ -8074,7 +8090,10 @@ Index: /a/one.rs
         );
         // A backtick in a path cannot escape the inline span it names.
         assert_eq!(
-            format_tool_input("codex/file_change", &json!({"changes": [{"path": "a`b.rs"}]})),
+            format_tool_input(
+                "codex/file_change",
+                &json!({"changes": [{"path": "a`b.rs", "kind": {"type": "update"}}]})
+            ),
             "📄 ``a`b.rs``"
         );
     }
@@ -8248,9 +8267,11 @@ excerpt two";
     /// panel shows its query rather than an empty Output beside it.
     #[test]
     fn codex_web_search_without_results_has_no_output_section() {
-        let md = panel_md(codex_web_search_panel(json!(null)));
-        assert!(md.contains("🔎 `rust lifetimes`"), "query still shown: {md}");
-        assert!(!md.contains("**Output**"), "no empty Output: {md}");
+        for empty in [json!(null), json!(""), json!("   ")] {
+            let md = panel_md(codex_web_search_panel(empty.clone()));
+            assert!(md.contains("🔎 `rust lifetimes`"), "query shown: {empty}");
+            assert!(!md.contains("**Output**"), "no empty Output for {empty}: {md}");
+        }
     }
 
     /// ADR-0042's amendment's shape gate covers the results renderer too: a
@@ -8406,6 +8427,20 @@ excerpt two";
             md.contains(&format!("```\n\n{SEARCH_TRUNCATION_NOTE}")),
             "the fence closes bare, then the note: {md}"
         );
+    }
+
+    /// A result list longer than the panel budget is markdown, so the generic
+    /// `truncate_md` marker is safe — it must never be fenced (which would
+    /// turn the list into literal syntax) and must not lose its count header.
+    #[test]
+    fn a_long_result_list_truncates_as_markdown() {
+        let entries = (0..80)
+            .map(|n| json!({"title": format!("result {n}"), "url": format!("https://a.example/{n}")}))
+            .collect::<Vec<_>>();
+        let md = panel_md(codex_web_search_panel(json!(entries)));
+        assert!(md.contains("🔎 80 条结果"), "count kept: {md}");
+        assert!(!md.contains("```"), "the list is not fenced: {md}");
+        assert!(md.contains('…'), "the list is truncated: {md}");
     }
 
     /// V2 records a shell command's outcome in the call's metadata; a settled

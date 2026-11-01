@@ -178,7 +178,8 @@ same boundary and the same id-plus-shape gate:
   `codex_file_change_diff` takes the path from the change entry (one change) and
   joins several behind `Index:` lines, then reuses the existing `EditDiff`
   parser, diff budget, clip note and count header. The file count is the
-  input's `changes` count, so an entry that records no diff is still named. A
+  input's `changes` count, so an entry that records no diff is still counted
+  (and named in the body whenever any entry yields a hunk). A
   single change names its file and carries the 「📂 打开」 button — a rename
   names and opens its destination everywhere (Input line, folded title,
   button), a delete still names the removed file but carries no button;
