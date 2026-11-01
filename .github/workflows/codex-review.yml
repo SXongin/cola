@@ -141,7 +141,14 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.actor != 'dependabot[bot]' &&
       !startsWith(github.head_ref || '', 'release/')
-    runs-on: ubuntu-latest
+    # Pinned below `ubuntu-latest` on 2026-11-01: the hosted image moved to
+    # ubuntu-26.04 that day, where the action's `drop-sudo` socket ACL dies with
+    # `Could not restrict access to /run/dbus/system_bus_socket` and then
+    # `/usr/bin/sudo exited with code 1` — with `/usr/bin/setfacl` present and
+    # /run a tmpfs, so the package prerequisite is not the cause. ubuntu-24.04
+    # ran the same action, pin and model successfully the day before. Unpin when
+    # codex-action supports 26.04 (track its releases).
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
       contents: read
@@ -386,25 +393,6 @@ jobs:
             echo "::error title=Review gate credential::HTTP $code from $GATE_ENDPOINT: $( (head -c 400 "$RUNNER_TEMP/gate-preflight.json" || true) | tr '\n' ' ')"
             exit 1
           fi
-
-      # The action's `drop-sudo` strategy denies the runner UID access to
-      # root-owned service sockets under /run with a socket ACL, which needs
-      # `/usr/bin/setfacl` (the `acl` package) and ACL support on /run. The
-      # ubuntu-26.04 image the runner moved to on 2026-11-01 fails that step
-      # (`Could not restrict access to /run/dbus/system_bus_socket`, then
-      # `/usr/bin/sudo exited with code 1`) while ubuntu-24.04 still worked the
-      # day before, so the prerequisites are asserted (and installed when the
-      # package is missing) rather than assumed.
-      - name: Ensure the sandbox prerequisites
-        run: |
-          set -euo pipefail
-          command -v setfacl >/dev/null && command -v setpriv >/dev/null || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq acl util-linux
-          }
-          command -v setfacl
-          command -v setpriv
-          findmnt -no SOURCE,FSTYPE,OPTIONS /run
 
       # Bounded, and salvageable when it does not return (#530): a completed
       # review is still published if the step is cancelled at its bound; a cut
