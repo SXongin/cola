@@ -2295,22 +2295,22 @@ async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
         Some("已按最新的选择更新"),
         "the late submit is refused"
     );
-    let card = late.card.expect("the repaint still comes back");
-    let inputs = card_inputs(&card);
-    assert_eq!(inputs.len(), 1);
-    assert_eq!(inputs[0]["name"], "custom_2", "question 3 stays open: {}", card);
-    // The newer draft is the one recorded for the box it came from.
-    let text = card_text(&card);
     assert!(
-        !text.contains("旧的"),
-        "the stale text never reaches a box: {text}"
+        late.card.is_none(),
+        "a dropped switch must not replace the card: the reader may be typing \
+         into the box that is open now"
     );
-    // Back to question 1: its draft is the NEWER tap's text.
-    let back = app.host_action(switch(0, 2, "")).await.expect("a card");
-    let card = back.card.expect("a repaint");
+    // The state itself is untouched: a fresh repaint still shows question 3.
+    let repaint = app.host_action(switch(0, 2, "")).await.expect("a card");
+    let card = repaint.card.expect("a repaint");
+    assert_eq!(
+        card_inputs(&card)[0]["name"],
+        "custom_0",
+        "back on question 1: {card}"
+    );
     assert_eq!(
         card_inputs(&card)[0]["default_value"],
         "最新",
-        "the newer draft stands: {card}"
+        "the newer draft stands, the stale text never reached a box: {card}"
     );
 }

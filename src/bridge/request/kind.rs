@@ -1569,6 +1569,18 @@ impl RequestKind for QuestionKind {
                     .with_question_state(req_id, |state| state.paint())
                     .await
                     .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(req.questions.len()));
+                let toast = switch_toast(target, switched, &paint.done);
+                // Only a switch that OPENED something repaints. A dropped one
+                // (stale, already answered, already open) must not replace the
+                // card: the reader may be typing into the box that is open NOW,
+                // and a rebuild from state would seed it from the server's
+                // draft — erasing what the client alone holds.
+                if matches!(switched, SwitchApplied::Refused | SwitchApplied::Stale) {
+                    return Some(CardActionResult {
+                        card: None,
+                        toast: Some(toast),
+                    });
+                }
                 if inline {
                     let card = refresh_question_block(
                         &handles.cards,
@@ -1589,7 +1601,7 @@ impl RequestKind for QuestionKind {
                             Some(card) => Some(card),
                             None => ack_inline_card(&handles.cards, host, session_id).await,
                         },
-                        toast: Some(switch_toast(target, switched, &paint.done)),
+                        toast: Some(toast),
                     });
                 }
                 Some(CardActionResult {
@@ -1604,7 +1616,7 @@ impl RequestKind for QuestionKind {
                         paint.open,
                         &paint.drafts,
                     )),
-                    toast: Some(switch_toast(target, switched, &paint.done)),
+                    toast: Some(toast),
                 })
             }
             "submit" => {
@@ -1777,6 +1789,7 @@ fn draft_inputs(value: &serde_json::Value) -> Vec<(usize, &str)> {
 }
 
 /// What a switch submit did to the request's state.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SwitchApplied {
     /// The target is now the open question.
     Opened,
@@ -2096,7 +2109,7 @@ mod tests {
                 display: vec![None, None],
                 done: vec![false, false],
                 open: 1,
-                drafts: vec!["草稿一".to_string(), String::new()],
+                drafts: vec![String::new(), "草稿二".to_string()],
             },
         );
         let elements = req.snapshot_block_elements("/w", &state);
@@ -2110,6 +2123,10 @@ mod tests {
         assert_eq!(
             inputs[0]["name"], "custom_1",
             "the snapshot opens the switched question: {text}"
+        );
+        assert_eq!(
+            inputs[0]["default_value"], "草稿二",
+            "the snapshot seeds the open question's draft: {text}"
         );
         assert!(
             text.contains("1. 问题 1"),

@@ -12,6 +12,14 @@ use super::tool_render::json_escaped_len;
 /// clicks toggle the running selection.
 const MAX_VISIBLE_OPTIONS: usize = 3;
 
+/// The most characters the free-text answer box accepts. The client enforces
+/// it; the bridge caps a stored draft at the same number, because
+/// `max_length` is a client-side rule.
+pub(crate) const CUSTOM_INPUT_MAX_CHARS: usize = 500;
+
+/// The most characters the numeric box accepts (a number is short).
+pub(crate) const NUMERIC_INPUT_MAX_CHARS: usize = 40;
+
 /// Display cap for a Custom Answer button label. Long or multiline answers
 /// collapse and truncate in the button only; the stored answer and the click
 /// value keep the raw text.
@@ -833,7 +841,7 @@ fn number_input(name: &str, draft: &str) -> serde_json::Value {
         "name": name,
         "input_type": "text",
         "placeholder": { "tag": "plain_text", "content": "✍️ 输入数字" },
-        "max_length": 40,
+        "max_length": NUMERIC_INPUT_MAX_CHARS,
         "width": "fill",
     });
     if !draft.is_empty() {
