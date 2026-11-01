@@ -2426,13 +2426,15 @@ mod tests {
                     custom: None,
                     ..Default::default()
                 },
+                // Answered, so the skip submit renders too.
+                string_question(2),
                 many_option_question(),
             ],
             "/tmp/proj/lib",
-            &[None, None],
-            &[false, false],
+            &[None, Some(vec!["/a2".into()]), None],
+            &[false, true, false],
             0,
-            &[String::new(), String::new()],
+            &[String::new(), String::new(), String::new()],
         );
         let mut submits: Vec<String> = all_elements(&card)
             .iter()
@@ -2452,7 +2454,7 @@ mod tests {
             .iter()
             .filter_map(|e| e["text"]["content"].as_str())
             .collect();
-        for required in ["苹果", "✅ 确定该题", "🚫 无法回答"] {
+        for required in ["苹果", "✅ 确定该题", "✅ 提交（跳过剩余）", "🚫 无法回答"] {
             assert!(
                 labels.contains(&required),
                 "the card must show the non-submit control {required}: {card}"
@@ -2461,13 +2463,45 @@ mod tests {
         // And none of them is a submit.
         for element in all_elements(&card) {
             let label = element["text"]["content"].as_str().unwrap_or("");
-            if ["苹果", "✅ 确定该题", "🚫 无法回答"].contains(&label) {
+            if ["苹果", "✅ 确定该题", "✅ 提交（跳过剩余）", "🚫 无法回答"].contains(&label)
+            {
                 assert!(
                     element.get("form_action_type").is_none(),
                     "{label} must not submit the form: {element}"
                 );
             }
         }
+    }
+
+    /// A numeric field's box is seeded from its draft like any other, so a
+    /// switch away and back does not lose a half-typed number — and it stays
+    /// single-line while doing it.
+    #[test]
+    fn a_numeric_field_seeds_its_draft_into_a_single_line_box() {
+        let numeric = crate::backend::types::QuestionInfo {
+            question: "数量".into(),
+            header: "h".into(),
+            kind: crate::backend::types::FormFieldKind::Integer,
+            ..Default::default()
+        };
+        let card = build_question_card(
+            "",
+            "que_1",
+            "ses_1",
+            &[numeric],
+            "/tmp/proj/lib",
+            &[None],
+            &[false],
+            0,
+            &["12".to_string()],
+        );
+        let input = form_elements(&card)
+            .iter()
+            .find(|e| e["tag"] == "input")
+            .expect("the numeric field renders a box")
+            .clone();
+        assert_eq!(input["input_type"], "text", "still single-line: {card}");
+        assert_eq!(input["default_value"], "12", "the draft is seeded: {card}");
     }
 
     /// One question — the common ask — keeps today's flat layout: no fold, no

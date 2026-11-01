@@ -84,6 +84,14 @@ are free.
   (handler side) and `PendingQuestion` (render side) both carry `open` and
   `drafts`, and the snapshot state mirrors them — otherwise a repaint would show
   a different question than the click meant to act on.
+- A switch is honoured only from the question that is open when the submit
+  lands: two taps racing on the same pre-switch card (both carrying the earlier
+  question's box) resolve to the newer choice, because the older submit no
+  longer rides the open question and is dropped.
+- A switch's paint is the callback ack, like every card interaction. Feishu
+  discards an ack that misses its budget, and the freeze that protects the open
+  box also stops a background repaint from repairing the card, so a dropped ack
+  leaves the previous render standing until the next tap.
 - None of this is observable in `cargo test` beyond element order and the
   callback payloads the unit tests pin. Whether the draft actually survives on
   the client is a device observation (Android 14 / Feishu 8.4.9), like every
