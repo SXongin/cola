@@ -471,7 +471,12 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 `--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少 daemon 同样判为
 失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行运行
 `codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时
-（纯 Feishu 部署）该检查通过，因为没有需要连接的对象。
+（纯 Feishu 部署）该检查通过，因为没有需要连接的对象。在 Windows 上，
+doctor 会先列出 daemon 的三个前置条件：进程不能持有提升的管理员令牌；启动器
+必须允许 breakaway 子进程（`cargo run` 和外层 job 对象都不允许）；控制套接字
+路径必须符合 AF_UNIX 的 108 字节上限（含终止 NUL）。每条失败的行都带可执行的
+指示——从非管理员终端启动 cola、直接运行 `codex.exe`，或缩短 `CODEX_HOME`；
+令牌或路径不满足时，doctor 会跳过运行时诊断，而不是只报告一句 attach failed。
 
 `cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在**共享**
 daemon（并非 cola 所有）上创建一个临时线程并发起最小回合并等待
