@@ -144,4 +144,19 @@ pub(crate) enum CodexError {
     /// this is a misconfiguration and fails loudly.
     #[error("the codex daemon control socket at `{socket}` is unusable: {detail}")]
     DaemonSocket { socket: String, detail: String },
+
+    /// The resolved control-socket path cannot fit the platform's AF_UNIX
+    /// address. On Windows the published path **is** the socket, so unlike
+    /// Unix a long `CODEX_HOME` is a precondition failure — checked before
+    /// anything is spawned, never left to a connect that cannot succeed.
+    #[error(
+        "the codex daemon control socket path `{path}` is {length} bytes, but a Windows \
+         unix-socket address is limited to {limit} bytes including the terminating NUL; set a \
+         shorter `CODEX_HOME` so the control socket path fits"
+    )]
+    ControlSocketPathTooLong {
+        path: String,
+        length: usize,
+        limit: usize,
+    },
 }

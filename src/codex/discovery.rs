@@ -7,10 +7,12 @@
 //! of that configuration:
 //!
 //! - the control socket is `$CODEX_HOME/app-server-control/app-server-control.sock`,
-//!   so a relocated `CODEX_HOME` moves it with the rest of Codex's state. It is
-//!   normally a **symlink** into `/tmp/codex-daemon-0/<hash>`; the path is used
-//!   verbatim and the OS follows the link at connect time (never canonicalised,
-//!   never required to be a regular file);
+//!   so a relocated `CODEX_HOME` moves it with the rest of Codex's state. On
+//!   Unix it is normally a **symlink** into `/tmp/codex-daemon-<uid>/<hash>`; on
+//!   Windows the path **is** the socket, an AF_UNIX reparse point that must fit
+//!   the platform's 108-byte address. Either way the path is used verbatim and
+//!   the OS follows a link at connect time (never canonicalised, never required
+//!   to be a symlink or a regular file);
 //! - the binary that must be probed for the schema is the one the **daemon
 //!   runs**, which is not the `codex` on `PATH`: the daemon's management CLI
 //!   reports `managedCodexPath` (`codex app-server daemon version`), and the
@@ -33,9 +35,20 @@ use super::error::{CodexError, Result};
 /// The daemon's control directory, relative to `CODEX_HOME`.
 pub(crate) const CONTROL_DIR: &str = "app-server-control";
 
-/// The control socket's file name inside [`CONTROL_DIR`]. It is a symlink into
-/// the daemon's runtime directory; the OS follows it.
+/// The control socket's file name inside [`CONTROL_DIR`]. On Unix it is a
+/// symlink into the daemon's runtime directory; on Windows it is the socket
+/// itself.
 pub(crate) const CONTROL_SOCKET: &str = "app-server-control.sock";
+
+/// The longest control-socket path an AF_UNIX address can carry on Windows,
+/// **including** the terminating NUL.
+///
+/// Windows binds the socket at the published path itself, so there is no short
+/// `/tmp/codex-daemon-<uid>/<hash>` runtime directory to move it to: a long
+/// `CODEX_HOME` overflows `sun_path` and a dial would fail with
+/// `ENAMETOOLONG`. The budget is enforced before anything is spawned.
+#[cfg(windows)]
+pub(crate) const WINDOWS_SOCKET_PATH_LIMIT: usize = 108;
 
 /// Where a managed daemon package installs its own binary, relative to
 /// `CODEX_HOME`. Used when the management CLI cannot report `managedCodexPath`.
@@ -93,6 +106,17 @@ impl Environment {
         self.home.join(CONTROL_DIR).join(CONTROL_SOCKET)
     }
 
+    /// Enforce the platform's control-socket path budget **before** a dial.
+    ///
+    /// Only Windows binds the socket at the published path; elsewhere the path
+    /// is a link into a short runtime directory, so this is a no-op. A caller
+    /// that is about to spawn anything (ticket #949/#952's proxy) checks here
+    /// first, so a long `CODEX_HOME` is a named precondition failure rather
+    /// than a failed connect.
+    pub(crate) fn check_socket_budget(&self) -> Result<()> {
+        check_socket_budget(&self.socket())
+    }
+
     /// The managed daemon binary a standard install keeps under this home.
     fn package_binary(&self) -> PathBuf {
         self.home.join(MANAGED_BINARY)
@@ -125,29 +149,33 @@ fn resolve_home(from_env: Option<PathBuf>, home_dir: Option<PathBuf>) -> Result<
 
 /// The identity of the control socket on disk, used to notice that a daemon was
 /// replaced under the same path (a restart gives the daemon a new runtime
-/// directory, so its symlink target's inode changes).
+/// directory, so its socket's identity changes).
 ///
-/// On a platform without unix-domain sockets the discovery is a named failure,
-/// not a panic and not a silent "absent" (ADR-0090's open question 4, Windows).
+/// Unix reads the target's `(device, inode)` from `std::fs::metadata`, which
+/// **follows** the published symlink: the identity belongs to the socket the
+/// link names, not to the link itself. Windows has no link to follow — the
+/// published path *is* the socket — and reads the same file object's
+/// `(volume serial number, file index)`.
+///
+/// A build with neither (an unsupported platform) is a named failure, not a
+/// panic and not a silent "absent" (ADR-0090's open question 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SocketIdentity {
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
     inode: u64,
+    #[cfg(windows)]
+    volume_serial_number: u32,
+    #[cfg(windows)]
+    file_index: u64,
 }
 
-/// Read the control socket's identity, following a symlink. `Ok(None)` means
-/// no socket is there (a dangling link counts as absent — the daemon is gone);
-/// an existing non-socket is a named error, never a silent absence.
+/// Read the control socket's identity, following a link in the path. `Ok(None)`
+/// means no socket is there (a dangling link counts as absent — the daemon is
+/// gone); an existing path that cannot be used is a named error, never a silent
+/// absence.
 pub(crate) fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
-    #[cfg(not(unix))]
-    {
-        Err(CodexError::UnsupportedPlatform {
-            path: path.display().to_string(),
-            platform: std::env::consts::OS,
-        })
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -173,6 +201,104 @@ pub(crate) fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
             inode: metadata.ino(),
         }))
     }
+    #[cfg(windows)]
+    {
+        windows_socket_identity(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(CodexError::UnsupportedPlatform {
+            path: path.display().to_string(),
+            platform: std::env::consts::OS,
+        })
+    }
+}
+
+/// The Windows identity: the volume serial number and file index of the object
+/// the published path names.
+///
+/// `std::os::windows::fs::MetadataExt`'s `volume_serial_number` and
+/// `file_index` accessors are still nightly-only (`windows_by_handle`, Rust
+/// issue #63010), so this reads the same `BY_HANDLE_FILE_INFORMATION` fields
+/// through `winapi-util`'s safe wrapper. The handle is opened exactly as
+/// `std::fs::metadata` opens one: attributes only, so no read permission is
+/// required. The reparse-point fallback mirrors `std`'s own `stat`: the AF_UNIX
+/// socket file *is* an NTFS reparse point, and opening it without
+/// `FILE_FLAG_OPEN_REPARSE_POINT` can fail with `ERROR_CANT_ACCESS_FILE`.
+#[cfg(windows)]
+fn windows_socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CodexError::DaemonSocket {
+                socket: path.display().to_string(),
+                detail: error.to_string(),
+            });
+        }
+    }
+
+    let open = |flags: u32| {
+        std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(flags)
+            .open(path)
+    };
+    let file = match open(FILE_FLAG_BACKUP_SEMANTICS) {
+        Ok(file) => file,
+        // `std::fs::metadata` succeeded, so the path exists; the object may
+        // only be reachable as a reparse point.
+        Err(_) => open(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).map_err(|error| {
+            CodexError::DaemonSocket {
+                socket: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })?,
+    };
+    let info = winapi_util::file::information(&file).map_err(|error| CodexError::DaemonSocket {
+        socket: path.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    Ok(Some(SocketIdentity {
+        volume_serial_number: info.volume_serial_number() as u32,
+        file_index: info.file_index(),
+    }))
+}
+
+/// Check the resolved control-socket path against the platform's AF_UNIX
+/// address budget.
+///
+/// Windows stores the path in `sun_path` verbatim, so the path plus its NUL
+/// terminator must fit 108 bytes. Elsewhere the published path is a link into
+/// a short runtime directory and is not what the kernel stores, so the check is
+/// a no-op.
+#[cfg(windows)]
+pub(crate) fn check_socket_budget(socket: &Path) -> Result<()> {
+    let Some(text) = socket.to_str() else {
+        return Err(CodexError::DaemonSocket {
+            socket: socket.display().to_string(),
+            detail: "a Windows unix-socket address must be valid UTF-8".to_string(),
+        });
+    };
+    let length = text.len();
+    if length >= WINDOWS_SOCKET_PATH_LIMIT {
+        return Err(CodexError::ControlSocketPathTooLong {
+            path: socket.display().to_string(),
+            length,
+            limit: WINDOWS_SOCKET_PATH_LIMIT,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn check_socket_budget(_socket: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// The JSON report of `codex app-server daemon version` (and `daemon start`),
@@ -369,6 +495,7 @@ pub(crate) async fn discover_daemon(environment: &Environment) -> Result<Option<
 /// answer does not make a serving socket disappear (the package path is the
 /// fallback). An unsupported platform or an undialable path is a named error.
 pub(crate) async fn discover(environment: &Environment) -> Result<Discovery> {
+    environment.check_socket_budget()?;
     let socket = environment.socket();
     let identity = socket_identity(&socket)?;
     let daemon = match identity {
@@ -476,6 +603,7 @@ fn parse_info(stdout: &[u8]) -> Result<DaemonInfo> {
 /// is the outcome we asked for, so that case returns the discovered daemon
 /// instead of a timeout — the caller's attach still proves it answers.
 pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon> {
+    environment.check_socket_budget()?;
     let socket = environment.socket();
     // A socket path left behind by a crashed daemon is not a fresh one: the
     // launcher must produce a **new** socket (Codex re-links the path into a new
@@ -1167,6 +1295,192 @@ mod tests {
         std::fs::write(&socket, "").expect("regular file");
         let error = socket_identity(&socket).expect_err("not a socket");
         assert!(matches!(error, CodexError::DaemonSocket { .. }), "{error}");
+    }
+
+    /// `std::fs::metadata` follows the published path: the identity belongs to
+    /// the socket the symlink names, never to the link itself. That is what
+    /// makes a re-pointed link read as a replacement instead of the same
+    /// daemon.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_control_path_identifies_its_target() {
+        use std::os::unix::net::UnixListener;
+
+        let root = crate::codex::test_server::socket_tempdir();
+        let target = root.path().join("daemon.sock");
+        let _listener = UnixListener::bind(&target).expect("bind the target socket");
+        let link = root.path().join("app-server-control.sock");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink the socket");
+
+        let through_link = socket_identity(&link)
+            .expect("identity")
+            .expect("a symlinked socket has an identity");
+        let target_identity = socket_identity(&target)
+            .expect("identity")
+            .expect("the target is a socket");
+        assert_eq!(
+            through_link, target_identity,
+            "the identity is the link's target, not the link"
+        );
+
+        // The exact replacement a dial must refuse to attach through.
+        let other = root.path().join("daemon-1.sock");
+        let _other_listener = UnixListener::bind(&other).expect("bind the other socket");
+        std::fs::remove_file(&link).expect("remove the old link");
+        std::os::unix::fs::symlink(&other, &link).expect("re-point the link");
+        assert_ne!(
+            socket_identity(&link)
+                .expect("identity")
+                .expect("the replacement is a socket"),
+            through_link,
+            "a re-pointed link names a different object"
+        );
+    }
+
+    /// An identity describes the file object, not its name: renaming the
+    /// socket on disk must not read as a daemon replacement.
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_socket_identity_survives_a_rename() {
+        use std::os::unix::net::UnixListener;
+
+        let root = crate::codex::test_server::socket_tempdir();
+        let original = root.path().join("socket");
+        let _listener = UnixListener::bind(&original).expect("bind the socket");
+        let before = socket_identity(&original).expect("identity").expect("a socket");
+
+        let renamed = root.path().join("renamed");
+        std::fs::rename(&original, &renamed).expect("rename the socket");
+        assert_eq!(
+            socket_identity(&renamed)
+                .expect("identity")
+                .expect("the renamed socket"),
+            before
+        );
+    }
+
+    /// macOS resolves `/tmp` to `/private/tmp`. The advertised path is never
+    /// canonicalised, and the identity is the file's own `(device, inode)`, so
+    /// a symlinked temp root changes neither. The test builds that shape under
+    /// a temp directory instead of depending on the host actually having
+    /// `/private/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_temp_root_changes_neither_the_advertised_path_nor_the_identity() {
+        use std::os::unix::net::UnixListener;
+
+        let root = crate::codex::test_server::socket_tempdir();
+        let real = root.path().join("private");
+        let linked = root.path().join("tmp");
+        std::fs::create_dir_all(&real).expect("real root");
+        std::os::unix::fs::symlink(&real, &linked).expect("symlink the temp root");
+
+        let home = linked.join("codex-home");
+        let environment = Environment {
+            home: home.clone(),
+            cli: PathBuf::from("codex"),
+            version_timeout: VERSION_TIMEOUT,
+            start_timeout: START_TIMEOUT,
+            socket_ready_timeout: SOCKET_READY_TIMEOUT,
+        };
+        // The caller sees the path it configured, not the resolved target.
+        assert_eq!(
+            environment.socket(),
+            linked.join("codex-home").join(CONTROL_DIR).join(CONTROL_SOCKET)
+        );
+        assert_eq!(environment.home, linked.join("codex-home"));
+
+        let control = environment.socket();
+        let real_control = real.join("codex-home").join(CONTROL_DIR).join(CONTROL_SOCKET);
+        std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
+        let _listener = UnixListener::bind(&real_control).expect("bind the real socket");
+        assert_eq!(
+            socket_identity(&control)
+                .expect("identity")
+                .expect("the socket through the link"),
+            socket_identity(&real_control)
+                .expect("identity")
+                .expect("the real socket"),
+        );
+    }
+
+    /// The Windows identity is the same `(volume serial number, file index)`
+    /// pair for a file under two names; a rename is not a replacement.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_file_identity_survives_a_rename() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let original = directory.path().join("socket");
+        std::fs::write(&original, b"").expect("write the file");
+        let before = socket_identity(&original).expect("identity").expect("a file");
+
+        let renamed = directory.path().join("renamed");
+        std::fs::rename(&original, &renamed).expect("rename the file");
+        assert_eq!(
+            socket_identity(&renamed)
+                .expect("identity")
+                .expect("the renamed file"),
+            before
+        );
+    }
+
+    /// On Windows the published path is the socket itself, so an absent path is
+    /// absent and a re-created one is a new object — the replacement a dial
+    /// must not attach through.
+    #[cfg(windows)]
+    #[test]
+    fn an_absent_windows_control_path_is_absent_and_a_recreated_one_is_a_replacement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("app-server-control.sock");
+        assert_eq!(socket_identity(&socket).expect("absence is not an error"), None);
+
+        std::fs::write(&socket, b"").expect("create the socket path");
+        let first = socket_identity(&socket).expect("identity").expect("a file");
+        std::fs::remove_file(&socket).expect("remove the socket path");
+        std::fs::write(&socket, b"").expect("re-create the socket path");
+        let second = socket_identity(&socket)
+            .expect("identity")
+            .expect("the re-created file");
+        assert_ne!(first, second, "a re-created path is a replacement");
+    }
+
+    /// A path over the Windows `sun_path` budget fails by name before the
+    /// management CLI can be spawned: the fake CLI below does not exist, so a
+    /// spawn-first implementation would surface its own error instead.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_codex_home_over_the_socket_budget_fails_before_any_command_runs() {
+        let home = PathBuf::from(r"C:\").join("x".repeat(80));
+        let environment = Environment {
+            home,
+            cli: PathBuf::from("this-codex-must-never-be-spawned"),
+            version_timeout: VERSION_TIMEOUT,
+            start_timeout: START_TIMEOUT,
+            socket_ready_timeout: SOCKET_READY_TIMEOUT,
+        };
+        let socket = environment.socket();
+        assert!(
+            socket.as_os_str().len() >= WINDOWS_SOCKET_PATH_LIMIT,
+            "the fixture must overflow the budget"
+        );
+
+        let error = discover(&environment).await.expect_err("over budget");
+        let message = error.to_string();
+        assert!(message.contains("108"), "{message}");
+        assert!(
+            message.contains(&socket.display().to_string()),
+            "the resolved path is in the message: {message}"
+        );
+        assert!(
+            message.contains("CODEX_HOME"),
+            "the instruction names the setting: {message}"
+        );
+        let CodexError::ControlSocketPathTooLong { path, length, limit } = &error else {
+            panic!("expected a named path-budget error, got {error}");
+        };
+        assert_eq!(*limit, WINDOWS_SOCKET_PATH_LIMIT);
+        assert_eq!(*length, socket.to_str().expect("a UTF-8 path").len());
+        assert_eq!(*path, socket.display().to_string());
     }
 
     /// The explicit opt-out is the decisive signal, on a TUI only.

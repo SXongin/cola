@@ -1535,6 +1535,46 @@ mod tests {
         }
     }
 
+    /// Re-points the control path **during every handshake**, so each attempt
+    /// dials the daemon its discovery named and then loses the identity race
+    /// again before the identity is re-read.
+    struct RacingProbe {
+        control: PathBuf,
+        targets: Arc<Mutex<std::collections::VecDeque<PathBuf>>>,
+    }
+
+    impl ProbeSource for RacingProbe {
+        fn probe(&self, _daemon: &Daemon) -> Box<dyn SurfaceProbe> {
+            Box::new(RacingSurface {
+                control: self.control.clone(),
+                targets: Arc::clone(&self.targets),
+            })
+        }
+    }
+
+    struct RacingSurface {
+        control: PathBuf,
+        targets: Arc<Mutex<std::collections::VecDeque<PathBuf>>>,
+    }
+
+    #[async_trait]
+    impl SurfaceProbe for RacingSurface {
+        async fn surface(
+            &self,
+            server: &super::super::client::ServerVersion,
+        ) -> Result<super::super::schema::Surface> {
+            if let Some(target) = self.targets.lock().expect("re-point targets").pop_front() {
+                std::fs::remove_file(&self.control).expect("remove the old link");
+                std::os::unix::fs::symlink(target, &self.control).expect("re-point the link");
+            }
+            PinnedProbe.surface(server).await
+        }
+
+        fn source(&self) -> String {
+            PinnedProbe.source()
+        }
+    }
+
     struct Fixture {
         root: tempfile::TempDir,
         environment: Environment,
@@ -2170,6 +2210,68 @@ mod tests {
         );
         second.wait_for_liveness(1).await;
         assert_eq!(first.liveness_probes(), 0, "the voided connection is gone");
+    }
+
+    /// A path re-pointed on **both** attempts is a race with no winner: the
+    /// pass reports `Raced`, never an attachment to a daemon the path no longer
+    /// names, and never a start against a live daemon.
+    #[tokio::test]
+    async fn a_control_path_that_keeps_moving_ends_the_pass_as_a_race() {
+        let fixture = Fixture::new();
+        let first_path = fixture.root.path().join("daemon-0").join("app-server-control");
+        std::fs::create_dir_all(first_path.parent().expect("dir")).expect("dir");
+        let first = FakeServer::unix(&first_path, "codex-tui/0.163.0 (test)").await;
+        let second_path = fixture.root.path().join("daemon-1").join("app-server-control");
+        std::fs::create_dir_all(second_path.parent().expect("dir")).expect("dir");
+        let second = FakeServer::unix(&second_path, "codex-tui/0.163.0 (test)").await;
+        let third_path = fixture.root.path().join("daemon-2").join("app-server-control");
+        std::fs::create_dir_all(third_path.parent().expect("dir")).expect("dir");
+        let third = FakeServer::unix(&third_path, "codex-tui/0.163.0 (test)").await;
+
+        let control = fixture.environment.socket();
+        std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
+        std::os::unix::fs::symlink(&first_path, &control).expect("symlink the first daemon");
+
+        let lifecycle = CodexLifecycle::new(
+            CodexConfig {
+                start_server: crate::config::ServerStartPolicy::Never,
+                ..CodexConfig::default()
+            },
+            fixture.environment.clone(),
+            Box::new(RacingProbe {
+                control: control.clone(),
+                targets: Arc::new(Mutex::new(std::collections::VecDeque::from([
+                    second_path,
+                    third_path,
+                ]))),
+            }),
+        );
+
+        let discovered = discovery::discover(&fixture.environment)
+            .await
+            .expect("the first discovery")
+            .running()
+            .expect("a running daemon");
+        assert_eq!(
+            lifecycle
+                .attach(&discovered.daemon, discovered.identity)
+                .await
+                .expect("a race is an outcome, not an error"),
+            Attempt::Raced
+        );
+        assert_eq!(first.connections(), 1, "the daemon discovery named was dialled");
+        assert_eq!(second.connections(), 1, "the retry dialled its replacement");
+        assert_eq!(third.connections(), 0, "the last replacement was never dialled");
+        assert_eq!(
+            fixture.cli.starts(),
+            0,
+            "a moving path is a race, not a reason to start a daemon: {:?}",
+            fixture.cli.invocations()
+        );
+        assert!(
+            lifecycle.attached_client().await.is_none(),
+            "a raced pass leaves no attachment"
+        );
     }
 
     /// A dial that fails while the control path moves to a **healthy** daemon
