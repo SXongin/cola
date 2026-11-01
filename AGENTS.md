@@ -156,6 +156,15 @@ and the map from the old numbers.
   form's own writes (its arrival, a click's ack, the answer) and the
   settlement are not the render pass and still land.
 
+  One user-initiated repaint is allowed while a box holds text: switching to
+  another question (ADR-0094). It is a form **submit**, so the text arrives with
+  it (keyed `custom_<i>`), the handler records it as that question's draft
+  before painting, and the repaint seeds the new box with `default_value` — the
+  one moment Feishu hands the text to the server at all. It writes through
+  `refresh_question_block`, never the render pass, so the freeze above cannot
+  swallow it. Typing and then tapping a **multi-select option** still loses the
+  text: a non-submit click carries no `form_value`.
+
   **Every card write advances the render gate's signature cache** — the flush
   does it (`advance_sent_signatures`, `src/bridge/turn/flush.rs`), and so must
   an out-of-band write that restamps the header (`Turn::mark_header_shown` for
@@ -171,9 +180,12 @@ and the map from the old numbers.
   are not. It is layout, not a repaint race (static, never-patched cards
   reproduce it, and one box stays bad while its neighbours behave), and a
   **folded** panel below the input costs only its header. Hence one open
-  question at a time (`question_elements`), search forms after the rows and
-  pager (`search_form` call sites), and a folded receipt log on the snapshot
-  card (#917, ADR-0093).
+  question at a time (`question_elements`) — the reader picks which, and the
+  switch is a form **submit** so the open question's draft travels with it
+  (ADR-0094) — search forms after the rows and pager (`search_form` call
+  sites), and a folded receipt log on the snapshot card (#917, ADR-0093).
+  One form per question block, at the body's top level: a `form` inside a
+  `collapsible_panel` is rejected (200621), a panel inside the form is legal.
 - **`info-probe`** — the generation is probed with `GET /api/info`, and the
   status alone cannot classify it: V1's web-UI catch-all serves `index.html` for
   every unknown path, so V1 answers 200 `text/html`. The rule — 200 + V2's JSON

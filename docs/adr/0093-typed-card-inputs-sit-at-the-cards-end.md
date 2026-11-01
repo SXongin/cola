@@ -44,16 +44,18 @@ Every card that renders a typed input keeps it within a couple of elements of
 the card's bottom:
 
 - **Question card** (`question_elements`): one question open at a time. The
-  first unanswered question renders its controls — including its custom-answer
-  or numeric form — and every other unanswered question folds into a
-  collapsible panel whose header carries the question text. A single-question
-  ask, the common case, is unchanged. A folded question drops its form: Feishu
-  rejects a `form` nested in a `collapsible_panel` (ErrCode 200621, "type of
-  element is not supported tag: form"), and the open question owns the card's
-  only input anyway — a fold left with no clickable control says to answer the
-  open question first. `PendingQuestion::awaits_typed_answer` reads the same
-  "open question", so the freeze never guards an input the card does not
-  render.
+  open question renders its controls — including its custom-answer or numeric
+  input — and every other unanswered question folds into a collapsible panel
+  whose header carries the question text. A single-question ask, the common
+  case, is unchanged. Which question is open is the reader's choice, and the
+  whole block is one root-level form so a switch can carry the open question's
+  typed draft (ADR-0094) — the one form wraps the panels, because Feishu rejects
+  a `form` nested **inside** a `collapsible_panel` (ErrCode 200621, "type of
+  element is not supported tag: form"). The open question owns the card's only
+  input; a folded question keeps its option controls and adds the switch that
+  opens it. `PendingQuestion::awaits_typed_answer` reads the same resolved open
+  question (`question::open_index`), so the freeze never guards an input the card
+  does not render.
 - **List cards** (`/switch`, `/dir`, `/sub`, the `/skill` picker): the search
   form renders **after** the rows and the pager. `/switch` keeps only its
   ＋新建会话 footer below.
@@ -68,7 +70,8 @@ the card's bottom:
   Android.
 - Multi-question asks change shape: the card shows one open question at a time
   and the rest as folded headers. Answering the open one opens the next, which
-  is one tap per question but no longer a card taller than the phone.
+  is one tap per question but no longer a card taller than the phone. The reader
+  may also pick the open question directly, which is the switch ADR-0094 adds.
 - A snapshot card's receipt log is folded whenever it grows past two lines; the
   count is in the panel header.
 - Nothing here is observable in `cargo test` beyond element order. The layout
