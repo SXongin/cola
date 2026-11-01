@@ -179,9 +179,12 @@ same boundary and the same id-plus-shape gate:
   joins several behind `Index:` lines, then reuses the existing `EditDiff`
   parser, diff budget, clip note and count header. The file count is the
   input's `changes` count, so an entry that records no diff is still named. A
-  single change also names its file and carries the 「📂 打开」 button (a rename
-  opens its destination, a delete carries none); several name the count and
-  totals in the folded title and carry no button.
+  single change names its file and carries the 「📂 打开」 button — a rename
+  names and opens its destination everywhere (Input line, folded title,
+  button), a delete still names the removed file but carries no button;
+  several name the input's file count and, except on a failed call whose
+  change is unknown, the parsed hunk totals in the folded title (zero totals
+  when no hunk parses) and carry no button.
 - `codex/web_search` reads the adapter's `metadata.results`, which the pinned
   app-server schema calls **opaque JSON** ("new result fields and result types
   can pass through without a Codex release"). Only one subset is a presentation

@@ -322,7 +322,7 @@ impl ToolPanel {
             // (a rename opens its destination, a delete nothing at all);
             // several have no single target. Gated on the adapter's own shape
             // (ADR-0042's amendment), like every other `codex/` arm.
-            _ if is_codex_file_change(self) => codex_open_path(self.input()),
+            "codex/file_change" if is_codex_file_change(self) => codex_open_path(self.input()),
             _ => None,
         }
     }
@@ -883,22 +883,44 @@ fn header_file_name(name: &str) -> String {
 /// the embedded image's caption, and two names for one file on one line is
 /// noise. `None` for every other tool and for a call with no usable path.
 fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
+    // A Codex change counts its INPUT files, not the entries that happened to
+    // parse a hunk: a rename or binary entry still belongs to the list, and a
+    // patch with no hunk at all still says how many files it touched. The
+    // totals come from the hunks that did parse (zero when none did) — except
+    // on a FAILED call, whose body is the error text and whose change is
+    // unknown, so a `+0 −0` there would claim nothing changed.
+    if is_codex_file_change(tool)
+        && let Some(paths) = codex_change_paths(tool.input())
+        && paths.len() > 1
+    {
+        let totals = if call_failed(tool) {
+            None
+        } else {
+            Some(
+                file_edit_diff_for(tool)
+                    .map(|diff| (diff.additions, diff.deletions))
+                    .unwrap_or_default(),
+            )
+        };
+        return Some(multi_file_detail(paths.len(), totals));
+    }
     if let Some(diff) = file_edit_diff_for(tool)
         && diff.paths.len() > 1
     {
-        return Some(format!(
-            " · 📄 {} files · +{} −{}",
+        return Some(multi_file_detail(
             diff.paths.len(),
-            diff.additions,
-            diff.deletions
+            Some((diff.additions, diff.deletions)),
         ));
     }
     let (icon, path) = match tool.name() {
         "write" | "edit" => ("📄", tool.file_open_path()?),
-        // A single `fileChange` names its file even when there is no way in (a
-        // delete): the folded title says WHAT changed, the button says whether
-        // it can be opened. Gated like every other `codex/` arm.
-        "codex/file_change" if is_codex_file_change(tool) => ("📄", codex_change_path(tool.input())?),
+        // A single `fileChange` names the file its button opens — a rename
+        // names its destination — and a delete, which has no way in, still
+        // names the file it removed. Gated like every other `codex/` arm.
+        "codex/file_change" if is_codex_file_change(tool) => (
+            "📄",
+            codex_open_path(tool.input()).or_else(|| codex_title_path(tool.input()))?,
+        ),
         // The book icon the read panel's Input line already uses — and the one
         // that still reads correctly for a directory read. Only a read WITHOUT
         // a File Content gets the fragment: one with one is already named by
@@ -919,6 +941,16 @@ fn panel_file_detail(tool: &ToolPanel) -> Option<String> {
     let trimmed = path.trim_end_matches(['/', '\\']);
     let name = if trimmed.is_empty() { path } else { trimmed };
     Some(format!(" · {icon} {}", header_file_name(name)))
+}
+
+/// The folded-title fragment a multi-file patch carries: the file count and,
+/// when they are known, the change totals. One formatter for both the Codex
+/// and OpenCode producers, so the two cannot disagree.
+fn multi_file_detail(files: usize, totals: Option<(usize, usize)>) -> String {
+    match totals {
+        Some((additions, deletions)) => format!(" · 📄 {files} files · +{additions} −{deletions}"),
+        None => format!(" · 📄 {files} files"),
+    }
 }
 
 /// The byte length the folded header's file detail [`panel_file_detail`]
@@ -1309,11 +1341,14 @@ fn file_edit_diff_for(tool: &ToolPanel) -> Option<EditDiff> {
 /// header — so the path comes from the change entry, not the text: one change
 /// parses as a single-file diff whose Input line names the file, several join
 /// behind `Index:` lines the way [`recorded_diff`] joins a multi-file patch.
+/// [`codex_display_path`] names a rename's destination, the same file the
+/// Input line, folded title and button name.
 ///
-/// `None` for a FAILED call (its error text is the body) and for a payload
-/// without a parseable hunk, so the generic output path still shows the text.
+/// `None` for a FAILED call (its error text is the body, by the one
+/// [`call_failed`] rule) and for a payload without a parseable hunk, so the
+/// generic output path still shows the text.
 fn codex_file_change_diff(tool: &ToolPanel) -> Option<EditDiff> {
-    if !is_codex_file_change(tool) || tool.status().is_failure() || tool.metadata_failure() {
+    if !is_codex_file_change(tool) || call_failed(tool) {
         return None;
     }
     let changes = tool.metadata()?.get("changes")?.as_array()?;
@@ -1324,7 +1359,7 @@ fn codex_file_change_diff(tool: &ToolPanel) -> Option<EditDiff> {
     // dropped before joining: a real blank line between files is what
     // `parse_diff` reads as the trailing-note boundary.
     if let [only] = changes.as_slice() {
-        let path = only.get("path").and_then(serde_json::Value::as_str)?;
+        let path = codex_display_path(only)?;
         let diff = only
             .get("diff")
             .and_then(serde_json::Value::as_str)
@@ -1337,12 +1372,12 @@ fn codex_file_change_diff(tool: &ToolPanel) -> Option<EditDiff> {
     let joined = changes
         .iter()
         .filter_map(|change| {
-            let path = change.get("path").and_then(serde_json::Value::as_str)?;
+            let path = codex_display_path(change)?;
             let diff = change
                 .get("diff")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
-                .trim_end();
+                .trim_end_matches(['\r', '\n']);
             Some(if diff.is_empty() {
                 format!("Index: {path}")
             } else {
@@ -1631,8 +1666,9 @@ pub(crate) fn panel_output_estimate(tool: &ToolPanel) -> usize {
             BodyStyle::Code(lang) => {
                 json_escaped_len(&body) + fenced_overhead(&body) + fence_lang_bytes(lang)
             }
-            BodyStyle::Auto if needs_code_block(&body) => json_escaped_len(&body) + fenced_overhead(&body),
-            BodyStyle::Auto => json_escaped_len(&body),
+            // `codex_web_search_output` yields only the two shapes above; this
+            // arm exists for exhaustiveness and keeps the generic charge.
+            BodyStyle::Auto => json_escaped_len(&body) + fenced_overhead(&body),
         };
         return header + body;
     }
@@ -2805,7 +2841,7 @@ pub(crate) fn tool_display_name(tool: &ToolPanel) -> &str {
         // the `codex/` namespace already keeps its ids apart from a third
         // party's.
         "codex/command_execution" if command_execution_shape(tool.input()) => "命令",
-        "codex/file_change" if file_change_shape(tool.input()) => "文件修改",
+        "codex/file_change" if is_codex_file_change(tool) => "文件修改",
         "codex/web_search" if web_search_shape(tool.input()) => "网页搜索",
         "codex/image" if image_shape(tool.input()) => "图片",
         other => other,
@@ -2841,28 +2877,36 @@ fn file_change_shape(input: Option<&serde_json::Value>) -> bool {
         })
 }
 
-/// The files a shape-gated `fileChange` input names, in order. `None` when any
-/// entry lacks a usable path, so a caller renders generically rather than
-/// reporting a partial list. The one walk the Input line, the folded detail
-/// and the diff builder share.
+/// The files a shape-gated `fileChange` input names, in order, as the reader
+/// sees them: a rename names its destination. `None` when any entry lacks a
+/// usable path, so a caller renders generically rather than reporting a
+/// partial list. The one walk the Input line, the folded title and the diff
+/// builder share.
 fn codex_change_paths(input: Option<&serde_json::Value>) -> Option<Vec<&str>> {
     input?
         .get("changes")?
         .as_array()?
         .iter()
-        .map(|change| {
-            change
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .filter(|path| !path.trim().is_empty())
-        })
+        .map(codex_display_path)
         .collect()
 }
 
-/// The one file a `fileChange` names, when it names exactly one — the path the
-/// folded title shows. Unlike [`codex_open_path`] it is kind-agnostic: a delete
-/// still says which file went away.
-fn codex_change_path(input: Option<&serde_json::Value>) -> Option<&str> {
+/// The file one change names as the reader sees it: a rename's destination
+/// (`movePath` — the file that now exists), otherwise its own `path`.
+fn codex_display_path(change: &serde_json::Value) -> Option<&str> {
+    change
+        .get("kind")
+        .and_then(|kind| kind.get("movePath"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| change.get("path").and_then(serde_json::Value::as_str))
+        .filter(|path| !path.trim().is_empty())
+}
+
+/// The one file a `fileChange` names, when it names exactly one — the folded
+/// title's fallback when [`codex_open_path`] has no target. It is kind-agnostic:
+/// a delete still says which file went away.
+fn codex_title_path(input: Option<&serde_json::Value>) -> Option<&str> {
     match codex_change_paths(input)?.as_slice() {
         [only] => Some(*only),
         _ => None,
@@ -2870,30 +2914,22 @@ fn codex_change_path(input: Option<&serde_json::Value>) -> Option<&str> {
 }
 
 /// The file a single-change `fileChange` panel's 「📂 打开」 opens: a rename
-/// opens its destination (`movePath`), and a delete opens nothing at all (the
-/// file no longer exists). `None` for several changes and for a path that is
-/// absent, blank or non-ASCII-string-shaped.
+/// opens its destination, and a delete opens nothing at all (the file no
+/// longer exists). `None` for several changes and for a path that is absent,
+/// blank or non-string-shaped.
 fn codex_open_path(input: Option<&serde_json::Value>) -> Option<&str> {
     let [only] = input?.get("changes")?.as_array()?.as_slice() else {
         return None;
     };
-    let kind = only.get("kind");
-    match kind
+    if only
+        .get("kind")
         .and_then(|kind| kind.get("type"))
         .and_then(serde_json::Value::as_str)
+        == Some("delete")
     {
-        Some("delete") => None,
-        Some("update") => kind
-            .and_then(|kind| kind.get("movePath"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .or_else(|| only.get("path").and_then(serde_json::Value::as_str))
-            .filter(|path| !path.trim().is_empty()),
-        _ => only
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .filter(|path| !path.trim().is_empty()),
+        return None;
     }
+    codex_display_path(only)
 }
 
 /// `webSearch`: `{query: string, action: …}` — the adapter always writes the
@@ -3024,10 +3060,12 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
             None => generic_tool_input(obj),
         },
         // Codex's `fileChange` names its targets in `changes[].path` (one entry
-        // per file), not in a top-level `path`. A payload where any entry lacks
-        // a usable path is rendered generically rather than silently reporting
-        // a partial file list. Backticks are flattened (`permission_target`'s
-        // rule) so a path cannot break the inline code span it sits in.
+        // per file), not in a top-level `path`. A rename names its destination
+        // (`movePath`) — the same file the folded title and the button name. A
+        // payload where any entry lacks a usable path is rendered generically
+        // rather than silently reporting a partial file list. Backticks are
+        // flattened (`permission_target`'s rule) so a path cannot break the
+        // inline code span it sits in.
         "codex/file_change" => match codex_change_paths(Some(input)).as_deref() {
             None | Some([]) => generic_tool_input(obj),
             Some([only]) => format!("📄 {}", inline_code(only)),
@@ -5766,12 +5804,17 @@ Index: src/main.rs
         );
         assert_eq!(tool.file_open_path(), None, "three files have no single target");
 
+        // A rename names and opens the SAME file: its destination.
         let rename = codex_file_change_panel(vec![json!({
             "path": "src/old.rs",
             "kind": {"type": "update", "movePath": "src/new.rs"},
             "diff": "@@ -1 +1 @@\n-old\n+new",
         })]);
         assert_eq!(rename.file_open_path(), Some("src/new.rs"));
+        assert!(
+            panel_title(rename).contains("· 📄 new.rs"),
+            "the title names the file the button opens"
+        );
 
         let delete = codex_file_change_panel(vec![json!({
             "path": "src/gone.rs",
@@ -5782,6 +5825,39 @@ Index: src/main.rs
         assert!(
             panel_title(delete).contains("· 📄 gone.rs"),
             "the folded title still names what was deleted"
+        );
+
+        // A rename/binary-only patch parses no hunk but still counts its files.
+        let no_hunks = codex_file_change_panel(vec![
+            json!({"path": "assets/a.bin", "kind": {"type": "add"}}),
+            json!({"path": "assets/b.bin", "kind": {"type": "delete"}}),
+        ]);
+        assert!(
+            panel_title(no_hunks).contains("· 📄 2 files · +0 −0"),
+            "the input count survives a patch with no hunks"
+        );
+
+        // A multi-file rename names its destination in the body too, and the
+        // fence follows the destination (here `.py`, not the source `.rs`).
+        let multi_rename = codex_file_change_panel(vec![
+            json!({
+                "path": "src/old.rs",
+                "kind": {"type": "update", "movePath": "src/new.py"},
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+            }),
+            json!({
+                "path": "lib/other.rs",
+                "kind": {"type": "update", "movePath": "lib/other.py"},
+                "diff": "@@ -1 +1 @@\n-a\n+b",
+            }),
+        ]);
+        let md = panel_md(multi_rename);
+        assert!(md.contains("Index: src/new.py"), "destination in body: {md}");
+        assert!(md.contains("Index: lib/other.py"), "second: {md}");
+        assert!(!md.contains("old.rs"), "no stale source path: {md}");
+        assert!(
+            md.contains("```python"),
+            "the fence follows the destination: {md}"
         );
     }
 
@@ -5801,6 +5877,27 @@ Index: src/main.rs
         let md = panel_md(tool);
         assert!(!md.contains("+1 −1"), "no diff panel: {md}");
         assert!(md.contains("patch rejected"), "the error text: {md}");
+
+        // A failed MULTI-file change names its file count but no totals: the
+        // change is unknown, so `+0 −0` would claim nothing changed.
+        let mut multi = codex_file_change_panel(vec![
+            json!({
+                "path": "src/a.rs",
+                "kind": {"type": "update"},
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+            }),
+            json!({
+                "path": "src/b.rs",
+                "kind": {"type": "update"},
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+            }),
+        ]);
+        multi.call.status = ToolStatus::Error;
+        multi.call.output.blocks = vec![ContentBlock::Text("patch rejected".into())];
+        multi.call.output.error = Some("patch rejected".into());
+        let title = panel_title(multi);
+        assert!(title.contains("· 📄 2 files"), "count only: {title}");
+        assert!(!title.contains("+0 −0"), "no invented totals: {title}");
     }
 
     /// ADR-0042's amendment applies to the output side too: a tool that
@@ -7909,6 +8006,14 @@ Index: /a/one.rs
                 &json!({"changes": [{"path": "a.rs"}, {"path": "b.rs"}]})
             ),
             "📄 `a.rs` 等 2 个文件"
+        );
+        // A rename names the file that now exists, like the title and button.
+        assert_eq!(
+            format_tool_input(
+                "codex/file_change",
+                &json!({"changes": [{"path": "old.rs", "kind": {"type": "update", "movePath": "new.rs"}}]})
+            ),
+            "📄 `new.rs`"
         );
         let partial = format_tool_input(
             "codex/file_change",
