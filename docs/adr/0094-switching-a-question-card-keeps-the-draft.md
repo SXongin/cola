@@ -70,8 +70,10 @@ are free.
 
 - Typing into a folded question costs two taps (expand, 作答这道题) and saves
   answering the earlier questions first.
-- Every question block is a form now, even one with no input; the card holds
-  exactly one, and a `collapsible_panel` never gets one (200621).
+- Every question block is a form now, even one with no input; a question block holds
+  exactly one, and a `collapsible_panel` never gets one (200621). A Session
+  Snapshot can carry several pending blocks, so it carries one form **per
+  block** — never one per card.
 - The switch is a user-initiated repaint, and it saves the draft before painting.
   It writes through `refresh_question_block`, never the render pass, so ADR-0093's
   freeze — which stands down for no background paint while a box is open — cannot
