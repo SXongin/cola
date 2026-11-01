@@ -442,16 +442,7 @@ pub(super) async fn refresh_question_block(
     // restore the state that click already moved past. Under the lock, the
     // newest paint is what both the accumulator and the ack get.
     let paint = flow.with_question_state(req_id, |state| state.paint()).await?;
-    Turn::update_question_state(
-        cards,
-        host.as_deref().unwrap_or(session_id),
-        req_id,
-        &paint.display,
-        &paint.done,
-        paint.open,
-        &paint.drafts,
-    )
-    .await;
+    Turn::update_question_state(cards, host.as_deref().unwrap_or(session_id), req_id, &paint).await;
     let message_id = clicked?;
     let elements = crate::feishu::card::question::question_elements(
         &request.title,

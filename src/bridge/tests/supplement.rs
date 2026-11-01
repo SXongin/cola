@@ -1384,10 +1384,7 @@ async fn supplement_split_migrates_a_pending_question() {
         "ses_test",
         &question_request("que_live", "ses_test"),
         "/work",
-        &[None, None],
-        &[false; 2],
-        0,
-        &[],
+        &crate::bridge::question::QuestionPaint::blank(2),
     )
     .await;
     app.inflight.lock().await.insert("ses_test".to_string());

@@ -4852,10 +4852,7 @@ async fn seed_inline_request(
                 session_id,
                 q,
                 directory,
-                &vec![None; q.questions.len()],
-                &vec![false; q.questions.len()],
-                0,
-                &[],
+                &crate::bridge::question::QuestionPaint::blank(q.questions.len()),
             )
             .await;
         }

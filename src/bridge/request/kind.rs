@@ -1149,17 +1149,7 @@ impl RequestKind for QuestionKind {
             .with_question_state(&q.id, |state| state.paint())
             .await
             .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
-        Turn::add_question(
-            cards,
-            host,
-            q,
-            dir,
-            &paint.display,
-            &paint.done,
-            paint.open,
-            &paint.drafts,
-        )
-        .await
+        Turn::add_question(cards, host, q, dir, &paint).await
     }
 
     async fn add_initial_inline(
@@ -1177,17 +1167,7 @@ impl RequestKind for QuestionKind {
         // remembered, so it starts open; the remembered state is recorded
         // right after (`remember_surfaced`).
         let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
-        Turn::add_question(
-            cards,
-            host,
-            q,
-            dir,
-            &paint.display,
-            &paint.done,
-            paint.open,
-            &paint.drafts,
-        )
-        .await
+        Turn::add_question(cards, host, q, dir, &paint).await
     }
 
     fn build_card(&self, req: &PendingRequest, dir: &str) -> serde_json::Value {
@@ -1578,12 +1558,15 @@ impl RequestKind for QuestionKind {
                         for (index, text) in drafts {
                             state.record_draft(index, text);
                         }
-                        let applied = if state.switch_open(target) {
-                            SwitchApplied::Opened
+                        // A dropped switch reports no mutation even when it
+                        // recorded its draft: the handler answers it without a
+                        // card (the open box must not be rebuilt), and the
+                        // snapshot wrapper must not rebuild behind that.
+                        if state.switch_open(target) {
+                            (SwitchApplied::Opened, state.revision() != revision)
                         } else {
-                            SwitchApplied::Refused
-                        };
-                        (applied, state.revision() != revision)
+                            (SwitchApplied::Refused, false)
+                        }
                     })
                     .await;
                 let Some((switched, mutated)) = switched else {

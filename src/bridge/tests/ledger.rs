@@ -5829,10 +5829,7 @@ async fn add_question_block(app: &Arc<App>, session_id: &str, directory: &str, t
         session_id,
         &request,
         directory,
-        &[None],
-        &[false],
-        0,
-        &[],
+        &crate::bridge::question::QuestionPaint::blank(1),
     )
     .await;
 }

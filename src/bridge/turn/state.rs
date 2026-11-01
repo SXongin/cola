@@ -3265,10 +3265,7 @@ impl StreamAccumulator {
     pub(super) fn update_question_state(
         &mut self,
         request_id: &str,
-        answers: &[Option<Vec<String>>],
-        done: &[bool],
-        open: usize,
-        drafts: &[String],
+        paint: &crate::bridge::question::QuestionPaint,
     ) -> bool {
         match self
             .interactions
@@ -3276,10 +3273,10 @@ impl StreamAccumulator {
             .find(|b| b.request_id() == request_id)
         {
             Some(InteractionBlock::Question(q)) => {
-                q.answers = answers.to_vec();
-                q.done = done.to_vec();
-                q.open = open;
-                q.drafts = drafts.to_vec();
+                q.answers = paint.display.clone();
+                q.done = paint.done.clone();
+                q.open = paint.open;
+                q.drafts = paint.drafts.clone();
                 true
             }
             _ => false,
