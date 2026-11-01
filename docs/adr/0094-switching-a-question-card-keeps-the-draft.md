@@ -89,6 +89,9 @@ are free.
   non-submit click carries no `form_value`, and its repaint rebuilds the box.
   That is unchanged from before this decision; only a **switch** preserves a
   draft.
+- A catch-up repaint rebuilds `body.elements`, so it also collapses any panel
+  the reader had expanded (client-side state, ADR-0093). That is the visible cost
+  of the path; the alternative is a card that never catches up.
 - Two small rules the state keeps so a callback cannot shape the card: a stored
   draft is capped at its box's own `max_length` (500 for free text, 40 for a
   number), because that limit is enforced by the client alone; and a numeric
