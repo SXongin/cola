@@ -28,6 +28,11 @@ pub struct QuestionState {
     /// Only honoured while that question is still unanswered, so answering it
     /// opens the next one instead of leaving a finalized question "open".
     open: usize,
+    /// Bumped on every change this state makes. The snapshot wrapper asks "did
+    /// THIS click change the state?" by comparing it before and after, which is
+    /// precise where diffing the whole card's state is not: a concurrent click
+    /// that changed another slot must not make a no-op look like a mutation.
+    revision: u64,
     /// Unsubmitted text the reader typed into each question's custom-answer box
     /// before switching away. Feishu keeps an input's text in the client only —
     /// every repaint rebuilds `body.elements` — so a switch (a submit, so the
@@ -94,6 +99,7 @@ impl QuestionState {
             toggles: slots,
             open: 0,
             drafts,
+            revision: 0,
         }
     }
 
@@ -133,7 +139,11 @@ impl QuestionState {
             return;
         }
         let cap = draft_max_chars(index, &self.request);
-        self.drafts[index] = text.chars().take(cap).collect();
+        let text: String = text.chars().take(cap).collect();
+        if self.drafts[index] != text {
+            self.drafts[index] = text;
+            self.revision += 1;
+        }
     }
 
     /// Open question `target` (the switch submit's destination). Refused — with
@@ -144,12 +154,18 @@ impl QuestionState {
             return false;
         }
         self.open = target;
+        self.revision += 1;
         true
     }
 
     /// The full request, for rebuilding its card with partial answers.
     pub(crate) fn request(&self) -> &crate::backend::types::QuestionRequest {
         &self.request
+    }
+
+    /// The number of changes this state has made (see the field's doc).
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Everything the card paints, in one value (see [`QuestionPaint`]).
@@ -190,6 +206,7 @@ impl QuestionState {
             // input for a finalized question, so a kept draft could only
             // resurface as a stale box.
             self.drafts[index].clear();
+            self.revision += 1;
         }
     }
 
@@ -212,6 +229,7 @@ impl QuestionState {
         if empty {
             self.toggles[index] = None;
         }
+        self.revision += 1;
     }
 
     /// Append a typed custom label to an open multi-select (never removes; a
@@ -230,6 +248,7 @@ impl QuestionState {
         if let Some(draft) = self.drafts.get_mut(index) {
             draft.clear();
         }
+        self.revision += 1;
     }
 
     /// Lock the live toggles of question `index` into its final answer (empty
@@ -243,6 +262,7 @@ impl QuestionState {
         if let Some(draft) = self.drafts.get_mut(index) {
             draft.clear();
         }
+        self.revision += 1;
     }
 
     /// Whether `answer` is currently in the live toggles for one question.

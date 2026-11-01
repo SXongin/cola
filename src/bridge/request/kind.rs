@@ -1301,6 +1301,7 @@ impl RequestKind for QuestionKind {
                 if answer.is_empty() && reply != "confirm" {
                     if reply == "custom" {
                         return Some(CardActionResult {
+                            mutated: false,
                             card: None,
                             toast: Some("请输入自定义答案".to_string()),
                         });
@@ -1343,6 +1344,7 @@ impl RequestKind for QuestionKind {
                 // ever auto-submitting mid-composition.
                 let mutated = flow
                     .with_question_state(req_id, |state| {
+                        let revision = state.revision();
                         let mut outcome = None;
                         if multi {
                             // Read the selection BEFORE mutating so the toast can
@@ -1377,10 +1379,11 @@ impl RequestKind for QuestionKind {
                             state.record_answer(index, &answer);
                         }
                         let count = state.merge().0;
-                        (count, state.paint(), outcome)
+                        let mutated = state.revision() != revision;
+                        (count, state.paint(), outcome, mutated)
                     })
                     .await;
-                let Some((answered_count, paint, outcome)) = mutated else {
+                let Some((answered_count, paint, outcome, mutated)) = mutated else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
                 if answered_count == n {
@@ -1473,16 +1476,14 @@ impl RequestKind for QuestionKind {
                                 req_id,
                                 &req,
                                 directory.unwrap_or(""),
-                                &paint.display,
-                                &paint.done,
-                                paint.open,
-                                &paint.drafts,
+                                flow,
                             )
                             .await
                         }
                         None => None,
                     };
                     let r = CardActionResult {
+                        mutated,
                         card: match card {
                             Some(card) => Some(card),
                             None => ack_inline_card(&handles.cards, host, session_id).await,
@@ -1510,6 +1511,7 @@ impl RequestKind for QuestionKind {
                         &paint.drafts,
                     );
                     let mut r = CardActionResult {
+                        mutated,
                         card: Some(card),
                         toast: None,
                     };
@@ -1539,6 +1541,7 @@ impl RequestKind for QuestionKind {
                 }
                 let switched = flow
                     .with_question_state(req_id, |state| {
+                        let revision = state.revision();
                         let drafts = draft_inputs(value);
                         // A switch rides the box it was submitted with, so it is
                         // honoured only while that box is still the open one: two
@@ -1570,7 +1573,7 @@ impl RequestKind for QuestionKind {
                             }),
                         };
                         if stale {
-                            return (SwitchApplied::Stale, state.paint());
+                            return (SwitchApplied::Stale, false);
                         }
                         for (index, text) in drafts {
                             state.record_draft(index, text);
@@ -1580,18 +1583,22 @@ impl RequestKind for QuestionKind {
                         } else {
                             SwitchApplied::Refused
                         };
-                        // Painted inside the SAME acquisition: a second read
-                        // could observe a newer click's state and repaint with
-                        // a paint that no longer matches what this submit did.
-                        (applied, state.paint())
+                        (applied, state.revision() != revision)
                     })
                     .await;
-                let Some((switched, paint)) = switched else {
+                let Some((switched, mutated)) = switched else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
                 let Some(req) = flow.question_request(req_id).await else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
+                // The paint is read AFTER the mutation, never carried across the
+                // awaits: a concurrent answer that landed in between must not be
+                // overwritten by this click's older view (ADR-0094).
+                let paint = flow
+                    .with_question_state(req_id, |state| state.paint())
+                    .await
+                    .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(req.questions.len()));
                 let toast = switch_toast(target, switched, &paint.done);
                 // A dropped switch (stale, already answered, already open)
                 // repaints only when nothing can be lost: with no typed box open
@@ -1605,6 +1612,8 @@ impl RequestKind for QuestionKind {
                         .is_some_and(crate::feishu::card::question::renders_typed_input);
                 if matches!(switched, SwitchApplied::Refused | SwitchApplied::Stale) && typed_box_open {
                     return Some(CardActionResult {
+                        // A refused switch may still have recorded its draft.
+                        mutated,
                         card: None,
                         toast: Some(toast),
                     });
@@ -1618,13 +1627,11 @@ impl RequestKind for QuestionKind {
                         req_id,
                         &req,
                         directory.unwrap_or(""),
-                        &paint.display,
-                        &paint.done,
-                        paint.open,
-                        &paint.drafts,
+                        flow,
                     )
                     .await;
                     return Some(CardActionResult {
+                        mutated,
                         card: match card {
                             Some(card) => Some(card),
                             None => ack_inline_card(&handles.cards, host, session_id).await,
@@ -1633,6 +1640,7 @@ impl RequestKind for QuestionKind {
                     });
                 }
                 Some(CardActionResult {
+                    mutated,
                     card: Some(crate::feishu::card::question::build_question_card(
                         &req.title,
                         req_id,

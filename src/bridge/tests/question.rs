@@ -2288,6 +2288,10 @@ async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
     // The newer tap (Q0 → Q3) lands first.
     let first = app.host_action(switch(2, 0, "最新")).await.expect("a card");
     assert_eq!(first.toast.as_deref(), Some("已切到第 3 题"));
+    assert!(
+        first.mutated,
+        "a switch that opened a question reports the change"
+    );
     // The older tap (Q0 → Q2), still carrying Q0's box, lands late.
     let late = app.host_action(switch(1, 0, "旧的")).await.expect("a card");
     assert_eq!(
@@ -2299,6 +2303,10 @@ async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
         late.card.is_none(),
         "a dropped switch must not replace the card: the reader may be typing \
          into the box that is open now"
+    );
+    assert!(
+        !late.mutated,
+        "a dropped switch changed nothing — the snapshot must not repaint for it"
     );
     // The state itself is untouched: a fresh repaint still shows question 3.
     let repaint = app.host_action(switch(0, 2, "")).await.expect("a card");
