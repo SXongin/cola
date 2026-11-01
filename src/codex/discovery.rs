@@ -337,7 +337,7 @@ fn open_attribute_handle_with(
 /// NUL-terminated string must fit `sun_path`). This is pure so the boundary and
 /// the non-UTF-8 arm are pinned on any platform.
 #[cfg(any(windows, test))]
-fn socket_path_budget(socket: &Path, limit: usize) -> Result<()> {
+pub(crate) fn socket_path_budget(socket: &Path, limit: usize) -> Result<()> {
     let Some(text) = socket.to_str() else {
         return Err(unusable_socket(
             socket,
@@ -859,6 +859,15 @@ fn daemon_reports_running(info: &DaemonInfo) -> bool {
 /// instead of a timeout — the caller's attach still proves it answers.
 pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon> {
     environment.check_socket_budget()?;
+    // Windows daemon preconditions, before the launcher runs (ticket #952): an
+    // elevated token or a job-restricted launcher makes `daemon start` fail
+    // silently at the TUI level, so the command is not attempted at all. The
+    // budget above keeps its more specific error; `cola doctor` renders the
+    // same refusal as a named row.
+    #[cfg(windows)]
+    if let Some(reason) = super::preconditions::probe(environment).start_refusal() {
+        return Err(CodexError::WindowsPrecondition(reason));
+    }
     let socket = environment.socket();
     // A socket path left behind by a crashed daemon is not a fresh one: the
     // launcher must produce a **new** socket (Codex re-links the path into a new

@@ -144,6 +144,13 @@ pub(crate) enum CodexError {
     #[error("codex daemon command failed: {0}")]
     Daemon(String),
 
+    /// A Windows daemon precondition refused the start before anything was
+    /// spawned (ticket #952): an elevated token, a launcher that forbids
+    /// breakaway, or a control-socket path over the AF_UNIX budget. The detail
+    /// carries the same actionable instruction `cola doctor` prints.
+    #[error("cannot start the codex daemon on Windows: {0}")]
+    WindowsPrecondition(String),
+
     /// The daemon's control path exists but is not something this client can
     /// dial (not a unix socket, or unreadable). Absence is a state;
     /// this is a misconfiguration and fails loudly.
