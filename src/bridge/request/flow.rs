@@ -1932,6 +1932,9 @@ impl RequestFlow {
                     // (a replay or a stale notice) — letting it replace this
                     // message would overwrite the whole snapshot.
                     result.card = None;
+                    // A card-less ack is empty unless it says something: the
+                    // click would look dead (the `codex-request-ids` pitfall).
+                    result.toast.get_or_insert_with(|| "已处理".to_string());
                 }
             } else {
                 // Resolved: drop the block from the snapshot and patch it in

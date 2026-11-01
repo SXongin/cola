@@ -2387,7 +2387,12 @@ async fn a_stale_switch_on_a_claimed_snapshot_does_not_rebuild_the_card() {
     // The first switch changes the state, so the snapshot IS repainted.
     let first = app.host_action(switch(1, "草稿")).await.expect("an ack");
     assert_eq!(first.toast.as_deref(), Some("已切到第 2 题"));
-    assert!(first.card.is_some(), "state changed: the snapshot mirrors it");
+    let rebuilt = first.card.expect("state changed: the snapshot mirrors it");
+    assert!(
+        card_header(&rebuilt).contains("已接管"),
+        "the ack must be the SNAPSHOT card (a standalone result would replace \
+         the message and drop every other block): {rebuilt}"
+    );
 
     // The duplicate arrives late with the same (now stale) box.
     let stale = app.host_action(switch(1, "草稿")).await.expect("an ack");

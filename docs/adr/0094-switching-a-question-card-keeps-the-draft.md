@@ -100,20 +100,24 @@ are free.
   `drafts`, and the snapshot state mirrors them — otherwise a repaint would show
   a different question than the click meant to act on.
 - A switch is honoured only while it still carries the box of the question that
-  is open (the name's last segment): two taps racing on the same pre-switch card
-  keep the **first to land** and drop the other, so the winner's draft is never
-  overwritten by the loser's. A switch that carries no box (a boolean open
-  question) is fine unless the question open now renders a typed box. With
-  nothing to protect, arrival order decides. A dropped switch does not repaint
-  the card — the reader may be typing into the box that is open now, and a
-  rebuild from state would seed it from the server's draft, erasing what the
-  client alone holds.
+  is open (the name's last segment, repeated in the button's `value`): two taps
+  racing on the same pre-switch card keep the **first to land** and drop the
+  other, so the winner's draft is never overwritten by the loser's. A card from
+  before that segment existed, or a client that sends only a `value`, falls back
+  to the payload's input name; with no box at all, the switch is dropped only
+  when the question open now renders a typed box.
+- A dropped switch does not repaint while a typed box is open — the reader may
+  be typing into it, and a rebuild from state would seed it from the server's
+  draft, erasing what the client alone holds. With no typed box open it **does**
+  repaint, which is the only way a card whose ack was dropped catches up before
+  the reader answers something.
 - A switch's paint is the callback ack, like every card interaction. Feishu
   discards an ack that misses its budget, and the freeze that protects the open
   box also stops a background repaint from repairing the card, so a dropped ack
   leaves the previous render standing until the next tap. Any answer click
   re-syncs the card, because it changes the state.
-- A **Session Snapshot** repaints only when the question state actually changed:
+- A **Session Snapshot** repaints only when the question state actually changed
+  (and an unchanged click still answers a toast, never an empty ack):
   the wrapper compares the snapshot's question state before and after the click
   and leaves the card alone when the two match. Older code rebuilt on every
   click, which recreated the body's inputs and silently erased whatever the Host

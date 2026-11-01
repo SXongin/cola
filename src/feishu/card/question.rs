@@ -695,6 +695,9 @@ fn switch_button(request_id: &str, session_id: &str, index: usize, from: usize) 
             "request_id": request_id,
             "session_id": session_id,
             "question_index": index,
+            // Also in the value: a client that delivers `action.value` and no
+            // name must still say which box the switch rode.
+            "from_index": from,
         },
     })
 }
