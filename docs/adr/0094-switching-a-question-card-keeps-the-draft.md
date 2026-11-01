@@ -121,13 +121,18 @@ are free.
   box also stops a background repaint from repairing the card, so a dropped ack
   leaves the previous render standing until the next tap. Any answer click
   re-syncs the card, because it changes the state.
-- A **Session Snapshot** repaints only when the question state actually changed
-  (and an unchanged click still answers a toast, never an empty ack):
-  the wrapper compares the snapshot's question state before and after the click
-  and leaves the card alone when the two match. Older code rebuilt on every
-  click, which recreated the body's inputs and silently erased whatever the Host
-  had typed into the open box — a stale or duplicate switch (or a double-click)
-  was enough to trigger it.
+- A **Session Snapshot** repaints only when the click ITSELF changed the state,
+  as the handler reports it (`CardActionResult::mutated`), and an unchanged click
+  still answers a toast rather than an empty ack. Comparing the state before and
+  after a click cannot answer that question: a click that changed nothing still
+  sees what a concurrent click just changed, and the repaint it would trigger
+  recreates the body's inputs and erases whatever the Host has typed into the
+  open box — a stale or duplicate switch (or a double-click) was enough.
+- The paint a callback applies is read under the card write lock at APPLY time,
+  never carried from the moment it mutated the state: an answer that commits
+  while a switch waits for the lock would otherwise be overwritten by the
+  switch's older view, leaving the accumulator (and the freeze's idea of which
+  box is open) behind the state.
 - None of this is observable in `cargo test` beyond element order and the
   callback payloads the unit tests pin. Whether the draft actually survives on
   the client is a device observation (Android 14 / Feishu 8.4.9), like every
