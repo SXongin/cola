@@ -1539,10 +1539,24 @@ impl RequestKind for QuestionKind {
                 }
                 let switched = flow
                     .with_question_state(req_id, |state| {
-                        for (index, text) in draft_inputs(value) {
+                        let drafts = draft_inputs(value);
+                        // A switch rides the box it was submitted with, so it is
+                        // honoured only while that box is still the open one: two
+                        // taps racing on the pre-switch card (both carrying Q0's
+                        // text) must not let the older one overwrite the newer
+                        // choice once it lands last.
+                        let from = drafts.first().map(|(index, _)| *index);
+                        if from.is_some_and(|from| state.open() != Some(from)) {
+                            return SwitchApplied::Stale;
+                        }
+                        for (index, text) in drafts {
                             state.record_draft(index, text);
                         }
-                        state.switch_open(target)
+                        if state.switch_open(target) {
+                            SwitchApplied::Opened
+                        } else {
+                            SwitchApplied::Refused
+                        }
                     })
                     .await;
                 let Some(switched) = switched else {
@@ -1762,17 +1776,27 @@ fn draft_inputs(value: &serde_json::Value) -> Vec<(usize, &str)> {
         .collect()
 }
 
+/// What a switch submit did to the request's state.
+enum SwitchApplied {
+    /// The target is now the open question.
+    Opened,
+    /// The target is finalized, out of range, or was already open — only a stale
+    /// card or a double tap can ask for those.
+    Refused,
+    /// The submit came from a box that is no longer the open question: an older
+    /// tap landed after a newer one, so it is dropped and the newer choice
+    /// stands.
+    Stale,
+}
+
 /// Toast for a switch click: names the question now open, or says why nothing
-/// moved — an already-answered target, or the one already open (only a stale or
-/// double-tapped card asks for either).
-fn switch_toast(target: usize, switched: bool, done: &[bool]) -> String {
-    if switched {
-        return format!("已切到第 {} 题", target + 1);
-    }
-    if done.get(target).copied().unwrap_or(true) {
-        "这道题已经答完".to_string()
-    } else {
-        format!("已经停在第 {} 题", target + 1)
+/// moved.
+fn switch_toast(target: usize, applied: SwitchApplied, done: &[bool]) -> String {
+    match applied {
+        SwitchApplied::Opened => format!("已切到第 {} 题", target + 1),
+        SwitchApplied::Stale => "已按最新的选择更新".to_string(),
+        SwitchApplied::Refused if done.get(target).copied().unwrap_or(true) => "这道题已经答完".to_string(),
+        SwitchApplied::Refused => format!("已经停在第 {} 题", target + 1),
     }
 }
 
@@ -2040,6 +2064,57 @@ mod tests {
             always: vec![],
             always_supported: true,
         }
+    }
+
+    /// Issue #917 part 3: the snapshot card re-renders a claimed request from
+    /// `SnapshotQuestionState`, so the open question and the drafts must travel
+    /// with it — a rebuild after a switch would otherwise reopen question 1 and
+    /// lose the text.
+    #[test]
+    fn a_snapshot_block_paints_the_switched_question_and_its_draft() {
+        let question = |n: usize| crate::backend::types::QuestionInfo {
+            question: format!("问题 {n}"),
+            header: format!("h{n}"),
+            options: vec![crate::backend::types::QuestionOption {
+                label: format!("/a{n}"),
+                ..Default::default()
+            }],
+            kind: crate::backend::types::FormFieldKind::String,
+            custom: None,
+            ..Default::default()
+        };
+        let req = PendingRequest::Question(crate::backend::types::QuestionRequest {
+            id: "que_snap".into(),
+            session_id: "ses_1".into(),
+            questions: vec![question(1), question(2)],
+            ..Default::default()
+        });
+        let mut state = crate::feishu::snapshot_card::SnapshotQuestionState::new();
+        state.insert(
+            "que_snap".into(),
+            crate::feishu::snapshot_card::QuestionBlockState {
+                display: vec![None, None],
+                done: vec![false, false],
+                open: 1,
+                drafts: vec!["草稿一".to_string(), String::new()],
+            },
+        );
+        let elements = req.snapshot_block_elements("/w", &state);
+        let text = serde_json::to_string(&elements).expect("elements serialize");
+        let inputs: Vec<&serde_json::Value> = elements
+            .iter()
+            .flat_map(|e| e["elements"].as_array().into_iter().flatten())
+            .filter(|e| e["tag"] == "input")
+            .collect();
+        assert_eq!(inputs.len(), 1, "one box on the snapshot block: {text}");
+        assert_eq!(
+            inputs[0]["name"], "custom_1",
+            "the snapshot opens the switched question: {text}"
+        );
+        assert!(
+            text.contains("1. 问题 1"),
+            "the folded question keeps its panel: {text}"
+        );
     }
 
     /// A receipt is a one-line residue: a genuinely over-budget set of answers

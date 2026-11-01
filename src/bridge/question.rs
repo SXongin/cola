@@ -46,7 +46,8 @@ const DRAFT_MAX_CHARS: usize = 500;
 /// What a question block paints: the display selection per slot, which
 /// questions are finalized, which one is open and the unsubmitted draft in its
 /// box. One value so every render seam (standalone card, inline block, snapshot
-/// block, the clicked card's ack) passes the same four facts in one piece.#[derive(Clone, Debug, PartialEq, Default)]
+/// block, the clicked card's ack) passes the same four facts in one piece.
+#[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) struct QuestionPaint {
     pub display: Vec<Option<Vec<String>>>,
     pub done: Vec<bool>,

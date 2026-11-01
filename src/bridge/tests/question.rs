@@ -2233,3 +2233,84 @@ async fn an_inline_switch_repaints_the_clicked_card_and_moves_the_block() {
         "the draft came back on the inline card: {card}"
     );
 }
+
+/// Two taps can race: a reader expands two panels on the same pre-switch card
+/// and taps both, so the OLDER submit can land last. A switch is honoured only
+/// from the question that is open when it lands, so the loser is dropped and
+/// neither the newer choice nor its draft is overwritten.
+#[tokio::test]
+async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+    let typed = |n: usize| crate::backend::types::QuestionInfo {
+        question: format!("问题 {n}"),
+        header: format!("h{n}"),
+        options: vec![crate::backend::types::QuestionOption {
+            label: format!("/a{n}"),
+            ..Default::default()
+        }],
+        kind: crate::backend::types::FormFieldKind::String,
+        custom: None,
+        ..Default::default()
+    };
+    app.question
+        .remember_question(
+            &crate::backend::types::QuestionRequest {
+                id: "que_race".into(),
+                session_id: "ses_1".into(),
+                questions: vec![typed(1), typed(2), typed(3)],
+                ..Default::default()
+            },
+            "/work",
+        )
+        .await;
+
+    let switch = |target: u64, from: u64, draft: &str| {
+        let mut value = serde_json::json!({
+            "action": "question",
+            "reply": "open",
+            "request_id": "que_race",
+            "session_id": "ses_1",
+            "directory": "/work",
+            "question_index": target,
+        });
+        value["form_value"] = serde_json::Value::Object(serde_json::Map::from_iter([(
+            format!("custom_{from}"),
+            serde_json::json!(draft),
+        )]));
+        value
+    };
+
+    // The newer tap (Q0 → Q3) lands first.
+    let first = app.host_action(switch(2, 0, "最新")).await.expect("a card");
+    assert_eq!(first.toast.as_deref(), Some("已切到第 3 题"));
+    // The older tap (Q0 → Q2), still carrying Q0's box, lands late.
+    let late = app.host_action(switch(1, 0, "旧的")).await.expect("a card");
+    assert_eq!(
+        late.toast.as_deref(),
+        Some("已按最新的选择更新"),
+        "the late submit is refused"
+    );
+    let card = late.card.expect("the repaint still comes back");
+    let inputs = card_inputs(&card);
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0]["name"], "custom_2", "question 3 stays open: {}", card);
+    // The newer draft is the one recorded for the box it came from.
+    let text = card_text(&card);
+    assert!(
+        !text.contains("旧的"),
+        "the stale text never reaches a box: {text}"
+    );
+    // Back to question 1: its draft is the NEWER tap's text.
+    let back = app.host_action(switch(0, 2, "")).await.expect("a card");
+    let card = back.card.expect("a repaint");
+    assert_eq!(
+        card_inputs(&card)[0]["default_value"],
+        "最新",
+        "the newer draft stands: {card}"
+    );
+}
