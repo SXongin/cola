@@ -108,9 +108,11 @@ are free.
   when the question open now renders a typed box.
 - A dropped switch does not repaint while a typed box is open — the reader may
   be typing into it, and a rebuild from state would seed it from the server's
-  draft, erasing what the client alone holds. With no typed box open it **does**
-  repaint, which is the only way a card whose ack was dropped catches up before
-  the reader answers something.
+  draft, erasing what the client alone holds. With no typed box open it repaints
+  on the standalone and inline surfaces, so a card whose ack Feishu discarded can
+  catch up. **A claimed Session Snapshot does not**: its wrapper repaints only on
+  a state change (below), so a snapshot whose ack was dropped stays on the
+  previous question until an answer click changes the state.
 - A switch's paint is the callback ack, like every card interaction. Feishu
   discards an ack that misses its budget, and the freeze that protects the open
   box also stops a background repaint from repairing the card, so a dropped ack

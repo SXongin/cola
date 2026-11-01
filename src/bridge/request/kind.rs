@@ -1593,12 +1593,17 @@ impl RequestKind for QuestionKind {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
                 let toast = switch_toast(target, switched, &paint.done);
-                // Only a switch that OPENED something repaints. A dropped one
-                // (stale, already answered, already open) must not replace the
-                // card: the reader may be typing into the box that is open NOW,
-                // and a rebuild from state would seed it from the server's
-                // draft — erasing what the client alone holds.
-                if matches!(switched, SwitchApplied::Refused | SwitchApplied::Stale) {
+                // A dropped switch (stale, already answered, already open)
+                // repaints only when nothing can be lost: with no typed box open
+                // the repaint is what lets a card whose ack Feishu discarded
+                // catch up. While a box IS open it must not — the rebuild would
+                // seed it from the server's draft and erase what the client
+                // alone holds.
+                let typed_box_open =
+                    crate::feishu::card::question::open_index(req.questions.len(), &paint.done, paint.open)
+                        .and_then(|open| req.questions.get(open))
+                        .is_some_and(crate::feishu::card::question::renders_typed_input);
+                if matches!(switched, SwitchApplied::Refused | SwitchApplied::Stale) && typed_box_open {
                     return Some(CardActionResult {
                         card: None,
                         toast: Some(toast),
@@ -1833,8 +1838,8 @@ fn switch_toast(target: usize, applied: SwitchApplied, done: &[bool]) -> String 
         SwitchApplied::Stale => "已按最新的选择更新".to_string(),
         // An index past the end can only come from a stale card: it names no
         // question, so it cannot be called answered.
-        SwitchApplied::Refused if target >= done.len() => "已更新到最新状态".to_string(),
-        SwitchApplied::Refused if done[target] => "这道题已经答完".to_string(),
+        SwitchApplied::Refused if target >= done.len() => "这张卡片已过期".to_string(),
+        SwitchApplied::Refused if done.get(target).copied().unwrap_or(false) => "这道题已经答完".to_string(),
         SwitchApplied::Refused => format!("已经停在第 {} 题", target + 1),
     }
 }
@@ -2157,6 +2162,33 @@ mod tests {
         assert!(
             text.contains("1. 问题 1"),
             "the folded question keeps its panel: {text}"
+        );
+    }
+
+    /// A switch click's toast names what happened — including the arms a stale
+    /// card can reach.
+    #[test]
+    fn a_switch_toast_names_the_outcome() {
+        assert_eq!(
+            switch_toast(1, SwitchApplied::Opened, &[false, false]),
+            "已切到第 2 题"
+        );
+        assert_eq!(
+            switch_toast(1, SwitchApplied::Stale, &[false, false]),
+            "已按最新的选择更新"
+        );
+        // Out of range: the card names a question that no longer exists.
+        assert_eq!(
+            switch_toast(9, SwitchApplied::Refused, &[false, false]),
+            "这张卡片已过期"
+        );
+        assert_eq!(
+            switch_toast(1, SwitchApplied::Refused, &[false, true]),
+            "这道题已经答完"
+        );
+        assert_eq!(
+            switch_toast(1, SwitchApplied::Refused, &[false, false]),
+            "已经停在第 2 题"
         );
     }
 
