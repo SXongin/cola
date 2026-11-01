@@ -30,6 +30,7 @@ pub(crate) mod discovery;
 pub(crate) mod error;
 pub(crate) mod lifecycle;
 pub(crate) mod model_surface;
+pub(crate) mod preconditions;
 pub(crate) mod read_model;
 pub(crate) mod schema;
 pub(crate) mod threads;

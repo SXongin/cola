@@ -83,6 +83,10 @@ flate2 = "1"
 tar = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+# A safe wrapper over `OpenProcessToken` + `GetTokenInformation(TokenElevation)`
+# for `cola doctor`'s elevation precondition (ticket #952): this crate forbids
+# `unsafe` outside tests, and `windows-sys` exposes those calls only as `unsafe`.
+is_elevated = "0.1"
 # Safe handle-identity comparison (`opened_stays_beneath`): the stable
 # `MetadataExt` volume/file-index accessors are still nightly-only.
 same-file = "1"
