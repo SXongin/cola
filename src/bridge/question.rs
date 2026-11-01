@@ -37,11 +37,16 @@ pub struct QuestionState {
     drafts: Vec<String>,
 }
 
+/// The most characters one draft may hold. It mirrors the answer box's
+/// `max_length` (`custom_answer_elements`), which only the CLIENT enforces — the
+/// server caps it again so a stale or hand-made submit cannot seed a value every
+/// later repaint must render.
+const DRAFT_MAX_CHARS: usize = 500;
+
 /// What a question block paints: the display selection per slot, which
 /// questions are finalized, which one is open and the unsubmitted draft in its
 /// box. One value so every render seam (standalone card, inline block, snapshot
-/// block, the clicked card's ack) passes the same four facts in one piece.
-#[derive(Clone, Debug, PartialEq, Default)]
+/// block, the clicked card's ack) passes the same four facts in one piece.#[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) struct QuestionPaint {
     pub display: Vec<Option<Vec<String>>>,
     pub done: Vec<bool>,
@@ -104,12 +109,15 @@ impl QuestionState {
 
     /// Record the text a switch submit carried for question `index`. A draft
     /// for a finalized question is dropped: the reader cannot be typing into a
-    /// field the card no longer renders.
+    /// field the card no longer renders. The text is capped at the box's own
+    /// limit: the input's `max_length` is enforced by the CLIENT, so a stale or
+    /// hand-made submit could otherwise park an arbitrarily large string here,
+    /// and every later repaint would render it back into the card's JSON.
     pub(crate) fn record_draft(&mut self, index: usize, text: &str) {
         if index >= self.drafts.len() || self.answers[index].is_some() {
             return;
         }
-        self.drafts[index] = text.to_string();
+        self.drafts[index] = text.chars().take(DRAFT_MAX_CHARS).collect();
     }
 
     /// Open question `target` (the switch submit's destination). Refused — with
@@ -619,6 +627,23 @@ mod tests {
         assert!(!state.switch_open(9), "an index past the end cannot open");
         assert!(!state.switch_open(0), "question 0 is already open");
         assert_eq!(state.open(), Some(0));
+    }
+
+    /// The draft cap: the box's `max_length` is client-side, so a stale or
+    /// hand-made submit must not park an unbounded string that every later
+    /// repaint renders back into the card.
+    #[test]
+    fn a_draft_is_capped_at_the_box_limit() {
+        let mut state = state_with(&[false]);
+        let long = "字".repeat(DRAFT_MAX_CHARS + 500);
+        state.record_draft(0, &long);
+        assert_eq!(
+            state.paint().drafts[0].chars().count(),
+            DRAFT_MAX_CHARS,
+            "an oversized draft is clipped, not stored whole"
+        );
+        state.record_draft(0, "短的");
+        assert_eq!(state.paint().drafts[0], "短的", "a normal draft is kept verbatim");
     }
 
     /// The draft belongs to an UNANSWERED question: a stale submit for a
