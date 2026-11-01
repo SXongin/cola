@@ -53,8 +53,14 @@ fn draft_max_chars(index: usize, request: &crate::backend::types::QuestionReques
 
 /// What a question block paints: the display selection per slot, which
 /// questions are finalized, which one is open and the unsubmitted draft in its
-/// box. One value so every render seam (standalone card, inline block, snapshot
-/// block, the clicked card's ack) passes the same four facts in one piece.
+/// box. The flow builds ONE of these per click and hands the same four facts to
+/// every render seam (standalone card, inline block, snapshot block, the clicked
+/// card's ack).
+///
+/// The seams take the slices, not this type: `feishu` renders the card and must
+/// not depend on `bridge` types (the dependency runs the other way), so the
+/// bridge unpacks the paint at the boundary. Keep the field meanings here and
+/// the card layer's own vocabulary in `feishu::card::question`.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub(crate) struct QuestionPaint {
     pub display: Vec<Option<Vec<String>>>,

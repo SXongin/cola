@@ -1545,30 +1545,53 @@ impl RequestKind for QuestionKind {
                         // taps racing on the pre-switch card (both carrying Q0's
                         // text) must not let the older one overwrite the newer
                         // choice once it lands last.
-                        let from = drafts.first().map(|(index, _)| *index);
-                        if from.is_some_and(|from| state.open() != Some(from)) {
-                            return SwitchApplied::Stale;
+                        // Which box the switch rode: the button name carries it
+                        // (a submit may deliver no `form_value` at all), and the
+                        // payload's input name is the fallback for a card
+                        // rendered before that segment existed.
+                        let from = value
+                            .get("from_index")
+                            .and_then(|v| v.as_u64())
+                            .map(|i| i as usize)
+                            .or_else(|| drafts.first().map(|(index, _)| *index));
+                        let stale = match from {
+                            // The box it rides is no longer the open question.
+                            Some(from) => state.open() != Some(from),
+                            // No box at all: a boolean question's switch carries
+                            // none. Fine unless the question open NOW renders a
+                            // typed box — repainting would recreate it and erase
+                            // what the Host is typing.
+                            None => state.open().is_some_and(|open| {
+                                state
+                                    .request()
+                                    .questions
+                                    .get(open)
+                                    .is_some_and(crate::feishu::card::question::renders_typed_input)
+                            }),
+                        };
+                        if stale {
+                            return (SwitchApplied::Stale, state.paint());
                         }
                         for (index, text) in drafts {
                             state.record_draft(index, text);
                         }
-                        if state.switch_open(target) {
+                        let applied = if state.switch_open(target) {
                             SwitchApplied::Opened
                         } else {
                             SwitchApplied::Refused
-                        }
+                        };
+                        // Painted inside the SAME acquisition: a second read
+                        // could observe a newer click's state and repaint with
+                        // a paint that no longer matches what this submit did.
+                        (applied, state.paint())
                     })
                     .await;
-                let Some(switched) = switched else {
+                let Some((switched, paint)) = switched else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
                 let Some(req) = flow.question_request(req_id).await else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
-                let paint = flow
-                    .with_question_state(req_id, |state| state.paint())
-                    .await
-                    .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(req.questions.len()));
                 let toast = switch_toast(target, switched, &paint.done);
                 // Only a switch that OPENED something repaints. A dropped one
                 // (stale, already answered, already open) must not replace the
