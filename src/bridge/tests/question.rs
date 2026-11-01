@@ -2082,7 +2082,7 @@ async fn switching_questions_carries_the_typed_draft() {
             "event": {
                 "action": {
                     "tag": "button",
-                    "name": format!("open|que_switch|ses_1|{target}"),
+                    "name": format!("open|que_switch|ses_1|{target}|{from}"),
                     "form_value": { format!("custom_{from}"): draft },
                 }
             }
@@ -2312,5 +2312,89 @@ async fn a_late_switch_from_a_question_that_is_no_longer_open_is_dropped() {
         card_inputs(&card)[0]["default_value"],
         "最新",
         "the newer draft stands, the stale text never reached a box: {card}"
+    );
+}
+
+/// A switch on a SNAPSHOT-claimed request: the wrapper rebuilds the card only
+/// when the question state actually changed, so a stale duplicate cannot rebuild
+/// the card and erase text the Host has typed into the box that is open now.
+#[tokio::test]
+async fn a_stale_switch_on_a_claimed_snapshot_does_not_rebuild_the_card() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let backend = Arc::new(MockBackend::new(realistic_parts()));
+    let platform = Arc::new(RecordingPlatform::new());
+    let app = Arc::new(App::new(cfg, backend.clone(), platform).unwrap());
+
+    let typed = |n: usize| crate::backend::types::QuestionInfo {
+        question: format!("问题 {n}"),
+        header: format!("h{n}"),
+        options: vec![crate::backend::types::QuestionOption {
+            label: format!("/a{n}"),
+            ..Default::default()
+        }],
+        kind: crate::backend::types::FormFieldKind::String,
+        custom: None,
+        ..Default::default()
+    };
+    let request = crate::backend::types::QuestionRequest {
+        id: "que_snap".into(),
+        session_id: "ses_snap".into(),
+        questions: vec![typed(1), typed(2)],
+        ..Default::default()
+    };
+    app.question.remember_question(&request, "/work").await;
+    app.core.snapshot_claims.lock().await.claim(
+        "mid_snap",
+        "已接管",
+        "接管",
+        &crate::bridge::snapshot::SnapshotData {
+            session_id: "ses_snap".into(),
+            directory: "/work".into(),
+            status: None,
+            waiting: false,
+            pending: vec![crate::bridge::request::kind::PendingRequest::Question(
+                request.clone(),
+            )],
+            pending_elsewhere: None,
+            pending_overflow: crate::bridge::snapshot::PendingOverflow::None,
+            tail: Vec::new(),
+            newest_user_anchor: None,
+            newest_user_is_cola_authored: false,
+        },
+        None,
+    );
+
+    // A switch carries the box it was submitted with. Both callbacks omit the
+    // directory, so the wrapper's liveness check takes its "unknown → still
+    // pending" arm, which is the branch that used to rebuild unconditionally.
+    let switch = |target: u64, draft: &str| {
+        let mut value = serde_json::json!({
+            "action": "question",
+            "reply": "open",
+            "request_id": "que_snap",
+            "session_id": "ses_snap",
+            "question_index": target,
+        });
+        value["form_value"] = serde_json::Value::Object(serde_json::Map::from_iter([(
+            "custom_0".to_string(),
+            serde_json::json!(draft),
+        )]));
+        value
+    };
+
+    // The first switch changes the state, so the snapshot IS repainted.
+    let first = app.host_action(switch(1, "草稿")).await.expect("an ack");
+    assert_eq!(first.toast.as_deref(), Some("已切到第 2 题"));
+    assert!(first.card.is_some(), "state changed: the snapshot mirrors it");
+
+    // The duplicate arrives late with the same (now stale) box.
+    let stale = app.host_action(switch(1, "草稿")).await.expect("an ack");
+    assert_eq!(stale.toast.as_deref(), Some("已按最新的选择更新"));
+    assert!(
+        stale.card.is_none(),
+        "state unchanged: the snapshot must NOT be rebuilt (it would recreate \
+         the open box and erase what the Host is typing)"
     );
 }

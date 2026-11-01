@@ -1844,6 +1844,24 @@ impl RequestFlow {
                 None => false,
             };
 
+        // A snapshot repaint must MIRROR a state change, not merely accompany a
+        // click: Feishu rebuilds every input when the card's body is replaced,
+        // so a rebuild on a click that changed nothing wipes whatever the Host
+        // has typed into the block's box. Captured before the click mutates it.
+        let state_before = match claimed_message.as_deref() {
+            Some(message_id) => {
+                let pending = handles
+                    .requests
+                    .snapshot_claims
+                    .lock()
+                    .await
+                    .host_pending(message_id)
+                    .unwrap_or_default();
+                Some(self.live_snapshot_state(&pending).await)
+            }
+            None => None,
+        };
+
         let mut r = self
             .kind
             .handle_action(
@@ -1887,7 +1905,8 @@ impl RequestFlow {
                 // The click recorded state (question) or was a no-op
                 // (double-click): keep the block and show the live answer
                 // state, so the snapshot mirrors the standalone card's
-                // 已选/✅ markers.
+                // 已选/✅ markers — unless nothing changed, in which case the
+                // rebuild would only wipe an open box's typed text.
                 let pending = handles
                     .requests
                     .snapshot_claims
@@ -1896,12 +1915,24 @@ impl RequestFlow {
                     .host_pending(&message_id)
                     .unwrap_or_default();
                 let state = handles.requests.question.live_snapshot_state(&pending).await;
-                result.card = handles
-                    .requests
-                    .snapshot_claims
-                    .lock()
-                    .await
-                    .rebuild(&message_id, &state);
+                // A repaint mirrors a state change. A click that left the state
+                // alone (a stale or dropped switch, a double-click) must not
+                // rebuild: Feishu recreates every input, so the rebuild would
+                // erase text the Host has typed into the open box.
+                if state_before.as_ref() != Some(&state) {
+                    result.card = handles
+                        .requests
+                        .snapshot_claims
+                        .lock()
+                        .await
+                        .rebuild(&message_id, &state);
+                } else {
+                    // Nothing changed, so the snapshot must stay exactly as it
+                    // is. The handler's card, if any, is a STANDALONE result
+                    // (a replay or a stale notice) — letting it replace this
+                    // message would overwrite the whole snapshot.
+                    result.card = None;
+                }
             } else {
                 // Resolved: drop the block from the snapshot and patch it in
                 // place — no new message. `resolve` does the whole transition

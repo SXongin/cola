@@ -90,15 +90,16 @@ fn status_chip_element(
 /// the flow's current state so the block mirrors the standalone question
 /// card's 已选/✅ markers; the initial adopt-time snapshot passes nothing (all
 /// questions open).
-#[derive(Default, Clone)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct QuestionBlockState {
     /// The displayed answers per question slot (locked answers + live
     /// multi-select toggles).
     pub display: Vec<Option<Vec<String>>>,
     /// Whether each question slot is finalized (answered).
     pub done: Vec<bool>,
-    /// The question rendered open (the reader's switch choice, resolved against
-    /// `done`) — mirrors [`crate::bridge::question::QuestionPaint`].
+    /// The question the reader last switched to, unresolved — the renderer
+    /// resolves it against `done` (`question::open_index`). Mirrors
+    /// [`crate::bridge::question::QuestionPaint::open`].
     pub open: usize,
     /// The unsubmitted text per question, seeded into the open question's box.
     pub drafts: Vec<String>,

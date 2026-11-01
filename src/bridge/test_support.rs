@@ -4646,9 +4646,6 @@ pub(crate) fn card_tags<'a>(card: &'a serde_json::Value, tag: &str) -> Vec<&'a s
 /// Every `input` element anywhere on the card, in document order — the question
 /// card's boxes sit inside its one root-level form (issue #917 part 3), so a
 /// top-level scan would miss them.
-/// Every `input` element anywhere on the card, in document order — the question
-/// card's boxes sit inside its one root-level form (issue #917 part 3), so a
-/// top-level scan would miss them.
 pub(crate) fn card_inputs(card: &serde_json::Value) -> Vec<&serde_json::Value> {
     card_tags(card, "input")
 }

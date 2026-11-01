@@ -427,18 +427,26 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                     val["directory"] = serde_json::Value::String(dir.to_string());
                 }
                 val
-            } else if parts[0] == "open" && parts.len() == 4 {
+            } else if parts[0] == "open" && matches!(parts.len(), 4 | 5) {
                 // A switch between questions (issue #917 part 3): the folded
                 // question's 作答这道题 button submits the card's one form, so
-                // the routing is in the name ("open|<req>|<ses>|<qi>"); the
-                // typed draft arrives as `form_value` below.
-                serde_json::json!({
+                // the routing is in the name ("open|<req>|<ses>|<qi>[|<from>]").
+                // `from` — the question whose box the switch rode — is part of
+                // the name because a submit may deliver no `form_value` at all
+                // (an empty box), and the guard that drops a superseded switch
+                // cannot infer it from the payload. The typed draft, when there
+                // is one, arrives as `form_value` below.
+                let mut val = serde_json::json!({
                     "action": "question",
                     "reply": "open",
                     "request_id": parts[1],
                     "session_id": parts[2],
                     "question_index": parts[3].parse::<u64>().ok()?,
-                })
+                });
+                if let Some(from) = parts.get(4).and_then(|f| f.parse::<u64>().ok()) {
+                    val["from_index"] = serde_json::Value::from(from);
+                }
+                val
             } else if parts[0] != "submit" || !(parts.len() == 4 || parts.len() == 5) {
                 // Form submit callbacks don't always deliver the button `value`;
                 // the routing payload is encoded in the button `name`
@@ -1119,6 +1127,22 @@ mod tests {
         assert!(
             value.get("answer").is_none(),
             "a switch carries drafts, not an answer: {value}"
+        );
+        // The name's fifth segment is the box the switch rode — the guard needs
+        // it even when an empty box delivers no `form_value` at all.
+        let named = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": { "tag": "button", "name": "open|que_1|ses_1|2|1" }
+            }
+        }"#;
+        let value = extract_card_action_value(named.as_bytes()).expect("value extracted");
+        assert_eq!(value["reply"], "open");
+        assert_eq!(value["question_index"], 2, "the target is the fourth segment");
+        assert_eq!(value["from_index"], 1, "the origin is the fifth");
+        assert!(
+            value.get("form_value").is_none(),
+            "an empty box may deliver nothing: {value}"
         );
 
         // Clearing the box before switching forwards the empty string.

@@ -607,7 +607,9 @@ pub fn question_elements(
             // open question's typed text travels with it.
             let mut block: Vec<serde_json::Value> = form.split_off(block_start);
             if !finalized && !is_open {
-                block.push(switch_button(request_id, session_id, i));
+                // A fold only exists while some question is open, so the
+                // resolved open question is the box this switch rides.
+                block.push(switch_button(request_id, session_id, i, current.unwrap_or(open)));
                 form.push(super::shell::collapsible_panel_elements(
                     &format!("{}. {}", i + 1, question_label(q, 40)),
                     std::mem::take(&mut block),
@@ -677,13 +679,16 @@ fn draft_of(drafts: &[String], index: usize) -> &str {
 /// question to open. It rides the button `name` ("open|req|ses|qi") because a
 /// form submit does not deliver the button `value`; the directory stays out of
 /// it, exactly like `submit_name` (Feishu caps `name` at 100 chars).
-fn switch_button(request_id: &str, session_id: &str, index: usize) -> serde_json::Value {
+fn switch_button(request_id: &str, session_id: &str, index: usize, from: usize) -> serde_json::Value {
     json!({
         "tag": "button",
         "text": { "tag": "plain_text", "content": "▸ 作答这道题" },
         "type": "default",
         "form_action_type": "submit",
-        "name": submit_name("open", request_id, session_id, index),
+        // `from` rides the name: a submit may deliver no `form_value` at all
+        // (an empty box), and the guard that drops a superseded switch needs to
+        // know which box it rode. Still short of the 100-char `name` cap.
+        "name": format!("open|{request_id}|{session_id}|{index}|{from}"),
         "value": {
             "action": "question",
             "reply": "open",
@@ -2163,7 +2168,8 @@ mod tests {
             assert_eq!(switch["form_action_type"], "submit");
             assert_eq!(
                 switch["name"],
-                format!("open|que_1|ses_1|{}", switch["value"]["question_index"])
+                format!("open|que_1|ses_1|{}|0", switch["value"]["question_index"]),
+                "the name carries the target AND the box the switch rode"
             );
         }
         // The reject control stays last, below the open question.
@@ -2383,7 +2389,10 @@ mod tests {
             .find(|e| e["tag"] == "button" && e["value"]["reply"] == "open")
             .expect("the folded question offers its switch");
         assert_eq!(switch["value"]["question_index"], 0);
-        assert_eq!(switch["name"], "open|que_1|ses_1|0");
+        assert_eq!(
+            switch["name"], "open|que_1|ses_1|0|1",
+            "target 0, riding question 2's open box"
+        );
         assert_eq!(
             switch["form_action_type"], "submit",
             "the switch must submit the form so the draft travels with it"

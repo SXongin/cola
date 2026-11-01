@@ -41,7 +41,7 @@ form                                   ← the card's only form, at the body's t
   panel ▸    2. 问题二                  ← folded; its body is the same block minus the box
     markdown  **2. 问题二** + the option bullets
     buttons   options …                 ← answering by option still works
-    button    ▸ 作答这道题 (submit, name = "open|req|ses|1")
+    button    ▸ 作答这道题 (submit, name = "open|req|ses|1|0")
   button     🚫 无法回答
 ```
 
@@ -50,6 +50,10 @@ switch target. `question::open_index` resolves it — the chosen one while it is
 still unanswered, otherwise the first unanswered one — and is the ONE predicate
 both the renderer and the typed-answer freeze read, so the card and the freeze
 cannot disagree about which question is open.
+
+The switch name's last segment is the question whose box it rode: a submit may
+deliver no `form_value` at all (an empty box), and the guard below needs to know
+which box was on screen.
 
 **2. A draft rides the switch, keyed by its own name.** The submit carries the
 open question's box, so the handler files the text under the input's name
@@ -70,10 +74,13 @@ are free.
 
 - Typing into a folded question costs two taps (expand, 作答这道题) and saves
   answering the earlier questions first.
-- Every question block is a form now, even one with no input; a question block holds
-  exactly one, and a `collapsible_panel` never gets one (200621). A Session
-  Snapshot can carry several pending blocks, so it carries one form **per
-  block** — never one per card.
+- Every **answerable** question block is a form now, even one with no input; a
+  block holds exactly one, and a `collapsible_panel` never gets one (200621). An
+  uncollectable block has none — there is nothing to type, and its decline is a
+  plain button. A Session Snapshot can carry several pending blocks, so it
+  carries one form **per block**: that shape predates this decision, which is
+  why several sibling forms on one card are known to be accepted (before this
+  change each question's form held its own input).
 - The switch is a user-initiated repaint, and it saves the draft before painting.
   It writes through `refresh_question_block`, never the render pass, so ADR-0093's
   freeze — which stands down for no background paint while a box is open — cannot
@@ -82,22 +89,36 @@ are free.
   non-submit click carries no `form_value`, and its repaint rebuilds the box.
   That is unchanged from before this decision; only a **switch** preserves a
   draft.
+- Two small rules the state keeps so a callback cannot shape the card: a stored
+  draft is capped at its box's own `max_length` (500 for free text, 40 for a
+  number), because that limit is enforced by the client alone; and a numeric
+  answer is parsed after trimming surrounding whitespace, so a box that carried a
+  newline (or a paste) cannot turn `42` into an unanswered field that the card
+  has already marked done.
 - The question block's interaction is stateful per request: `QuestionState`
   (handler side) and `PendingQuestion` (render side) both carry `open` and
   `drafts`, and the snapshot state mirrors them — otherwise a repaint would show
   a different question than the click meant to act on.
 - A switch is honoured only while it still carries the box of the question that
-  is open: two taps racing on the same pre-switch card keep the **first to
-  land** and drop the other, so the winner's draft is never overwritten by the
-  loser's. With no box to carry (a boolean open question) there is nothing to
-  protect, and arrival order decides. A dropped switch does not repaint the card
-  — the reader may be typing into the box that is open now, and a rebuild from
-  state would seed it from the server's draft, erasing what the client alone
-  holds.
+  is open (the name's last segment): two taps racing on the same pre-switch card
+  keep the **first to land** and drop the other, so the winner's draft is never
+  overwritten by the loser's. A switch that carries no box (a boolean open
+  question) is fine unless the question open now renders a typed box. With
+  nothing to protect, arrival order decides. A dropped switch does not repaint
+  the card — the reader may be typing into the box that is open now, and a
+  rebuild from state would seed it from the server's draft, erasing what the
+  client alone holds.
 - A switch's paint is the callback ack, like every card interaction. Feishu
   discards an ack that misses its budget, and the freeze that protects the open
   box also stops a background repaint from repairing the card, so a dropped ack
-  leaves the previous render standing until the next tap.
+  leaves the previous render standing until the next tap. Any answer click
+  re-syncs the card, because it changes the state.
+- A **Session Snapshot** repaints only when the question state actually changed:
+  the wrapper compares the snapshot's question state before and after the click
+  and leaves the card alone when the two match. Older code rebuilt on every
+  click, which recreated the body's inputs and silently erased whatever the Host
+  had typed into the open box — a stale or duplicate switch (or a double-click)
+  was enough to trigger it.
 - None of this is observable in `cargo test` beyond element order and the
   callback payloads the unit tests pin. Whether the draft actually survives on
   the client is a device observation (Android 14 / Feishu 8.4.9), like every
