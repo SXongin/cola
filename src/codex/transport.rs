@@ -690,11 +690,23 @@ async fn spawn_proxy(binary: &Path, socket: &Path) -> Result<(ChildIo, Child)> {
 
 /// Drain the proxy child's stderr to the log. Its only writer is `codex`'s own
 /// diagnostics on a failure; without this the operator sees a bare exit code.
+///
+/// Bytes are read to `\n` and decoded lossily: a `lines()` reader stops at the
+/// first non-UTF-8 line, which would leave the pipe undrained and block the
+/// child mid-relay.
 fn watch_proxy_stderr(stderr: ChildStderr) {
     tokio::spawn(async move {
-        let mut lines = tokio::io::BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::warn!("codex app-server proxy: {line}");
+        let mut stderr = tokio::io::BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match stderr.read_until(b'\n', &mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let text = String::from_utf8_lossy(&line);
+                    tracing::warn!("codex app-server proxy: {}", text.trim_end());
+                }
+            }
         }
     });
 }
@@ -1052,9 +1064,14 @@ mod tests {
     }
 
     /// The hermetic acceptance path (#949): a real `codex app-server proxy`
-    /// child connects to the fake daemon's AF_UNIX socket, the WebSocket
-    /// handshake completes over its stdio, a request gets its response, and a
-    /// server-initiated request is answered with the server's own id.
+    /// child connects to the fake daemon, the WebSocket handshake completes
+    /// over its stdio, a request gets its response, and a server-initiated
+    /// request is answered with the server's own id.
+    ///
+    /// On unix the fake daemon is a real AF_UNIX socket behind a symlinked
+    /// control path. On Windows stable Rust cannot bind AF_UNIX, so the relay
+    /// is handed a `tcp://` target instead (see [`ProxyDaemon`]); that is the
+    /// same child/handshake seam, not the AF_UNIX-on-Windows proof (#953).
     #[tokio::test]
     async fn the_transport_handshakes_and_correlates_through_a_real_proxy_child() {
         let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
@@ -1214,14 +1231,19 @@ mod tests {
         drop(connection);
     }
 
-    /// A handshake that times out strands a real child mid-handshake: no
+    /// A handshake cancelled mid-flight strands a real child: no
     /// `ConnectionInner` exists yet, and the real proxy keeps running while its
     /// socket side stays open. The handshake-failure guard must kill and reap
-    /// it. The fake daemon here accepts and never answers, and the relay
-    /// fixture does not exit on its own, so removing the guard leaves the pid
-    /// alive and this test fails.
+    /// it.
+    ///
+    /// The dial gets a generous budget and is **aborted once the child has been
+    /// observed**, rather than racing a short timeout against a process-table
+    /// scan on a slow runner. Aborting drops the same future a timeout would,
+    /// so the drop path under test is unchanged. The fake daemon accepts and
+    /// never answers, and the relay fixture does not exit on its own, so
+    /// removing the guard leaves the pid alive and fails this test.
     #[tokio::test]
-    async fn a_timed_out_handshake_kills_and_reaps_the_proxy_child() {
+    async fn a_cancelled_handshake_kills_and_reaps_the_proxy_child() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a silent daemon");
@@ -1242,7 +1264,7 @@ mod tests {
             tokio::spawn(async move {
                 RpcConnection::open_with_proxy(
                     &Endpoint::Unix(target),
-                    Duration::from_millis(500),
+                    Duration::from_secs(5),
                     Some(&crate::codex::test_server::proxy_helper()),
                 )
                 .await
@@ -1251,22 +1273,19 @@ mod tests {
         let pid = wait_for_proxy_child(&target).await;
         assert!(crate::process::alive(pid as i32), "the proxy child runs");
 
-        let error = dial
-            .await
-            .expect("the dial task did not panic")
-            .err()
-            .expect("a silent daemon cannot complete the handshake");
+        dial.abort();
+        let joined = dial.await;
         assert!(
-            matches!(error, CodexError::Timeout(_)),
-            "the handshake times out by name: {error}"
+            joined.is_err_and(|error| error.is_cancelled()),
+            "the dial task was cancelled mid-handshake"
         );
         wait_for_pid_to_disappear(pid).await;
         let _ = release.send(());
     }
 
     /// A proxy that exits before the handshake is a transport failure. This
-    /// says nothing about reaping (the fixture exits itself); the timeout test
-    /// above is the one that proves the guard.
+    /// says nothing about reaping (the fixture exits itself); the cancellation
+    /// test above is the one that proves the guard.
     #[tokio::test]
     async fn an_immediately_exiting_proxy_cannot_handshake() {
         let error = RpcConnection::open_with_proxy(
