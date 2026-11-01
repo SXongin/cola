@@ -33,15 +33,15 @@ is a form **submit**:
 
 ```
 form                                   ← the card's only form, at the body's top level
-  markdown   **1. 问题一**
+  markdown   **1. 问题一** + the option bullets
   buttons    options …                  ← non-submit callbacks, `value` arrives
   input      custom_0  (default_value = draft[0])
   button     ✍️ 自定义   (submit, name = "submit|req|ses|0")
   hr
-  markdown   **2. 问题二**
-  panel ▸    2. 问题二                  ← folded; expanded, its body is answerable
-    buttons  options …                  ← answering by option still works
-    button   ▸ 作答这道题 (submit, name = "open|req|ses|1")
+  panel ▸    2. 问题二                  ← folded; its body is the same block minus the box
+    markdown  **2. 问题二** + the option bullets
+    buttons   options …                 ← answering by option still works
+    button    ▸ 作答这道题 (submit, name = "open|req|ses|1")
   button     🚫 无法回答
 ```
 
