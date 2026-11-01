@@ -84,10 +84,14 @@ are free.
   (handler side) and `PendingQuestion` (render side) both carry `open` and
   `drafts`, and the snapshot state mirrors them — otherwise a repaint would show
   a different question than the click meant to act on.
-- A switch is honoured only from the question that is open when the submit
-  lands: two taps racing on the same pre-switch card (both carrying the earlier
-  question's box) resolve to the newer choice, because the older submit no
-  longer rides the open question and is dropped.
+- A switch is honoured only while it still carries the box of the question that
+  is open: two taps racing on the same pre-switch card keep the **first to
+  land** and drop the other, so the winner's draft is never overwritten by the
+  loser's. With no box to carry (a boolean open question) there is nothing to
+  protect, and arrival order decides. A dropped switch does not repaint the card
+  — the reader may be typing into the box that is open now, and a rebuild from
+  state would seed it from the server's draft, erasing what the client alone
+  holds.
 - A switch's paint is the callback ack, like every card interaction. Feishu
   discards an ack that misses its budget, and the freeze that protects the open
   box also stops a background repaint from repairing the card, so a dropped ack

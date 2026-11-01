@@ -37,11 +37,19 @@ pub struct QuestionState {
     drafts: Vec<String>,
 }
 
-/// The most characters one draft may hold. It mirrors the answer box's
-/// `max_length` (`custom_answer_elements`), which only the CLIENT enforces — the
-/// server caps it again so a stale or hand-made submit cannot seed a value every
-/// later repaint must render.
-const DRAFT_MAX_CHARS: usize = 500;
+/// The most characters a question's draft may hold: the answer box's own
+/// `max_length`, which only the CLIENT enforces — the bridge caps it again so a
+/// stale or hand-made submit cannot seed a value every later repaint must render
+/// (and cannot seed a numeric box past its shorter limit).
+fn draft_max_chars(index: usize, request: &crate::backend::types::QuestionRequest) -> usize {
+    use crate::backend::types::FormFieldKind;
+    match request.questions.get(index).map(|q| q.kind) {
+        Some(FormFieldKind::Number | FormFieldKind::Integer) => {
+            crate::feishu::card::question::NUMERIC_INPUT_MAX_CHARS
+        }
+        _ => crate::feishu::card::question::CUSTOM_INPUT_MAX_CHARS,
+    }
+}
 
 /// What a question block paints: the display selection per slot, which
 /// questions are finalized, which one is open and the unsubmitted draft in its
@@ -118,7 +126,8 @@ impl QuestionState {
         if index >= self.drafts.len() || self.answers[index].is_some() {
             return;
         }
-        self.drafts[index] = text.chars().take(DRAFT_MAX_CHARS).collect();
+        let cap = draft_max_chars(index, &self.request);
+        self.drafts[index] = text.chars().take(cap).collect();
     }
 
     /// Open question `target` (the switch submit's destination). Refused — with
@@ -635,16 +644,40 @@ mod tests {
     /// repaint renders back into the card.
     #[test]
     fn a_draft_is_capped_at_the_box_limit() {
+        use crate::backend::types::{FormFieldKind, QuestionInfo};
+        let cap = crate::feishu::card::question::CUSTOM_INPUT_MAX_CHARS;
         let mut state = state_with(&[false]);
-        let long = "字".repeat(DRAFT_MAX_CHARS + 500);
+        let long = "字".repeat(cap + 500);
         state.record_draft(0, &long);
         assert_eq!(
             state.paint().drafts[0].chars().count(),
-            DRAFT_MAX_CHARS,
+            cap,
             "an oversized draft is clipped, not stored whole"
         );
         state.record_draft(0, "短的");
         assert_eq!(state.paint().drafts[0], "短的", "a normal draft is kept verbatim");
+
+        // A numeric field's box is shorter, so its cap is too: a hand-made
+        // submit must not seed a `default_value` past that limit.
+        let numeric = QuestionState::new(
+            crate::backend::types::QuestionRequest {
+                id: "q".into(),
+                session_id: "s".into(),
+                questions: vec![QuestionInfo {
+                    kind: FormFieldKind::Integer,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "/w".into(),
+        );
+        let mut numeric = numeric;
+        numeric.record_draft(0, &"7".repeat(cap));
+        assert_eq!(
+            numeric.paint().drafts[0].chars().count(),
+            crate::feishu::card::question::NUMERIC_INPUT_MAX_CHARS,
+            "a numeric draft is capped at its own box"
+        );
     }
 
     /// The draft belongs to an UNANSWERED question: a stale submit for a

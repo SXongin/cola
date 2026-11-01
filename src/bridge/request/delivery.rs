@@ -431,6 +431,13 @@ pub(super) async fn refresh_question_block(
     open: usize,
     drafts: &[String],
 ) -> Option<serde_json::Value> {
+    // The same lock the render pass takes (issue #917): applying the new paint
+    // to the accumulator and building the ack must not interleave with a flush
+    // that already passed its typed-answer check, or the older body can land
+    // after the ack and leave the card on the previous question — with the
+    // freeze then keeping it there.
+    let write_lock = cards.write_lock(host.as_deref().unwrap_or(session_id)).await;
+    let _guard = write_lock.lock().await;
     Turn::update_question_state(
         cards,
         host.as_deref().unwrap_or(session_id),
