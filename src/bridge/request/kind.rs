@@ -1366,6 +1366,16 @@ impl RequestKind for QuestionKind {
                 let Some((answered_count, paint, outcome, mutated)) = mutated else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
+                // A duplicate click (a stale confirm, a re-sent option) changed
+                // nothing, and a rebuild would recreate the open question's box
+                // from the server's draft. Answer it without touching the card.
+                if !mutated {
+                    return Some(CardActionResult {
+                        mutated,
+                        card: None,
+                        toast: Some(action_toast(reply, n - answered_count, outcome)),
+                    });
+                }
                 if answered_count == n {
                     // All questions answered → claim the request and submit.
                     // The claim is atomic: a click that loses the race re-serves
@@ -1558,6 +1568,14 @@ impl RequestKind for QuestionKind {
                         };
                         if stale {
                             return (SwitchApplied::Stale, false);
+                        }
+                        // A submit whose payload carries no text for the box it
+                        // rode is an EMPTY box: record the clear explicitly, or
+                        // the old draft would be seeded back later.
+                        if let Some(from) = from
+                            && !drafts.iter().any(|(index, _)| *index == from)
+                        {
+                            state.record_draft(from, "");
                         }
                         for (index, text) in drafts {
                             state.record_draft(index, text);
