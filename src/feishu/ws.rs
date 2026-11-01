@@ -479,8 +479,11 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
         // first-non-empty `answer` mapping below.
         if is_switch {
             val["form_value"] = serde_json::Value::Object(fv.clone());
-        } else {
-            // Typed custom answer: first non-empty input value.
+        } else if val.get("answer").is_none() {
+            // Typed custom answer: first non-empty input value. A value that
+            // already carries an answer (an option click) keeps it: the click's
+            // own answer is what the Host chose, and the draft beside it is
+            // just the box's text — never let it overwrite the choice.
             for (_, v) in fv {
                 if let Some(s) = v.as_str()
                     && !s.is_empty()
@@ -1131,6 +1134,31 @@ mod tests {
         }"#;
         let value = extract_card_action_value(cleared.as_bytes()).expect("value extracted");
         assert_eq!(value["form_value"]["custom_0"], "");
+
+        // An OPTION click's own answer is never replaced by the box's draft,
+        // even if a client ever sent both: the click is what the Host chose.
+        let both = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "value": {
+                        "action": "question",
+                        "reply": "answer",
+                        "request_id": "que_1",
+                        "session_id": "ses_1",
+                        "question_index": 0,
+                        "answer": "/a"
+                    },
+                    "form_value": { "custom_0": "打到一半" }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(both.as_bytes()).expect("value extracted");
+        assert_eq!(
+            value["answer"], "/a",
+            "an option click keeps its own answer: {value}"
+        );
     }
 
     /// Form submit callbacks may omit `action.value` entirely — the routing
