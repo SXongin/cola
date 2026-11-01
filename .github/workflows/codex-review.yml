@@ -387,6 +387,25 @@ jobs:
             exit 1
           fi
 
+      # The action's `drop-sudo` strategy denies the runner UID access to
+      # root-owned service sockets under /run with a socket ACL, which needs
+      # `/usr/bin/setfacl` (the `acl` package) and ACL support on /run. The
+      # ubuntu-26.04 image the runner moved to on 2026-11-01 fails that step
+      # (`Could not restrict access to /run/dbus/system_bus_socket`, then
+      # `/usr/bin/sudo exited with code 1`) while ubuntu-24.04 still worked the
+      # day before, so the prerequisites are asserted (and installed when the
+      # package is missing) rather than assumed.
+      - name: Ensure the sandbox prerequisites
+        run: |
+          set -euo pipefail
+          command -v setfacl >/dev/null && command -v setpriv >/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq acl util-linux
+          }
+          command -v setfacl
+          command -v setpriv
+          findmnt -no SOURCE,FSTYPE,OPTIONS /run
+
       # Bounded, and salvageable when it does not return (#530): a completed
       # review is still published if the step is cancelled at its bound; a cut
       # stream (no verdict) fails the post step instead of being published.
