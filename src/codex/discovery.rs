@@ -124,8 +124,21 @@ impl Environment {
     }
 
     /// The managed daemon binary a standard install keeps under this home.
-    pub(crate) fn package_binary(&self) -> PathBuf {
-        self.home.join(MANAGED_BINARY)
+    ///
+    /// [`MANAGED_BINARY`] is the platform-neutral suffix; Windows only runs
+    /// PE executables, so the managed package's binary is `codex.exe` there.
+    /// Resolving the extensionless path would name a file `Command` cannot
+    /// start.
+    fn package_binary(&self) -> PathBuf {
+        let path = self.home.join(MANAGED_BINARY);
+        #[cfg(windows)]
+        {
+            return path.with_extension("exe");
+        }
+        #[cfg(not(windows))]
+        {
+            path
+        }
     }
 }
 
@@ -633,7 +646,8 @@ struct ProxyBinaryAttempt {
 ///
 /// 1. the `managedCodexPath` from the daemon's own version report;
 /// 2. the managed package binary under `CODEX_HOME` ([`MANAGED_BINARY`]);
-/// 3. `codex` on `PATH`.
+/// 3. the configured CLI ([`Environment::cli`], `codex` by default), resolved
+///    through `PATH` exactly as a spawn would.
 ///
 /// `info` is the report from the discovery pass that paired the daemon with
 /// its socket, so this reuses [`daemon_version`]'s parsing instead of asking
@@ -649,7 +663,7 @@ pub(crate) fn resolve_proxy_binary(environment: &Environment, info: Option<&Daem
     select_proxy_binary(&proxy_binary_attempts(
         environment,
         info,
-        which_client(Path::new("codex")),
+        cli_proxy_step(environment),
     ))
 }
 
@@ -658,7 +672,7 @@ pub(crate) fn resolve_proxy_binary(environment: &Environment, info: Option<&Daem
 fn proxy_binary_attempts(
     environment: &Environment,
     info: Option<&DaemonInfo>,
-    on_path: Option<PathBuf>,
+    cli: ProxyBinaryAttempt,
 ) -> Vec<ProxyBinaryAttempt> {
     let reported = info
         .and_then(|info| info.managed_codex_path.clone())
@@ -679,12 +693,30 @@ fn proxy_binary_attempts(
         candidate: Some(environment.package_binary()),
         absent: None,
     };
-    let path = ProxyBinaryAttempt {
-        source: "`codex` on PATH".to_string(),
-        candidate: on_path,
-        absent: Some("not found".to_string()),
-    };
-    vec![managed, package, path]
+    vec![managed, package, cli]
+}
+
+/// The third step: the configured CLI, resolved exactly as a spawn would.
+///
+/// An explicit path is checked as given; a bare name is looked up on `PATH`
+/// (Windows resolves `codex.exe`). The label says which of the two it was, so
+/// the failure points at the right place.
+fn cli_proxy_step(environment: &Environment) -> ProxyBinaryAttempt {
+    let cli = &environment.cli;
+    let explicit = cli.components().count() > 1 || cli.is_absolute();
+    ProxyBinaryAttempt {
+        source: if explicit {
+            format!("configured CLI `{}`", cli.display())
+        } else {
+            format!("`{}` on PATH", cli.display())
+        },
+        candidate: which_client(cli),
+        absent: Some(if explicit {
+            "not an executable file".to_string()
+        } else {
+            "not found".to_string()
+        }),
+    }
 }
 
 /// Choose the first executable candidate, or one error naming every step.
@@ -699,9 +731,19 @@ fn select_proxy_binary(attempts: &[ProxyBinaryAttempt]) -> Result<PathBuf> {
     let tried = attempts
         .iter()
         .map(|attempt| match &attempt.candidate {
-            // Every executable candidate was returned above, so a path here
-            // exists but cannot be run.
-            Some(path) => format!("{} `{}` (not executable)", attempt.source, path.display()),
+            // Every executable candidate was returned above. Say which
+            // fault this one is: a missing file and a present-but-unrunnable
+            // one need different fixes.
+            Some(path) => format!(
+                "{} `{}` ({})",
+                attempt.source,
+                path.display(),
+                if path.exists() {
+                    "not executable"
+                } else {
+                    "missing"
+                }
+            ),
             None => format!(
                 "{} ({})",
                 attempt.source,
@@ -2462,7 +2504,7 @@ mod tests {
             ..DaemonInfo::default()
         };
 
-        let attempts = proxy_binary_attempts(&environment, Some(&info), Some(on_path));
+        let attempts = proxy_binary_attempts(&environment, Some(&info), cli_attempt(Some(on_path)));
         assert_eq!(
             select_proxy_binary(&attempts).expect("the reported binary"),
             managed
@@ -2481,7 +2523,7 @@ mod tests {
         let on_path = root.path().join("path-codex");
         write_executable(&on_path);
 
-        let attempts = proxy_binary_attempts(&environment, None, Some(on_path));
+        let attempts = proxy_binary_attempts(&environment, None, cli_attempt(Some(on_path)));
         assert_eq!(
             select_proxy_binary(&attempts).expect("the package binary"),
             package
@@ -2503,7 +2545,7 @@ mod tests {
             ..DaemonInfo::default()
         };
         let package = environment.package_binary();
-        let attempts = proxy_binary_attempts(&environment, Some(&info), None);
+        let attempts = proxy_binary_attempts(&environment, Some(&info), cli_attempt(None));
         let error = select_proxy_binary(&attempts).expect_err("nothing executable");
         let CodexError::ProxyBinary { tried } = error else {
             panic!("expected the named proxy-binary error, got {error}");
@@ -2518,7 +2560,12 @@ mod tests {
         );
         assert!(
             tried.contains("`codex` on PATH (not found)"),
-            "names the PATH step: {tried}"
+            "names the CLI step: {tried}"
+        );
+        assert_eq!(
+            tried.matches("(missing)").count(),
+            2,
+            "a path that does not exist is reported as missing: {tried}"
         );
         assert!(
             tried.contains("managedCodexPath") && tried.contains("managed package"),
@@ -2547,7 +2594,7 @@ mod tests {
             ..DaemonInfo::default()
         };
 
-        let attempts = proxy_binary_attempts(&environment, Some(&info), None);
+        let attempts = proxy_binary_attempts(&environment, Some(&info), cli_attempt(None));
         let error = select_proxy_binary(&attempts).expect_err("nothing spawnable");
         let CodexError::ProxyBinary { tried } = error else {
             panic!("expected the named proxy-binary error, got {error}");
@@ -2563,6 +2610,27 @@ mod tests {
         );
     }
 
+    /// Windows only runs PE executables, so the managed package candidate must
+    /// name `codex.exe`; the extensionless [`MANAGED_BINARY`] would pass the
+    /// executable predicate but fail `Command::spawn`.
+    #[cfg(windows)]
+    #[test]
+    fn the_managed_package_binary_is_a_windows_executable() {
+        let environment = test_environment(Path::new("C:\\codex-home"));
+        let package = environment.package_binary();
+        assert!(
+            package.to_string_lossy().ends_with("codex.exe"),
+            "the package binary names a Windows executable: {}",
+            package.display()
+        );
+        assert_eq!(
+            package,
+            Path::new("C:\\codex-home")
+                .join(MANAGED_BINARY)
+                .with_extension("exe")
+        );
+    }
+
     /// Resolution checks the platform's socket budget **before** any spawn:
     /// a long `CODEX_HOME` is a named precondition failure, not a proxy child
     /// that cannot dial.
@@ -2571,10 +2639,7 @@ mod tests {
     fn proxy_resolution_enforces_the_socket_budget_first() {
         let environment = Environment {
             home: PathBuf::from("C:\\").join("a".repeat(200)),
-            cli: PathBuf::from("codex"),
-            version_timeout: Duration::from_secs(5),
-            start_timeout: Duration::from_secs(5),
-            socket_ready_timeout: Duration::from_millis(500),
+            ..test_environment(Path::new("unused"))
         };
         let error = resolve_proxy_binary(&environment, None).expect_err("over the sun_path budget");
         assert!(
@@ -2583,13 +2648,28 @@ mod tests {
         );
     }
 
-    fn proxy_test_environment(root: &Path) -> Environment {
+    /// The one test `Environment`: a relocated home under `root`.
+    fn test_environment(home: &Path) -> Environment {
         Environment {
-            home: root.join("codex-home"),
+            home: home.to_path_buf(),
             cli: PathBuf::from("codex"),
             version_timeout: Duration::from_secs(5),
             start_timeout: Duration::from_secs(5),
             socket_ready_timeout: Duration::from_millis(500),
+        }
+    }
+
+    fn proxy_test_environment(root: &Path) -> Environment {
+        test_environment(&root.join("codex-home"))
+    }
+
+    /// A stand-in for the third (configured CLI / `PATH`) attempt, so the
+    /// selection tests never depend on the host's `codex`.
+    fn cli_attempt(candidate: Option<PathBuf>) -> ProxyBinaryAttempt {
+        ProxyBinaryAttempt {
+            source: "`codex` on PATH".to_string(),
+            candidate,
+            absent: Some("not found".to_string()),
         }
     }
 
@@ -2600,17 +2680,6 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
                 .expect("make it executable");
-        }
-    }
-
-    #[cfg(unix)]
-    fn test_environment(home: &Path) -> Environment {
-        Environment {
-            home: home.to_path_buf(),
-            cli: PathBuf::from("codex"),
-            version_timeout: Duration::from_secs(5),
-            start_timeout: Duration::from_secs(5),
-            socket_ready_timeout: Duration::from_millis(500),
         }
     }
 }

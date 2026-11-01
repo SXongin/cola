@@ -955,14 +955,11 @@ mod tests {
     ///
     /// Opt-in like the repository's other live suites: set
     /// `COLA_LIVE_CODEX_SOCKET` (the control socket, symlink allowed) and
-    /// `COLA_LIVE_CODEX_BIN` (the binary the daemon runs, for the schema
-    /// probe) and run `cargo test -- --ignored codex::client::tests::live_`
-    /// (or `--ignored live_initialize`). It skips with a message when the
-    /// environment is absent.
-    ///
-    /// Opt-in like the other live tests: the test needs a real daemon and
-    /// the binary the proxy child is spawned from. Unix-only because it names
-    /// an AF_UNIX control socket by path.
+    /// `COLA_LIVE_CODEX_BIN` (the binary the daemon runs; it is also the proxy
+    /// child's binary) and run `cargo test -- --ignored
+    /// codex::client::tests::live_` (or `--ignored live_initialize`). It skips
+    /// with a message when the environment is absent. Unix-only because it
+    /// names an AF_UNIX control socket by path.
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "live codex app-server: set COLA_LIVE_CODEX_SOCKET and COLA_LIVE_CODEX_BIN"]
