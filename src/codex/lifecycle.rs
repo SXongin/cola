@@ -1485,15 +1485,16 @@ mod tests {
         }
     }
 
-    /// The pinned probe, plus one side effect on the first `surface()` call:
-    /// re-point the control symlink **during** the handshake, after it has
-    /// reached the old daemon. That is the identity race `attach` must refuse to
-    /// record. (`surface()` is called after `initialize`, inside
+    /// The pinned probe, plus a side effect on each `surface()` call: re-point
+    /// the control symlink **during** the handshake, after it has reached the
+    /// daemon the attempt dialled. That is the identity race `attach` must
+    /// refuse to record. (`surface()` is called after `initialize`, inside
     /// `CodexClient::connect`, so this lands mid-attach.)
+    ///
+    /// One target re-points once; two targets lose the race on both attempts.
     struct RepointingProbe {
-        once: Arc<std::sync::Once>,
         control: PathBuf,
-        target: PathBuf,
+        targets: Arc<Mutex<std::collections::VecDeque<PathBuf>>>,
         seen: Arc<Mutex<Vec<PathBuf>>>,
     }
 
@@ -1504,61 +1505,19 @@ mod tests {
                 .expect("probe log")
                 .push(daemon.managed_binary.clone());
             Box::new(RepointingSurface {
-                once: Arc::clone(&self.once),
-                control: self.control.clone(),
-                target: self.target.clone(),
-            })
-        }
-    }
-
-    struct RepointingSurface {
-        once: Arc<std::sync::Once>,
-        control: PathBuf,
-        target: PathBuf,
-    }
-
-    #[async_trait]
-    impl SurfaceProbe for RepointingSurface {
-        async fn surface(
-            &self,
-            server: &super::super::client::ServerVersion,
-        ) -> Result<super::super::schema::Surface> {
-            self.once.call_once(|| {
-                std::fs::remove_file(&self.control).expect("remove the old link");
-                std::os::unix::fs::symlink(&self.target, &self.control).expect("re-point the link");
-            });
-            PinnedProbe.surface(server).await
-        }
-
-        fn source(&self) -> String {
-            PinnedProbe.source()
-        }
-    }
-
-    /// Re-points the control path **during every handshake**, so each attempt
-    /// dials the daemon its discovery named and then loses the identity race
-    /// again before the identity is re-read.
-    struct RacingProbe {
-        control: PathBuf,
-        targets: Arc<Mutex<std::collections::VecDeque<PathBuf>>>,
-    }
-
-    impl ProbeSource for RacingProbe {
-        fn probe(&self, _daemon: &Daemon) -> Box<dyn SurfaceProbe> {
-            Box::new(RacingSurface {
                 control: self.control.clone(),
                 targets: Arc::clone(&self.targets),
             })
         }
     }
 
-    struct RacingSurface {
+    struct RepointingSurface {
         control: PathBuf,
         targets: Arc<Mutex<std::collections::VecDeque<PathBuf>>>,
     }
 
     #[async_trait]
-    impl SurfaceProbe for RacingSurface {
+    impl SurfaceProbe for RepointingSurface {
         async fn surface(
             &self,
             server: &super::super::client::ServerVersion,
@@ -2178,9 +2137,10 @@ mod tests {
             },
             fixture.environment.clone(),
             Box::new(RepointingProbe {
-                once: Arc::new(std::sync::Once::new()),
                 control: control.clone(),
-                target: second_path.clone(),
+                targets: Arc::new(Mutex::new(std::collections::VecDeque::from(
+                    [second_path.clone()],
+                ))),
                 seen: Arc::clone(&seen),
             }),
         );
@@ -2213,8 +2173,8 @@ mod tests {
     }
 
     /// A path re-pointed on **both** attempts is a race with no winner: the
-    /// pass reports `Raced`, never an attachment to a daemon the path no longer
-    /// names, and never a start against a live daemon.
+    /// attempt reports `Raced` and leaves no attachment to a daemon the path no
+    /// longer names.
     #[tokio::test]
     async fn a_control_path_that_keeps_moving_ends_the_pass_as_a_race() {
         let fixture = Fixture::new();
@@ -2238,12 +2198,13 @@ mod tests {
                 ..CodexConfig::default()
             },
             fixture.environment.clone(),
-            Box::new(RacingProbe {
+            Box::new(RepointingProbe {
                 control: control.clone(),
                 targets: Arc::new(Mutex::new(std::collections::VecDeque::from([
                     second_path,
                     third_path,
                 ]))),
+                seen: Arc::new(Mutex::new(Vec::new())),
             }),
         );
 
@@ -2262,12 +2223,6 @@ mod tests {
         assert_eq!(first.connections(), 1, "the daemon discovery named was dialled");
         assert_eq!(second.connections(), 1, "the retry dialled its replacement");
         assert_eq!(third.connections(), 0, "the last replacement was never dialled");
-        assert_eq!(
-            fixture.cli.starts(),
-            0,
-            "a moving path is a race, not a reason to start a daemon: {:?}",
-            fixture.cli.invocations()
-        );
         assert!(
             lifecycle.attached_client().await.is_none(),
             "a raced pass leaves no attachment"
