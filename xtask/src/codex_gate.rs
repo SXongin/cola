@@ -477,10 +477,12 @@ mod tests {
             seen.contains("Authorization: Bearer test-key"),
             "the step must send the workflow's key"
         );
+        // The probe is a plain Responses call: no lane-specific header. The
+        // `x-opencode-session` the Go lane needed was dropped with the move to
+        // DeepSeek, which takes only the bearer token.
         assert!(
-            seen.to_lowercase()
-                .contains("x-opencode-session: cola-codex-gate-preflight"),
-            "the Go lane rejects a request without a session header: {seen}"
+            !seen.to_lowercase().contains("x-opencode-session"),
+            "the probe must send only what the endpoint needs: {seen}"
         );
         for field in [
             r#""model":"test-model""#,
@@ -497,7 +499,7 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "an empty key must fail the step");
         assert!(
-            log.contains("OPENCODE_API_KEY is empty"),
+            log.contains("DEEPSEEK_API_KEY is empty"),
             "the step must name the missing secret: {log}"
         );
     }
