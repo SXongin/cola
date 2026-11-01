@@ -89,6 +89,8 @@ impl PendingRequest {
                     crate::feishu::snapshot_card::QuestionBlockState {
                         display: vec![None; n],
                         done: vec![false; n],
+                        open: 0,
+                        drafts: vec![String::new(); n],
                     },
                 );
                 crate::feishu::card::question::question_elements(
@@ -100,6 +102,8 @@ impl PendingRequest {
                     directory,
                     &state.display,
                     &state.done,
+                    state.open,
+                    &state.drafts,
                 )
             }
         }
@@ -1105,13 +1109,10 @@ impl RequestKind for QuestionKind {
         // restart): the persisted card may show 已选 markers whose toggles did
         // not survive, and a card that lies about a selection is worse than an
         // un-answered one.
-        let (display, done) = flow
-            .with_question_state(&q.id, |state| {
-                let (_, display, done) = state.merge();
-                (display, done)
-            })
+        let paint = flow
+            .with_question_state(&q.id, |state| state.paint())
             .await
-            .unwrap_or_else(|| (vec![None; q.questions.len()], vec![false; q.questions.len()]));
+            .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
         let elements = crate::feishu::card::question::question_elements(
             &q.title,
             q.uncollectable,
@@ -1119,8 +1120,10 @@ impl RequestKind for QuestionKind {
             &q.session_id,
             &q.questions,
             dir,
-            &display,
-            &done,
+            &paint.display,
+            &paint.done,
+            paint.open,
+            &paint.drafts,
         );
         cards
             .card_handles
@@ -1142,14 +1145,21 @@ impl RequestKind for QuestionKind {
         };
         // Restore what the Host already answered: a re-hosted question keeps
         // its 已选 markers and finalized slots (ADR-0038, rule 1).
-        let (answers, done) = flow
-            .with_question_state(&q.id, |state| {
-                let (_, display, done) = state.merge();
-                (display, done)
-            })
+        let paint = flow
+            .with_question_state(&q.id, |state| state.paint())
             .await
-            .unwrap_or_else(|| (vec![None; q.questions.len()], vec![false; q.questions.len()]));
-        Turn::add_question(cards, host, q, dir, &answers, &done).await
+            .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(q.questions.len()));
+        Turn::add_question(
+            cards,
+            host,
+            q,
+            dir,
+            &paint.display,
+            &paint.done,
+            paint.open,
+            &paint.drafts,
+        )
+        .await
     }
 
     async fn add_initial_inline(
@@ -1166,13 +1176,16 @@ impl RequestKind for QuestionKind {
         // The follow seeds the adopt-time block before anything was
         // remembered, so it starts open; the remembered state is recorded
         // right after (`remember_surfaced`).
+        let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
         Turn::add_question(
             cards,
             host,
             q,
             dir,
-            &vec![None; q.questions.len()],
-            &vec![false; q.questions.len()],
+            &paint.display,
+            &paint.done,
+            paint.open,
+            &paint.drafts,
         )
         .await
     }
@@ -1189,14 +1202,17 @@ impl RequestKind for QuestionKind {
                 dir,
             );
         }
+        let paint = crate::bridge::question::QuestionPaint::blank(q.questions.len());
         crate::feishu::card::question::build_question_card(
             &q.title,
             &q.id,
             &q.session_id,
             &q.questions,
             dir,
-            &vec![None; q.questions.len()],
-            &vec![false; q.questions.len()],
+            &paint.display,
+            &paint.done,
+            paint.open,
+            &paint.drafts,
         )
     }
 
@@ -1227,13 +1243,18 @@ impl RequestKind for QuestionKind {
             let mut out = crate::feishu::snapshot_card::SnapshotQuestionState::new();
             for req in pending {
                 if let PendingRequest::Question(q) = req {
-                    let (_, display, done) = match states.get(&q.id) {
-                        Some(state) => state.merge(),
-                        None => (0, vec![None; q.questions.len()], vec![false; q.questions.len()]),
+                    let paint = match states.get(&q.id) {
+                        Some(state) => state.paint(),
+                        None => crate::bridge::question::QuestionPaint::blank(q.questions.len()),
                     };
                     out.insert(
                         q.id.clone(),
-                        crate::feishu::snapshot_card::QuestionBlockState { display, done },
+                        crate::feishu::snapshot_card::QuestionBlockState {
+                            display: paint.display,
+                            done: paint.done,
+                            open: paint.open,
+                            drafts: paint.drafts,
+                        },
                     );
                 }
             }
@@ -1355,11 +1376,11 @@ impl RequestKind for QuestionKind {
                         } else {
                             state.record_answer(index, &answer);
                         }
-                        let (count, display, done) = state.merge();
-                        (count, display, done, outcome)
+                        let count = state.merge().0;
+                        (count, state.paint(), outcome)
                     })
                     .await;
-                let Some((answered_count, display, done, outcome)) = mutated else {
+                let Some((answered_count, paint, outcome)) = mutated else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
                 if answered_count == n {
@@ -1452,8 +1473,10 @@ impl RequestKind for QuestionKind {
                                 req_id,
                                 &req,
                                 directory.unwrap_or(""),
-                                &display,
-                                &done,
+                                &paint.display,
+                                &paint.done,
+                                paint.open,
+                                &paint.drafts,
                             )
                             .await
                         }
@@ -1481,8 +1504,10 @@ impl RequestKind for QuestionKind {
                         &req.session_id,
                         &req.questions,
                         directory.unwrap_or(""),
-                        &display,
-                        &done,
+                        &paint.display,
+                        &paint.done,
+                        paint.open,
+                        &paint.drafts,
                     );
                     let mut r = CardActionResult {
                         card: Some(card),
@@ -1491,6 +1516,82 @@ impl RequestKind for QuestionKind {
                     r.toast = Some(action_toast(reply, remaining, outcome));
                     Some(r)
                 }
+            }
+            // A switch between questions (issue #917 part 3): the folded
+            // question's 作答这道题 button is a form SUBMIT, so the text in the
+            // open question's box arrives with it. Record every input the
+            // submit carried as its question's draft, open the target, and
+            // repaint — the new open question's box is seeded from that draft,
+            // so switching never loses what the Host typed.
+            "open" => {
+                let target = value.get("question_index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if flow.is_answered(&handles.requests, req_id).await {
+                    return Some(
+                        flow.answered_result(req_id)
+                            .await
+                            .unwrap_or_else(|| question_replay_card(inline)),
+                    );
+                }
+                // #130: same gate as "answer" — a state-less click must not
+                // repaint against a request cola can no longer see.
+                if let Some(result) = flow.question_gate(req_id, directory, inline).await {
+                    return Some(result);
+                }
+                let switched = flow
+                    .with_question_state(req_id, |state| {
+                        for (index, text) in draft_inputs(value) {
+                            state.record_draft(index, text);
+                        }
+                        state.switch_open(target)
+                    })
+                    .await;
+                let Some(switched) = switched else {
+                    return Some(flow.missing_question_result(directory, inline).await);
+                };
+                let Some(req) = flow.question_request(req_id).await else {
+                    return Some(flow.missing_question_result(directory, inline).await);
+                };
+                let paint = flow
+                    .with_question_state(req_id, |state| state.paint())
+                    .await
+                    .unwrap_or_else(|| crate::bridge::question::QuestionPaint::blank(req.questions.len()));
+                if inline {
+                    let card = refresh_question_block(
+                        &handles.cards,
+                        host,
+                        session_id,
+                        clicked,
+                        req_id,
+                        &req,
+                        directory.unwrap_or(""),
+                        &paint.display,
+                        &paint.done,
+                        paint.open,
+                        &paint.drafts,
+                    )
+                    .await;
+                    return Some(CardActionResult {
+                        card: match card {
+                            Some(card) => Some(card),
+                            None => ack_inline_card(&handles.cards, host, session_id).await,
+                        },
+                        toast: Some(switch_toast(target, switched, &paint.done)),
+                    });
+                }
+                Some(CardActionResult {
+                    card: Some(crate::feishu::card::question::build_question_card(
+                        &req.title,
+                        req_id,
+                        &req.session_id,
+                        &req.questions,
+                        directory.unwrap_or(""),
+                        &paint.display,
+                        &paint.done,
+                        paint.open,
+                        &paint.drafts,
+                    )),
+                    toast: Some(switch_toast(target, switched, &paint.done)),
+                })
             }
             "submit" => {
                 // Finalize with whatever was answered (empty for the rest).
@@ -1642,6 +1743,36 @@ impl RequestKind for QuestionKind {
             }
             _ => None,
         }
+    }
+}
+
+/// The typed drafts a switch submit carried. The card's one input is named
+/// `custom_<question index>`, so the name itself says which question the text
+/// belongs to — a stale card that was showing a different question open cannot
+/// misfile the draft into the wrong slot.
+fn draft_inputs(value: &serde_json::Value) -> Vec<(usize, &str)> {
+    let Some(form) = value.get("form_value").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    form.iter()
+        .filter_map(|(name, text)| {
+            let index = name.strip_prefix("custom_")?.parse::<usize>().ok()?;
+            Some((index, text.as_str()?))
+        })
+        .collect()
+}
+
+/// Toast for a switch click: names the question now open, or says why nothing
+/// moved — an already-answered target, or the one already open (only a stale or
+/// double-tapped card asks for either).
+fn switch_toast(target: usize, switched: bool, done: &[bool]) -> String {
+    if switched {
+        return format!("已切到第 {} 题", target + 1);
+    }
+    if done.get(target).copied().unwrap_or(true) {
+        "这道题已经答完".to_string()
+    } else {
+        format!("已经停在第 {} 题", target + 1)
     }
 }
 

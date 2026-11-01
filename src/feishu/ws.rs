@@ -427,6 +427,18 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
                     val["directory"] = serde_json::Value::String(dir.to_string());
                 }
                 val
+            } else if parts[0] == "open" && parts.len() == 4 {
+                // A switch between questions (issue #917 part 3): the folded
+                // question's 作答这道题 button submits the card's one form, so
+                // the routing is in the name ("open|<req>|<ses>|<qi>"); the
+                // typed draft arrives as `form_value` below.
+                serde_json::json!({
+                    "action": "question",
+                    "reply": "open",
+                    "request_id": parts[1],
+                    "session_id": parts[2],
+                    "question_index": parts[3].parse::<u64>().ok()?,
+                })
             } else if parts[0] != "submit" || !(parts.len() == 4 || parts.len() == 5) {
                 // Form submit callbacks don't always deliver the button `value`;
                 // the routing payload is encoded in the button `name`
@@ -459,13 +471,23 @@ pub(crate) fn extract_card_action_value(payload: &[u8]) -> Option<serde_json::Va
         }
     }
     if let Some(fv) = a.get("form_value").and_then(|f| f.as_object()) {
-        // Typed custom answer: first non-empty input value.
-        for (_, v) in fv {
-            if let Some(s) = v.as_str()
-                && !s.is_empty()
-            {
-                val["answer"] = serde_json::Value::String(s.to_string());
-                break;
+        let is_switch = val.get("reply").and_then(|v| v.as_str()) == Some("open");
+        // A switch carries the open question's typed draft, keyed by the input's
+        // name (`custom_<index>`) so the handler files it under the right
+        // question. It is forwarded verbatim — including an EMPTY box, which is
+        // how the Host clears a draft — so it must not go through the
+        // first-non-empty `answer` mapping below.
+        if is_switch {
+            val["form_value"] = serde_json::Value::Object(fv.clone());
+        } else {
+            // Typed custom answer: first non-empty input value.
+            for (_, v) in fv {
+                if let Some(s) = v.as_str()
+                    && !s.is_empty()
+                {
+                    val["answer"] = serde_json::Value::String(s.to_string());
+                    break;
+                }
             }
         }
         // `/switch` / `/dir` / `/sub` / `/skill` card search: the typed keyword
@@ -1065,6 +1087,50 @@ mod tests {
         assert_eq!(value["answer"], "自己写的答案");
         assert_eq!(value["question_index"], 0);
         assert_eq!(value["request_id"], "que_1");
+    }
+
+    /// A switch between questions is a form SUBMIT, so it may carry no
+    /// `action.value`; the routing is in the button `name` and the typed draft
+    /// rides `form_value` — including an EMPTY box, which is how the Host
+    /// clears a draft. It must not be folded into `answer`.
+    #[test]
+    fn a_switch_submit_forwards_the_drafts_verbatim() {
+        let payload = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "open|que_1|ses_1|2",
+                    "form_value": {
+                        "custom_0": "打到一半"
+                    }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(payload.as_bytes()).expect("value extracted");
+        assert_eq!(value["reply"], "open");
+        assert_eq!(value["question_index"], 2, "the fold names its target");
+        assert_eq!(value["request_id"], "que_1");
+        assert_eq!(value["session_id"], "ses_1");
+        assert_eq!(value["form_value"]["custom_0"], "打到一半");
+        assert!(
+            value.get("answer").is_none(),
+            "a switch carries drafts, not an answer: {value}"
+        );
+
+        // Clearing the box before switching forwards the empty string.
+        let cleared = r#"{
+            "schema": "2.0",
+            "event": {
+                "action": {
+                    "tag": "button",
+                    "name": "open|que_1|ses_1|2",
+                    "form_value": { "custom_0": "" }
+                }
+            }
+        }"#;
+        let value = extract_card_action_value(cleared.as_bytes()).expect("value extracted");
+        assert_eq!(value["form_value"]["custom_0"], "");
     }
 
     /// Form submit callbacks may omit `action.value` entirely — the routing

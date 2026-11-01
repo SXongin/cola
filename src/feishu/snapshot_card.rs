@@ -97,6 +97,11 @@ pub struct QuestionBlockState {
     pub display: Vec<Option<Vec<String>>>,
     /// Whether each question slot is finalized (answered).
     pub done: Vec<bool>,
+    /// The question rendered open (the reader's switch choice, resolved against
+    /// `done`) — mirrors [`crate::bridge::question::QuestionPaint`].
+    pub open: usize,
+    /// The unsubmitted text per question, seeded into the open question's box.
+    pub drafts: Vec<String>,
 }
 
 pub type SnapshotQuestionState = std::collections::HashMap<String, QuestionBlockState>;
