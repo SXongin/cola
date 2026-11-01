@@ -579,6 +579,7 @@ fn field_answer(field: &QuestionInfo, values: &[String]) -> Option<FormValue> {
         // f64 but cannot be represented on the wire.
         FormFieldKind::Number => values
             .first()?
+            .trim()
             .parse::<f64>()
             .ok()
             .filter(|number| number.is_finite())
@@ -587,6 +588,7 @@ fn field_answer(field: &QuestionInfo, values: &[String]) -> Option<FormValue> {
         // to `3`, a fractional value is invalid and leaves the field open.
         FormFieldKind::Integer => values
             .first()?
+            .trim()
             .parse::<f64>()
             .ok()
             .filter(|number| {
@@ -953,6 +955,22 @@ mod tests {
         assert_eq!(
             field_answer(&field("i", FormFieldKind::Integer), &["9007199254740992".into()]),
             Some(FormValue::Integer(9_007_199_254_740_992))
+        );
+        // Surrounding whitespace is not part of the number: a box that can carry
+        // a newline (a multiline input, or a paste) must not turn `42\n` into an
+        // unanswered field after the card already marked it done.
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &[" 42\n".into()]),
+            Some(FormValue::Integer(42))
+        );
+        assert_eq!(
+            field_answer(&field("n", FormFieldKind::Number), &["\n2.5 \t".into()]),
+            Some(FormValue::Number(2.5))
+        );
+        assert_eq!(
+            field_answer(&field("i", FormFieldKind::Integer), &[" \n ".into()]),
+            None,
+            "whitespace alone is still not a number"
         );
         // An unanswered slot stays unanswered in field order.
         let unanswered = build_form_answers(&questions, &[None, None, None]);
