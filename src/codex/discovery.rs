@@ -251,6 +251,20 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 /// directory is rejected because it cannot be one.
 #[cfg(windows)]
 fn windows_socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
+    windows_socket_identity_with(path, |flags| open_path(path, flags))
+}
+
+/// The identity composition, over an injectable opener.
+///
+/// Factored so a test can make the first open fail and prove the reparse-point
+/// fallback is what produces the identity. Stable `std` cannot bind an AF_UNIX
+/// socket on Windows, so this is the closest the suite can get to the object a
+/// real daemon creates.
+#[cfg(windows)]
+fn windows_socket_identity_with(
+    path: &Path,
+    mut open: impl FnMut(u32) -> std::io::Result<std::fs::File>,
+) -> Result<Option<SocketIdentity>> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -263,7 +277,7 @@ fn windows_socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
         ));
     }
 
-    let file = open_attribute_handle(path).map_err(|error| unusable_socket(path, error))?;
+    let file = open_attribute_handle_with(&mut open).map_err(|error| unusable_socket(path, error))?;
     let info = winapi_util::file::information(&file).map_err(|error| unusable_socket(path, error))?;
     Ok(Some(SocketIdentity {
         volume_serial_number: info.volume_serial_number() as u32,
@@ -273,26 +287,26 @@ fn windows_socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
 
 /// Open the object at `path` for its metadata only.
 #[cfg(windows)]
-fn open_attribute_handle(path: &Path) -> std::io::Result<std::fs::File> {
+fn open_path(path: &Path, flags: u32) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    open_attribute_handle_with(|flags| {
-        std::fs::OpenOptions::new()
-            .access_mode(0)
-            .custom_flags(flags)
-            .open(path)
-    })
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(flags)
+        .open(path)
 }
 
 /// Try the plain attributes-only open, then the reparse-point form.
 ///
 /// This mirrors `std`'s own `stat`: the AF_UNIX socket file is an NTFS reparse
 /// point, and opening it without `FILE_FLAG_OPEN_REPARSE_POINT` can fail with
-/// `ERROR_CANT_ACCESS_FILE`. Factored over the opener so the retry is testable
-/// without a real socket (stable `std` cannot bind one on Windows).
+/// `ERROR_CANT_ACCESS_FILE`. Any plain-open error is retried as a reparse point
+/// — the retry is the last attempt, and the socket file is the object that
+/// matters here. Factored over the opener so both the retry and the composition
+/// are testable without a real socket.
 #[cfg(windows)]
 fn open_attribute_handle_with(
-    mut open: impl FnMut(u32) -> std::io::Result<std::fs::File>,
+    open: &mut impl FnMut(u32) -> std::io::Result<std::fs::File>,
 ) -> std::io::Result<std::fs::File> {
     match open(FILE_FLAG_BACKUP_SEMANTICS) {
         Ok(file) => Ok(file),
@@ -336,11 +350,11 @@ pub(crate) fn check_socket_budget(socket: &Path) -> Result<()> {
     socket_path_budget(socket, WINDOWS_SOCKET_PATH_LIMIT)
 }
 
-/// A no-op on Unix: the spec's measured behaviour is that Codex publishes the
-/// socket as a symlink into a short runtime directory (`/tmp/codex-daemon-<uid>
-/// /<hash>`) on both Linux and macOS, so the path passed here is not the address
-/// the kernel stores. Windows is the only platform that binds at the published
-/// path, and it is checked above.
+/// A no-op on Unix. Spec #948's upstream facts (measured against `codex-cli`
+/// 0.166.0) say the managed daemon publishes the control endpoint as a symlink
+/// into a short runtime directory (`/tmp/codex-daemon-<uid>/<hash>`) on Unix,
+/// so the path passed here is not the address the kernel stores. Windows is the
+/// only platform that binds at the published path, and it is checked above.
 #[cfg(not(windows))]
 pub(crate) fn check_socket_budget(_socket: &Path) -> Result<()> {
     Ok(())
@@ -627,6 +641,51 @@ fn parse_info(stdout: &[u8]) -> Result<DaemonInfo> {
     })
 }
 
+/// One readiness tick's decision, factored from the I/O so every arm is
+/// testable on any platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTick {
+    /// The path names a different object than the pass snapshotted.
+    ReadyByIdentity,
+    /// The path exists, a management probe is due, and the deadline has not
+    /// passed: ask the daemon itself (Windows only).
+    Probe,
+    /// Nothing to do yet; sleep for one step.
+    Wait,
+    /// The readiness bound is spent. This outranks a due probe: a probe must
+    /// never run past the deadline.
+    Expired,
+}
+
+/// Decide one tick.
+///
+/// An identity change is success even at the deadline (it proves the start
+/// happened); expiry is checked **before** probing so a due probe cannot run
+/// past the bound; a probe is never due without a socket to ask.
+fn start_tick(identity_changed: bool, socket_present: bool, probe_due: bool, expired: bool) -> StartTick {
+    if identity_changed {
+        StartTick::ReadyByIdentity
+    } else if expired {
+        StartTick::Expired
+    } else if !socket_present {
+        StartTick::Wait
+    } else if probe_due {
+        StartTick::Probe
+    } else {
+        StartTick::Wait
+    }
+}
+
+/// Whether the management report says a daemon is actually running. A zero
+/// exit is not enough: `daemon version` also prints non-running states.
+///
+/// Upstream 0.166's report carries `"status":"running"` when the daemon serves
+/// (spec #948's measured facts); this accepts only that value.
+#[cfg(any(windows, test))]
+fn daemon_reports_running(info: &DaemonInfo) -> bool {
+    info.status == "running"
+}
+
 /// Start the daemon through Codex's own management command and return the
 /// daemon that is serving afterwards, paired with its socket identity.
 ///
@@ -678,39 +737,61 @@ pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon>
     #[cfg(windows)]
     let mut next_version_probe = tokio::time::Instant::now() + WINDOWS_READY_PROBE_STEP;
     loop {
-        if let Some(identity) = socket_identity(&socket)?
-            && Some(identity) != before
-        {
-            return discovered_after_start(environment).await;
-        }
-        // Windows: a re-created socket can reuse the old file index, so ask the
-        // daemon itself. Only a live server answers `daemon version`; the old
-        // corpse behind a leftover path does not.
+        let now = tokio::time::Instant::now();
+        let identity = socket_identity(&socket)?;
+        let identity_changed = identity.is_some() && identity != before;
+        let socket_present = identity.is_some();
         #[cfg(windows)]
-        if tokio::time::Instant::now() >= next_version_probe {
-            next_version_probe = tokio::time::Instant::now() + WINDOWS_READY_PROBE_STEP;
-            if daemon_version(environment).await.is_ok() {
-                return discovered_after_start(environment).await;
+        let probe_due = now >= next_version_probe;
+        #[cfg(not(windows))]
+        let probe_due = false;
+        match start_tick(identity_changed, socket_present, probe_due, now >= deadline) {
+            StartTick::ReadyByIdentity => return discovered_after_start(environment).await,
+            // Windows: a re-created socket can reuse the old file index, so ask
+            // the daemon itself. The probe is bounded by the time left before
+            // the deadline, and only runs when the path exists — a start that
+            // never produced a socket must not spawn the CLI at all.
+            StartTick::Probe => {
+                #[cfg(windows)]
+                {
+                    let remaining = deadline.saturating_duration_since(now);
+                    let budget = remaining.min(environment.version_timeout);
+                    if let Ok(Ok(info)) = tokio::time::timeout(budget, daemon_version(environment)).await
+                        && daemon_reports_running(&info)
+                        && let Some(identity) = identity
+                    {
+                        return Ok(DiscoveredDaemon {
+                            daemon: Daemon {
+                                socket: socket.clone(),
+                                managed_binary: managed_binary(environment, Some(&info)),
+                                info: Some(info),
+                            },
+                            identity,
+                        });
+                    }
+                    next_version_probe = tokio::time::Instant::now() + WINDOWS_READY_PROBE_STEP;
+                }
             }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            // `daemon start` is **idempotent**: a daemon that appeared between
-            // our snapshot and the command (a replacement racing the failed
-            // dial) makes the command a no-op, so no identity changes. A daemon
-            // already serving is what we asked for — return it rather than a
-            // timeout for a start that had nothing to do. The caller's attach
-            // still proves the daemon answers; a corpse behind a stale path
-            // fails there, never as "attached".
-            if let Some(daemon) = discover_daemon(environment).await? {
-                return Ok(daemon);
+            StartTick::Expired => {
+                // `daemon start` is **idempotent**: a daemon that appeared
+                // between our snapshot and the command (a replacement racing
+                // the failed dial) makes the command a no-op, so no identity
+                // changes. A daemon already serving is what we asked for —
+                // return it rather than a timeout for a start that had nothing
+                // to do. The caller's attach still proves the daemon answers; a
+                // corpse behind a stale path fails there, never as "attached".
+                if let Some(daemon) = discover_daemon(environment).await? {
+                    return Ok(daemon);
+                }
+                return Err(CodexError::Daemon(format!(
+                    "`{} app-server daemon start` reported success, but {} did not appear (or was \
+                     not replaced) within {:?}",
+                    environment.cli.display(),
+                    socket.display(),
+                    environment.socket_ready_timeout
+                )));
             }
-            return Err(CodexError::Daemon(format!(
-                "`{} app-server daemon start` reported success, but {} did not appear (or was \
-                 not replaced) within {:?}",
-                environment.cli.display(),
-                socket.display(),
-                environment.socket_ready_timeout
-            )));
+            StartTick::Wait => {}
         }
         tokio::time::sleep(SOCKET_READY_STEP).await;
     }
@@ -1512,6 +1593,49 @@ mod tests {
         assert!(error.to_string().contains("UTF-8"), "{error}");
     }
 
+    /// The Windows readiness branch is pure, so every arm is pinned here.
+    #[test]
+    fn the_readiness_tick_orders_identity_expiry_and_probe() {
+        use StartTick::*;
+
+        // A changed identity is success, even at the deadline.
+        assert_eq!(start_tick(true, true, true, true), ReadyByIdentity);
+        // Expiry outranks a due probe: no probe may run past the bound.
+        assert_eq!(start_tick(false, true, true, true), Expired);
+        assert_eq!(start_tick(false, false, false, true), Expired);
+        // A probe is due only when the path exists and the deadline is ahead.
+        assert_eq!(start_tick(false, true, true, false), Probe);
+        assert_eq!(start_tick(false, true, false, false), Wait);
+        // No socket means no probe, however due the schedule says it is.
+        assert_eq!(start_tick(false, false, true, false), Wait);
+        assert_eq!(start_tick(false, false, false, false), Wait);
+    }
+
+    /// A probe accepts only the upstream `running` state, not just a zero exit.
+    #[test]
+    fn only_a_running_daemon_report_accepts_the_probe() {
+        let running = DaemonInfo {
+            status: "running".to_string(),
+            ..DaemonInfo::default()
+        };
+        assert!(daemon_reports_running(&running));
+        for status in ["starting", "stopped", ""] {
+            let info = DaemonInfo {
+                status: status.to_string(),
+                ..DaemonInfo::default()
+            };
+            assert!(!daemon_reports_running(&info), "{status:?}");
+        }
+    }
+
+    /// The Windows constant is the platform's documented `sun_path` size; pin
+    /// it so the boundary tests cannot drift from production.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_sun_path_limit_is_108_bytes() {
+        assert_eq!(WINDOWS_SOCKET_PATH_LIMIT, 108);
+    }
+
     /// The Windows identity is the same `(volume serial number, file index)`
     /// pair for a file under two names; a rename is not a replacement.
     #[cfg(windows)]
@@ -1585,11 +1709,11 @@ mod tests {
         std::fs::write(&path, b"").expect("write the file");
 
         let mut flags = Vec::new();
-        let file = open_attribute_handle_with(|flag| {
+        let file = open_attribute_handle_with(&mut |flag| {
             flags.push(flag);
             if flags.len() == 1 {
                 // ERROR_CANT_ACCESS_FILE, the error `std`'s own `stat` retries.
-                Err(std::io::Error::from_raw_os_error(0x2ee))
+                Err(std::io::Error::from_raw_os_error(0x780))
             } else {
                 std::fs::File::open(&path)
             }
@@ -1605,12 +1729,42 @@ mod tests {
         );
 
         let mut attempts = 0;
-        let _file = open_attribute_handle_with(|_| {
+        let _file = open_attribute_handle_with(&mut |_| {
             attempts += 1;
             std::fs::File::open(&path)
         })
         .expect("the plain open succeeds");
         assert_eq!(attempts, 1, "a successful plain open is not retried");
+    }
+
+    /// The full identity composition, not just the opener: a first-open failure
+    /// must still produce the same identity through the reparse-point fallback.
+    /// Deleting the fallback from `windows_socket_identity_with` fails here.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_identity_is_read_through_the_reparse_fallback() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("object");
+        std::fs::write(&path, b"").expect("write the file");
+        let expected = socket_identity(&path).expect("identity").expect("the file");
+
+        let mut flags = Vec::new();
+        let identity = windows_socket_identity_with(&path, |flag| {
+            flags.push(flag);
+            if flags.len() == 1 {
+                Err(std::io::Error::from_raw_os_error(0x780))
+            } else {
+                open_path(&path, flag)
+            }
+        })
+        .expect("identity")
+        .expect("a file");
+        assert_eq!(identity, expected);
+        assert_eq!(
+            flags.len(),
+            2,
+            "the plain open failed, so the identity came from the fallback"
+        );
     }
 
     /// Windows is a supported discovery platform now: an existing control
