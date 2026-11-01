@@ -6053,6 +6053,14 @@ Index: src/main.rs
             Some(DIFF_TRUNCATION_NOTE),
             "the diff budget, with its clip note"
         );
+        // The render itself takes the byte budget: the fence closes bare and
+        // the note follows, and the emitted body is what the estimate charges.
+        let md = panel_md(tool.clone());
+        assert!(
+            md.contains(&format!("```\n\n{DIFF_TRUNCATION_NOTE}")),
+            "the fence clips bare, then the note: {md}"
+        );
+        assert!(panel_output_estimate(&tool) > 0, "the rendered body is charged");
     }
 
     /// A file-editing panel whose diff exceeds the panel budget clips the body

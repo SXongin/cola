@@ -194,8 +194,8 @@ same boundary and the same id-plus-shape gate:
   excerpts dropped. Every other value is shown inside a `json` fence — a JSON
   string's own text, otherwise its pretty-printed JSON — so an unrecognized
   shape is never dropped and never guessed into a result list. A search with no
-  results yet renders no Output section rather than an empty one beside the
-  query. This is not the generic "any valid JSON → pretty-print" fallback
+  results yet — or a blank message — renders no Output section rather than an
+  empty one beside the query. This is not the generic "any valid JSON → pretty-print" fallback
   rejected above: it applies to exactly one adapter-owned id and that item's own
   payload, and no other tool's rendering changes.
 
