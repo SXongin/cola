@@ -1375,23 +1375,30 @@ fn codex_file_change_diff(tool: &ToolPanel) -> Option<EditDiff> {
         parsed.paths = vec![path.to_string()];
         return Some(parsed);
     }
-    let joined = changes
-        .iter()
-        .filter_map(|change| {
-            let path = codex_display_path(change)?;
-            let diff = change
-                .get("diff")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .trim_end_matches(['\r', '\n']);
-            Some(if diff.is_empty() {
-                format!("Index: {path}")
-            } else {
-                format!("Index: {path}\n{diff}")
-            })
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Only a diff with a `@@` hunk header can enter the joined patch: a non-empty
+    // no-hunk value (e.g. "Binary files … differ") is not diff syntax, and
+    // `parse_diff` would read it as the trailing note — swallowing every file
+    // after it. Such values are appended after all hunks instead, where the
+    // parser keeps them in `EditDiff::tail` and the panel still shows them.
+    let (mut hunks, mut notes) = (Vec::new(), Vec::new());
+    for change in changes {
+        let Some(path) = codex_display_path(change) else {
+            continue;
+        };
+        let diff = change
+            .get("diff")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim_end_matches(['\r', '\n']);
+        if diff.is_empty() {
+            hunks.push(format!("Index: {path}"));
+        } else if diff.lines().any(|line| line.starts_with("@@")) {
+            hunks.push(format!("Index: {path}\n{diff}"));
+        } else {
+            notes.push(format!("Index: {path}\n{diff}"));
+        }
+    }
+    let joined = hunks.into_iter().chain(notes).collect::<Vec<_>>().join("\n");
     parse_multi_file_diff(&joined)
 }
 
@@ -3024,20 +3031,10 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
     let get = |k: &str| obj.get(k).and_then(|v| v.as_str());
     match name {
         // Codex's `commandExecution` carries `command` plus `cwd`; the
-        // OpenCode arm's `workdir` is the same fact under another name.
-        "bash" | "shell" | "codex/command_execution" => {
-            let mut s = String::new();
-            if let Some(cmd) = get("command") {
-                s.push_str(&inline_code(cmd));
-            }
-            if let Some(dir) = get("workdir").or_else(|| get("cwd")) {
-                s.push_str(&format!("\n📁 `{}`", dir));
-            }
-            if let Some(d) = get("description") {
-                s.push_str(&format!("\n📝 {}", d));
-            }
-            if s.is_empty() { input.to_string() } else { s }
-        }
+        // OpenCode arm's `workdir` is the same fact under another name. The
+        // Codex id is gated on the adapter's whole shape (ADR-0042).
+        "bash" | "shell" => command_input(input),
+        "codex/command_execution" if command_execution_shape(Some(input)) => command_input(input),
         "edit" => {
             // Only the target file. oldString/newString are near-identical
             // full-block snapshots (the change is usually a few lines deep in
@@ -3099,7 +3096,13 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
                 input.to_string()
             }
         }
-        "websearch" | "codex/web_search" => match get("query") {
+        "websearch" => match get("query") {
+            Some(query) => format!("🔎 `{}`", query),
+            None => generic_tool_input(obj),
+        },
+        // Codex's `webSearch` always writes `action`, even as `null`; a
+        // payload without it is not the adapter's shape and stays opaque.
+        "codex/web_search" if web_search_shape(Some(input)) => match get("query") {
             Some(query) => format!("🔎 `{}`", query),
             None => generic_tool_input(obj),
         },
@@ -3167,6 +3170,27 @@ fn format_tool_input(name: &str, input: &serde_json::Value) -> String {
         },
         _ => generic_tool_input(obj),
     }
+}
+
+/// The Input line a shell-like call renders: the command, its directory and
+/// description. Shared by `bash` / `shell` and the shape-gated
+/// `codex/command_execution`.
+fn command_input(input: &serde_json::Value) -> String {
+    let Some(obj) = input.as_object() else {
+        return input.as_str().map(str::to_string).unwrap_or_default();
+    };
+    let get = |key: &str| obj.get(key).and_then(serde_json::Value::as_str);
+    let mut line = String::new();
+    if let Some(command) = get("command") {
+        line.push_str(&inline_code(command));
+    }
+    if let Some(dir) = get("workdir").or_else(|| get("cwd")) {
+        line.push_str(&format!("\n📁 `{}`", dir));
+    }
+    if let Some(description) = get("description") {
+        line.push_str(&format!("\n📝 {}", description));
+    }
+    if line.is_empty() { input.to_string() } else { line }
 }
 
 /// The generic fallback for a tool without a tailored input arm: one
@@ -5908,6 +5932,39 @@ Index: src/main.rs
         );
     }
 
+    /// A non-hunk `diff` (a binary change's message) must not poison the files
+    /// after it: it rides the diff's tail, and the later hunks still render.
+    #[test]
+    fn codex_file_change_binary_entry_does_not_swallow_the_later_hunks() {
+        let tool = codex_file_change_panel(vec![
+            json!({
+                "path": "assets/logo.png",
+                "kind": {"type": "add"},
+                "diff": "Binary files a/logo.png and b/logo.png differ",
+            }),
+            json!({
+                "path": "src/main.rs",
+                "kind": {"type": "update"},
+                "diff": "@@ -1 +1 @@\n-old\n+new",
+            }),
+        ]);
+        let title = panel_title(tool.clone());
+        assert!(
+            title.contains("· 📄 2 files · +1 −1"),
+            "count and totals: {title}"
+        );
+        let md = panel_md(tool);
+        assert!(
+            md.contains("Index: src/main.rs"),
+            "the later hunk still renders: {md}"
+        );
+        assert!(md.contains("+new"), "the later hunk body: {md}");
+        assert!(
+            md.contains("Binary files a/logo.png"),
+            "the note rides the tail: {md}"
+        );
+    }
+
     /// A failed `fileChange` is not a diff panel: its change stays in metadata,
     /// but the call's error text is the body (as for a failed `edit`).
     #[test]
@@ -8033,6 +8090,13 @@ Index: /a/one.rs
             ),
             "`` echo `pwd` ``\n📁 `/work/cola`"
         );
+        // The adapter always writes `cwd`; a payload without it stays opaque
+        // (ADR-0042's whole-shape gate).
+        let no_cwd = format_tool_input("codex/command_execution", &json!({"command": "ls"}));
+        assert!(
+            no_cwd.starts_with("- command:"),
+            "a missing cwd takes the generic shape: {no_cwd}"
+        );
     }
 
     /// A Codex file change names its targets in `changes[].path`, one entry per
@@ -8125,6 +8189,13 @@ Index: /a/one.rs
                 &json!({"query": "rust lifetimes", "action": null})
             ),
             "🔎 `rust lifetimes`"
+        );
+        // The adapter always writes `action`; a payload without it stays
+        // opaque (ADR-0042's whole-shape gate).
+        let no_action = format_tool_input("codex/web_search", &json!({"query": "rust lifetimes"}));
+        assert!(
+            no_action.starts_with("- query:"),
+            "a missing action takes the generic shape: {no_action}"
         );
     }
 
@@ -8348,6 +8419,32 @@ excerpt two";
             md.contains("1. [Raw](https://a.example)"),
             "the raw results render: {md}"
         );
+    }
+
+    /// Metadata is the adapter's structured field; the raw output is only the
+    /// fallback. When the two disagree, the panel shows metadata.
+    #[test]
+    fn codex_web_search_prefers_metadata_results_over_the_raw_output() {
+        let tool = ToolPanel::new(ToolCall {
+            identity: ToolIdentity {
+                name: "codex/web_search".into(),
+                call_id: "call_disagree".into(),
+            },
+            status: ToolStatus::Completed,
+            started_at: None,
+            input: Some(json!({"query": "rust lifetimes", "action": null})),
+            metadata: Some(json!({
+                "results": [{"title": "Meta", "url": "https://meta.example"}]
+            })),
+            output: ToolOutput {
+                raw: Some(json!([{"title": "Raw", "url": "https://raw.example"}])),
+                blocks: Vec::new(),
+                error: None,
+            },
+        });
+        let md = panel_md(tool);
+        assert!(md.contains("[Meta](https://meta.example)"), "metadata wins: {md}");
+        assert!(!md.contains("raw.example"), "the raw value is not used: {md}");
     }
 
     /// An empty list while the search is still running is not "0 results": the
