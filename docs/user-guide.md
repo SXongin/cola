@@ -588,7 +588,14 @@ is a warning, while a `--no-daemon` client or one pointed at another endpoint is
 a named failure. A missing daemon is a failure too — `start_server = "never"`
 only stops cola from starting one; run `codex app-server daemon start` yourself
 and point your client at it. With no local client at all (a Feishu-only
-deployment) the check passes, because there is nothing to attach.
+deployment) the check passes, because there is nothing to attach. On Windows,
+doctor first names the daemon's three preconditions: the process must not hold
+an elevated administrator token, the launcher must permit a breakaway child
+(`cargo run` and outer job objects do not), and the control-socket path must fit
+the AF_UNIX limit of 108 bytes including the terminator. Each failing row
+carries its instruction — start cola from a non-elevated terminal, run
+`codex.exe` directly, or shorten `CODEX_HOME` — and a blocked token or path
+skips the runtime diagnosis instead of reporting a bare attach failure.
 
 `cola doctor` proves the configured provider can complete a real turn: it starts
 a minimal turn on a scratch thread on the **shared** daemon (which cola does not
