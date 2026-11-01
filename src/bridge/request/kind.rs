@@ -1366,16 +1366,6 @@ impl RequestKind for QuestionKind {
                 let Some((answered_count, paint, outcome, mutated)) = mutated else {
                     return Some(flow.missing_question_result(directory, inline).await);
                 };
-                // A duplicate click (a stale confirm, a re-sent option) changed
-                // nothing, and a rebuild would recreate the open question's box
-                // from the server's draft. Answer it without touching the card.
-                if !mutated {
-                    return Some(CardActionResult {
-                        mutated,
-                        card: None,
-                        toast: Some(action_toast(reply, n - answered_count, outcome)),
-                    });
-                }
                 if answered_count == n {
                     // All questions answered → claim the request and submit.
                     // The claim is atomic: a click that loses the race re-serves
@@ -1451,6 +1441,16 @@ impl RequestKind for QuestionKind {
                     // Re-served verbatim to a losing double-click.
                     flow.remember_answered_result(req_id, &r).await;
                     Some(r)
+                } else if !mutated {
+                    // A duplicate or stale click changed nothing, and a rebuild
+                    // would recreate the open box from the server's draft. It
+                    // must still answer — but only the settlement above needs
+                    // to run for a click that DID change the state.
+                    return Some(CardActionResult {
+                        mutated,
+                        card: None,
+                        toast: Some(action_toast(reply, n - answered_count, outcome)),
+                    });
                 } else if inline {
                     // Inline: the ack carries the clicked card with the updated
                     // display state (已选/✅ markers) — the mechanism that

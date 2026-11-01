@@ -519,6 +519,76 @@ async fn double_click_on_same_request_replies_once() {
     assert_eq!(calls.len(), 1, "double click must not double-reply: {:?}", calls);
 }
 
+/// A FAILED reply (a dropped connection, not a 404) keeps the request and the
+/// recorded answer, so the same click must be retryable. The retry reports no
+/// state change — it must still reach `reply_question`, or the request could
+/// never be settled.
+#[tokio::test]
+async fn a_failed_final_answer_is_retryable() {
+    let _wd = test_work_dir();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = test_config(&dir.path().join("sessions.json"));
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.fail_next_question_reply(1);
+    let backend = Arc::new(backend);
+    let app = Arc::new(App::new(cfg, backend.clone(), Arc::new(RecordingPlatform::new())).unwrap());
+
+    app.question
+        .remember_question(
+            &crate::backend::types::QuestionRequest {
+                id: "que_retry".into(),
+                session_id: "ses_1".into(),
+                questions: vec![crate::backend::types::QuestionInfo {
+                    question: "选择目录".into(),
+                    header: "目录".into(),
+                    options: vec![crate::backend::types::QuestionOption {
+                        label: "/a".into(),
+                        ..Default::default()
+                    }],
+                    kind: crate::backend::types::FormFieldKind::String,
+                    custom: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "/work",
+        )
+        .await;
+
+    let click = serde_json::json!({
+        "action": "question",
+        "reply": "answer",
+        "request_id": "que_retry",
+        "session_id": "ses_1",
+        "directory": "/work",
+        "question_index": 0,
+        "answer": "/a",
+    });
+    let failed = app.host_action(click.clone()).await.expect("a result");
+    assert!(
+        failed
+            .card
+            .as_ref()
+            .is_some_and(|c| c.to_string().contains("处理失败")),
+        "the first attempt must report the failure"
+    );
+    // The second click carries the SAME answer: no state change, but it must
+    // still be submitted.
+    let retry = app.host_action(click).await.expect("a result");
+    assert_eq!(
+        backend.reply_question_calls.lock().await.len(),
+        2,
+        "the retry must reach reply_question again"
+    );
+    assert!(
+        retry
+            .card
+            .as_ref()
+            .is_some_and(|c| c.to_string().contains("已回答")),
+        "and succeed"
+    );
+}
+
 /// A 404 on a question reply means the question was already answered (or
 /// rejected) elsewhere — a neutral "已处理" card, not the red failure card.
 #[tokio::test]
@@ -564,7 +634,7 @@ async fn question_reply_404_renders_neutral_already_handled() {
         "question_index": 0,
         "answer": "/a",
     });
-    let result = app.host_action(value).await.expect("a result card");
+    let result = app.host_action(value.clone()).await.expect("a result card");
     let card = result.card.expect("standalone card").to_string();
     assert!(card.contains("已处理"), "neutral card expected: {}", card);
     assert!(
