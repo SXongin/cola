@@ -86,8 +86,9 @@ pub(crate) fn socket_tempdir() -> tempfile::TempDir {
 }
 
 /// The source of the test proxy, compiled once by [`proxy_helper`]. Kept as a
-/// real file (not a string literal) so it is reviewable and formatted like
-/// code; `include_str!` embeds it verbatim.
+/// real file (not a string literal) so it is reviewable; `include_str!` embeds
+/// it verbatim, and `cargo xtask check-fixture-format` is its rustfmt gate
+/// because `cargo fmt` does not reach a file outside the module tree.
 const PROXY_HELPER_SOURCE: &str = include_str!("fixtures/proxy_fixture.rs");
 
 static PROXY_HELPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -125,12 +126,18 @@ pub(crate) fn proxy_helper() -> PathBuf {
 /// directory, then the short Unix bases. A base that refuses execution is
 /// retried against the next one.
 fn proxy_fixture_bases() -> Vec<PathBuf> {
-    let mut bases = vec![
+    let mut bases: Vec<PathBuf> = Vec::new();
+    for base in [
         std::env::temp_dir(),
         PathBuf::from("/tmp"),
         PathBuf::from("/var/tmp"),
-    ];
-    bases.dedup();
+    ] {
+        // Duplicates are not necessarily adjacent (`TMPDIR` can be `/var/tmp`),
+        // so keep first-seen order explicitly rather than `dedup()`.
+        if !bases.contains(&base) {
+            bases.push(base);
+        }
+    }
     bases
 }
 
@@ -764,9 +771,9 @@ impl Default for State {
 
 pub(crate) struct FakeServer {
     state: Arc<State>,
-    /// Set on a server that can be stopped; `None` for the TCP constructors,
-    /// which no test kills.
-    shutdown: Option<Arc<tokio::sync::Notify>>,
+    /// Set by [`FakeServer::die`]: stops accepting and releases the live
+    /// connection tasks. Every constructor wires one.
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl FakeServer {
@@ -797,10 +804,7 @@ impl FakeServer {
             // Dropping the listener closes the socket, but the *path* stays on
             // disk: exactly a crashed daemon's stale control socket.
         });
-        Self {
-            state,
-            shutdown: Some(shutdown),
-        }
+        Self { state, shutdown }
     }
 
     /// Make the fake daemon die: stop accepting and break every live
@@ -810,9 +814,7 @@ impl FakeServer {
     /// Works for both constructors so the child-lifecycle tests can run on
     /// Windows against a TCP daemon.
     pub(crate) async fn die(&self) {
-        if let Some(shutdown) = &self.shutdown {
-            shutdown.notify_one();
-        }
+        self.shutdown.notify_one();
         let tasks: Vec<_> = self
             .state
             .tasks
@@ -862,13 +864,7 @@ impl FakeServer {
                 }
             }
         });
-        (
-            Self {
-                state,
-                shutdown: Some(shutdown),
-            },
-            format!("ws://{address}"),
-        )
+        (Self { state, shutdown }, format!("ws://{address}"))
     }
 
     /// Add one thread to the stored list. The list is served in insertion

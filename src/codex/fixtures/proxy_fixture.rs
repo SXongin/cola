@@ -3,8 +3,9 @@
 //! This file is **not** part of cola's module tree. `test_server::proxy_helper`
 //! embeds it with `include_str!`, compiles it once with the crate's own
 //! edition, and spawns it wherever the production transport would spawn the
-//! real proxy. Keeping it a real file means it is reviewed and formatted like
-//! code instead of hiding in a string literal.
+//! real proxy. Keeping it a real file keeps it reviewable; because it sits
+//! outside the crate's module tree, `cargo fmt` does not see it —
+//! `cargo xtask check-fixture-format` is its rustfmt gate.
 //!
 //! It relays raw bytes between stdio and `--sock`:
 //!

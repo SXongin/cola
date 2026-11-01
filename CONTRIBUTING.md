@@ -123,6 +123,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo xtask check-generation
 cargo xtask check-client-seam
+cargo xtask check-fixture-format
 cargo xtask check-doc-drift
 cargo test --workspace --locked
 cargo build --release --locked
@@ -141,6 +142,11 @@ bridge reaches the active client through `SharedCore::client`, so a second
 adapter does not have to edit the bridge to exist (ADR-0090). The only
 exemptions are the adapter's own modules and, until #875, its attach/lifecycle
 plumbing (`generation`, `strategy`, `transport`), listed one item at a time.
+
+`cargo xtask check-fixture-format` is the fixture format gate: the Codex proxy
+fixture (`src/codex/fixtures/proxy_fixture.rs`) is compiled by `rustc` from an
+`include_str!` file outside the crate's module tree, so `cargo fmt` never sees
+it; this runs `rustfmt --check` on it with the edition it is compiled under.
 
 `cargo xtask check-doc-drift` is the translation drift guard: it compares the
 Simplified Chinese user guide (`docs/user-guide.zh-CN.md`) with its English

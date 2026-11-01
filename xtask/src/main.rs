@@ -13,7 +13,7 @@ fn main() {
         eprintln!("Usage: cargo xtask <task>");
         eprintln!(
             "Tasks: check, test, clippy, fmt, audit, check-commit-msg, check-generation, \
-             check-client-seam, check-doc-drift, release"
+             check-client-seam, check-fixture-format, check-doc-drift, release"
         );
         exit(1);
     });
@@ -27,12 +27,13 @@ fn main() {
         "check-commit-msg" => run_check_commit_msg(),
         "check-generation" => generation_guard::run(),
         "check-client-seam" => client_seam_guard::run(),
+        "check-fixture-format" => check_fixture_format(),
         "check-doc-drift" => doc_drift::run(),
         "release" => release::cli(),
         other => {
             eprintln!(
                 "Unknown task: {other}. Available: check, test, clippy, fmt, audit, check-commit-msg, \
-                 check-generation, check-client-seam, check-doc-drift, release"
+                 check-generation, check-client-seam, check-fixture-format, check-doc-drift, release"
             );
             exit(1);
         }
@@ -163,6 +164,31 @@ fn run_fmt() {
         .status()
         .unwrap();
     if !status.success() {
+        exit(status.code().unwrap_or(1));
+    }
+}
+
+/// The Codex proxy fixture is compiled by `rustc` from an `include_str!` file
+/// outside the crate's module tree, so `cargo fmt --all` and clippy never see
+/// it. This is its format gate: the same `rustfmt --check` the rest of the tree
+/// gets, with the edition the fixture is compiled under.
+fn check_fixture_format() {
+    let fixture = repo_root().join("src/codex/fixtures/proxy_fixture.rs");
+    let rustfmt = std::env::var_os("RUSTFMT").unwrap_or_else(|| "rustfmt".into());
+    let status = Command::new(rustfmt)
+        .args(["--edition", "2024", "--check"])
+        .arg(&fixture)
+        .status()
+        .unwrap_or_else(|error| {
+            eprintln!("error: running rustfmt on {}: {error}", fixture.display());
+            exit(1);
+        });
+    if !status.success() {
+        eprintln!(
+            "{} is not rustfmt-clean; run: rustfmt --edition 2024 {}",
+            fixture.display(),
+            fixture.display()
+        );
         exit(status.code().unwrap_or(1));
     }
 }
