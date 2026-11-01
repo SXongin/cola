@@ -12,8 +12,8 @@ use thiserror::Error;
 
 pub(crate) type Result<T> = std::result::Result<T, CodexError>;
 
-// `Endpoint` and `UnsupportedPlatform` are the parse/transport arms a `ws://`
-// or a non-unix build reaches; the daemon path never constructs them here.
+// `Endpoint` is the parse arm a `ws://` or a malformed listen URL reaches; the
+// daemon path never constructs it here.
 #[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum CodexError {
@@ -31,15 +31,13 @@ pub(crate) enum CodexError {
     #[error("{context}: {detail}")]
     Transport { context: String, detail: String },
 
-    /// The endpoint is a unix-domain socket, and this build's platform does
-    /// not provide one. Windows has AF_UNIX limits (ADR-0090's open question
-    /// 4), so the failure is named rather than surfacing as an obscure IO
-    /// error.
-    #[error(
-        "codex app-server endpoint `unix://{path}` needs a unix domain socket, which this build \
-         does not support on {platform}; use `ws://HOST:PORT` instead"
-    )]
-    UnsupportedPlatform { path: String, platform: &'static str },
+    /// No usable `codex` binary was found to run `app-server proxy`. The
+    /// adapter's dial path resolves the binary in a fixed order (the daemon's
+    /// reported `managedCodexPath`, the managed package under `CODEX_HOME`,
+    /// then `codex` on `PATH`); this names every step it tried so a
+    /// misconfiguration is actionable rather than a bare spawn failure.
+    #[error("cannot find an executable codex binary to run `app-server proxy`; tried: {tried}")]
+    ProxyBinary { tried: String },
 
     /// The connection or handshake did not answer inside the budget. A wedged
     /// server must not hold cola's boot.

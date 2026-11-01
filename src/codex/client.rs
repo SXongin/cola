@@ -3,7 +3,8 @@
 //!
 //! Construction order is deliberate:
 //!
-//! 1. dial the endpoint (WebSocket over `ws://` or a unix socket);
+//! 1. dial the endpoint (WebSocket over `ws://`, or over the stdio of a
+//!    `codex app-server proxy` child for a unix control socket);
 //! 2. `initialize`, read the server's identity, send `initialized`;
 //! 3. ask the [`SurfaceProbe`] for that version's method surface;
 //! 4. refuse if a required method is missing, naming it.
@@ -52,6 +53,12 @@ const MAX_EXPERIMENTAL_FEATURE_PAGES: usize = 8;
 pub(crate) struct CodexOptions {
     pub(crate) endpoint: Endpoint,
     pub(crate) timeout: Duration,
+    /// The `codex` binary spawned as `app-server proxy` for a `unix://`
+    /// endpoint (ticket #949). The lifecycle resolves it from its
+    /// [`super::discovery::Environment`] with
+    /// `discovery::resolve_proxy_binary`, so the dial path never searches the
+    /// machine by itself. `None` is correct for `ws://`.
+    pub(crate) proxy_binary: Option<std::path::PathBuf>,
     /// The Background Task State handle shared with the bridge. One per active
     /// client: the lifecycle creates it and hands the same instance to every
     /// client it attaches, so the Bridge records through the handle its reads
@@ -80,12 +87,21 @@ impl CodexOptions {
         Self {
             endpoint,
             timeout: HANDSHAKE_TIMEOUT,
+            proxy_binary: None,
             tasks: TasksHandle::new(),
             authored: super::authorship::Authorship::in_memory(),
             thread_settings: ThreadSettings::default(),
             pending: None,
             configured_provider_fact: None,
         }
+    }
+
+    /// Carry the resolved proxy binary into a `unix://` dial (ticket #949).
+    /// The lifecycle gets it from `discovery::resolve_proxy_binary`, which also
+    /// enforces the platform's socket budget before anything is spawned.
+    pub(crate) fn with_proxy_binary(mut self, binary: std::path::PathBuf) -> Self {
+        self.proxy_binary = Some(binary);
+        self
     }
 
     /// Carry the active client's own task handle into the attached client.
@@ -310,7 +326,12 @@ impl fmt::Debug for CodexClient {
 impl CodexClient {
     /// Connect, handshake, and verify the server's surface.
     pub(crate) async fn connect(options: &CodexOptions, probe: &dyn SurfaceProbe) -> Result<Self> {
-        let connection = RpcConnection::open(&options.endpoint, options.timeout).await?;
+        let connection = RpcConnection::open_with_proxy(
+            &options.endpoint,
+            options.timeout,
+            options.proxy_binary.as_deref(),
+        )
+        .await?;
 
         let initialize = tokio::time::timeout(
             options.timeout,
@@ -939,9 +960,9 @@ mod tests {
     /// (or `--ignored live_initialize`). It skips with a message when the
     /// environment is absent.
     ///
-    /// Unix-only like the transport it exercises: on a platform without unix
-    /// domain sockets the endpoint construction is the named unsupported-
-    /// platform error, not a skipped run.
+    /// Opt-in like the other live tests: the test needs a real daemon and
+    /// the binary the proxy child is spawned from. Unix-only because it names
+    /// an AF_UNIX control socket by path.
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "live codex app-server: set COLA_LIVE_CODEX_SOCKET and COLA_LIVE_CODEX_BIN"]
@@ -956,12 +977,13 @@ mod tests {
         };
         let endpoint = Endpoint::parse(&format!("unix://{}", std::path::Path::new(&socket).display()))
             .expect("endpoint");
-        let probe = crate::codex::schema::AutoProbe::new(binary);
+        let probe = crate::codex::schema::AutoProbe::new(binary.clone());
+        let options = CodexOptions::new(endpoint).with_proxy_binary(std::path::PathBuf::from(binary));
 
-        let first = CodexClient::connect(&CodexOptions::new(endpoint.clone()), &probe)
+        let first = CodexClient::connect(&options, &probe)
             .await
             .expect("first live connection");
-        let second = CodexClient::connect(&CodexOptions::new(endpoint), &probe)
+        let second = CodexClient::connect(&options, &probe)
             .await
             .expect("second live connection");
 

@@ -467,7 +467,15 @@ impl CodexLifecycle {
                 continue;
             }
             let probe = self.probes.probe(&current.daemon);
+            // The daemon's control endpoint is a unix socket on every
+            // platform, so the dial goes through `codex app-server proxy`.
+            // Resolve that binary from this same discovery pass's report (the
+            // daemon's `managedCodexPath`, the managed package, then `PATH`),
+            // and enforce the socket budget before anything is spawned.
+            let proxy_binary =
+                discovery::resolve_proxy_binary(&self.environment, current.daemon.info.as_ref())?;
             let options = CodexOptions::new(Endpoint::Unix(current.daemon.socket.clone()))
+                .with_proxy_binary(proxy_binary)
                 .with_tasks(self.tasks.clone())
                 .with_authorship(self.authored.clone())
                 .with_pending(self.pending.clone())
@@ -1461,8 +1469,9 @@ impl ServerLifecycle for CodexLifecycle {
     }
 }
 
-// The lifecycle's tests drive a real unix socket (the daemon transport is
-// unix-only on this side); the type itself still compiles on every platform.
+// The lifecycle's tests drive a real unix socket through the proxy child (the
+// daemon's control endpoint is AF_UNIX everywhere); the type itself still
+// compiles on every platform.
 #[cfg(all(test, unix))]
 mod tests {
     use std::path::PathBuf;
@@ -1560,12 +1569,19 @@ mod tests {
             std::fs::create_dir_all(daemon_socket.parent().expect("daemon dir")).expect("daemon dir");
             let daemon_pid = root.path().join("fake-daemon.pid");
             let control = home.join(discovery::CONTROL_DIR).join(discovery::CONTROL_SOCKET);
+            // The dial now spawns `codex app-server proxy`, so the fake
+            // daemon's managed binary must be a real relay. Place it at the
+            // path the fake CLI reports and at the managed package path, so
+            // resolution finds it without ever searching the host's `PATH`.
+            let managed = root.path().join("managed-codex");
+            crate::codex::test_server::install_proxy_helper(&managed);
+            crate::codex::test_server::install_proxy_helper(&home.join(discovery::MANAGED_BINARY));
             let cli = FakeCodex::write(
                 root.path(),
                 &control,
                 Some(&daemon_socket),
                 Some(&daemon_pid),
-                &root.path().join("managed-codex"),
+                &managed,
             );
             let environment = Environment {
                 home,
@@ -1582,6 +1598,12 @@ mod tests {
                 daemon_pid,
                 probe_binaries: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// The resolver's winning candidate for this fixture: the fake
+        /// daemon's managed binary, which is a real proxy relay.
+        fn proxy_binary(&self) -> PathBuf {
+            self.root.path().join("managed-codex")
         }
 
         fn lifecycle(&self, start_server: crate::config::ServerStartPolicy) -> CodexLifecycle {
@@ -1972,9 +1994,13 @@ mod tests {
             "dropping the client must not terminate the daemon"
         );
         let endpoint = Endpoint::Unix(fixture.environment.socket());
-        crate::codex::transport::RpcConnection::open(&endpoint, Duration::from_secs(5))
-            .await
-            .expect("the daemon still serves after the client dropped");
+        crate::codex::transport::RpcConnection::open_with_proxy(
+            &endpoint,
+            Duration::from_secs(5),
+            Some(&fixture.proxy_binary()),
+        )
+        .await
+        .expect("the daemon still serves after the client dropped");
 
         let log = fixture.cli.invocations();
         assert!(
@@ -3079,9 +3105,12 @@ mod tests {
             "/tmp/user-project",
         ));
         let endpoint = Endpoint::Unix(fixture.environment.socket());
-        let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
-            .await
-            .expect("attach to the scripted daemon");
+        let client = CodexClient::connect(
+            &CodexOptions::new(endpoint).with_proxy_binary(fixture.proxy_binary()),
+            &PinnedProbe,
+        )
+        .await
+        .expect("attach to the scripted daemon");
 
         let result = clean_probe_thread(client.connection(), None, None, false, &directory).await;
         assert!(result.is_ok(), "{result:?}");

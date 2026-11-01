@@ -1,18 +1,28 @@
 //! The app-server transport: JSON-RPC 2.0 over one WebSocket, one message per
-//! text frame (spec #860, tickets #876/#878).
+//! text frame (spec #860, tickets #876/#878/#949).
 //!
-//! `codex app-server --listen` takes `ws://IP:PORT` or `unix://PATH` (stdio is
-//! the remaining form and is not used: a peer attachment cannot own the
-//! agent's stdin/stdout). Both are the same WebSocket protocol, so the only
-//! difference is the byte stream underneath — a TCP socket or a unix socket.
-//! `client_async` over a boxed `AsyncRead + AsyncWrite` keeps one client type
-//! for both.
+//! The daemon's control endpoint is a **unix-domain socket file on every
+//! platform**, and stable Rust cannot reach one on Windows. So the production
+//! path never dials it directly: cola spawns `codex app-server proxy
+//! --sock <path>`, a Codex subcommand that relays raw bytes between its
+//! stdio and the control socket, and runs the normal WebSocket handshake over
+//! the child's stdin/stdout. `client_async` over a boxed `AsyncRead +
+//! AsyncWrite` keeps one client type for every byte stream underneath.
+//!
+//! `Endpoint::WebSocket` remains for a TUI's own `ws://` listener and the
+//! hermetic tests; the daemon cannot serve it. It is test/live-only in
+//! practice.
+//!
+//! The proxy child's lifetime is the connection's: dropping the last
+//! [`RpcConnection`] kills and reaps it, and the child exiting for any reason
+//! closes the connection exactly like a socket close, so every waiter fails by
+//! name and [`ServerEvent::Closed`] reaches the decision stream.
 //!
 //! The shipped control socket under `$CODEX_HOME/app-server-control/` is a
-//! **symlink** into `/tmp/codex-daemon-0/<hash>` (ADR-0090's amendment,
-//! question 4). The path is used verbatim and never canonicalised: the OS
-//! follows the link at connect time, so a daemon that re-points it is picked
-//! up on the next attach.
+//! **symlink** into `/tmp/codex-daemon-0/<hash>` on Unix (ADR-0090's amendment,
+//! question 4). The path is handed to the proxy verbatim and never
+//! canonicalised: the OS follows the link at connect time, so a daemon that
+//! re-points it is picked up on the next attach.
 //!
 //! # One reader loop, fanned out
 //!
@@ -37,7 +47,8 @@
 //! notification belongs to which thread is the adapter's business.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -47,8 +58,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -90,7 +100,7 @@ pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How to reach an app-server.
 // `ws://` endpoints are how a TUI's own listener is addressed (and how every
-// hermetic test dials the fake server); the daemon path uses `Unix`.
+// hermetic test dials a TCP fake server); the daemon path uses `Unix`.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
@@ -98,7 +108,8 @@ pub(crate) enum Endpoint {
     WebSocket(String),
     /// `unix://PATH` — a filesystem socket, usually the daemon control socket
     /// (a symlink; followed by the OS, not by string canonicalisation). The
-    /// variant parses on every platform; connecting to it is unix-only.
+    /// dial spawns `codex app-server proxy --sock PATH` and speaks WebSocket
+    /// over the child's stdio, so this works on every platform.
     Unix(PathBuf),
 }
 
@@ -199,11 +210,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ByteStream for T {}
 type BoxedStream = Box<dyn ByteStream>;
 type Socket = WebSocketStream<BoxedStream>;
 
-/// The HTTP request line the WebSocket handshake uses over a unix socket: the
+/// The request target the WebSocket handshake uses over the proxy child: the
 /// daemon serves one endpoint and ignores the host, but the handshake still
 /// needs a valid request target.
-#[cfg(unix)]
-const UNIX_HANDSHAKE_URL: &str = "ws://localhost/";
+const PROXY_HANDSHAKE_URL: &str = "ws://localhost/";
 
 /// One live app-server connection, shared by the handshake, the lifecycle's
 /// liveness probe and the thread adapter (ticket #878). Cloning is cheap: every
@@ -273,11 +283,26 @@ struct ConnectionInner {
     /// a one-shot notify) so a close that races the writer's select cannot be
     /// missed: the writer sees the value even when it checks after the send.
     closing: watch::Sender<bool>,
+    /// Set when this connection was dialled through `codex app-server proxy`:
+    /// firing it makes the child's watcher kill and reap the process. No
+    /// `Endpoint::WebSocket` connection has one.
+    proxy_terminate: Option<Arc<tokio::sync::Notify>>,
+    /// The proxy child's pid, for the tests that prove it is gone after the
+    /// last handle drops.
+    #[cfg(test)]
+    proxy_pid: Option<u32>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for ConnectionInner {
     fn drop(&mut self) {
+        // The proxy child must not outlive its last handle: the watcher owns
+        // the `Child`, so notify it to kill and reap. A `Notify` permit is
+        // remembered even when the watcher has not polled yet, so this cannot
+        // race itself away while the runtime is still alive.
+        if let Some(terminate) = &self.proxy_terminate {
+            terminate.notify_one();
+        }
         // The tasks capture a `Weak` (the reader) or only a channel (the
         // writer), so they cannot keep this alive; aborting them here closes
         // the socket promptly instead of waiting for the peer's own close.
@@ -291,35 +316,47 @@ impl Drop for ConnectionInner {
 impl RpcConnection {
     /// Dial the endpoint and complete the WebSocket handshake, bounded by
     /// `timeout` so a wedged server cannot hold cola's boot.
+    ///
+    /// A `unix://` endpoint needs a proxy binary; dialling one without it is a
+    /// named failure rather than silently falling back to some `codex` on the
+    /// machine. Production paths call [`Self::open_with_proxy`] with the binary
+    /// `discovery::resolve_proxy_binary` resolved; this `ws://`-only shorthand
+    /// is the test seam.
+    #[cfg(test)]
     pub(crate) async fn open(endpoint: &Endpoint, timeout: Duration) -> Result<Self> {
-        match tokio::time::timeout(timeout, Self::open_inner(endpoint)).await {
+        Self::open_with_proxy(endpoint, timeout, None).await
+    }
+
+    /// [`Self::open`] with the `codex` binary to spawn as `app-server proxy`
+    /// for a `unix://` endpoint. Ignored for `ws://`.
+    pub(crate) async fn open_with_proxy(
+        endpoint: &Endpoint,
+        timeout: Duration,
+        proxy_binary: Option<&Path>,
+    ) -> Result<Self> {
+        match tokio::time::timeout(timeout, Self::open_inner(endpoint, proxy_binary)).await {
             Err(_) => Err(CodexError::Timeout(timeout)),
             Ok(result) => result,
         }
     }
 
-    async fn open_inner(endpoint: &Endpoint) -> Result<Self> {
-        let socket = match endpoint {
+    async fn open_inner(endpoint: &Endpoint, proxy_binary: Option<&Path>) -> Result<Self> {
+        let connection = match endpoint {
             Endpoint::Unix(path) => {
-                #[cfg(unix)]
-                {
-                    let stream = UnixStream::connect(path)
-                        .await
-                        .map_err(|error| CodexError::Transport {
-                            context: format!("connect to unix socket {}", path.display()),
-                            detail: error.to_string(),
-                        })?;
-                    Self::handshake(UNIX_HANDSHAKE_URL, Box::new(stream)).await?
-                }
-                // A unix-domain socket is not part of this platform's socket
-                // support. Say so by name; the caller can still use `ws://`.
-                #[cfg(not(unix))]
-                {
-                    return Err(CodexError::UnsupportedPlatform {
-                        path: path.display().to_string(),
-                        platform: std::env::consts::OS,
-                    });
-                }
+                let binary = proxy_binary.ok_or_else(|| CodexError::ProxyBinary {
+                    tried: format!(
+                        "dialling `{}` needs a codex binary, and this call supplied none",
+                        path.display()
+                    ),
+                })?;
+                let (io, child) = spawn_proxy(binary, path).await?;
+                // Cancellation anywhere in the handshake (the outer timeout,
+                // a caller dropping the future) drops this guard, which kills
+                // the child instead of leaking a process nobody owns.
+                let mut guard = ProxyGuard::new(child);
+                let socket = Self::handshake(PROXY_HANDSHAKE_URL, Box::new(io)).await?;
+                let child = guard.take();
+                Self::start_with_proxy(socket, Some(child))
             }
             Endpoint::WebSocket(raw) => {
                 let url = Url::parse(raw).map_err(|error| CodexError::Transport {
@@ -338,11 +375,11 @@ impl RpcConnection {
                             context: format!("connect to {raw}"),
                             detail: error.to_string(),
                         })?;
-                Self::handshake(raw, Box::new(stream)).await?
+                Self::start_with_proxy(Self::handshake(raw, Box::new(stream)).await?, None)
             }
         };
 
-        Ok(Self::start(socket))
+        Ok(connection)
     }
 
     async fn handshake(url: &str, stream: BoxedStream) -> Result<Socket> {
@@ -356,12 +393,13 @@ impl RpcConnection {
     }
 
     /// Split the socket and start the writer and reader tasks.
-    fn start(socket: Socket) -> Self {
+    fn start_with_proxy(socket: Socket, child: Option<Child>) -> Self {
         let (sink, stream) = socket.split();
         let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
         let (server_events, server_events_rx) = mpsc::channel(SERVER_EVENT_CAPACITY);
         let (closing, closing_rx) = watch::channel(false);
+        let proxy_terminate = child.as_ref().map(|_| Arc::new(tokio::sync::Notify::new()));
 
         let inner = Arc::new(ConnectionInner {
             outgoing,
@@ -373,6 +411,9 @@ impl RpcConnection {
             inbound_seq: AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             closing,
+            proxy_terminate: proxy_terminate.clone(),
+            #[cfg(test)]
+            proxy_pid: child.as_ref().and_then(Child::id),
             tasks: Mutex::new(Vec::new()),
         });
 
@@ -383,6 +424,11 @@ impl RpcConnection {
             .lock()
             .expect("connection tasks")
             .extend([writer, reader]);
+        if let (Some(child), Some(terminate)) = (child, proxy_terminate) {
+            // Deliberately not in `tasks`: aborting the connection's I/O tasks
+            // must not prevent the child from being killed and reaped.
+            watch_proxy(child, terminate, Arc::downgrade(&inner));
+        }
 
         Self { inner }
     }
@@ -570,6 +616,8 @@ impl RpcConnection {
             inbound_seq: AtomicU64::new(0),
             closed: std::sync::atomic::AtomicBool::new(false),
             closing,
+            proxy_terminate: None,
+            proxy_pid: None,
             tasks: Mutex::new(Vec::new()),
         });
         (Self { inner }, outgoing_rx, closing_rx)
@@ -578,6 +626,14 @@ impl RpcConnection {
     #[cfg(test)]
     fn pending_len(&self) -> usize {
         self.inner.pending.lock().expect("pending requests").len()
+    }
+
+    /// The proxy child's pid, when this connection was dialled through one.
+    /// Test-only: the lifetime tests assert the process is gone after the last
+    /// handle drops.
+    #[cfg(test)]
+    pub(crate) fn proxy_pid(&self) -> Option<u32> {
+        self.inner.proxy_pid
     }
 
     async fn send(&self, message: &Value) -> Result<()> {
@@ -591,6 +647,136 @@ impl RpcConnection {
             .await
             .map_err(|_| CodexError::NoResponse("the connection writer".to_string()))
     }
+}
+
+/// Spawn `codex app-server proxy --sock PATH` and hand back its stdio as one
+/// byte stream.
+///
+/// The proxy is Codex's own relay to the control socket (spec #948): cola never
+/// speaks the unix domain socket itself, which is why this transport works on
+/// Windows too. Stderr is dropped: the proxy speaks raw bytes on stdout, and a
+/// diagnostic there must not be mistaken for a frame.
+async fn spawn_proxy(binary: &Path, socket: &Path) -> Result<(ChildIo, Child)> {
+    let mut command = Command::new(binary);
+    command
+        .arg("app-server")
+        .arg("proxy")
+        .arg("--sock")
+        .arg(socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // Belt and braces for a runtime that is going away mid-handshake: the
+        // explicit guard below is the normal path, this covers its absence.
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|error| CodexError::Transport {
+        context: format!(
+            "spawn `{} app-server proxy --sock {}`",
+            binary.display(),
+            socket.display()
+        ),
+        detail: error.to_string(),
+    })?;
+    let stdin = child.stdin.take().expect("the proxy child's stdin is piped");
+    let stdout = child.stdout.take().expect("the proxy child's stdout is piped");
+    Ok((ChildIo { stdin, stdout }, child))
+}
+
+/// The proxy child's stdin/stdout as one duplex byte stream.
+struct ChildIo {
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
+
+impl AsyncRead for ChildIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stdout).poll_read(context, buffer)
+    }
+}
+
+impl AsyncWrite for ChildIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stdin).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stdin).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stdin).poll_shutdown(context)
+    }
+}
+
+/// Owns the child until the connection takes it over; dropping it kills the
+/// process, which is what happens when the handshake fails or is cancelled.
+struct ProxyGuard(Option<Child>);
+
+impl ProxyGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn take(&mut self) -> Child {
+        self.0.take().expect("the proxy child is taken once")
+    }
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        // `start_kill` is synchronous and needs no runtime; reaping does. When
+        // the runtime is already gone there is nothing left that could wait,
+        // and `kill_on_drop` has signalled the child already.
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
+/// Watch the proxy child: its exit of **any** kind is the connection's close,
+/// and the terminate edge (last handle dropped, or the connection closed for a
+/// protocol error) kills and reaps it.
+fn watch_proxy(mut child: Child, terminate: Arc<tokio::sync::Notify>, inner: Weak<ConnectionInner>) {
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            _ = terminate.notified() => {
+                let _ = child.start_kill();
+                if let Err(error) = child.wait().await {
+                    tracing::debug!("codex app-server proxy could not be reaped: {error}");
+                }
+            }
+            status = child.wait() => {
+                match status {
+                    Ok(status) => tracing::debug!("codex app-server proxy exited: {status}"),
+                    Err(error) => tracing::debug!("codex app-server proxy wait failed: {error}"),
+                }
+            }
+        }
+        if let Some(inner) = inner.upgrade() {
+            close(&inner);
+        }
+    });
 }
 
 /// Serialise every outgoing frame; the sink is the only writer.
@@ -696,6 +882,11 @@ fn close(inner: &ConnectionInner) {
     // End the writer first: it drops the frame receiver, which wakes callers
     // blocked on the bounded queue (their send fails instead of hanging).
     let _ = inner.closing.send(true);
+    // A closed connection owns nothing: the proxy child is killed and reaped
+    // by its watcher even while other handles are still alive.
+    if let Some(terminate) = &inner.proxy_terminate {
+        terminate.notify_one();
+    }
     let pending = std::mem::take(&mut *inner.pending.lock().expect("pending requests"));
     for (_, pending) in pending {
         let _ = pending.reply.send(Err(RpcFailure::Closed));
@@ -801,7 +992,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::codex::test_server::FakeServer;
+    use crate::codex::test_server::{FakeServer, ProxyDaemon};
 
     #[test]
     fn endpoints_parse_the_listen_forms() {
@@ -818,22 +1009,16 @@ mod tests {
         assert!(Endpoint::parse("http://127.0.0.1:4501").is_err());
     }
 
-    /// The shipped control socket is a symlink (ADR-0090 amendment, question
-    /// 4). A real symlink to a real unix-socket server must connect: the path
-    /// is handed to the OS, never canonicalised first.
-    #[cfg(unix)]
+    /// The hermetic acceptance path (#949): a real `codex app-server proxy`
+    /// child connects to the fake daemon's AF_UNIX socket, the WebSocket
+    /// handshake completes over its stdio, a request gets its response, and a
+    /// server-initiated request is answered with the server's own id.
     #[tokio::test]
-    async fn the_unix_transport_follows_a_symlinked_socket() {
-        let dir = crate::codex::test_server::socket_tempdir();
-        let real = dir.path().join("app-server.sock");
-        let link = dir.path().join("app-server-control.sock");
-        let server = FakeServer::unix(&real, "codex-tui/0.163.0 (test)").await;
-        std::os::unix::fs::symlink(&real, &link).expect("symlink the control socket");
-
-        let endpoint = Endpoint::parse(&format!("unix://{}", link.display())).expect("endpoint");
-        let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
-            .await
-            .expect("connect through the symlink");
+    async fn the_transport_handshakes_and_correlates_through_a_real_proxy_child() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+        assert!(crate::process::alive(pid as i32), "the proxy child runs");
 
         let result = connection
             .request(
@@ -841,10 +1026,164 @@ mod tests {
                 json!({ "clientInfo": { "name": "cola", "version": "test" } }),
             )
             .await
-            .expect("initialize");
-        assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
+            .expect("initialize over the proxy's stdio");
+        assert_eq!(result["userAgent"], "codex-tui/0.166.0 (test)");
         connection.notify("initialized", None).await.expect("initialized");
-        server.wait_for_initialized(1).await;
+        daemon.server.wait_for_initialized(1).await;
+
+        let mut server_events = connection
+            .take_server_events()
+            .expect("the connection's one server-request stream");
+        let id = daemon
+            .server
+            .request_to_all("test/approval", json!({ "threadId": "t" }));
+        let event = tokio::time::timeout(Duration::from_secs(2), server_events.recv())
+            .await
+            .expect("the server request arrives through the proxy")
+            .expect("the stream stays open");
+        let ServerEvent::Request {
+            id: received, method, ..
+        } = event
+        else {
+            panic!("expected a server request, got {event:?}");
+        };
+        assert_eq!(received, id);
+        assert_eq!(method, "test/approval");
+        connection
+            .respond(&received, json!({ "decision": "accept" }))
+            .await
+            .expect("the answer is written");
+        daemon.server.wait_for_server_request_replies(1).await;
+        assert_eq!(
+            daemon.server.server_request_replies()[0].result,
+            Some(json!({ "decision": "accept" }))
+        );
+    }
+
+    /// Returning from the dial with a handshaken connection means the child is
+    /// still there; dropping the last handle kills and reaps it.
+    #[tokio::test]
+    async fn dropping_the_last_handle_reaps_the_proxy_child() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+        assert!(crate::process::alive(pid as i32));
+
+        let second_handle = connection.clone();
+        drop(second_handle);
+        assert!(
+            crate::process::alive(pid as i32),
+            "one surviving handle keeps the child alive"
+        );
+
+        drop(connection);
+        wait_for_pid_to_disappear(pid).await;
+    }
+
+    /// The child exiting for any reason is the connection's close: a pending
+    /// waiter fails exactly like a socket close, the decision stream ends with
+    /// `Closed`, and the child is reaped (it exits by itself here — the fake
+    /// daemon died underneath it).
+    #[tokio::test]
+    async fn a_dead_daemon_closes_the_proxy_connection_and_reaps_the_child() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+        let mut server_events = connection
+            .take_server_events()
+            .expect("the connection's one server-request stream");
+
+        // The fake server answers no method it does not implement, so this
+        // request is genuinely pending when the daemon dies.
+        let pending = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.request("test/never", json!({})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "the request is still pending");
+
+        daemon.server.die().await;
+
+        let failed = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("a dead daemon must not leave the waiter hanging")
+            .expect("the request task did not panic")
+            .expect_err("the request cannot be answered over a dead daemon");
+        assert!(
+            matches!(failed, CodexError::NoResponse(_)),
+            "the waiter fails by name: {failed}"
+        );
+        assert!(connection.closed());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), server_events.recv()).await {
+                Ok(Some(ServerEvent::Closed)) => break,
+                Ok(Some(other)) => panic!("only `Closed` can follow a dead daemon: {other:?}"),
+                Ok(None) => break,
+                Err(_) if tokio::time::Instant::now() < deadline => {}
+                Err(_) => panic!("the decision stream never reported the close"),
+            }
+        }
+        wait_for_pid_to_disappear(pid).await;
+    }
+
+    /// The proxy spawns from the binary the caller resolved; a `unix://` dial
+    /// with none is the named failure, never a silent search of the host.
+    #[tokio::test]
+    async fn a_unix_dial_without_a_proxy_binary_fails_by_name() {
+        let error = RpcConnection::open(
+            &Endpoint::Unix(PathBuf::from("/tmp/app-server-control.sock")),
+            Duration::from_secs(1),
+        )
+        .await
+        .err()
+        .expect("no binary can be spawned");
+        assert!(
+            matches!(error, CodexError::ProxyBinary { .. }),
+            "the dial names the missing proxy binary: {error}"
+        );
+    }
+
+    /// A proxy that exits before the handshake is a transport failure, and no
+    /// child is left behind (the handshake-failure guard reaps it).
+    #[tokio::test]
+    async fn a_proxy_that_exits_before_the_handshake_is_reaped() {
+        let error = RpcConnection::open_with_proxy(
+            &Endpoint::Unix(PathBuf::from("exit")),
+            Duration::from_secs(5),
+            Some(&crate::codex::test_server::proxy_helper()),
+        )
+        .await
+        .err()
+        .expect("a child with no daemon cannot complete the handshake");
+        assert!(
+            matches!(error, CodexError::Transport { .. } | CodexError::Timeout(_)),
+            "the failure is the transport's: {error}"
+        );
+    }
+
+    async fn wait_for_pid_to_disappear(pid: u32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while crate::process::alive(pid as i32) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the proxy child {pid} survived its connection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // `alive` already treats a zombie as gone; the reaping half of the
+            // contract is that `/proc/<pid>` is gone too.
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the proxy child {pid} was killed but never reaped"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
     }
 
     /// Two clients attach independently: a second connection's handshake does
