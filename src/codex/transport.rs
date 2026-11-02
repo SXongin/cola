@@ -898,14 +898,17 @@ impl ProxyWatch {
     /// names a different socket, or the socket it names no longer accepts a
     /// connection. The last case is the one a SIGKILL leaves behind — the path
     /// and its `(dev,ino)` survive but nothing listens — so an unchanged
-    /// identity is only a precondition for probing, never proof of life. A
-    /// metadata read error is not evidence of death, so it is ignored rather
-    /// than closing a healthy connection.
+    /// identity is only a precondition for probing, never proof of life. A path
+    /// that exists but is no longer a usable socket (a regular file replacing
+    /// it) is also death: the daemon we dialled cannot answer through it. Any
+    /// other metadata read error is inconclusive, so it is ignored rather than
+    /// closing a healthy connection.
     async fn lost(&self) -> bool {
         match self {
             Self::Path { path, identity } => {
                 let current = match discovery::socket_identity(path) {
                     Ok(current) => current,
+                    Err(CodexError::DaemonSocket { .. }) => return true,
                     Err(_) => return false,
                 };
                 match current {
@@ -1420,6 +1423,68 @@ mod tests {
             .expect("a stale control socket must not leave the waiter hanging")
             .expect("the request task did not panic")
             .expect_err("the request cannot be answered over a dead daemon");
+        assert!(
+            matches!(failed, CodexError::NoResponse(_)),
+            "the waiter fails by name: {failed}"
+        );
+        assert!(connection.closed());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), server_events.recv()).await {
+                Ok(Some(ServerEvent::Closed)) => break,
+                Ok(Some(other)) => panic!("only `Closed` can follow a dead daemon: {other:?}"),
+                Ok(None) => break,
+                Err(_) if tokio::time::Instant::now() < deadline => {}
+                Err(_) => panic!("the decision stream never reported the close"),
+            }
+        }
+        wait_for_pid_to_disappear(pid).await;
+    }
+
+    /// A control path replaced by a **regular file** no longer names a usable
+    /// socket, so the daemon cola dialled cannot answer through it. The fake
+    /// daemon is deliberately left running (`die` is not called); only the
+    /// path's shape changes. `socket_identity` reports `DaemonSocket` rather
+    /// than a metadata miss, and treating that as inconclusive would leave the
+    /// watcher probing a non-socket forever and the pending waiter hanging.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_control_path_that_becomes_a_regular_file_closes_the_proxy_connection() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+        let mut server_events = connection
+            .take_server_events()
+            .expect("the connection's one server-request stream");
+        let Endpoint::Unix(control) = &daemon.endpoint else {
+            panic!("the unix fake daemon publishes a control path");
+        };
+
+        let pending = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.request("test/never", json!({})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "the request is still pending");
+
+        // Replace the published path itself, not the socket it pointed at: the
+        // daemon keeps serving, but the path cola watches is now a plain file.
+        std::fs::remove_file(control).expect("remove the published control path");
+        std::fs::write(control, b"not a socket").expect("write a regular file at the control path");
+        assert!(
+            matches!(
+                discovery::socket_identity(control),
+                Err(CodexError::DaemonSocket { .. })
+            ),
+            "a regular file at the control path is a named socket failure"
+        );
+
+        let failed = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("a non-socket control path must not leave the waiter hanging")
+            .expect("the request task did not panic")
+            .expect_err("the request cannot be answered through a regular file");
         assert!(
             matches!(failed, CodexError::NoResponse(_)),
             "the waiter fails by name: {failed}"
