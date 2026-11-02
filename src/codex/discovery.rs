@@ -1254,7 +1254,7 @@ fn endpoint_matches(endpoint: &str, daemon: &Path) -> bool {
 const SS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long one `lsof` query gets to answer.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const LSOF_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A platform probe's outcome with a human-readable reason, not the crate's
@@ -1292,6 +1292,35 @@ pub(crate) async fn prove_attachments(clients: &mut LocalClients, daemon: &Path)
     prove_unsupported(clients, daemon).await;
 }
 
+/// Build the attached report for one proven client.
+///
+/// The endpoint is the client's `--remote` spelling, or the daemon's control
+/// socket for an implicit attachment.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn attached_client(client: UnverifiedClient, daemon: &Path, detail: String) -> AttachedClient {
+    AttachedClient {
+        pid: client.pid,
+        binary: client.binary,
+        endpoint: client
+            .endpoint
+            .unwrap_or_else(|| format!("unix://{}", daemon.display())),
+        detail,
+    }
+}
+
+/// Publish one prover pass: both lists sorted by pid and assigned together.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn finish(
+    clients: &mut LocalClients,
+    mut attached: Vec<AttachedClient>,
+    mut unverified: Vec<UnverifiedClient>,
+) {
+    attached.sort_by_key(|client| client.pid);
+    unverified.sort_by_key(|client| client.pid);
+    clients.attached = attached;
+    clients.unverified = unverified;
+}
+
 /// The Linux prover: open socket inodes plus `ss -x -e` peer inodes.
 ///
 /// It proves a client holds a live connection to **this** daemon, not merely
@@ -1327,21 +1356,16 @@ async fn prove_linux(clients: &mut LocalClients, daemon: &Path) {
             unverified.push(client);
             continue;
         }
-        attached.push(AttachedClient {
-            pid: client.pid,
-            binary: client.binary,
-            endpoint: client
-                .endpoint
-                .unwrap_or_else(|| format!("unix://{}", daemon.display())),
-            detail: format!(
+        attached.push(attached_client(
+            client,
+            daemon,
+            format!(
                 "holds a live unix-socket connection to the daemon at {}",
                 daemon.display()
             ),
-        });
+        ));
     }
-    clients.attached = attached;
-    clients.unverified = unverified;
-    clients.attached.sort_by_key(|client| client.pid);
+    finish(clients, attached, unverified);
 }
 
 /// The evidence the macOS prover collected, or why `lsof` could not produce it.
@@ -1370,28 +1394,159 @@ async fn prove_macos(clients: &mut LocalClients, daemon: &Path) {
     if clients.unverified.is_empty() {
         return;
     }
-    let evidence = collect_lsof_evidence(&clients.unverified, daemon).await;
+    let evidence = collect_lsof_evidence(&clients.unverified, daemon, &LsofProgram::System).await;
     apply_lsof_evidence(clients, daemon, evidence);
+}
+
+/// One `lsof` invocation and the command that produced it.
+///
+/// The command is the actual argv, so an error cannot drift from what ran.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Debug)]
+struct LsofRun {
+    command: String,
+    output: std::process::Output,
+}
+
+/// Where the macOS prover finds `lsof`.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Debug)]
+enum LsofProgram {
+    /// The platform's usual locations, tried in order.
+    #[cfg(target_os = "macos")]
+    System,
+    /// One explicit executable, used by tests.
+    #[cfg(test)]
+    Explicit(PathBuf),
+}
+
+/// Why one `lsof` invocation produced no usable answer.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Debug)]
+enum LsofRunError {
+    Missing { command: String, error: std::io::Error },
+    Failed { command: String, error: std::io::Error },
+    TimedOut { command: String, timeout: Duration },
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+impl std::fmt::Display for LsofRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { command, error } => {
+                write!(f, "{command} is not installed ({error})")
+            }
+            Self::Failed { command, error } => write!(f, "{command} could not run: {error}"),
+            Self::TimedOut { command, timeout } => {
+                write!(f, "{command} did not answer within {timeout:?}")
+            }
+        }
+    }
+}
+
+/// Run one `lsof`, bounded by `timeout`.
+///
+/// `kill_on_drop(true)` is part of the contract: a timeout drops this future,
+/// and the child must die with it rather than keep running an answer nobody
+/// reads. The caller gets the real command in the error.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn run_lsof_with(
+    program: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+) -> std::result::Result<LsofRun, LsofRunError> {
+    let mut rendered = format!("`{}`", program.display());
+    for argument in arguments {
+        rendered.push(' ');
+        rendered.push_str(argument);
+    }
+    let mut command = tokio::process::Command::new(program);
+    command.args(arguments).kill_on_drop(true);
+    #[cfg(test)]
+    if let Some(parent) = program.parent().filter(|parent| parent.is_dir()) {
+        // A test fixture can be a shell script, and another test may leave the
+        // process cwd deleted; run it from its own directory so `/bin/sh` can
+        // start without a getcwd failure.
+        command.current_dir(parent);
+    }
+    let attempt = tokio::time::timeout(timeout, command.output()).await;
+    match attempt {
+        Ok(Ok(output)) => Ok(LsofRun {
+            command: rendered,
+            output,
+        }),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Err(LsofRunError::Missing {
+            command: rendered,
+            error,
+        }),
+        Ok(Err(error)) => Err(LsofRunError::Failed {
+            command: rendered,
+            error,
+        }),
+        Err(_) => Err(LsofRunError::TimedOut {
+            command: rendered,
+            timeout,
+        }),
+    }
+}
+
+/// Run `lsof` through the configured program.
+///
+/// Production tries the platform's usual locations in order; tests pass one
+/// explicit executable. A missing binary is not fatal: every candidate is
+/// tried and each miss becomes a named reason.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn run_lsof(program: &LsofProgram, arguments: &[&str]) -> ProbeResult<LsofRun> {
+    match program {
+        #[cfg(target_os = "macos")]
+        LsofProgram::System => {
+            let mut missing = Vec::new();
+            for candidate in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"] {
+                match run_lsof_with(Path::new(candidate), arguments, LSOF_TIMEOUT).await {
+                    Ok(run) => return Ok(run),
+                    Err(LsofRunError::Missing { error, .. }) => {
+                        missing.push(error.to_string());
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+            Err(format!("`lsof` is unavailable ({})", missing.join("; ")))
+        }
+        #[cfg(test)]
+        LsofProgram::Explicit(program) => run_lsof_with(program, arguments, LSOF_TIMEOUT)
+            .await
+            .map_err(|error| error.to_string()),
+    }
 }
 
 /// Run the `lsof` queries the macOS prover needs, keeping each failure as a
 /// reason for the report rather than turning it into an error.
-#[cfg(target_os = "macos")]
-async fn collect_lsof_evidence(clients: &[UnverifiedClient], daemon: &Path) -> LsofEvidence {
-    let daemon_addresses = daemon_socket_addresses(daemon).await;
-    if daemon_addresses.is_err() {
-        // Every client gets the same reason; scanning each pid would only
-        // repeat a failure that already applies to all of them.
-        return LsofEvidence {
-            daemon: daemon_addresses,
-            clients: Vec::new(),
-        };
+///
+/// The daemon read happens first; when it fails (or finds no bound socket)
+/// there is nothing a client scan could match, so no per-client `lsof` runs.
+/// Otherwise each candidate costs one bounded `lsof`; this is a `doctor`/`status`
+/// path, not the poll loop, and the process table has few Codex clients.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn collect_lsof_evidence(
+    clients: &[UnverifiedClient],
+    daemon: &Path,
+    lsof: &LsofProgram,
+) -> LsofEvidence {
+    let daemon_addresses = daemon_socket_addresses(daemon, lsof).await;
+    match &daemon_addresses {
+        Ok(addresses) if !addresses.is_empty() => {}
+        _ => {
+            return LsofEvidence {
+                daemon: daemon_addresses,
+                clients: Vec::new(),
+            };
+        }
     }
     let mut evidence = Vec::with_capacity(clients.len());
     for client in clients {
         evidence.push((
             client.pid,
-            lsof_unix_sockets(client.pid)
+            lsof_unix_sockets(client.pid, lsof)
                 .await
                 .map(|output| lsof_peer_addresses(&output)),
         ));
@@ -1406,113 +1561,107 @@ async fn collect_lsof_evidence(clients: &[UnverifiedClient], daemon: &Path) -> L
 /// from the pid(s) that hold that socket open.
 ///
 /// `daemon` is normally a symlink into the daemon's runtime directory, and the
-/// socket is bound at the target, so the path is canonicalised before the
-/// `lsof` path query. The pid query is the only way to name a daemon cola does
-/// not own — cola deliberately keeps no daemon pid (ADR-0090 decision 3).
+/// socket is bound at the target, so both spellings are queried and compared.
+/// The pid query is the only way to name a daemon cola does not own — cola
+/// deliberately keeps no daemon pid (ADR-0090 decision 3).
 ///
 /// A connected client's `->0x<addr>` names the peer it connected to. On Darwin
 /// that is the *accepted* socket's kernel address, not the listener's, so the
 /// accepted sockets bound to the control path are collected too: both inherit
 /// the listener's path and both are evidence of this daemon.
-#[cfg(target_os = "macos")]
-async fn daemon_socket_addresses(daemon: &Path) -> ProbeResult<Vec<String>> {
-    let target = std::fs::canonicalize(daemon).unwrap_or_else(|_| daemon.to_path_buf());
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn daemon_socket_addresses(daemon: &Path, lsof: &LsofProgram) -> ProbeResult<Vec<String>> {
+    let raw = daemon.to_string_lossy().into_owned();
+    let target = std::fs::canonicalize(daemon)
+        .unwrap_or_else(|_| daemon.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
     // Query the published path first (the name the user's daemon is described
     // by), then the physical path if that selected nothing. On macOS the
     // control path is normally a symlink and `/tmp` is itself a symlink, so
     // lsof and this process need not spell the socket the same way.
-    let mut pids = lsof_pids_for_path(daemon).await?;
-    if pids.is_empty() && target.as_path() != daemon {
-        pids = lsof_pids_for_path(&target).await?;
+    let mut pids = lsof_pids_for_path(daemon, lsof).await?;
+    if pids.is_empty() && target.as_str() != raw {
+        pids = lsof_pids_for_path(Path::new(&target), lsof).await?;
     }
     let mut addresses = Vec::new();
     for pid in pids {
-        let output = lsof_unix_sockets(pid).await?;
-        addresses.extend(lsof_daemon_addresses(&output, &target));
+        let output = lsof_unix_sockets(pid, lsof).await?;
+        addresses.extend(lsof_daemon_addresses(&output, &raw, &target));
     }
     addresses.sort();
     addresses.dedup();
     Ok(addresses)
 }
 
-/// The pids `lsof` reports as holding `path` open. An empty match is not an
-/// error; a non-zero exit with no output means no process matched.
-#[cfg(target_os = "macos")]
-async fn lsof_pids_for_path(path: &Path) -> ProbeResult<Vec<i32>> {
+/// The pids `lsof` reports as holding `path` open.
+///
+/// Exit 1 with no stdout **and no stderr** means no process matched and is an
+/// empty result. Exit 1 that also printed a diagnostic is a failure and keeps
+/// that diagnostic, so a denied or broken scan cannot masquerade as no match.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn lsof_pids_for_path(path: &Path, lsof: &LsofProgram) -> ProbeResult<Vec<i32>> {
     let path = path.to_string_lossy();
-    let run = run_lsof(&["-t", "-U", "-a", "--", path.as_ref()]).await?;
-    if !run.output.status.success() {
-        if run.output.status.code() == Some(1)
-            && String::from_utf8_lossy(&run.output.stdout).trim().is_empty()
-        {
-            return Ok(Vec::new());
-        }
-        return Err(format!(
-            "`{} -t -U -a -- {}` exited with {}: {}",
-            run.program,
-            path,
-            run.output.status,
-            first_line(&run.output.stderr)
-        ));
+    let run = run_lsof(lsof, &["-t", "-U", "-a", "--", path.as_ref()]).await?;
+    interpret_lsof_pids(&run)
+}
+
+/// Decode one `lsof -t -U -a -- <path>` run.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn interpret_lsof_pids(run: &LsofRun) -> ProbeResult<Vec<i32>> {
+    if run.output.status.success() {
+        return Ok(String::from_utf8_lossy(&run.output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect());
     }
-    Ok(String::from_utf8_lossy(&run.output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect())
+    if no_lsof_match(run) {
+        return Ok(Vec::new());
+    }
+    Err(lsof_failure(run))
 }
 
 /// One candidate client's `lsof -U -a -p <pid>` output.
-#[cfg(target_os = "macos")]
-async fn lsof_unix_sockets(pid: i32) -> ProbeResult<String> {
-    let pid = pid.to_string();
-    let run = run_lsof(&["-U", "-a", "-p", &pid]).await?;
-    if !run.output.status.success() {
-        return Err(format!(
-            "`{} -U -a -p {pid}` exited with {}: {}",
-            run.program,
-            run.output.status,
-            first_line(&run.output.stderr)
-        ));
-    }
-    Ok(String::from_utf8_lossy(&run.output.stdout).into_owned())
-}
-
-/// One `lsof` invocation and the program that answered.
-#[cfg(target_os = "macos")]
-struct LsofRun {
-    program: &'static str,
-    output: std::process::Output,
-}
-
-/// Run `lsof` from the usual places, bounded by [`LSOF_TIMEOUT`].
 ///
-/// A missing binary is not fatal: the next candidate is tried, and every miss
-/// becomes a named reason. A present binary that exits non-zero is returned to
-/// the caller, which decides whether no match or a failure is the right read.
-#[cfg(target_os = "macos")]
-async fn run_lsof(arguments: &[&str]) -> ProbeResult<LsofRun> {
-    let mut missing = Vec::new();
-    for program in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"] {
-        let attempt = tokio::time::timeout(
-            LSOF_TIMEOUT,
-            tokio::process::Command::new(program).args(arguments).output(),
-        )
-        .await;
-        match attempt {
-            Ok(Ok(output)) => return Ok(LsofRun { program, output }),
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(format!("`{program}` is not installed"));
-            }
-            Ok(Err(error)) => return Err(format!("`{program}` could not run: {error}")),
-            Err(_) => {
-                return Err(format!(
-                    "`{program} {}` did not answer within {LSOF_TIMEOUT:?}",
-                    arguments.join(" ")
-                ));
-            }
-        }
+/// Exit 1 with no stdout and no stderr means the process holds no unix socket;
+/// that is an empty output (reported as "no peer addresses"), not a failure.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+async fn lsof_unix_sockets(pid: i32, lsof: &LsofProgram) -> ProbeResult<String> {
+    let pid = pid.to_string();
+    let run = run_lsof(lsof, &["-U", "-a", "-p", &pid]).await?;
+    interpret_lsof_unix_sockets(&run)
+}
+
+/// Decode one `lsof -U -a -p <pid>` run.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn interpret_lsof_unix_sockets(run: &LsofRun) -> ProbeResult<String> {
+    if run.output.status.success() {
+        return Ok(String::from_utf8_lossy(&run.output.stdout).into_owned());
     }
-    Err(format!("`lsof` is unavailable ({})", missing.join("; ")))
+    if no_lsof_match(run) {
+        return Ok(String::new());
+    }
+    Err(lsof_failure(run))
+}
+
+/// Whether `lsof` reported a clean "nothing matched": exit 1 with no stdout
+/// and no stderr. A stderr diagnostic is a failure, never a no-match.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn no_lsof_match(run: &LsofRun) -> bool {
+    run.output.status.code() == Some(1)
+        && String::from_utf8_lossy(&run.output.stdout).trim().is_empty()
+        && String::from_utf8_lossy(&run.output.stderr).trim().is_empty()
+}
+
+/// The named failure for a completed `lsof` run whose status is not success.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn lsof_failure(run: &LsofRun) -> String {
+    format!(
+        "{} exited with {}: {}",
+        run.command,
+        run.output.status,
+        first_line(&run.output.stderr)
+    )
 }
 
 /// Classify the collected `lsof` evidence: promote only a client whose peer
@@ -1553,22 +1702,19 @@ fn apply_lsof_evidence(clients: &mut LocalClients, daemon: &Path, evidence: Lsof
             .map(|(_, peers)| peers);
         match peers {
             Some(Ok(peers)) if peers.iter().any(|peer| daemon_addresses.contains(peer)) => {
-                attached.push(AttachedClient {
-                    pid: client.pid,
-                    binary: client.binary,
-                    endpoint: client
-                        .endpoint
-                        .unwrap_or_else(|| format!("unix://{}", daemon.display())),
-                    detail: format!(
-                        "holds a live unix-socket connection to the daemon at {} (peer {})",
-                        daemon.display(),
-                        peers
-                            .iter()
-                            .find(|peer| daemon_addresses.contains(peer))
-                            .cloned()
-                            .unwrap_or_default()
+                let peer = peers
+                    .iter()
+                    .find(|peer| daemon_addresses.contains(peer))
+                    .cloned()
+                    .unwrap_or_default();
+                attached.push(attached_client(
+                    client,
+                    daemon,
+                    format!(
+                        "holds a live unix-socket connection to the daemon at {} (peer {peer})",
+                        daemon.display()
                     ),
-                });
+                ));
             }
             Some(Ok(peers)) => {
                 let mut client = client;
@@ -1598,10 +1744,7 @@ fn apply_lsof_evidence(clients: &mut LocalClients, daemon: &Path, evidence: Lsof
             }
         }
     }
-    attached.sort_by_key(|client| client.pid);
-    still_unverified.sort_by_key(|client| client.pid);
-    clients.attached = attached;
-    clients.unverified = still_unverified;
+    finish(clients, attached, still_unverified);
 }
 
 /// Leave every candidate unverified with `reason` in its detail.
@@ -1610,8 +1753,7 @@ fn mark_unproven(clients: &mut LocalClients, mut unverified: Vec<UnverifiedClien
     for client in &mut unverified {
         client.detail = format!("attachment is not hard-proven: {reason}");
     }
-    unverified.sort_by_key(|client| client.pid);
-    clients.unverified = unverified;
+    finish(clients, Vec::new(), unverified);
 }
 
 /// One `lsof` row's whitespace tokens, when the row is a unix socket.
@@ -1626,10 +1768,11 @@ fn lsof_unix_tokens(line: &str) -> Option<Vec<&str>> {
 }
 
 /// The pure half of the macOS report: the peer addresses `->0x<addr>` on
-/// `lsof` rows, normalised for comparison.
+/// `lsof` rows, normalised, deduplicated and sorted for comparison.
 ///
-/// A client's connected socket renders `->0x<addr>` in NAME; the DEVICE
-/// column's `0x…` and a socket path must never be read as a peer.
+/// A client's connected socket renders `->0x<addr>` as the first NAME token.
+/// The DEVICE column's `0x…`, a socket path, and a bound socket's later tokens
+/// must never be read as a peer.
 #[cfg(any(target_os = "macos", test))]
 fn lsof_peer_addresses(output: &str) -> Vec<String> {
     let mut peers = Vec::new();
@@ -1637,30 +1780,35 @@ fn lsof_peer_addresses(output: &str) -> Vec<String> {
         let Some(tokens) = lsof_unix_tokens(line) else {
             continue;
         };
-        for token in &tokens[8..] {
-            if let Some(peer) = token.strip_prefix("->").and_then(normalized_unix_address) {
-                peers.push(peer);
-            }
+        if let Some(peer) = tokens
+            .get(8)
+            .and_then(|name| name.strip_prefix("->"))
+            .and_then(normalized_unix_address)
+        {
+            peers.push(peer);
         }
     }
+    peers.sort();
+    peers.dedup();
     peers
 }
 
-/// The pure half of the macOS report: the daemon's socket addresses (DEVICE)
-/// for rows bound to its control path.
+/// The daemon's socket addresses (DEVICE) from rows that prove it is the
+/// control-path daemon.
 ///
-/// A listener's NAME is the bound path and its DEVICE is the local kernel
-/// address. Accepted stream sockets inherit the path, so their DEVICE is
-/// collected too — that is the address a client's `->0x<addr>` names. The
-/// ticket's bare `0x<addr>` listener spelling is accepted as well. A row whose
-/// NAME is a peer arrow or another path contributes nothing.
+/// Collected shapes:
+/// - the control path's rows — the listener and its accepted stream sockets
+///   inherit it, and their DEVICE is the address a client's `->0x<addr>` names;
+/// - the daemon's unnamed listening rows — a bare `0x<addr>` NAME with no peer
+///   arrow, the ticket's listener spelling.
+///
+/// A row carrying a peer arrow is a connection, not a listener, and a row for
+/// another path belongs to someone else; neither contributes an address.
+///
+/// `raw` and `target` are the published and canonical spellings of the control
+/// path, so no per-row `canonicalize` syscall is needed.
 #[cfg(any(target_os = "macos", test))]
-fn lsof_daemon_addresses(output: &str, daemon: &Path) -> Vec<String> {
-    let raw = daemon.to_string_lossy().into_owned();
-    let target = std::fs::canonicalize(daemon)
-        .unwrap_or_else(|_| daemon.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+fn lsof_daemon_addresses(output: &str, raw: &str, target: &str) -> Vec<String> {
     let mut addresses = Vec::new();
     for line in output.lines() {
         let Some(tokens) = lsof_unix_tokens(line) else {
@@ -1670,23 +1818,22 @@ fn lsof_daemon_addresses(output: &str, daemon: &Path) -> Vec<String> {
             continue;
         };
         let name = tokens[8..].join(" ");
-        if is_daemon_path(&name, &raw, &target) || normalized_unix_address(&name).is_some() {
+        let unnamed_listener = !name.contains("->") && normalized_unix_address(&name).is_some();
+        if is_daemon_path(&name, raw, target) || unnamed_listener {
             addresses.push(device);
         }
     }
     addresses
 }
 
-/// Whether `name` is the daemon's bound path.
+/// Whether `name` is one of the control path's two spellings.
 ///
 /// `daemon` may be the control symlink while lsof reports the physical path (or
 /// the other way round); on macOS `/tmp` is itself a symlink to `/private/tmp`,
-/// so the rendered path need not equal either spelling byte-for-byte.
+/// so both spellings are compared directly rather than canonicalising each row.
 #[cfg(any(target_os = "macos", test))]
 fn is_daemon_path(name: &str, raw: &str, target: &str) -> bool {
-    name == raw
-        || name == target
-        || std::fs::canonicalize(name).is_ok_and(|resolved| resolved.to_string_lossy() == target)
+    name == raw || name == target
 }
 
 /// Normalise `0x<hex>` to a lowercase, unpadded spelling so two renderings of
@@ -1698,14 +1845,14 @@ fn normalized_unix_address(token: &str) -> Option<String> {
 }
 
 /// No prover exists outside Linux and macOS. The argv may name the daemon, but
-/// there is no descriptor or peer-address evidence to promote it.
+/// cola has no evidence to promote it, so the attachment stays not hard-proven.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn prove_unsupported(clients: &mut LocalClients, daemon: &Path) {
-    let platform = if cfg!(windows) { "Windows" } else { "This platform" };
+    let platform = std::env::consts::OS;
     for client in &mut clients.unverified {
         client.detail = format!(
-            "argv names the daemon at {}, but {platform} has no unix-socket descriptor or \
-             peer-address evidence, so the attachment is not hard-proven",
+            "argv names the daemon at {}, but cola has no prover for {platform}: the attachment \
+             is not hard-proven",
             daemon.display()
         );
     }
@@ -1723,7 +1870,10 @@ async fn established_unix_peers() -> Option<Vec<(u64, u64)>> {
     for program in ["ss", "/usr/sbin/ss", "/usr/bin/ss", "/sbin/ss"] {
         let output = tokio::time::timeout(
             SS_TIMEOUT,
-            tokio::process::Command::new(program).args(["-x", "-e"]).output(),
+            tokio::process::Command::new(program)
+                .args(["-x", "-e"])
+                .kill_on_drop(true)
+                .output(),
         )
         .await;
         if let Ok(Ok(output)) = output
@@ -1860,17 +2010,52 @@ mod tests {
     }
 
     /// One unverified candidate, as a process scan would have produced it.
+    fn candidate(pid: i32) -> UnverifiedClient {
+        UnverifiedClient {
+            pid,
+            binary: "codex".into(),
+            endpoint: None,
+            detail: "argv".into(),
+            start_time: process_start_time(pid),
+        }
+    }
+
+    /// A scan result holding one unverified candidate.
     fn unverified_client(pid: i32, endpoint: Option<String>, detail: &str) -> LocalClients {
+        let mut client = candidate(pid);
+        client.endpoint = endpoint;
+        client.detail = detail.into();
         LocalClients {
-            unverified: vec![UnverifiedClient {
-                pid,
-                binary: "codex".into(),
-                endpoint,
-                detail: detail.into(),
-                start_time: process_start_time(pid),
-            }],
+            unverified: vec![client],
             ..LocalClients::default()
         }
+    }
+
+    /// A fake `lsof` executable, plus the guard that keeps it on disk.
+    #[cfg(unix)]
+    fn fake_lsof(script: &str) -> (tempfile::TempDir, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("lsof");
+        std::fs::write(&path, script).expect("write fake lsof");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fake lsof metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod fake lsof");
+        (root, path)
+    }
+
+    /// Whether `kill -0` still finds `pid` (a zombie counts until reaped).
+    #[cfg(unix)]
+    fn process_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     /// The pure resolver is where `CODEX_HOME` is honoured: the variable wins
@@ -2691,10 +2876,12 @@ codex 42 me 11u unix 0x00000000000000BB 0t0 124 /tmp/control.sock
 codex 42 me 12u unix 0x00000000000000cc 0t0 125 /tmp/control.sock
 codex 42 me 13u unix 0x00000000000000dd 0t0 126 /tmp/other.sock
 codex 42 me 14u unix 0x00000000000000ee 0t0 127 0x00000000000000FF
+codex 42 me 15u unix 0x00000000000000ff 0t0 128 0x00000000000000ab->0x00000000000000cd
+codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x00000000000000cd
 ";
         assert_eq!(lsof_peer_addresses(output), vec!["0xbb"]);
         assert_eq!(
-            lsof_daemon_addresses(output, Path::new("/tmp/control.sock")),
+            lsof_daemon_addresses(output, "/tmp/control.sock", "/tmp/control.sock"),
             vec!["0xbb", "0xcc", "0xee"]
         );
     }
@@ -2717,6 +2904,141 @@ codex 42 me 14u unix 0x00000000000000ee 0t0 127 0x00000000000000FF
         assert!(is_daemon_path(&raw, &raw, &target));
         assert!(is_daemon_path(&target, &raw, &target));
         assert!(!is_daemon_path("/tmp/another.sock", &raw, &target));
+    }
+
+    /// `lsof` exits 1 when nothing matches, but a diagnostic on stderr is a
+    /// failure, not a match. Exit 1 with no output at all is a clean no-match.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lsof_exit_one_without_output_is_no_match() {
+        let (_root, program) = fake_lsof("#!/bin/sh\nexit 1\n");
+        let lsof = LsofProgram::Explicit(program);
+        let pids = lsof_pids_for_path(Path::new("/tmp/no-daemon"), &lsof)
+            .await
+            .expect("a clean exit 1 is no match");
+        assert!(pids.is_empty());
+        let output = lsof_unix_sockets(9, &lsof)
+            .await
+            .expect("a process with no unix socket is not a failure");
+        assert!(output.is_empty());
+        assert!(lsof_peer_addresses(&output).is_empty());
+    }
+
+    /// A client that holds no unix socket is reported as having no peer
+    /// addresses, not as an `lsof` exit-1 failure.
+    #[test]
+    fn a_client_with_no_unix_socket_reports_no_peer_addresses() {
+        let daemon = Path::new("/tmp/codex-daemon-0/app-server-control.sock");
+        let mut clients = unverified_client(9, Some(format!("unix://{}", daemon.display())), "argv");
+        apply_lsof_evidence(
+            &mut clients,
+            daemon,
+            LsofEvidence {
+                daemon: Ok(vec!["0xbb".into()]),
+                clients: vec![(9, Ok(Vec::new()))],
+            },
+        );
+        assert!(clients.attached.is_empty());
+        assert!(
+            clients.unverified[0]
+                .detail
+                .contains("client peer addresses: none"),
+            "{}",
+            clients.unverified[0].detail
+        );
+    }
+
+    /// Exit 1 that prints a diagnostic is a named failure carrying it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lsof_exit_one_with_stderr_is_a_named_failure() {
+        let (_root, program) = fake_lsof("#!/bin/sh\necho 'permission denied' >&2\nexit 1\n");
+        let lsof = LsofProgram::Explicit(program.clone());
+        let error = lsof_pids_for_path(Path::new("/tmp/no-daemon"), &lsof)
+            .await
+            .expect_err("stderr makes exit 1 a failure");
+        assert!(error.contains("permission denied"), "{error}");
+        assert!(
+            error.contains(&program.display().to_string()),
+            "the error names the real command: {error}"
+        );
+        let error = lsof_unix_sockets(9, &lsof)
+            .await
+            .expect_err("stderr makes exit 1 a failure");
+        assert!(error.contains("permission denied"), "{error}");
+    }
+
+    /// A missing executable is a named reason, not a silent no-match.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_missing_lsof_is_a_named_reason() {
+        let root = tempfile::tempdir().expect("temp root");
+        let missing = root.path().join("missing-lsof");
+        let error = run_lsof_with(&missing, &["-U"], Duration::from_millis(100))
+            .await
+            .expect_err("a missing program is an error");
+        assert!(matches!(error, LsofRunError::Missing { .. }), "{error:?}");
+        assert!(error.to_string().contains("is not installed"), "{error}");
+    }
+
+    /// A wedged `lsof` is bounded and killed with the dropped future; the
+    /// error says so and the child is gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_lsof_is_killed() {
+        let pid_root = tempfile::tempdir().expect("pid root");
+        let pid_file = pid_root.path().join("pid");
+        let script = format!(
+            "#!/bin/sh\necho $$ > {}\nexec sleep 30\n",
+            crate::codex::test_server::shell_single_quote(&pid_file.display().to_string())
+        );
+        let (_root, program) = fake_lsof(&script);
+        let error = run_lsof_with(&program, &[], Duration::from_millis(500))
+            .await
+            .expect_err("a sleeping lsof must time out");
+        assert!(matches!(error, LsofRunError::TimedOut { .. }), "{error:?}");
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        if !pid_file.exists() {
+            eprintln!("skipping kill check: the fake lsof never wrote its pid");
+            return;
+        }
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_exists(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!process_exists(pid), "lsof child {pid} survived the timeout");
+    }
+
+    /// Once the daemon read fails there is nothing a client scan could match,
+    /// so `collect_lsof_evidence` never runs the per-pid queries.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_lsof_failure_skips_every_client_scan() {
+        let calls_root = tempfile::tempdir().expect("calls root");
+        let calls = calls_root.path().join("calls");
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = \"-t\" ]; then echo 'permission denied' >&2; exit 2; fi\nexit 1\n",
+            crate::codex::test_server::shell_single_quote(&calls.display().to_string())
+        );
+        let (_root, program) = fake_lsof(&script);
+        let lsof = LsofProgram::Explicit(program);
+        let evidence = collect_lsof_evidence(
+            &[candidate(11), candidate(12)],
+            Path::new("/tmp/cola-missing-daemon.sock"),
+            &lsof,
+        )
+        .await;
+        assert!(evidence.daemon.is_err(), "{:?}", evidence.daemon);
+        assert!(evidence.clients.is_empty());
+        let log = std::fs::read_to_string(&calls).expect("call log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "only the daemon query ran: {log}");
+        assert!(lines[0].starts_with("-t -U -a -- "), "{log}");
     }
 
     /// The positive macOS case: a client's peer address is one of the daemon's
@@ -2905,7 +3227,9 @@ codex 42 me 14u unix 0x00000000000000ee 0t0 127 0x00000000000000FF
             clients.unverified[0].detail
         );
         assert!(
-            clients.unverified[0].detail.contains("Windows"),
+            clients.unverified[0]
+                .detail
+                .contains("cola has no prover for windows"),
             "{}",
             clients.unverified[0].detail
         );

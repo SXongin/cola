@@ -466,8 +466,10 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 运行时、单实例锁、日志路径、自启动二进制路径——每项带 ✅/⚠️/❌ 标记并给出
 汇总，任一检查失败时以非零码退出。OpenCode 客户端仍探测共享服务器；Codex
 客户端则报告 app-server daemon、你自己的客户端是否连接到它，以及运行时是否
-公布了预期的能力。连接与否由 Linux 上客户端进程打开的套接字描述符（`/proc`、
-`ss`）证明，而不是只看 argv：无法证明的 argv 匹配会给出警告，而带
+公布了预期的能力。连接与否由平台提供的套接字证据证明——Linux 上是客户端进程
+打开的套接字描述符（`/proc`、`ss`），macOS 上是 `lsof` 的 peer 地址配对——
+而不是只看 argv。Windows 上只有进程身份与 argv，因此连接会被报告为**未经硬
+证明**（not hard-proven）。无法证明的 argv 匹配会给出警告，而带
 `--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少 daemon 同样判为
 失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行运行
 `codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时

@@ -582,10 +582,13 @@ and the autostart binary path — each with a ✅/⚠️/❌ mark and a summary,
 non-zero when a check fails. For an OpenCode client it probes the shared server
 as before; for a Codex client it reports the app-server daemon, whether your own
 client is attached to it, and whether the runtime advertises the expected
-surface. Attachment is proven from the client process's open socket descriptors
-on Linux (`/proc`, `ss`), not from its argv: an argv match that cannot be proven
-is a warning, while a `--no-daemon` client or one pointed at another endpoint is
-a named failure. A missing daemon is a failure too — `start_server = "never"`
+surface. Attachment is proven from the client process's socket evidence where
+the platform exposes it — open descriptors on Linux (`/proc`, `ss`) and `lsof`
+peer-address pairing on macOS — never from its argv alone. On Windows only
+process identity and argv are available, so the attachment is reported as
+**not hard-proven**. An argv match that cannot be proven is a warning, while a
+`--no-daemon` client or one pointed at another endpoint is a named failure. A
+missing daemon is a failure too — `start_server = "never"`
 only stops cola from starting one; run `codex app-server daemon start` yourself
 and point your client at it. With no local client at all (a Feishu-only
 deployment) the check passes, because there is nothing to attach. On Windows,
