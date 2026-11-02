@@ -708,17 +708,39 @@ fn system() -> sysinfo::System {
     system
 }
 
-/// The spellings of `home` a process path may use: the path as given and its
-/// canonical form. On macOS `/tmp` is a symlink to `/private/tmp`, so sysinfo's
-/// executable path (the physical spelling) does not prefix-match a home under
-/// `/tmp` unless both sides are resolved.
+/// Append `path` unless an identical spelling is already present.
+#[cfg(unix)]
+fn push_unique(spellings: &mut Vec<PathBuf>, path: PathBuf) {
+    if !spellings.contains(&path) {
+        spellings.push(path);
+    }
+}
+
+/// The spellings of `home` a process path may use: the path as given, its
+/// canonical form, and — when `home` is a symlink — the link target's raw and
+/// canonical spellings. On macOS `/tmp` is a symlink to `/private/tmp`, so
+/// sysinfo's executable path (the physical spelling) does not prefix-match a
+/// home under `/tmp` unless both sides are resolved; a symlinked test home adds
+/// the target's unresolved spelling for the same reason.
 #[cfg(unix)]
 fn home_spellings(home: &Path) -> Vec<PathBuf> {
-    let mut spellings = vec![home.to_path_buf()];
-    if let Ok(canonical) = std::fs::canonicalize(home)
-        && canonical != home
-    {
-        spellings.push(canonical);
+    let mut spellings = Vec::new();
+    push_unique(&mut spellings, home.to_path_buf());
+    if let Ok(canonical) = std::fs::canonicalize(home) {
+        push_unique(&mut spellings, canonical);
+    }
+    if let Ok(target) = std::fs::read_link(home) {
+        // `read_link` returns the verbatim target, which may be relative to the
+        // link's directory. Keep it raw and canonical.
+        let target = if target.is_absolute() {
+            target
+        } else {
+            home.parent().unwrap_or_else(|| Path::new("")).join(target)
+        };
+        push_unique(&mut spellings, target.clone());
+        if let Ok(canonical) = std::fs::canonicalize(&target) {
+            push_unique(&mut spellings, canonical);
+        }
     }
     spellings
 }
@@ -797,26 +819,38 @@ mod tests {
 
     /// macOS resolves `/tmp` to `/private/tmp`, so a process's executable path
     /// and the suite's unresolved temp home can spell the same tree
-    /// differently. Both spellings of the home must match, and a sibling that
-    /// merely shares the prefix must not.
+    /// differently. Every spelling — the link, the link target raw and
+    /// canonical — must match, and a sibling that merely shares the prefix must
+    /// not. The relative symlink pins the target's parent-join; the absolute
+    /// one pins the verbatim target.
     #[cfg(unix)]
     #[test]
-    fn a_canonical_home_matches_both_spellings_of_a_process_path() {
+    fn a_symlinked_home_matches_every_spelling_of_a_process_path() {
         let root = tempfile::tempdir().expect("temp root");
         let real = root.path().join("real");
         std::fs::create_dir(&real).expect("real home");
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).expect("symlinked home");
-
-        let spellings = home_spellings(&link);
         let canonical_real = std::fs::canonicalize(&real).expect("canonical real home");
-        assert!(spellings.iter().any(|home| home == &link));
-        assert!(spellings.iter().any(|home| home == &canonical_real));
 
-        assert!(path_is_under(&link.join("bin/codex"), &spellings));
-        assert!(path_is_under(&real.join("bin/codex"), &spellings));
-        assert!(!path_is_under(&root.path().join("other/codex"), &spellings));
-        assert!(!path_is_under(&root.path().join("realer/codex"), &spellings));
+        let relative_link = root.path().join("link");
+        std::os::unix::fs::symlink("real", &relative_link).expect("relative symlinked home");
+        let absolute_link = root.path().join("absolute-link");
+        std::os::unix::fs::symlink(&real, &absolute_link).expect("absolute symlinked home");
+
+        for link in [&relative_link, &absolute_link] {
+            let spellings = home_spellings(link);
+            assert!(spellings.iter().any(|home| home == link));
+            assert!(
+                spellings.iter().any(|home| home == &real),
+                "the target's raw spelling is kept"
+            );
+            assert!(spellings.iter().any(|home| home == &canonical_real));
+
+            assert!(path_is_under(&link.join("bin/codex"), &spellings));
+            assert!(path_is_under(&real.join("bin/codex"), &spellings));
+            assert!(path_is_under(&canonical_real.join("bin/codex"), &spellings));
+            assert!(!path_is_under(&root.path().join("other/codex"), &spellings));
+            assert!(!path_is_under(&root.path().join("realer/codex"), &spellings));
+        }
     }
 
     /// The Windows listener path this suite hands the child must fit the
