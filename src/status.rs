@@ -794,7 +794,7 @@ fn windows_precondition_checks(preconditions: &Preconditions) -> Vec<Check> {
             "Windows 权限令牌",
             format!(
                 "无法读取当前进程的令牌提升状态：{detail}。无法证明它不是管理员；只读诊断仍会\
-                 运行，但不会尝试启动 daemon。请从非管理员终端启动 cola 后重试"
+                 运行，但不会尝试启动 app-server daemon。请从非管理员终端启动 cola 后重试"
             ),
         ),
     });
@@ -814,19 +814,19 @@ fn windows_precondition_checks(preconditions: &Preconditions) -> Vec<Check> {
         // the cause without the disambiguating retry.
         Breakaway::Unavailable(detail) => Check::warn(
             "Windows 启动器",
-            format!("无法执行 breakaway 探测：{detail}；这不影响 attach 到已有 daemon"),
+            format!("无法执行 breakaway 探测：{detail}；这不影响 attach 到已有 app-server daemon"),
         ),
         // Not probed because the socket or token already blocks the start; no
         // `CreateProcess` was paid.
         Breakaway::Skipped(reason) => Check::warn(
             "Windows 启动器",
-            format!("未执行 breakaway 探测：{reason}（前置条件已阻止启动 daemon）"),
+            format!("未执行 breakaway 探测：{reason}（前置条件已阻止启动 app-server daemon）"),
         ),
     });
     checks.push(match &preconditions.socket {
         SocketBudget::Fits { path, length, limit } => Check::pass(
             "Windows 控制套接字路径",
-            format!("按 daemon 的规范化路径测量：`{path}` 共 {length} 字节（上限 {limit} 字节，含终止 NUL）"),
+            format!("按 app-server daemon 的规范化路径测量：`{path}` 共 {length} 字节（上限 {limit} 字节，含终止 NUL）"),
         ),
         SocketBudget::TooLong { .. } | SocketBudget::Unusable { .. } => Check::fail(
             "Windows 控制套接字路径",
