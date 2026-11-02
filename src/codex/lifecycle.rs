@@ -2322,11 +2322,10 @@ mod tests {
     /// let `auto` run `app-server daemon start` against a live daemon on every
     /// pass while logging that the daemon vanished.
     ///
-    /// Linux-only: Unix spawn semantics differ. Linux's `execve` fails
-    /// synchronously for a junk-but-executable file, so `Command::spawn`
-    /// returns the `ProxySpawn` error this test needs. macOS's `posix_spawn`
-    /// can succeed and the child then exits, which the attach correctly reads
-    /// as a gone child (`Unreachable` → `Serverless`), not a spawn failure.
+    /// Linux-only: Linux's `execve` fails synchronously for a junk-but-executable
+    /// file, so `Command::spawn` returns the `ProxySpawn` error this test needs.
+    /// The macOS shape — `posix_spawn` succeeds and the child then exits — is
+    /// covered by the cross-Unix wrapper test below.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_unrunnable_proxy_binary_is_not_a_dead_daemon() {
@@ -2374,6 +2373,47 @@ mod tests {
             detail: "exec format error".to_string(),
         };
         assert!(!daemon_gone(&error), "{error}");
+    }
+
+    /// The macOS shape of the same configuration failure: a 0755 wrapper whose
+    /// `posix_spawn` succeeds, then exits non-zero before the handshake
+    /// (missing interpreter or dylib). Only the handshake-time exit check can
+    /// name it; reading it as a gone daemon would let `auto` run `daemon start`
+    /// against the live daemon.
+    #[tokio::test]
+    async fn an_early_exiting_proxy_wrapper_is_not_a_dead_daemon() {
+        let fixture = Fixture::new();
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
+        fixture.link_daemon();
+        std::fs::remove_file(&fixture.managed_binary).expect("remove the relay");
+        std::fs::write(&fixture.managed_binary, b"#!/bin/sh\nexit 7\n").expect("write a wrapper");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fixture.managed_binary, std::fs::Permissions::from_mode(0o755))
+                .expect("make the wrapper executable");
+        }
+
+        let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
+        let never_busy = || false;
+        let error = lifecycle
+            .ensure_attached(request(&never_busy))
+            .await
+            .expect_err("an early-exiting proxy is loud");
+        let message = error.to_string();
+        assert!(
+            message.contains("could not start the codex app-server proxy"),
+            "the failure names the proxy binary: {message}"
+        );
+        assert!(
+            message.contains("exited before the handshake"),
+            "the failure names the early exit: {message}"
+        );
+        assert_eq!(
+            fixture.cli.starts(),
+            0,
+            "an early-exiting proxy must not trigger `daemon start`: {:?}",
+            fixture.cli.invocations()
+        );
     }
 
     /// A daemon that disappears is unattached on the next pass — and nothing is
