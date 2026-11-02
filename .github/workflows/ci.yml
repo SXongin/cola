@@ -295,10 +295,26 @@ jobs:
               echo "the tier-1 suite left a live codex process behind" >&2
               exit 1
             fi
-          elif pgrep -fl 'cola-cx' >/dev/null; then
-            pgrep -fl 'cola-cx'
-            echo "the tier-1 suite left a live process behind" >&2
-            exit 1
+          else
+            # The marker above is the authoritative check. The fallback must
+            # only name this suite's actual children: matching the temp prefix
+            # (`cola-cx`) also matched unrelated `git` processes, whose command
+            # lines happened to carry a lookalike path. A codex app-server
+            # listener or proxy is specific to the tier.
+            leftovers=""
+            for pattern in 'app-server proxy' 'app-server --listen'; do
+              # Drop this step's own shell: a `pgrep -f` over the pattern can
+              # match the script that contains it.
+              found=$(pgrep -fl "$pattern" | awk -v self="$$" '$1 != self')
+              if [ -n "$found" ]; then
+                leftovers="$leftovers$found"$'\n'
+              fi
+            done
+            if [ -n "$leftovers" ]; then
+              printf '%s' "$leftovers"
+              echo "the tier-1 suite left a live process behind" >&2
+              exit 1
+            fi
           fi
 
   live-codex-tier2:
@@ -396,8 +412,20 @@ jobs:
               esac
             done < "$marker"
           fi
-          if pgrep -fl 'cola-t2' >/dev/null; then
-            pgrep -fl 'cola-t2'
+          # The marker above is authoritative. As for tier-1, the temp-prefix
+          # fallback matched unrelated processes, so only the suite's own
+          # app-server listener/proxy children are checked here.
+          leftovers=""
+          for pattern in 'app-server proxy' 'app-server --listen'; do
+            # Drop this step's own shell: a `pgrep -f` over the pattern can
+            # match the script that contains it.
+            found=$(pgrep -fl "$pattern" | awk -v self="$$" '$1 != self')
+            if [ -n "$found" ]; then
+              leftovers="$leftovers$found"$'\n'
+            fi
+          done
+          if [ -n "$leftovers" ]; then
+            printf '%s' "$leftovers"
             echo "the tier-2 suite left a live process behind" >&2
             exit 1
           fi
