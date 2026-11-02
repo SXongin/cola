@@ -248,11 +248,11 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
 
 ### Linux、macOS 与 Windows 上的 Codex
 
-`kind = "codex"` 客户端连接到 Codex 的 app-server daemon。daemon 的控制套接字
-在所有平台上都是 AF_UNIX 套接字；cola 通过 `codex app-server proxy` 到达它，
-因此 cola 的路径上不需要 WebSocket 或 TCP 监听器，`ws://` 也不是面向用户的
-daemon 端点。不同之处在于 `cola doctor` 能要求什么证据，才会认定你自己的
-客户端确实已连接。
+`kind = "codex"` 客户端连接到 Codex 的 app-server daemon。app-server daemon
+的控制套接字在所有平台上都是 AF_UNIX 套接字；cola 通过
+`codex app-server proxy` 到达它，因此 cola 的路径上不需要 WebSocket 或 TCP
+监听器，`ws://` 也不是面向用户的 app-server daemon 端点。不同之处在于
+`cola doctor` 能要求什么证据，才会认定你自己的客户端确实已连接。
 
 | 平台 | cola 连接 | `cola doctor` 证明*你的*客户端已连接 | 验证 |
 | --- | --- | --- | --- |
@@ -271,17 +271,18 @@ Windows 的“未经硬证明”说的是**证明**，不是传输。非强制�
 cola，并完成一个回合、一次审批往返和一次中断。cola 在 Windows 上看不到的是
 *你自己的* TUI 的套接字描述符或 peer 地址，因此 `cola doctor` 会把该客户端
 报告为 unverified 并给出原因，而不是把它的 `--remote` argv 提升为已连接。
-托管 daemon 在 Windows 上的连接尚未测量：daemon 无法在托管 Windows runner 上
-启动，因为 runner 的令牌是提升的。
+托管 app-server daemon 在 Windows 上的连接尚未测量：app-server daemon 无法在
+托管 Windows runner 上启动，因为 runner 的令牌是提升的。
 
-在 Windows 上，启动 daemon 有三个 doctor 检查；当 Codex 运行在 WSL 内时还有
-第四个约束。大多数失败在 TUI 层面是静默的（它会退回内嵌服务器）；在
+在 Windows 上，启动 app-server daemon 有三个 doctor 检查；当 Codex 运行在
+WSL 内时还有第四个约束。大多数失败在 TUI 层面是静默的（它会退回内嵌服务器）；
+在
 `cola doctor` 中，提升的令牌是 ❌，无法读取的提升状态是 ⚠️：
 
 - **非提升的进程令牌。** 管理员令牌会让每个共享客户端继承管理员权限；请从
   非提升的终端启动 cola。
 - **允许 breakaway 的启动器。** Codex 用 `CREATE_BREAKAWAY_FROM_JOB` 启动
-  daemon；`cargo run` 或外层 job 对象会拒绝这个子进程，请直接运行
+  app-server daemon；`cargo run` 或外层 job 对象会拒绝这个子进程，请直接运行
   `codex.exe`。
 - **较短的 `CODEX_HOME`。** Windows 在发布路径上绑定 AF_UNIX 控制套接字，
   该路径（含终止 NUL）必须不超过 108 字节；超出时请缩短 `CODEX_HOME`。

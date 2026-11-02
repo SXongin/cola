@@ -329,12 +329,12 @@ default_client = "ada"           # which Agent Client is active (default: "defau
 
 ### Codex on Linux, macOS and Windows
 
-A `kind = "codex"` client attaches to Codex's app-server daemon. The daemon's
-control socket is an AF_UNIX socket on every platform; cola reaches it through
-`codex app-server proxy`, so nothing in cola's path needs a WebSocket or TCP
-listener, and `ws://` is not a user-facing endpoint for the daemon. What
-differs is the evidence `cola doctor` can demand before it calls your own
-client's attachment proven.
+A `kind = "codex"` client attaches to Codex's app-server daemon. The app-server
+daemon's control socket is an AF_UNIX socket on every platform; cola reaches it
+through `codex app-server proxy`, so nothing in cola's path needs a WebSocket
+or TCP listener, and `ws://` is not a user-facing endpoint for the app-server
+daemon. What differs is the evidence `cola doctor` can demand before it calls
+your own client's attachment proven.
 
 | Platform | cola attaches | `cola doctor` proves *your* client attached | Verification |
 | --- | --- | --- | --- |
@@ -354,18 +354,18 @@ cola through the proxy, and completes a turn, an approval round-trip and an
 interrupt. What cola cannot observe on Windows is a socket descriptor or peer
 address for *your own* TUI, so `cola doctor` reports that client as unverified
 with the reason instead of promoting its `--remote` argv to attached. The
-managed daemon's Windows attachment is unmeasured: the daemon cannot start on a
-hosted Windows runner, whose token is elevated.
+managed app-server daemon's Windows attachment is unmeasured: the app-server
+daemon cannot start on a hosted Windows runner, whose token is elevated.
 
-On Windows, a daemon start has three doctor checks; a fourth constraint
-applies when Codex runs inside WSL. Most failures are silent at the TUI level
-(it falls back to an embedded server); in `cola doctor` an elevated token is a
-❌ and an unreadable elevation a ⚠️:
+On Windows, an app-server daemon start has three doctor checks; a fourth
+constraint applies when Codex runs inside WSL. Most failures are silent at the
+TUI level (it falls back to an embedded server); in `cola doctor` an elevated
+token is a ❌ and an unreadable elevation a ⚠️:
 
 - **A non-elevated process token.** An administrator token would hand every
   shared client administrator privileges; start cola from a non-elevated
   terminal.
-- **A breakaway-capable launcher.** Codex starts the daemon with
+- **A breakaway-capable launcher.** Codex starts the app-server daemon with
   `CREATE_BREAKAWAY_FROM_JOB`; `cargo run` or an outer job object refuses that
   child, so run `codex.exe` directly.
 - **A short `CODEX_HOME`.** Windows binds the AF_UNIX control socket at the
