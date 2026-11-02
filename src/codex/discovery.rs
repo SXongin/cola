@@ -58,6 +58,12 @@ pub(crate) const MANAGED_BINARY: &str = "packages/app-server-daemon/current/bin/
 /// How long the management CLI gets to report the daemon's state.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long one control-socket liveness probe may take before the daemon is
+/// presumed gone. A hung connect must not stall the proxy watcher, so the probe
+/// runs on the blocking pool under this budget; an unanswered connect is not
+/// evidence of life.
+pub(crate) const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
 /// How long `daemon start` gets to return. The command daemonizes and returns
 /// promptly; a bound keeps a wedged CLI from holding an attach pass forever.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -252,6 +258,49 @@ pub(crate) fn socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
             ),
         ))
     }
+}
+
+/// Whether a real connect to the control socket succeeds — a **liveness check
+/// on the app-server daemon**, not a second transport.
+///
+/// The adapter's RPC transport is the proxy child (`codex app-server proxy`),
+/// which owns the traffic; this probe only asks whether a listener is still
+/// there and drops the stream immediately. It is separate because a daemon
+/// killed without unlinking its socket leaves the same path and file identity
+/// behind, so metadata alone cannot tell a live daemon from a stale socket. The
+/// probe runs on the blocking pool under [`CONTROL_PROBE_TIMEOUT`]; a failed or
+/// timed-out connect means the daemon is gone.
+pub(crate) async fn control_socket_accepts(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    let connect = tokio::task::spawn_blocking(move || connect_control_socket(&path));
+    matches!(
+        tokio::time::timeout(CONTROL_PROBE_TIMEOUT, connect).await,
+        Ok(Ok(Ok(())))
+    )
+}
+
+#[cfg(unix)]
+fn connect_control_socket(path: &Path) -> std::io::Result<()> {
+    let stream = std::os::unix::net::UnixStream::connect(path)?;
+    drop(stream);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn connect_control_socket(path: &Path) -> std::io::Result<()> {
+    // Stable Rust cannot reach an AF_UNIX socket on Windows; `uds_windows`
+    // exposes the same blocking connect and is used only for this probe.
+    let stream = uds_windows::UnixStream::connect(path)?;
+    drop(stream);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn connect_control_socket(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no unix-domain sockets",
+    ))
 }
 
 /// `FILE_FLAG_BACKUP_SEMANTICS` also opens directories; with
@@ -2325,6 +2374,36 @@ mod tests {
             .expect_err("a relative home is refused");
         assert!(matches!(error, CodexError::CodexHome(_)), "{error}");
         assert!(error.to_string().contains("absolute"), "{error}");
+    }
+
+    /// The liveness probe follows a real listener, not a filesystem entry: a
+    /// bound socket accepts a probe, a surviving path does not, and a missing
+    /// path does not. The stale path exists but has nothing listening behind
+    /// it — a metadata-only check would call it alive, so only a real connect
+    /// passes this. The end-to-end SIGKILL case (a stale socket file left by a
+    /// killed daemon) is the transport suite's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_control_socket_accepts_and_a_stale_path_does_not() {
+        let root = tempfile::tempdir().expect("temp root");
+        let live = root.path().join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&live).expect("bind a listener");
+        assert!(
+            control_socket_accepts(&live).await,
+            "a bound listener accepts the probe"
+        );
+        drop(listener);
+
+        let stale = root.path().join("stale.sock");
+        std::fs::write(&stale, b"").expect("create a path with no listener");
+        assert!(
+            !control_socket_accepts(&stale).await,
+            "an existing path with no listener is not proof of life"
+        );
+        assert!(
+            !control_socket_accepts(&root.path().join("missing.sock")).await,
+            "a missing path refuses the probe"
+        );
     }
 
     /// The daemon's own report shape, as `codex app-server daemon version`
