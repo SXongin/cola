@@ -295,8 +295,11 @@ jobs:
       # The GitHub-release asset is a standalone CLI: `daemon bootstrap` fails
       # with "this CLI has no complete local package". The npm package ships
       # the managed package `daemon bootstrap` installs, so tier-2 runs the
-      # npm shim while tier-1 keeps the release asset on PATH. `--prefix`
-      # installs no global bin entry, so it cannot shadow tier-1's `codex`.
+      # npm shim while tier-1 keeps the release asset on PATH. The main npm
+      # tarball is SHA-256-pinned (ADR-0057's exact version + artifact digest);
+      # npm still resolves the platform package from the registry with its own
+      # integrity. `--prefix` installs no global bin entry, so it cannot shadow
+      # tier-1's `codex`.
       - if: >-
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
@@ -305,7 +308,17 @@ jobs:
         run: |
           set -euo pipefail
           prefix="$RUNNER_TEMP/codex-npm"
-          npm install --prefix "$prefix" @openai/codex@0.166.0
+          tarball="$RUNNER_TEMP/codex-0.166.0.tgz"
+          digest=67ee6f4069d9328956401f54ac202c20369233159058af9f4ec1af731b87f5b7
+          curl --fail --silent --show-error --location \
+            "https://registry.npmjs.org/@openai/codex/-/codex-0.166.0.tgz" \
+            --output "$tarball"
+          actual=$(shasum -a 256 "$tarball" | awk '{print $1}')
+          if [ "$actual" != "$digest" ]; then
+            echo "the npm Codex tarball SHA-256 is $actual, expected $digest" >&2
+            exit 1
+          fi
+          npm install --prefix "$prefix" --ignore-scripts "$tarball"
           shim="$prefix/node_modules/.bin/codex"
           if [ ! -x "$shim" ]; then
             echo "the npm Codex shim is missing or not executable: $shim" >&2
