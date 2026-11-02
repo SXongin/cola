@@ -841,6 +841,7 @@ async fn daemon_version(environment: &Environment) -> Result<DaemonInfo> {
         environment,
         &["app-server", "daemon", "version"],
         environment.version_timeout,
+        true,
     )
     .await?;
     if !output.status.success() {
@@ -970,6 +971,7 @@ async fn start_after_preflight(
         environment,
         &["app-server", "daemon", "start"],
         environment.start_timeout,
+        false,
     )
     .await?;
     if !output.status.success() {
@@ -1059,18 +1061,23 @@ async fn discovered_after_start(environment: &Environment) -> Result<DiscoveredD
 /// Run one management command with `CODEX_HOME` pinned to the environment's
 /// home, stdin closed, and a bound.
 ///
-/// The child is deliberately **not** killed on drop: the command is Codex's own
+/// `kill_on_drop` is **false** for the launcher: `daemon start` is Codex's own
 /// launcher, never the daemon, but cola still reaps nothing it did not start.
+/// It is **true** for `daemon version`, which the Windows readiness probe calls
+/// repeatedly; a child that wedges past the timeout would otherwise accumulate
+/// for the life of the start.
 async fn run_cli(
     environment: &Environment,
     arguments: &[&str],
     timeout: Duration,
+    kill_on_drop: bool,
 ) -> Result<std::process::Output> {
     let mut command = tokio::process::Command::new(&environment.cli);
     command
         .args(arguments)
         .env("CODEX_HOME", &environment.home)
-        .stdin(std::process::Stdio::null());
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(kill_on_drop);
     match tokio::time::timeout(timeout, command.output()).await {
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(CodexError::Daemon(format!(
