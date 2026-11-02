@@ -68,6 +68,13 @@ const TREE_REMOVE_STEP: Duration = Duration::from_millis(50);
 /// 108-byte `sun_path` budget on a hosted `%TEMP%`.
 const LIVE_HOME_DIR: &str = "h";
 
+/// The tier-2 daemon's isolated `CODEX_HOME` directory name under the temp
+/// root, matching [`LiveDaemon::new`]. It is longer than [`LIVE_HOME_DIR`], so
+/// the socket budget check uses it as the worst case: a root that fits here
+/// serves either tier.
+#[cfg(unix)]
+const LIVE_DAEMON_HOME_DIR: &str = "home";
+
 /// The longest AF_UNIX path the temp root may produce. Unix `sun_path` is 104
 /// bytes on macOS and 108 on Linux; Windows uses the Windows limit from
 /// discovery. A one-byte margin keeps the terminating NUL inside the field.
@@ -105,10 +112,25 @@ pub fn short_tempdir(prefix: &str) -> tempfile::TempDir {
     );
 }
 
+/// The home directory name the budget is measured against: the longer of the
+/// two tiers' names, so one check covers both.
+fn home_dir_for_budget() -> &'static str {
+    #[cfg(unix)]
+    {
+        LIVE_DAEMON_HOME_DIR
+    }
+    #[cfg(not(unix))]
+    {
+        LIVE_HOME_DIR
+    }
+}
+
 /// Whether a temp root's listener path — including the private directory Codex
-/// creates — is inside the platform budget.
+/// creates — is inside the platform budget. Measured against the worst-case
+/// (`home`, the tier-2 name), so a near-limit root cannot pass this check and
+/// then fail the daemon's own `ENAMETOOLONG` dial.
 fn socket_path_fits(root: &Path) -> bool {
-    root.join(LIVE_HOME_DIR)
+    root.join(home_dir_for_budget())
         .join(CONTROL_DIR)
         .join(CONTROL_SOCKET)
         .as_os_str()
@@ -384,7 +406,7 @@ pub struct LiveDaemon {
 impl LiveDaemon {
     pub fn new(cli: PathBuf) -> Self {
         let root = short_tempdir("cola-t2");
-        let home = root.path().join("home");
+        let home = root.path().join(LIVE_DAEMON_HOME_DIR);
         std::fs::create_dir_all(&home).expect("create the isolated CODEX_HOME");
         Self {
             _root: root,
