@@ -287,6 +287,12 @@ fn windows_socket_identity(path: &Path) -> Result<Option<SocketIdentity>> {
 /// fallback is what produces the identity. Stable `std` cannot bind an AF_UNIX
 /// socket on Windows, so this is the closest the suite can get to the object a
 /// real daemon creates.
+///
+/// The metadata read and the open are two separate syscalls, so a daemon that
+/// removes or re-creates the control object between them makes the open fail
+/// `NotFound`. That gap is the same absence `metadata` would have reported a
+/// moment later, so it returns `Ok(None)`; every other open error stays a
+/// named failure.
 #[cfg(windows)]
 fn windows_socket_identity_with(
     path: &Path,
@@ -304,7 +310,11 @@ fn windows_socket_identity_with(
         ));
     }
 
-    let file = open_attribute_handle_with(&mut open).map_err(|error| unusable_socket(path, error))?;
+    let file = match open_attribute_handle_with(&mut open) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unusable_socket(path, error)),
+    };
     let info = winapi_util::file::information(&file).map_err(|error| unusable_socket(path, error))?;
     Ok(Some(SocketIdentity {
         volume_serial_number: info.volume_serial_number() as u32,
@@ -2740,6 +2750,22 @@ mod tests {
             2,
             "the plain open failed, so the identity came from the fallback"
         );
+    }
+
+    /// The metadata read and the open are two syscalls. A daemon that removes
+    /// the control object in that gap makes the open return `NotFound`; that is
+    /// the absence `socket_identity` promises as `Ok(None)`, not a hard error.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_object_that_vanishes_between_metadata_and_open_is_absent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("object");
+        std::fs::write(&path, b"").expect("write the file");
+
+        let identity =
+            windows_socket_identity_with(&path, |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+                .expect("absence is not an error");
+        assert_eq!(identity, None);
     }
 
     /// Windows is a supported discovery platform now: an existing control
