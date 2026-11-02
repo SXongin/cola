@@ -52,6 +52,16 @@ const STARTUP_STEP: Duration = Duration::from_millis(25);
 /// of holding the 20-minute budget.
 #[cfg(unix)]
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+/// `daemon bootstrap` installs the managed package and starts it; the CLI is a
+/// standalone release binary, so this is the only way to get a daemon package.
+#[cfg(unix)]
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Windows can keep a directory handle open for a moment after a child exits;
+/// a temp-tree removal is retried for this long, then reported with the OS
+/// error rather than the assertion being weakened.
+const TREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The pause between temp-tree removal attempts.
+const TREE_REMOVE_STEP: Duration = Duration::from_millis(50);
 
 /// The isolated `CODEX_HOME`'s directory name under the temp root, matching
 /// [`isolated_home`]. One byte keeps the Windows listener path well inside the
@@ -315,13 +325,10 @@ impl LiveAppServer {
         // The reaped process is the proof no listener remains. Remove the
         // temp tree here rather than relying on `TempDir`'s drop: the test's
         // cleanup assertions are about what shutdown proved, not what a
-        // best-effort destructor happens to do later.
-        let _ = std::fs::remove_dir_all(&self.work);
-        let _ = std::fs::remove_dir_all(&self.home);
-        assert!(
-            !self.home.exists() && !self.work.exists(),
-            "the live app-server temp home/work was left behind"
-        );
+        // best-effort destructor happens to do later. Windows can hold a
+        // handle briefly, so the removal is retried.
+        remove_tree_with_retry(&self.work).await;
+        remove_tree_with_retry(&self.home).await;
     }
 }
 
@@ -331,6 +338,28 @@ impl Drop for LiveAppServer {
             let _ = child.start_kill();
         }
     }
+}
+
+/// Remove a temp tree, retrying transient Windows sharing violations, then
+/// assert it is gone with the last OS error in the message.
+async fn remove_tree_with_retry(path: &Path) {
+    let deadline = Instant::now() + TREE_REMOVE_TIMEOUT;
+    let last_error = loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    break error;
+                }
+                sleep(TREE_REMOVE_STEP).await;
+            }
+        }
+    };
+    panic!(
+        "the live Codex temp path {} was left behind after {TREE_REMOVE_TIMEOUT:?}: {last_error}",
+        path.display()
+    );
 }
 
 /// A real managed daemon started through `codex app-server daemon start` under
@@ -433,34 +462,31 @@ impl LiveDaemon {
         );
     }
 
-    /// Stop the daemon and prove every process under this isolated home is
-    /// gone. `daemon stop` reaps the managed daemon but Codex's
-    /// `app-server daemon pid-update-loop` helper is detached; this suite
-    /// started it, so it kills anything whose executable or argv is under the
-    /// temp home (and nothing else).
-    pub async fn shutdown(&self) {
-        let socket = self.environment().socket();
-        // This daemon's own runtime directory, from the published symlink.
-        // Cleanup is keyed to it and to the pre-test snapshot, never to every
-        // `codex-daemon-*` directory: a developer's daemon elsewhere is out of
-        // scope even if it shares the per-user directory.
-        let runtime_dir = std::fs::read_link(&socket)
+    /// The managed package binary `daemon bootstrap`/`daemon start` installs.
+    pub fn package_binary(&self) -> PathBuf {
+        self.home.join(crate::codex::discovery::MANAGED_BINARY)
+    }
+
+    /// This daemon's own runtime directory, from the published symlink.
+    fn runtime_dir(&self) -> Option<PathBuf> {
+        std::fs::read_link(self.environment().socket())
             .ok()
             .and_then(|target| target.parent().map(Path::to_path_buf))
             .map(|directory| std::fs::canonicalize(&directory).unwrap_or(directory))
             .filter(|directory| {
                 let text = directory.to_string_lossy();
                 text.starts_with("/tmp/codex-daemon-") || text.starts_with("/private/tmp/codex-daemon-")
-            });
-        if socket.exists() {
-            self.stop().await;
-            self.stopped.set(true);
-        }
+            })
+    }
+
+    /// Kill every process the daemon left under this isolated home (the
+    /// `pid-update-loop` helper and plugin-fetch children included).
+    async fn kill_lingering(&self) {
         let deadline = Instant::now() + REAP_TIMEOUT;
         loop {
             let lingering = daemon_processes_under(&self.home);
             if lingering.is_empty() {
-                break;
+                return;
             }
             for pid in lingering {
                 if let Some(process) = system().process(pid) {
@@ -474,6 +500,17 @@ impl LiveDaemon {
             );
             sleep(STARTUP_STEP).await;
         }
+    }
+
+    /// Stop the daemon (if any), reap its helpers, remove only the runtime
+    /// entries this test added, and assert the published socket is gone.
+    async fn stop_and_remove_runtime(&self) {
+        let socket = self.environment().socket();
+        let runtime_dir = self.runtime_dir();
+        if socket.exists() {
+            self.stop().await;
+        }
+        self.kill_lingering().await;
         if let Some(directory) = runtime_dir.as_deref() {
             cleanup_runtime(directory, self.runtime_before.get(directory));
         }
@@ -483,14 +520,66 @@ impl LiveDaemon {
             "the managed daemon's control socket {} was left behind",
             socket.display()
         );
-        // Remove the temp tree explicitly: the test's assertion is about what
-        // shutdown did, not what `TempDir`'s drop later attempts.
-        std::fs::remove_dir_all(&self.home).expect("remove the live CODEX_HOME");
+    }
+
+    /// Install the managed package from the standalone CLI and start it once,
+    /// then stop it again. The GitHub release asset is a standalone `codex`,
+    /// not a packaged daemon: `daemon start` alone answers "this CLI has no
+    /// complete local package" (macOS) or refuses a `/tmp` helper install
+    /// (Linux). `daemon bootstrap` is the supported entry point, and it leaves
+    /// `$CODEX_HOME/packages/app-server-daemon/current/bin/codex` behind for
+    /// the real `never`/`auto` flow.
+    pub async fn bootstrap(&self) {
+        let mut command = tokio::process::Command::new(&self.cli);
+        command
+            .args(["app-server", "daemon", "bootstrap"])
+            .env("CODEX_HOME", &self.home)
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(BOOTSTRAP_TIMEOUT, command.output())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("`codex app-server daemon bootstrap` did not answer within {BOOTSTRAP_TIMEOUT:?}")
+            })
+            .expect("run `codex app-server daemon bootstrap`");
         assert!(
-            !self.home.exists(),
-            "the live CODEX_HOME {} was left behind",
-            self.home.display()
+            output.status.success(),
+            "`codex app-server daemon bootstrap` failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|_| panic!("bootstrap printed no JSON: {:?}", output.stdout));
+        assert_eq!(
+            report["status"], "bootstrapped",
+            "unexpected bootstrap report: {report}"
+        );
+        let package = self.package_binary();
+        assert!(
+            package.is_file(),
+            "bootstrap did not install the managed package at {}",
+            package.display()
+        );
+
+        // The bootstrap daemon is setup evidence only: stop it before `never`
+        // proves no daemon remains, and keep its package for `auto`.
+        self.stop_and_remove_runtime().await;
+        assert!(
+            package.is_file(),
+            "stopping the bootstrap daemon removed the managed package at {}",
+            package.display()
+        );
+        assert!(
+            !self.environment().socket().exists(),
+            "the bootstrap daemon left a control socket at {}",
+            self.environment().socket().display()
+        );
+    }
+
+    /// Stop the daemon and prove every process under this isolated home is
+    /// gone, then remove the temp home explicitly.
+    pub async fn shutdown(&self) {
+        self.stop_and_remove_runtime().await;
+        self.stopped.set(true);
+        remove_tree_with_retry(&self.home).await;
     }
 }
 
