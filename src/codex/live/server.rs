@@ -12,9 +12,11 @@
 //! is protected, owner-only and one inheritable ACE. A `tempfile` root under
 //! `%TEMP%` inherits SYSTEM/Administrators ACEs, so the child exits
 //! `PermissionDenied: socket directory is not private to the current user`.
-//! The listener therefore lives at `<root>/app-server-control/app-server.sock`
-//! with `app-server-control` **absent before the spawn** — the same shape as
-//! Codex's own Windows tests — and Codex creates the private directory.
+//! The listener therefore lives at the discovered control-socket path,
+//! `<home>/app-server-control/app-server-control.sock`, with
+//! `app-server-control` **absent before the spawn** — the same shape as Codex's
+//! own Windows tests — and Codex creates the private directory. Discovery and
+//! the lifecycle both look there, so the tier drives the real attach path.
 //!
 //! The server's whole world is the temp tree — the store, config and work
 //! directory — so it can never see the machine's own Codex state.
@@ -36,8 +38,7 @@ use std::time::{Duration, Instant};
 
 use tokio::time::sleep;
 
-#[cfg(unix)]
-use crate::codex::discovery::Environment;
+use crate::codex::discovery::{CONTROL_DIR, CONTROL_SOCKET, Environment};
 use crate::codex::transport::Endpoint;
 
 /// How long app-server gets to publish its control socket.
@@ -52,11 +53,9 @@ const STARTUP_STEP: Duration = Duration::from_millis(25);
 #[cfg(unix)]
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The private directory Codex creates for a listener socket. It must not exist
-/// before the child starts (see the module docs).
-const LIVE_CONTROL_DIR: &str = "app-server-control";
-/// The listener's file name inside [`LIVE_CONTROL_DIR`].
-const LIVE_SOCKET_NAME: &str = "app-server.sock";
+/// The isolated `CODEX_HOME`'s directory name under the temp root, matching
+/// [`isolated_home`].
+const LIVE_HOME_DIR: &str = "home";
 
 /// The longest AF_UNIX path the temp root may produce. Unix `sun_path` is 104
 /// bytes on macOS and 108 on Linux; Windows uses the Windows limit from
@@ -98,20 +97,21 @@ pub fn short_tempdir(prefix: &str) -> tempfile::TempDir {
 /// Whether a temp root's listener path — including the private directory Codex
 /// creates — is inside the platform budget.
 fn socket_path_fits(root: &Path) -> bool {
-    root.join(LIVE_CONTROL_DIR)
-        .join(LIVE_SOCKET_NAME)
+    root.join(LIVE_HOME_DIR)
+        .join(CONTROL_DIR)
+        .join(CONTROL_SOCKET)
         .as_os_str()
         .len()
         < SOCKET_PATH_LIMIT
 }
 
 /// The Windows worst-case shape this suite relies on: `%TEMP%` on a hosted
-/// runner plus `cola-cxXXXXXX/app-server-control/app-server.sock`. Kept as a
-/// test below so a future prefix or directory name cannot silently overflow
-/// the 108-byte limit on a platform this host cannot run.
+/// runner plus `cola-cxXXXXXX/home/app-server-control/app-server-control.sock`.
+/// Kept as a test below so a future prefix or directory name cannot silently
+/// overflow the 108-byte limit on a platform this host cannot run.
 #[cfg(test)]
 fn windows_socket_shape(temp: &str) -> String {
-    format!(r"{temp}\cola-cxAbCdEf\{LIVE_CONTROL_DIR}\{LIVE_SOCKET_NAME}")
+    format!(r"{temp}\cola-cxAbCdEf\{LIVE_HOME_DIR}\{CONTROL_DIR}\{CONTROL_SOCKET}")
 }
 
 /// One isolated `CODEX_HOME` plus the provider base URL it points at.
@@ -145,6 +145,7 @@ pub struct LiveAppServer {
     child: Option<tokio::process::Child>,
     _root: tempfile::TempDir,
     home: PathBuf,
+    cli: PathBuf,
     work: PathBuf,
     socket: PathBuf,
     log: PathBuf,
@@ -156,9 +157,11 @@ impl LiveAppServer {
         let root = short_tempdir("cola-cx");
         let home = isolated_home(root.path(), provider_base_url);
         let work = root.path().join("work");
-        // Deliberately do not create the parent: Codex creates it with the
-        // private Windows DACL (see the module docs).
-        let socket = root.path().join(LIVE_CONTROL_DIR).join(LIVE_SOCKET_NAME);
+        // The discovered control-socket path, so the lifecycle's discovery and
+        // dial look exactly where this listener published. Deliberately do not
+        // create the parent: Codex creates it with the private Windows DACL
+        // (see the module docs).
+        let socket = home.join(CONTROL_DIR).join(CONTROL_SOCKET);
         let log = root.path().join("app-server.log");
         let stderr = std::fs::File::create(&log).expect("create the app-server log");
         let stdout = std::fs::File::create(root.path().join("app-server.out"))
@@ -181,6 +184,7 @@ impl LiveAppServer {
             child: Some(child),
             _root: root,
             home,
+            cli: binary.to_path_buf(),
             work,
             socket,
             log,
@@ -218,6 +222,19 @@ impl LiveAppServer {
 
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// The same isolated home and CLI the listener runs with, so the live tier
+    /// drives the production discovery and attach path rather than a bespoke
+    /// endpoint.
+    pub fn environment(&self) -> Environment {
+        Environment {
+            home: self.home.clone(),
+            cli: self.cli.clone(),
+            version_timeout: Duration::from_secs(15),
+            start_timeout: Duration::from_secs(60),
+            socket_ready_timeout: Duration::from_secs(20),
+        }
     }
 
     pub fn work(&self) -> &Path {

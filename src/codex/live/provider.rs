@@ -7,7 +7,7 @@
 //! - **text** — a plain assistant message, streamed as one
 //!   `response.output_item.done` plus `response.completed`;
 //! - **approval** — a `exec_command` function call; after the tool result comes
-//!   back, the closing text. The thread's read-only sandbox plus `untrusted`
+//!   back, the closing text. The thread's read-only sandbox plus `on-request`
 //!   approval policy turns the call into a real approval request;
 //! - **interrupt** — the handler holds the response open until the test
 //!   releases it, so `turn/interrupt` lands while the model call is in flight.
