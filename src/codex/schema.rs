@@ -13,7 +13,7 @@
 //! A server reporting another version is never assumed compatible. Its own
 //! binary is asked for a schema (`generate-json-schema`) and the required
 //! subset is checked against that; the binary's `--version` must match the
-//! version the server reported, so a 0.163 CLI cannot vouch for a 0.166
+//! version the server reported, so a 0.165 CLI cannot vouch for a 0.166
 //! daemon. A missing required method fails construction, named — never at the
 //! first prompt. An older binary is refused outright.
 //!
