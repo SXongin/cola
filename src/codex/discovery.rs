@@ -1952,7 +1952,6 @@ fn mark_unproven(clients: &mut LocalClients, mut unverified: Vec<UnverifiedClien
 /// both layouts parse (the old fixed index 8 skipped every macOS row).
 #[cfg(any(target_os = "macos", test))]
 struct LsofUnixRow {
-    pid: i32,
     /// The DEVICE column's kernel address, normalised.
     device: String,
     /// The NAME column: a path, a bare `0x<addr>`, or a `local->peer` pair.
@@ -1965,7 +1964,9 @@ fn lsof_unix_row(line: &str) -> Option<LsofUnixRow> {
     if tokens.len() < 7 || tokens[4] != "unix" {
         return None;
     }
-    let pid = tokens[1].parse().ok()?;
+    // The PID must be numeric, but only control-path rows are collected, so
+    // the value itself is not needed.
+    tokens[1].parse::<i32>().ok()?;
     let device = normalized_unix_address(tokens[5])?;
     let mut name_start = 7;
     if tokens
@@ -1979,7 +1980,7 @@ fn lsof_unix_row(line: &str) -> Option<LsofUnixRow> {
         .get(name_start..)
         .map(|tokens| tokens.join(" "))
         .unwrap_or_default();
-    Some(LsofUnixRow { pid, device, name })
+    Some(LsofUnixRow { device, name })
 }
 
 /// Split a NAME into its local and peer parts at the first `->`.
@@ -2020,16 +2021,13 @@ fn lsof_peer_addresses(output: &str) -> Vec<String> {
 /// The daemon's socket addresses (DEVICE) from rows that prove it is the
 /// control-path daemon.
 ///
-/// Collected shapes:
-/// - the control path's rows — the listener and its accepted stream sockets
-///   inherit it, and their DEVICE is the address a client's `->0x<addr>` names;
-/// - the daemon's unnamed listening rows — a bare `0x<addr>` NAME with no peer
-///   arrow, the ticket's listener spelling. Restricted to the pid(s) that also
-///   hold a control-path row: a helper listener the daemon owns but that no
-///   client connected to must not promote a client connected elsewhere.
+/// Only the control path's rows count: the listener and its accepted stream
+/// sockets inherit it, and their DEVICE is the address a client's `->0x<addr>`
+/// names. A bare `0x<addr>` listener is deliberately **not** evidence — a
+/// daemon helper can own one that no client ever connected to, so promoting its
+/// address would mark a client attached to an unrelated socket.
 ///
-/// A row carrying a peer arrow is a connection, not a listener, and a row for
-/// another path belongs to someone else; neither contributes an address.
+/// A row for another path belongs to someone else and contributes no address.
 ///
 /// `spellings` are the published, canonical and literal-target spellings of the
 /// control path. The normal match is string equality; only when that fails is
@@ -2037,25 +2035,12 @@ fn lsof_peer_addresses(output: &str) -> Vec<String> {
 /// verbatim bind spelling.
 #[cfg(any(target_os = "macos", test))]
 fn lsof_daemon_addresses(output: &str, spellings: &[String]) -> Vec<String> {
-    let rows: Vec<LsofUnixRow> = output.lines().filter_map(lsof_unix_row).collect();
-    let mut control_pids = Vec::new();
-    for row in &rows {
-        let (local, _) = split_lsof_name(&row.name);
-        if is_daemon_path(local, spellings) && !control_pids.contains(&row.pid) {
-            control_pids.push(row.pid);
-        }
-    }
-    let mut addresses = Vec::new();
-    for row in &rows {
-        let (local, peer) = split_lsof_name(&row.name);
-        let path_row = is_daemon_path(local, spellings);
-        let unnamed_listener =
-            peer.is_none() && normalized_unix_address(local).is_some() && control_pids.contains(&row.pid);
-        if path_row || unnamed_listener {
-            addresses.push(row.device.clone());
-        }
-    }
-    addresses
+    output
+        .lines()
+        .filter_map(lsof_unix_row)
+        .filter(|row| is_daemon_path(split_lsof_name(&row.name).0, spellings))
+        .map(|row| row.device)
+        .collect()
 }
 
 /// Whether `name` is one of the control path's spellings.
@@ -3317,8 +3302,9 @@ mod tests {
 
     /// The macOS parser reads the NAME peer arrow for the client and the
     /// DEVICE address of sockets bound to the daemon path for the daemon. A
-    /// different path's DEVICE and the peer arrow are never daemon addresses,
-    /// and both renderings of the same address normalise.
+    /// different path's DEVICE, a bare unnamed listener and the peer arrow are
+    /// never daemon addresses, and both renderings of the same address
+    /// normalise.
     #[test]
     fn lsof_peer_and_daemon_addresses_come_from_their_own_columns() {
         let output = "\
@@ -3338,7 +3324,8 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         );
         assert_eq!(
             lsof_daemon_addresses(output, &["/tmp/control.sock".to_string()]),
-            vec!["0xbb", "0xcc", "0xee"]
+            vec!["0xbb", "0xcc"],
+            "only the control path's rows count; the bare `0xee` listener does not"
         );
     }
 
@@ -3369,11 +3356,12 @@ codex 42 me 13u unix 0x0000000000000012 0t0 0x00000000000000ab->0x00000000000000
         );
     }
 
-    /// The unnamed-listener arm only applies to a pid that also holds a
-    /// control-path row: a helper listener owned by someone else must not be
-    /// mistaken for the daemon.
+    /// A bare `0x<addr>` listener is never evidence, even on the daemon's own
+    /// pid: a helper can own one that no client connected to, so promoting it
+    /// would mark a client attached to an unrelated socket. Only the
+    /// control-path row counts.
     #[test]
-    fn an_unrelated_unnamed_listener_is_not_a_daemon_address() {
+    fn a_bare_unnamed_listener_is_not_a_daemon_address() {
         let output = "\
 COMMAND PID USER FD TYPE DEVICE SIZE/OFF NAME
 codex 42 me 10u unix 0x00000000000000aa 0t0 /tmp/control.sock
@@ -3382,7 +3370,8 @@ other 99 me 12u unix 0x00000000000000cc 0t0 0x00000000000000cc
 ";
         assert_eq!(
             lsof_daemon_addresses(output, &["/tmp/control.sock".to_string()]),
-            vec!["0xaa", "0xbb"]
+            vec!["0xaa"],
+            "a helper listener on the daemon's pid must not be promoted"
         );
     }
 
