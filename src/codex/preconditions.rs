@@ -453,7 +453,7 @@ mod tests {
     fn fits() -> SocketBudget {
         SocketBudget::Fits {
             path: "/short/control.sock".to_string(),
-            length: 18,
+            length: 19,
             limit: 108,
         }
     }
