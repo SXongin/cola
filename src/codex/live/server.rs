@@ -5,8 +5,19 @@
 //! an AF_UNIX socket at the published path itself and enforces the 108-byte
 //! `sun_path` limit (terminator included), so a temp root inherited from a
 //! deep macOS `$TMPDIR` would make the test fail for a reason unrelated to the
-//! adapter. The server's whole world is the temp tree — the store, config and
-//! work directory — so it can never see the machine's own Codex state.
+//! adapter.
+//!
+//! On Windows the socket must also live in a directory Codex itself creates:
+//! `prepare_private_socket_directory` accepts a directory only when its DACL
+//! is protected, owner-only and one inheritable ACE. A `tempfile` root under
+//! `%TEMP%` inherits SYSTEM/Administrators ACEs, so the child exits
+//! `PermissionDenied: socket directory is not private to the current user`.
+//! The listener therefore lives at `<root>/app-server-control/app-server.sock`
+//! with `app-server-control` **absent before the spawn** — the same shape as
+//! Codex's own Windows tests — and Codex creates the private directory.
+//!
+//! The server's whole world is the temp tree — the store, config and work
+//! directory — so it can never see the machine's own Codex state.
 //!
 //! **tier-2** starts the real managed daemon through Codex's own
 //! `app-server daemon start`, using the same isolated-home guarantee.
@@ -35,6 +46,17 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often startup re-reads the socket path.
 const STARTUP_STEP: Duration = Duration::from_millis(25);
+/// How long a `codex app-server daemon …` management command gets before it is
+/// treated as wedged. Every call is bounded so a hung CLI fails the job instead
+/// of holding the 20-minute budget.
+#[cfg(unix)]
+const CLI_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The private directory Codex creates for a listener socket. It must not exist
+/// before the child starts (see the module docs).
+const LIVE_CONTROL_DIR: &str = "app-server-control";
+/// The listener's file name inside [`LIVE_CONTROL_DIR`].
+const LIVE_SOCKET_NAME: &str = "app-server.sock";
 
 /// The longest AF_UNIX path the temp root may produce. Unix `sun_path` is 104
 /// bytes on macOS and 108 on Linux; Windows uses the Windows limit from
@@ -73,9 +95,23 @@ pub fn short_tempdir(prefix: &str) -> tempfile::TempDir {
     );
 }
 
-/// Whether a temp root's own listener path is inside the platform budget.
+/// Whether a temp root's listener path — including the private directory Codex
+/// creates — is inside the platform budget.
 fn socket_path_fits(root: &Path) -> bool {
-    root.join("app-server.sock").as_os_str().len() < SOCKET_PATH_LIMIT
+    root.join(LIVE_CONTROL_DIR)
+        .join(LIVE_SOCKET_NAME)
+        .as_os_str()
+        .len()
+        < SOCKET_PATH_LIMIT
+}
+
+/// The Windows worst-case shape this suite relies on: `%TEMP%` on a hosted
+/// runner plus `cola-cxXXXXXX/app-server-control/app-server.sock`. Kept as a
+/// test below so a future prefix or directory name cannot silently overflow
+/// the 108-byte limit on a platform this host cannot run.
+#[cfg(test)]
+fn windows_socket_shape(temp: &str) -> String {
+    format!(r"{temp}\cola-cxAbCdEf\{LIVE_CONTROL_DIR}\{LIVE_SOCKET_NAME}")
 }
 
 /// One isolated `CODEX_HOME` plus the provider base URL it points at.
@@ -120,7 +156,9 @@ impl LiveAppServer {
         let root = short_tempdir("cola-cx");
         let home = isolated_home(root.path(), provider_base_url);
         let work = root.path().join("work");
-        let socket = root.path().join("app-server.sock");
+        // Deliberately do not create the parent: Codex creates it with the
+        // private Windows DACL (see the module docs).
+        let socket = root.path().join(LIVE_CONTROL_DIR).join(LIVE_SOCKET_NAME);
         let log = root.path().join("app-server.log");
         let stderr = std::fs::File::create(&log).expect("create the app-server log");
         let stdout = std::fs::File::create(root.path().join("app-server.out"))
@@ -190,13 +228,34 @@ impl LiveAppServer {
         &self.socket
     }
 
+    /// The child process id, for the cleanup marker.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().and_then(tokio::process::Child::id)
+    }
+
+    /// Every path this listener must have removed by the end of the test: the
+    /// published path and, on Unix, the runtime socket and lock it links to.
+    pub fn runtime_paths(&self) -> Vec<PathBuf> {
+        let paths = vec![self.socket.clone()];
+        #[cfg(unix)]
+        let paths = {
+            let mut paths = paths;
+            if let Ok(target) = std::fs::read_link(&self.socket) {
+                paths.push(target.clone());
+                paths.push(target.with_extension("lock"));
+            }
+            paths
+        };
+        paths
+    }
+
     pub fn endpoint(&self) -> Endpoint {
         Endpoint::Unix(self.socket.clone())
     }
 
-    /// Kill the server and reap it; the test then proves the temp home, the
-    /// published socket path and both proxy children are gone. The temp home
-    /// is removed when `self` drops.
+    /// Kill the server, reap it, and remove the temp home/work explicitly; the
+    /// test then proves the published socket path and both proxy children are
+    /// gone too.
     pub async fn shutdown(&mut self) {
         let Some(mut child) = self.child.take() else {
             return;
@@ -213,7 +272,12 @@ impl LiveAppServer {
         });
         let pid = child.id();
         let _ = child.start_kill();
-        let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+        if tokio::time::timeout(REAP_TIMEOUT, child.wait()).await.is_err() {
+            // SIGKILL did not land within the bound; the process is still
+            // alive, and the assertion below names it rather than hanging.
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        }
         if let Some(pid) = pid {
             assert!(
                 !process_alive(pid),
@@ -230,10 +294,16 @@ impl LiveAppServer {
                 let _ = std::fs::remove_dir(parent);
             }
         }
-        // The reaped process is the proof no listener remains; a socket file
-        // can outlive SIGKILL, and the temp home (which owns the published
-        // path) is removed when `self` drops. The test asserts that path is
-        // gone after the drop.
+        // The reaped process is the proof no listener remains. Remove the
+        // temp tree here rather than relying on `TempDir`'s drop: the test's
+        // cleanup assertions are about what shutdown proved, not what a
+        // best-effort destructor happens to do later.
+        let _ = std::fs::remove_dir_all(&self.work);
+        let _ = std::fs::remove_dir_all(&self.home);
+        assert!(
+            !self.home.exists() && !self.work.exists(),
+            "the live app-server temp home/work was left behind"
+        );
     }
 }
 
@@ -296,15 +366,47 @@ impl LiveDaemon {
         }
     }
 
-    /// Whether a daemon process this suite started is still alive. The
-    /// management CLI reports a pid only while it is serving, so absence here
-    /// is "no daemon", and a leftover is a cleanup failure.
+    /// Every process the daemon started under this isolated home (the daemon,
+    /// its `pid-update-loop` helper, and anything else it forked).
+    pub fn process_ids(&self) -> Vec<u32> {
+        daemon_processes_under(&self.home)
+            .into_iter()
+            .map(|pid| pid.as_u32())
+            .collect()
+    }
+
+    /// Every path that must be gone after [`Self::shutdown`]: the published
+    /// socket and every runtime socket/lock this daemon added.
+    pub fn runtime_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![self.environment().socket()];
+        if let Ok(target) = std::fs::read_link(self.environment().socket()) {
+            paths.push(target.clone());
+            paths.push(target.with_extension("lock"));
+        }
+        for (directory, names) in runtime_snapshot() {
+            let baseline = self.runtime_before.get(&directory);
+            for name in names {
+                if baseline.is_none_or(|baseline| !baseline.contains(&name)) {
+                    paths.push(directory.join(name));
+                }
+            }
+        }
+        paths
+    }
+
+    /// Stop the daemon. Bounded: a wedged management CLI fails the test
+    /// instead of holding the job's whole 20-minute budget.
     pub async fn stop(&self) {
-        let output = tokio::process::Command::new(&self.cli)
+        let mut command = tokio::process::Command::new(&self.cli);
+        command
             .args(["app-server", "daemon", "stop"])
             .env("CODEX_HOME", &self.home)
-            .output()
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
             .await
+            .unwrap_or_else(|_| {
+                panic!("`codex app-server daemon stop` did not answer within {CLI_TIMEOUT:?}")
+            })
             .expect("run `codex app-server daemon stop`");
         assert!(
             output.status.success(),
@@ -320,6 +422,18 @@ impl LiveDaemon {
     /// temp home (and nothing else).
     pub async fn shutdown(&self) {
         let socket = self.environment().socket();
+        // This daemon's own runtime directory, from the published symlink.
+        // Cleanup is keyed to it and to the pre-test snapshot, never to every
+        // `codex-daemon-*` directory: a developer's daemon elsewhere is out of
+        // scope even if it shares the per-user directory.
+        let runtime_dir = std::fs::read_link(&socket)
+            .ok()
+            .and_then(|target| target.parent().map(Path::to_path_buf))
+            .map(|directory| std::fs::canonicalize(&directory).unwrap_or(directory))
+            .filter(|directory| {
+                let text = directory.to_string_lossy();
+                text.starts_with("/tmp/codex-daemon-") || text.starts_with("/private/tmp/codex-daemon-")
+            });
         if socket.exists() {
             self.stop().await;
             self.stopped.set(true);
@@ -342,15 +456,22 @@ impl LiveDaemon {
             );
             sleep(STARTUP_STEP).await;
         }
-        // The daemon's helper sockets live beside the published one; remove
-        // every runtime entry this daemon added (the test holds the live lock,
-        // so no sibling test's entries are new since `new`).
-        cleanup_runtime(&self.runtime_before);
+        if let Some(directory) = runtime_dir.as_deref() {
+            cleanup_runtime(directory, self.runtime_before.get(directory));
+        }
         let _ = std::fs::remove_file(&socket);
         assert!(
             !socket.exists(),
             "the managed daemon's control socket {} was left behind",
             socket.display()
+        );
+        // Remove the temp tree explicitly: the test's assertion is about what
+        // shutdown did, not what `TempDir`'s drop later attempts.
+        std::fs::remove_dir_all(&self.home).expect("remove the live CODEX_HOME");
+        assert!(
+            !self.home.exists(),
+            "the live CODEX_HOME {} was left behind",
+            self.home.display()
         );
     }
 }
@@ -358,19 +479,38 @@ impl LiveDaemon {
 #[cfg(unix)]
 impl Drop for LiveDaemon {
     fn drop(&mut self) {
-        // A failed test must not leave the daemon running: `daemon stop` is a
-        // synchronous child and bounded by its own startup timeout, but Drop
-        // cannot await, so the test's own `shutdown` is the asserted path and
-        // this is only the backstop. After `shutdown` ran there is nothing to
-        // stop, and a second call could spawn a helper under the runtime dir
-        // after the test already proved it clean.
+        // A failed test must not leave the daemon running. Drop cannot await,
+        // so the test's own `shutdown` is the asserted path and this is only
+        // the backstop. After `shutdown` ran there is nothing to stop, and a
+        // second call could spawn a helper under the runtime dir after the
+        // test already proved it clean.
         if self.stopped.get() {
             return;
         }
-        let _ = std::process::Command::new(&self.cli)
+        // Drop cannot await, so bound the synchronous child with a wait loop;
+        // a wedged `daemon stop` is killed rather than hanging the test binary
+        // at exit (and with it the job).
+        let Ok(mut child) = std::process::Command::new(&self.cli)
             .args(["app-server", "daemon", "stop"])
             .env("CODEX_HOME", &self.home)
-            .output();
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let deadline = Instant::now() + CLI_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                Ok(None) => std::thread::sleep(STARTUP_STEP),
+            }
+        }
     }
 }
 
@@ -392,6 +532,7 @@ fn runtime_snapshot() -> BTreeMap<PathBuf, BTreeSet<OsString>> {
         if !path.is_dir() {
             continue;
         }
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         let names = std::fs::read_dir(&path)
             .map(|entries| entries.flatten().map(|entry| entry.file_name()).collect())
             .unwrap_or_default();
@@ -400,20 +541,26 @@ fn runtime_snapshot() -> BTreeMap<PathBuf, BTreeSet<OsString>> {
     snapshot
 }
 
-/// Remove runtime entries that were not in the pre-test snapshot, then drop a
-/// runtime directory the test created. A user daemon's pre-existing entries are
-/// left untouched.
+/// Remove runtime entries in `directory` that were not in the pre-test
+/// snapshot, then drop the directory if it is now empty.
+///
+/// **Assumption**: the test holds the live suite lock and runs in isolation, so
+/// any entry absent from the snapshot was created by this test's daemon. Pre-existing entries (a developer's daemon, or a prior
+/// crashed run) are never touched. The caller passes the one directory the
+/// daemon's own published socket named; other `codex-daemon-*` directories are
+/// not scanned here.
 #[cfg(unix)]
-fn cleanup_runtime(before: &BTreeMap<PathBuf, BTreeSet<OsString>>) {
-    for (directory, names) in runtime_snapshot() {
-        let baseline = before.get(&directory);
-        for name in names {
-            if baseline.is_none_or(|baseline| !baseline.contains(&name)) {
-                let _ = std::fs::remove_file(directory.join(&name));
-            }
+fn cleanup_runtime(directory: &Path, before: Option<&BTreeSet<OsString>>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if before.is_none_or(|before| !before.contains(&name)) {
+            let _ = std::fs::remove_file(directory.join(name));
         }
-        let _ = std::fs::remove_dir(&directory);
     }
+    let _ = std::fs::remove_dir(directory);
 }
 
 /// A fresh process table with command lines and executables, for the
@@ -465,11 +612,14 @@ pub fn process_alive(pid: u32) -> bool {
 /// real answer rather than only the fields discovery decoded.
 #[cfg(unix)]
 pub async fn daemon_version(daemon: &LiveDaemon) -> serde_json::Value {
-    let output = tokio::process::Command::new(daemon.cli())
+    let mut command = tokio::process::Command::new(daemon.cli());
+    command
         .args(["app-server", "daemon", "version"])
         .env("CODEX_HOME", daemon.home())
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
         .await
+        .unwrap_or_else(|_| panic!("`codex app-server daemon version` did not answer within {CLI_TIMEOUT:?}"))
         .expect("run `codex app-server daemon version`");
     assert!(
         output.status.success(),
@@ -477,4 +627,28 @@ pub async fn daemon_version(daemon: &LiveDaemon) -> serde_json::Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("daemon version is JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Windows listener path this suite hands the child must fit the
+    /// 108-byte `sun_path` field on a hosted runner. The literal is checked on
+    /// every platform because this host cannot run the Windows leg, and a
+    /// future prefix or directory name must not silently overflow it.
+    #[test]
+    fn the_windows_socket_shape_fits_the_hosted_runner_budget() {
+        for temp in [
+            r"C:\Users\runneradmin\AppData\Local\Temp",
+            r"C:\Users\RUNNER~1\AppData\Local\Temp",
+        ] {
+            let shape = windows_socket_shape(temp);
+            assert!(
+                shape.len() < 108,
+                "the Windows listener path is {} bytes (max 107): {shape}",
+                shape.len()
+            );
+        }
+    }
 }

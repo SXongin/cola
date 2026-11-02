@@ -26,12 +26,18 @@
 //! `codex` on `PATH` is the fallback. Every child runs under a fresh temp
 //! `CODEX_HOME` whose path fits the platform's `sun_path` limit, and each test
 //! asserts its process, listener, proxy children and temp home are gone before
-//! it returns. The user's own `~/.codex` is never read or written.
+//! it returns. With `COLA_LIVE_CODEX_PID_FILE` set, it also writes the pids and
+//! runtime paths for CI's post-process orphan check. The user's own `~/.codex`
+//! is never read or written.
+//!
+//! tier-1 also regenerates the schema from the live binary and compares it with
+//! the checked-in reference, so the pin is evidence rather than a document
+//! checked against itself.
 
 mod provider;
 mod server;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -44,7 +50,7 @@ use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, S
 use crate::codex::client::{CodexClient, CodexOptions};
 #[cfg(unix)]
 use crate::codex::discovery::{self, DaemonState};
-use crate::codex::schema::PinnedProbe;
+use crate::codex::schema::{PINNED_VERSION, PinnedProbe, Surface};
 use crate::codex::threads::{Adoption, ThreadModel, ThreadSettings};
 use crate::codex::transport::Inbound;
 #[cfg(unix)]
@@ -71,9 +77,10 @@ fn codex_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("codex"))
 }
 
-/// The thread settings tier-1 pins: a read-only sandbox plus `untrusted`
-/// approval, which turns the scripted `exec_command` into a real approval
-/// request instead of silently running it.
+/// The thread settings tier-1 pins: a read-only sandbox plus `on-request`
+/// approval, which turns the scripted `exec_command` (which asks for escalated
+/// sandbox permissions) into a real approval request instead of silently
+/// running it.
 fn live_settings() -> ThreadSettings {
     ThreadSettings {
         sandbox: Some(SandboxMode::ReadOnly),
@@ -89,10 +96,83 @@ fn options(endpoint: crate::codex::transport::Endpoint, binary: &std::path::Path
         .with_thread_settings(live_settings())
 }
 
-async fn connect(endpoint: crate::codex::transport::Endpoint, binary: &std::path::Path) -> CodexClient {
+async fn connect(endpoint: crate::codex::transport::Endpoint, binary: &Path) -> CodexClient {
     CodexClient::connect(&options(endpoint, binary), &PinnedProbe)
         .await
         .expect("attach cola through the codex proxy")
+}
+
+/// Regenerate the schema from the **live** binary and compare it with the
+/// checked-in pinned surface. `PinnedProbe` alone would only check the document
+/// against itself; this is what makes the 0.166 reference evidence.
+async fn verify_live_surface(binary: &Path, home: &Path) {
+    let directory = tempfile::tempdir().expect("schema tempdir");
+    let mut command = tokio::process::Command::new(binary);
+    command
+        .args(["app-server", "generate-json-schema", "--out"])
+        .arg(directory.path())
+        .env("CODEX_HOME", home)
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(60), command.output())
+        .await
+        .expect("the live binary generated its schema within 60s")
+        .expect("run `codex app-server generate-json-schema`");
+    assert!(
+        output.status.success(),
+        "`codex app-server generate-json-schema` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let generated = Surface::from_generated_dir(directory.path()).expect("parse the live generated surface");
+    let pinned = Surface::pinned();
+    let mut differences = Vec::new();
+    for (label, got, want) in [
+        (
+            "client→server methods",
+            &generated.client_requests,
+            &pinned.client_requests,
+        ),
+        ("notifications", &generated.notifications, &pinned.notifications),
+        (
+            "server→client requests",
+            &generated.server_requests,
+            &pinned.server_requests,
+        ),
+        (
+            "session-decision approvals",
+            &generated.session_decisions,
+            &pinned.session_decisions,
+        ),
+    ] {
+        let added: Vec<_> = got.difference(want).cloned().collect();
+        let removed: Vec<_> = want.difference(got).cloned().collect();
+        if !added.is_empty() || !removed.is_empty() {
+            differences.push(format!("{label}: added {added:?}, missing {removed:?}"));
+        }
+    }
+    assert!(
+        differences.is_empty(),
+        "the live {PINNED_VERSION} surface differs from the checked-in reference \
+         `docs/reference/codex-app-server-{PINNED_VERSION}.md`:\n{}",
+        differences.join("\n")
+    );
+}
+
+/// Write the pids and paths the cleanup assertions proved gone, so a CI step
+/// can re-check them after the test process exits. Opt-in: no path is written
+/// when the env var is unset.
+fn record_cleanup_marker(pids: &[u32], paths: &[PathBuf]) {
+    let Some(file) = std::env::var_os("COLA_LIVE_CODEX_PID_FILE") else {
+        return;
+    };
+    let mut text = String::new();
+    for pid in pids.iter().collect::<std::collections::BTreeSet<_>>() {
+        text.push_str(&format!("pid:{pid}\n"));
+    }
+    for path in paths.iter().collect::<std::collections::BTreeSet<_>>() {
+        text.push_str(&format!("path:{}\n", path.display()));
+    }
+    std::fs::write(&file, text).expect("write the live cleanup marker");
 }
 
 async fn start_turn(client: &CodexClient, thread_id: &str, text: &str) -> String {
@@ -245,10 +325,29 @@ async fn live_codex_tier1_scripted_transport() {
     let socket_path = server.socket().to_path_buf();
     let work_text = work.to_string_lossy().to_string();
 
+    // The reference is checked against the *live* binary, not against itself.
+    verify_live_surface(&binary, &home).await;
+
     let client_a = connect(endpoint.clone(), &binary).await;
     let client_b = connect(endpoint, &binary).await;
-    assert_eq!(client_a.server_info().version.to_string(), "0.166.0");
-    assert_eq!(client_a.server_info().surface_counts, (106, 85, 10));
+    let pinned = Surface::pinned();
+    assert_eq!(client_a.server_info().version.to_string(), PINNED_VERSION);
+    assert_eq!(client_a.server_info().surface_counts, pinned.counts());
+
+    // Record the cleanup evidence now, so a later assertion failure still
+    // leaves CI a pid/path list to check.
+    let proxy_pids: Vec<u32> = [&client_a, &client_b]
+        .into_iter()
+        .filter_map(|client| client.connection().proxy_pid())
+        .collect();
+    assert_eq!(proxy_pids.len(), 2, "each client dialled through its own proxy");
+    let cleanup_pids: Vec<u32> = server
+        .pid()
+        .into_iter()
+        .chain(proxy_pids.iter().copied())
+        .collect();
+    let cleanup_paths = server.runtime_paths();
+    record_cleanup_marker(&cleanup_pids, &cleanup_paths);
 
     // One thread, created by the production thread surface.
     let thread = client_a
@@ -347,22 +446,20 @@ async fn live_codex_tier1_scripted_transport() {
     // cleanup proof, or the proxy child would outlive the client handles.
     drop(_adoption);
 
-    // Cleanup is part of the contract: the proxy children, listener and temp
-    // home must all be gone before the test returns.
-    let proxy_pids: Vec<u32> = [&client_a, &client_b]
-        .into_iter()
-        .filter_map(|client| client.connection().proxy_pid())
-        .collect();
-    assert_eq!(proxy_pids.len(), 2, "each client dialled through its own proxy");
+    // Cleanup is part of the contract: the server, the proxy children, the
+    // listener and the temp home must all be gone before the test returns.
     drop(client_b);
     drop(client_a);
     // Closing the listener is what makes each proxy child see EOF and exit;
     // the transport then reaps them as their connections drop.
     server.shutdown().await;
-    for pid in proxy_pids {
+    for pid in cleanup_pids {
         wait_until_dead(pid).await;
     }
     drop(server);
+    for path in &cleanup_paths {
+        assert_path_gone(path).await;
+    }
     assert_path_gone(&home).await;
     assert_path_gone(&work).await;
     assert_path_gone(&socket_path).await;
@@ -392,7 +489,8 @@ async fn live_codex_tier2_managed_daemon() {
 
     // Nothing starts under `never`, even when the request would allow a spawn
     // (the bridge's demand path). This is the assertion that fails if the
-    // policy is ignored.
+    // policy is ignored. The same older-than-pin rule also refuses 0.164.0 and
+    // 0.165.0: every version below `PINNED_VERSION` is older.
     let never = CodexLifecycle::new(
         crate::config::CodexConfig {
             start_server: ServerStartPolicy::Never,
@@ -431,6 +529,26 @@ async fn live_codex_tier2_managed_daemon() {
         AttachOutcome::Attached
     );
 
+    // Record the cleanup evidence before any later assertion can fail: the
+    // daemon's argv does not carry the temp prefix, so pids are the CI-visible
+    // proof and the runtime paths are the Unix-side one.
+    let attached = auto.attached_client().await.expect("an attached client");
+    let proxy_pid = attached
+        .connection()
+        .proxy_pid()
+        .expect("the managed daemon was dialled through a proxy child");
+    drop(attached);
+    let daemon_pids = daemon.process_ids();
+    assert!(
+        !daemon_pids.is_empty(),
+        "the running daemon's processes were not found under {}",
+        daemon.home().display()
+    );
+    let cleanup_paths = daemon.runtime_paths();
+    let mut cleanup_pids = daemon_pids.clone();
+    cleanup_pids.push(proxy_pid);
+    record_cleanup_marker(&cleanup_pids, &cleanup_paths);
+
     // Discovery through the control socket: the published path is a symlink
     // into the daemon's short runtime directory on Unix, and the report names
     // the binary the daemon actually runs.
@@ -455,16 +573,16 @@ async fn live_codex_tier2_managed_daemon() {
     // The management CLI's real report, not only the decoded discovery fields.
     let report = server::daemon_version(&daemon).await;
     assert_eq!(report["status"], "running");
-    assert_eq!(report["cliVersion"], "0.166.0");
-    assert_eq!(report["appServerVersion"], "0.166.0");
-    assert_eq!(report["managedCodexVersion"], "0.166.0");
+    assert_eq!(report["cliVersion"], PINNED_VERSION);
+    assert_eq!(report["appServerVersion"], PINNED_VERSION);
+    assert_eq!(report["managedCodexVersion"], PINNED_VERSION);
     assert_eq!(
         report["socketPath"].as_str().map(std::path::Path::new),
         Some(found.socket.as_path())
     );
     let info = found.info.as_ref().expect("discovery kept the version report");
-    assert_eq!(info.app_server_version.as_deref(), Some("0.166.0"));
-    assert_eq!(info.cli_version.as_deref(), Some("0.166.0"));
+    assert_eq!(info.app_server_version.as_deref(), Some(PINNED_VERSION));
+    assert_eq!(info.cli_version.as_deref(), Some(PINNED_VERSION));
 
     // A second attach is the cached steady state, not a new daemon.
     assert_eq!(
@@ -480,9 +598,27 @@ async fn live_codex_tier2_managed_daemon() {
         RestartOutcome::NotOwned
     );
 
+    // Dropping the lifecycle closes the proxy connection; the daemon remains
+    // until the explicit stop below.
+    drop(auto);
     let home = daemon.home().to_path_buf();
     daemon.shutdown().await;
+    assert!(
+        daemon.process_ids().is_empty(),
+        "the managed daemon's processes outlived shutdown: {:?}",
+        daemon.process_ids()
+    );
+    for pid in &cleanup_pids {
+        assert!(
+            !server::process_alive(*pid),
+            "the tier-2 process {pid} outlived shutdown"
+        );
+    }
+    wait_until_dead(proxy_pid).await;
     assert!(!environment.socket().exists());
+    for path in &cleanup_paths {
+        assert_path_gone(path).await;
+    }
     drop(daemon);
     assert_path_gone(&home).await;
 }

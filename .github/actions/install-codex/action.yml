@@ -17,8 +17,9 @@
 #   Windows x86_64 -> codex-x86_64-pc-windows-msvc.exe.zip
 #
 # `macos-latest` is arm64 today; the Intel asset is pinned too so a runner
-# re-image cannot silently install the wrong arch. A runner OS this action does
-# not know fails by name instead of guessing.
+# re-image cannot silently install the wrong arch. Linux is pinned only for
+# x86_64, and an arm64 Linux runner fails by name rather than installing the
+# wrong architecture. A runner OS this action does not know fails by name too.
 name: Install Codex
 description: Download, verify and install the pinned Codex CLI on PATH.
 
@@ -45,6 +46,10 @@ runs:
         VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+        if [ "$RUNNER_ARCH" != "X64" ]; then
+          echo "install-codex pins only linux-x64; this runner is $RUNNER_ARCH" >&2
+          exit 1
+        fi
         mkdir -p "$HOME/.cache/codex"
         curl -fsSL \
           "https://github.com/openai/codex/releases/download/rust-v${VERSION}/codex-x86_64-unknown-linux-musl.tar.gz" \
@@ -100,6 +105,10 @@ runs:
         }
         case "$RUNNER_OS" in
           Linux)
+            if [ "$RUNNER_ARCH" != "X64" ]; then
+              echo "install-codex pins only linux-x64; this runner is $RUNNER_ARCH" >&2
+              exit 1
+            fi
             expected="a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978"
             archive="$prefix/codex.tar.gz"
             verify_sha "$expected" "$archive"
@@ -136,7 +145,9 @@ runs:
             exit 1
             ;;
         esac
-        chmod 755 "$prefix/bin/codex" 2>/dev/null || true
+        if [ "$RUNNER_OS" != "Windows" ]; then
+          chmod 755 "$prefix/bin/codex"
+        fi
         if [ "$RUNNER_OS" = "Windows" ]; then
           "$prefix/bin/codex.exe" --version
         else

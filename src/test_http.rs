@@ -407,69 +407,64 @@ enum Answer {
 }
 
 async fn response_for(state: &ServerState, request: &RecordedRequest) -> Answer {
-    let deferred = {
-        let routes = state.routes.lock().unwrap();
-        let matched = routes
-            .iter()
-            .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
-            .max_by_key(|route| route.path_prefix.len());
-        match matched {
-            Some(route) => match &route.kind {
-                RouteKind::AsyncDynamic(handler) => Some(handler(request.clone())),
-                RouteKind::Dynamic(handler) => {
-                    let response = handler(request);
-                    return Answer::Ready {
-                        status: response.status,
-                        content_type: response.content_type,
-                        headers: response.headers,
-                        body: response.body,
-                        delay: Duration::ZERO,
-                    };
-                }
-                RouteKind::Script { responses, served } => {
-                    let index = served.fetch_add(1, Ordering::Relaxed).min(responses.len() - 1);
-                    let (headers, body) = &responses[index];
-                    return Answer::Ready {
-                        status: 200,
-                        content_type: "application/json".to_string(),
-                        headers: headers.clone(),
-                        body: body.clone(),
-                        delay: Duration::ZERO,
-                    };
-                }
-                RouteKind::Fixed {
-                    status,
-                    content_type,
-                    body,
-                    headers,
-                    delay,
-                } => {
-                    return Answer::Ready {
-                        status: *status,
-                        content_type: content_type.clone(),
-                        headers: headers.clone(),
-                        body: body.clone(),
-                        delay: *delay,
-                    };
-                }
-            },
-            None => {
-                return Answer::Ready {
-                    status: 404,
-                    content_type: "application/json".to_string(),
-                    headers: Vec::new(),
-                    body: serde_json::json!({
-                        "code": -1,
-                        "msg": format!("no route for {} {}", request.method, request.path),
-                    })
-                    .to_string()
-                    .into_bytes(),
+    // No await happens while this guard is held: the async route only builds
+    // its future here, and `handle_connection` awaits it after this returns.
+    let routes = state.routes.lock().unwrap();
+    let matched = routes
+        .iter()
+        .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
+        .max_by_key(|route| route.path_prefix.len());
+    match matched {
+        Some(route) => match &route.kind {
+            RouteKind::AsyncDynamic(handler) => Answer::Deferred(handler(request.clone())),
+            RouteKind::Dynamic(handler) => {
+                let response = handler(request);
+                Answer::Ready {
+                    status: response.status,
+                    content_type: response.content_type,
+                    headers: response.headers,
+                    body: response.body,
                     delay: Duration::ZERO,
-                };
+                }
             }
-        }
-    };
-    Answer::Deferred(deferred.expect("only an async route defers"))
+            RouteKind::Script { responses, served } => {
+                let index = served.fetch_add(1, Ordering::Relaxed).min(responses.len() - 1);
+                let (headers, body) = &responses[index];
+                Answer::Ready {
+                    status: 200,
+                    content_type: "application/json".to_string(),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                    delay: Duration::ZERO,
+                }
+            }
+            RouteKind::Fixed {
+                status,
+                content_type,
+                body,
+                headers,
+                delay,
+            } => Answer::Ready {
+                status: *status,
+                content_type: content_type.clone(),
+                headers: headers.clone(),
+                body: body.clone(),
+                delay: *delay,
+            },
+        },
+        None => Answer::Ready {
+            status: 404,
+            content_type: "application/json".to_string(),
+            headers: Vec::new(),
+            body: serde_json::json!({
+                "code": -1,
+                "msg": format!("no route for {} {}", request.method, request.path),
+            })
+            .to_string()
+            .into_bytes(),
+            delay: Duration::ZERO,
+        },
+    }
 }
 
 async fn write_response(
@@ -556,6 +551,61 @@ mod tests {
         assert_eq!(response.headers()["content-type"], "text/event-stream");
         assert_eq!(response.headers()["x-echo"], "yes");
         assert_eq!(response.text().await.unwrap(), "data: hello\n\n");
+    }
+
+    /// The async route defers the response until its handler's future
+    /// resolves: the live Codex suite holds a model call open to interrupt it.
+    #[tokio::test]
+    async fn async_dynamic_route_waits_for_the_handler() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        let server = TestHttpServer::start().await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let handler_entered = Arc::clone(&entered);
+        let handler_release = Arc::clone(&release);
+        server.route_async_dynamic("POST", "/held", move |request| {
+            let entered = Arc::clone(&handler_entered);
+            let release = Arc::clone(&handler_release);
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                DynamicResponse::new(202, "text/plain", format!("deferred:{}", request.body))
+            }
+        });
+
+        let mut request = tokio::spawn({
+            let url = format!("{}/held", server.base_url());
+            async move {
+                no_proxy_transport()
+                    .post(url)
+                    .body("hello")
+                    .send()
+                    .await
+                    .expect("send")
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the async handler started");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut request)
+                .await
+                .is_err(),
+            "the response must wait for the handler's future"
+        );
+        assert_eq!(server.request_count(), 1);
+
+        release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("the released response completed")
+            .expect("request task");
+        assert_eq!(response.status(), 202);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(response.text().await.unwrap(), "deferred:hello");
     }
 
     #[tokio::test]

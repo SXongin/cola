@@ -239,17 +239,56 @@ jobs:
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Live Codex tier-1 suite
+        env:
+          COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier1-pids.txt
         run: cargo test --locked -- --ignored live_codex_tier1
-      # The suite asserts its own cleanup; this is the CI-side proof. The
-      # random temp root always carries the `cola-cx` prefix.
+      # The suite asserts its own cleanup; this re-checks the pids and runtime
+      # paths it recorded after the test process exits. The argv scan is only a
+      # fallback: temp paths are random and a Windows daemon's argv does not
+      # carry them.
       - if: >-
           always() &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
-        name: No live Codex process left behind
+        name: No live Codex process or runtime path left behind
         shell: bash
+        env:
+          COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier1-pids.txt
         run: |
           set -euo pipefail
+          marker="$COLA_LIVE_CODEX_PID_FILE"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            marker=$(cygpath -u "$marker" 2>/dev/null || echo "$marker")
+          fi
+          if [ -f "$marker" ]; then
+            while IFS= read -r line; do
+              case "$line" in
+                pid:*)
+                  pid="${line#pid:}"
+                  if [ "$RUNNER_OS" = "Windows" ]; then
+                    alive=$(powershell -NoProfile -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { 'alive' }")
+                    if [ "$alive" = "alive" ]; then
+                      echo "tier-1 left pid $pid alive" >&2
+                      exit 1
+                    fi
+                  elif kill -0 "$pid" 2>/dev/null; then
+                    echo "tier-1 left pid $pid alive" >&2
+                    exit 1
+                  fi
+                  ;;
+                path:*)
+                  path="${line#path:}"
+                  if [ "$RUNNER_OS" = "Windows" ]; then
+                    path=$(cygpath -u "$path" 2>/dev/null || echo "$path")
+                  fi
+                  if [ -e "$path" ]; then
+                    echo "tier-1 left runtime path $path behind" >&2
+                    exit 1
+                  fi
+                  ;;
+              esac
+            done < "$marker"
+          fi
           if [ "$RUNNER_OS" = "Windows" ]; then
             if tasklist | grep -qi 'codex'; then
               tasklist | grep -i 'codex'
@@ -301,15 +340,40 @@ jobs:
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Live Codex tier-2 suite
+        env:
+          COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier2-pids.txt
         run: cargo test --locked -- --ignored live_codex_tier2
       - if: >-
           always() &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
-        name: No live Codex daemon left behind
+        name: No live Codex daemon or runtime path left behind
         shell: bash
+        env:
+          COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier2-pids.txt
         run: |
           set -euo pipefail
+          marker="$COLA_LIVE_CODEX_PID_FILE"
+          if [ -f "$marker" ]; then
+            while IFS= read -r line; do
+              case "$line" in
+                pid:*)
+                  pid="${line#pid:}"
+                  if kill -0 "$pid" 2>/dev/null; then
+                    echo "tier-2 left pid $pid alive" >&2
+                    exit 1
+                  fi
+                  ;;
+                path:*)
+                  path="${line#path:}"
+                  if [ -e "$path" ]; then
+                    echo "tier-2 left runtime path $path behind" >&2
+                    exit 1
+                  fi
+                  ;;
+              esac
+            done < "$marker"
+          fi
           if pgrep -fl 'cola-t2' >/dev/null; then
             pgrep -fl 'cola-t2'
             echo "the tier-2 suite left a live process behind" >&2

@@ -105,12 +105,12 @@ async fn answer_async(script: &Script, request: RecordedRequest) -> DynamicRespo
     let prompt = prompt_text(&body);
     let call = script.calls.fetch_add(1, Ordering::SeqCst) + 1;
 
-    if prompt.contains("interrupt") {
+    if prompt == INTERRUPT_PROMPT {
         script.blocked.notify_one();
         let _ = tokio::time::timeout(HELD_RESPONSE_BUDGET, script.release.notified()).await;
         return DynamicResponse::new(200, "text/event-stream", text_stream("interrupted", call));
     }
-    if prompt.contains("command") {
+    if prompt == APPROVAL_PROMPT {
         if has_tool_result(&body) {
             return DynamicResponse::new(200, "text/event-stream", text_stream(APPROVAL_TEXT, call));
         }

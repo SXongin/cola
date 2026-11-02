@@ -282,12 +282,16 @@ server still serves). Windows remains untested.
   the configured provider can complete a turn.** A ChatGPT sign-in is not a
   support requirement — a provider-keyed `[model_providers.*]` entry is a fully
   supported configuration.
-- Pinned surface for `0.163.0`: **105 client→server methods, 85 notifications,
+- Pinned surface for `0.166.0` (re-pinned by ticket #953; the 2026-10-23 spike
+  first recorded `0.163.0`): **106 client→server methods, 85 notifications,
   10 server→client requests**. The three lists are checked in at
-  `docs/reference/codex-app-server-0.163.0.md`, generated from the binary with
+  `docs/reference/codex-app-server-0.166.0.md`, generated from the binary with
   `codex app-server generate-json-schema --out <dir>`, so a CLI bump is a diff
   against that file rather than a re-derivation — and that output, generated
   from the pinned version, is what the adapter's contract is checked against.
+  The live tier-1 suite regenerates this surface from the pinned binary and
+  compares it with the checked-in file, so the reference is evidence rather
+  than a guess.
 
 ### Corrections to this ADR
 
@@ -387,7 +391,11 @@ The checked-in lists are `docs/reference/codex-app-server-0.166.0.md`,
 regenerated from the pinned binary with `codex app-server generate-json-schema
 --out <dir>`; the `0.163.0` reference is deleted. `0.163.0` is therefore
 **older than the pin** and is refused through the existing rule (the named
-`OlderServer { pinned: "0.166.0", found: … }` error), never guessed at.
+`OlderServer { pinned: "0.166.0", found: … }` error), never guessed at. The rule
+is ordering-based, so `0.164.0` and `0.165.0` are refused by the same path.
+tier-1 regenerates this surface from the live binary and compares it with the
+checked-in file, so the reference is evidence rather than a document checked
+against itself.
 
 Diff against the `0.163.0` reference (measured on the 0.166.0 binary):
 

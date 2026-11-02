@@ -200,7 +200,7 @@ Set `COLA_LIVE_CAPTURE_DIR=<dir>` on either run to re-record the raw transcript
 responses into the fixture format; sanitize them by hand before committing under
 `src/opencode/wire/fixtures/`.
 
-The Codex live contract has the same shape (ticket #953). Both tiers are
+The Codex live contract has the same shape (ticket #953). Its two new tiers are
 `#[ignore]`-gated and read `COLA_LIVE_CODEX_BIN` (falling back to `codex` on
 `PATH`); each starts in a fresh temp `CODEX_HOME` whose control path fits the
 platform's `sun_path` limit, never the user's store:
@@ -213,10 +213,28 @@ COLA_LIVE_CODEX_BIN=/path/to/codex cargo test --locked -- --ignored live_codex_t
 COLA_LIVE_CODEX_BIN=/path/to/codex cargo test --locked -- --ignored live_codex_tier2
 ```
 
-`Live Codex tier-1` and `Live Codex tier-2` run them in CI, installed by
-`.github/actions/install-codex` at the same 0.166.0 pin; both are advisory until
-they stabilise. Each test asserts its daemon, listener, proxy children and temp
-home are gone before it returns.
+The four `COLA_LIVE_CODEX_*` variables:
+
+- `COLA_LIVE_CODEX_BIN` — the pinned binary the new tiers spawn (fallback:
+  `codex` on `PATH`) and the older `live_initialize…` test's proxy binary.
+- `COLA_LIVE_CODEX_SOCKET` — the older `live_initialize…` test's control socket;
+  that test **skips** when it or `COLA_LIVE_CODEX_BIN` is unset.
+- `COLA_LIVE_CODEX_HOME` — the older `live_attach_to_the_running_daemon` test's
+  daemon home (ambient `CODEX_HOME` is the fallback); that test **skips** when
+  neither is set.
+- `COLA_LIVE_CODEX_PID_FILE` — optional cleanup marker for the new tiers. When
+  set, each test writes the pids and runtime paths it proved gone so the CI
+  orphan-guard step can re-check them after the test process exits.
+
+Unlike the older tests, the new tiers do **not** skip when the binary is
+missing: `codex` on `PATH` is the fallback, and a missing or unpinned binary is
+a failure. CI installs it with `.github/actions/install-codex` at the 0.166.0
+pin. The five advisory checks are, exactly as GitHub reports them:
+`Live Codex tier-1 (ubuntu-latest)`, `Live Codex tier-1 (macos-latest)`,
+`Live Codex tier-1 (windows-latest)`, `Live Codex tier-2 (ubuntu-latest)` and
+`Live Codex tier-2 (macos-latest)`. Each test asserts its daemon, listener,
+proxy children and temp home are gone before it returns; the CI step re-checks
+the marker after the process exits.
 
 ## Pull request rules
 
@@ -253,9 +271,10 @@ Release PRs (`release/*`) and docs-only PRs skip the code-dependent work
 (Format, Check, Coverage, the live suites, and the Test steps): a skipped job
 or step reports success, so the required checks still satisfy the `main: CI`
 ruleset and the PR stays mergeable without running the code-dependent gates.
-The Test matrix and the two live jobs still dispatch (idling for a few
+The Test matrix and all four live jobs still dispatch (idling for a few
 seconds) — a job-level skip leaves the matrix unexpanded or the required
-`Live V1`/`Live V2` checks unreported, so only their steps are gated.
+`Live V1`/`Live V2` checks unreported, and the advisory Codex tier checks
+missing, so only their steps are gated.
 `Dependency audit` and `Docs drift` always run: the drift guard is not gated by
 `classify` precisely because a docs-only PR, which skips every code gate, is
 where the guide pair can drift.
@@ -297,8 +316,8 @@ One class of lines genuinely cannot light up in the hermetic job — the
   proxy-respecting attach entry the wire tests deliberately bypass in favour of
   the `_over` seams (ADR-0031);
 - the `systemctl`/network glue in `src/autostart.rs` and `src/update.rs`;
-- lines already excluded by path in `codecov.yml` (`src/opencode/live/**`, the
-  machine-local `src/bridge/attach_live.rs`).
+- lines already excluded by path in `codecov.yml` (`src/opencode/live/**`,
+  `src/codex/live/**`, the machine-local `src/bridge/attach_live.rs`).
 
 When `codecov/patch` goes red, read its comment: if the missing lines are only
 that boundary, merge on the required checks; anything else is a real signal —

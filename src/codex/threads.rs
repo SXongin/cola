@@ -294,14 +294,14 @@ struct UnsubscribeResponse {
 /// the daemon's config instead is not cola's to do: the daemon is shared, may be
 /// started by the user's own client, and carries their provider tokens.
 ///
-/// Every field is in the **pinned** 0.163 `ThreadStartParams` and
+/// Every field is in the **pinned** 0.166 `ThreadStartParams` and
 /// `ThreadResumeParams` (checked with `codex-cli 0.166.0 app-server
 /// generate-json-schema`), with the same value sets, so no version gate guards
 /// them. The summary is a config override rather than `TurnStartParams.summary`:
-/// the live 0.163 daemon ignores the turn-level field (a turn asked for
-/// `detailed` still recorded `none`), while the same value under
+/// the live 0.163 daemon measured here ignored the turn-level field (a turn
+/// asked for `detailed` still recorded `none`), while the same value under
 /// `thread/start`'s `config` takes effect and streams
-/// `item/reasoning/summaryTextDelta`.
+/// `item/reasoning/summaryTextDelta`; the 0.166 pin keeps the same shape.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ThreadSettings {
     /// `thread/start`'s `sandbox`.
