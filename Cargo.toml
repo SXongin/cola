@@ -95,4 +95,9 @@ same-file = "1"
 # index)` pair; `winapi-util` reads it through a safe wrapper so `discovery.rs`
 # needs no `unsafe` block.
 winapi-util = "0.1"
+# The transport's liveness probe connects to the real AF_UNIX control socket to
+# tell a live daemon from a SIGKILLed one whose socket file remains. Stable Rust
+# still cannot do that on Windows; `uds_windows` exposes the same blocking
+# `UnixStream::connect` through safe wrappers.
+uds_windows = "1.2"
 zip = { version = "9", default-features = false, features = ["deflate"] }

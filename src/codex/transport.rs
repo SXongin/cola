@@ -12,8 +12,10 @@
 //! A **daemon** close is detected from the control path, not from stdout: the
 //! real proxy's two copy directions are joined, so after the daemon socket
 //! reaches EOF it keeps stdout open while it waits for stdin EOF. The watcher
-//! polls the control path, and a path that disappears (or names a different
-//! socket) closes the connection and kills and reaps the child. A reader that
+//! polls the control path, and a path that disappears, names a different
+//! socket, or no longer accepts a connection closes the connection and kills
+//! and reaps the child (a killed daemon leaves its socket file behind, so the
+//! last check is a real connect, not a metadata comparison). A reader that
 //! does see EOF still closes the connection. The reverse direction is explicit
 //! as well: closing the connection (the last handle dropping, a protocol
 //! fault, an overflowed decision queue) terminates and reaps the child. A
@@ -113,9 +115,15 @@ pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the proxy's watcher checks whether the control path still names
 /// the daemon it dialled. The real proxy keeps stdout open after the daemon
 /// side reaches EOF, so this poll — not the child's exit — is what notices a
-/// daemon that is gone. A `std::fs::metadata` read is cheap enough at this
-/// cadence and performs no spawn.
-const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// daemon that is gone. One poll is a metadata read plus a real connect (the
+/// only way to tell a live socket from a killed daemon's stale file), so the
+/// cadence is slower than the cheap metadata-only check it replaced.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long one liveness probe may take before the daemon is presumed gone. A
+/// hung connect must not stall the watcher, so the probe runs on the blocking
+/// pool under this budget; an unanswered connect is not evidence of life.
+const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The most of one proxy stderr line kept for the log. The proxy's diagnostics
 /// are short; a newline-free torrent must not grow a buffer without limit, so
@@ -858,11 +866,15 @@ impl Drop for ProxyGuard {
 /// What the proxy's peer looks like from cola's side, captured before the
 /// child is spawned.
 ///
-/// The production proxy relays to a filesystem control socket, so a daemon
-/// that exits removes (or re-points) the path and the poll notices. The
-/// Windows hermetic fixture cannot bind an AF_UNIX socket in stable Rust, so
-/// its fake daemon is a TCP listener and the poll checks that listener
-/// instead; that target never comes from production.
+/// The production proxy relays to a filesystem control socket. A clean daemon
+/// exit removes (or re-points) the path and the metadata check notices, but a
+/// daemon killed without unlinking its socket leaves the same file behind with
+/// the same identity — so a path that still looks unchanged is not proof of
+/// life. The poll therefore also connects to the socket: a daemon that is gone
+/// refuses the connection even though its path survives. The Windows hermetic
+/// fixture cannot bind an AF_UNIX socket in stable Rust, so its fake daemon is
+/// a TCP listener and the poll checks that listener instead; that target never
+/// comes from production.
 #[derive(Debug)]
 enum ProxyWatch {
     Path {
@@ -887,16 +899,26 @@ impl ProxyWatch {
         }
     }
 
-    /// Whether the daemon this path named is gone: the path is missing, or it
-    /// now names a different socket. A read error is not evidence of death,
-    /// so it is ignored rather than closing a healthy connection.
+    /// Whether the daemon this path named is gone: the path is missing, it now
+    /// names a different socket, or the socket it names no longer accepts a
+    /// connection. The last case is the one a SIGKILL leaves behind — the path
+    /// and its `(dev,ino)` survive but nothing listens — so an unchanged
+    /// identity is only a precondition for probing, never proof of life. A
+    /// metadata read error is not evidence of death, so it is ignored rather
+    /// than closing a healthy connection.
     async fn lost(&self) -> bool {
         match self {
-            Self::Path { path, identity } => match discovery::socket_identity(path) {
-                Ok(Some(current)) => identity.is_some_and(|baseline| baseline != current),
-                Ok(None) => identity.is_some(),
-                Err(_) => false,
-            },
+            Self::Path { path, identity } => {
+                let current = match discovery::socket_identity(path) {
+                    Ok(current) => current,
+                    Err(_) => return false,
+                };
+                match current {
+                    None => identity.is_some(),
+                    Some(current) if identity.is_some_and(|baseline| baseline != current) => true,
+                    Some(_) => !control_socket_accepts(path).await,
+                }
+            }
             #[cfg(not(unix))]
             Self::Tcp { address } => {
                 use std::net::SocketAddr;
@@ -904,21 +926,57 @@ impl ProxyWatch {
                 let Ok(address) = address.parse::<SocketAddr>() else {
                     return false;
                 };
-                // The fixture's fake daemon is this suite's only TCP peer. A
-                // refused connection means its listener is gone; any other
-                // outcome (including a timeout) is inconclusive and does not
-                // close a healthy connection.
-                match tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(address)).await {
+                // The fixture's fake daemon is this suite's only TCP peer. Once
+                // its listener is gone every connect attempt fails — refused,
+                // timed out, or whatever kind this platform's stack reports —
+                // and any of those means the fixture is dead. Only a completed
+                // connect is evidence of life.
+                match tokio::time::timeout(CONTROL_PROBE_TIMEOUT, TcpStream::connect(address)).await {
                     Ok(Ok(stream)) => {
                         drop(stream);
                         false
                     }
-                    Ok(Err(error)) => error.kind() == std::io::ErrorKind::ConnectionRefused,
-                    Err(_) => false,
+                    _ => true,
                 }
             }
         }
     }
+}
+
+/// Whether a real connect to the control socket succeeds. The probe stream is
+/// dropped immediately: it only asks whether a listener is still there, and
+/// the relay's own connection carries the traffic. A failed or timed-out
+/// connect means the daemon is gone, including the case where the socket file
+/// survives a SIGKILL.
+async fn control_socket_accepts(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    let connect = tokio::task::spawn_blocking(move || connect_control_socket(&path));
+    matches!(
+        tokio::time::timeout(CONTROL_PROBE_TIMEOUT, connect).await,
+        Ok(Ok(Ok(())))
+    )
+}
+
+#[cfg(unix)]
+fn connect_control_socket(path: &Path) -> std::io::Result<()> {
+    let stream = std::os::unix::net::UnixStream::connect(path)?;
+    drop(stream);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn connect_control_socket(path: &Path) -> std::io::Result<()> {
+    let stream = uds_windows::UnixStream::connect(path)?;
+    drop(stream);
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn connect_control_socket(_path: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this platform has no unix-domain sockets",
+    ))
 }
 
 /// Watch the proxy child: its exit of **any** kind is the connection's close,
@@ -970,8 +1028,9 @@ fn watch_proxy(
 }
 
 /// Poll the control path until it is gone. The first interval tick completes
-/// immediately; it is harmless (the captured identity is still current) and
-/// keeps a daemon that vanished during the handshake from going unnoticed.
+/// immediately; it is harmless (the captured identity is still current, and
+/// the handshake just proved a listener is there) and keeps a daemon that
+/// vanished during the handshake from going unnoticed.
 async fn wait_for_control_path(watch: &ProxyWatch, poll: &mut tokio::time::Interval) {
     loop {
         poll.tick().await;
@@ -1336,6 +1395,66 @@ mod tests {
         let failed = tokio::time::timeout(Duration::from_secs(5), pending)
             .await
             .expect("a dead daemon must not leave the waiter hanging")
+            .expect("the request task did not panic")
+            .expect_err("the request cannot be answered over a dead daemon");
+        assert!(
+            matches!(failed, CodexError::NoResponse(_)),
+            "the waiter fails by name: {failed}"
+        );
+        assert!(connection.closed());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), server_events.recv()).await {
+                Ok(Some(ServerEvent::Closed)) => break,
+                Ok(Some(other)) => panic!("only `Closed` can follow a dead daemon: {other:?}"),
+                Ok(None) => break,
+                Err(_) if tokio::time::Instant::now() < deadline => {}
+                Err(_) => panic!("the decision stream never reported the close"),
+            }
+        }
+        wait_for_pid_to_disappear(pid).await;
+    }
+
+    /// A daemon killed **without** unlinking its control socket is still dead:
+    /// a SIGKILL leaves the socket file and its `(dev,ino)` identity behind, so
+    /// the metadata comparison sees no change. Only a real connect can tell
+    /// that stale path from a live daemon, so a pending waiter must fail,
+    /// `Closed` must arrive, and the proxy child must be reaped. Removing the
+    /// liveness probe makes this test time out, which is the point.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_sigkilled_daemon_closes_the_proxy_connection_through_its_stale_socket() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+        let mut server_events = connection
+            .take_server_events()
+            .expect("the connection's one server-request stream");
+        let Endpoint::Unix(control) = &daemon.endpoint else {
+            panic!("the unix fake daemon publishes a control path");
+        };
+        let identity = discovery::socket_identity(control)
+            .expect("the control path is readable")
+            .expect("the control path names the live socket");
+
+        let pending = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.request("test/never", json!({})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "the request is still pending");
+
+        daemon.die_keeping_socket().await;
+        assert_eq!(
+            discovery::socket_identity(control).expect("the stale path is readable"),
+            Some(identity),
+            "a SIGKILL leaves the control path and its identity behind"
+        );
+
+        let failed = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("a stale control socket must not leave the waiter hanging")
             .expect("the request task did not panic")
             .expect_err("the request cannot be answered over a dead daemon");
         assert!(
