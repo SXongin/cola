@@ -252,7 +252,7 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
 的控制套接字在所有平台上都是 AF_UNIX 套接字；cola 通过
 `codex app-server proxy` 到达它，因此 cola 的路径上不需要 WebSocket 或 TCP
 监听器，`ws://` 也不是面向用户的 app-server daemon 端点。不同之处在于
-`cola doctor` 能要求什么证据，才会认定你自己的客户端确实已连接。
+`cola doctor` 能要求什么证据，才会认定你自己的 Agent Client 确实已连接。
 
 | 平台 | cola 连接 | `cola doctor` 证明*你的*客户端已连接 | 验证 |
 | --- | --- | --- | --- |
