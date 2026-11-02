@@ -33,10 +33,12 @@ ignore:
   # count; excluding those needs nightly `#[coverage(off)]`.
   - "src/test_*.rs"
   - "src/bridge/test_support.rs"
-  # The opted-in live harness (ADR-0057): every test is `#[ignore]`-gated and
-  # needs a pinned binary, so the instrumented hermetic `coverage` job can
-  # never execute these lines — the advisory `Live V1`/`Live V2` jobs run them.
+  # The opted-in live harnesses (ADR-0057, ticket #953): every test is
+  # `#[ignore]`-gated and needs a pinned binary, so the instrumented hermetic
+  # `coverage` job can never execute these lines — the advisory
+  # `Live V1`/`Live V2`/`Live Codex tier-1`/`Live Codex tier-2` jobs run them.
   - "src/opencode/live/**"
+  - "src/codex/live/**"
   # The machine-local attach check (`#[ignore]`-gated, needs a live local
   # server): same rationale as the live harness. A file of its own so those
   # lines do not read as `src/bridge/attach.rs`'s coverage.

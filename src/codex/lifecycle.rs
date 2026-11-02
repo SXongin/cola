@@ -3322,11 +3322,14 @@ mod tests {
     ///
     /// Opt-in like the repository's other live suites: set
     /// `COLA_LIVE_CODEX_HOME` (or an ambient `CODEX_HOME`) and run
-    /// `cargo test -- --ignored live_`; it skips with a message when neither is
-    /// set. Read-only by construction — `start_server = "never"` — so it never
-    /// starts or stops the user's daemon. The hermetic tests above are the
-    /// proof of the policy; this one validates the real socket, the symlink and
-    /// the managed 0.166.0 binary the daemon runs.
+    /// `cargo test -- --ignored live_attach_to_the_running_daemon`; it skips
+    /// with a message when neither is set. Read-only by construction —
+    /// `start_server = "never"` — so it never starts or stops the user's
+    /// daemon. The hermetic tests above are the proof of the policy; this one
+    /// validates the real socket, the symlink and the managed 0.166.0 binary
+    /// the daemon runs. Do not widen the filter to `live_`: the new
+    /// tier-1/tier-2 suites also match it and require a pinned binary rather
+    /// than skipping.
     #[tokio::test]
     #[ignore = "live codex app-server daemon: set COLA_LIVE_CODEX_HOME or CODEX_HOME"]
     async fn live_attach_to_the_running_daemon() {

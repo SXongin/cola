@@ -955,9 +955,11 @@ mod tests {
     /// `COLA_LIVE_CODEX_SOCKET` (the control socket, symlink allowed) and
     /// `COLA_LIVE_CODEX_BIN` (the binary the daemon runs; it is also the proxy
     /// child's binary) and run `cargo test -- --ignored
-    /// codex::client::tests::live_` (or `--ignored live_initialize`). It skips
-    /// with a message when the environment is absent. Unix-only because it
-    /// names an AF_UNIX control socket by path.
+    /// codex::client::tests::live_initialize_then_initialized_and_a_second_connection`
+    /// (or `--ignored live_initialize`). It skips with a message when the
+    /// environment is absent. Unix-only because it names an AF_UNIX control
+    /// socket by path. Do not widen the filter to `live_`: the new tier-1/tier-2
+    /// suites also match it and require a pinned binary rather than skipping.
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "live codex app-server: set COLA_LIVE_CODEX_SOCKET and COLA_LIVE_CODEX_BIN"]

@@ -824,7 +824,8 @@ mod tests {
 
     /// Ticket #953's acceptance: the previous pin (`0.163.0`) is now older than
     /// the pin, so it is refused outright with the named version error rather
-    /// than probed or assumed compatible.
+    /// than probed or assumed compatible. The rule is ordering-based, so
+    /// `0.164.0` and `0.165.0` are refused by the same path.
     #[tokio::test]
     async fn the_previous_pin_is_refused_with_the_named_version_error() {
         let server = ServerVersion::parse("codex-tui/0.163.0 (test)").expect("version");

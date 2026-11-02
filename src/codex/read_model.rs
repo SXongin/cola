@@ -60,9 +60,10 @@ const ERROR_NOTIFICATION: &str = "error";
 /// The server's own thread-level settings broadcast (issue #910): `ThreadSettings
 /// { model, modelProvider, effort, … }`. It is the server telling every
 /// subscriber that the thread moved, so the projection can follow without a
-/// read. The pinned 0.163 server does not send it for a resume-over-provider to
-/// a connection that was just resubscribed (measured); consuming it is still
-/// correct, and the read-back after a switch never depends on it.
+/// read. The measured shape (0.163, unchanged at the 0.166 re-pin) does not send
+/// it for a resume-over-provider to a connection that was just resubscribed;
+/// consuming it is still correct, and the read-back after a switch never
+/// depends on it.
 pub(crate) const SETTINGS_UPDATED: &str = "thread/settings/updated";
 
 /// The live-turn state a `thread/status/changed` broadcast reports. The
