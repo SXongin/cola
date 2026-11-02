@@ -248,42 +248,48 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
 
 ### Linux、macOS 与 Windows 上的 Codex
 
-`kind = "codex"` 客户端连接到 Codex 的 app-server daemon。daemon 的控制端点
+`kind = "codex"` 客户端连接到 Codex 的 app-server daemon。daemon 的控制套接字
 在所有平台上都是 AF_UNIX 套接字；cola 通过 `codex app-server proxy` 到达它，
 因此 cola 的路径上不需要 WebSocket 或 TCP 监听器，`ws://` 也不是面向用户的
 daemon 端点。不同之处在于 `cola doctor` 能要求什么证据，才会认定你自己的
 客户端确实已连接。
 
-| 平台 | cola 连接 | `cola doctor` 证明*你的*客户端已连接 | 实机验证 |
+| 平台 | cola 连接 | `cola doctor` 证明*你的*客户端已连接 | 验证 |
 | --- | --- | --- | --- |
-| Linux | ✅ 已验证 | `/proc/<pid>/fd` 加 `ss -x -e` 的 peer 配对 | tier-2 托管 daemon 套件 |
-| macOS | ✅ 已在 CI 验证 | `lsof` 的 peer 地址配对 | tier-1 与 tier-2 套件 |
-| Windows | ✅ 传输层已在 CI 验证 | 只有进程身份与 `--remote` argv，因此**未经硬证明**（not hard-proven） | tier-1 套件 |
+| Linux | ✅ 由非强制 live 套件验证 | `/proc/<pid>/fd` 加 `ss -x -e` 的 peer 配对 | 非强制的 live 套件，托管 daemon |
+| macOS | ✅ 由非强制 live 套件验证 | `lsof` 的 peer 地址配对 | 非强制的 live 套件，托管 daemon |
+| Windows | ✅ 传输层与独立 app-server 由非强制 live 套件验证 | 只有进程身份与 `--remote` argv，因此**未经硬证明**（not hard-proven） | 非强制的 live 套件，独立 app-server |
 
-Windows 行的“未经硬证明”说的是**证明**，不是传输。在 `windows-latest` 上，
-tier-1 会用真实固定版本的 Codex 二进制启动
-`app-server --listen unix://<short path>`，通过代理连接 cola，并完成一个
-回合、一次审批往返和一次中断。cola 在
-那里看不到的是*你自己的* TUI 的套接字描述符或 peer 地址，因此 `cola doctor`
-会把该客户端报告为 unverified 并给出原因，而不是把它的 `--remote` argv 提升
-为已连接。托管 daemon 本身无法在托管 Windows CI 上启动——runner 的令牌是提升
-的——所以这一半只在 Linux 与 macOS 上验证。
+这些是 live 套件要建立的受支持状态，不是已经观察到的必需检查：Codex live
+套件目前是非强制的（advisory），纯文档改动会跳过它们的步骤，所以一个绿色的
+非强制检查可能只是被跳过的任务，而不是一次绿色运行。提升为必需检查另行跟踪。
 
-在 Windows 上，daemon 有四个前置条件，违反时 TUI 层面是静默的（它会退回内嵌
-服务器）：
+Windows 的“未经硬证明”说的是**证明**，不是传输。非强制的 live 套件会用真实
+固定版本的 Codex 二进制启动独立的
+`app-server --listen unix://<short path>`（不是托管 daemon），通过代理连接
+cola，并完成一个回合、一次审批往返和一次中断。cola 在 Windows 上看不到的是
+*你自己的* TUI 的套接字描述符或 peer 地址，因此 `cola doctor` 会把该客户端
+报告为 unverified 并给出原因，而不是把它的 `--remote` argv 提升为已连接。
+托管 daemon 在 Windows 上的连接尚未测量：daemon 无法在托管 Windows runner 上
+启动，因为 runner 的令牌是提升的。
 
-- **非提升的终端。** 管理员令牌会让每个共享客户端继承管理员权限；请从普通
-  终端启动 cola。
+在 Windows 上，启动 daemon 有三个 doctor 检查；当 Codex 运行在 WSL 内时还有
+第四个约束。大多数失败在 TUI 层面是静默的（它会退回内嵌服务器），但提升令牌
+的情况会以警告呈现：
+
+- **非提升的进程令牌。** 管理员令牌会让每个共享客户端继承管理员权限；请从
+  非提升的终端启动 cola。
 - **允许 breakaway 的启动器。** Codex 用 `CREATE_BREAKAWAY_FROM_JOB` 启动
   daemon；`cargo run` 或外层 job 对象会拒绝这个子进程，请直接运行
   `codex.exe`。
-- **较短的 `CODEX_HOME`。** Windows 在发布路径上绑定 AF_UNIX 套接字，该路径
-  （含终止 NUL）必须不超过 108 字节；超出时请缩短 `CODEX_HOME`。
-- **不要使用 WSL DrvFS 上的 home。** 位于 WSL DrvFS 挂载
-  （`\\wsl.localhost\…`）上的 `CODEX_HOME` 会被 Codex 自己拒绝。
+- **较短的 `CODEX_HOME`。** Windows 在发布路径上绑定 AF_UNIX 控制套接字，
+  该路径（含终止 NUL）必须不超过 108 字节；超出时请缩短 `CODEX_HOME`。
+- **WSL 侧 home 不能来自 Windows 挂载。** 在 WSL 内运行的 Codex 不得使用从
+  Windows 挂载的 `CODEX_HOME`（DrvFS，`/mnt/c/...`）。这是 WSL 侧约束，
+  不是 Windows 主机的前置条件。
 
 `cola doctor` 会把前三条作为检查行列出，每行给出一条可执行的指示；第四条是
-Codex 自己的拒绝，因此唯一的解决办法是把 `CODEX_HOME` 放在 DrvFS 挂载之外。
+Codex 自己的拒绝。
 
 ### `[bridge]` —— 全部可选
 
@@ -507,20 +513,14 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 客户端则报告 app-server daemon、你自己的客户端是否连接到它，以及运行时是否
 公布了预期的能力。连接与否由平台提供的套接字证据证明——Linux 上是客户端进程
 打开的套接字描述符（`/proc`、`ss`），macOS 上是 `lsof` 的 peer 地址配对——
-而不是只看 argv。Windows 上只有进程身份与 argv，因此连接会被报告为**未经硬
-证明**（not hard-proven）。无法证明的 argv 匹配会给出警告，而带
-`--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少 daemon 同样判为
-失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行运行
-`codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时
-（纯 Feishu 部署）该检查通过，因为没有需要连接的对象。在 Windows 上，
-doctor 会先列出 daemon 的三个机器前置条件：进程不能持有提升的管理员令牌；
-启动器必须允许 breakaway 子进程（`cargo run` 和外层 job 对象都不允许）；控制
-套接字路径必须符合 AF_UNIX 的 108 字节上限（含终止 NUL）。每条失败的行都带
-可执行的指示——从非管理员终端启动 cola、直接运行 `codex.exe`，或缩短
-`CODEX_HOME`；令牌或路径不满足时，doctor 会跳过运行时诊断，而不是只报告一句
-attach failed。第四个 Windows 前置条件是 `CODEX_HOME` 不能位于 WSL DrvFS
-挂载上；这属于 Codex 自己的拒绝，而不是 doctor 的一行检查。如果完全无法读取
-令牌的提升状态，doctor 会给出警告而不是通过，只运行只读诊断，并跳过真实回合
+而不是只看 argv。Windows 上只能看到进程身份与 `--remote` argv，因此那里的
+本地客户端会被报告为 unverified，而不是已连接；上面的 Codex 平台章节解释了
+这意味着什么，并列出了 daemon 的前置条件。无法证明的 argv 匹配会给出警告，
+而带 `--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少 daemon
+同样判为失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行
+运行 `codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时
+（纯 Feishu 部署）该检查通过，因为没有需要连接的对象。如果完全无法读取令牌
+的提升状态，doctor 会给出警告而不是通过，只运行只读诊断，并跳过真实回合
 探测，因此不会产生 provider 费用。
 
 `cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在**共享**

@@ -330,45 +330,53 @@ default_client = "ada"           # which Agent Client is active (default: "defau
 ### Codex on Linux, macOS and Windows
 
 A `kind = "codex"` client attaches to Codex's app-server daemon. The daemon's
-control endpoint is an AF_UNIX socket on every platform; cola reaches it
-through `codex app-server proxy`, so nothing in cola's path needs a WebSocket
-or TCP listener, and `ws://` is not a user-facing endpoint for the daemon. What
+control socket is an AF_UNIX socket on every platform; cola reaches it through
+`codex app-server proxy`, so nothing in cola's path needs a WebSocket or TCP
+listener, and `ws://` is not a user-facing endpoint for the daemon. What
 differs is the evidence `cola doctor` can demand before it calls your own
 client's attachment proven.
 
-| Platform | cola attaches | `cola doctor` proves *your* client attached | Live verification |
+| Platform | cola attaches | `cola doctor` proves *your* client attached | Verification |
 | --- | --- | --- | --- |
-| Linux | ✅ verified | `/proc/<pid>/fd` plus `ss -x -e` peer pairing | tier-2 managed-daemon suite |
-| macOS | ✅ verified in CI | `lsof` peer-address pairing | tier-1 and tier-2 suites |
-| Windows | ✅ verified in CI for the transport | process identity and `--remote` argv only, so **not hard-proven** | tier-1 suite |
+| Linux | ✅ verified by the advisory live suite | `/proc/<pid>/fd` plus `ss -x -e` peer pairing | advisory live suite, managed daemon |
+| macOS | ✅ verified by the advisory live suite | `lsof` peer-address pairing | advisory live suite, managed daemon |
+| Windows | ✅ transport and standalone app-server verified by the advisory live suite | process identity and `--remote` argv only, so **not hard-proven** | advisory live suite, standalone app-server |
 
-The Windows row's "not hard-proven" is about **proof**, not about the
-transport. On `windows-latest`, tier-1 starts a real pinned Codex binary with
-`app-server --listen unix://<short path>`, attaches cola through the proxy, and
-completes a turn, an approval round-trip and an interrupt. What cola cannot
-observe there is a socket descriptor or peer address for *your own* TUI, so
-`cola doctor` reports that client as unverified with the reason instead of
-promoting its `--remote` argv to attached. The managed daemon itself cannot
-start on hosted Windows CI — the runner's token is elevated — so that half is
-verified on Linux and macOS only.
+Those are the support states the live suites are written to establish, not an
+observed required check: the Codex live suites are advisory and a docs-only
+change skips their steps, so a green advisory check can be a skipped job rather
+than a green run. Promotion to a required check is tracked separately.
 
-On Windows the daemon has four preconditions, and a violation is silent at the
-TUI level (it falls back to an embedded server):
+The Windows "not hard-proven" row is about **proof**, not about the transport.
+The advisory live suite starts a real pinned Codex binary with a standalone
+`app-server --listen unix://<short path>` (not the managed daemon), attaches
+cola through the proxy, and completes a turn, an approval round-trip and an
+interrupt. What cola cannot observe on Windows is a socket descriptor or peer
+address for *your own* TUI, so `cola doctor` reports that client as unverified
+with the reason instead of promoting its `--remote` argv to attached. The
+managed daemon's Windows attachment is unmeasured: the daemon cannot start on a
+hosted Windows runner, whose token is elevated.
 
-- **A non-elevated shell.** An administrator token would hand every shared
-  client administrator privileges; start cola from a normal terminal.
+On Windows, a daemon start has three doctor checks; a fourth constraint
+applies when Codex runs inside WSL. Most failures are silent at the TUI level
+(it falls back to an embedded server), though the elevation case is surfaced as
+a warning:
+
+- **A non-elevated process token.** An administrator token would hand every
+  shared client administrator privileges; start cola from a non-elevated
+  terminal.
 - **A breakaway-capable launcher.** Codex starts the daemon with
   `CREATE_BREAKAWAY_FROM_JOB`; `cargo run` or an outer job object refuses that
   child, so run `codex.exe` directly.
-- **A short `CODEX_HOME`.** Windows binds the AF_UNIX socket at the published
-  path, which must fit 108 bytes including the terminating NUL; shorten
-  `CODEX_HOME` when it does not.
-- **No WSL DrvFS home.** A `CODEX_HOME` on a WSL DrvFS mount
-  (`\\wsl.localhost\…`) is refused by Codex itself.
+- **A short `CODEX_HOME`.** Windows binds the AF_UNIX control socket at the
+  published path, which must fit 108 bytes including the terminating NUL;
+  shorten `CODEX_HOME` when it does not.
+- **A WSL-side home that is not Windows-mounted.** Codex running inside WSL
+  must not use a `CODEX_HOME` mounted from Windows (DrvFS, `/mnt/c/...`). This
+  is a WSL-side constraint, not a Windows-host one.
 
-`cola doctor` names the first three as rows with one actionable instruction
-each; the fourth is Codex's own refusal, so keeping `CODEX_HOME` off a DrvFS
-mount is the only fix.
+`cola doctor` reports the first three as rows with one actionable instruction
+each; the fourth is Codex's own refusal.
 
 ### `[bridge]` — all optional
 
@@ -628,25 +636,17 @@ client is attached to it, and whether the runtime advertises the expected
 surface. Attachment is proven from the client process's socket evidence where
 the platform exposes it — open descriptors on Linux (`/proc`, `ss`) and `lsof`
 peer-address pairing on macOS — never from its argv alone. On Windows only
-process identity and argv are available, so the attachment is reported as
-**not hard-proven**. An argv match that cannot be proven is a warning, while a
-`--no-daemon` client or one pointed at another endpoint is a named failure. A
-missing daemon is a failure too — `start_server = "never"`
-only stops cola from starting one; run `codex app-server daemon start` yourself
-and point your client at it. With no local client at all (a Feishu-only
-deployment) the check passes, because there is nothing to attach. On Windows,
-doctor first names the daemon's three machine preconditions: the process must
-not hold an elevated administrator token, the launcher must permit a breakaway
-child (`cargo run` and outer job objects do not), and the control-socket path
-must fit the AF_UNIX limit of 108 bytes including the terminator. Each failing
-row carries its instruction — start cola from a non-elevated terminal, run
-`codex.exe` directly, or shorten `CODEX_HOME` — and a blocked token or path
-skips the runtime diagnosis instead of reporting a bare attach failure. The
-fourth Windows precondition, a `CODEX_HOME` outside WSL DrvFS mounts, is
-Codex's own refusal rather than a doctor row. If the
-token's elevation cannot be read at all, doctor warns rather than passing, runs
-only the read-only diagnosis, and skips the real-turn probe so no provider spend
-can occur.
+process identity and `--remote` argv are visible, so a local client there is
+reported as unverified rather than attached; the Codex platform section above
+explains what that means and names the daemon's preconditions. An argv match
+that cannot be proven is a warning, while a `--no-daemon` client or one pointed
+at another endpoint is a named failure. A missing daemon is a failure too —
+`start_server = "never"` only stops cola from starting one; run
+`codex app-server daemon start` yourself and point your client at it. With no
+local client at all (a Feishu-only deployment) the check passes, because there
+is nothing to attach. If the token's elevation cannot be read at all, doctor
+warns rather than passing, runs only the read-only diagnosis, and skips the
+real-turn probe so no provider spend can occur.
 
 `cola doctor` proves the configured provider can complete a real turn: it starts
 a minimal turn on a scratch thread on the **shared** daemon (which cola does not
