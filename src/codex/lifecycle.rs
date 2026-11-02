@@ -451,10 +451,11 @@ impl CodexLifecycle {
                 };
             }
             let identity = discovery::socket_identity(&current.daemon.socket)?;
-            // The identity pair is proof of sameness on Unix. Windows may reuse
-            // a freed file index for a re-created socket, so here a match is
-            // necessary but not sufficient; #949's dial proof (the proxy
-            // connecting to the server the path names now) settles it.
+            // The identity is proof of sameness on Unix. Windows also includes
+            // the creation time, so a re-created object with a reused index
+            // differs; a match is still necessary but not sufficient, and
+            // #949's dial proof (the proxy connecting to the server the path
+            // names now) settles it.
             if identity != Some(current.identity) {
                 // The path moved after the pass that paired this daemon with
                 // its socket: probing it now would pair one daemon's binary
@@ -2320,6 +2321,13 @@ mod tests {
     /// not evidence that the daemon is gone. Reading it as `Unreachable` would
     /// let `auto` run `app-server daemon start` against a live daemon on every
     /// pass while logging that the daemon vanished.
+    ///
+    /// Linux-only: Unix spawn semantics differ. Linux's `execve` fails
+    /// synchronously for a junk-but-executable file, so `Command::spawn`
+    /// returns the `ProxySpawn` error this test needs. macOS's `posix_spawn`
+    /// can succeed and the child then exits, which the attach correctly reads
+    /// as a gone child (`Unreachable` → `Serverless`), not a spawn failure.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn an_unrunnable_proxy_binary_is_not_a_dead_daemon() {
         let fixture = Fixture::new();
@@ -2353,6 +2361,19 @@ mod tests {
             "a spawn failure must not trigger `daemon start`: {:?}",
             fixture.cli.invocations()
         );
+    }
+
+    /// The classification itself is platform-neutral: a `ProxySpawn` failure
+    /// is configuration, never a dead daemon. Pinned on every platform because
+    /// the integration test above can only exercise Linux's synchronous exec
+    /// failure.
+    #[test]
+    fn a_proxy_spawn_failure_is_not_a_dead_daemon() {
+        let error = CodexError::ProxySpawn {
+            binary: "/managed/bin/codex".to_string(),
+            detail: "exec format error".to_string(),
+        };
+        assert!(!daemon_gone(&error), "{error}");
     }
 
     /// A daemon that disappears is unattached on the next pass — and nothing is

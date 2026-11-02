@@ -464,8 +464,10 @@ job rather than an observed run. Promotion to a required check is tracked by
   AF_UNIX socket and must fit `sun_path`'s 108 bytes including the terminating
   NUL. Discovery hands the path verbatim to the proxy (the OS follows the link
   at connect time) and identifies the object from file metadata — `(device,
-  inode)` on Unix, following the symlink; `(volume serial number, file index)`
-  on Windows. A control socket that moves once between discovery and the dial
+  inode)` on Unix, following the symlink; `(volume serial number, file index,
+  creation time)` on Windows, where the extra timestamp stops a re-created
+  object from inheriting a reused index. A control socket that moves once
+  between discovery and the dial
   is re-discovered and then re-attached (`ATTACH_ATTEMPTS = 2`); only a path
   that moves on both attempts ends the pass as `Attempt::Raced`, never an
   attachment to a daemon the path no longer names (#950);
