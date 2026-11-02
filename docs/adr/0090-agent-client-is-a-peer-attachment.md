@@ -313,7 +313,9 @@ ticket #954 amendment below).
 - Whether a real **TUI** renders another client's steer and approvals. The
   spike used raw WebSocket clients; the item stream is shared, so it should,
   but that is inference until #884 observes it.
-- The Windows half of the daemon/socket matrix (AF_UNIX limits).
+- The Windows half of the daemon/socket matrix (AF_UNIX limits). The transport
+  half is measured by the ticket #954 amendment below; the managed daemon on
+  Windows remains unmeasured.
 - Whether cola's `thread/resume` can race a TUI-side unload inside the
   server's 30-minute grace window.
 
@@ -434,8 +436,18 @@ Live V1/V2 20-minute bound.
 Open question 4 asked whether the daemon's implicit attachment works on every
 supported platform, and how discovery behaves when `CODEX_HOME` is relocated.
 Measured against `codex-cli 0.166.0` and the landed tickets #949–#953, the
-answer is **yes for attachment on Linux, macOS and Windows**, with one
-deliberate split between what attaches and what cola can prove:
+answer splits by platform and by what was actually measured:
+
+- **Linux and macOS:** attachment, discovery and the managed daemon are
+  exercised by the advisory live suites, and each platform's prover can promote
+  a client to attached;
+- **Windows:** the transport and a standalone `codex app-server` attachment are
+  exercised by the advisory live tier. The **managed daemon's Windows
+  attachment is unmeasured**, and no prover can promote a Windows client.
+
+The live suites are advisory, not required checks. A docs-only change classifies
+`heavy=false` and skips their steps, so a green advisory check can be a skipped
+job rather than an observed run. Promotion to required is tracked separately.
 
 - **one transport on every platform.** cola spawns
   `codex app-server proxy --sock <control socket>` and runs the existing
@@ -444,68 +456,75 @@ deliberate split between what attaches and what cola can prove:
   The proxy child is cola's, so it is killed and reaped when the last
   `RpcConnection` drops; the daemon is not cola's, so its exit is the
   connection's `Closed` and nothing about it is reaped;
-- **relocation is the control path, not a second store.** The control endpoint
-  is `$CODEX_HOME/app-server-control/app-server-control.sock` on every
+- **relocation is the control-socket path, not a second store.** The control
+  socket is `$CODEX_HOME/app-server-control/app-server-control.sock` on every
   platform. On Unix it is normally a symlink into
   `/tmp/codex-daemon-<uid>/<hash>`; on Windows the published path **is** the
   AF_UNIX socket and must fit `sun_path`'s 108 bytes including the terminating
   NUL. Discovery hands the path verbatim to the proxy (the OS follows the link
   at connect time) and identifies the object from file metadata — `(device,
   inode)` on Unix, following the symlink; `(volume serial number, file index)`
-  on Windows. A control path re-pointed or re-created between discovery and
-  the dial yields `Attempt::Raced`, never an attachment to a server the path no
-  longer names (#950);
-- **Linux: attachment and proof verified.** The Linux prover pairs the client's
-  open socket inodes (`/proc/<pid>/fd`) with the daemon's via `ss -x -e`. A
-  missing `/proc`, `ss` or descriptor table leaves the client **unverified**.
-  tier-2 exercises the real managed daemon (`daemon start`, discovery through
-  the symlink, `daemon version`, the `start_server` policy and the restart
-  refusal);
-- **macOS: attachment and proof verified in CI.** The macOS prover pairs a
-  client socket's `->0x<addr>` against a daemon socket bound to the control
-  path (`0x<addr>`) through `lsof -U -a -p <pid>`; the bind spelling is
-  canonicalised when the verbatim and published spellings differ. A missing,
-  denied, failing or timed-out `lsof`, or no pairing, leaves the client
-  **unverified** — the same shape as a Linux host without `ss`. tier-1 and
-  tier-2 both run on `macos-latest`;
-- **Windows: transport verified in CI, proof not hard-proven.** tier-1 on
-  `windows-latest` starts the real pinned binary with
-  `app-server --listen unix://<short path>`, attaches cola through the proxy,
-  and completes a turn, an approval round-trip answered by a second client
-  subscribed with `thread/resume`, and an interrupt. The managed daemon cannot
-  run on hosted Windows CI because the runner's token is elevated, so tier-2
-  excludes Windows. cola has no descriptor or peer-address prover there: a
-  client's process identity (pid, binary, `--remote` argv) is visible, but
-  argv alone is never promoted, so `ClientReport.state` stays `Unattached`
-  with the reason in `detail`. That is what the user guide's Windows attachment
-  row means by **not hard-proven** — the connection works, the proof does not.
+  on Windows. A control socket that moves once between discovery and the dial
+  is re-discovered and then re-attached (`ATTACH_ATTEMPTS = 2`); only a path
+  that moves on both attempts ends the pass as `Attempt::Raced`, never an
+  attachment to a daemon the path no longer names (#950);
+- **Linux: attachment and proof.** The Linux prover pairs the client's open
+  socket inodes (`/proc/<pid>/fd`) with the daemon's via `ss -x -e`. A missing
+  `/proc`, `ss` or descriptor table leaves the client **unverified**. The
+  advisory tier-2 suite exercises the real managed daemon (`daemon start`,
+  discovery through the symlink, `daemon version`, the `start_server` policy
+  and the restart refusal); it is not a required check yet;
+- **macOS: attachment and proof.** The macOS prover pairs a client socket's
+  `->0x<addr>` against a daemon socket bound to the control-socket path
+  (`0x<addr>`) through `lsof -U -a -p <pid>`; the bind spelling is canonicalised
+  when the verbatim and published spellings differ. A missing, denied, failing
+  or timed-out `lsof`, or no pairing, leaves the client **unverified** — the
+  same shape as a Linux host without `ss`. The advisory tier-1 and tier-2
+  suites are wired for macOS; neither is a required check yet;
+- **Windows: transport and standalone app-server, not the managed daemon.** The
+  advisory tier-1 suite starts the real pinned binary with
+  `app-server --listen unix://<short path>` — a standalone server, not the
+  managed daemon — attaches cola through the proxy, and completes a turn, an
+  approval round-trip answered by a second client subscribed with
+  `thread/resume`, and an interrupt. The managed daemon cannot start on a
+  hosted Windows runner because its token is elevated, so the managed daemon's
+  Windows attachment has no measurement and tier-2 excludes Windows. cola has
+  no descriptor or peer-address prover there: a client's process identity (pid,
+  binary, `--remote` argv) is visible, but argv alone is never promoted. The
+  unproven state is `UserClient.state == UserClientState::Unverified` with the
+  reason in `UserClient.detail`; `ClientReport.state` is cola's own attachment
+  and is `Attached` when the proxy dial succeeds. That split is what the user
+  guide's Windows attachment row means by **not hard-proven**.
 
-A Windows daemon start also has four preconditions, silent at the TUI level
-because the TUI falls back to an embedded server:
+On Windows, a daemon start has three doctor checks. A fourth constraint applies
+when Codex runs inside WSL. Most failures are silent at the TUI level because
+the TUI falls back to an embedded server; the elevation case is surfaced as a
+warning.
 
-1. a **non-elevated** process token, since shared clients must not inherit
-   administrator privileges;
+1. a **non-elevated process token**, since shared clients must not inherit
+   administrator privileges; start cola from a non-elevated terminal;
 2. a launcher that permits a **breakaway** child; `cargo run` and an outer job
    object do not;
-3. a **short `CODEX_HOME`**, so the control path fits the 108-byte AF_UNIX
-   budget before anything is spawned;
-4. a **`CODEX_HOME` outside WSL DrvFS mounts**; Codex refuses a DrvFS home
-   itself.
+3. a **short `CODEX_HOME`**, so the control-socket path fits the 108-byte
+   AF_UNIX budget including the terminating NUL before anything is spawned;
+4. **Codex running inside WSL must not use a Windows-mounted (DrvFS)
+   `CODEX_HOME`** (`/mnt/c/...`, 9p). This is a WSL-side constraint, not a
+   Windows-host precondition.
 
-`cola doctor` names the first three as rows with one actionable instruction
+`cola doctor` reports the first three as rows with one actionable instruction
 each, and refuses a start before the launcher runs (#952, #950); the fourth is
-Codex's own refusal, so it is a documented precondition rather than a doctor
-row.
+Codex's own refusal.
 
-**Proxy is not ownership of the agent's stdio.** Decision 1's line that "a peer
-attachment cannot own the agent's stdin/stdout" still holds, and this amendment
-sharpens why `codex app-server proxy` does not violate it. cola owns the
-**proxy child's** stdin/stdout — a pipe into a relay — while the app-server is
-a separate process (the managed daemon, or a listener cola did not start) that
-cola neither spawned nor reaps. That is the Peer Attachment shape: cola is one
-more connection to a server someone else owns. Spelling the app-server's own
-stdin/stdout as the transport (Codex's `stdio://`, or ACP's model of spawning
-the agent as the client's subprocess) is the **Owned Runtime** shape and
-remains deliberately unsupported. `ws://` describes neither: it stays a
-test/live-only `Endpoint`, because the daemon serves no WebSocket or TCP
-listener and offers no config key to create one.
+**Proxy is not ownership of the agent's stdio.** The Peer Attachment rule
+(decision 1) is that cola is one client of a runtime-owned session; owning
+the agent's stdin/stdout would make cola its sole client instead.
+`codex app-server proxy` does not do that: cola owns the **proxy child's**
+stdin/stdout — a pipe into a relay — while the app-server is a separate process
+(the managed daemon, or a listener cola did not start) that cola neither spawned
+nor reaps. That is the Peer Attachment shape: cola is one more connection to a
+runtime someone else owns. Spelling the app-server's own stdin/stdout as the
+transport (Codex's `stdio://`, or ACP's model of spawning the agent as the
+client's subprocess) is the **Owned Runtime** shape and remains deliberately
+unsupported. `ws://` describes neither: it stays an `Endpoint` that only tests
+construct, because the daemon serves no WebSocket or TCP listener and offers no
+config key to create one.
