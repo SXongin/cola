@@ -267,6 +267,18 @@ impl ProxyDaemon {
         .await
         .expect("dial through the real proxy child")
     }
+
+    /// Make the fake daemon die the way a clean app-server shutdown does: the
+    /// listener stops serving and the published control path disappears. The
+    /// transport's watcher treats that as the daemon's death, because the real
+    /// proxy keeps stdout open after the socket side reaches EOF.
+    pub(crate) async fn die(&self) {
+        self.server.die().await;
+        #[cfg(unix)]
+        if let crate::codex::transport::Endpoint::Unix(path) = &self.endpoint {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// A fixture-only target: production `Endpoint::Unix` always names an AF_UNIX

@@ -14,6 +14,10 @@
 //!   stable Rust cannot bind an AF_UNIX socket there;
 //! - `exit` exits immediately, for the "child does not survive a failed
 //!   handshake" path.
+//!
+//! Like the real proxy, it joins both copy directions: a daemon-side EOF ends
+//! the socket→stdout pump but leaves stdout open until stdin EOF. Exiting on
+//! the daemon's EOF instead would hide the transport's dead-daemon detection.
 
 use std::io::{Read, Write};
 
@@ -87,9 +91,14 @@ fn pump<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<()> 
 
 fn relay<S: Relay>(stream: S) -> std::io::Result<()> {
     let mut writer = stream.duplicate()?;
-    std::thread::spawn(move || {
+    let stdin = std::thread::spawn(move || {
         let _ = pump(std::io::stdin(), &mut writer);
     });
     let _ = pump(stream, std::io::stdout());
-    std::process::exit(0);
+    // Mimic the real proxy, which joins both copy directions: when the daemon
+    // side reaches EOF, stdout stays open until stdin EOF too. Exiting here
+    // instead would close cola's read half by itself and hide the transport's
+    // dead-daemon detection.
+    let _ = stdin.join();
+    Ok(())
 }

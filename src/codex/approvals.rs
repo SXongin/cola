@@ -2689,6 +2689,10 @@ mod tests {
         }
 
         server.die().await;
+        // The real proxy keeps stdout open after the daemon socket closes, so
+        // the transport watches the control path; a shut-down daemon removes
+        // it, and that is this connection's loss.
+        let _ = std::fs::remove_file(&path);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         while !client
             .list_permissions(None)
