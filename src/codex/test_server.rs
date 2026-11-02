@@ -279,6 +279,16 @@ impl ProxyDaemon {
             let _ = std::fs::remove_file(path);
         }
     }
+
+    /// Make the fake daemon die the way a SIGKILL does: nothing serves the
+    /// socket any more, but the published control path (and the inode identity
+    /// the transport captured) survives. Only a real connect can tell this
+    /// stale path from a live daemon. Unix only; the TCP fixture has no path
+    /// to leave behind.
+    #[cfg(unix)]
+    pub(crate) async fn die_keeping_socket(&self) {
+        self.server.die().await;
+    }
 }
 
 /// A fixture-only target: production `Endpoint::Unix` always names an AF_UNIX
@@ -786,6 +796,10 @@ pub(crate) struct FakeServer {
     /// Set by [`FakeServer::die`]: stops accepting and releases the live
     /// connection tasks. Every constructor wires one.
     shutdown: Arc<tokio::sync::Notify>,
+    /// The accept loop itself. `die` joins it so the listener really is
+    /// dropped — and the port or path really refuses — before the caller's
+    /// liveness probe runs. A `Notify` alone only asked the loop to stop.
+    accept_loop: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl FakeServer {
@@ -803,7 +817,7 @@ impl FakeServer {
         let serving = Arc::clone(&state);
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let signal = Arc::clone(&shutdown);
-        tokio::spawn(async move {
+        let accept_loop = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = signal.notified() => break,
@@ -816,7 +830,11 @@ impl FakeServer {
             // Dropping the listener closes the socket, but the *path* stays on
             // disk: exactly a crashed daemon's stale control socket.
         });
-        Self { state, shutdown }
+        Self {
+            state,
+            shutdown,
+            accept_loop: std::sync::Mutex::new(Some(accept_loop)),
+        }
     }
 
     /// Make the fake daemon die: stop accepting and break every live
@@ -827,6 +845,14 @@ impl FakeServer {
     /// Windows against a TCP daemon.
     pub(crate) async fn die(&self) {
         self.shutdown.notify_one();
+        // Wait for the loop to drop the listener, not merely notice the
+        // signal. A liveness probe right after `die` must see a closed port
+        // (or socket) on every platform, and only the join proves the drop
+        // happened.
+        let accept_loop = self.accept_loop.lock().expect("accept loop").take();
+        if let Some(accept_loop) = accept_loop {
+            let _ = accept_loop.await;
+        }
         let tasks: Vec<_> = self
             .state
             .tasks
@@ -865,7 +891,7 @@ impl FakeServer {
         let serving = Arc::clone(&state);
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let signal = Arc::clone(&shutdown);
-        tokio::spawn(async move {
+        let accept_loop = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = signal.notified() => break,
@@ -876,7 +902,14 @@ impl FakeServer {
                 }
             }
         });
-        (Self { state, shutdown }, format!("ws://{address}"))
+        (
+            Self {
+                state,
+                shutdown,
+                accept_loop: std::sync::Mutex::new(Some(accept_loop)),
+            },
+            format!("ws://{address}"),
+        )
     }
 
     /// Add one thread to the stored list. The list is served in insertion
@@ -1018,7 +1051,8 @@ impl FakeServer {
         )
     }
 
-    /// Connections accepted so far (one per client handshake).
+    /// Completed client handshakes so far. The transport's liveness probe
+    /// connects and closes without one, so it is not counted.
     pub(crate) fn connections(&self) -> usize {
         self.state.connections.load(Ordering::SeqCst)
     }
@@ -1478,7 +1512,6 @@ fn accept_connection<S>(stream: S, state: Arc<State>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    state.connections.fetch_add(1, Ordering::SeqCst);
     let connection_id = state.next_connection.fetch_add(1, Ordering::SeqCst);
     let (outgoing, incoming) = mpsc::unbounded_channel::<Message>();
     state
@@ -1532,6 +1565,10 @@ async fn serve<S>(
     let Ok(socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
+    // Counted after the handshake: the transport's liveness probe opens a
+    // connection to the control path and drops it immediately, and that probe
+    // is not a dial. Only a client that completed the WebSocket handshake is.
+    state.connections.fetch_add(1, Ordering::SeqCst);
     let (mut sink, mut incoming) = socket.split();
     loop {
         tokio::select! {
