@@ -14,9 +14,11 @@
 //!   subscribed with `thread/resume`, and a `turn/interrupt` that ends the
 //!   turn as `interrupted`.
 //! - **tier-2** ([`live_codex_tier2_managed_daemon`], Ubuntu and macOS): the
-//!   real managed daemon started by Codex itself — discovery through the
-//!   control socket's symlink, the `daemon version` report, `start_server =
-//!   "never"` refusing a start, `auto` starting one, and the restart refusal.
+//!   real managed daemon started by Codex itself. The release asset is a
+//!   standalone CLI, so `daemon bootstrap` first installs the managed package
+//!   (then stops that daemon); the suite asserts discovery through the control
+//!   socket's symlink, the `daemon version` report, `start_server = "never"`
+//!   refusing a start, `auto` starting one, and the restart refusal.
 //!
 //! Run one tier with the pinned binary:
 //!
@@ -537,6 +539,23 @@ async fn live_codex_tier2_managed_daemon() {
     let binary = codex_binary();
     let daemon = server::LiveDaemon::new(binary);
     let environment = daemon.environment();
+
+    // The pinned release asset is a standalone CLI, not a packaged daemon.
+    // `daemon start` alone fails ("no complete local package" on macOS, or a
+    // `/tmp` helper refusal on Linux); `daemon bootstrap` installs the managed
+    // package from the CLI version. Bootstrap starts a daemon, so stop it again
+    // and prove no socket remains before the `never` assertion.
+    daemon.bootstrap().await;
+    assert!(
+        daemon.package_binary().is_file(),
+        "the managed package is installed at {}",
+        daemon.package_binary().display()
+    );
+    assert!(
+        !environment.socket().exists(),
+        "the bootstrap daemon was not stopped"
+    );
+
     let never_busy = || false;
     let request = || EnsureAttached {
         allow_spawn: true,
