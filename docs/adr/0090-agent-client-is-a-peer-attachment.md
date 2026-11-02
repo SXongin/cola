@@ -194,7 +194,7 @@ config half (`ThreadKey`'s `root_id` alias: add, tolerate, never rename).
 **Answered in part** by the 2026-10-23 amendment at the end of this file, on
 `codex-cli 0.163.0`: questions 1 and 2 fully, question 3 at the protocol level
 (the TUI half is #884's), question 4 on Linux only (all three platforms are
-answered by the ticket #954 amendment below). Kept for history: the questions
+addressed by the ticket #954 amendment below). Kept for history: the questions
 below are what the spike was run against.
 
 1. With two connections subscribed to one thread, does a server-initiated
@@ -220,7 +220,7 @@ setup, which is the configuration decision 3 has to support.
 
 Status: 1 and 2 are answered; 3 is answered at the protocol level, with the TUI
 half left to #884; 4 is answered for Linux, with Windows still open at that
-point (answered by the ticket #954 amendment below). Each answer says which it
+point (addressed by the ticket #954 amendment below). Each answer says which it
 is.
 
 ### The four questions
@@ -266,7 +266,7 @@ socket follows `$CODEX_HOME/app-server-control/app-server-control.sock`, and
 that path is a symlink into `/tmp/codex-daemon-0/<hash>`; discovery must follow
 it rather than require a regular socket file. A `CODEX_HOME` under `/tmp` makes
 Codex warn that it declines to install helper binaries there (warning only; the
-server still serves). Windows remains untested at that time (measured by the
+server still serves). Windows remains untested at that time (exercised by the
 ticket #954 amendment below).
 
 ### Facts the adapter is written against
@@ -314,7 +314,7 @@ ticket #954 amendment below).
   spike used raw WebSocket clients; the item stream is shared, so it should,
   but that is inference until #884 observes it.
 - The Windows half of the daemon/socket matrix (AF_UNIX limits). The transport
-  half is measured by the ticket #954 amendment below; the managed daemon on
+  half is exercised by the ticket #954 amendment below; the managed daemon on
   Windows remains unmeasured.
 - Whether cola's `thread/resume` can race a TUI-side unload inside the
   server's 30-minute grace window.
@@ -431,7 +431,7 @@ Both jobs mirror Live V1/V2: only the steps are gated by `classify` (and the
 `release/*` skip), so the job name always reports, and neither may exceed the
 Live V1/V2 20-minute bound.
 
-## Amendment (ticket #954): open question 4 on all three platforms
+## Amendment (ticket #954): open question 4 by platform
 
 Open question 4 asked whether the daemon's implicit attachment works on every
 supported platform, and how discovery behaves when `CODEX_HOME` is relocated.
@@ -447,7 +447,8 @@ answer splits by platform and by what was actually measured:
 
 The live suites are advisory, not required checks. A docs-only change classifies
 `heavy=false` and skips their steps, so a green advisory check can be a skipped
-job rather than an observed run. Promotion to required is tracked separately.
+job rather than an observed run. Promotion to a required check is tracked by
+#953 under spec #948.
 
 - **one transport on every platform.** cola spawns
   `codex app-server proxy --sock <control socket>` and runs the existing
@@ -498,8 +499,8 @@ job rather than an observed run. Promotion to required is tracked separately.
 
 On Windows, a daemon start has three doctor checks. A fourth constraint applies
 when Codex runs inside WSL. Most failures are silent at the TUI level because
-the TUI falls back to an embedded server; the elevation case is surfaced as a
-warning.
+the TUI falls back to an embedded server; in `cola doctor` an elevated token is
+a ❌ and an unreadable elevation a ⚠️.
 
 1. a **non-elevated process token**, since shared clients must not inherit
    administrator privileges; start cola from a non-elevated terminal;
@@ -507,9 +508,15 @@ warning.
    object do not;
 3. a **short `CODEX_HOME`**, so the control-socket path fits the 108-byte
    AF_UNIX budget including the terminating NUL before anything is spawned;
-4. **Codex running inside WSL must not use a Windows-mounted (DrvFS)
-   `CODEX_HOME`** (`/mnt/c/...`, 9p). This is a WSL-side constraint, not a
-   Windows-host precondition.
+4. **A `CODEX_HOME` on a Windows-mounted (DrvFS, `/mnt/c/...`) filesystem is
+   refused when Codex runs inside WSL** (`9p`, mount type `0x01021997`) — this
+   affects Windows users who run Codex under WSL, and is not a Windows-host
+   precondition.
+
+That fourth item corrects #948's shorthand "a WSL DrvFS home is refused":
+upstream's `uses_wsl_drvfs` is `#[cfg(target_os = "linux")]` and tests the
+mount's `f_type == 0x01021997`, so it is a WSL-side (Linux) check, not a
+Windows-host check.
 
 `cola doctor` reports the first three as rows with one actionable instruction
 each, and refuses a start before the launcher runs (#952, #950); the fourth is
