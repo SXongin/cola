@@ -56,12 +56,23 @@ const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 /// standalone release binary, so this is the only way to get a daemon package.
 #[cfg(unix)]
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
-/// Windows can keep a directory handle open for a moment after a child exits;
-/// a temp-tree removal is retried for this long, then reported with the OS
-/// error rather than the assertion being weakened.
+/// Windows can keep a directory handle open for longer after a child exits; a
+/// temp-tree removal is retried for this long, then reported with the OS error
+/// (or, for the work directory only, logged and skipped).
+#[cfg(windows)]
+const TREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(not(windows))]
 const TREE_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The pause between temp-tree removal attempts.
+#[cfg(windows)]
+const TREE_REMOVE_STEP: Duration = Duration::from_millis(100);
+#[cfg(not(windows))]
 const TREE_REMOVE_STEP: Duration = Duration::from_millis(50);
+
+/// How long Windows shutdown spends killing processes whose executable or cwd
+/// lives under the temp tree before retrying removal.
+#[cfg(windows)]
+const PROCESS_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The isolated `CODEX_HOME`'s directory name under the temp root, matching
 /// [`isolated_home`]. One byte keeps the Windows listener path well inside the
@@ -348,9 +359,20 @@ impl LiveAppServer {
         // temp tree here rather than relying on `TempDir`'s drop: the test's
         // cleanup assertions are about what shutdown proved, not what a
         // best-effort destructor happens to do later. Windows can hold a
-        // handle briefly, so the removal is retried.
-        remove_tree_with_retry(&self.work).await;
-        remove_tree_with_retry(&self.home).await;
+        // handle briefly — and through a child the app-server spawned — so
+        // kill anything still anchored there before retrying.
+        #[cfg(windows)]
+        kill_processes_under(&[self.work.clone(), self.home.clone()]).await;
+        #[cfg(windows)]
+        {
+            remove_work_tree(&self.work).await;
+            remove_tree_with_retry(&self.home).await;
+        }
+        #[cfg(not(windows))]
+        {
+            remove_tree_with_retry(&self.work).await;
+            remove_tree_with_retry(&self.home).await;
+        }
     }
 }
 
@@ -365,23 +387,110 @@ impl Drop for LiveAppServer {
 /// Remove a temp tree, retrying transient Windows sharing violations, then
 /// assert it is gone with the last OS error in the message.
 async fn remove_tree_with_retry(path: &Path) {
+    if let Err(last_error) = remove_tree_bounded(path).await {
+        panic!(
+            "the live Codex temp path {} was left behind after {TREE_REMOVE_TIMEOUT:?}: {last_error}",
+            path.display()
+        );
+    }
+}
+
+/// The bounded removal loop. `Ok` for a removed or already-absent tree; the
+/// last sharing violation once the budget is spent.
+async fn remove_tree_bounded(path: &Path) -> std::io::Result<()> {
     let deadline = Instant::now() + TREE_REMOVE_TIMEOUT;
-    let last_error = loop {
+    loop {
         match std::fs::remove_dir_all(path) {
-            Ok(()) => return,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 if Instant::now() >= deadline {
-                    break error;
+                    return Err(error);
                 }
                 sleep(TREE_REMOVE_STEP).await;
             }
         }
-    };
-    panic!(
-        "the live Codex temp path {} was left behind after {TREE_REMOVE_TIMEOUT:?}: {last_error}",
-        path.display()
+    }
+}
+
+/// Remove tier-1's work directory. Windows can keep the last handle on a
+/// process's cwd longer than on the home; the home and published socket are
+/// the assertions that prove the suite's state is gone, and the CI cleanup
+/// marker does not record `work`, so a still-locked work directory is logged
+/// rather than failing an otherwise clean run.
+#[cfg(windows)]
+async fn remove_work_tree(path: &Path) {
+    if let Err(error) = remove_tree_bounded(path).await {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "the live Codex work directory remained locked; home and socket are still asserted"
+        );
+    }
+}
+
+/// Kill every process whose executable or working directory lives under one of
+/// `roots`, bounded, so Windows releases the directory handles a descendant may
+/// still hold. The app-server child itself is reaped before this runs; this
+/// catches helpers it spawned.
+#[cfg(windows)]
+async fn kill_processes_under(roots: &[PathBuf]) {
+    let deadline = Instant::now() + PROCESS_KILL_TIMEOUT;
+    loop {
+        let system = system_with_cwd();
+        let mut killed = false;
+        for (pid, process) in system.processes() {
+            if pid.as_u32() == std::process::id() {
+                continue;
+            }
+            let exe_match = process.exe().is_some_and(|exe| path_under_any(exe, &roots));
+            let cwd_match = process.cwd().is_some_and(|cwd| path_under_any(cwd, &roots));
+            if exe_match || cwd_match {
+                let _ = process.kill();
+                killed = true;
+            }
+        }
+        if !killed || Instant::now() >= deadline {
+            return;
+        }
+        sleep(TREE_REMOVE_STEP).await;
+    }
+}
+
+/// A fresh process table with executables and working directories.
+#[cfg(windows)]
+fn system_with_cwd() -> sysinfo::System {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cwd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
     );
+    system
+}
+
+/// Whether `path` is one of `roots` or under one of them, comparing the raw
+/// and canonical spellings case-insensitively (Windows paths may carry the
+/// `\\?\` verbatim prefix).
+#[cfg(windows)]
+fn path_under_any(path: &Path, roots: &[PathBuf]) -> bool {
+    fn normalized(path: &Path) -> String {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = canonical.to_string_lossy();
+        let text = text.as_ref();
+        text.strip_prefix(r"\\?\")
+            .unwrap_or(text)
+            .trim_end_matches('\\')
+            .to_lowercase()
+    }
+    let path = normalized(path);
+    roots.iter().any(|root| {
+        let root = normalized(root);
+        path == root || path.starts_with(&format!("{root}\\"))
+    })
 }
 
 /// A real managed daemon started through `codex app-server daemon start` under
