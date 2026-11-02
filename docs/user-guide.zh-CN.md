@@ -246,6 +246,45 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
 - **Agent Client id 是持久状态。** cola 会把活动 id 记录在每个会话旁，因此
   重命名 id 是一次状态迁移，而不是一次配置修改。
 
+### Linux、macOS 与 Windows 上的 Codex
+
+`kind = "codex"` 客户端连接到 Codex 的 app-server daemon。daemon 的控制端点
+在所有平台上都是 AF_UNIX 套接字；cola 通过 `codex app-server proxy` 到达它，
+因此 cola 的路径上不需要 WebSocket 或 TCP 监听器，`ws://` 也不是面向用户的
+daemon 端点。不同之处在于 `cola doctor` 能要求什么证据，才会认定你自己的
+客户端确实已连接。
+
+| 平台 | cola 连接 | `cola doctor` 证明*你的*客户端已连接 | 实机验证 |
+| --- | --- | --- | --- |
+| Linux | ✅ 已验证 | `/proc/<pid>/fd` 加 `ss -x -e` 的 peer 配对 | tier-2 托管 daemon 套件 |
+| macOS | ✅ 已在 CI 验证 | `lsof` 的 peer 地址配对 | tier-1 与 tier-2 套件 |
+| Windows | ✅ 传输层已在 CI 验证 | 只有进程身份与 `--remote` argv，因此**未经硬证明**（not hard-proven） | tier-1 套件 |
+
+Windows 行的“未经硬证明”说的是**证明**，不是传输。在 `windows-latest` 上，
+tier-1 会用真实固定版本的 Codex 二进制启动
+`app-server --listen unix://<short path>`，通过代理连接 cola，并完成一个
+回合、一次审批往返和一次中断。cola 在
+那里看不到的是*你自己的* TUI 的套接字描述符或 peer 地址，因此 `cola doctor`
+会把该客户端报告为 unverified 并给出原因，而不是把它的 `--remote` argv 提升
+为已连接。托管 daemon 本身无法在托管 Windows CI 上启动——runner 的令牌是提升
+的——所以这一半只在 Linux 与 macOS 上验证。
+
+在 Windows 上，daemon 有四个前置条件，违反时 TUI 层面是静默的（它会退回内嵌
+服务器）：
+
+- **非提升的终端。** 管理员令牌会让每个共享客户端继承管理员权限；请从普通
+  终端启动 cola。
+- **允许 breakaway 的启动器。** Codex 用 `CREATE_BREAKAWAY_FROM_JOB` 启动
+  daemon；`cargo run` 或外层 job 对象会拒绝这个子进程，请直接运行
+  `codex.exe`。
+- **较短的 `CODEX_HOME`。** Windows 在发布路径上绑定 AF_UNIX 套接字，该路径
+  （含终止 NUL）必须不超过 108 字节；超出时请缩短 `CODEX_HOME`。
+- **不要使用 WSL DrvFS 上的 home。** 位于 WSL DrvFS 挂载
+  （`\\wsl.localhost\…`）上的 `CODEX_HOME` 会被 Codex 自己拒绝。
+
+`cola doctor` 会把前三条作为检查行列出，每行给出一条可执行的指示；第四条是
+Codex 自己的拒绝，因此唯一的解决办法是把 `CODEX_HOME` 放在 DrvFS 挂载之外。
+
 ### `[bridge]` —— 全部可选
 
 ```toml
@@ -474,13 +513,15 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行运行
 `codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时
 （纯 Feishu 部署）该检查通过，因为没有需要连接的对象。在 Windows 上，
-doctor 会先列出 daemon 的三个前置条件：进程不能持有提升的管理员令牌；启动器
-必须允许 breakaway 子进程（`cargo run` 和外层 job 对象都不允许）；控制套接字
-路径必须符合 AF_UNIX 的 108 字节上限（含终止 NUL）。每条失败的行都带可执行的
-指示——从非管理员终端启动 cola、直接运行 `codex.exe`，或缩短 `CODEX_HOME`；
-令牌或路径不满足时，doctor 会跳过运行时诊断，而不是只报告一句 attach failed。
-如果完全无法读取令牌的提升状态，doctor 会给出警告而不是通过，只运行只读诊断，
-并跳过真实回合探测，因此不会产生 provider 费用。
+doctor 会先列出 daemon 的三个机器前置条件：进程不能持有提升的管理员令牌；
+启动器必须允许 breakaway 子进程（`cargo run` 和外层 job 对象都不允许）；控制
+套接字路径必须符合 AF_UNIX 的 108 字节上限（含终止 NUL）。每条失败的行都带
+可执行的指示——从非管理员终端启动 cola、直接运行 `codex.exe`，或缩短
+`CODEX_HOME`；令牌或路径不满足时，doctor 会跳过运行时诊断，而不是只报告一句
+attach failed。第四个 Windows 前置条件是 `CODEX_HOME` 不能位于 WSL DrvFS
+挂载上；这属于 Codex 自己的拒绝，而不是 doctor 的一行检查。如果完全无法读取
+令牌的提升状态，doctor 会给出警告而不是通过，只运行只读诊断，并跳过真实回合
+探测，因此不会产生 provider 费用。
 
 `cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在**共享**
 daemon（并非 cola 所有）上创建一个临时线程并发起最小回合并等待
