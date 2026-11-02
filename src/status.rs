@@ -1045,10 +1045,10 @@ fn unverified_proof_hint(platform: &str) -> &'static str {
              可由打开的描述符证实"
         }
         "windows" => {
-            "Windows 只提供进程身份与 `--remote` argv，没有套接字描述符或 peer 地址证据，\
-             因此无法硬证明它已连接到共享 daemon（not hard-proven）"
+            "Windows 只提供进程身份与 `--remote` argv，没有套接字描述符或 peer 地址证据\
+             （not hard-proven）"
         }
-        _ => "此平台没有套接字描述符或 peer 地址证据，因此无法硬证明它已连接到共享 daemon",
+        _ => "此平台没有套接字描述符或 peer 地址证据（not hard-proven）",
     }
 }
 
@@ -1813,9 +1813,12 @@ kind = "codex"
         assert!(hint.contains("进程身份"), "{hint}");
         assert!(hint.contains("`--remote` argv"), "{hint}");
         assert!(hint.contains("没有套接字描述符"), "{hint}");
-        assert!(hint.contains("无法硬证明"), "{hint}");
         assert!(hint.contains("not hard-proven"), "{hint}");
         assert!(!hint.contains("连接本身可用"), "{hint}");
+        assert!(
+            !hint.contains("已连接到共享 daemon"),
+            "the enclosing check already says the connection is unproven: {hint}"
+        );
     }
 
     /// Every platform's unverified hint is specific to it; an unknown target

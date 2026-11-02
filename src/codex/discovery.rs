@@ -1959,18 +1959,30 @@ fn normalized_unix_address(token: &str) -> Option<String> {
     Some(format!("0x{value:x}"))
 }
 
-/// No prover exists outside Linux and macOS. The argv may name the daemon and
-/// the process identity is visible, but cola has no descriptor or peer-address
-/// evidence to promote it, so the attachment stays not hard-proven.
+/// No prover exists outside Linux and macOS. The process identity is visible,
+/// but cola has no descriptor or peer-address evidence to promote it, so the
+/// attachment stays not hard-proven. A client with no `--remote` endpoint is
+/// described by its process identity alone: its argv does not name the daemon,
+/// so the unverified detail must not say it does.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn prove_unsupported(clients: &mut LocalClients, daemon: &Path) {
     let platform = std::env::consts::OS;
     for client in &mut clients.unverified {
+        let evidence = match &client.endpoint {
+            Some(endpoint) => format!(
+                "argv names {endpoint}, and {platform} exposes the process identity for the \
+                 daemon at {}",
+                daemon.display()
+            ),
+            None => format!(
+                "{platform} exposes the process identity, but argv names no `--remote` endpoint \
+                 for the daemon at {}",
+                daemon.display()
+            ),
+        };
         client.detail = format!(
-            "argv names the daemon at {}, and {platform} exposes the process identity, but cola \
-             has no socket descriptor or peer-address prover there: the attachment is not \
-             hard-proven",
-            daemon.display()
+            "{evidence}, but cola has no socket descriptor or peer-address prover there: the \
+             attachment is not hard-proven"
         );
     }
 }
@@ -3540,6 +3552,23 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
             "{}",
             clients.unverified[0].detail
         );
+    }
+
+    /// A client whose argv names no `--remote` endpoint is not described as
+    /// naming the daemon: only its process identity is available (ticket #954
+    /// review).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_does_not_claim_an_implicit_client_names_the_daemon() {
+        let daemon = Path::new(r"C:\codex-home\app-server-control\app-server-control.sock");
+        let mut clients = unverified_client(9, None, "no --remote");
+        prove_attachments(&mut clients, &daemon).await;
+        assert!(clients.attached.is_empty());
+        assert_eq!(clients.unverified.len(), 1);
+        let detail = &clients.unverified[0].detail;
+        assert!(detail.contains("names no `--remote` endpoint"), "{detail}");
+        assert!(!detail.contains("argv names"), "{detail}");
+        assert!(detail.contains("not hard-proven"), "{detail}");
     }
 
     /// The macOS end-to-end proof (CI only; the Linux suite compiles it out):
