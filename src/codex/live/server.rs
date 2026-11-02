@@ -686,19 +686,52 @@ fn system() -> sysinfo::System {
     system
 }
 
+/// The spellings of `home` a process path may use: the path as given and its
+/// canonical form. On macOS `/tmp` is a symlink to `/private/tmp`, so sysinfo's
+/// executable path (the physical spelling) does not prefix-match a home under
+/// `/tmp` unless both sides are resolved.
+#[cfg(unix)]
+fn home_spellings(home: &Path) -> Vec<PathBuf> {
+    let mut spellings = vec![home.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(home)
+        && canonical != home
+    {
+        spellings.push(canonical);
+    }
+    spellings
+}
+
+/// Whether `path` lives under one of `home`'s spellings. The path is resolved
+/// where it still exists (a live executable), falling back to its raw spelling;
+/// both are compared so a `/tmp` home and a `/private/tmp` executable still
+/// match.
+#[cfg(unix)]
+fn path_is_under(path: &Path, spellings: &[PathBuf]) -> bool {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    spellings
+        .iter()
+        .any(|home| resolved.starts_with(home) || path.starts_with(home))
+}
+
 /// Every process whose executable or argv lives under `home` — the isolated
-/// tree this suite created. Nothing outside that path is ever matched.
+/// tree this suite created. Nothing outside that path is ever matched. The
+/// executable is compared in both its raw and canonical spellings (macOS
+/// resolves `/tmp` to `/private/tmp`), and argv stays a fallback for a process
+/// whose executable the scan cannot read.
 #[cfg(unix)]
 fn daemon_processes_under(home: &Path) -> Vec<sysinfo::Pid> {
+    let spellings = home_spellings(home);
     let system = system();
     system
         .processes()
         .iter()
         .filter(|(_, process)| {
-            process.exe().is_some_and(|exe| exe.starts_with(home))
+            process.exe().is_some_and(|exe| path_is_under(exe, &spellings))
                 || process.cmd().iter().any(|arg| {
-                    arg.to_string_lossy()
-                        .contains(&home.to_string_lossy().to_string())
+                    let arg = arg.to_string_lossy();
+                    spellings
+                        .iter()
+                        .any(|home| arg.contains(&home.to_string_lossy().to_string()))
                 })
         })
         .map(|(pid, _)| *pid)
@@ -739,6 +772,30 @@ pub async fn daemon_version(daemon: &LiveDaemon) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS resolves `/tmp` to `/private/tmp`, so a process's executable path
+    /// and the suite's unresolved temp home can spell the same tree
+    /// differently. Both spellings of the home must match, and a sibling that
+    /// merely shares the prefix must not.
+    #[cfg(unix)]
+    #[test]
+    fn a_canonical_home_matches_both_spellings_of_a_process_path() {
+        let root = tempfile::tempdir().expect("temp root");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).expect("real home");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked home");
+
+        let spellings = home_spellings(&link);
+        let canonical_real = std::fs::canonicalize(&real).expect("canonical real home");
+        assert!(spellings.iter().any(|home| home == &link));
+        assert!(spellings.iter().any(|home| home == &canonical_real));
+
+        assert!(path_is_under(&link.join("bin/codex"), &spellings));
+        assert!(path_is_under(&real.join("bin/codex"), &spellings));
+        assert!(!path_is_under(&root.path().join("other/codex"), &spellings));
+        assert!(!path_is_under(&root.path().join("realer/codex"), &spellings));
+    }
 
     /// The Windows listener path this suite hands the child must fit the
     /// 108-byte `sun_path` field on a hosted runner. The literal is checked on
