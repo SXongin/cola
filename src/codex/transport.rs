@@ -18,9 +18,8 @@
 //! own also closes the connection. Either way every waiter fails by name and
 //! [`ServerEvent::Closed`] reaches the decision stream.
 //!
-//! `Endpoint::WebSocket` remains for a TUI's own `ws://` listener and the
-//! hermetic tests; the daemon cannot serve it. It is test/live-only in
-//! practice.
+//! `Endpoint::WebSocket` remains for the hermetic tests only; the live suites
+//! dial `Endpoint::Unix`, and the daemon cannot serve a WebSocket listener.
 //!
 //! The shipped control socket under `$CODEX_HOME/app-server-control/` is a
 //! **symlink** into `/tmp/codex-daemon-0/<hash>` on Unix (spec #948). The path
@@ -108,14 +107,14 @@ const OUTGOING_CAPACITY: usize = 64;
 pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How to reach an app-server.
-// `ws://` endpoints are how the hermetic tests dial a TCP fake server, and how
-// the live harness addresses an explicit listener; the daemon path uses `Unix`
-// because the daemon serves no WebSocket listener (ticket #954).
+// `ws://` endpoints are how the hermetic tests dial a TCP fake server; the
+// live suites and the daemon path use `Unix`, because the daemon serves no
+// WebSocket listener (ticket #954).
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
-    /// `ws://HOST:PORT` — a test/live-only listener, never the daemon's
-    /// control endpoint.
+    /// `ws://HOST:PORT` — a hermetic-test listener, never the daemon's control
+    /// socket.
     WebSocket(String),
     /// `unix://PATH` — a filesystem socket, usually the daemon control socket
     /// (a symlink; followed by the OS, not by string canonicalisation). The

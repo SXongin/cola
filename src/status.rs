@@ -1029,6 +1029,29 @@ fn agent_questions_check(report: &ClientReport) -> Check {
     }
 }
 
+/// What an unverified client's platform can actually establish.
+///
+/// Split from [`local_client_check`] so every platform's wording is pinned by a
+/// unit test, including the Windows text on hosts where the Windows prover
+/// cannot run. The Windows arm must not claim the connection works: the client
+/// is `UserClientState::Unverified`, so only its process identity and argv are
+/// known, and whether it shares the daemon is exactly what cola could not
+/// prove.
+fn unverified_proof_hint(platform: &str) -> &'static str {
+    match platform {
+        "macos" => "在有 `lsof` 的 macOS 上，持有到该 socket 的连接可由客户端 socket 的 peer 地址证实",
+        "linux" => {
+            "在有 `/proc` 与 `ss` 的 Linux 上，以 `codex --remote unix://…` 启动且持有连接时，\
+             可由打开的描述符证实"
+        }
+        "windows" => {
+            "Windows 只提供进程身份与 `--remote` argv，没有套接字描述符或 peer 地址证据，\
+             因此无法硬证明它已连接到共享 daemon（not hard-proven）"
+        }
+        _ => "此平台没有套接字描述符或 peer 地址证据，因此无法硬证明它已连接到共享 daemon",
+    }
+}
+
 /// The user's own client, classified honestly:
 ///
 /// - **proven attached** (a live descriptor connection) → PASS;
@@ -1075,19 +1098,11 @@ fn local_client_check(report: &ClientReport) -> Check {
             .map(|client| format!("PID {} ({})：{}", client.pid, client.binary, client.detail))
             .collect::<Vec<_>>()
             .join("；");
-        let proof_hint = if cfg!(target_os = "macos") {
-            "在有 `lsof` 的 macOS 上，持有到该 socket 的连接可由客户端 socket 的 peer 地址证实"
-        } else if cfg!(target_os = "linux") {
-            "在有 `/proc` 与 `ss` 的 Linux 上，以 `codex --remote unix://…` 启动且持有连接时，\
-             可由打开的描述符证实"
-        } else {
-            "Windows 只提供进程身份与 `--remote` argv，没有套接字描述符或 peer 地址证据；\
-             连接本身可用，但无法硬证明，因此共享状态保持 unverified（not hard-proven）"
-        };
         return Check::warn(
             "Codex 本地客户端",
             format!(
-                "{listed}。无法证明它已连接到共享 daemon；{proof_hint}（daemon: {}）",
+                "{listed}。无法证明它已连接到共享 daemon；{}（daemon: {}）",
+                unverified_proof_hint(std::env::consts::OS),
                 report.endpoint
             ),
         );
@@ -1786,6 +1801,31 @@ kind = "codex"
             "{}",
             local.detail
         );
+    }
+
+    /// The Windows hint names only the evidence Windows has — process identity
+    /// and `--remote` argv — and never claims the connection works. The client
+    /// is unverified, so a working connection is the one fact cola cannot
+    /// assert (ticket #954 review).
+    #[test]
+    fn the_windows_unverified_hint_claims_only_identity_and_argv() {
+        let hint = unverified_proof_hint("windows");
+        assert!(hint.contains("进程身份"), "{hint}");
+        assert!(hint.contains("`--remote` argv"), "{hint}");
+        assert!(hint.contains("没有套接字描述符"), "{hint}");
+        assert!(hint.contains("无法硬证明"), "{hint}");
+        assert!(hint.contains("not hard-proven"), "{hint}");
+        assert!(!hint.contains("连接本身可用"), "{hint}");
+    }
+
+    /// Every platform's unverified hint is specific to it; an unknown target
+    /// gets the neutral text, never the Windows wording.
+    #[test]
+    fn only_the_windows_hint_names_windows() {
+        assert!(unverified_proof_hint("macos").contains("lsof"));
+        assert!(unverified_proof_hint("linux").contains("/proc"));
+        assert!(unverified_proof_hint("freebsd").contains("此平台"));
+        assert!(!unverified_proof_hint("freebsd").contains("Windows"));
     }
 
     /// A platform prover that could not run is still only a warning: `lsof`

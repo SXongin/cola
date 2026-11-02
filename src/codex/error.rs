@@ -12,8 +12,9 @@ use thiserror::Error;
 
 pub(crate) type Result<T> = std::result::Result<T, CodexError>;
 
-// `Endpoint` is the parse arm a `ws://` or a malformed listen URL reaches; the
-// daemon path never constructs it here.
+// `Endpoint` is the error arm a malformed or unsupported listen URL reaches;
+// `parse` accepts `unix://` and `ws://`, and the daemon path constructs
+// `Unix` directly.
 #[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum CodexError {
