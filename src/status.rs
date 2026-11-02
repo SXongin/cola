@@ -1055,7 +1055,8 @@ fn unverified_proof_hint(platform: &str) -> &'static str {
 /// The user's own client, classified honestly:
 ///
 /// - **proven attached** (a live descriptor or peer-address connection) → PASS;
-/// - **unverified** (neither argv nor descriptors settle it) → WARN, naming
+/// - **unverified** (neither argv nor a descriptor/peer-address proof settles
+///   it) → WARN, naming
 ///   the gap; never a pass, because claiming sharing cola cannot establish is
 ///   the silence ADR-0090 decision 3 rejects;
 /// - **embedded** or **unreachable** (proven not to share this daemon) → FAIL;
@@ -1807,6 +1808,38 @@ kind = "codex"
         assert!(
             local.detail.contains("无法证明它已连接到共享 daemon"),
             "{}",
+            local.detail
+        );
+    }
+
+    /// A detail without the platform's own proof text still gets the platform
+    /// hint: the suppression above is conditional, not unconditional.
+    #[test]
+    fn a_detail_without_the_platform_evidence_keeps_the_hint() {
+        let report = codex_report(
+            ClientState::Attached,
+            vec![UserClient {
+                pid: 9,
+                binary: "codex".into(),
+                state: UserClientState::Unverified,
+                detail: "names no `--remote`; argv cannot establish a live connection".into(),
+            }],
+        );
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Warn);
+        assert!(
+            local.detail.contains(unverified_proof_hint(std::env::consts::OS)),
+            "the platform hint is missing: {}",
             local.detail
         );
     }

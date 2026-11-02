@@ -54,8 +54,9 @@ const STARTUP_STEP: Duration = Duration::from_millis(25);
 const CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The isolated `CODEX_HOME`'s directory name under the temp root, matching
-/// [`isolated_home`].
-const LIVE_HOME_DIR: &str = "home";
+/// [`isolated_home`]. One byte keeps the Windows listener path well inside the
+/// 108-byte `sun_path` budget on a hosted `%TEMP%`.
+const LIVE_HOME_DIR: &str = "h";
 
 /// The longest AF_UNIX path the temp root may produce. Unix `sun_path` is 104
 /// bytes on macOS and 108 on Linux; Windows uses the Windows limit from
@@ -106,7 +107,7 @@ fn socket_path_fits(root: &Path) -> bool {
 }
 
 /// The Windows worst-case shape this suite relies on: `%TEMP%` on a hosted
-/// runner plus `cola-cxXXXXXX/home/app-server-control/app-server-control.sock`.
+/// runner plus `cola-cxXXXXXX/h/app-server-control/app-server-control.sock`.
 /// Kept as a test below so a future prefix or directory name cannot silently
 /// overflow the 108-byte limit on a platform this host cannot run.
 #[cfg(test)]
@@ -120,7 +121,7 @@ fn windows_socket_shape(temp: &str) -> String {
 /// writes only the scripted provider entry, so a model call cannot reach the
 /// network.
 pub fn isolated_home(root: &Path, provider_base_url: &str) -> PathBuf {
-    let home = root.join("home");
+    let home = root.join(LIVE_HOME_DIR);
     let work = root.join("work");
     std::fs::create_dir_all(&home).expect("create the isolated CODEX_HOME");
     std::fs::create_dir_all(&work).expect("create the live work directory");
@@ -661,9 +662,12 @@ mod tests {
             r"C:\Users\RUNNER~1\AppData\Local\Temp",
         ] {
             let shape = windows_socket_shape(temp);
+            // 98 bytes with the one-byte home, leaving margin under the
+            // 108-byte `sun_path` limit (terminator included).
             assert!(
-                shape.len() < 108,
-                "the Windows listener path is {} bytes (max 107): {shape}",
+                shape.len() < 100,
+                "the Windows listener path is {} bytes (want < 100 for margin under the \
+                 108-byte limit): {shape}",
                 shape.len()
             );
         }
