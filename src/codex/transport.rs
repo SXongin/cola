@@ -67,7 +67,7 @@ use std::time::Duration;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -116,6 +116,11 @@ pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// daemon that is gone. A `std::fs::metadata` read is cheap enough at this
 /// cadence and performs no spawn.
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The most of one proxy stderr line kept for the log. The proxy's diagnostics
+/// are short; a newline-free torrent must not grow a buffer without limit, so
+/// the rest of the line is drained and replaced by a marker.
+const MAX_STDERR_LINE: usize = 8 * 1024;
 
 /// How to reach an app-server.
 // `ws://` endpoints are how the hermetic tests dial a TCP fake server; the
@@ -707,24 +712,56 @@ async fn spawn_proxy(binary: &Path, socket: &Path) -> Result<(ChildIo, Child)> {
 /// Drain the proxy child's stderr to the log. Its only writer is `codex`'s own
 /// diagnostics on a failure; without this the operator sees a bare exit code.
 ///
-/// Bytes are read to `\n` and decoded lossily: a `lines()` reader stops at the
-/// first non-UTF-8 line, which would leave the pipe undrained and block the
-/// child mid-relay.
+/// Fixed-size chunks are decoded lossily and split into lines here rather than
+/// with a line reader: a reader stops at the first non-UTF-8 line and leaves
+/// the pipe undrained, blocking the child mid-relay. A single line is capped
+/// at [`MAX_STDERR_LINE`], with the remainder drained and marked, so a
+/// newline-free stream cannot grow the buffer without limit.
 fn watch_proxy_stderr(stderr: ChildStderr) {
     tokio::spawn(async move {
-        let mut stderr = tokio::io::BufReader::new(stderr);
-        let mut line = Vec::new();
+        let mut stderr = stderr;
+        let mut buffer = [0u8; 4096];
+        let mut line = Vec::with_capacity(256);
+        let mut truncated = false;
         loop {
-            line.clear();
-            match stderr.read_until(b'\n', &mut line).await {
+            let read = match stderr.read(&mut buffer).await {
                 Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let text = String::from_utf8_lossy(&line);
-                    tracing::warn!("codex app-server proxy: {}", text.trim_end());
+                Ok(read) => read,
+            };
+            for &byte in &buffer[..read] {
+                if let Some(truncated_line) = push_stderr_byte(&mut line, &mut truncated, byte) {
+                    log_stderr_line(&line, truncated_line);
+                    line.clear();
                 }
             }
         }
+        if !line.is_empty() || truncated {
+            log_stderr_line(&line, truncated);
+        }
     });
+}
+
+fn push_stderr_byte(line: &mut Vec<u8>, truncated: &mut bool, byte: u8) -> Option<bool> {
+    if byte == b'\n' {
+        let ended = *truncated;
+        *truncated = false;
+        return Some(ended);
+    }
+    if line.len() < MAX_STDERR_LINE {
+        line.push(byte);
+    } else {
+        *truncated = true;
+    }
+    None
+}
+
+fn log_stderr_line(line: &[u8], truncated: bool) {
+    let text = String::from_utf8_lossy(line);
+    if truncated {
+        tracing::warn!("codex app-server proxy: {} [line truncated]", text.trim_end());
+    } else {
+        tracing::warn!("codex app-server proxy: {}", text.trim_end());
+    }
 }
 
 /// The proxy child's stdin/stdout as one duplex byte stream.
@@ -1172,6 +1209,26 @@ mod tests {
         assert!(Endpoint::parse("stdio://").is_err());
         assert!(Endpoint::parse("unix://").is_err());
         assert!(Endpoint::parse("http://127.0.0.1:4501").is_err());
+    }
+
+    #[test]
+    fn a_proxy_stderr_line_is_capped_and_the_rest_drained() {
+        let mut line = Vec::new();
+        let mut truncated = false;
+        for _ in 0..MAX_STDERR_LINE + 32 {
+            assert_eq!(push_stderr_byte(&mut line, &mut truncated, b'x'), None);
+        }
+        assert_eq!(line.len(), MAX_STDERR_LINE, "the line is capped");
+        assert!(truncated, "the excess is recorded as a marker");
+        assert_eq!(
+            push_stderr_byte(&mut line, &mut truncated, b'\n'),
+            Some(true),
+            "the rest of the oversized line was still drained to its newline"
+        );
+        assert!(!truncated);
+        line.clear();
+        assert!(push_stderr_byte(&mut line, &mut truncated, b'y').is_none());
+        assert_eq!(push_stderr_byte(&mut line, &mut truncated, b'\n'), Some(false));
     }
 
     /// The hermetic acceptance path (#949): a real `codex app-server proxy`
