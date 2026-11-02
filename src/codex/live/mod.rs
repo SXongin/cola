@@ -655,9 +655,17 @@ async fn live_codex_tier2_managed_daemon() {
     assert_eq!(report["cliVersion"], PINNED_VERSION);
     assert_eq!(report["appServerVersion"], PINNED_VERSION);
     assert_eq!(report["managedCodexVersion"], PINNED_VERSION);
+    // Compare the canonical forms: the daemon's report resolves macOS's
+    // `/tmp` to `/private/tmp`, while discovery keeps the published spelling.
+    // Both name the same control socket, so a literal comparison fails there.
+    let reported_socket = report["socketPath"]
+        .as_str()
+        .expect("the daemon report names its control socket");
+    let canonical = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     assert_eq!(
-        report["socketPath"].as_str().map(std::path::Path::new),
-        Some(found.socket.as_path())
+        canonical(Path::new(reported_socket)),
+        canonical(&found.socket),
+        "the report names the discovered control socket (canonicalised, since macOS `/tmp` is `/private/tmp`)"
     );
     let info = found.info.as_ref().expect("discovery kept the version report");
     assert_eq!(info.app_server_version.as_deref(), Some(PINNED_VERSION));
