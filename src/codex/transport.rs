@@ -125,6 +125,12 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// the rest of the line is drained and replaced by a marker.
 const MAX_STDERR_LINE: usize = 8 * 1024;
 
+/// How long to wait for the proxy child to report an exit after a failed
+/// handshake. A wrapper that execs successfully but dies (missing interpreter
+/// or dylib) is still running for a moment; this bound is long enough to see
+/// the common early exit and short enough not to delay the transport error.
+const PROXY_EXIT_GRACE: Duration = Duration::from_millis(500);
+
 /// How to reach an app-server.
 // `ws://` endpoints are how the hermetic tests dial a TCP fake server; the
 // live suites and the daemon path use `Unix`, because the daemon serves no
@@ -381,12 +387,30 @@ impl RpcConnection {
                 // spawned, so a daemon replaced during the handshake is still
                 // noticed by the watcher.
                 let watch = ProxyWatch::capture(path);
+                // Record whether the daemon was reachable *before* the child is
+                // spawned. A failed handshake with an early child exit is only
+                // the proxy binary's fault when there was a live daemon to
+                // reach; otherwise it is the daemon's death, as before.
+                let daemon_accepting = dial_target_accepts(path).await;
                 let (io, child) = spawn_proxy(binary, path).await?;
                 // Cancellation anywhere in the handshake (the outer timeout,
                 // a caller dropping the future) drops this guard, which kills
                 // the child instead of leaking a process nobody owns.
                 let mut guard = ProxyGuard::new(child);
-                let socket = Self::handshake(PROXY_HANDSHAKE_URL, Box::new(io)).await?;
+                let socket = match Self::handshake(PROXY_HANDSHAKE_URL, Box::new(io)).await {
+                    Ok(socket) => socket,
+                    Err(error) => {
+                        // A wrapper can exec successfully and then die before
+                        // the handshake (missing interpreter/dylib). That is a
+                        // configuration failure that names the binary, not a
+                        // gone daemon: reading it as the latter would let
+                        // `auto` run `daemon start` against a live daemon.
+                        if daemon_accepting && let Some(exited) = proxy_exited(&mut guard, binary).await {
+                            return Err(exited);
+                        }
+                        return Err(error);
+                    }
+                };
                 let child = guard.take();
                 Self::start_with_proxy(socket, Some(child), Some(watch))
             }
@@ -815,6 +839,47 @@ impl AsyncWrite for ChildIo {
 /// completes — no `kill_on_drop` backstop — so a test can prove the guard is
 /// what reaps a child stranded mid-handshake.
 struct ProxyGuard(Option<Child>);
+
+/// Whether the dial target accepted a connection at the moment the proxy was
+/// spawned. Mirrors [`ProxyWatch`]: the Windows hermetic fixture's target is a
+/// `tcp://` address, while production and the Unix fixtures dial the AF_UNIX
+/// control path.
+async fn dial_target_accepts(path: &Path) -> bool {
+    #[cfg(not(unix))]
+    if let Some(address) = path.to_str().and_then(|path| path.strip_prefix("tcp://"))
+        && let Ok(address) = address.parse::<std::net::SocketAddr>()
+    {
+        return match tokio::time::timeout(discovery::CONTROL_PROBE_TIMEOUT, TcpStream::connect(address)).await
+        {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                true
+            }
+            _ => false,
+        };
+    }
+    discovery::control_socket_accepts(path).await
+}
+
+/// If the proxy child already exited, name it as a spawn/configuration failure
+/// instead of letting its transport error read as a dead daemon. Returns `None`
+/// for a child that is still running (or whose status cannot be read), in which
+/// case the caller keeps the original handshake error and the guard reaps it.
+async fn proxy_exited(guard: &mut ProxyGuard, binary: &Path) -> Option<CodexError> {
+    let child = guard.child();
+    let status = match child.try_wait() {
+        Ok(Some(status)) => status,
+        Ok(None) => match tokio::time::timeout(PROXY_EXIT_GRACE, child.wait()).await {
+            Ok(Ok(status)) => status,
+            _ => return None,
+        },
+        Err(_) => return None,
+    };
+    Some(CodexError::ProxySpawn {
+        binary: binary.display().to_string(),
+        detail: format!("exited before the handshake: {status}"),
+    })
+}
 
 impl ProxyGuard {
     fn new(child: Child) -> Self {
@@ -1641,23 +1706,56 @@ mod tests {
         let _ = release.send(());
     }
 
-    /// A proxy that exits before the handshake is a transport failure. This
-    /// says nothing about reaping (the fixture exits itself); the cancellation
-    /// test above is the one that proves the guard.
+    /// A proxy that exits before the handshake while the daemon is reachable is
+    /// a **configuration** failure that names the binary, not a transport
+    /// failure that reads as a gone daemon. The binary is a 0755 shell wrapper
+    /// on Unix and the command interpreter on Windows: both spawn, then exit
+    /// non-zero before answering. This says nothing about reaping (the child
+    /// exits itself); the cancellation test above is the one that proves the
+    /// guard.
     #[tokio::test]
     async fn an_immediately_exiting_proxy_cannot_handshake() {
-        let error = RpcConnection::open_with_proxy(
-            &Endpoint::Unix(PathBuf::from("exit")),
-            Duration::from_secs(5),
-            Some(&crate::codex::test_server::proxy_helper()),
-        )
-        .await
-        .err()
-        .expect("a child with no daemon cannot complete the handshake");
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let (proxy, _root) = exiting_proxy();
+        let error = RpcConnection::open_with_proxy(&daemon.endpoint, Duration::from_secs(5), Some(&proxy))
+            .await
+            .err()
+            .expect("a child that exits cannot complete the handshake");
         assert!(
-            matches!(error, CodexError::Transport { .. } | CodexError::Timeout(_)),
-            "the failure is the transport's: {error}"
+            matches!(&error, CodexError::ProxySpawn { .. }),
+            "an early exit is a spawn/configuration failure: {error}"
         );
+        assert!(
+            error.to_string().contains(&proxy.display().to_string()),
+            "the failure names the proxy path: {error}"
+        );
+        assert!(
+            error.to_string().contains("exited before the handshake"),
+            "the failure names the early exit: {error}"
+        );
+    }
+
+    /// A binary that spawns successfully and exits before the handshake.
+    #[cfg(unix)]
+    fn exiting_proxy() -> (PathBuf, Option<tempfile::TempDir>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("broken-proxy");
+        std::fs::write(&path, b"#!/bin/sh\nexit 7\n").expect("write a broken proxy");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make the broken proxy executable");
+        (path, Some(root))
+    }
+
+    /// On Windows the command interpreter is a real executable that exits
+    /// non-zero when handed the proxy arguments it cannot run.
+    #[cfg(not(unix))]
+    fn exiting_proxy() -> (PathBuf, Option<tempfile::TempDir>) {
+        let command = std::env::var_os("COMSPEC")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cmd.exe"));
+        (command, None)
     }
 
     /// The fixture must behave like the real proxy: a daemon-side EOF ends only
