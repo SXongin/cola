@@ -336,6 +336,28 @@ jobs:
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: ./.github/actions/install-codex
+      # The GitHub-release asset is a standalone CLI: `daemon bootstrap` fails
+      # with "this CLI has no complete local package". The npm package ships
+      # the managed package `daemon bootstrap` installs, so tier-2 runs the
+      # npm shim while tier-1 keeps the release asset on PATH. `--prefix`
+      # installs no global bin entry, so it cannot shadow tier-1's `codex`.
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: Install the npm Codex package for tier-2
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/codex-npm"
+          npm install --prefix "$prefix" @openai/codex@0.166.0
+          shim="$prefix/node_modules/.bin/codex"
+          if [ ! -x "$shim" ]; then
+            echo "the npm Codex shim is missing or not executable: $shim" >&2
+            ls -la "$prefix/node_modules/.bin" >&2 || true
+            exit 1
+          fi
+          "$shim" --version
+          echo "COLA_LIVE_CODEX_BIN=$shim" >> "$GITHUB_ENV"
       - if: >-
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
