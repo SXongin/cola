@@ -639,13 +639,13 @@ the platform exposes it — open descriptors on Linux (`/proc`, `ss`) and `lsof`
 peer-address pairing on macOS — never from its argv alone. On Windows only
 process identity and `--remote` argv are visible, so a local client there is
 reported as unverified rather than attached; the Codex platform section above
-explains what that means and names the daemon's preconditions. An argv match
-that cannot be proven is a warning, while a `--no-daemon` client or one pointed
-at another endpoint is a named failure. A missing daemon is a failure too —
-`start_server = "never"` only stops cola from starting one; run
-`codex app-server daemon start` yourself and point your client at it. With no
-local client at all (a Feishu-only deployment) the check passes, because there
-is nothing to attach. If the token's elevation cannot be read at all, doctor
+explains what that means and names the app-server daemon's preconditions. An
+argv match that cannot be proven is a warning, while a `--no-daemon` client or
+one pointed at another endpoint is a named failure. A missing app-server daemon
+is a failure too — `start_server = "never"` only stops cola from starting one;
+run `codex app-server daemon start` yourself and point your client at it. With
+no local client at all (a Feishu-only deployment) the check passes, because
+there is nothing to attach. If the token's elevation cannot be read at all, doctor
 warns rather than passing, runs only the read-only diagnosis, and skips the
 real-turn probe so no provider spend can occur.
 

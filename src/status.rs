@@ -1111,7 +1111,7 @@ fn local_client_check(report: &ClientReport) -> Check {
         return Check::warn(
             "Codex 本地客户端",
             format!(
-                "{listed}。无法证明它已连接到共享 daemon{hint}（daemon: {}）",
+                "{listed}。无法证明它已连接到共享 app-server daemon{hint}（app-server daemon: {}）",
                 report.endpoint
             ),
         );
@@ -1806,7 +1806,7 @@ kind = "codex"
             .expect("the local-client check");
         assert_eq!(local.status, CheckStatus::Warn);
         assert!(
-            local.detail.contains("无法证明它已连接到共享 daemon"),
+            local.detail.contains("无法证明它已连接到共享 app-server daemon"),
             "{}",
             local.detail
         );
@@ -1857,7 +1857,7 @@ kind = "codex"
         assert!(hint.contains("not hard-proven"), "{hint}");
         assert!(!hint.contains("连接本身可用"), "{hint}");
         assert!(
-            !hint.contains("已连接到共享 daemon"),
+            !hint.contains("已连接到共享 app-server daemon"),
             "the enclosing check already says the connection is unproven: {hint}"
         );
     }
