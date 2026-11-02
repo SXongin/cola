@@ -28,6 +28,22 @@ _Avoid_: live sync, mirroring (a mirror is one-way, and the claim is two faces o
 The mode where cola starts the agent and is its only client, so the user picks the **Session** up later from history. Never described or configured as peer sync (ADR-0090).
 _Avoid_: gateway (cola is not one), standalone mode
 
+**Codex CLI**:
+The command-line Codex client (`codex`), including its TUI. It is a client of the **app-server**, not the server itself: a TUI on its own embedded server shares nothing, while one pointed at the local daemon with `--remote` shares the **Session** store.
+_Avoid_: Codex (bare — the product family also spans the desktop app and ChatGPT), server
+
+**app-server**:
+Codex's protocol surface and the process that owns the thread store (`codex app-server`) — the shared runtime every peer client attaches to. `kind = "codex"` names this surface, never the CLI, the desktop app or ChatGPT.
+_Avoid_: Codex server, backend (a **Backend** is cola's adapter-neutral term), TUI server
+
+**app-server daemon**:
+The managed **app-server** that Codex starts and keeps alive (`codex app-server daemon start`), owning the shared thread store under `$CODEX_HOME`. cola discovers it and may start it under `start_server`, but never owns, stops or reaps it (ADR-0090 decision 3).
+_Avoid_: daemon (bare — cola also has background processes), service
+
+**Codex desktop / ChatGPT**:
+The Codex desktop app and the ChatGPT cloud product: other clients, or a different product, not the **app-server** surface. The desktop app shares the local **Session** store only when it attaches to the same daemon; an embedded server, and ChatGPT's cloud threads, share nothing with cola.
+_Avoid_: Codex (bare), app-server (the desktop app is a client of it, not it)
+
 **Generation**:
 An OpenCode protocol era cola can speak: **V1** is the 1.18.x unprefixed compatibility surface; **V2** is the 2.0.x `/api`-only surface. The numbers name OpenCode releases, not protocol versions (ADR-0055).
 _Avoid_: version, API version, protocol v1/v2 (the numbers are OpenCode releases, not protocol versions)

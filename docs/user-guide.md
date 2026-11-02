@@ -327,6 +327,49 @@ default_client = "ada"           # which Agent Client is active (default: "defau
 - **An Agent Client id is durable state.** cola records the active id beside
   each Session, so renaming an id is a state migration, not a config edit.
 
+### Codex on Linux, macOS and Windows
+
+A `kind = "codex"` client attaches to Codex's app-server daemon. The daemon's
+control endpoint is an AF_UNIX socket on every platform; cola reaches it
+through `codex app-server proxy`, so nothing in cola's path needs a WebSocket
+or TCP listener, and `ws://` is not a user-facing endpoint for the daemon. What
+differs is the evidence `cola doctor` can demand before it calls your own
+client's attachment proven.
+
+| Platform | cola attaches | `cola doctor` proves *your* client attached | Live verification |
+| --- | --- | --- | --- |
+| Linux | ✅ verified | `/proc/<pid>/fd` plus `ss -x -e` peer pairing | tier-2 managed-daemon suite |
+| macOS | ✅ verified in CI | `lsof` peer-address pairing | tier-1 and tier-2 suites |
+| Windows | ✅ verified in CI for the transport | process identity and `--remote` argv only, so **not hard-proven** | tier-1 suite |
+
+The Windows row's "not hard-proven" is about **proof**, not about the
+transport. On `windows-latest`, tier-1 starts a real pinned Codex binary with
+`app-server --listen unix://<short path>`, attaches cola through the proxy, and
+completes a turn, an approval round-trip and an interrupt. What cola cannot
+observe there is a socket descriptor or peer address for *your own* TUI, so
+`cola doctor` reports that client as unverified with the reason instead of
+promoting its `--remote` argv to attached. The managed daemon itself cannot
+start on hosted Windows CI — the runner's token is elevated — so that half is
+verified on Linux and macOS only.
+
+On Windows the daemon has four preconditions, and a violation is silent at the
+TUI level (it falls back to an embedded server):
+
+- **A non-elevated shell.** An administrator token would hand every shared
+  client administrator privileges; start cola from a normal terminal.
+- **A breakaway-capable launcher.** Codex starts the daemon with
+  `CREATE_BREAKAWAY_FROM_JOB`; `cargo run` or an outer job object refuses that
+  child, so run `codex.exe` directly.
+- **A short `CODEX_HOME`.** Windows binds the AF_UNIX socket at the published
+  path, which must fit 108 bytes including the terminating NUL; shorten
+  `CODEX_HOME` when it does not.
+- **No WSL DrvFS home.** A `CODEX_HOME` on a WSL DrvFS mount
+  (`\\wsl.localhost\…`) is refused by Codex itself.
+
+`cola doctor` names the first three as rows with one actionable instruction
+each; the fourth is Codex's own refusal, so keeping `CODEX_HOME` off a DrvFS
+mount is the only fix.
+
 ### `[bridge]` — all optional
 
 ```toml
@@ -592,13 +635,15 @@ missing daemon is a failure too — `start_server = "never"`
 only stops cola from starting one; run `codex app-server daemon start` yourself
 and point your client at it. With no local client at all (a Feishu-only
 deployment) the check passes, because there is nothing to attach. On Windows,
-doctor first names the daemon's three preconditions: the process must not hold
-an elevated administrator token, the launcher must permit a breakaway child
-(`cargo run` and outer job objects do not), and the control-socket path must fit
-the AF_UNIX limit of 108 bytes including the terminator. Each failing row
-carries its instruction — start cola from a non-elevated terminal, run
+doctor first names the daemon's three machine preconditions: the process must
+not hold an elevated administrator token, the launcher must permit a breakaway
+child (`cargo run` and outer job objects do not), and the control-socket path
+must fit the AF_UNIX limit of 108 bytes including the terminator. Each failing
+row carries its instruction — start cola from a non-elevated terminal, run
 `codex.exe` directly, or shorten `CODEX_HOME` — and a blocked token or path
-skips the runtime diagnosis instead of reporting a bare attach failure. If the
+skips the runtime diagnosis instead of reporting a bare attach failure. The
+fourth Windows precondition, a `CODEX_HOME` outside WSL DrvFS mounts, is
+Codex's own refusal rather than a doctor row. If the
 token's elevation cannot be read at all, doctor warns rather than passing, runs
 only the read-only diagnosis, and skips the real-turn probe so no provider spend
 can occur.
