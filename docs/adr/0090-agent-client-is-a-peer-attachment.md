@@ -332,7 +332,8 @@ Regenerating the schema from both binaries and diffing (ticket #876):
   `PluginReadResponse` fields); no required field was removed and no method the
   adapter uses changed shape.
 
-The adapter's declared contract stays the `0.163.0` surface. Construction reads
+The adapter's declared contract stays the `0.163.0` surface at this point
+(ticket #953 later re-pins it to `0.166.0`). Construction reads
 `initialize`'s `userAgent` (`codex-tui/0.164.0 …`), and a version other than the
 pin is checked against a schema regenerated from the binary the server is
 *actually running*; a binary whose `--version` does not match the server's
@@ -378,3 +379,41 @@ accepted as a hidden no-op alias for scripts written before the default flipped;
 the single safety setting set for both the report and the probe lives in one
 helper (`attach_for_diagnostics`), so a future change cannot make the diagnostic
 start a daemon.
+
+## Amendment (ticket #953): the contract pin is `0.166.0`
+
+The adapter's declared contract moves from `0.163.0` to `codex-cli 0.166.0`.
+The checked-in lists are `docs/reference/codex-app-server-0.166.0.md`,
+regenerated from the pinned binary with `codex app-server generate-json-schema
+--out <dir>`; the `0.163.0` reference is deleted. `0.163.0` is therefore
+**older than the pin** and is refused through the existing rule (the named
+`OlderServer { pinned: "0.166.0", found: … }` error), never guessed at.
+
+Diff against the `0.163.0` reference (measured on the 0.166.0 binary):
+
+- client→server methods: **106**, one added — `feedback/save`;
+- notifications: **85**, unchanged;
+- server→client requests: **10**, unchanged;
+- every `REQUIRED_CLIENT_METHODS`, `REQUIRED_NOTIFICATIONS` and
+  `REQUIRED_SERVER_REQUESTS` entry is still served, and no required payload
+  shape was removed;
+- the four approval response schemas still advertise their session decision
+  (`acceptForSession` / `approved_for_session`).
+
+The pin's evidence is the two live tiers, both `#[ignore]`-gated and advisory
+while they stabilise. **tier-1** runs on Ubuntu, macOS and Windows: the real
+pinned binary starts `app-server --listen unix://<short path>` in an isolated
+`CODEX_HOME` whose control path fits the Windows 108-byte limit, a scripted
+Responses provider answers the model protocol, and cola attaches through
+`codex app-server proxy`. The suite asserts a `thread/start`, a completed turn
+carrying the scripted text, an approval request answered by a second cola
+client subscribed with `thread/resume`, and a `turn/interrupt` that ends the
+turn as `interrupted`. **tier-2** runs on Ubuntu and macOS against the real
+managed daemon: `daemon start`, discovery through the control socket's
+symlink, the `daemon version` report (`cliVersion` and `appServerVersion`
+both 0.166.0), `start_server = "never"` refusing a start, `auto` starting one,
+and `restart_server` answering `RestartOutcome::NotOwned`.
+
+Both jobs mirror Live V1/V2: only the steps are gated by `classify` (and the
+`release/*` skip), so the job name always reports, and neither may exceed the
+Live V1/V2 20-minute bound.

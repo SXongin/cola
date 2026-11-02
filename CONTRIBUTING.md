@@ -200,6 +200,24 @@ Set `COLA_LIVE_CAPTURE_DIR=<dir>` on either run to re-record the raw transcript
 responses into the fixture format; sanitize them by hand before committing under
 `src/opencode/wire/fixtures/`.
 
+The Codex live contract has the same shape (ticket #953). Both tiers are
+`#[ignore]`-gated and read `COLA_LIVE_CODEX_BIN` (falling back to `codex` on
+`PATH`); each starts in a fresh temp `CODEX_HOME` whose control path fits the
+platform's `sun_path` limit, never the user's store:
+
+```bash
+# tier-1 (all platforms): real listener, scripted Responses provider, proxy dial
+COLA_LIVE_CODEX_BIN=/path/to/codex cargo test --locked -- --ignored live_codex_tier1
+
+# tier-2 (Ubuntu, macOS): the real managed daemon and its start policy
+COLA_LIVE_CODEX_BIN=/path/to/codex cargo test --locked -- --ignored live_codex_tier2
+```
+
+`Live Codex tier-1` and `Live Codex tier-2` run them in CI, installed by
+`.github/actions/install-codex` at the same 0.166.0 pin; both are advisory until
+they stabilise. Each test asserts its daemon, listener, proxy children and temp
+home are gone before it returns.
+
 ## Pull request rules
 
 1. **Title** is a Conventional Commits subject (kept verbatim by the rebase

@@ -52,7 +52,7 @@
 //! **response schemas** of the attached server: [`super::schema::Surface`]
 //! records the approval methods whose generated response advertises
 //! `acceptForSession` (or the legacy `approved_for_session`), and this module
-//! consults that set ([`advertises_session_decision`]). The pinned `0.163.0`
+//! consults that set ([`advertises_session_decision`]). The pinned `0.166.0`
 //! surface contributes the four it advertises; a probed newer daemon
 //! contributes only what its own generated files declare, so a server that
 //! kept the method but dropped the variant gets no "always" control.
@@ -2655,7 +2655,7 @@ mod tests {
 
         let directory = crate::codex::test_server::socket_tempdir();
         let path = directory.path().join("app-server.sock");
-        let server = FakeServer::unix(&path, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&path, "codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&format!("unix://{}", path.display())).expect("endpoint");
         let client = CodexClient::connect(
             &CodexOptions::new(endpoint).with_proxy_binary(crate::codex::test_server::proxy_helper()),

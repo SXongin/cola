@@ -1755,7 +1755,7 @@ mod tests {
     #[tokio::test]
     async fn the_lifecycle_forwards_the_codex_provider_capabilities() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle_with(crate::config::CodexConfig {
             start_server: crate::config::ServerStartPolicy::Auto,
             ..crate::config::CodexConfig::default()
@@ -1790,7 +1790,7 @@ mod tests {
     #[tokio::test]
     async fn reattaching_forgets_the_cached_configured_provider() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle_with(crate::config::CodexConfig {
             start_server: crate::config::ServerStartPolicy::Auto,
             ..crate::config::CodexConfig::default()
@@ -1906,7 +1906,7 @@ mod tests {
             .expect_err("an unattached lifecycle cannot record a pending effort");
         assert!(error.to_string().contains("not attached"), "{error}");
 
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let attached = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
         let never_busy = || false;
         assert_eq!(
@@ -1933,7 +1933,7 @@ mod tests {
     #[tokio::test]
     async fn auto_starts_one_daemon_then_attaches_and_never_owns_it() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
         let never_busy = || false;
 
@@ -2024,7 +2024,7 @@ mod tests {
     #[tokio::test]
     async fn a_dead_daemon_with_a_stale_socket_reads_unattached() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
         let never_busy = || false;
         assert_eq!(
@@ -2080,7 +2080,7 @@ mod tests {
     #[tokio::test]
     async fn auto_starts_over_a_stale_socket_without_a_cached_attachment() {
         let fixture = Fixture::new();
-        let stale = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let stale = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         stale.die().await;
 
         // A fresh lifecycle has never attached; the corpse is all it can see.
@@ -2090,7 +2090,7 @@ mod tests {
             .expect("symlink the corpse");
         let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
-        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.166.0 (test)").await;
         fixture.cli.point_at(&replacement_path);
 
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
@@ -2112,7 +2112,7 @@ mod tests {
     #[tokio::test]
     async fn auto_revives_a_stale_socket_through_the_launcher() {
         let fixture = Fixture::new();
-        let first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
         let never_busy = || false;
         assert_eq!(
@@ -2131,7 +2131,7 @@ mod tests {
         first.die().await;
         let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
-        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.166.0 (test)").await;
         fixture.cli.point_at(&replacement_path);
 
         assert_eq!(
@@ -2158,10 +2158,10 @@ mod tests {
         let fixture = Fixture::new();
         let first_path = fixture.root.path().join("daemon-0").join("app-server-control");
         std::fs::create_dir_all(first_path.parent().expect("dir")).expect("dir");
-        let first = FakeServer::unix(&first_path, "codex-tui/0.163.0 (test)").await;
+        let first = FakeServer::unix(&first_path, "codex-tui/0.166.0 (test)").await;
         let second_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(second_path.parent().expect("dir")).expect("dir");
-        let second = FakeServer::unix(&second_path, "codex-tui/0.163.0 (test)").await;
+        let second = FakeServer::unix(&second_path, "codex-tui/0.166.0 (test)").await;
         let control = fixture.environment.socket();
         std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
         std::os::unix::fs::symlink(&first_path, &control).expect("symlink");
@@ -2217,13 +2217,13 @@ mod tests {
         let fixture = Fixture::new();
         let first_path = fixture.root.path().join("daemon-0").join("app-server-control");
         std::fs::create_dir_all(first_path.parent().expect("dir")).expect("dir");
-        let first = FakeServer::unix(&first_path, "codex-tui/0.163.0 (test)").await;
+        let first = FakeServer::unix(&first_path, "codex-tui/0.166.0 (test)").await;
         let second_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(second_path.parent().expect("dir")).expect("dir");
-        let second = FakeServer::unix(&second_path, "codex-tui/0.163.0 (test)").await;
+        let second = FakeServer::unix(&second_path, "codex-tui/0.166.0 (test)").await;
         let third_path = fixture.root.path().join("daemon-2").join("app-server-control");
         std::fs::create_dir_all(third_path.parent().expect("dir")).expect("dir");
-        let third = FakeServer::unix(&third_path, "codex-tui/0.163.0 (test)").await;
+        let third = FakeServer::unix(&third_path, "codex-tui/0.166.0 (test)").await;
 
         let control = fixture.environment.socket();
         std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
@@ -2275,7 +2275,7 @@ mod tests {
         let fixture = Fixture::new();
         // A's listener is gone but its socket path stays, so the dial fails
         // fast (`ECONNREFUSED`) at a path that still looks like a daemon.
-        let stale = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let stale = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         stale.die().await;
         let control = fixture.environment.socket();
         std::fs::create_dir_all(control.parent().expect("control dir")).expect("control dir");
@@ -2284,7 +2284,7 @@ mod tests {
         // The healthy daemon the path moves to while that dial fails.
         let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
-        let replacement = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        let replacement = FakeServer::unix(&replacement_path, "codex-tui/0.166.0 (test)").await;
         fixture.cli.point_at(&replacement_path);
 
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
@@ -2323,7 +2323,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrunnable_proxy_binary_is_not_a_dead_daemon() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         // The reported managed binary passes the executable predicate but has
         // no runnable format, so the spawn itself is what fails.
@@ -2360,7 +2360,7 @@ mod tests {
     #[tokio::test]
     async fn a_daemon_that_disappears_is_unattached_without_reaping() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
         let never_busy = || false;
         assert_eq!(
@@ -2411,7 +2411,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_survives_attachment_replacement() {
         let fixture = Fixture::new();
-        let _first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
         let never_busy = || false;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
@@ -2435,7 +2435,7 @@ mod tests {
 
         let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
-        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -2476,7 +2476,7 @@ mod tests {
     #[tokio::test]
     async fn a_pending_is_dropped_by_a_process_restart() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
             .expect("control dir");
         std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
@@ -2516,7 +2516,7 @@ mod tests {
     #[tokio::test]
     async fn pending_reads_work_with_no_attached_client() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
             .expect("control dir");
         std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
@@ -2573,7 +2573,7 @@ mod tests {
     #[tokio::test]
     async fn applied_effort_survives_an_unattached_interval() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
             .expect("control dir");
         std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
@@ -2603,7 +2603,7 @@ mod tests {
     #[tokio::test]
     async fn a_replaced_daemon_is_reattached() {
         let fixture = Fixture::new();
-        let first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let first = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Never);
         let never_busy = || false;
         // A daemon is already there: link the socket as the launcher would.
@@ -2621,7 +2621,7 @@ mod tests {
 
         let replacement_path = fixture.root.path().join("daemon-1").join("app-server-control");
         std::fs::create_dir_all(replacement_path.parent().expect("dir")).expect("dir");
-        let second = FakeServer::unix(&replacement_path, "codex-tui/0.163.0 (test)").await;
+        let second = FakeServer::unix(&replacement_path, "codex-tui/0.166.0 (test)").await;
         std::fs::remove_file(fixture.environment.socket()).expect("remove link");
         std::os::unix::fs::symlink(&replacement_path, fixture.environment.socket())
             .expect("re-point the link");
@@ -2646,7 +2646,7 @@ mod tests {
     #[tokio::test]
     async fn the_busy_probe_is_read_under_the_lock_and_gates_the_heal() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         let lifecycle = fixture.lifecycle(crate::config::ServerStartPolicy::Auto);
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = Arc::clone(&called);
@@ -2713,7 +2713,7 @@ mod tests {
         );
         assert!(fixture.cli.invocations().is_empty());
 
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("dir")).expect("dir");
         std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
         assert_eq!(
@@ -2770,7 +2770,7 @@ mod tests {
     #[tokio::test]
     async fn a_daemon_present_tui_is_unverified_not_assumed_sharing() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         std::fs::create_dir_all(fixture.environment.socket().parent().expect("control dir"))
             .expect("control dir");
         std::os::unix::fs::symlink(&fixture.daemon_socket, fixture.environment.socket()).expect("symlink");
@@ -2838,7 +2838,7 @@ mod tests {
             return;
         }
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         server.set_experimental_features(vec![json!({
             "name": crate::codex::client::AGENT_QUESTIONS_FEATURE,
             "enabled": false,
@@ -2879,7 +2879,7 @@ mod tests {
             format!("unix://{}", fixture.environment.socket().display())
         );
         assert_eq!(report.state, ClientState::Attached);
-        assert_eq!(report.version.as_deref(), Some("0.163.0"));
+        assert_eq!(report.version.as_deref(), Some("0.166.0"));
         assert_eq!(report.platform.as_deref(), Some("unix/linux"));
         assert!(
             report
@@ -2978,7 +2978,7 @@ mod tests {
     #[tokio::test]
     async fn the_turn_probe_passes_and_deletes_its_scratch_thread() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         server.script_turn(
             "*",
@@ -3018,7 +3018,7 @@ mod tests {
     #[tokio::test]
     async fn a_retryable_provider_error_fails_the_turn_probe() {
         let fixture = Fixture::new();
-        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let _server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         _server.script_turn(
             "*",
@@ -3058,7 +3058,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_turn_probe_still_cleans_up() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         let lifecycle = Arc::new(fixture.lifecycle(crate::config::ServerStartPolicy::Never));
         let task = tokio::spawn({
@@ -3083,7 +3083,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancelled_probe_interrupts_a_turn_it_never_cached() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         // Accept and persist the turn but never answer `turn/start`: the
         // probe is still awaiting the id when it is cancelled.
@@ -3127,7 +3127,7 @@ mod tests {
     #[tokio::test]
     async fn an_ambiguous_create_is_cleaned_up_by_its_probe_directory() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         let directory = fixture.root.path().join("ambiguous-probe");
         std::fs::create_dir_all(&directory).expect("probe dir");
@@ -3165,7 +3165,7 @@ mod tests {
     #[tokio::test]
     async fn the_configured_thread_overrides_reach_thread_start() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         let lifecycle = fixture.lifecycle_with(CodexConfig {
             start_server: crate::config::ServerStartPolicy::Never,
@@ -3238,7 +3238,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_cleanup_is_surfaced_in_a_passing_probe() {
         let fixture = Fixture::new();
-        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&fixture.daemon_socket, "codex-tui/0.166.0 (test)").await;
         fixture.link_daemon();
         server.script_turn(
             "*",
@@ -3326,7 +3326,7 @@ mod tests {
     /// set. Read-only by construction — `start_server = "never"` — so it never
     /// starts or stops the user's daemon. The hermetic tests above are the
     /// proof of the policy; this one validates the real socket, the symlink and
-    /// the managed 0.164.0 binary the daemon runs.
+    /// the managed 0.166.0 binary the daemon runs.
     #[tokio::test]
     #[ignore = "live codex app-server daemon: set COLA_LIVE_CODEX_HOME or CODEX_HOME"]
     async fn live_attach_to_the_running_daemon() {

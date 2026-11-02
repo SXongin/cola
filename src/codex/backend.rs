@@ -1489,7 +1489,7 @@ impl CodexClient {
     /// another project can never be substituted for it.
     fn input_items(&self, session_id: &str, text: &str, skills: &[PromptSkill]) -> Result<Value> {
         // `text_elements` is the protocol's spelling (`UserInput::Text` keeps
-        // it snake_case on 0.163.0, unlike the surrounding camelCase fields).
+        // it snake_case, unlike the surrounding camelCase fields).
         let mut input = vec![json!({ "type": "text", "text": text, "text_elements": [] })];
         let directory = self.projections.cwd(session_id);
         for skill in skills {
@@ -3715,7 +3715,7 @@ mod tests {
     /// items.
     #[tokio::test]
     async fn a_recorded_fixture_replays_over_the_subscription_without_duplicates() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -3845,7 +3845,7 @@ mod tests {
     /// never present an unseeded cache as `Idle`.
     #[tokio::test]
     async fn a_status_first_read_on_a_busy_thread_is_busy() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a real thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -3875,7 +3875,7 @@ mod tests {
     /// reports Busy/Idle. No `thread/resume` may be sent.
     #[tokio::test]
     async fn session_status_is_fed_by_the_status_broadcast_without_subscribing() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -3930,7 +3930,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_closed_connection_clears_its_cached_status() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -3986,7 +3986,7 @@ mod tests {
     /// picked a model for still names the model it is actually running.
     #[tokio::test]
     async fn the_threads_model_reaches_the_transcript_and_the_session_info() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -4026,7 +4026,7 @@ mod tests {
     /// a thread the server reports no model for stays modelless.
     #[tokio::test]
     async fn a_thread_without_a_reported_provider_or_model_shows_no_invented_one() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -4050,7 +4050,7 @@ mod tests {
             "an absent provider falls back to the neutral bucket"
         );
 
-        let (bare_server, bare_url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (bare_server, bare_url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut bare = ScriptedThread::adopted("thread-2", "session-two", "/work/cola", "bare");
         bare.turns = vec![scripted_turn(
             "turn-1",
@@ -4079,7 +4079,7 @@ mod tests {
     /// stale one. A stale name would claim the wrong model answered.
     #[tokio::test]
     async fn a_read_that_names_no_model_clears_the_footers_model() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-6-luna".into());
         thread.model_provider = Some("opencode-go".into());
@@ -4113,7 +4113,7 @@ mod tests {
     /// projection the footer reads — not just answer the picker.
     #[tokio::test]
     async fn a_peer_model_switch_reaches_the_footer_through_the_session_read() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-6-luna".into());
         thread.model_provider = Some("opencode-go".into());
@@ -4153,7 +4153,7 @@ mod tests {
     /// move the recorded model: only the accepted response is evidence.
     #[tokio::test]
     async fn a_refused_pick_does_not_move_the_footers_model() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-6-luna".into());
         thread.model_provider = Some("opencode-go".into());
@@ -4196,7 +4196,7 @@ mod tests {
     /// silence (the test above). Same rule, seen from the two sources.
     #[tokio::test]
     async fn a_silent_read_keeps_the_models_cola_picked() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-6-luna".into());
         thread.model_provider = Some("opencode-go".into());
@@ -4251,7 +4251,7 @@ mod tests {
     /// the thread reported, not claim `codex/<model>` for a custom one.
     #[tokio::test]
     async fn a_neutral_picker_value_keeps_the_threads_real_provider() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-6-luna".into());
         thread.model_provider = Some("opencode-go".into());
@@ -4307,7 +4307,7 @@ mod tests {
     /// the read's id keys both the metadata update and the model lookup.
     #[tokio::test]
     async fn a_response_naming_another_thread_is_not_answered_with_this_ones_model() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut asked = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "asked");
         asked.model = Some("gpt-6-luna".into());
         asked.model_provider = Some("opencode-go".into());
@@ -4346,7 +4346,7 @@ mod tests {
     /// adoption pages `thread/turns/list` before the first transcript read.
     #[tokio::test]
     async fn adoption_pages_the_whole_history_without_a_lag() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
         thread.turns = vec![
             scripted_turn("turn-1", "completed", 1_700_000_000, "item-1", "one"),
@@ -4386,7 +4386,7 @@ mod tests {
     /// again, rather than resyncing from the bounded `thread/read` page.
     #[tokio::test]
     async fn a_lagged_subscription_resyncs_every_paged_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
         thread.turns = vec![
             scripted_turn("turn-1", "completed", 1_700_000_000, "item-1", "one"),
@@ -4433,7 +4433,7 @@ mod tests {
     /// stays explicitly truncated.
     #[tokio::test]
     async fn a_malformed_turns_page_leaves_the_first_read_truncated() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -4460,7 +4460,7 @@ mod tests {
     /// projection stays explicitly incomplete.
     #[tokio::test]
     async fn a_repeated_turns_cursor_leaves_the_first_read_truncated() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
         thread.turns = vec![
             scripted_turn("turn-1", "completed", 1_700_000_000, "item-1", "one"),
@@ -4490,7 +4490,7 @@ mod tests {
     /// in flight, so the final text must be "Hello world", not doubled.
     #[tokio::test]
     async fn an_event_already_in_the_page_is_applied_once() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a live thread");
         thread.turns = vec![json!({
             "id": "turn-live",
@@ -4602,7 +4602,7 @@ mod tests {
     /// page was in flight: paging and application share one serialisation.
     #[tokio::test]
     async fn an_event_during_a_paging_retry_survives_the_resync() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -4669,7 +4669,7 @@ mod tests {
     /// leaving the transcript truncated forever with no lag marker.
     #[tokio::test]
     async fn a_limited_drain_recovers_on_the_next_read() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -4734,7 +4734,7 @@ mod tests {
     /// finishes the page in the background.
     #[tokio::test]
     async fn a_stalled_first_history_page_returns_promptly_then_completes() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -4771,7 +4771,7 @@ mod tests {
     /// snapshot survives, and re-adoption pages the history again.
     #[tokio::test]
     async fn released_threads_evict_transcripts_and_keep_their_diff() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         for index in 0..3 {
             let id = format!("thread-{index}");
             let mut thread = ScriptedThread::adopted(&id, "session-root", "/work/cola", &id);
@@ -4847,7 +4847,7 @@ mod tests {
     /// seeded from it must be running, and the queued completion settles it.
     #[tokio::test]
     async fn an_in_progress_history_item_seeds_as_running() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a live thread");
         thread.turns = vec![json!({
             "id": "turn-live",
@@ -4925,7 +4925,7 @@ mod tests {
     /// not left truncated forever by the live subscription state.
     #[tokio::test]
     async fn a_failed_history_page_retries_on_the_next_read() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a long thread");
         thread.turns = vec![
             scripted_turn("turn-1", "completed", 1_700_000_000, "item-1", "one"),
@@ -4976,7 +4976,7 @@ mod tests {
     /// next status read re-adopts rather than answering stale state.
     #[tokio::test]
     async fn a_dead_subscription_reopens_on_the_next_status_read() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.turns = vec![scripted_turn(
             "turn-1",
@@ -5041,7 +5041,7 @@ mod tests {
     /// read.
     #[tokio::test]
     async fn a_hung_adoption_does_not_block_an_unrelated_thread() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut other =
             ScriptedThread::adopted("thread-other", "session-other", "/work/cola", "another thread");
         other.turns = vec![scripted_turn(
@@ -5080,7 +5080,7 @@ mod tests {
     /// that a subscription-awaiting implementation would miss.
     #[tokio::test]
     async fn a_mid_turn_read_is_prompt_and_keeps_applied_deltas() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5146,7 +5146,7 @@ mod tests {
     /// first turn, and cola starts mirroring the moment the rollout exists.
     #[tokio::test]
     async fn a_never_run_thread_retries_the_subscription_after_its_first_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::never_run(
             "thread-new",
             "session-root",
@@ -5185,7 +5185,7 @@ mod tests {
     /// a file.
     #[tokio::test]
     async fn turn_diff_and_token_usage_are_served_for_a_changed_file_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5245,7 +5245,7 @@ mod tests {
     /// (ADR-0090's authorship consequence) — never an External Message.
     #[tokio::test]
     async fn a_prompt_becomes_the_threads_user_message_and_is_recorded_as_colas() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5305,7 +5305,7 @@ mod tests {
     /// directory and still answers "cola's" for the earlier turn.
     #[tokio::test]
     async fn a_turn_cola_started_survives_a_restart() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5359,7 +5359,7 @@ mod tests {
     /// message is treated as cola's and the adapter says so loudly.
     #[tokio::test]
     async fn a_corrupt_authorship_record_never_reports_a_message_as_external() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5383,7 +5383,7 @@ mod tests {
     /// recorded for the card to settle on.
     #[tokio::test]
     async fn a_prompt_that_folds_into_an_active_turn_binds_that_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5452,7 +5452,7 @@ mod tests {
     /// starting a new one, and the text appears once in the transcript.
     #[tokio::test]
     async fn a_supplement_steers_the_in_flight_turn_once() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5522,7 +5522,7 @@ mod tests {
     /// error, not a hang.
     #[tokio::test]
     async fn interrupting_sends_the_live_turn_and_settles_interrupted() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5570,7 +5570,7 @@ mod tests {
     /// request is sent.
     #[tokio::test]
     async fn interrupting_an_idle_thread_sends_nothing() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5587,7 +5587,7 @@ mod tests {
     /// Compaction the existing card path already renders — exactly once.
     #[tokio::test]
     async fn compact_runs_and_projects_the_compaction_once() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5658,7 +5658,7 @@ mod tests {
     /// catalog, paged, with each model's reasoning efforts as its variants.
     #[tokio::test]
     async fn list_models_pages_the_catalog_with_effort_variants() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(vec![
             json!({
                 "id": "gpt-5.1-codex",
@@ -5851,7 +5851,7 @@ mod tests {
     async fn the_current_line_keeps_the_resolved_think_level() {
         use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
 
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5890,7 +5890,7 @@ mod tests {
     async fn a_recorded_model_is_pending_not_current() {
         use crate::backend::types::{ModelSelection, ModelSurfaceQuery};
 
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -5943,7 +5943,7 @@ mod tests {
             200,
             r#"{"data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"}]}"#,
         );
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(vec![json!({
             "id": "gpt-5.1-codex",
             "hidden": false,
@@ -6124,7 +6124,7 @@ mod tests {
     async fn model_surface_variant_lookup_skips_config_and_probes() {
         let probed = crate::test_http::TestHttpServer::start().await;
         probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(vec![
             json!({ "id": "gpt-5.1-codex", "supportedReasoningEfforts": [] }),
         ]);
@@ -6173,7 +6173,7 @@ mod tests {
     async fn a_pending_sessions_cold_card_read_names_the_config_provider() {
         let probed = crate::test_http::TestHttpServer::start().await;
         probed.route("GET", "/v1/models", 200, r#"{"data":[{"id":"one"}]}"#);
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(vec![
             json!({ "id": "gpt-5.1-codex", "supportedReasoningEfforts": [] }),
         ]);
@@ -6266,7 +6266,7 @@ mod tests {
     /// then says config was unreadable instead of hanging the ack.
     #[tokio::test]
     async fn a_callback_config_read_is_bounded_by_the_ack_budget() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_config_read_delay(Duration::from_secs(5));
         let client = connect(&url).await;
 
@@ -6303,7 +6303,7 @@ mod tests {
     /// hand-write hint, never an empty card or a call past the ack budget.
     #[tokio::test]
     async fn a_stalled_model_list_is_bounded_by_the_callback_budget() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.silence_next_model_list();
         server.set_config_read(json!({
             "config": {},
@@ -6369,7 +6369,7 @@ mod tests {
     /// page loop keeps what it read and does not spend 64 pages of the budget.
     #[tokio::test]
     async fn a_slow_paginated_catalog_is_capped_by_the_callback_budget() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.set_models(
             (0..100)
                 .map(|index| json!({ "id": format!("model-{index}"), "supportedReasoningEfforts": [] }))
@@ -6424,7 +6424,7 @@ mod tests {
     /// never truncated before the target's page.
     #[tokio::test]
     async fn a_later_catalog_page_resolves_variants_without_an_ack_budget() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let models: Vec<Value> = (0..6)
             .map(|index| {
                 let efforts = if index == 4 {
@@ -6465,7 +6465,7 @@ mod tests {
     /// (empty plus the normal note), not a hung pick.
     #[tokio::test]
     async fn a_silent_catalog_validation_read_is_bounded() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.silence_next_model_list();
         let client = connect(&url).await;
 
@@ -6500,7 +6500,7 @@ mod tests {
     /// sends a callback budget, so a stalled catalog cannot hold the pick.
     #[tokio::test]
     async fn a_stalled_catalog_only_variant_lookup_is_bounded() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.silence_next_model_list();
         let client = connect(&url).await;
 
@@ -6537,7 +6537,7 @@ mod tests {
     /// creation fact, not a per-turn protocol field.
     #[tokio::test]
     async fn a_neutral_model_pick_rides_the_next_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6570,7 +6570,7 @@ mod tests {
     /// input (which needs the path the neutral DTO does not carry).
     #[tokio::test]
     async fn a_skill_pick_reaches_the_next_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6626,7 +6626,7 @@ mod tests {
     /// dropped request (the model would answer without it).
     #[tokio::test]
     async fn an_unknown_skill_fails_the_prompt_by_name_and_leaves_no_marker() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6697,7 +6697,7 @@ mod tests {
     /// two directories is ambiguous until the session's own directory answers.
     #[tokio::test]
     async fn a_skill_that_disappears_between_lists_is_refused() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6782,7 +6782,7 @@ mod tests {
     /// so a same-named skill advertised for another project is never sent.
     #[tokio::test]
     async fn a_skill_resolves_in_the_sessions_own_directory() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6835,7 +6835,7 @@ mod tests {
     /// so a later foreign live turn with no client id is reported external.
     #[tokio::test]
     async fn a_never_delivered_marker_does_not_vouch_for_a_later_tui_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6889,7 +6889,7 @@ mod tests {
     /// prompt before anything is sent, and leaves the existing record trusted.
     #[tokio::test]
     async fn a_prompt_is_refused_when_its_marker_cannot_be_persisted() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6948,7 +6948,7 @@ mod tests {
     /// the prompt that would exceed the cap is refused and not sent.
     #[tokio::test]
     async fn a_full_authorship_record_refuses_the_next_prompt() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -6986,7 +6986,7 @@ mod tests {
     /// Finding 4: a stalled `thread/read` cannot hold `/stop`.
     #[tokio::test]
     async fn a_stalled_stop_read_is_bounded() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7009,7 +7009,7 @@ mod tests {
     /// supplement created: the turn and its other (id-less) items stay external.
     #[tokio::test]
     async fn a_steer_into_a_tui_turn_marks_only_its_own_item() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7077,7 +7077,7 @@ mod tests {
     /// The steer id is durable: a rebuilt client still classifies the item.
     #[tokio::test]
     async fn a_steer_id_survives_a_restart() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7143,7 +7143,7 @@ mod tests {
     /// drives the thread-wide fallback.
     #[tokio::test]
     async fn an_aged_steer_marker_vouches_for_nothing() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7211,7 +7211,7 @@ mod tests {
     /// history, so this is the first-read case the finding names.
     #[tokio::test]
     async fn an_aged_recorded_id_cannot_bind_a_foreign_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7292,7 +7292,7 @@ mod tests {
     /// name instead of hanging before submission.
     #[tokio::test]
     async fn a_stalled_cwd_read_fails_the_skill_prompt_by_name() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7331,7 +7331,7 @@ mod tests {
     /// unfamiliar id claiming cola's prefix is somebody else's turn.
     #[tokio::test]
     async fn a_foreign_client_id_claiming_colas_prefix_is_external() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7390,7 +7390,7 @@ mod tests {
     /// silently taken from that directory.
     #[tokio::test]
     async fn a_skill_only_in_another_directory_is_refused() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7439,7 +7439,7 @@ mod tests {
     /// the interrupt fires the moment the turn appears.
     #[tokio::test]
     async fn a_stop_waits_for_the_turn_the_server_persists_a_moment_later() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7473,7 +7473,7 @@ mod tests {
     /// mislabelled automatic; a definite refusal clears it.
     #[tokio::test]
     async fn an_ambiguous_compaction_failure_keeps_the_manual_marker() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7496,7 +7496,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_compaction_clears_the_manual_marker() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7518,7 +7518,7 @@ mod tests {
     /// `switch_session_model` stays the trait's no-op here.
     #[tokio::test]
     async fn a_model_and_effort_pick_ride_the_next_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7559,7 +7559,7 @@ mod tests {
     /// the pending is never resurrected and later turns send no pick.
     #[tokio::test]
     async fn a_pending_model_rides_the_next_new_turn_then_is_consumed() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -7622,7 +7622,7 @@ mod tests {
     /// not consume the pending. Only a genuinely new turn does.
     #[tokio::test]
     async fn a_steer_a_fold_and_a_command_do_not_consume_the_pending() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -7686,7 +7686,7 @@ mod tests {
     /// a peer.
     #[tokio::test]
     async fn a_definite_refusal_keeps_the_pending_and_an_ambiguous_failure_drops_it() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7729,7 +7729,7 @@ mod tests {
     /// new accepted turn consumes it.
     #[tokio::test]
     async fn a_reset_only_pending_survives_fold_and_refusal_until_acceptance() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -7816,7 +7816,7 @@ mod tests {
     /// the effort with no model field.
     #[tokio::test]
     async fn a_pending_effort_alone_rides_the_next_new_turn() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -7848,7 +7848,7 @@ mod tests {
     /// survives and is what the following new turn carries.
     #[tokio::test]
     async fn a_pending_recorded_while_a_turn_is_in_flight_survives_its_acceptance() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -7943,7 +7943,7 @@ mod tests {
     /// what the next new turn sends.
     #[tokio::test]
     async fn an_identical_pending_recorded_in_flight_survives_by_generation() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -8037,7 +8037,7 @@ mod tests {
     /// stays — even though the returned id differs from the empty snapshot.
     #[tokio::test]
     async fn an_unobserved_live_turn_with_an_older_started_at_does_not_consume_the_pending() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -8071,7 +8071,7 @@ mod tests {
     /// new, so it must not consume the pending either.
     #[tokio::test]
     async fn an_unobserved_fold_without_started_at_does_not_consume_the_pending() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -8104,7 +8104,7 @@ mod tests {
     /// dropped by the cancellation guard and never re-sent.
     #[tokio::test]
     async fn a_cancelled_pending_prompt_drops_the_sent_selection() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-5.1-codex".into());
         thread.model_provider = Some("openai".into());
@@ -8147,7 +8147,7 @@ mod tests {
     /// prompt, not the one the thread was adopted with (issue #904).
     #[tokio::test]
     async fn a_pick_moves_the_transcript_model_with_it() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "a thread");
         thread.model = Some("gpt-6-luna".into());
         thread.model_provider = Some("opencode-go".into());
@@ -8200,7 +8200,7 @@ mod tests {
     /// completed turn of the same thread is not.
     #[tokio::test]
     async fn an_item_without_a_client_id_in_the_live_turn_is_colas_while_a_prompt_is_pending() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8291,7 +8291,7 @@ mod tests {
     /// recovered (ADR-0092 decision 2).
     #[tokio::test]
     async fn an_item_carrying_the_pending_submission_binds_its_turn_on_the_read() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8349,7 +8349,7 @@ mod tests {
     /// request, and the restarted process reconciles it from persisted history.
     #[tokio::test]
     async fn an_accepted_prompt_with_a_lost_response_is_colas_after_a_restart() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8428,7 +8428,7 @@ mod tests {
     /// a later external turn on the thread is not suppressed.
     #[tokio::test]
     async fn a_definitely_refused_prompt_clears_its_pending_marker() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8496,7 +8496,7 @@ mod tests {
     /// holds).
     #[tokio::test]
     async fn releasing_a_thread_unsubscribes_this_connection_only() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8535,7 +8535,7 @@ mod tests {
     /// `thread/unsubscribe` for a subscription this connection never made.
     #[tokio::test]
     async fn releasing_a_session_that_was_never_adopted_is_a_no_op() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8556,7 +8556,7 @@ mod tests {
     /// `thread/resume` and its item stream works.
     #[tokio::test]
     async fn re_adopting_a_released_thread_resumes_again() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8582,7 +8582,7 @@ mod tests {
     /// again rather than sitting on a phantom subscription.
     #[tokio::test]
     async fn a_refused_unsubscribe_is_reported_and_the_thread_re_adopts() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8610,7 +8610,7 @@ mod tests {
     /// `config/read` pre-flight — there is no provider choice to validate.
     #[tokio::test]
     async fn create_session_sends_the_chosen_model_without_a_provider() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let client = connect(&url).await;
 
         let input = crate::backend::types::CreateSessionInput {
@@ -8676,7 +8676,7 @@ mod tests {
     /// inherit them.
     #[tokio::test]
     async fn deleting_a_thread_forgets_its_pending_and_applied_effort() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8720,7 +8720,7 @@ mod tests {
     /// real provider (issue #910).
     #[tokio::test]
     async fn an_ordinary_subscription_loss_forgets_the_provider_fact() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8761,7 +8761,7 @@ mod tests {
     /// followed.
     #[tokio::test]
     async fn a_thread_settings_broadcast_updates_the_model_fact() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8802,7 +8802,7 @@ mod tests {
     /// pair). Asserted over the adoption and the prompt that follows it.
     #[tokio::test]
     async fn thread_resume_never_carries_a_provider() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -8841,7 +8841,7 @@ mod tests {
     /// a thread fact. Asserted over every recorded turn request.
     #[tokio::test]
     async fn turn_start_never_carries_a_provider() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",

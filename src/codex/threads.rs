@@ -295,7 +295,7 @@ struct UnsubscribeResponse {
 /// started by the user's own client, and carries their provider tokens.
 ///
 /// Every field is in the **pinned** 0.163 `ThreadStartParams` and
-/// `ThreadResumeParams` (checked with `codex-cli 0.163.0 app-server
+/// `ThreadResumeParams` (checked with `codex-cli 0.166.0 app-server
 /// generate-json-schema`), with the same value sets, so no version gate guards
 /// them. The summary is a config override rather than `TurnStartParams.summary`:
 /// the live 0.163 daemon ignores the turn-level field (a turn asked for
@@ -899,7 +899,7 @@ mod tests {
     /// `thread/start` — exactly the values the file spelled, not a default.
     #[tokio::test]
     async fn thread_start_carries_the_configured_sandbox_and_approval_policy() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let client = connect_with(
             &url,
             ThreadSettings {
@@ -931,7 +931,7 @@ mod tests {
     /// config always names it, and `thread/resume` stays opt-in like the rest.
     #[tokio::test]
     async fn thread_start_carries_the_reasoning_summary_and_resume_only_when_opted_in() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -990,7 +990,7 @@ mod tests {
     /// a client that did not opt in behaves exactly as before #898.
     #[tokio::test]
     async fn thread_start_sends_no_overrides_when_they_are_unset() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let client = connect(&url).await;
 
         client
@@ -1009,7 +1009,7 @@ mod tests {
     /// request carries only the thread id.
     #[tokio::test]
     async fn thread_resume_carries_the_overrides_only_when_opted_in() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1053,7 +1053,7 @@ mod tests {
     /// provider — the daemon's config owns that fact.
     #[tokio::test]
     async fn thread_start_carries_the_chosen_model_without_a_provider() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let client = connect(&url).await;
 
         let thread = client
@@ -1086,7 +1086,7 @@ mod tests {
     /// the end (the scripted page size is 2, so five threads are three calls).
     #[tokio::test]
     async fn the_list_pages_to_the_end_for_the_directory() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         for index in 0..5 {
             server.seed_thread(ScriptedThread::adopted(
                 &format!("thread-{index}"),
@@ -1158,7 +1158,7 @@ mod tests {
     /// falls back to the preview when the thread was never named.
     #[tokio::test]
     async fn read_returns_one_thread_and_title_falls_back_to_the_preview() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::never_run(
             "thread-new",
             "session-root",
@@ -1177,7 +1177,7 @@ mod tests {
     /// and an item event for it arrives on this connection.
     #[tokio::test]
     async fn adopting_a_thread_with_history_streams_its_items() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1213,7 +1213,7 @@ mod tests {
     /// state, not a transport error, and leaves no local subscription behind.
     #[tokio::test]
     async fn adopting_a_never_run_thread_reports_no_history_yet() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::never_run(
             "thread-new",
             "session-root",
@@ -1240,7 +1240,7 @@ mod tests {
     /// read shows it.
     #[tokio::test]
     async fn a_rename_round_trips_through_the_next_list() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let mut thread = ScriptedThread::adopted("thread-1", "session-root", "/work/cola", "first message");
         thread.name = None;
         server.seed_thread(thread);
@@ -1269,7 +1269,7 @@ mod tests {
     /// holds).
     #[tokio::test]
     async fn releasing_one_subscription_leaves_another_connection_streaming() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1338,7 +1338,7 @@ mod tests {
     /// `thread/unsubscribe` while the other still reads.
     #[tokio::test]
     async fn a_second_local_handle_keeps_the_server_subscription() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1383,7 +1383,7 @@ mod tests {
     /// because the dispatcher lives with the registry, not with that surface.
     #[tokio::test]
     async fn a_subscription_outlives_the_surface_that_created_it() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1417,7 +1417,7 @@ mod tests {
     async fn a_lost_connection_ends_the_subscription() {
         let directory = crate::codex::test_server::socket_tempdir();
         let socket = directory.path().join("app-server.sock");
-        let server = FakeServer::unix(&socket, "codex-tui/0.163.0 (test)").await;
+        let server = FakeServer::unix(&socket, "codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1488,7 +1488,7 @@ mod tests {
     /// pins the decision the list API cannot express.
     #[tokio::test]
     async fn the_session_root_comes_from_read_not_the_list_row() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",
@@ -1517,7 +1517,7 @@ mod tests {
     /// `thread/unsubscribe` (this test then fails on the call count).
     #[tokio::test]
     async fn cancelling_an_adopt_releases_the_local_holder() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         server.seed_thread(ScriptedThread::adopted(
             "thread-1",
             "session-root",

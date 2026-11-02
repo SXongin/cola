@@ -1,0 +1,149 @@
+# The pinned Codex CLI install, shared by the two live Codex jobs. `codex
+# app-server` is the surface the adapter speaks, so both tiers must run the
+# exact version the contract pin names (`PINNED_VERSION` in
+# `src/codex/schema.rs`) — a newer binary would exercise a different surface.
+#
+# The archives come from the `openai/codex` release `rust-v0.166.0`. The release
+# does not publish a checksum file for the standalone CLI archives, so the
+# SHA256 values below are computed from the downloaded release assets and act
+# as the integrity pin: version, URL and digest move together as an ordinary
+# bump, and every run re-verifies the binary (cache hit or miss) so a poisoned
+# cache fails loudly instead of installing.
+#
+# The asset per runner:
+#   Linux  x86_64  -> codex-x86_64-unknown-linux-musl.tar.gz
+#   macOS  arm64   -> codex-aarch64-apple-darwin.tar.gz
+#   macOS  x86_64  -> codex-x86_64-apple-darwin.tar.gz
+#   Windows x86_64 -> codex-x86_64-pc-windows-msvc.exe.zip
+#
+# `macos-latest` is arm64 today; the Intel asset is pinned too so a runner
+# re-image cannot silently install the wrong arch. A runner OS this action does
+# not know fails by name instead of guessing.
+name: Install Codex
+description: Download, verify and install the pinned Codex CLI on PATH.
+
+inputs:
+  version:
+    description: The pinned Codex CLI version. Bumps move this and the SHA256 below together.
+    required: false
+    default: 0.166.0
+
+runs:
+  using: composite
+  steps:
+    - name: Cache the pinned archive
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/codex
+        key: codex-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Download Codex ${{ inputs.version }} (Linux)
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.cache/codex"
+        curl -fsSL \
+          "https://github.com/openai/codex/releases/download/rust-v${VERSION}/codex-x86_64-unknown-linux-musl.tar.gz" \
+          -o "$HOME/.cache/codex/codex.tar.gz"
+
+    - name: Download Codex ${{ inputs.version }} (macOS)
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'macOS'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.cache/codex"
+        # `macos-latest` is arm64 today; the x64 asset is pinned too so a
+        # runner re-image cannot silently install the wrong architecture.
+        if [ "$RUNNER_ARCH" = "ARM64" ]; then
+          asset="codex-aarch64-apple-darwin.tar.gz"
+        else
+          asset="codex-x86_64-apple-darwin.tar.gz"
+        fi
+        curl -fsSL \
+          "https://github.com/openai/codex/releases/download/rust-v${VERSION}/${asset}" \
+          -o "$HOME/.cache/codex/codex.tar.gz"
+
+    - name: Download Codex ${{ inputs.version }} (Windows x86_64)
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$HOME/.cache/codex"
+        curl -fsSL \
+          "https://github.com/openai/codex/releases/download/rust-v${VERSION}/codex-x86_64-pc-windows-msvc.exe.zip" \
+          -o "$HOME/.cache/codex/codex.zip"
+
+    # The digest is per platform, so one bash step switches on `RUNNER_OS`
+    # rather than trying to compute a composite-action env value.
+    - name: Verify and expose
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        prefix="$HOME/.cache/codex"
+        # macOS ships `shasum`, not GNU `sha256sum`; both support check mode.
+        verify_sha() {
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "$1  $2" | sha256sum -c -
+          else
+            echo "$1  $2" | shasum -a 256 -c -
+          fi
+        }
+        case "$RUNNER_OS" in
+          Linux)
+            expected="a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978"
+            archive="$prefix/codex.tar.gz"
+            verify_sha "$expected" "$archive"
+            mkdir -p "$prefix/bin"
+            tar -xzf "$archive" -C "$prefix/bin"
+            mv "$prefix/bin/codex-x86_64-unknown-linux-musl" "$prefix/bin/codex"
+            ;;
+          macOS)
+            archive="$prefix/codex.tar.gz"
+            if [ "$RUNNER_ARCH" = "ARM64" ]; then
+              expected="c48824462fc57681eafb0925d97b11b589010475613904f570b42fea53e240d5"
+              binary="codex-aarch64-apple-darwin"
+            else
+              expected="db0c38713c36199b12e7c8d1629386c35a4ce8f99e1c9ce72f1725a74df67b57"
+              binary="codex-x86_64-apple-darwin"
+            fi
+            verify_sha "$expected" "$archive"
+            mkdir -p "$prefix/bin"
+            tar -xzf "$archive" -C "$prefix/bin"
+            mv "$prefix/bin/$binary" "$prefix/bin/codex"
+            ;;
+          Windows)
+            expected="bf67d9662ed539f305849b74ad6420cc7b23aa2be07753710ca3db9134a0246d"
+            archive="$prefix/codex.zip"
+            verify_sha "$expected" "$archive"
+            rm -rf "$prefix/pkg"
+            mkdir -p "$prefix/pkg" "$prefix/bin"
+            powershell -NoProfile -Command \
+              "Expand-Archive -Path '$(cygpath -w "$archive")' -DestinationPath '$(cygpath -w "$prefix/pkg")' -Force"
+            cp "$prefix/pkg/codex-x86_64-pc-windows-msvc.exe" "$prefix/bin/codex.exe"
+            ;;
+          *)
+            echo "install-codex does not know the runner OS: $RUNNER_OS" >&2
+            exit 1
+            ;;
+        esac
+        chmod 755 "$prefix/bin/codex" 2>/dev/null || true
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          "$prefix/bin/codex.exe" --version
+        else
+          "$prefix/bin/codex" --version
+        fi
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          echo "$(cygpath -w "$prefix/bin")" >> "$GITHUB_PATH"
+        else
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+        fi

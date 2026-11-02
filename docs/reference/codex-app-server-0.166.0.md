@@ -1,8 +1,8 @@
-# `codex app-server` surface, `codex-cli 0.163.0`
+# `codex app-server` surface, `codex-cli 0.166.0`
 
 The method lists the Codex adapter is written against (ADR-0090's 2026-10-23
-amendment). Generated from the binary itself, so a version bump is a diff
-rather than a re-derivation:
+amendment, re-pinned by ticket #953). Generated from the binary itself, so a version
+bump is a diff rather than a re-derivation:
 
 ```bash
 codex app-server generate-json-schema --out ./codex-schema
@@ -12,7 +12,7 @@ then read `ClientRequest.json`, `ServerNotification.json` and
 `ServerRequest.json` (`oneOf[].properties.method.enum`). Regenerate when the
 pinned CLI version changes, and read the diff as the adapter's upgrade work.
 
-Counts: **105 client→server methods, 85 notifications,
+Counts: **106 client→server methods, 85 notifications,
 10 server→client requests.**
 
 ## Server → client requests (10)
@@ -30,7 +30,7 @@ These need an answer from cola; they are the Permission and Question surface.
 - `item/tool/requestUserInput`
 - `mcpServer/elicitation/request`
 
-## Client → server methods (105)
+## Client → server methods (106)
 
 The adapter calls a subset of these. The subset that matters is named in the
 amendment: `initialize`, `initialized`, `thread/*` discovery and subscription,
@@ -67,6 +67,7 @@ amendment: `initialize`, `initialized`, `thread/*` discovery and subscription,
 - `externalAgentConfig/import`
 - `externalAgentConfig/import/readHistories`
 - `externalAgentConfig/import/recordHistory`
+- `feedback/save`
 - `feedback/upload`
 - `fs/copy`
 - `fs/createDirectory`
@@ -143,19 +144,10 @@ amendment: `initialize`, `initialized`, `thread/*` discovery and subscription,
 - `windowsSandbox/readiness`
 - `windowsSandbox/setupStart`
 
-`thread/settings/update` is deliberately absent from this list: it exists in the
-CLI source — Codex's own TUI uses it for `/model` — but it is experimental and
-not in the public app-server API overview, so cola does not adopt it and it is
-**not** a required client method. The adapter's model switch is the stable
-`turn/start` `model` + `effort`, which the protocol documents as becoming the
-thread's defaults for later turns.
-
 ## Notifications (85)
 
-Broadcast (`thread/started`, `thread/status/changed`,
-`remoteControl/status/changed`, the `thread/goal/*` family) versus
-subscriber-only (`turn/*`, `item/*`, `error`) is recorded in the amendment; the
-list here is the complete set for this version.
+The read model, Session Sync and card withdrawal consume a subset (named in
+ADR-0090's amendment); the rest are server-internal.
 
 - `account/gatewayOAuth/changed`
 - `account/login/completed`
@@ -243,18 +235,16 @@ list here is the complete set for this version.
 - `windows/worldWritableWarning`
 - `windowsSandbox/setupCompleted`
 
-## Next version (`0.164.0`) — probed, not assumed
+## Delta from `0.163.0` — measured
 
-Regenerated from the running daemon's managed binary (ticket #876;
-`codex app-server daemon version` reports `appServerVersion: 0.164.0`):
+Regenerated from `codex-cli 0.166.0` (ticket #953), the pin this document
+records:
 
-- client→server methods: **106**, one added — `feedback/save`;
+- client→server methods: **106**, one added over `0.163.0` — `feedback/save`;
 - notifications: **85**, unchanged;
 - server→client requests: **10**, unchanged;
-- other schema diffs are additive response fields only (v2 image-generation
-  attachment items, `ListMcpServerStatusResponse`, `PluginReadResponse`).
-
-The adapter's contract above remains pinned to `0.163.0`. A server reporting
-another version is checked against a schema generated from the binary it is
-actually running; a mismatch between that binary's `--version` and the version
-in `initialize`'s `userAgent` is refused rather than trusted.
+- every method the adapter requires (`REQUIRED_CLIENT_METHODS`,
+  `REQUIRED_NOTIFICATIONS`, `REQUIRED_SERVER_REQUESTS`) is still served, and no
+  required payload shape was removed;
+- the four approval response schemas still advertise their session decision
+  (`acceptForSession` / `approved_for_session`).

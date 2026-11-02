@@ -5,7 +5,7 @@
 //! carries the binary's identity (`userAgent`, `codexHome`, platform) and
 //! nothing else. The declared surface is therefore checked in as the reference
 //! document generated from the pinned binary —
-//! `docs/reference/codex-app-server-0.163.0.md`, produced by
+//! `docs/reference/codex-app-server-0.166.0.md`, produced by
 //! `codex app-server generate-json-schema --out <dir>` — and the adapter reads
 //! that document as its contract. A server reporting the pinned version is
 //! checked against it directly.
@@ -13,7 +13,7 @@
 //! A server reporting another version is never assumed compatible. Its own
 //! binary is asked for a schema (`generate-json-schema`) and the required
 //! subset is checked against that; the binary's `--version` must match the
-//! version the server reported, so a 0.163 CLI cannot vouch for a 0.164
+//! version the server reported, so a 0.163 CLI cannot vouch for a 0.166
 //! daemon. A missing required method fails construction, named — never at the
 //! first prompt. An older binary is refused outright.
 //!
@@ -48,7 +48,7 @@ use super::error::{CodexError, Result};
 
 /// The version the adapter was written against, and the version of the checked
 /// in reference document.
-pub(crate) const PINNED_VERSION: &str = "0.163.0";
+pub(crate) const PINNED_VERSION: &str = "0.166.0";
 
 /// Bound the two subprocesses a non-pinned server costs: `--version` plus
 /// `generate-json-schema`. A probe that hangs must not hang the attach.
@@ -124,7 +124,7 @@ pub(crate) const REQUIRED_SERVER_REQUESTS: &[&str] = &[
 /// The checked-in reference document is the pinned surface's source of truth:
 /// the same list the schema diff is read against, embedded so a build cannot
 /// drift from the document it ships beside.
-const PINNED_REFERENCE: &str = include_str!("../../docs/reference/codex-app-server-0.163.0.md");
+const PINNED_REFERENCE: &str = include_str!("../../docs/reference/codex-app-server-0.166.0.md");
 
 /// The approval methods whose **response** schema can carry a session-scoped
 /// decision, and the generated file that declares it. `item/permissions/\
@@ -163,7 +163,7 @@ pub(crate) struct Surface {
 }
 
 impl Surface {
-    /// The pinned `0.163.0` surface, parsed from the checked-in reference.
+    /// The pinned `0.166.0` surface, parsed from the checked-in reference.
     ///
     /// The session-decision set is the four methods the pinned response
     /// schemas advertise, recorded from
@@ -240,7 +240,7 @@ impl Surface {
     }
 
     /// The three list sizes, for the attach log (the pinned counts are
-    /// 105 / 85 / 10).
+    /// 106 / 85 / 10).
     pub(crate) fn counts(&self) -> (usize, usize, usize) {
         (
             self.client_requests.len(),
@@ -582,7 +582,7 @@ mod tests {
         let surface = Surface::pinned();
         assert_eq!(
             surface.counts(),
-            (105, 85, 10),
+            (106, 85, 10),
             "the checked-in reference must parse to the pinned counts"
         );
         assert!(
@@ -610,7 +610,7 @@ mod tests {
     }
 
     /// The pinned surface's session decisions are the four approval methods the
-    /// `0.163.0` response schemas advertise; the permissions grant is not one.
+    /// `0.166.0` response schemas advertise; the permissions grant is not one.
     #[test]
     fn the_pinned_surface_offers_the_four_session_decisions() {
         let decisions = Surface::pinned().session_decisions();
@@ -814,7 +814,7 @@ mod tests {
         let pinned = PinnedProbe;
         for (raw, needle) in [
             ("codex-tui/0.162.0 (test)", "0.162.0"),
-            ("codex-tui/0.164.0 (test)", "0.164.0"),
+            ("codex-tui/0.167.0 (test)", "0.167.0"),
         ] {
             let server = ServerVersion::parse(raw).expect("version");
             let error = pinned.surface(&server).await.expect_err("refused").to_string();
@@ -822,15 +822,39 @@ mod tests {
         }
     }
 
+    /// Ticket #953's acceptance: the previous pin (`0.163.0`) is now older than
+    /// the pin, so it is refused outright with the named version error rather
+    /// than probed or assumed compatible.
+    #[tokio::test]
+    async fn the_previous_pin_is_refused_with_the_named_version_error() {
+        let server = ServerVersion::parse("codex-tui/0.163.0 (test)").expect("version");
+        for probe in [
+            &PinnedProbe as &dyn SurfaceProbe,
+            &AutoProbe::new("/nonexistent/codex"),
+        ] {
+            match probe
+                .surface(&server)
+                .await
+                .expect_err("0.163.0 is older than the pin")
+            {
+                CodexError::OlderServer { pinned, found } => {
+                    assert_eq!(pinned, "0.166.0");
+                    assert_eq!(found, "0.163.0");
+                }
+                other => panic!("expected the named older-server error, got {other}"),
+            }
+        }
+    }
+
     /// The pin costs no subprocess: the checked-in surface is used directly.
     #[tokio::test]
     async fn the_auto_probe_short_circuits_the_pinned_version() {
-        let server = ServerVersion::parse("codex-tui/0.163.0 (test)").expect("version");
+        let server = ServerVersion::parse("codex-tui/0.166.0 (test)").expect("version");
         let surface = AutoProbe::new("/nonexistent/codex")
             .surface(&server)
             .await
             .expect("the pin needs no binary");
-        assert_eq!(surface.counts(), (105, 85, 10));
+        assert_eq!(surface.counts(), (106, 85, 10));
     }
 
     /// A non-pinned server is described by regenerating its own binary's
@@ -848,7 +872,7 @@ mod tests {
             &binary,
             r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
-  echo "codex-cli 0.164.0"
+  echo "codex-cli 0.167.0"
   exit 0
 fi
 out="$4"
@@ -863,12 +887,12 @@ printf '%s' '{"oneOf":[{"properties":{"method":{"enum":["item/tool/requestUserIn
             .expect("make fake codex executable");
 
         let probe = AutoProbe::new(&binary);
-        let newer = ServerVersion::parse("codex-tui/0.164.0 (test)").expect("version");
+        let newer = ServerVersion::parse("codex-tui/0.167.0 (test)").expect("version");
         let surface = probe.surface(&newer).await.expect("generated surface");
         assert!(surface.client_requests.contains("turn/steer"));
         assert_eq!(surface.counts(), (2, 1, 1));
 
-        let other = ServerVersion::parse("codex-tui/0.165.0 (test)").expect("version");
+        let other = ServerVersion::parse("codex-tui/0.168.0 (test)").expect("version");
         let error = probe
             .surface(&other)
             .await
@@ -883,7 +907,7 @@ printf '%s' '{"oneOf":[{"properties":{"method":{"enum":["item/tool/requestUserIn
     #[cfg(unix)]
     #[tokio::test]
     async fn an_unusable_probe_binary_is_a_loud_failure() {
-        let newer = ServerVersion::parse("codex-tui/0.164.0 (test)").expect("version");
+        let newer = ServerVersion::parse("codex-tui/0.167.0 (test)").expect("version");
         let error = AutoProbe::new("/nonexistent/codex")
             .surface(&newer)
             .await
@@ -900,11 +924,11 @@ printf '%s' '{"oneOf":[{"properties":{"method":{"enum":["item/tool/requestUserIn
 
         let directory = tempfile::tempdir().expect("tempdir");
         let binary = directory.path().join("codex");
-        std::fs::write(&binary, "#!/bin/sh\necho \"codex-cli 0.164.0\"\nexit 3\n").expect("write fake codex");
+        std::fs::write(&binary, "#!/bin/sh\necho \"codex-cli 0.167.0\"\nexit 3\n").expect("write fake codex");
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .expect("make fake codex executable");
 
-        let newer = ServerVersion::parse("codex-tui/0.164.0 (test)").expect("version");
+        let newer = ServerVersion::parse("codex-tui/0.167.0 (test)").expect("version");
         let error = AutoProbe::new(&binary)
             .surface(&newer)
             .await
