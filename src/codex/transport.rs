@@ -120,11 +120,6 @@ pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// cadence is slower than the cheap metadata-only check it replaced.
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long one liveness probe may take before the daemon is presumed gone. A
-/// hung connect must not stall the watcher, so the probe runs on the blocking
-/// pool under this budget; an unanswered connect is not evidence of life.
-const CONTROL_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// The most of one proxy stderr line kept for the log. The proxy's diagnostics
 /// are short; a newline-free torrent must not grow a buffer without limit, so
 /// the rest of the line is drained and replaced by a marker.
@@ -916,7 +911,9 @@ impl ProxyWatch {
                 match current {
                     None => identity.is_some(),
                     Some(current) if identity.is_some_and(|baseline| baseline != current) => true,
-                    Some(_) => !control_socket_accepts(path).await,
+                    // A liveness check on the daemon, not the adapter's
+                    // transport: the proxy child stays the only RPC carrier.
+                    Some(_) => !discovery::control_socket_accepts(path).await,
                 }
             }
             #[cfg(not(unix))]
@@ -931,7 +928,9 @@ impl ProxyWatch {
                 // timed out, or whatever kind this platform's stack reports —
                 // and any of those means the fixture is dead. Only a completed
                 // connect is evidence of life.
-                match tokio::time::timeout(CONTROL_PROBE_TIMEOUT, TcpStream::connect(address)).await {
+                match tokio::time::timeout(discovery::CONTROL_PROBE_TIMEOUT, TcpStream::connect(address))
+                    .await
+                {
                     Ok(Ok(stream)) => {
                         drop(stream);
                         false
@@ -941,42 +940,6 @@ impl ProxyWatch {
             }
         }
     }
-}
-
-/// Whether a real connect to the control socket succeeds. The probe stream is
-/// dropped immediately: it only asks whether a listener is still there, and
-/// the relay's own connection carries the traffic. A failed or timed-out
-/// connect means the daemon is gone, including the case where the socket file
-/// survives a SIGKILL.
-async fn control_socket_accepts(path: &Path) -> bool {
-    let path = path.to_path_buf();
-    let connect = tokio::task::spawn_blocking(move || connect_control_socket(&path));
-    matches!(
-        tokio::time::timeout(CONTROL_PROBE_TIMEOUT, connect).await,
-        Ok(Ok(Ok(())))
-    )
-}
-
-#[cfg(unix)]
-fn connect_control_socket(path: &Path) -> std::io::Result<()> {
-    let stream = std::os::unix::net::UnixStream::connect(path)?;
-    drop(stream);
-    Ok(())
-}
-
-#[cfg(windows)]
-fn connect_control_socket(path: &Path) -> std::io::Result<()> {
-    let stream = uds_windows::UnixStream::connect(path)?;
-    drop(stream);
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn connect_control_socket(_path: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "this platform has no unix-domain sockets",
-    ))
 }
 
 /// Watch the proxy child: its exit of **any** kind is the connection's close,
@@ -1422,7 +1385,7 @@ mod tests {
     /// that stale path from a live daemon, so a pending waiter must fail,
     /// `Closed` must arrive, and the proxy child must be reaped. Removing the
     /// liveness probe makes this test time out, which is the point.
-    #[cfg(unix)]
+    #[cfg(target_family = "unix")]
     #[tokio::test]
     async fn a_sigkilled_daemon_closes_the_proxy_connection_through_its_stale_socket() {
         let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
@@ -1479,7 +1442,7 @@ mod tests {
     /// A control path re-pointed at another daemon's socket is the same close:
     /// the identity captured before the spawn no longer matches, so the
     /// connection cannot be trusted to name the server it was dialled for.
-    #[cfg(unix)]
+    #[cfg(target_family = "unix")]
     #[tokio::test]
     async fn a_replaced_control_socket_closes_the_proxy_connection() {
         let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
