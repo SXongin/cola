@@ -1255,10 +1255,17 @@ fn observe_client(
     arguments: &[String],
     daemon: Option<&Path>,
 ) -> Option<Observation> {
+    // Compare the executable's stem, case-insensitively: on Windows sysinfo
+    // reports both the process name and argv[0] as `codex.exe`, so an exact
+    // `"codex"` match found no client at all and the unverified warning was
+    // never reached.
     let is_codex_client = arguments
         .first()
-        .is_some_and(|binary| Path::new(binary).file_name().is_some_and(|name| name == "codex"))
-        || process_name == "codex";
+        .and_then(|binary| Path::new(binary).file_stem())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"))
+        || Path::new(process_name)
+            .file_stem()
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("codex"));
     if !is_codex_client || !tui_invocation(arguments) {
         return None;
     }
@@ -3663,6 +3670,39 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
                 None
             )
             .is_none()
+        );
+    }
+
+    /// Windows sysinfo reports both the process name and argv[0] as
+    /// `codex.exe`. Both are observed here, not a hand-built candidate: before
+    /// the stem comparison the scan found no local client at all, so the
+    /// unverified warning `cola doctor` promises never ran.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_windows_codex_exe_is_observed_as_a_local_client() {
+        let daemon = Path::new(r"C:\Users\runner\.codex\app-server-control\app-server-control.sock");
+        let arguments = vec![r"C:\tools\codex.exe".to_string()];
+        let Some(Observation::Unverified(client)) = observe_client(77, "codex.exe", &arguments, Some(daemon))
+        else {
+            panic!("codex.exe must be observed as a local Codex client");
+        };
+
+        // The process name alone is enough when argv[0] is unavailable.
+        assert!(matches!(
+            observe_client(78, "CODEX.EXE", &[], Some(daemon)),
+            Some(Observation::Unverified(_))
+        ));
+
+        let mut clients = LocalClients {
+            unverified: vec![client],
+            ..LocalClients::default()
+        };
+        prove_unsupported(&mut clients, daemon).await;
+        assert_eq!(clients.unverified.len(), 1);
+        assert!(
+            clients.unverified[0].detail.contains("not hard-proven"),
+            "Windows never hard-proves its attachment: {}",
+            clients.unverified[0].detail
         );
     }
 

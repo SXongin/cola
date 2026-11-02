@@ -1054,7 +1054,7 @@ fn unverified_proof_hint(platform: &str) -> &'static str {
 
 /// The user's own client, classified honestly:
 ///
-/// - **proven attached** (a live descriptor connection) → PASS;
+/// - **proven attached** (a live descriptor or peer-address connection) → PASS;
 /// - **unverified** (neither argv nor descriptors settle it) → WARN, naming
 ///   the gap; never a pass, because claiming sharing cola cannot establish is
 ///   the silence ADR-0090 decision 3 rejects;
@@ -1098,11 +1098,19 @@ fn local_client_check(report: &ClientReport) -> Check {
             .map(|client| format!("PID {} ({})：{}", client.pid, client.binary, client.detail))
             .collect::<Vec<_>>()
             .join("；");
+        // The per-client detail already carries the platform's evidence when a
+        // prover could not run (Windows says the attachment is not
+        // hard-proven). Repeating the platform hint after it prints the same
+        // fact twice, so the hint only fills in for a detail that does not.
+        let hint = if listed.contains("not hard-proven") {
+            String::new()
+        } else {
+            format!("；{}", unverified_proof_hint(std::env::consts::OS))
+        };
         return Check::warn(
             "Codex 本地客户端",
             format!(
-                "{listed}。无法证明它已连接到共享 daemon；{}（daemon: {}）",
-                unverified_proof_hint(std::env::consts::OS),
+                "{listed}。无法证明它已连接到共享 daemon{hint}（daemon: {}）",
                 report.endpoint
             ),
         );
@@ -1818,6 +1826,44 @@ kind = "codex"
         assert!(
             !hint.contains("已连接到共享 daemon"),
             "the enclosing check already says the connection is unproven: {hint}"
+        );
+    }
+
+    /// A detail that already carries the platform evidence is not followed by
+    /// the same fact again: the Windows prover's per-client detail ends with
+    /// "not hard-proven", so the check must stand down its platform hint.
+    #[test]
+    fn a_detail_that_says_not_hard_proven_does_not_repeat_the_platform_hint() {
+        let detail = "windows exposes the process identity for the daemon at \
+                      C:\\Users\\u\\.codex\\app-server-control\\app-server-control.sock, but cola \
+                      has no socket descriptor or peer-address prover there: the attachment is \
+                      not hard-proven";
+        let report = codex_report(
+            ClientState::Attached,
+            vec![UserClient {
+                pid: 9,
+                binary: "codex.exe".into(),
+                state: UserClientState::Unverified,
+                detail: detail.into(),
+            }],
+        );
+        let checks = codex_client_checks(
+            Some(&report),
+            Some(&TurnProbe::Passed {
+                detail: "ok".into(),
+                cleanup: None,
+            }),
+        );
+        let local = checks
+            .iter()
+            .find(|check| check.label == "Codex 本地客户端")
+            .expect("the local-client check");
+        assert_eq!(local.status, CheckStatus::Warn);
+        assert_eq!(local.detail.matches("not hard-proven").count(), 1);
+        assert!(
+            !local.detail.contains(unverified_proof_hint(std::env::consts::OS)),
+            "the platform hint repeats the detail: {}",
+            local.detail
         );
     }
 
