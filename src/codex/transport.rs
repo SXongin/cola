@@ -9,14 +9,17 @@
 //! the child's stdin/stdout. `client_async` over a boxed `AsyncRead +
 //! AsyncWrite` keeps one client type for every byte stream underneath.
 //!
-//! A **daemon** close is observed as EOF on the child's stdout; the reader loop
-//! then closes the connection. The child does not necessarily exit — the real
-//! proxy's two copy directions are joined, so it waits for stdin EOF as well as
-//! the socket's. The reverse direction is therefore explicit: closing the
-//! connection (the last handle dropping, a protocol fault, an overflowed
-//! decision queue) terminates and reaps the child. A child that exits on its
-//! own also closes the connection. Either way every waiter fails by name and
-//! [`ServerEvent::Closed`] reaches the decision stream.
+//! A **daemon** close is detected from the control path, not from stdout: the
+//! real proxy's two copy directions are joined, so after the daemon socket
+//! reaches EOF it keeps stdout open while it waits for stdin EOF. The watcher
+//! polls the control path, and a path that disappears (or names a different
+//! socket) closes the connection and kills and reaps the child. A reader that
+//! does see EOF still closes the connection. The reverse direction is explicit
+//! as well: closing the connection (the last handle dropping, a protocol
+//! fault, an overflowed decision queue) terminates and reaps the child. A
+//! child that exits on its own also closes the connection. Either way every
+//! waiter fails by name and [`ServerEvent::Closed`] reaches the decision
+//! stream.
 //!
 //! `Endpoint::WebSocket` remains for the hermetic tests only; the live suites
 //! dial `Endpoint::Unix`, and the daemon cannot serve a WebSocket listener.
@@ -72,6 +75,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
+use super::discovery;
 use super::error::{CodexError, Result};
 
 /// How many inbound notifications a subscriber may fall behind before the
@@ -105,6 +109,13 @@ const OUTGOING_CAPACITY: usize = 64;
 /// not hold a Feishu callback open, and the request must remain answerable, so
 /// this budget fails the send by name and lets the adapter restore it.
 pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the proxy's watcher checks whether the control path still names
+/// the daemon it dialled. The real proxy keeps stdout open after the daemon
+/// side reaches EOF, so this poll — not the child's exit — is what notices a
+/// daemon that is gone. A `std::fs::metadata` read is cheap enough at this
+/// cadence and performs no spawn.
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// How to reach an app-server.
 // `ws://` endpoints are how the hermetic tests dial a TCP fake server; the
@@ -358,6 +369,10 @@ impl RpcConnection {
                         path.display()
                     ),
                 })?;
+                // Capture the control path's identity *before* the child is
+                // spawned, so a daemon replaced during the handshake is still
+                // noticed by the watcher.
+                let watch = ProxyWatch::capture(path);
                 let (io, child) = spawn_proxy(binary, path).await?;
                 // Cancellation anywhere in the handshake (the outer timeout,
                 // a caller dropping the future) drops this guard, which kills
@@ -365,7 +380,7 @@ impl RpcConnection {
                 let mut guard = ProxyGuard::new(child);
                 let socket = Self::handshake(PROXY_HANDSHAKE_URL, Box::new(io)).await?;
                 let child = guard.take();
-                Self::start_with_proxy(socket, Some(child))
+                Self::start_with_proxy(socket, Some(child), Some(watch))
             }
             Endpoint::WebSocket(raw) => {
                 let url = Url::parse(raw).map_err(|error| CodexError::Transport {
@@ -384,7 +399,7 @@ impl RpcConnection {
                             context: format!("connect to {raw}"),
                             detail: error.to_string(),
                         })?;
-                Self::start_with_proxy(Self::handshake(raw, Box::new(stream)).await?, None)
+                Self::start_with_proxy(Self::handshake(raw, Box::new(stream)).await?, None, None)
             }
         })
     }
@@ -400,7 +415,7 @@ impl RpcConnection {
     }
 
     /// Split the socket and start the writer and reader tasks.
-    fn start_with_proxy(socket: Socket, child: Option<Child>) -> Self {
+    fn start_with_proxy(socket: Socket, child: Option<Child>, watch: Option<ProxyWatch>) -> Self {
         let (sink, stream) = socket.split();
         let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
@@ -431,10 +446,10 @@ impl RpcConnection {
             .lock()
             .expect("connection tasks")
             .extend([writer, reader]);
-        if let (Some(child), Some(terminate)) = (child, proxy_terminate) {
+        if let (Some(child), Some(terminate), Some(watch)) = (child, proxy_terminate, watch) {
             // Deliberately not in `tasks`: aborting the connection's I/O tasks
             // must not prevent the child from being killed and reaped.
-            watch_proxy(child, terminate, Arc::downgrade(&inner));
+            watch_proxy(child, terminate, Arc::downgrade(&inner), watch);
         }
 
         Self { inner }
@@ -803,14 +818,89 @@ impl Drop for ProxyGuard {
     }
 }
 
+/// What the proxy's peer looks like from cola's side, captured before the
+/// child is spawned.
+///
+/// The production proxy relays to a filesystem control socket, so a daemon
+/// that exits removes (or re-points) the path and the poll notices. The
+/// Windows hermetic fixture cannot bind an AF_UNIX socket in stable Rust, so
+/// its fake daemon is a TCP listener and the poll checks that listener
+/// instead; that target never comes from production.
+#[derive(Debug)]
+enum ProxyWatch {
+    Path {
+        path: PathBuf,
+        identity: Option<discovery::SocketIdentity>,
+    },
+    #[cfg(not(unix))]
+    Tcp { address: String },
+}
+
+impl ProxyWatch {
+    fn capture(path: &Path) -> Self {
+        #[cfg(not(unix))]
+        if let Some(address) = path.to_str().and_then(|path| path.strip_prefix("tcp://")) {
+            return Self::Tcp {
+                address: address.to_string(),
+            };
+        }
+        Self::Path {
+            path: path.to_path_buf(),
+            identity: discovery::socket_identity(path).ok().flatten(),
+        }
+    }
+
+    /// Whether the daemon this path named is gone: the path is missing, or it
+    /// now names a different socket. A read error is not evidence of death,
+    /// so it is ignored rather than closing a healthy connection.
+    async fn lost(&self) -> bool {
+        match self {
+            Self::Path { path, identity } => match discovery::socket_identity(path) {
+                Ok(Some(current)) => identity.is_some_and(|baseline| baseline != current),
+                Ok(None) => identity.is_some(),
+                Err(_) => false,
+            },
+            #[cfg(not(unix))]
+            Self::Tcp { address } => {
+                use std::net::SocketAddr;
+
+                let Ok(address) = address.parse::<SocketAddr>() else {
+                    return false;
+                };
+                // The fixture's fake daemon is this suite's only TCP peer. A
+                // refused connection means its listener is gone; any other
+                // outcome (including a timeout) is inconclusive and does not
+                // close a healthy connection.
+                match tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(address)).await {
+                    Ok(Ok(stream)) => {
+                        drop(stream);
+                        false
+                    }
+                    Ok(Err(error)) => error.kind() == std::io::ErrorKind::ConnectionRefused,
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+}
+
 /// Watch the proxy child: its exit of **any** kind is the connection's close,
-/// and the terminate edge (last handle dropped, or the connection closed for a
-/// protocol error) kills and reaps it. Owning the child through
-/// [`ProxyGuard`] also covers the watcher being cancelled at runtime
-/// shutdown.
-fn watch_proxy(child: Child, terminate: Arc<tokio::sync::Notify>, inner: Weak<ConnectionInner>) {
+/// the terminate edge (last handle dropped, or the connection closed for a
+/// protocol error) kills and reaps it, and a control path that no longer names
+/// the daemon it dialled is a dead daemon — the real proxy keeps stdout open
+/// waiting for stdin EOF, so that is the only edge a `read_loop` cannot see.
+/// Owning the child through [`ProxyGuard`] also covers the watcher being
+/// cancelled at runtime shutdown.
+fn watch_proxy(
+    child: Child,
+    terminate: Arc<tokio::sync::Notify>,
+    inner: Weak<ConnectionInner>,
+    watch: ProxyWatch,
+) {
     tokio::spawn(async move {
         let mut child = ProxyGuard::new(child);
+        let mut poll = tokio::time::interval(CONTROL_POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tokio::select! {
             biased;
             _ = terminate.notified() => child.kill_and_reap().await,
@@ -827,11 +917,31 @@ fn watch_proxy(child: Child, terminate: Arc<tokio::sync::Notify>, inner: Weak<Co
                     }
                 }
             }
+            _ = wait_for_control_path(&watch, &mut poll) => {
+                // The daemon is gone. Fail every waiter before the reap so a
+                // close cannot be delayed by the child's own shutdown.
+                if let Some(inner) = inner.upgrade() {
+                    close(&inner);
+                }
+                child.kill_and_reap().await;
+            }
         }
         if let Some(inner) = inner.upgrade() {
             close(&inner);
         }
     });
+}
+
+/// Poll the control path until it is gone. The first interval tick completes
+/// immediately; it is harmless (the captured identity is still current) and
+/// keeps a daemon that vanished during the handshake from going unnoticed.
+async fn wait_for_control_path(watch: &ProxyWatch, poll: &mut tokio::time::Interval) {
+    loop {
+        poll.tick().await;
+        if watch.lost().await {
+            return;
+        }
+    }
 }
 
 /// Serialise every outgoing frame; the sink is the only writer.
@@ -1140,10 +1250,12 @@ mod tests {
         wait_for_pid_to_disappear(pid).await;
     }
 
-    /// The child exiting for any reason is the connection's close: a pending
-    /// waiter fails exactly like a socket close, the decision stream ends with
-    /// `Closed`, and the child is reaped (it exits by itself here — the fake
-    /// daemon died underneath it).
+    /// The daemon going away is the connection's close even though the proxy
+    /// child survives: the real proxy joins both copy directions, so after the
+    /// socket side reaches EOF it keeps stdout open until stdin EOF. A pending
+    /// waiter must fail, the decision stream must end with `Closed`, and the
+    /// child must be reaped — all driven by the control path disappearing, not
+    /// by the child exiting.
     #[tokio::test]
     async fn a_dead_daemon_closes_the_proxy_connection_and_reaps_the_child() {
         let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
@@ -1162,7 +1274,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!pending.is_finished(), "the request is still pending");
 
-        daemon.server.die().await;
+        daemon.die().await;
 
         let failed = tokio::time::timeout(Duration::from_secs(5), pending)
             .await
@@ -1186,6 +1298,47 @@ mod tests {
             }
         }
         wait_for_pid_to_disappear(pid).await;
+    }
+
+    /// A control path re-pointed at another daemon's socket is the same close:
+    /// the identity captured before the spawn no longer matches, so the
+    /// connection cannot be trusted to name the server it was dialled for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replaced_control_socket_closes_the_proxy_connection() {
+        let daemon = ProxyDaemon::start("codex-tui/0.166.0 (test)").await;
+        let connection = daemon.connection().await;
+        let pid = connection.proxy_pid().expect("a proxy child was spawned");
+        let pending = tokio::spawn({
+            let connection = connection.clone();
+            async move { connection.request("test/never", json!({})).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pending.is_finished(), "the request is still pending");
+
+        let crate::codex::transport::Endpoint::Unix(link) = &daemon.endpoint else {
+            panic!("the unix fake daemon publishes a control path");
+        };
+        let replacement = link.with_file_name("replacement.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&replacement).expect("bind a replacement daemon");
+        // Replace the published link atomically: no window in which the path is
+        // missing, so only the identity comparison can notice.
+        let staged = link.with_file_name("staged-link");
+        std::os::unix::fs::symlink(&replacement, &staged).expect("stage the replacement link");
+        std::fs::rename(&staged, link).expect("re-point the control path");
+
+        let failed = tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("a replaced daemon must not leave the waiter hanging")
+            .expect("the request task did not panic")
+            .expect_err("the request cannot be answered over a replaced daemon");
+        assert!(
+            matches!(failed, CodexError::NoResponse(_)),
+            "the waiter fails by name: {failed}"
+        );
+        wait_for_pid_to_disappear(pid).await;
+        drop(listener);
     }
 
     /// The proxy spawns from the binary the caller resolved; a `unix://` dial
@@ -1301,6 +1454,45 @@ mod tests {
             matches!(error, CodexError::Transport { .. } | CodexError::Timeout(_)),
             "the failure is the transport's: {error}"
         );
+    }
+
+    /// The fixture must behave like the real proxy: a daemon-side EOF ends only
+    /// the socket→stdout pump, and the process stays alive with stdout open
+    /// until stdin EOF. Without this the dead-daemon test would pass even if
+    /// the transport's control-path watcher were removed.
+    #[tokio::test]
+    async fn the_proxy_fixture_survives_a_daemon_side_eof() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a fake daemon");
+        let address = listener.local_addr().expect("address");
+        let mut child = Command::new(crate::codex::test_server::proxy_helper())
+            .arg("--sock")
+            .arg(format!("tcp://{address}"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the relay fixture");
+        let stdin = child.stdin.take().expect("the fixture's stdin is piped");
+
+        let (stream, _) = listener.accept().await.expect("the fixture connects");
+        // The daemon side closes: the socket→stdout pump ends, but the process
+        // must keep waiting for stdin instead of exiting.
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            child.try_wait().expect("poll the fixture").is_none(),
+            "the fixture exited on the daemon-side EOF, unlike the real proxy"
+        );
+
+        drop(stdin);
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .expect("stdin EOF ends the fixture")
+            .expect("wait for the fixture");
+        assert!(status.success(), "the fixture exits cleanly: {status}");
     }
 
     async fn wait_for_proxy_child(target: &Path) -> u32 {

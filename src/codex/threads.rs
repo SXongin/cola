@@ -1424,7 +1424,7 @@ mod tests {
             "/work/cola",
             "a real thread",
         ));
-        let endpoint = Endpoint::Unix(socket);
+        let endpoint = Endpoint::Unix(socket.clone());
         let client = CodexClient::connect(
             &CodexOptions::new(endpoint).with_proxy_binary(crate::codex::test_server::proxy_helper()),
             &PinnedProbe,
@@ -1437,6 +1437,10 @@ mod tests {
         };
 
         server.die().await;
+        // The real proxy keeps stdout open after the daemon socket closes, so
+        // the transport watches the control path; a shut-down daemon removes
+        // it, and that is this connection's loss.
+        let _ = std::fs::remove_file(&socket);
 
         let ended = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
             .await
