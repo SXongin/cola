@@ -387,7 +387,10 @@ fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
 /// Drop the `\\?\` device prefix Rust's `canonicalize` can add, matching the
 /// normalised path upstream binds (`AbsolutePathBuf` strips it). The verbatim
 /// form is four bytes longer and would overstate the AF_UNIX address.
-#[cfg(windows)]
+///
+/// Pure string manipulation, so it compiles and is tested on every platform;
+/// only Windows produces such a prefix.
+#[cfg(any(windows, test))]
 fn normalize_verbatim_prefix(path: PathBuf) -> PathBuf {
     let Some(text) = path.to_str() else {
         return path;
@@ -400,11 +403,6 @@ fn normalize_verbatim_prefix(path: PathBuf) -> PathBuf {
     {
         return PathBuf::from(rest);
     }
-    path
-}
-
-#[cfg(all(not(windows), test))]
-fn normalize_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
@@ -945,7 +943,7 @@ pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon>
     // command is not attempted at all. `start_after_preflight` holds the guard
     // so a platform-neutral test can prove deleting it fails.
     #[cfg(windows)]
-    let preconditions = Some(super::preconditions::probe(environment));
+    let preconditions = Some(super::preconditions::probe(Some(environment)));
     #[cfg(not(windows))]
     let preconditions: Option<Preconditions> = None;
     start_after_preflight(environment, preconditions).await
@@ -2773,6 +2771,22 @@ mod tests {
         assert_eq!(measured, expected);
         assert_ne!(measured, published);
         socket_path_budget(&published, 108).expect("the canonical path fits");
+    }
+
+    /// Rust's `canonicalize` can return a `\\?\` verbatim path; upstream
+    /// normalises it away before binding, so the budget must too.
+    #[test]
+    fn a_verbatim_prefix_is_stripped() {
+        assert_eq!(
+            normalize_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\u\.codex")).to_string_lossy(),
+            r"C:\Users\u\.codex"
+        );
+        assert_eq!(
+            normalize_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\.codex")).to_string_lossy(),
+            r"\\server\share\.codex"
+        );
+        let plain = PathBuf::from(r"C:\Users\u\.codex");
+        assert_eq!(normalize_verbatim_prefix(plain.clone()), plain);
     }
 
     /// A home that does not exist yet is measured from its nearest existing

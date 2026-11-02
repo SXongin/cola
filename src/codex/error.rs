@@ -144,12 +144,14 @@ pub(crate) enum CodexError {
     #[error("codex daemon command failed: {0}")]
     Daemon(String),
 
-    /// A Windows daemon precondition refused the start before anything was
-    /// spawned (ticket #952): an elevated or unreadable token, or a launcher
-    /// that forbids breakaway. The payload is English like every other
-    /// `CodexError`; `cola doctor` renders the Chinese instruction from the
-    /// same precondition. Path failures reuse [`Self::ControlSocketPathTooLong`]
-    /// (ticket #950) instead, so their message has one source.
+    /// A Windows daemon precondition refused the start before the daemon
+    /// launcher ran (ticket #952): an elevated or unreadable token, or a
+    /// launcher that forbids breakaway. (The breakaway probe itself may have
+    /// spawned one suspended child; it never executes.) The payload is English
+    /// like every other `CodexError`; `cola doctor` renders the Chinese
+    /// instruction from the same precondition. Path failures reuse
+    /// [`Self::ControlSocketPathTooLong`] (ticket #950) instead, so their
+    /// message has one source.
     #[error("cannot start the codex daemon on Windows: {0}")]
     WindowsPrecondition(String),
 

@@ -479,6 +479,8 @@ doctor 会先列出 daemon 的三个前置条件：进程不能持有提升的�
 路径必须符合 AF_UNIX 的 108 字节上限（含终止 NUL）。每条失败的行都带可执行的
 指示——从非管理员终端启动 cola、直接运行 `codex.exe`，或缩短 `CODEX_HOME`；
 令牌或路径不满足时，doctor 会跳过运行时诊断，而不是只报告一句 attach failed。
+如果完全无法读取令牌的提升状态，doctor 会给出警告而不是通过，只运行只读诊断，
+并跳过真实回合探测，因此不会产生 provider 费用。
 
 `cola doctor` 会验证配置的 provider 能否完成一次真实回合：它在**共享**
 daemon（并非 cola 所有）上创建一个临时线程并发起最小回合并等待

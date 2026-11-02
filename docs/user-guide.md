@@ -598,7 +598,10 @@ an elevated administrator token, the launcher must permit a breakaway child
 the AF_UNIX limit of 108 bytes including the terminator. Each failing row
 carries its instruction — start cola from a non-elevated terminal, run
 `codex.exe` directly, or shorten `CODEX_HOME` — and a blocked token or path
-skips the runtime diagnosis instead of reporting a bare attach failure.
+skips the runtime diagnosis instead of reporting a bare attach failure. If the
+token's elevation cannot be read at all, doctor warns rather than passing, runs
+only the read-only diagnosis, and skips the real-turn probe so no provider spend
+can occur.
 
 `cola doctor` proves the configured provider can complete a real turn: it starts
 a minimal turn on a scratch thread on the **shared** daemon (which cola does not
