@@ -228,8 +228,11 @@ The four `COLA_LIVE_CODEX_*` variables:
 
 Unlike the older tests, the new tiers do **not** skip when the binary is
 missing: `codex` on `PATH` is the fallback, and a missing or unpinned binary is
-a failure. CI installs it with `.github/actions/install-codex` at the 0.166.0
-pin. The five advisory checks are, exactly as GitHub reports them:
+a failure. Tier-1 installs the 0.166.0 release asset with
+`.github/actions/install-codex`; tier-2 installs the 0.166.0 main npm tarball,
+whose SHA-256 is pinned in the workflow (ADR-0057's exact version + artifact
+digest), then runs its shim. The five advisory checks are, exactly as GitHub
+reports them:
 `Live Codex tier-1 (ubuntu-latest)`, `Live Codex tier-1 (macos-latest)`,
 `Live Codex tier-1 (windows-latest)`, `Live Codex tier-2 (ubuntu-latest)` and
 `Live Codex tier-2 (macos-latest)`. Each test asserts its daemon, listener,
