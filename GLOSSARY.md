@@ -29,7 +29,7 @@ The mode where cola starts the agent and is its only client, so the user picks t
 _Avoid_: gateway (cola is not one), standalone mode
 
 **Codex CLI**:
-The command-line Codex client (`codex`), including its TUI. It is a client of the **app-server** rather than the process that owns the Codex Session store: a TUI on its own embedded server shares nothing, while one pointed at the local daemon with `--remote` shares the Codex Session store.
+The command-line Codex client (`codex`), including its TUI. It is a client of the **app-server** rather than the process that owns the Codex Session store: a TUI on its own embedded server shares nothing, while one pointed at the local app-server daemon with `--remote` shares the Codex Session store.
 _Avoid_: Codex when you mean the CLI (the product family also spans the desktop app and the app-server), the Codex runtime
 
 **app-server**:
@@ -41,7 +41,7 @@ The managed **app-server** that Codex starts and keeps alive (`codex app-server 
 _Avoid_: daemon (bare — say **app-server daemon**; cola has other background processes), service (bare — **Shared Service** is OpenCode's)
 
 **Codex desktop / ChatGPT**:
-The Codex desktop app and the ChatGPT cloud product: other clients, or a different product, not the **app-server** surface. The desktop app shares the Codex Session store only when it attaches to the same daemon; an embedded server, and ChatGPT's cloud threads, share nothing with cola.
+The Codex desktop app and the ChatGPT cloud product: other clients, or a different product, not the **app-server** surface. The desktop app shares the Codex Session store only when it attaches to the same app-server daemon; an embedded server, and ChatGPT's cloud threads, share nothing with cola.
 _Avoid_: Codex when you mean the desktop app, app-server (the desktop app is a client of it), ChatGPT desktop (a different product)
 
 **Generation**:
