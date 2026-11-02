@@ -15,8 +15,8 @@
 //!    job without breakaway (the classic case is `cargo run`, or an outer job
 //!    object) makes that spawn fail with `ERROR_ACCESS_DENIED`.
 //! 3. **The control-socket path fits.** Windows binds the AF_UNIX socket at
-//!    the published path itself, so `$CODEX_HOME/app-server-control/app-server-control.sock`
-//!    must fit `sun_path`'s 108 bytes including the terminating NUL.
+//!    the path upstream canonicalises for binding, so the measured path must
+//!    fit `sun_path`'s 108 bytes including the terminating NUL.
 //!
 //! The probes are `#[cfg(windows)]`; the model and its decisions are compiled
 //! everywhere so Linux and macOS tests pin the logic even though the Win32
@@ -29,10 +29,11 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[cfg(any(windows, test))]
+use super::discovery::measured_socket_path;
+#[cfg(any(windows, test))]
 use super::discovery::socket_path_budget;
 #[cfg(windows)]
 use super::discovery::{Environment, WINDOWS_SOCKET_PATH_LIMIT};
-#[cfg(any(windows, test))]
 use super::error::CodexError;
 
 /// `ERROR_ACCESS_DENIED`, the failure `CreateProcess` reports when the
@@ -57,13 +58,19 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// The token's elevation, as far as the process can tell.
 ///
+/// `Unknown` is a **failure**, not a non-elevated answer: the query error is
+/// kept so doctor can warn and a start can be refused. Folding the failure
+/// into "not elevated" would let a token nobody could read inherit into every
+/// shared client.
+///
 /// The variants are constructed only by the Windows probe (or a test), so a
 /// non-Windows non-test build reads them but never builds one.
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Elevation {
     NotElevated,
     Elevated,
+    Unknown(String),
 }
 
 /// Whether a suspended child can leave the launcher's Windows job.
@@ -78,6 +85,9 @@ pub(crate) enum Breakaway {
     /// The probe could not run at all. The launcher is not proven restricted,
     /// so this is a warning rather than a failure.
     Unavailable(String),
+    /// Not probed because an earlier precondition already blocks both the
+    /// diagnosis and a start, so no `CreateProcess` is paid.
+    Skipped(String),
 }
 
 /// The resolved control-socket path against the Windows AF_UNIX budget.
@@ -109,25 +119,32 @@ pub(crate) struct Preconditions {
 }
 
 impl Preconditions {
-    /// The elevation instruction, when the token is elevated. A shared daemon
-    /// must never inherit administrator privileges.
-    pub(crate) fn elevation_refusal(&self) -> Option<&'static str> {
+    /// The Chinese doctor-row instruction for a positively elevated token.
+    ///
+    /// The actionable text lives at the doctor layer; [`Self::start_refusal`]
+    /// builds an English [`CodexError`] for the lifecycle path, and the path
+    /// cases reuse the canonical #950 errors rather than restating their
+    /// message here.
+    pub(crate) fn elevation_instruction(&self) -> Option<&'static str> {
         (self.elevation == Elevation::Elevated).then_some(
             "当前进程持有提升的管理员令牌；共享客户端不应继承管理员权限。\
              请从非管理员终端启动 cola。",
         )
     }
 
-    /// The launcher instruction, when breakaway was provably rejected.
-    pub(crate) fn breakaway_refusal(&self) -> Option<&'static str> {
+    /// The Chinese doctor-row instruction when breakaway was provably
+    /// rejected.
+    pub(crate) fn breakaway_instruction(&self) -> Option<&'static str> {
         matches!(self.breakaway, Breakaway::Rejected).then_some(
             "启动器拒绝 breakaway 子进程（`cargo run` 或外层 job 对象会造成这种限制）。\
              请直接运行 codex.exe，而不是通过限制 job 的启动器。",
         )
     }
 
-    /// The control-socket instruction, when the path cannot be used.
-    pub(crate) fn socket_refusal(&self) -> Option<String> {
+    /// The Chinese doctor-row instruction when the control path cannot be
+    /// used. The display layer is deliberately separate from the canonical
+    /// [`CodexError`] `start_refusal` returns.
+    pub(crate) fn socket_instruction(&self) -> Option<String> {
         match &self.socket {
             SocketBudget::Fits { .. } => None,
             SocketBudget::TooLong { path, length, limit } => Some(format!(
@@ -140,66 +157,130 @@ impl Preconditions {
         }
     }
 
-    /// Whether the read-only diagnosis may run. An elevated token and an
-    /// unusable control path both make the diagnostic meaningless — and the
-    /// path must be refused **before** the proxy child is spawned.
+    /// Whether the read-only diagnosis may run.
+    ///
+    /// An elevated token blocks it: the daemon it would describe cannot exist
+    /// under this token, and the path must be refused **before** the proxy
+    /// child is spawned. An **unknown** elevation still allows the read-only
+    /// diagnosis — attaching to an existing daemon writes nothing and is the
+    /// one thing that can still answer — but is never reported as a pass and
+    /// never allows a start.
     pub(crate) fn allows_diagnostics(&self) -> bool {
-        self.elevation_refusal().is_none() && self.socket_refusal().is_none()
+        !matches!(self.elevation, Elevation::Elevated) && self.socket_instruction().is_none()
     }
 
-    /// The first reason a start is refused, in the order the doctor rows
-    /// report them. `None` when the machine satisfies every precondition.
-    #[cfg(any(windows, test))]
-    pub(crate) fn start_refusal(&self) -> Option<String> {
-        self.elevation_refusal()
-            .map(str::to_string)
-            .or_else(|| self.socket_refusal())
-            .or_else(|| self.breakaway_refusal().map(str::to_string))
+    /// The canonical error a start is refused with, in the order the doctor
+    /// rows report it. `None` when the machine satisfies every precondition.
+    ///
+    /// The path cases reuse the errors ticket #950 introduced, so the message
+    /// a start prints and the message the rest of the adapter prints cannot
+    /// drift. The elevation and launcher cases are English like every other
+    /// `CodexError`; the Chinese instructions live in the doctor rows above.
+    pub(crate) fn start_refusal(&self) -> Option<CodexError> {
+        match &self.elevation {
+            Elevation::Elevated => {
+                return Some(CodexError::WindowsPrecondition(
+                    "the process token is elevated; shared clients must not inherit \
+                     administrator privileges — start cola from a non-elevated terminal"
+                        .to_string(),
+                ));
+            }
+            Elevation::Unknown(detail) => {
+                return Some(CodexError::WindowsPrecondition(format!(
+                    "the process token's elevation could not be read ({detail}); refusing to \
+                     start a daemon without establishing that the token is non-elevated"
+                )));
+            }
+            Elevation::NotElevated => {}
+        }
+
+        match &self.socket {
+            SocketBudget::TooLong { path, length, limit } => {
+                return Some(CodexError::ControlSocketPathTooLong {
+                    path: path.clone(),
+                    length: *length,
+                    limit: *limit,
+                });
+            }
+            SocketBudget::Unusable { path, detail } => {
+                return Some(CodexError::DaemonSocket {
+                    socket: path.clone(),
+                    detail: detail.clone(),
+                });
+            }
+            SocketBudget::Fits { .. } => {}
+        }
+
+        match self.breakaway {
+            Breakaway::Rejected => Some(CodexError::WindowsPrecondition(
+                "the launcher prevents a breakaway child (for example `cargo run` or an outer \
+                 job object); run codex.exe directly"
+                    .to_string(),
+            )),
+            Breakaway::Allowed | Breakaway::Unavailable(_) | Breakaway::Skipped(_) => None,
+        }
     }
 }
 
 /// Probe the machine's Windows daemon preconditions. Windows only: every other
 /// platform publishes a symlink into a short runtime directory, has no token
 /// elevation, and has no job object, so there is nothing to report.
+///
+/// The order is deliberate: the pure socket-budget check runs first, then the
+/// token query, and the breakaway **spawn** runs only when neither of those
+/// already blocks the diagnosis and the start. An over-budget path or an
+/// elevated token therefore never pays a `CreateProcess`.
 #[cfg(windows)]
 pub(crate) fn probe(environment: &Environment) -> Preconditions {
+    let socket = socket_budget(&environment.socket(), WINDOWS_SOCKET_PATH_LIMIT);
+    let elevation = probe_elevation();
+    let breakaway = match (&elevation, &socket) {
+        (Elevation::Elevated, _) => Breakaway::Skipped("令牌已提升".to_string()),
+        (_, SocketBudget::TooLong { .. } | SocketBudget::Unusable { .. }) => {
+            Breakaway::Skipped("控制套接字路径不可用".to_string())
+        }
+        _ => probe_breakaway(),
+    };
     Preconditions {
-        elevation: probe_elevation(),
-        breakaway: probe_breakaway(),
-        socket: socket_budget(&environment.socket(), WINDOWS_SOCKET_PATH_LIMIT),
+        elevation,
+        breakaway,
+        socket,
     }
 }
 
-/// `GetTokenInformation(TokenElevation)` through a safe wrapper. The wrapper
-/// reports "not elevated" when the query fails; there is no error channel to
-/// carry, and a false pass here is the same answer the daemon's own check
-/// would reach only if its query also failed.
+/// `GetTokenInformation(TokenElevation)` through the first-party safe wrapper.
+/// A failed query is [`Elevation::Unknown`], never a silent "not elevated".
 #[cfg(windows)]
 fn probe_elevation() -> Elevation {
-    if is_elevated::is_elevated() {
-        Elevation::Elevated
-    } else {
-        Elevation::NotElevated
+    match win_elevation::token_elevation() {
+        Ok(true) => Elevation::Elevated,
+        Ok(false) => Elevation::NotElevated,
+        Err(detail) => Elevation::Unknown(detail),
     }
 }
 
 /// Classify a resolved control path against an AF_UNIX address budget.
 ///
 /// Delegates to [`socket_path_budget`], which [`Environment::check_socket_budget`]
-/// also uses, so the doctor row and the pre-spawn gate can never disagree.
+/// also uses, so the doctor row and the pre-spawn gate can never disagree. The
+/// path reported here is the **canonical** path upstream binds, not the
+/// published spelling — see [`measured_socket_path`].
 #[cfg(any(windows, test))]
 pub(crate) fn socket_budget(socket: &Path, limit: usize) -> SocketBudget {
     match socket_path_budget(socket, limit) {
-        Ok(()) => SocketBudget::Fits {
-            path: socket.display().to_string(),
-            length: socket.to_str().map(str::len).unwrap_or_default(),
-            limit,
-        },
+        Ok(()) => {
+            let measured = measured_socket_path(socket);
+            SocketBudget::Fits {
+                path: measured.display().to_string(),
+                length: measured.to_str().map(str::len).unwrap_or_default(),
+                limit,
+            }
+        }
         Err(CodexError::ControlSocketPathTooLong { path, length, limit }) => {
             SocketBudget::TooLong { path, length, limit }
         }
         Err(error) => SocketBudget::Unusable {
-            path: socket.display().to_string(),
+            path: measured_socket_path(socket).display().to_string(),
             detail: error.to_string(),
         },
     }
@@ -221,15 +302,14 @@ enum SpawnAttempt {
 /// `CreateProcess`'s `ERROR_ACCESS_DENIED` is ambiguous on its own: it can mean
 /// the file cannot execute, or that the job forbids breakaway. The retry
 /// without `CREATE_BREAKAWAY_FROM_JOB` disambiguates it — only a succeeding
-/// retry proves the job is the restriction.
+/// retry proves the job is the restriction. A retry that is also denied is not
+/// proof, so it stays unavailable.
 #[cfg(any(windows, test))]
 fn classify_breakaway(first: SpawnAttempt, retry: Option<SpawnAttempt>) -> Breakaway {
     match (first, retry) {
         (SpawnAttempt::Spawned, _) => Breakaway::Allowed,
         (SpawnAttempt::AccessDenied, Some(SpawnAttempt::Spawned)) => Breakaway::Rejected,
         (SpawnAttempt::AccessDenied, Some(SpawnAttempt::Failed(detail))) => Breakaway::Unavailable(detail),
-        // The retry without breakaway was also denied, or never ran: the job
-        // cannot be named as the cause, so this is an unavailable probe.
         (SpawnAttempt::AccessDenied, Some(SpawnAttempt::AccessDenied))
         | (SpawnAttempt::AccessDenied, None) => {
             Breakaway::Unavailable("the probe could not spawn without CREATE_BREAKAWAY_FROM_JOB".to_string())
@@ -247,7 +327,9 @@ fn classify_breakaway(first: SpawnAttempt, retry: Option<SpawnAttempt>) -> Break
 fn probe_breakaway() -> Breakaway {
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
-        Err(error) => return Breakaway::Unavailable(format!("cannot resolve the probe executable: {error}")),
+        Err(error) => {
+            return Breakaway::Unavailable(format!("cannot resolve the probe executable: {error}"));
+        }
     };
     let first = spawn_suspended(&executable, /*breakaway*/ true);
     let retry = matches!(first, SpawnAttempt::AccessDenied)
@@ -256,6 +338,10 @@ fn probe_breakaway() -> Breakaway {
 }
 
 /// One suspended spawn attempt, reaped before returning.
+///
+/// A failed `kill` is returned as a failure and the child is dropped rather
+/// than waited on: it is `CREATE_SUSPENDED`, so a wait would never return while
+/// the lifecycle pass lock is held. That matches upstream's shape.
 #[cfg(windows)]
 fn spawn_suspended(executable: &Path, breakaway: bool) -> SpawnAttempt {
     use std::os::windows::process::CommandExt;
@@ -272,13 +358,16 @@ fn spawn_suspended(executable: &Path, breakaway: bool) -> SpawnAttempt {
     command.creation_flags(flags);
     match command.spawn() {
         Ok(mut child) => {
-            // A suspended child cannot have done anything, and it must not be
-            // left behind: terminate it, then reap the handle.
             if let Err(error) = child.kill() {
-                tracing::warn!("the breakaway launch probe could not be terminated: {error}");
+                // Do not wait: a suspended child never exits on its own.
+                return SpawnAttempt::Failed(format!(
+                    "the suspended launch probe could not be terminated: {error}"
+                ));
             }
             if let Err(error) = child.wait() {
-                tracing::warn!("the breakaway launch probe could not be reaped: {error}");
+                return SpawnAttempt::Failed(format!(
+                    "the suspended launch probe could not be reaped: {error}"
+                ));
             }
             SpawnAttempt::Spawned
         }
@@ -337,6 +426,18 @@ mod tests {
         assert_eq!(rendered, "a".repeat(108));
     }
 
+    /// A non-UTF-8 path cannot be a Winsock AF_UNIX address; it is reported as
+    /// unusable rather than measured with a lossy conversion.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_control_path_is_unusable() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"/tmp/\xff-control.sock"));
+        assert!(matches!(socket_budget(path, 108), SocketBudget::Unusable { .. }));
+    }
+
     /// An elevated token fails the check with the non-elevated-terminal
     /// instruction, and neither diagnostics nor a start may follow.
     #[test]
@@ -344,8 +445,28 @@ mod tests {
         let pre = preconditions(Elevation::Elevated, Breakaway::Allowed, fits());
         assert!(!pre.allows_diagnostics());
         let refusal = pre.start_refusal().expect("a refusal");
-        assert!(refusal.contains("非管理员终端"), "{refusal}");
-        assert!(refusal.contains("管理员权限"), "{refusal}");
+        assert!(matches!(refusal, CodexError::WindowsPrecondition(_)));
+        let message = refusal.to_string();
+        assert!(message.contains("non-elevated"), "{message}");
+        assert!(message.contains("administrator privileges"), "{message}");
+    }
+
+    /// An unqueryable token is **not** a non-elevated one: doctor warns, a
+    /// read-only diagnosis may still run, and a start is refused.
+    #[test]
+    fn an_unknown_elevation_allows_diagnostics_but_refuses_a_start() {
+        let pre = preconditions(
+            Elevation::Unknown("OpenProcessToken failed: access denied".into()),
+            Breakaway::Allowed,
+            fits(),
+        );
+        assert!(pre.allows_diagnostics());
+        let refusal = pre.start_refusal().expect("a refusal");
+        assert!(matches!(refusal, CodexError::WindowsPrecondition(_)));
+        let message = refusal.to_string();
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(message.contains("access denied"), "{message}");
+        assert!(message.contains("refusing"), "{message}");
     }
 
     /// A launcher restriction is a start precondition, not an attach one: an
@@ -355,21 +476,38 @@ mod tests {
         let pre = preconditions(Elevation::NotElevated, Breakaway::Rejected, fits());
         assert!(pre.allows_diagnostics());
         let refusal = pre.start_refusal().expect("a refusal");
-        assert!(refusal.contains("cargo run"), "{refusal}");
-        assert!(refusal.contains("job 对象"), "{refusal}");
-        assert!(refusal.contains("codex.exe"), "{refusal}");
+        let message = refusal.to_string();
+        assert!(message.contains("cargo run"), "{message}");
+        assert!(message.contains("job object"), "{message}");
+        assert!(message.contains("codex.exe"), "{message}");
     }
 
-    /// An over-budget path is refused before anything is spawned, and the
-    /// instruction names the setting to shorten.
+    /// A skipped probe is not a rejection: it says why it did not run and
+    /// never refuses a start beyond the precondition that skipped it.
+    #[test]
+    fn a_skipped_breakaway_is_not_a_rejection() {
+        let pre = preconditions(
+            Elevation::NotElevated,
+            Breakaway::Skipped("control path unusable".into()),
+            fits(),
+        );
+        assert!(pre.allows_diagnostics());
+        assert!(pre.start_refusal().is_none());
+        assert!(pre.breakaway_instruction().is_none());
+    }
+
+    /// An over-budget path is refused before anything is spawned, with the
+    /// canonical #950 error, and the instruction names the setting to shorten.
     #[test]
     fn an_over_budget_socket_blocks_before_any_spawn() {
         let socket = socket_budget(Path::new(&"b".repeat(108)), 108);
         let pre = preconditions(Elevation::NotElevated, Breakaway::Allowed, socket);
         assert!(!pre.allows_diagnostics());
         let refusal = pre.start_refusal().expect("a refusal");
-        assert!(refusal.contains("CODEX_HOME"), "{refusal}");
-        assert!(refusal.contains("108"), "{refusal}");
+        assert!(matches!(refusal, CodexError::ControlSocketPathTooLong { .. }));
+        let message = refusal.to_string();
+        assert!(message.contains("CODEX_HOME"), "{message}");
+        assert!(message.contains("108"), "{message}");
     }
 
     /// The retry is what separates "job forbids breakaway" from "this file
@@ -391,6 +529,15 @@ mod tests {
             ),
             Breakaway::Unavailable(detail) if detail.contains("cannot execute")
         ));
+        // A retry that is also denied proves nothing about the job.
+        assert!(matches!(
+            classify_breakaway(
+                SpawnAttempt::AccessDenied,
+                Some(SpawnAttempt::AccessDenied)
+            ),
+            Breakaway::Unavailable(detail)
+                if detail.contains("without CREATE_BREAKAWAY_FROM_JOB")
+        ));
         assert!(matches!(
             classify_breakaway(SpawnAttempt::Failed("no such file".into()), None),
             Breakaway::Unavailable(detail) if detail.contains("no such file")
@@ -407,6 +554,6 @@ mod tests {
         );
         assert!(pre.allows_diagnostics());
         assert!(pre.start_refusal().is_none());
-        assert!(pre.breakaway_refusal().is_none());
+        assert!(pre.breakaway_instruction().is_none());
     }
 }

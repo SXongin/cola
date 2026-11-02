@@ -671,36 +671,15 @@ async fn doctor_checks(
             format!("{} (kind = {})", active.id, active.kind.as_str()),
         ));
     }
-    match active.as_ref().map(|active| active.kind) {
-        Some(config::ClientKind::Codex) => {
-            let preconditions = codex_preconditions();
-            checks.extend(codex_checks(client, check_turn, preconditions.as_ref()).await);
-        }
-        // The OpenCode rows are unchanged (ADR-0081): the client-scoped rows
-        // are additive, and a broken/unsupported config keeps its old report.
-        _ => {
-            checks.push(opencode_binary_check());
-
-            let server = probe_server(client).await;
-            match &server {
-                Some(s) => match &s.generation {
-                    Some(g) => checks.push(Check::pass(
-                        "共享 OpenCode 服务器",
-                        format!("{} (世代 {g})", s.url),
-                    )),
-                    None => checks.push(Check::warn(
-                        "共享 OpenCode 服务器",
-                        format!("{} 世代未知：{}", s.url, s.evidence),
-                    )),
-                },
-                None => checks.push(Check::warn(
-                    "共享 OpenCode 服务器",
-                    "未发现（federated 服务器未运行；LAZY 启动或 attach-only）".to_string(),
-                )),
-            }
-            checks.push(multiple_servers_check(server.as_ref()));
-        }
-    }
+    let kind = active.as_ref().map(|active| active.kind);
+    let start_expected = active
+        .as_ref()
+        .and_then(|active| active.codex())
+        .is_none_or(|codex| codex.start_server.spawns_when_needed());
+    let preconditions = matches!(kind, Some(config::ClientKind::Codex))
+        .then(codex_preconditions)
+        .flatten();
+    checks.extend(client_branch_checks(kind, client, check_turn, start_expected, preconditions).await);
 
     checks.push(lock_check(crate::lock_state()));
     checks.push(log_check(log_path));
@@ -739,6 +718,51 @@ async fn doctor_checks(
     checks
 }
 
+/// The client-kind dispatch of [`doctor_checks`], split out so the Codex
+/// branch — including the probe-to-row plumbing — is testable without the
+/// config and Feishu checks. `start_expected` is the active Codex client's
+/// `start_server` policy: when it is `never`, a rejected breakaway cannot fail
+/// a run cola never starts a daemon for.
+async fn client_branch_checks(
+    kind: Option<config::ClientKind>,
+    client: Option<&dyn Backend>,
+    check_turn: bool,
+    start_expected: bool,
+    preconditions: Option<Preconditions>,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    match kind {
+        Some(config::ClientKind::Codex) => {
+            checks.extend(codex_checks(client, check_turn, start_expected, preconditions.as_ref()).await);
+        }
+        // The OpenCode rows are unchanged (ADR-0081): the client-scoped rows
+        // are additive, and a broken/unsupported config keeps its old report.
+        _ => {
+            checks.push(opencode_binary_check());
+
+            let server = probe_server(client).await;
+            match &server {
+                Some(s) => match &s.generation {
+                    Some(g) => checks.push(Check::pass(
+                        "共享 OpenCode 服务器",
+                        format!("{} (世代 {g})", s.url),
+                    )),
+                    None => checks.push(Check::warn(
+                        "共享 OpenCode 服务器",
+                        format!("{} 世代未知：{}", s.url, s.evidence),
+                    )),
+                },
+                None => checks.push(Check::warn(
+                    "共享 OpenCode 服务器",
+                    "未发现（federated 服务器未运行；LAZY 启动或 attach-only）".to_string(),
+                )),
+            }
+            checks.push(multiple_servers_check(server.as_ref()));
+        }
+    }
+    checks
+}
+
 /// The Windows daemon preconditions, when this is a Windows build (spec #948,
 /// ticket #952). Every other platform has none: macOS and Linux publish the
 /// control socket as a symlink into a short runtime directory, and neither has
@@ -757,15 +781,29 @@ fn codex_preconditions() -> Option<Preconditions> {
 
 /// The three Windows preconditions as doctor rows, each with one actionable
 /// sentence on failure.
-fn windows_precondition_checks(preconditions: &Preconditions) -> Vec<Check> {
+///
+/// `start_expected` is the active Codex client's `start_server` policy. When
+/// it is `never`, cola will not spawn a daemon, so a launcher that rejects
+/// breakaway is a warning rather than a failure — it cannot break a run cola
+/// never starts.
+fn windows_precondition_checks(preconditions: &Preconditions, start_expected: bool) -> Vec<Check> {
     let mut checks = Vec::with_capacity(3);
-    checks.push(match preconditions.elevation {
+    checks.push(match &preconditions.elevation {
         Elevation::NotElevated => Check::pass("Windows 权限令牌", "非提升令牌（当前进程不是管理员）"),
         Elevation::Elevated => Check::fail(
             "Windows 权限令牌",
             preconditions
-                .elevation_refusal()
+                .elevation_instruction()
                 .expect("an elevated token carries its instruction"),
+        ),
+        // A failed token query is never a pass: nobody established that the
+        // daemon may inherit this token. Read-only diagnostics may still run.
+        Elevation::Unknown(detail) => Check::warn(
+            "Windows 权限令牌",
+            format!(
+                "无法读取当前进程的令牌提升状态：{detail}。无法证明它不是管理员；只读诊断仍会\
+                 运行，但不会尝试启动 daemon。请从非管理员终端启动 cola 后重试"
+            ),
         ),
     });
     checks.push(match &preconditions.breakaway {
@@ -773,11 +811,20 @@ fn windows_precondition_checks(preconditions: &Preconditions) -> Vec<Check> {
             "Windows 启动器",
             "允许创建 breakaway 子进程（`daemon start` 可以脱离启动器的 job）",
         ),
-        Breakaway::Rejected => Check::fail(
+        Breakaway::Rejected if start_expected => Check::fail(
             "Windows 启动器",
             preconditions
-                .breakaway_refusal()
+                .breakaway_instruction()
                 .expect("a rejected launcher carries its instruction"),
+        ),
+        Breakaway::Rejected => Check::warn(
+            "Windows 启动器",
+            format!(
+                "{}（`start_server = \"never\"`，cola 不会启动 daemon，因此只是警告）",
+                preconditions
+                    .breakaway_instruction()
+                    .expect("a rejected launcher carries its instruction")
+            ),
         ),
         // An unavailable probe is not a proven restriction: a failed spawn can
         // also mean the probe binary could not execute. Never claim the job is
@@ -786,16 +833,22 @@ fn windows_precondition_checks(preconditions: &Preconditions) -> Vec<Check> {
             "Windows 启动器",
             format!("无法执行 breakaway 探测：{detail}；这不影响 attach 到已有 daemon"),
         ),
+        // Not probed because the socket or token already blocks the start; no
+        // `CreateProcess` was paid.
+        Breakaway::Skipped(reason) => Check::warn(
+            "Windows 启动器",
+            format!("未执行 breakaway 探测：{reason}（前置条件已阻止启动 daemon）"),
+        ),
     });
     checks.push(match &preconditions.socket {
         SocketBudget::Fits { path, length, limit } => Check::pass(
             "Windows 控制套接字路径",
-            format!("`{path}` 共 {length} 字节（上限 {limit} 字节，含终止 NUL）"),
+            format!("按 daemon 的规范化路径测量：`{path}` 共 {length} 字节（上限 {limit} 字节，含终止 NUL）"),
         ),
         SocketBudget::TooLong { .. } | SocketBudget::Unusable { .. } => Check::fail(
             "Windows 控制套接字路径",
             preconditions
-                .socket_refusal()
+                .socket_instruction()
                 .expect("an unusable control path carries its instruction"),
         ),
     });
@@ -813,11 +866,12 @@ fn windows_precondition_checks(preconditions: &Preconditions) -> Vec<Check> {
 async fn codex_checks(
     client: Option<&dyn Backend>,
     check_turn: bool,
+    start_expected: bool,
     preconditions: Option<&Preconditions>,
 ) -> Vec<Check> {
     let mut checks = Vec::new();
     if let Some(preconditions) = preconditions {
-        checks.extend(windows_precondition_checks(preconditions));
+        checks.extend(windows_precondition_checks(preconditions, start_expected));
         if !preconditions.allows_diagnostics() {
             checks.push(Check::warn(
                 "Codex 诊断",
@@ -1939,9 +1993,11 @@ kind = "codex"
     }
 
     fn fitting_socket() -> SocketBudget {
+        let path = r"C:\Users\u\.codex\app-server-control\app-server-control.sock".to_string();
+        let length = path.len();
         SocketBudget::Fits {
-            path: r"C:\Users\u\.codex\app-server-control\app-server-control.sock".into(),
-            length: 66,
+            path,
+            length,
             limit: 108,
         }
     }
@@ -1958,7 +2014,7 @@ kind = "codex"
                 limit: 108,
             },
         );
-        let checks = windows_precondition_checks(&blocked);
+        let checks = windows_precondition_checks(&blocked, true);
         assert_eq!(checks.len(), 3);
         assert!(checks.iter().all(|check| check.status == CheckStatus::Fail));
         let token = checks
@@ -1981,8 +2037,18 @@ kind = "codex"
         assert!(socket.detail.contains("108"), "{}", socket.detail);
 
         let healthy = windows_preconditions(Elevation::NotElevated, Breakaway::Allowed, fitting_socket());
-        let checks = windows_precondition_checks(&healthy);
+        let checks = windows_precondition_checks(&healthy, true);
         assert!(checks.iter().all(|check| check.status == CheckStatus::Pass));
+        let socket = checks
+            .iter()
+            .find(|check| check.label == "Windows 控制套接字路径")
+            .expect("the socket row");
+        assert!(
+            socket.detail.contains("规范化路径"),
+            "the measured spelling is named: {}",
+            socket.detail
+        );
+
         // An unproven launcher is a warning, never a failure: the probe could
         // not run, so the job is not named as the cause.
         let unproven = windows_preconditions(
@@ -1990,12 +2056,115 @@ kind = "codex"
             Breakaway::Unavailable("spawn failed".into()),
             fitting_socket(),
         );
-        let launcher = windows_precondition_checks(&unproven)
+        let launcher = windows_precondition_checks(&unproven, true)
             .into_iter()
             .find(|check| check.label == "Windows 启动器")
             .expect("the launcher row");
         assert_eq!(launcher.status, CheckStatus::Warn);
         assert!(!launcher.detail.contains("cargo run"), "{}", launcher.detail);
+
+        // A skipped probe says so and never names the job as the cause.
+        let skipped = windows_preconditions(
+            Elevation::NotElevated,
+            Breakaway::Skipped("控制套接字路径不可用".into()),
+            fitting_socket(),
+        );
+        let launcher = windows_precondition_checks(&skipped, true)
+            .into_iter()
+            .find(|check| check.label == "Windows 启动器")
+            .expect("the launcher row");
+        assert_eq!(launcher.status, CheckStatus::Warn);
+        assert!(launcher.detail.contains("未执行"), "{}", launcher.detail);
+    }
+
+    /// An unreadable token is a warning (never the ✅ a failed query used to
+    /// produce), and it does not block the read-only diagnosis.
+    #[tokio::test]
+    async fn an_unknown_token_warns_and_keeps_the_read_only_diagnosis() {
+        let mut mock = crate::bridge::test_support::MockBackend::new(Vec::new());
+        mock.client_report = Some(codex_report(ClientState::Attached, vec![attached_user(7)]));
+        let preconditions = windows_preconditions(
+            Elevation::Unknown("OpenProcessToken failed: access denied".into()),
+            Breakaway::Allowed,
+            fitting_socket(),
+        );
+        let checks = codex_checks(Some(&mock), false, true, Some(&preconditions)).await;
+        let token = checks
+            .iter()
+            .find(|check| check.label == "Windows 权限令牌")
+            .expect("the token row");
+        assert_eq!(token.status, CheckStatus::Warn);
+        assert!(token.detail.contains("access denied"), "{}", token.detail);
+        assert!(
+            checks.iter().any(|check| check.label == "Codex daemon"),
+            "the read-only report still runs: {checks:?}"
+        );
+    }
+
+    /// A rejected breakaway fails only when `start_server` would let cola start
+    /// the daemon; `never` keeps it a warning and doctor passing.
+    #[tokio::test]
+    async fn a_rejected_launcher_fails_only_when_a_start_is_expected() {
+        let mut mock = crate::bridge::test_support::MockBackend::new(Vec::new());
+        mock.client_report = Some(report_with_agent_questions("enabled"));
+        let preconditions =
+            windows_preconditions(Elevation::NotElevated, Breakaway::Rejected, fitting_socket());
+
+        let checks = codex_checks(Some(&mock), false, true, Some(&preconditions)).await;
+        let launcher = checks
+            .iter()
+            .find(|check| check.label == "Windows 启动器")
+            .expect("the launcher row");
+        assert_eq!(launcher.status, CheckStatus::Fail);
+        assert!(!doctor_ok(&checks), "{checks:?}");
+
+        let checks = codex_checks(Some(&mock), false, false, Some(&preconditions)).await;
+        let launcher = checks
+            .iter()
+            .find(|check| check.label == "Windows 启动器")
+            .expect("the launcher row");
+        assert_eq!(launcher.status, CheckStatus::Warn);
+        assert!(
+            launcher.detail.contains("start_server = \"never\""),
+            "{}",
+            launcher.detail
+        );
+        assert!(doctor_ok(&checks), "{checks:?}");
+        let daemon = checks
+            .iter()
+            .find(|check| check.label == "Codex daemon")
+            .expect("the daemon row still runs");
+        assert_eq!(daemon.status, CheckStatus::Pass);
+    }
+
+    /// The Windows probe is wired into the doctor client branch rather than
+    /// only hand-built [`Preconditions`] being rendered.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_windows_probe_reaches_the_doctor_branch() {
+        let preconditions = codex_preconditions().expect("Windows probes its preconditions");
+        let checks = client_branch_checks(
+            Some(config::ClientKind::Codex),
+            None,
+            false,
+            true,
+            Some(preconditions),
+        )
+        .await;
+        for label in ["Windows 权限令牌", "Windows 启动器", "Windows 控制套接字路径"] {
+            assert!(
+                checks.iter().any(|check| check.label == label),
+                "missing {label}: {checks:?}"
+            );
+        }
+    }
+
+    /// Non-Windows builds keep the old rows exactly: the probe has nothing to
+    /// report, so the Codex branch has no Windows rows.
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_builds_have_no_windows_preconditions() {
+        assert!(codex_preconditions().is_none());
     }
 
     /// An elevated token reports ❌ and stops the Codex branch before any
@@ -2009,7 +2178,7 @@ kind = "codex"
             cleanup: None,
         });
         let preconditions = windows_preconditions(Elevation::Elevated, Breakaway::Allowed, fitting_socket());
-        let checks = codex_checks(Some(&mock), true, Some(&preconditions)).await;
+        let checks = codex_checks(Some(&mock), true, true, Some(&preconditions)).await;
         assert!(!doctor_ok(&checks), "{checks:?}");
         assert!(
             checks.iter().all(|check| check.label != "Codex daemon"),
@@ -2041,7 +2210,7 @@ kind = "codex"
                 limit: 108,
             },
         );
-        let checks = codex_checks(Some(&mock), false, Some(&preconditions)).await;
+        let checks = codex_checks(Some(&mock), false, true, Some(&preconditions)).await;
         assert!(!doctor_ok(&checks), "{checks:?}");
         assert!(
             checks.iter().all(|check| check.label != "Codex daemon"),
@@ -2053,27 +2222,6 @@ kind = "codex"
             .expect("the socket row");
         assert_eq!(socket.status, CheckStatus::Fail);
         assert!(socket.detail.contains("CODEX_HOME"), "{}", socket.detail);
-    }
-
-    /// A launcher rejection fails the start precondition but does not block the
-    /// read-only attach diagnosis: an existing daemon can still be reported.
-    #[tokio::test]
-    async fn a_rejected_launcher_still_reports_an_existing_daemon() {
-        let mut mock = crate::bridge::test_support::MockBackend::new(Vec::new());
-        mock.client_report = Some(codex_report(ClientState::Attached, vec![attached_user(7)]));
-        let preconditions =
-            windows_preconditions(Elevation::NotElevated, Breakaway::Rejected, fitting_socket());
-        let checks = codex_checks(Some(&mock), false, Some(&preconditions)).await;
-        let launcher = checks
-            .iter()
-            .find(|check| check.label == "Windows 启动器")
-            .expect("the launcher row");
-        assert_eq!(launcher.status, CheckStatus::Fail);
-        let daemon = checks
-            .iter()
-            .find(|check| check.label == "Codex daemon")
-            .expect("the daemon row still runs");
-        assert_eq!(daemon.status, CheckStatus::Pass);
     }
 
     fn report_with_agent_questions(value: &str) -> ClientReport {

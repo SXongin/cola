@@ -31,6 +31,7 @@ use serde::Deserialize;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use super::error::{CodexError, Result};
+use super::preconditions::Preconditions;
 
 /// The daemon's control directory, relative to `CODEX_HOME`.
 pub(crate) const CONTROL_DIR: &str = "app-server-control";
@@ -330,24 +331,103 @@ fn open_attribute_handle_with(
     }
 }
 
+/// The path Winsock actually receives on Windows.
+///
+/// Upstream's Windows bind (`codex-uds`' `validate_private_socket_path`)
+/// canonicalises the socket **directory's parent** — resolving ancestor
+/// junctions — then joins the unchanged directory and socket names. The
+/// published spelling can therefore understate the AF_UNIX address, so the
+/// budget and the doctor row measure the same canonical form.
+///
+/// A path component that does not exist yet (a fresh `CODEX_HOME`) cannot be
+/// canonicalised directly; the nearest existing ancestor is resolved and the
+/// missing components are appended, which is what the daemon will see once it
+/// creates them. A path with no parent/name (a filesystem root) is returned
+/// unchanged.
+#[cfg(any(windows, test))]
+pub(crate) fn measured_socket_path(socket: &Path) -> PathBuf {
+    let Some(directory) = socket.parent() else {
+        return socket.to_path_buf();
+    };
+    let Some(home) = directory.parent() else {
+        return socket.to_path_buf();
+    };
+    let (Some(directory_name), Some(socket_name)) = (directory.file_name(), socket.file_name()) else {
+        return socket.to_path_buf();
+    };
+    match canonicalize_existing_prefix(home) {
+        Some(canonical) => canonical.join(directory_name).join(socket_name),
+        None => socket.to_path_buf(),
+    }
+}
+
+/// Canonicalise `path`, walking up to the nearest existing ancestor when the
+/// leaf does not exist yet.
+#[cfg(any(windows, test))]
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match std::fs::canonicalize(current) {
+            Ok(canonical) => {
+                let mut measured = normalize_verbatim_prefix(canonical);
+                for component in missing.iter().rev() {
+                    measured.push(component);
+                }
+                return Some(measured);
+            }
+            Err(_) => {
+                missing.push(current.file_name()?.to_os_string());
+                current = current.parent()?;
+            }
+        }
+    }
+}
+
+/// Drop the `\\?\` device prefix Rust's `canonicalize` can add, matching the
+/// normalised path upstream binds (`AbsolutePathBuf` strips it). The verbatim
+/// form is four bytes longer and would overstate the AF_UNIX address.
+#[cfg(windows)]
+fn normalize_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return PathBuf::from(rest);
+    }
+    path
+}
+
+#[cfg(all(not(windows), test))]
+fn normalize_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// Check a resolved control-socket path against an AF_UNIX address budget.
 ///
-/// The path must be UTF-8 and shorter than `limit` bytes; the terminating NUL
-/// is included in `limit` (the kernel copies the path verbatim, then the
-/// NUL-terminated string must fit `sun_path`). This is pure so the boundary and
-/// the non-UTF-8 arm are pinned on any platform.
+/// The path is first mapped to the canonical form upstream binds (see
+/// [`measured_socket_path`]). It must be UTF-8 and shorter than `limit` bytes;
+/// the terminating NUL is included in `limit` (the kernel copies the path
+/// verbatim, then the NUL-terminated string must fit `sun_path`). Pure enough
+/// to pin the boundary and the non-UTF-8 arm on any platform.
 #[cfg(any(windows, test))]
 pub(crate) fn socket_path_budget(socket: &Path, limit: usize) -> Result<()> {
-    let Some(text) = socket.to_str() else {
+    let measured = measured_socket_path(socket);
+    let Some(text) = measured.to_str() else {
         return Err(unusable_socket(
-            socket,
+            &measured,
             "the path is not valid UTF-8, which a unix-socket address requires",
         ));
     };
     let length = text.len();
     if length >= limit {
         return Err(CodexError::ControlSocketPathTooLong {
-            path: socket.display().to_string(),
+            path: measured.display().to_string(),
             length,
             limit,
         });
@@ -860,13 +940,28 @@ fn daemon_reports_running(info: &DaemonInfo) -> bool {
 pub(crate) async fn start(environment: &Environment) -> Result<DiscoveredDaemon> {
     environment.check_socket_budget()?;
     // Windows daemon preconditions, before the launcher runs (ticket #952): an
-    // elevated token or a job-restricted launcher makes `daemon start` fail
-    // silently at the TUI level, so the command is not attempted at all. The
-    // budget above keeps its more specific error; `cola doctor` renders the
-    // same refusal as a named row.
+    // elevated or unreadable token, a job-restricted launcher, or an unusable
+    // control path makes `daemon start` fail silently at the TUI level, so the
+    // command is not attempted at all. `start_after_preflight` holds the guard
+    // so a platform-neutral test can prove deleting it fails.
     #[cfg(windows)]
-    if let Some(reason) = super::preconditions::probe(environment).start_refusal() {
-        return Err(CodexError::WindowsPrecondition(reason));
+    let preconditions = Some(super::preconditions::probe(environment));
+    #[cfg(not(windows))]
+    let preconditions: Option<Preconditions> = None;
+    start_after_preflight(environment, preconditions).await
+}
+
+/// The start body after the platform's preconditions were probed.
+///
+/// Kept separate from [`start`] so the refusal is exercised on every platform,
+/// not only where the Win32 probe compiles: a test passes a blocked
+/// [`Preconditions`] and asserts the launcher never runs.
+async fn start_after_preflight(
+    environment: &Environment,
+    preconditions: Option<Preconditions>,
+) -> Result<DiscoveredDaemon> {
+    if let Some(refusal) = preconditions.as_ref().and_then(Preconditions::start_refusal) {
+        return Err(refusal);
     }
     let socket = environment.socket();
     // A socket path left behind by a crashed daemon is not a fresh one: the
@@ -2553,8 +2648,9 @@ mod tests {
             socket_ready_timeout: SOCKET_READY_TIMEOUT,
         };
         let socket = environment.socket();
+        let measured = measured_socket_path(&socket);
         assert!(
-            socket.as_os_str().len() >= WINDOWS_SOCKET_PATH_LIMIT,
+            measured.to_str().expect("a UTF-8 path").len() >= WINDOWS_SOCKET_PATH_LIMIT,
             "the fixture must overflow the budget"
         );
 
@@ -2566,15 +2662,15 @@ mod tests {
         assert_eq!(*limit, WINDOWS_SOCKET_PATH_LIMIT);
         assert!(message.contains(&limit.to_string()), "{message}");
         assert!(
-            message.contains(&socket.display().to_string()),
-            "the resolved path is in the message: {message}"
+            message.contains(&measured.display().to_string()),
+            "the measured path is in the message: {message}"
         );
         assert!(
             message.contains("CODEX_HOME"),
             "the instruction names the setting: {message}"
         );
-        assert_eq!(*length, socket.to_str().expect("a UTF-8 path").len());
-        assert_eq!(*path, socket.display().to_string());
+        assert_eq!(*length, measured.to_str().expect("a UTF-8 path").len());
+        assert_eq!(*path, measured.display().to_string());
     }
 
     /// `start` is where "before anything is spawned" is the actual guarantee.
@@ -2606,6 +2702,94 @@ mod tests {
             matches!(error, CodexError::ControlSocketPathTooLong { .. }),
             "{error}"
         );
+    }
+
+    /// The `start` refusal is load-bearing: delete the guard and this fake
+    /// launcher runs. The guard lives in the platform-neutral body so the test
+    /// runs on Linux too, where the Win32 probe itself does not compile.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn start_refuses_a_blocked_precondition_before_running_the_launcher() {
+        use crate::codex::preconditions::{Breakaway, Elevation, Preconditions, SocketBudget};
+
+        let root = crate::codex::test_server::socket_tempdir();
+        let environment = test_environment(&root.path().join("codex-home"));
+        std::fs::create_dir_all(environment.socket().parent().expect("control dir")).expect("control dir");
+        let marker = root.path().join("launcher-ran");
+        let cli = root.path().join("cli");
+        std::fs::write(&cli, format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()))
+            .expect("write a fake launcher");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755))
+                .expect("make the fake launcher executable");
+        }
+        let environment = Environment { cli, ..environment };
+        let socket = environment.socket();
+        let socket_text = socket.to_str().expect("a UTF-8 path").len();
+        let preconditions = Preconditions {
+            elevation: Elevation::Elevated,
+            breakaway: Breakaway::Allowed,
+            socket: SocketBudget::Fits {
+                path: socket.display().to_string(),
+                length: socket_text,
+                limit: 108,
+            },
+        };
+
+        let error = start_after_preflight(&environment, Some(preconditions))
+            .await
+            .expect_err("the blocked token refuses the start");
+        assert!(matches!(error, CodexError::WindowsPrecondition(_)), "{error}");
+        assert!(!marker.exists(), "the launcher must never run");
+
+        // The guard is what made that true: without preconditions the same
+        // environment reaches the launcher (which leaves no socket, so the
+        // start then fails by name).
+        let error = start_after_preflight(&environment, None)
+            .await
+            .expect_err("the launcher leaves no socket");
+        assert!(marker.exists(), "the launcher runs without the guard");
+        assert!(!matches!(error, CodexError::WindowsPrecondition(_)));
+    }
+
+    /// The budget measures the canonical path upstream binds, not the
+    /// published spelling.
+    #[cfg(unix)]
+    #[test]
+    fn the_budget_measures_the_canonical_socket_path() {
+        let root = crate::codex::test_server::socket_tempdir();
+        let real_home = root.path().join("real-home");
+        std::fs::create_dir_all(real_home.join(CONTROL_DIR)).expect("control dir");
+        let link_home = root.path().join("link-home");
+        std::os::unix::fs::symlink(&real_home, &link_home).expect("home symlink");
+        let published = link_home.join(CONTROL_DIR).join(CONTROL_SOCKET);
+
+        let measured = measured_socket_path(&published);
+        let expected = std::fs::canonicalize(&real_home)
+            .expect("canonical home")
+            .join(CONTROL_DIR)
+            .join(CONTROL_SOCKET);
+        assert_eq!(measured, expected);
+        assert_ne!(measured, published);
+        socket_path_budget(&published, 108).expect("the canonical path fits");
+    }
+
+    /// A home that does not exist yet is measured from its nearest existing
+    /// ancestor, so a fresh `CODEX_HOME` is still measured rather than skipped.
+    #[cfg(unix)]
+    #[test]
+    fn an_uncreated_home_is_measured_from_its_existing_ancestor() {
+        let root = crate::codex::test_server::socket_tempdir();
+        let home = root.path().join("not-created");
+        let socket = home.join(CONTROL_DIR).join(CONTROL_SOCKET);
+        let measured = measured_socket_path(&socket);
+        let expected = std::fs::canonicalize(root.path())
+            .expect("canonical root")
+            .join("not-created")
+            .join(CONTROL_DIR)
+            .join(CONTROL_SOCKET);
+        assert_eq!(measured, expected);
     }
 
     /// The explicit opt-out is the decisive signal, on a TUI only.
