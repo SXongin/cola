@@ -69,8 +69,10 @@ const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const SOCKET_READY_STEP: Duration = Duration::from_millis(100);
 
 /// How often the Windows readiness loop asks the management CLI whether a
-/// daemon answers, when the socket identity did not change. Windows may reuse
-/// a freed file index for a re-created socket, so identity alone is not proof.
+/// daemon answers, when the socket identity did not change. The creation time
+/// now defeats a re-created object with a reused index, but the identity is
+/// metadata, not proof that a server answers, so the CLI report stays a second
+/// signal.
 #[cfg(windows)]
 const WINDOWS_READY_PROBE_STEP: Duration = Duration::from_secs(1);
 
@@ -176,10 +178,13 @@ fn resolve_home(from_env: Option<PathBuf>, home_dir: Option<PathBuf>) -> Result<
 /// runtime directory, so the identity changes.
 ///
 /// Windows has no link to follow — the published path *is* the socket — and
-/// reads the same file object's `(volume serial number, file index)`. Those two
-/// fields are what Microsoft documents as reusable after the last handle
-/// closes, so a re-created socket is *not* guaranteed a new identity; [`start`]
-/// therefore also accepts a successful `daemon version` report on Windows.
+/// reads the same file object's `(volume serial number, file index, creation
+/// time)`. The first two are what Microsoft documents as reusable after the
+/// last handle closes; the creation timestamp is added so a re-created object
+/// cannot compare equal merely because NTFS reused its index. [`start`] still
+/// accepts a successful `daemon version` report on Windows as a second signal,
+/// because the identity is metadata about the object, not proof the server
+/// answers.
 ///
 /// A build with neither (an unsupported platform) is a named failure, not a
 /// panic and not a silent "absent".
@@ -193,6 +198,10 @@ pub(crate) struct SocketIdentity {
     volume_serial_number: u32,
     #[cfg(windows)]
     file_index: u64,
+    /// The file object's creation time (`FILETIME`), which a reused
+    /// volume/index pair does not reproduce after a delete and recreate.
+    #[cfg(windows)]
+    creation_time: Option<u64>,
 }
 
 /// A control path that exists but cannot be used, as the adapter's named error.
@@ -252,15 +261,16 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-/// The Windows identity: the volume serial number and file index of the object
-/// the published path names.
+/// The Windows identity: the volume serial number, file index and creation
+/// time of the object the published path names.
 ///
 /// `std::os::windows::fs::MetadataExt`'s `volume_serial_number` and
 /// `file_index` accessors are still nightly-only (`windows_by_handle`, Rust
 /// issue #63010), so this reads the same `BY_HANDLE_FILE_INFORMATION` fields
-/// through `winapi-util`'s safe wrapper. The handle is opened exactly as
-/// `std::fs::metadata` opens one: attributes only, so no read permission is
-/// required.
+/// through `winapi-util`'s safe wrapper. `creation_time` closes the documented
+/// index-reuse hole: a replacement cannot inherit the retired object's
+/// timestamp. The handle is opened exactly as `std::fs::metadata` opens one:
+/// attributes only, so no read permission is required.
 ///
 /// Windows exposes no stable "is an AF_UNIX socket" predicate (the socket is an
 /// NTFS reparse point whose tag belongs to `afunix.sys`), so a regular file at
@@ -299,6 +309,7 @@ fn windows_socket_identity_with(
     Ok(Some(SocketIdentity {
         volume_serial_number: info.volume_serial_number() as u32,
         file_index: info.file_index(),
+        creation_time: info.creation_time(),
     }))
 }
 
@@ -925,11 +936,11 @@ fn daemon_reports_running(info: &DaemonInfo) -> bool {
 /// Codex re-links the path into a fresh runtime directory, so a successful cold
 /// start always produces a new identity.
 ///
-/// Windows stores the socket at the published path, and its `(volume serial
-/// number, file index)` pair may be reused once the old file is gone, so an
-/// unchanged identity is not proof that no daemon started. The Windows loop
-/// therefore also accepts a successful `daemon version` report as the start
-/// signal: a corpse behind the path cannot answer it.
+/// Windows stores the socket at the published path. Its identity includes the
+/// creation time, so a re-created object differs even when NTFS reuses the
+/// volume/index pair; the Windows loop still accepts a successful `daemon
+/// version` report as a second start signal, because a corpse behind the path
+/// cannot answer it.
 ///
 /// The command is idempotent, though, and the identity can change *before* it
 /// runs (a replacement appearing while a failed dial was being decided): then
@@ -996,10 +1007,11 @@ async fn start_after_preflight(
         let probe_due = false;
         match start_tick(identity_changed, socket_present, probe_due, now >= deadline) {
             StartTick::ReadyByIdentity => return discovered_after_start(environment).await,
-            // Windows: a re-created socket can reuse the old file index, so ask
-            // the daemon itself. The probe is bounded by the time left before
-            // the deadline, and only runs when the path exists — a start that
-            // never produced a socket must not spawn the CLI at all.
+            // Windows: the identity now includes the creation time, but ask
+            // the daemon itself as the second signal. The probe is bounded by
+            // the time left before the deadline, and only runs when the path
+            // exists — a start that never produced a socket must not spawn the
+            // CLI at all.
             StartTick::Probe => {
                 #[cfg(windows)]
                 {
@@ -1674,9 +1686,10 @@ async fn collect_lsof_evidence(
 /// The kernel address(es) of the daemon's sockets bound to its control path,
 /// from the pid(s) that hold that socket open.
 ///
-/// `daemon` is normally a symlink into the daemon's runtime directory, and the
-/// socket is bound at the target, so both spellings are queried and compared.
-/// The pid query is the only way to name a daemon cola does not own — cola
+/// `daemon` is normally a symlink into the daemon's runtime directory, so the
+/// pid query tries the published path, its canonical form and the symlink's
+/// literal target (the verbatim bind spelling), keeping each once. The pid
+/// query is the only way to name a daemon cola does not own — cola
 /// deliberately keeps no daemon pid (ADR-0090 decision 3).
 ///
 /// A connected client's `->0x<addr>` names the peer it connected to. On Darwin
@@ -1691,12 +1704,26 @@ async fn daemon_socket_addresses(daemon: &Path, lsof: &LsofProgram) -> ProbeResu
         .to_string_lossy()
         .into_owned();
     // Query the published path first (the name the user's daemon is described
-    // by), then the physical path if that selected nothing. On macOS the
-    // control path is normally a symlink and `/tmp` is itself a symlink, so
-    // lsof and this process need not spell the socket the same way.
-    let mut pids = lsof_pids_for_path(daemon, lsof).await?;
-    if pids.is_empty() && target.as_str() != raw {
-        pids = lsof_pids_for_path(Path::new(&target), lsof).await?;
+    // by), then the physical path, then the literal symlink target. On Darwin
+    // lsof selects a socket by the **verbatim bind spelling**, which can be a
+    // third path when the daemon bound through a symlinked directory; the
+    // canonical path then cannot select it. Keep each spelling once, in this
+    // order, and stop at the first that selects a pid.
+    let mut spellings = vec![daemon.to_path_buf()];
+    if target.as_str() != raw {
+        spellings.push(PathBuf::from(&target));
+    }
+    if let Some(bound) = literal_link_target(daemon)
+        && !spellings.iter().any(|spelling| spelling == &bound)
+    {
+        spellings.push(bound);
+    }
+    let mut pids = Vec::new();
+    for spelling in &spellings {
+        pids = lsof_pids_for_path(spelling, lsof).await?;
+        if !pids.is_empty() {
+            break;
+        }
     }
     let mut addresses = Vec::new();
     for pid in pids {
@@ -1706,6 +1733,19 @@ async fn daemon_socket_addresses(daemon: &Path, lsof: &LsofProgram) -> ProbeResu
     addresses.sort();
     addresses.dedup();
     Ok(addresses)
+}
+
+/// The literal target a symlink stores, with a relative target resolved
+/// against the link's parent. **Not** canonicalised: lsof binds and reports
+/// this spelling, so it is the third `lsof -t` query for a control symlink.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn literal_link_target(path: &Path) -> Option<PathBuf> {
+    let target = std::fs::read_link(path).ok()?;
+    if target.is_absolute() {
+        Some(target)
+    } else {
+        Some(path.parent()?.join(target))
+    }
 }
 
 /// The pids `lsof` reports as holding `path` open.
@@ -2528,8 +2568,9 @@ mod tests {
         assert_eq!(WINDOWS_SOCKET_PATH_LIMIT, 108);
     }
 
-    /// The Windows identity is the same `(volume serial number, file index)`
-    /// pair for a file under two names; a rename is not a replacement.
+    /// The Windows identity is the same `(volume serial number, file index,
+    /// creation time)` triple for a file under two names; a rename is not a
+    /// replacement.
     #[cfg(windows)]
     #[test]
     fn a_windows_file_identity_survives_a_rename() {
@@ -2551,8 +2592,8 @@ mod tests {
     /// On Windows the published path is the socket itself, so a replacement is
     /// a different object at the same name. The old file is **renamed aside**
     /// rather than deleted first, so it still occupies its MFT record and the
-    /// new file cannot reuse the old index; that keeps the assertion
-    /// deterministic even though Microsoft documents the pair as reusable.
+    /// new file cannot reuse the old index. The creation time now guards the
+    /// reuse case too; the constructed test below pins that field directly.
     #[cfg(windows)]
     #[test]
     fn a_windows_replacement_is_a_different_identity() {
@@ -2575,6 +2616,48 @@ mod tests {
         std::fs::write(&socket, b"").expect("create the replacement");
         let second = socket_identity(&socket).expect("identity").expect("a file");
         assert_ne!(first, second, "a re-created path is a replacement");
+    }
+
+    /// A delete-and-recreate at the same path is a replacement, not the old
+    /// object. The creation time makes this hold even if NTFS reuses the
+    /// volume/index pair.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_recreated_file_differs_from_the_retired_one() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("app-server-control.sock");
+        std::fs::write(&socket, b"").expect("create the control path");
+        let first = socket_identity(&socket).expect("identity").expect("a file");
+        std::fs::remove_file(&socket).expect("remove the retired object");
+        // Move past a coarse creation-time tick so the fixture cannot make the
+        // two objects look identical for a reason unrelated to the field.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&socket, b"").expect("create the replacement");
+        let second = socket_identity(&socket).expect("identity").expect("a file");
+        assert_ne!(
+            first, second,
+            "a re-created file must differ even when the index is reused"
+        );
+    }
+
+    /// The creation time is part of equality: two objects with the same
+    /// volume/index pair but different creation times are different daemons.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_identity_includes_the_creation_time() {
+        let first = SocketIdentity {
+            volume_serial_number: 7,
+            file_index: 9,
+            creation_time: Some(100),
+        };
+        let recreated = SocketIdentity {
+            creation_time: Some(200),
+            ..first
+        };
+        assert_ne!(
+            first, recreated,
+            "a reused index must not hide a different creation time"
+        );
     }
 
     /// A directory cannot be a unix socket. This is the one type distinction
@@ -3183,6 +3266,52 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         );
     }
 
+    /// The `lsof -t` pid query must include the literal symlink target, not
+    /// only the published path and its canonical form: a daemon that bound
+    /// through a symlinked directory is selected by that third spelling alone.
+    /// The fake `lsof` matches only the bind spelling, so this fails unless the
+    /// collector queries it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_daemon_query_includes_the_literal_symlink_target() {
+        let root = tempfile::tempdir().expect("temp root");
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked dir");
+        let bind = link.join("control.sock");
+        std::fs::write(&bind, b"").expect("bind stand-in");
+        let published = root.path().join("app-server-control.sock");
+        std::os::unix::fs::symlink(&bind, &published).expect("published symlink");
+
+        assert_eq!(literal_link_target(&published), Some(bind.clone()));
+        assert_eq!(literal_link_target(&real), None, "a directory is not a link");
+
+        let bind_string = bind.to_string_lossy().into_owned();
+        let bind_query = format!("-t -U -a -- {bind_string}");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"-t\" ]; then\n\
+               if [ \"$*\" = {} ]; then echo 42; exit 0; fi\n\
+               exit 1\n\
+             fi\n\
+             if [ \"$1\" = \"-U\" ]; then\n\
+               echo 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'\n\
+               echo 'codex 42 me 11u unix 0x00000000000000bb 0t0 1 {}'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+            crate::codex::test_server::shell_single_quote(&bind_query),
+            crate::codex::test_server::shell_single_quote(&bind_string)
+        );
+        let (_root, program) = fake_lsof(&script);
+        let lsof = LsofProgram::Explicit(program);
+        let addresses = daemon_socket_addresses(&published, &lsof)
+            .await
+            .expect("the bind spelling selects the daemon pid");
+        assert_eq!(addresses, vec!["0xbb"]);
+    }
+
     /// `lsof` exits 1 when nothing matches, but a diagnostic on stderr is a
     /// failure, not a match. Exit 1 with no output at all is a clean no-match.
     #[cfg(unix)]
@@ -3581,7 +3710,10 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert_eq!(clients.unverified.len(), 1);
         let detail = &clients.unverified[0].detail;
         assert!(detail.contains("names no `--remote` endpoint"), "{detail}");
-        assert!(!detail.contains("argv names"), "{detail}");
+        assert!(
+            !detail.contains("argv names the daemon"),
+            "the scoped detail must not claim argv names the daemon: {detail}"
+        );
         assert!(detail.contains("not hard-proven"), "{detail}");
     }
 
