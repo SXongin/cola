@@ -517,10 +517,11 @@ cola 总是追加写入日志文件——默认 `~/.cola/cola.log`（不含 ANSI
 打开的套接字描述符（`/proc`、`ss`），macOS 上是 `lsof` 的 peer 地址配对——
 而不是只看 argv。Windows 上只能看到进程身份与 `--remote` argv，因此那里的
 本地客户端会被报告为 unverified，而不是已连接；上面的 Codex 平台章节解释了
-这意味着什么，并列出了 daemon 的前置条件。无法证明的 argv 匹配会给出警告，
-而带 `--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少 daemon
-同样判为失败——`start_server = "never"` 只是禁止 cola 启动 daemon；请自行
-运行 `codex app-server daemon start` 并让客户端指向它。完全没有本地客户端时
+这意味着什么，并列出了 app-server daemon 的前置条件。无法证明的 argv 匹配会
+给出警告，而带 `--no-daemon` 或指向其他端点的客户端会被明确判为失败。缺少
+app-server daemon 同样判为失败——`start_server = "never"` 只是禁止 cola 启动
+app-server daemon；请自行运行 `codex app-server daemon start` 并让客户端指向
+它。完全没有本地客户端时
 （纯 Feishu 部署）该检查通过，因为没有需要连接的对象。如果完全无法读取令牌
 的提升状态，doctor 会给出警告而不是通过，只运行只读诊断，并跳过真实回合
 探测，因此不会产生 provider 费用。
