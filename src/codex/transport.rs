@@ -22,7 +22,7 @@
 //! dial `Endpoint::Unix`, and the daemon cannot serve a WebSocket listener.
 //!
 //! The shipped control socket under `$CODEX_HOME/app-server-control/` is a
-//! **symlink** into `/tmp/codex-daemon-0/<hash>` on Unix (spec #948). The path
+//! **symlink** into `/tmp/codex-daemon-<uid>/<hash>` on Unix (spec #948). The path
 //! is handed to the proxy verbatim and never canonicalised: the OS follows the
 //! link at connect time, so a daemon that re-points it is picked up on the
 //! next attach.

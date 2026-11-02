@@ -112,7 +112,7 @@ pub(crate) enum CodexError {
     Probe(String),
 
     /// The binary used for the schema probe is not the binary the server runs.
-    /// A 0.163 CLI's schema says nothing about a 0.164 daemon.
+    /// A 0.165 CLI's schema says nothing about a 0.166 daemon.
     #[error(
         "codex binary `{binary}` reports {binary_version}, but the running app-server reports \
          {server_version}; probing a different binary would not describe the running server"
