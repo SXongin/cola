@@ -199,6 +199,123 @@ jobs:
         name: Live V2 suite
         run: cargo test --locked -- --ignored live_v2
 
+  live-codex-tier1:
+    # tier-1 of the Codex live contract (ticket #953): the real pinned 0.166.0
+    # binary starts `app-server --listen unix://<short path>` in an isolated
+    # `CODEX_HOME`, a scripted Responses provider answers the model protocol,
+    # and cola attaches through `codex app-server proxy`. Advisory at first
+    # (not part of the required ruleset). The docs-only and release/* skips
+    # gate the STEPS, not the job, so the check always reports under its
+    # matrix-expanded name.
+    name: Live Codex tier-1 (${{ matrix.os }})
+    needs: classify
+    if: always()
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: ./.github/actions/install-codex
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: Live Codex tier-1 suite
+        run: cargo test --locked -- --ignored live_codex_tier1
+      # The suite asserts its own cleanup; this is the CI-side proof. The
+      # random temp root always carries the `cola-cx` prefix.
+      - if: >-
+          always() &&
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: No live Codex process left behind
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            if tasklist | grep -qi 'codex'; then
+              tasklist | grep -i 'codex'
+              echo "the tier-1 suite left a live codex process behind" >&2
+              exit 1
+            fi
+          elif pgrep -fl 'cola-cx' >/dev/null; then
+            pgrep -fl 'cola-cx'
+            echo "the tier-1 suite left a live process behind" >&2
+            exit 1
+          fi
+
+  live-codex-tier2:
+    # tier-2 of the Codex live contract (ticket #953): the real managed daemon
+    # started by Codex itself — discovery through the control socket's symlink,
+    # the `daemon version` report, `start_server = "never"` refusing a start,
+    # `auto` starting one, and the restart refusal. Ubuntu and macOS only: the
+    # daemon refuses an elevated token, and hosted Windows runners are elevated.
+    # Advisory at first; the job name always reports, like Live V1/V2.
+    name: Live Codex tier-2 (${{ matrix.os }})
+    needs: classify
+    if: always()
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        uses: ./.github/actions/install-codex
+      - if: >-
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: Live Codex tier-2 suite
+        run: cargo test --locked -- --ignored live_codex_tier2
+      - if: >-
+          always() &&
+          needs.classify.outputs.heavy != 'false' &&
+          !startsWith(github.head_ref || '', 'release/')
+        name: No live Codex daemon left behind
+        shell: bash
+        run: |
+          set -euo pipefail
+          if pgrep -fl 'cola-t2' >/dev/null; then
+            pgrep -fl 'cola-t2'
+            echo "the tier-2 suite left a live process behind" >&2
+            exit 1
+          fi
+
   test:
     # Compile + test only on the other platforms: catches platform quirks
     # cheaply. Full release builds still run on all three in release.yml.

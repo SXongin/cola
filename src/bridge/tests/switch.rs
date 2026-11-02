@@ -2200,7 +2200,7 @@ async fn switch_forget_releases_only_this_chats_codex_subscription() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
         "thread-1",
         "session-root",
@@ -2258,7 +2258,7 @@ async fn switching_to_another_session_releases_the_previous_codex_subscription()
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
         "thread-1",
         "session-root",
@@ -2335,7 +2335,7 @@ async fn a_live_provider_pick_is_refused_with_no_request() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
         "thread-1",
         "session-root",
@@ -2386,7 +2386,7 @@ async fn an_unknown_channel_pick_is_recorded_model_only_with_no_request() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
         "thread-1",
         "session-root",
@@ -2449,7 +2449,7 @@ async fn a_neutral_bucket_pick_is_model_only() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
         "thread-1",
         "session-root",
@@ -2528,7 +2528,7 @@ async fn a_catalog_pick_stays_neutral_even_with_a_configured_codex_provider() {
     let _wd = test_work_dir();
     let dir = tempfile::tempdir().unwrap();
     let cfg = test_config(&dir.path().join("sessions.json"));
-    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+    let (server, url) = crate::codex::test_server::FakeServer::tcp("codex-tui/0.166.0 (test)").await;
     server.seed_thread(crate::codex::test_server::ScriptedThread::adopted(
         "thread-1",
         "session-root",

@@ -6,6 +6,8 @@
 //! the socket — no mock of the HTTP library — so the bytes under test are the
 //! production ones (ADR-0031). Compiled only for tests.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +46,14 @@ impl DynamicResponse {
 /// A per-request response builder for [`TestHttpServer::route_dynamic`].
 type DynamicHandler = Arc<dyn Fn(&RecordedRequest) -> DynamicResponse + Send + Sync>;
 
+/// A boxed future for [`TestHttpServer::route_async_dynamic`].
+type BoxFuture = Pin<Box<dyn Future<Output = DynamicResponse> + Send>>;
+
+/// A per-request asynchronous response builder. The handler gets the request by
+/// value so the future it returns can be `'static`: the live Codex suite holds
+/// one response open until the test interrupts the turn.
+type AsyncDynamicHandler = Arc<dyn Fn(RecordedRequest) -> BoxFuture + Send + Sync>;
+
 /// What a route answers with — one variant per registration method, so a route
 /// can never carry fields its answering mode does not use.
 enum RouteKind {
@@ -68,6 +78,9 @@ enum RouteKind {
     /// The response is built from the recorded request — for an endpoint whose
     /// answer depends on the request body (the live suite's scripted provider).
     Dynamic(DynamicHandler),
+    /// The response is built by an async handler, which may wait before
+    /// answering — a hanging model call the client can interrupt.
+    AsyncDynamic(AsyncDynamicHandler),
 }
 
 /// A route: a method + path-prefix matcher and what it answers with.
@@ -215,6 +228,22 @@ impl TestHttpServer {
         });
     }
 
+    /// Answer matching requests with an **async** handler that may wait before
+    /// producing the response, and sees the request by value. Used for a
+    /// model call the client must be able to interrupt while it is in flight.
+    pub fn route_async_dynamic<F, Fut>(&self, method: &str, path_prefix: &str, handler: F)
+    where
+        F: Fn(RecordedRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = DynamicResponse> + Send + 'static,
+    {
+        let handler: AsyncDynamicHandler = Arc::new(move |request| Box::pin(handler(request)));
+        self.state.routes.lock().unwrap().push(Route {
+            method: method.to_ascii_uppercase(),
+            path_prefix: path_prefix.to_string(),
+            kind: RouteKind::AsyncDynamic(handler),
+        });
+    }
+
     /// Answer matching requests from a script: one response per request, in
     /// order, the last repeating. For protocols where the client is expected
     /// to come back with a cursor (`list_sessions` follows `x-next-cursor`).
@@ -294,7 +323,26 @@ async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<ServerState
         return;
     };
     state.requests.lock().unwrap().push(request.clone());
-    let (status, content_type, headers, body, delay) = response_for(&state, &request);
+    let answer = response_for(&state, &request).await;
+    let (status, content_type, headers, body, delay) = match answer {
+        Answer::Ready {
+            status,
+            content_type,
+            headers,
+            body,
+            delay,
+        } => (status, content_type, headers, body, delay),
+        Answer::Deferred(future) => {
+            let response = future.await;
+            (
+                response.status,
+                response.content_type,
+                response.headers,
+                response.body,
+                Duration::ZERO,
+            )
+        }
+    };
     if !delay.is_zero() {
         tokio::time::sleep(delay).await;
     }
@@ -345,65 +393,83 @@ async fn read_request(reader: &mut tokio::io::BufReader<tokio::net::TcpStream>) 
     })
 }
 
-fn response_for(
-    state: &ServerState,
-    request: &RecordedRequest,
-) -> (u16, String, Vec<(String, String)>, Vec<u8>, Duration) {
-    let routes = state.routes.lock().unwrap();
-    let matched = routes
-        .iter()
-        .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
-        .max_by_key(|route| route.path_prefix.len());
-    match matched {
-        Some(route) => match &route.kind {
-            RouteKind::Dynamic(handler) => {
-                let response = handler(request);
-                (
-                    response.status,
-                    response.content_type,
-                    response.headers,
-                    response.body,
-                    Duration::ZERO,
-                )
+/// What a matched route answers with: immediately, or through a deferred
+/// future. Factored so no route-table lock is held across the await.
+enum Answer {
+    Ready {
+        status: u16,
+        content_type: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        delay: Duration,
+    },
+    Deferred(BoxFuture),
+}
+
+async fn response_for(state: &ServerState, request: &RecordedRequest) -> Answer {
+    let deferred = {
+        let routes = state.routes.lock().unwrap();
+        let matched = routes
+            .iter()
+            .filter(|route| route.method == request.method && request.path.starts_with(&route.path_prefix))
+            .max_by_key(|route| route.path_prefix.len());
+        match matched {
+            Some(route) => match &route.kind {
+                RouteKind::AsyncDynamic(handler) => Some(handler(request.clone())),
+                RouteKind::Dynamic(handler) => {
+                    let response = handler(request);
+                    return Answer::Ready {
+                        status: response.status,
+                        content_type: response.content_type,
+                        headers: response.headers,
+                        body: response.body,
+                        delay: Duration::ZERO,
+                    };
+                }
+                RouteKind::Script { responses, served } => {
+                    let index = served.fetch_add(1, Ordering::Relaxed).min(responses.len() - 1);
+                    let (headers, body) = &responses[index];
+                    return Answer::Ready {
+                        status: 200,
+                        content_type: "application/json".to_string(),
+                        headers: headers.clone(),
+                        body: body.clone(),
+                        delay: Duration::ZERO,
+                    };
+                }
+                RouteKind::Fixed {
+                    status,
+                    content_type,
+                    body,
+                    headers,
+                    delay,
+                } => {
+                    return Answer::Ready {
+                        status: *status,
+                        content_type: content_type.clone(),
+                        headers: headers.clone(),
+                        body: body.clone(),
+                        delay: *delay,
+                    };
+                }
+            },
+            None => {
+                return Answer::Ready {
+                    status: 404,
+                    content_type: "application/json".to_string(),
+                    headers: Vec::new(),
+                    body: serde_json::json!({
+                        "code": -1,
+                        "msg": format!("no route for {} {}", request.method, request.path),
+                    })
+                    .to_string()
+                    .into_bytes(),
+                    delay: Duration::ZERO,
+                };
             }
-            RouteKind::Script { responses, served } => {
-                let index = served.fetch_add(1, Ordering::Relaxed).min(responses.len() - 1);
-                let (headers, body) = &responses[index];
-                (
-                    200,
-                    "application/json".to_string(),
-                    headers.clone(),
-                    body.clone(),
-                    Duration::ZERO,
-                )
-            }
-            RouteKind::Fixed {
-                status,
-                content_type,
-                body,
-                headers,
-                delay,
-            } => (
-                *status,
-                content_type.clone(),
-                headers.clone(),
-                body.clone(),
-                *delay,
-            ),
-        },
-        None => (
-            404,
-            "application/json".to_string(),
-            Vec::new(),
-            serde_json::json!({
-                "code": -1,
-                "msg": format!("no route for {} {}", request.method, request.path),
-            })
-            .to_string()
-            .into_bytes(),
-            Duration::ZERO,
-        ),
-    }
+        }
+    };
+    Answer::Deferred(deferred.expect("only an async route defers"))
 }
 
 async fn write_response(

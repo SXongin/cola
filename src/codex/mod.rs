@@ -9,7 +9,7 @@
 //! adapter's module path out of everything beside it.
 //!
 //! The surface the adapter is written against is pinned in
-//! `docs/reference/codex-app-server-0.163.0.md`, generated from
+//! `docs/reference/codex-app-server-0.166.0.md`, generated from
 //! `codex app-server generate-json-schema`. At construction the client reads
 //! `initialize`'s result (the binary's identity and version), then checks that
 //! the required methods are present before any prompt is possible. A version
@@ -41,6 +41,9 @@ pub(crate) mod test_server;
 
 #[cfg(test)]
 mod cards;
+
+#[cfg(test)]
+mod live;
 
 #[allow(unused_imports)]
 pub(crate) use authorship::Authorship;

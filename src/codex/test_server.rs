@@ -346,10 +346,10 @@ impl FakeCodex {
             "status": "running",
             "backend": "pid",
             "managedCodexPath": managed_binary,
-            "managedCodexVersion": "0.163.0",
+            "managedCodexVersion": "0.166.0",
             "socketPath": control_socket,
-            "cliVersion": "0.163.0",
-            "appServerVersion": "0.163.0",
+            "cliVersion": "0.166.0",
+            "appServerVersion": "0.166.0",
         })
         .to_string();
         let (start, target) = match real_socket {
@@ -484,7 +484,7 @@ pub(crate) struct ScriptedThread {
     /// connection's push delivery, so a test can inject events while adoption
     /// is paging.
     pub(crate) turns_page_delay_ms: u64,
-    /// The `model` the thread runs with, as `0.163.0` reports it (nullable).
+    /// The `model` the thread runs with, as `0.166.0` reports it (nullable).
     pub(crate) model: Option<String>,
     /// The `modelProvider` beside it (nullable), so a test can prove cola
     /// shows the real provider rather than a fabricated one.
@@ -2475,7 +2475,7 @@ fn list_threads(state: &State, params: &Value) -> Value {
     json!({ "data": data, "nextCursor": next })
 }
 
-/// One thread in the wire shape `0.163.0` defines. The full required set is
+/// One thread in the wire shape `0.166.0` defines. The full required set is
 /// present so the client decodes the real contract, not a relaxed fixture.
 fn thread_json(thread: &ScriptedThread) -> Value {
     let turns = match thread.read_turn_limit {
@@ -2491,7 +2491,7 @@ fn thread_json(thread: &ScriptedThread) -> Value {
         "cwd": thread.cwd,
         "createdAt": thread.created_at,
         "updatedAt": thread.updated_at,
-        "cliVersion": "0.163.0",
+        "cliVersion": "0.166.0",
         "model": thread.model,
         "modelProvider": thread.model_provider,
         "ephemeral": false,

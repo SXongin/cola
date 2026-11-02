@@ -142,17 +142,17 @@ impl CodexOptions {
 }
 
 /// The app-server version from an `initialize` `userAgent` (or from
-/// `codex --version`'s `codex-cli 0.164.0`).
+/// `codex --version`'s `codex-cli 0.166.0`).
 ///
 /// The user agent's **leading** token is `<client name>/<app-server version>`:
 /// the observed live daemon sends
-/// `cola/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)`,
-/// where `0.164.0` is the server and the parenthetical `(cola; 0.14.2)` is the
+/// `cola/0.166.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)`,
+/// where `0.166.0` is the server and the parenthetical `(cola; 0.14.2)` is the
 /// **client's own** version, never the server's. A `codex-*`-named
 /// `name/version` token is preferred wherever it appears — a TUI-originated
-/// `codex-tui/0.164.0 …` keeps its old meaning — and otherwise the first token
+/// `codex-tui/0.166.0 …` keeps its old meaning — and otherwise the first token
 /// whose slash-separated version is valid semver wins, whatever the client
-/// calls itself. The older space-separated `codex-cli 0.163.0` shape is kept.
+/// calls itself. The older space-separated `codex-cli 0.166.0` shape is kept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerVersion {
     raw: String,
@@ -180,7 +180,7 @@ impl ServerVersion {
                 }
             }
         }
-        // The older CLI shape has no slash: `codex-cli 0.163.0`.
+        // The older CLI shape has no slash: `codex-cli 0.166.0`.
         for (index, token) in tokens.iter().enumerate() {
             if !token.starts_with("codex") {
                 continue;
@@ -559,29 +559,29 @@ mod tests {
         // The observed live daemon: the client names itself in the leading
         // token and again in the parenthetical. Only the leading token's
         // version is the server's; `0.14.2` is cola's own.
-        let observed = "cola/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)";
+        let observed = "cola/0.166.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)";
         let version = ServerVersion::parse(observed).expect("the observed UA parses");
-        assert_eq!(version.to_string(), "0.164.0");
-        assert!(!version.is_pinned());
+        assert_eq!(version.to_string(), "0.166.0");
+        assert!(version.is_pinned());
 
         // A `codex-*` name is preferred even when a non-codex token comes
         // first: the TUI-originated shape keeps its old meaning.
         let preferred = ServerVersion::parse(
-            "something/0.150.0 codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
+            "something/0.150.0 codex-tui/0.166.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
         )
         .expect("the codex token wins");
-        assert_eq!(preferred.to_string(), "0.164.0");
+        assert_eq!(preferred.to_string(), "0.166.0");
 
         let tui = ServerVersion::parse(
-            "codex-tui/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
+            "codex-tui/0.166.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.0.1)",
         )
         .expect("version");
-        assert_eq!(tui.to_string(), "0.164.0");
-        assert!(!tui.is_pinned());
+        assert_eq!(tui.to_string(), "0.166.0");
+        assert!(tui.is_pinned());
 
         // The space-separated CLI shape still parses, and is pinned.
-        let cli = ServerVersion::parse("codex-cli 0.163.0").expect("cli");
-        assert_eq!(cli.to_string(), "0.163.0");
+        let cli = ServerVersion::parse("codex-cli 0.166.0").expect("cli");
+        assert_eq!(cli.to_string(), "0.166.0");
         assert!(cli.is_pinned());
 
         assert!(ServerVersion::parse("codex-tui/not-a-version").is_none());
@@ -589,16 +589,16 @@ mod tests {
         assert!(ServerVersion::parse("no version here").is_none());
     }
 
-    /// The observed UA attaches end to end: a fixed probe verifies the newer
-    /// surface, so construction records 0.164.0 instead of failing at version
+    /// The observed UA attaches end to end: a fixed probe verifies the pinned
+    /// surface, so construction records 0.166.0 instead of failing at version
     /// parse on the non-`codex` client name.
     #[tokio::test]
     async fn the_observed_live_user_agent_attaches_at_its_server_version() {
-        let observed = "cola/0.164.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)";
+        let observed = "cola/0.166.0 (Arch Linux Unknown; x86_64) WindowsTerminal (cola; 0.14.2)";
         let client = connect(observed, &FixedProbe(Surface::pinned()))
             .await
             .expect("the observed UA attaches");
-        assert_eq!(client.server_info().version.to_string(), "0.164.0");
+        assert_eq!(client.server_info().version.to_string(), "0.166.0");
         assert_eq!(client.server_info().user_agent, observed);
         assert_eq!(client.server_info().surface_source, "test fixture");
     }
@@ -613,24 +613,24 @@ mod tests {
         // would otherwise fail on the first `/name` or probe cleanup.
         surface.client_requests.remove("thread/delete");
         surface.client_requests.remove("thread/name/set");
-        let error = connect("codex-tui/0.163.0 (test)", &FixedProbe(surface))
+        let error = connect("codex-tui/0.166.0 (test)", &FixedProbe(surface))
             .await
             .expect_err("construction must fail");
         let message = error.to_string();
         assert!(message.contains("turn/steer"), "{message}");
         assert!(message.contains("thread/delete"), "{message}");
         assert!(message.contains("thread/name/set"), "{message}");
-        assert!(message.contains("0.163.0"), "{message}");
+        assert!(message.contains("0.166.0"), "{message}");
     }
 
     /// A newer server passes only after its own surface has been checked — the
     /// version is recorded, never guessed.
     #[tokio::test]
     async fn a_newer_server_passes_with_a_verified_surface() {
-        let client = connect("codex-tui/0.164.0 (test)", &FixedProbe(Surface::pinned()))
+        let client = connect("codex-tui/0.167.0 (test)", &FixedProbe(Surface::pinned()))
             .await
             .expect("a verified newer server passes");
-        assert_eq!(client.server_info().version.to_string(), "0.164.0");
+        assert_eq!(client.server_info().version.to_string(), "0.167.0");
         assert_eq!(client.server_info().surface_source, "test fixture");
     }
 
@@ -639,7 +639,7 @@ mod tests {
     /// The read is best-effort and reflects the server's row each time.
     #[tokio::test]
     async fn the_agent_question_feature_state_comes_from_the_server() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
         let client = CodexClient::connect(&CodexOptions::new(endpoint), &PinnedProbe)
             .await
@@ -682,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_version_degrades_loudly() {
         for (user_agent, needle) in [
-            ("codex-tui/0.164.0 (test)", "0.164.0"),
+            ("codex-tui/0.167.0 (test)", "0.167.0"),
             ("codex-tui/0.162.0 (test)", "0.162.0"),
         ] {
             let error = connect(user_agent, &PinnedProbe).await.expect_err("refused");
@@ -728,7 +728,7 @@ mod tests {
         }
     }
 
-    /// Ticket #882 acceptance: a `0.164.0` daemon's generated surface (106
+    /// Ticket #882 acceptance: a `0.166.0` daemon's generated surface (106
     /// client methods) carries the session-decision set its own response
     /// schemas declare, so the approval card offers the session control. The
     /// same method with the variant removed from its response schema hides it —
@@ -738,9 +738,7 @@ mod tests {
         use crate::codex::schema::{write_generated_surface, write_response_schema};
 
         let pinned = Surface::pinned();
-        let mut client_methods: Vec<&str> = pinned.client_requests.iter().map(String::as_str).collect();
-        client_methods.push("feedback/save");
-        client_methods.sort_unstable();
+        let client_methods: Vec<&str> = pinned.client_requests.iter().map(String::as_str).collect();
         let notifications: Vec<&str> = pinned.notifications.iter().map(String::as_str).collect();
         let server_requests: Vec<&str> = pinned.server_requests.iter().map(String::as_str).collect();
         let modern_files = [
@@ -774,7 +772,7 @@ mod tests {
             write_response_schema(directory.path(), file, decisions);
         }
         let surface = Surface::from_generated_dir(directory.path()).expect("generated surface");
-        assert_eq!(surface.counts(), (106, 85, 10), "the 0.164.0 method lists");
+        assert_eq!(surface.counts(), (106, 85, 10), "the 0.166.0 method lists");
         assert_eq!(
             surface.session_decisions(),
             Surface::pinned().session_decisions(),
@@ -788,10 +786,10 @@ mod tests {
             "command": "ls",
             "cwd": "/work",
         });
-        let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
+        let (_server, endpoint) = server("codex-tui/0.166.0 (test)").await;
         let client = CodexClient::connect(&CodexOptions::new(endpoint), &FixedProbe(surface))
             .await
-            .expect("a verified 0.164.0 surface attaches");
+            .expect("a verified 0.166.0 surface attaches");
         assert_eq!(client.server_info().surface_counts, (106, 85, 10));
         _server.request_to_all("item/commandExecution/requestApproval", approval.clone());
         let permission = recorded_permission(&client, "/work").await;
@@ -813,7 +811,7 @@ mod tests {
                 .session_decisions()
                 .contains("item/commandExecution/requestApproval")
         );
-        let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
+        let (_server, endpoint) = server("codex-tui/0.166.0 (test)").await;
         let client = CodexClient::connect(&CodexOptions::new(endpoint), &FixedProbe(narrowed))
             .await
             .expect("the narrowed surface still attaches");
@@ -899,7 +897,7 @@ mod tests {
         std::fs::write(
             &binary,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.164.0\"; exit 0; fi\ncp {}/*.json \"$4\"/\n",
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"codex-cli 0.167.0\"; exit 0; fi\ncp {}/*.json \"$4\"/\n",
                 shell_single_quote(&fixture.display().to_string())
             ),
         )
@@ -907,7 +905,7 @@ mod tests {
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .expect("make fake codex executable");
 
-        let (_server, endpoint) = server("codex-tui/0.164.0 (test)").await;
+        let (_server, endpoint) = server("codex-tui/0.167.0 (test)").await;
         CodexClient::connect(&CodexOptions::new(endpoint), &AutoProbe::new(&binary))
             .await
             .expect_err("a missing generated method fails construction")
@@ -917,7 +915,7 @@ mod tests {
     #[tokio::test]
     async fn the_adapter_is_selected_by_kind_not_id() {
         let opencode = active("grace", ClientKind::Opencode);
-        let (_server, endpoint) = server("codex-tui/0.163.0 (test)").await;
+        let (_server, endpoint) = server("codex-tui/0.166.0 (test)").await;
         let options = CodexOptions::new(endpoint);
         assert!(
             connect_for_active_client(&opencode, &options, &PinnedProbe)
@@ -932,7 +930,7 @@ mod tests {
                 .await
                 .expect("a codex client constructs")
                 .expect("this adapter is selected");
-            assert_eq!(client.server_info().version.to_string(), "0.163.0");
+            assert_eq!(client.server_info().version.to_string(), "0.166.0");
         }
     }
 

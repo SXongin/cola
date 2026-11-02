@@ -2238,7 +2238,7 @@ mod tests {
     #[test]
     fn the_daemon_report_parses_the_running_binary() {
         let info = parse_info(
-            br#"{"status":"running","backend":"pid","managedCodexPath":"/home/u/.codex/packages/app-server-daemon/current/bin/codex","managedCodexVersion":"0.164.0","socketPath":"/home/u/.codex/app-server-control/app-server-control.sock","cliVersion":"0.163.0","appServerVersion":"0.164.0"}"#,
+            br#"{"status":"running","backend":"pid","managedCodexPath":"/home/u/.codex/packages/app-server-daemon/current/bin/codex","managedCodexVersion":"0.166.0","socketPath":"/home/u/.codex/app-server-control/app-server-control.sock","cliVersion":"0.166.0","appServerVersion":"0.166.0"}"#,
         )
         .expect("the report parses");
         assert_eq!(info.status, "running");
@@ -2248,8 +2248,8 @@ mod tests {
                 "/home/u/.codex/packages/app-server-daemon/current/bin/codex"
             ))
         );
-        assert_eq!(info.app_server_version.as_deref(), Some("0.164.0"));
-        assert_eq!(info.cli_version.as_deref(), Some("0.163.0"));
+        assert_eq!(info.app_server_version.as_deref(), Some("0.166.0"));
+        assert_eq!(info.cli_version.as_deref(), Some("0.166.0"));
         assert!(parse_info(b"not json").is_err());
     }
 
@@ -3663,7 +3663,7 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
                 .info
                 .as_ref()
                 .and_then(|info| info.app_server_version.as_deref()),
-            Some("0.163.0")
+            Some("0.166.0")
         );
         assert!(
             found.socket.is_some(),

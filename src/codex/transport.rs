@@ -1344,7 +1344,7 @@ mod tests {
     /// not disturb the first, and each gets its own response.
     #[tokio::test]
     async fn a_second_connection_opens_independently() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
 
         let first = RpcConnection::open(&endpoint, Duration::from_secs(5))
@@ -1391,7 +1391,7 @@ mod tests {
     /// the `initialize` response).
     #[tokio::test]
     async fn a_racing_notification_is_delivered_not_mistaken_for_the_reply() {
-        let (_, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (_, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
         let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
             .await
@@ -1405,7 +1405,7 @@ mod tests {
             )
             .await
             .expect("initialize");
-        assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
+        assert_eq!(result["userAgent"], "codex-tui/0.166.0 (test)");
 
         let event = tokio::time::timeout(Duration::from_secs(2), inbound.recv())
             .await
@@ -1459,7 +1459,7 @@ mod tests {
     /// traffic in between.
     #[tokio::test]
     async fn a_server_request_is_answered_with_the_servers_id() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
         let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
             .await
@@ -1500,7 +1500,7 @@ mod tests {
             )
             .await
             .expect("initialize still answers");
-        assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
+        assert_eq!(result["userAgent"], "codex-tui/0.166.0 (test)");
     }
 
     /// Whole-branch review #883: the server-request protocol is **lossless**.
@@ -1773,7 +1773,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_malformed_frame_fails_the_pending_request() {
-        let (_, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (_, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
         let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
             .await
@@ -1807,7 +1807,7 @@ mod tests {
     /// response. The old synchronous correlation loop dropped it.
     #[tokio::test]
     async fn a_pushed_notification_reaches_inbound_while_requests_are_in_flight() {
-        let (server, url) = FakeServer::tcp("codex-tui/0.163.0 (test)").await;
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
         let endpoint = Endpoint::parse(&url).expect("endpoint");
         let connection = RpcConnection::open(&endpoint, Duration::from_secs(5))
             .await
@@ -1837,6 +1837,6 @@ mod tests {
             )
             .await
             .expect("initialize still answers");
-        assert_eq!(result["userAgent"], "codex-tui/0.163.0 (test)");
+        assert_eq!(result["userAgent"], "codex-tui/0.166.0 (test)");
     }
 }

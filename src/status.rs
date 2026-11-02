@@ -1553,12 +1553,12 @@ mod tests {
             kind: "codex".into(),
             endpoint: "unix:///home/u/.codex/app-server-control/app-server-control.sock".into(),
             state: "attached".into(),
-            detail: "attached to the app-server daemon (version 0.163.0, unix/linux)".into(),
+            detail: "attached to the app-server daemon (version 0.166.0, unix/linux)".into(),
             runtime_binary: Some("/home/u/.codex/packages/app-server-daemon/current/bin/codex".into()),
             client_binary: Some("/usr/local/bin/codex".into()),
-            version: Some("0.163.0".into()),
+            version: Some("0.166.0".into()),
             platform: Some("unix/linux".into()),
-            surface_source: Some("pinned 0.163.0".into()),
+            surface_source: Some("pinned 0.166.0".into()),
             capabilities: vec![
                 ClientCapability {
                     name: "background_tasks".into(),
@@ -1566,7 +1566,7 @@ mod tests {
                 },
                 ClientCapability {
                     name: "surface".into(),
-                    value: "pinned 0.163.0".into(),
+                    value: "pinned 0.166.0".into(),
                 },
             ],
             user_clients: vec![ClientProcess {
@@ -1585,9 +1585,9 @@ mod tests {
             state,
             detail: "daemon at /tmp/codex-home/app-server-control/app-server-control.sock".into(),
             runtime_binary: Some("/managed/bin/codex".into()),
-            version: Some("0.163.0".into()),
+            version: Some("0.166.0".into()),
             platform: Some("unix/linux".into()),
-            surface_source: Some("pinned 0.163.0".into()),
+            surface_source: Some("pinned 0.166.0".into()),
             capabilities: Vec::new(),
             user_clients,
             client_binary: Some("/usr/bin/codex".into()),
@@ -1648,8 +1648,8 @@ mod tests {
             "unix:///home/u/.codex/app-server-control/app-server-control.sock"
         );
         assert_eq!(v["client"]["state"], "attached");
-        assert_eq!(v["client"]["version"], "0.163.0");
-        assert_eq!(v["client"]["surface_source"], "pinned 0.163.0");
+        assert_eq!(v["client"]["version"], "0.166.0");
+        assert_eq!(v["client"]["surface_source"], "pinned 0.166.0");
         assert_eq!(v["client"]["capabilities"][0]["name"], "background_tasks");
         assert_eq!(v["client"]["capabilities"][0]["value"], "unsupported");
         assert_eq!(v["client"]["user_clients"][0]["state"], "attached");
@@ -1721,7 +1721,7 @@ kind = "codex"
             "unix:///tmp/codex-home/app-server-control/app-server-control.sock"
         );
         assert_eq!(client.state, "attached");
-        assert_eq!(client.version.as_deref(), Some("0.163.0"));
+        assert_eq!(client.version.as_deref(), Some("0.166.0"));
         assert_eq!(client.user_clients[0].state, "attached");
     }
 
