@@ -1403,11 +1403,12 @@ type ProbeResult<T> = std::result::Result<T, String>;
 ///   when one of its sockets' peer inode is the daemon control socket's inode.
 ///   Where `/proc`, `ss`, or the descriptor table is unavailable (including a
 ///   `ss` that exits non-zero), the client stays unverified.
-/// - **macOS** — `lsof -U -a -p <pid>` reports each unix socket's NAME and
-///   DEVICE address. A client is attached when one of its peer addresses
-///   (`->0x<addr>`) is a kernel address of one of the daemon's sockets bound to
-///   its control path (`0x<addr>`). A missing `lsof`, a non-zero exit, a
-///   timeout, or no pairing leaves the client unverified.
+/// - **macOS** — one `lsof -U` scan finds the daemon's sockets by their
+///   control-path NAME, and `lsof -U -a -p <pid>` reports each candidate
+///   client's NAME and DEVICE address. A client is attached when one of its
+///   peer addresses (`->0x<addr>`) is a kernel address of one of the daemon's
+///   sockets bound to its control path (`0x<addr>`). A missing `lsof`, a
+///   non-zero exit, a timeout, or no pairing leaves the client unverified.
 /// - **Windows (and every other platform)** — cola has no prover there. The
 ///   argv may name the daemon, but nothing can promote it, so the client stays
 ///   unverified and its detail says the attachment is not hard-proven. Argv
@@ -1694,13 +1695,18 @@ async fn collect_lsof_evidence(
 }
 
 /// The kernel address(es) of the daemon's sockets bound to its control path,
-/// from the pid(s) that hold that socket open.
+/// from one scan of the unix-socket table.
 ///
 /// `daemon` is normally a symlink into the daemon's runtime directory, so the
-/// pid query tries the published path, its canonical form and the symlink's
-/// literal target (the verbatim bind spelling), keeping each once. The pid
-/// query is the only way to name a daemon cola does not own — cola
-/// deliberately keeps no daemon pid (ADR-0090 decision 3).
+/// row match accepts the published path, its canonical form and the symlink's
+/// literal target (the verbatim bind spelling). The scan is the only way to
+/// name a daemon cola does not own — cola deliberately keeps no daemon pid
+/// (ADR-0090 decision 3).
+///
+/// The path **selection** query (`lsof -t -U -a -- <path>`) matched nothing on
+/// macOS even for a socket lsof itself reported in its table, so the daemon is
+/// found by scanning `lsof -U` and matching rows instead. That also removes the
+/// per-spelling process query and leaves one bounded invocation.
 ///
 /// A connected client's `->0x<addr>` names the peer it connected to. On Darwin
 /// that is the *accepted* socket's kernel address, not the listener's, so the
@@ -1713,41 +1719,24 @@ async fn daemon_socket_addresses(daemon: &Path, lsof: &LsofProgram) -> ProbeResu
         .unwrap_or_else(|_| daemon.to_path_buf())
         .to_string_lossy()
         .into_owned();
-    // Query the published path first (the name the user's daemon is described
-    // by), then the physical path, then the literal symlink target. On Darwin
-    // lsof selects a socket by the **verbatim bind spelling**, which can be a
-    // third path when the daemon bound through a symlinked directory; the
-    // canonical path then cannot select it. Keep each spelling once, in this
-    // order, and stop at the first that selects a pid.
-    let mut spellings = vec![daemon.to_path_buf()];
-    if target.as_str() != raw {
-        spellings.push(PathBuf::from(&target));
+    let mut spellings = vec![raw.clone()];
+    if target != raw {
+        spellings.push(target);
     }
-    if let Some(bound) = literal_link_target(daemon)
-        && !spellings.iter().any(|spelling| spelling == &bound)
-    {
-        spellings.push(bound);
-    }
-    let mut pids = Vec::new();
-    for spelling in &spellings {
-        pids = lsof_pids_for_path(spelling, lsof).await?;
-        if !pids.is_empty() {
-            break;
+    if let Some(bound) = literal_link_target(daemon) {
+        let bound = bound.to_string_lossy().into_owned();
+        if !spellings.contains(&bound) {
+            spellings.push(bound);
         }
     }
-    let mut addresses = Vec::new();
-    for pid in pids {
-        let output = lsof_unix_sockets(pid, lsof).await?;
-        addresses.extend(lsof_daemon_addresses(&output, &raw, &target));
-    }
-    addresses.sort();
-    addresses.dedup();
-    Ok(addresses)
+    let run = run_lsof(lsof, &["-U"]).await?;
+    let output = decode_lsof(&run)?.unwrap_or_default();
+    Ok(lsof_daemon_addresses(&output, &spellings))
 }
 
 /// The literal target a symlink stores, with a relative target resolved
 /// against the link's parent. **Not** canonicalised: lsof binds and reports
-/// this spelling, so it is the third `lsof -t` query for a control symlink.
+/// this spelling, so it is one of the spellings a control-path row may carry.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 fn literal_link_target(path: &Path) -> Option<PathBuf> {
     let target = std::fs::read_link(path).ok()?;
@@ -1756,28 +1745,6 @@ fn literal_link_target(path: &Path) -> Option<PathBuf> {
     } else {
         Some(path.parent()?.join(target))
     }
-}
-
-/// The pids `lsof` reports as holding `path` open.
-///
-/// Exit 1 with no stdout **and no stderr** means no process matched and is an
-/// empty result. Exit 1 that also printed a diagnostic is a failure and keeps
-/// that diagnostic, so a denied or broken scan cannot masquerade as no match.
-#[cfg(any(target_os = "macos", all(test, unix)))]
-async fn lsof_pids_for_path(path: &Path, lsof: &LsofProgram) -> ProbeResult<Vec<i32>> {
-    let path = path.to_string_lossy();
-    let run = run_lsof(lsof, &["-t", "-U", "-a", "--", path.as_ref()]).await?;
-    interpret_lsof_pids(&run)
-}
-
-/// Decode one `lsof -t -U -a -- <path>` run.
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn interpret_lsof_pids(run: &LsofRun) -> ProbeResult<Vec<i32>> {
-    Ok(decode_lsof(run)?
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| line.trim().parse().ok())
-        .collect())
 }
 
 /// One candidate client's `lsof -U -a -p <pid>` output.
@@ -1926,35 +1893,73 @@ fn mark_unproven(clients: &mut LocalClients, mut unverified: Vec<UnverifiedClien
     finish(clients, Vec::new(), unverified);
 }
 
-/// One `lsof` row's whitespace tokens, when the row is a unix socket.
+/// One `lsof` row parsed as a unix socket.
 ///
-/// The columns are `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME`, so
-/// `TYPE` is token 4 and `DEVICE` is token 5. A path with spaces only lengthens
-/// `NAME` (tokens 8..), which the callers join or scan.
+/// The header is `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME`, but
+/// macOS omits the `NODE` value for unix sockets: the reference row is
+/// `mysqld 829 user 21u unix 0x1c2b10907d83adad 0t0 /tmp/mysql.sock`, which is
+/// eight tokens and leaves the NAME at index 7. Linux keeps the numeric NODE,
+/// so its NAME is at index 8. The optional NODE is recognised by its digits, so
+/// both layouts parse (the old fixed index 8 skipped every macOS row).
 #[cfg(any(target_os = "macos", test))]
-fn lsof_unix_tokens(line: &str) -> Option<Vec<&str>> {
-    let tokens: Vec<&str> = line.split_whitespace().collect();
-    (tokens.len() >= 9 && tokens[4] == "unix").then_some(tokens)
+struct LsofUnixRow {
+    pid: i32,
+    /// The DEVICE column's kernel address, normalised.
+    device: String,
+    /// The NAME column: a path, a bare `0x<addr>`, or a `local->peer` pair.
+    name: String,
 }
 
-/// The pure half of the macOS report: the peer addresses `->0x<addr>` on
-/// `lsof` rows, normalised, deduplicated and sorted for comparison.
+#[cfg(any(target_os = "macos", test))]
+fn lsof_unix_row(line: &str) -> Option<LsofUnixRow> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if tokens.len() < 7 || tokens[4] != "unix" {
+        return None;
+    }
+    let pid = tokens[1].parse().ok()?;
+    let device = normalized_unix_address(tokens[5])?;
+    let mut name_start = 7;
+    if tokens
+        .get(7)
+        .is_some_and(|token| !token.is_empty() && token.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        // The NODE column is present (Linux); NAME follows it.
+        name_start = 8;
+    }
+    let name = tokens
+        .get(name_start..)
+        .map(|tokens| tokens.join(" "))
+        .unwrap_or_default();
+    Some(LsofUnixRow { pid, device, name })
+}
+
+/// Split a NAME into its local and peer parts at the first `->`.
 ///
-/// A client's connected socket renders `->0x<addr>` as the first NAME token.
-/// The DEVICE column's `0x…`, a socket path, and a bound socket's later tokens
-/// must never be read as a peer.
+/// macOS prints a bound listener as its path, a connected socket as
+/// `->0x<peer>`, and (depending on the kernel's address) `path->0x<peer>` or
+/// `0x<local>->0x<peer>`. The right side is always the peer; the left is the
+/// local path or address when present.
+#[cfg(any(target_os = "macos", test))]
+fn split_lsof_name(name: &str) -> (&str, Option<&str>) {
+    match name.split_once("->") {
+        Some((local, peer)) => (local.trim(), Some(peer.trim())),
+        None => (name.trim(), None),
+    }
+}
+
+/// The pure half of the macOS report: the peer addresses on `lsof` rows,
+/// normalised, deduplicated and sorted for comparison.
+///
+/// Only the right side of a NAME's `->` is a peer. The DEVICE column's `0x…`, a
+/// socket path, and a bound socket's local address must never be read as one.
 #[cfg(any(target_os = "macos", test))]
 fn lsof_peer_addresses(output: &str) -> Vec<String> {
     let mut peers = Vec::new();
     for line in output.lines() {
-        let Some(tokens) = lsof_unix_tokens(line) else {
+        let Some(row) = lsof_unix_row(line) else {
             continue;
         };
-        if let Some(peer) = tokens
-            .get(8)
-            .and_then(|name| name.strip_prefix("->"))
-            .and_then(normalized_unix_address)
-        {
+        if let Some(peer) = split_lsof_name(&row.name).1.and_then(normalized_unix_address) {
             peers.push(peer);
         }
     }
@@ -1970,49 +1975,60 @@ fn lsof_peer_addresses(output: &str) -> Vec<String> {
 /// - the control path's rows — the listener and its accepted stream sockets
 ///   inherit it, and their DEVICE is the address a client's `->0x<addr>` names;
 /// - the daemon's unnamed listening rows — a bare `0x<addr>` NAME with no peer
-///   arrow, the ticket's listener spelling.
+///   arrow, the ticket's listener spelling. Restricted to the pid(s) that also
+///   hold a control-path row: a helper listener the daemon owns but that no
+///   client connected to must not promote a client connected elsewhere.
 ///
 /// A row carrying a peer arrow is a connection, not a listener, and a row for
 /// another path belongs to someone else; neither contributes an address.
 ///
-/// `raw` and `target` are the published and canonical spellings of the control
-/// path. The normal match is two string comparisons; when lsof prints the
-/// verbatim bind spelling (a third spelling) the row's NAME is canonicalised
-/// once, on the doctor/status path, to bridge it.
+/// `spellings` are the published, canonical and literal-target spellings of the
+/// control path. The normal match is string equality; only when that fails is
+/// the row's NAME canonicalised once, on the doctor/status path, to bridge a
+/// verbatim bind spelling.
 #[cfg(any(target_os = "macos", test))]
-fn lsof_daemon_addresses(output: &str, raw: &str, target: &str) -> Vec<String> {
+fn lsof_daemon_addresses(output: &str, spellings: &[String]) -> Vec<String> {
+    let rows: Vec<LsofUnixRow> = output.lines().filter_map(lsof_unix_row).collect();
+    let mut control_pids = Vec::new();
+    for row in &rows {
+        let (local, _) = split_lsof_name(&row.name);
+        if is_daemon_path(local, spellings) && !control_pids.contains(&row.pid) {
+            control_pids.push(row.pid);
+        }
+    }
     let mut addresses = Vec::new();
-    for line in output.lines() {
-        let Some(tokens) = lsof_unix_tokens(line) else {
-            continue;
-        };
-        let Some(device) = normalized_unix_address(tokens[5]) else {
-            continue;
-        };
-        let name = tokens[8..].join(" ");
-        let unnamed_listener = !name.contains("->") && normalized_unix_address(&name).is_some();
-        let is_daemon = unnamed_listener || is_daemon_path(&name, raw, target);
-        if is_daemon {
-            addresses.push(device);
+    for row in &rows {
+        let (local, peer) = split_lsof_name(&row.name);
+        let path_row = is_daemon_path(local, spellings);
+        let unnamed_listener =
+            peer.is_none() && normalized_unix_address(local).is_some() && control_pids.contains(&row.pid);
+        if path_row || unnamed_listener {
+            addresses.push(row.device.clone());
         }
     }
     addresses
 }
 
-/// Whether `name` is the control path the daemon bound.
+/// Whether `name` is one of the control path's spellings.
 ///
 /// lsof prints the **verbatim bind spelling**, which need match neither the
-/// published control symlink (`raw`) nor `canonicalize(raw)` (`target`): a
-/// daemon bound through a symlinked directory, or macOS's `/tmp` →
-/// `/private/tmp`, produces a third spelling. The exact two comparisons are
-/// free; only when they fail is the row's NAME canonicalised once to bridge
-/// the bind spelling. This is the doctor/status path with few rows, where
-/// correctness matters more than one syscall.
+/// published control symlink nor `canonicalize(raw)`: a daemon bound through a
+/// symlinked directory, or macOS's `/tmp` → `/private/tmp`, produces a third
+/// spelling. The exact comparisons are free; only when they fail is the row's
+/// NAME canonicalised once to bridge the bind spelling. This is the
+/// doctor/status path, where a stat per non-matching path row is acceptable.
 #[cfg(any(target_os = "macos", test))]
-fn is_daemon_path(name: &str, raw: &str, target: &str) -> bool {
-    name == raw
-        || name == target
-        || std::fs::canonicalize(name).is_ok_and(|resolved| resolved.to_string_lossy() == target)
+fn is_daemon_path(name: &str, spellings: &[String]) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if spellings.iter().any(|spelling| spelling == name) {
+        return true;
+    }
+    std::fs::canonicalize(name).is_ok_and(|resolved| {
+        let resolved = resolved.to_string_lossy();
+        spellings.iter().any(|spelling| spelling == resolved.as_ref())
+    })
 }
 
 /// Normalise `0x<hex>` to a lowercase, unpadded spelling so two renderings of
@@ -3236,10 +3252,58 @@ codex 42 me 14u unix 0x00000000000000ee 0t0 127 0x00000000000000FF
 codex 42 me 15u unix 0x00000000000000ff 0t0 128 0x00000000000000ab->0x00000000000000cd
 codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x00000000000000cd
 ";
-        assert_eq!(lsof_peer_addresses(output), vec!["0xbb"]);
         assert_eq!(
-            lsof_daemon_addresses(output, "/tmp/control.sock", "/tmp/control.sock"),
+            lsof_peer_addresses(output),
+            vec!["0xbb", "0xcd"],
+            "the right side of every `local->peer` pair is a peer"
+        );
+        assert_eq!(
+            lsof_daemon_addresses(output, &["/tmp/control.sock".to_string()]),
             vec!["0xbb", "0xcc", "0xee"]
+        );
+    }
+
+    /// macOS `lsof -U` omits the `NODE` value on unix-socket rows, so the row
+    /// is `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NAME` — eight tokens, not
+    /// the nine the old fixed-index parser required. This is the observed
+    /// reference shape (`mysqld 829 … unix 0x… 0t0 /tmp/mysql.sock`); both the
+    /// peer arrow and a `path->peer` pair must be read as the peer, and the
+    /// local path rows must still yield the daemon's DEVICE.
+    #[test]
+    fn macos_unix_rows_without_a_node_column_are_parsed() {
+        let output = "\
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NAME
+mysqld 829 me 21u unix 0x1c2b10907d83adad 0t0 /tmp/mysql.sock
+codex 42 me 10u unix 0x00000000000000aa 0t0 ->0x00000000000000bb
+codex 42 me 11u unix 0x00000000000000cc 0t0 /tmp/control.sock
+codex 42 me 12u unix 0x00000000000000dd 0t0 /tmp/control.sock->0x00000000000000ee
+codex 42 me 13u unix 0x0000000000000012 0t0 0x00000000000000ab->0x00000000000000cd
+";
+        assert_eq!(
+            lsof_peer_addresses(output),
+            vec!["0xbb", "0xcd", "0xee"],
+            "the right of every arrow is a peer, however the local part renders"
+        );
+        assert_eq!(
+            lsof_daemon_addresses(output, &["/tmp/control.sock".to_string()]),
+            vec!["0xcc", "0xdd"]
+        );
+    }
+
+    /// The unnamed-listener arm only applies to a pid that also holds a
+    /// control-path row: a helper listener owned by someone else must not be
+    /// mistaken for the daemon.
+    #[test]
+    fn an_unrelated_unnamed_listener_is_not_a_daemon_address() {
+        let output = "\
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NAME
+codex 42 me 10u unix 0x00000000000000aa 0t0 /tmp/control.sock
+codex 42 me 11u unix 0x00000000000000bb 0t0 0x00000000000000bb
+other 99 me 12u unix 0x00000000000000cc 0t0 0x00000000000000cc
+";
+        assert_eq!(
+            lsof_daemon_addresses(output, &["/tmp/control.sock".to_string()]),
+            vec!["0xaa", "0xbb"]
         );
     }
 
@@ -3271,13 +3335,14 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert_ne!(raw, bound);
         assert_ne!(target, bound, "the bind spelling is its own third string");
 
-        assert!(is_daemon_path(&raw, &raw, &target));
-        assert!(is_daemon_path(&target, &raw, &target));
+        let spellings = vec![raw.clone(), target.clone(), bound.clone()];
+        assert!(is_daemon_path(&raw, &spellings));
+        assert!(is_daemon_path(&target, &spellings));
         assert!(
-            is_daemon_path(&bound, &raw, &target),
+            is_daemon_path(&bound, &spellings),
             "the verbatim bind spelling must bridge to the physical path"
         );
-        assert!(!is_daemon_path("/tmp/another.sock", &raw, &target));
+        assert!(!is_daemon_path("/tmp/another.sock", &spellings));
 
         let output = format!(
             "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n\
@@ -3287,19 +3352,20 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
              codex 42 me 14u unix 0x00000000000000dd 0t0 4 /tmp/another.sock\n"
         );
         assert_eq!(
-            lsof_daemon_addresses(&output, &raw, &target),
+            lsof_daemon_addresses(&output, &spellings),
             vec!["0xaa", "0xbb", "0xcc"]
         );
     }
 
-    /// The `lsof -t` pid query must include the literal symlink target, not
+    /// The full-scan row match must include the literal symlink target, not
     /// only the published path and its canonical form: a daemon that bound
     /// through a symlinked directory is selected by that third spelling alone.
-    /// The fake `lsof` matches only the bind spelling, so this fails unless the
-    /// collector queries it.
+    /// The fake `lsof` prints a macOS-shaped row (no `NODE` column) named with
+    /// the bind spelling, so this fails unless the collector both scans `-U`
+    /// and includes the literal target among its spellings.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_daemon_query_includes_the_literal_symlink_target() {
+    async fn a_full_scan_matches_the_literal_symlink_target() {
         let root = tempfile::tempdir().expect("temp root");
         let real = root.path().join("real");
         std::fs::create_dir(&real).expect("real dir");
@@ -3314,20 +3380,15 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert_eq!(literal_link_target(&real), None, "a directory is not a link");
 
         let bind_string = bind.to_string_lossy().into_owned();
-        let bind_query = format!("-t -U -a -- {bind_string}");
         let script = format!(
             "#!/bin/sh\n\
-             if [ \"$1\" = \"-t\" ]; then\n\
-               if [ \"$*\" = {} ]; then echo 42; exit 0; fi\n\
-               exit 1\n\
-             fi\n\
              if [ \"$1\" = \"-U\" ]; then\n\
-               echo 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME'\n\
-               echo 'codex 42 me 11u unix 0x00000000000000bb 0t0 1 {}'\n\
+               echo 'COMMAND PID USER FD TYPE DEVICE SIZE/OFF NAME'\n\
+               echo 'codex 42 me 11u unix 0x00000000000000bb 0t0 {}'\n\
+               echo 'codex 43 me 12u unix 0x00000000000000cc 0t0 /tmp/another.sock'\n\
                exit 0\n\
              fi\n\
              exit 1\n",
-            crate::codex::test_server::shell_single_quote(&bind_query),
             crate::codex::test_server::shell_single_quote(&bind_string)
         );
         let (_root, program) = fake_lsof(&script);
@@ -3345,10 +3406,10 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
     async fn lsof_exit_one_without_output_is_no_match() {
         let (_root, program) = fake_lsof("#!/bin/sh\nexit 1\n");
         let lsof = LsofProgram::Explicit(program);
-        let pids = lsof_pids_for_path(Path::new("/tmp/no-daemon"), &lsof)
+        let addresses = daemon_socket_addresses(Path::new("/tmp/no-daemon"), &lsof)
             .await
             .expect("a clean exit 1 is no match");
-        assert!(pids.is_empty());
+        assert!(addresses.is_empty());
         let output = lsof_unix_sockets(9, &lsof)
             .await
             .expect("a process with no unix socket is not a failure");
@@ -3386,7 +3447,7 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
     async fn lsof_exit_one_with_stderr_is_a_named_failure() {
         let (_root, program) = fake_lsof("#!/bin/sh\necho 'permission denied' >&2\nexit 1\n");
         let lsof = LsofProgram::Explicit(program.clone());
-        let error = lsof_pids_for_path(Path::new("/tmp/no-daemon"), &lsof)
+        let error = daemon_socket_addresses(Path::new("/tmp/no-daemon"), &lsof)
             .await
             .expect_err("stderr makes exit 1 a failure");
         assert!(error.contains("permission denied"), "{error}");
@@ -3477,7 +3538,7 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         let calls_root = tempfile::tempdir().expect("calls root");
         let calls = calls_root.path().join("calls");
         let script = format!(
-            "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = \"-t\" ]; then echo 'permission denied' >&2; exit 2; fi\nexit 1\n",
+            "#!/bin/sh\necho \"$@\" >> {}\nif [ \"$1\" = \"-U\" ]; then echo 'permission denied' >&2; exit 2; fi\nexit 1\n",
             crate::codex::test_server::shell_single_quote(&calls.display().to_string())
         );
         let (_root, program) = fake_lsof(&script);
@@ -3492,8 +3553,8 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert!(evidence.clients.is_empty());
         let log = std::fs::read_to_string(&calls).expect("call log");
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1, "only the daemon query ran: {log}");
-        assert!(lines[0].starts_with("-t -U -a -- "), "{log}");
+        assert_eq!(lines.len(), 1, "only the daemon scan ran: {log}");
+        assert_eq!(lines[0], "-U", "{log}");
     }
 
     /// An empty daemon read is also a short-circuit: no client scan can match
@@ -3518,8 +3579,8 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert!(evidence.clients.is_empty());
         let log = std::fs::read_to_string(&calls).expect("call log");
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1, "only the daemon query ran: {log}");
-        assert!(lines[0].starts_with("-t -U -a -- "), "{log}");
+        assert_eq!(lines.len(), 1, "only the daemon scan ran: {log}");
+        assert_eq!(lines[0], "-U", "{log}");
     }
 
     /// The positive macOS case: a client's peer address is one of the daemon's
@@ -3743,11 +3804,33 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert!(detail.contains("not hard-proven"), "{detail}");
     }
 
+    /// Run one `lsof` and render its argv, status and raw output for a failed
+    /// live test's captured log. Test-only: no timeout and no `LsofProgram`,
+    /// because the point is to see exactly what the macOS runner printed.
+    #[cfg(target_os = "macos")]
+    fn lsof_diagnostic(arguments: &[&str]) -> String {
+        match std::process::Command::new("lsof").args(arguments).output() {
+            Ok(output) => format!(
+                "`lsof {}` => {}\nstdout:\n{}\nstderr:\n{}",
+                arguments.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            ),
+            Err(error) => format!("`lsof {}` could not run: {error}", arguments.join(" ")),
+        }
+    }
+
     /// The macOS end-to-end proof (CI only; the Linux suite compiles it out):
     /// the socket is bound through a symlinked directory, so lsof reports the
     /// verbatim bind spelling while cola passes the published symlink — the
     /// production shape. A live connection this process holds is paired
     /// through `lsof`; the same daemon with no connection is not promoted.
+    ///
+    /// If this fails, the captured stdout carries the published path, its
+    /// `read_link` and canonical targets, the pid, every `lsof -t -U -a --`
+    /// spelling query and the raw `lsof -U` tables, so the next macOS run
+    /// shows the actual row shape instead of only "found no unix socket".
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_live_lsof_connection_is_proven_and_no_connection_is_not() {
@@ -3766,12 +3849,42 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         let accepted = listener.accept().expect("accept connected");
         let pid = std::process::id() as i32;
 
+        let read_link = std::fs::read_link(&published);
+        let canonical = std::fs::canonicalize(&published);
+        let mut diagnostics = format!(
+            "live lsof diagnostics:\n  published: {}\n  read_link: {read_link:?}\n  \
+             canonical: {canonical:?}\n  pid: {pid}\n",
+            published.display()
+        );
+        let mut spellings = vec![published.to_string_lossy().into_owned()];
+        if let Ok(target) = &canonical {
+            let target = target.to_string_lossy().into_owned();
+            if !spellings.contains(&target) {
+                spellings.push(target);
+            }
+        }
+        if let Some(bound) = literal_link_target(&published) {
+            let bound = bound.to_string_lossy().into_owned();
+            if !spellings.contains(&bound) {
+                spellings.push(bound);
+            }
+        }
+        for spelling in &spellings {
+            diagnostics.push_str(&lsof_diagnostic(&["-t", "-U", "-a", "--", spelling]));
+            diagnostics.push('\n');
+        }
+        let pid_text = pid.to_string();
+        diagnostics.push_str(&lsof_diagnostic(&["-U"]));
+        diagnostics.push('\n');
+        diagnostics.push_str(&lsof_diagnostic(&["-U", "-a", "-p", &pid_text]));
+        eprintln!("{diagnostics}");
+
         let mut clients = unverified_client(pid, Some(format!("unix://{}", published.display())), "argv");
         prove_attachments(&mut clients, &published).await;
         assert_eq!(
             clients.attached.len(),
             1,
-            "the live lsof peer is proven through the bind spelling: {:?}",
+            "the live lsof peer is proven through the bind spelling: {:?}\n{diagnostics}",
             clients.unverified
         );
         assert_eq!(clients.attached[0].pid, pid);
