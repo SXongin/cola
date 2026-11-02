@@ -529,11 +529,12 @@ Codex's own refusal.
 the agent's stdin/stdout would make cola its sole client instead.
 `codex app-server proxy` does not do that: cola owns the **proxy child's**
 stdin/stdout — a pipe into a relay — while the app-server is a separate process
-(the managed daemon, or a listener cola did not start) that cola neither spawned
-nor reaps. That is the Peer Attachment shape: cola is one more connection to a
-runtime someone else owns. Spelling the app-server's own stdin/stdout as the
-transport (Codex's `stdio://`, or ACP's model of spawning the agent as the
-client's subprocess) is the **Owned Runtime** shape and remains deliberately
-unsupported. `ws://` describes neither: it stays an `Endpoint` that only tests
-construct, because the daemon serves no WebSocket or TCP listener and offers no
-config key to create one.
+(the managed app-server daemon, or a listener cola did not start). cola may
+**launch** it through Codex's own `daemon start` under `start_server` (decision
+3), but it does not own, signal, or reap it. That is the Peer Attachment shape:
+cola is one more connection to a runtime someone else owns. Spelling the
+app-server's own stdin/stdout as the transport (Codex's `stdio://`, or ACP's
+model of spawning the agent as the client's subprocess) is the **Owned Runtime**
+shape and remains deliberately unsupported. `ws://` describes neither: it stays
+an `Endpoint` that only tests construct, because the daemon serves no WebSocket
+or TCP listener and offers no config key to create one.
