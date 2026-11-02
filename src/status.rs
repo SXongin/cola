@@ -1081,7 +1081,8 @@ fn local_client_check(report: &ClientReport) -> Check {
             "在有 `/proc` 与 `ss` 的 Linux 上，以 `codex --remote unix://…` 启动且持有连接时，\
              可由打开的描述符证实"
         } else {
-            "此平台没有 unix socket 描述符或 peer 地址证据，因此共享状态只能保持 unverified"
+            "Windows 只提供进程身份与 `--remote` argv，没有套接字描述符或 peer 地址证据；\
+             连接本身可用，但无法硬证明，因此共享状态保持 unverified（not hard-proven）"
         };
         return Check::warn(
             "Codex 本地客户端",

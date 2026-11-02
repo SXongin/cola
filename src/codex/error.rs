@@ -17,12 +17,14 @@ pub(crate) type Result<T> = std::result::Result<T, CodexError>;
 #[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum CodexError {
-    /// The listen URL is not one this client speaks. Codex also supports
-    /// `stdio://`, which cola deliberately does not: a peer attachment cannot
-    /// own the agent's stdin/stdout.
+    /// The listen URL is not one this client speaks. cola attaches to the
+    /// daemon's control socket (`unix://PATH`) through `codex app-server
+    /// proxy`; it deliberately does not own the agent's stdin/stdout, and the
+    /// daemon serves no `ws://` listener.
     #[error(
-        "codex app-server endpoint `{0}` is not supported; this client speaks `ws://HOST:PORT` \
-         and `unix://PATH` (not stdio)"
+        "codex app-server endpoint `{0}` is not supported; cola attaches through \
+         `codex app-server proxy`, which speaks the daemon's `unix://PATH` control socket \
+         (never a WebSocket listener or the agent's stdio)"
     )]
     Endpoint(String),
 
@@ -175,4 +177,19 @@ pub(crate) enum CodexError {
         length: usize,
         limit: usize,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The unsupported-endpoint error names the proxy transport as the remedy
+    /// and never offers a WebSocket URL as a daemon endpoint (ticket #954).
+    #[test]
+    fn the_endpoint_error_names_the_proxy_and_not_a_websocket_remedy() {
+        let message = CodexError::Endpoint("tcp://127.0.0.1:1".to_string()).to_string();
+        assert!(message.contains("codex app-server proxy"), "{message}");
+        assert!(message.contains("unix://PATH"), "{message}");
+        assert!(!message.contains("ws://"), "{message}");
+    }
 }
