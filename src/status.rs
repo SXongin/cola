@@ -861,8 +861,7 @@ async fn codex_checks(
         if !preconditions.allows_diagnostics() {
             checks.push(Check::warn(
                 "Codex 诊断",
-                "Windows daemon 前置条件未满足，已跳过 daemon 发现、连接和回合探测（不会尝试启动 \
-                 daemon）。修正上面的 ❌ 后重试",
+                "Windows app-server daemon 前置条件未满足，已跳过 app-server daemon 发现、连接和回合探测（不会尝试启动 app-server daemon）。修正上面的 ❌ 后重试",
             ));
             return checks;
         }

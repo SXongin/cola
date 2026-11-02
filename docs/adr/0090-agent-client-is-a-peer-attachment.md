@@ -80,7 +80,11 @@ configuration; a TUI on an embedded server is unsupported and `cola doctor` must
 say so, because the alternative is a bot that silently mirrors nothing. This is
 ADR-0085's "one server is correctness" applied to Codex: cola discovers the
 daemon socket under the shared `CODEX_HOME`, may start the daemon under
-`start_server`, and never owns or reaps it.
+`start_server`, and never owns or reaps it. That invariant is about the user's
+daemon: production never owns, signals or reaps it. The isolated live
+integration fixture is the one exception — it starts a throwaway daemon and may
+stop it through Codex's own `daemon stop` (with `Drop` as a backstop), which is
+test-only.
 
 **4. ACP is a later, cola-owned mode — not the way to reach the peer story.**
 The ACP adapter, when it lands, is a second `kind` that spawns an agent process
@@ -531,8 +535,10 @@ the agent's stdin/stdout would make cola its sole client instead.
 stdin/stdout — a pipe into a relay — while the app-server is a separate process
 (the managed app-server daemon, or a listener cola did not start). cola may
 **launch** it through Codex's own `daemon start` under `start_server` (decision
-3), but it does not own, signal, or reap it. That is the Peer Attachment shape:
-cola is one more connection to a runtime someone else owns. Spelling the
+3), but in production it does not own, signal, or reap the user's daemon; only
+the isolated live integration fixture may stop its own throwaway daemon, with
+`Drop` as the backstop. That is the Peer Attachment shape: cola is one more
+connection to a runtime someone else owns. Spelling the
 app-server's own stdin/stdout as the transport (Codex's `stdio://`, or ACP's
 model of spawning the agent as the client's subprocess) is the **Owned Runtime**
 shape and remains deliberately unsupported. `ws://` describes neither: it stays

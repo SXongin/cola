@@ -334,7 +334,7 @@ daemon's control socket is an AF_UNIX socket on every platform; cola reaches it
 through `codex app-server proxy`, so nothing in cola's path needs a WebSocket
 or TCP listener, and `ws://` is not a user-facing endpoint for the app-server
 daemon. What differs is the evidence `cola doctor` can demand before it calls
-your own client's attachment proven.
+your own Agent Client's attachment proven.
 
 | Platform | cola attaches | `cola doctor` proves *your* client attached | Verification |
 | --- | --- | --- | --- |
