@@ -214,6 +214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "check_elevation"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8bd5a44e782b910d9336320487a74e7a8256741c1485332608d014d3c2864e7"
+dependencies = [
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -292,6 +301,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
+ "check_elevation",
  "chrono",
  "clap",
  "clap_complete",
@@ -319,7 +329,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "win-elevation",
  "winapi-util",
  "zip",
 ]
@@ -2391,13 +2400,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "win-elevation"
-version = "0.1.0"
-dependencies = [
- "windows-sys 0.61.2",
 ]
 
 [[package]]

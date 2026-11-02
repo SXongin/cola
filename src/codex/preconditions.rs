@@ -107,6 +107,9 @@ pub(crate) enum SocketBudget {
     /// The path cannot be an AF_UNIX address at all (for example, it is not
     /// valid UTF-8).
     Unusable { path: String, detail: String },
+    /// The control path could not be resolved because `CODEX_HOME`/home is
+    /// unavailable. The token and launcher probes can still report.
+    Unlocalized(String),
 }
 
 /// The three Windows preconditions, probed once and then answered as a pure
@@ -146,7 +149,7 @@ impl Preconditions {
     /// [`CodexError`] `start_refusal` returns.
     pub(crate) fn socket_instruction(&self) -> Option<String> {
         match &self.socket {
-            SocketBudget::Fits { .. } => None,
+            SocketBudget::Fits { .. } | SocketBudget::Unlocalized(_) => None,
             SocketBudget::TooLong { path, length, limit } => Some(format!(
                 "控制套接字路径 `{path}` 为 {length} 字节，超过 Windows AF_UNIX 地址的 \
                  {limit} 字节上限（含终止 NUL）。请缩短 CODEX_HOME。"
@@ -163,14 +166,20 @@ impl Preconditions {
     /// under this token, and the path must be refused **before** the proxy
     /// child is spawned. An **unknown** elevation still allows the read-only
     /// diagnosis — attaching to an existing daemon writes nothing and is the
-    /// one thing that can still answer — but is never reported as a pass and
-    /// never allows a start.
+    /// one thing that can still answer — but is never reported as a pass,
+    /// never allows a start, and `doctor` skips the real-turn probe (which
+    /// writes a thread and may spend provider money).
     pub(crate) fn allows_diagnostics(&self) -> bool {
-        !matches!(self.elevation, Elevation::Elevated) && self.socket_instruction().is_none()
+        !matches!(self.elevation, Elevation::Elevated)
+            && !matches!(
+                self.socket,
+                SocketBudget::TooLong { .. } | SocketBudget::Unusable { .. }
+            )
     }
 
-    /// The canonical error a start is refused with, in the order the doctor
-    /// rows report it. `None` when the machine satisfies every precondition.
+    /// The canonical error a start is refused with, in the same order the
+    /// doctor rows report the preconditions: elevation, launcher, control
+    /// path. `None` when the machine satisfies every precondition.
     ///
     /// The path cases reuse the errors ticket #950 introduced, so the message
     /// a start prints and the message the rest of the adapter prints cannot
@@ -194,6 +203,14 @@ impl Preconditions {
             Elevation::NotElevated => {}
         }
 
+        if let Breakaway::Rejected = self.breakaway {
+            return Some(CodexError::WindowsPrecondition(
+                "the launcher prevents a breakaway child (for example `cargo run` or an outer \
+                 job object); run codex.exe directly"
+                    .to_string(),
+            ));
+        }
+
         match &self.socket {
             SocketBudget::TooLong { path, length, limit } => {
                 return Some(CodexError::ControlSocketPathTooLong {
@@ -208,17 +225,16 @@ impl Preconditions {
                     detail: detail.clone(),
                 });
             }
+            SocketBudget::Unlocalized(detail) => {
+                return Some(CodexError::WindowsPrecondition(format!(
+                    "the control-socket path could not be localized ({detail}); refusing to \
+                     start without measuring it"
+                )));
+            }
             SocketBudget::Fits { .. } => {}
         }
 
-        match self.breakaway {
-            Breakaway::Rejected => Some(CodexError::WindowsPrecondition(
-                "the launcher prevents a breakaway child (for example `cargo run` or an outer \
-                 job object); run codex.exe directly"
-                    .to_string(),
-            )),
-            Breakaway::Allowed | Breakaway::Unavailable(_) | Breakaway::Skipped(_) => None,
-        }
+        None
     }
 }
 
@@ -228,18 +244,19 @@ impl Preconditions {
 ///
 /// The order is deliberate: the pure socket-budget check runs first, then the
 /// token query, and the breakaway **spawn** runs only when neither of those
-/// already blocks the diagnosis and the start. An over-budget path or an
-/// elevated token therefore never pays a `CreateProcess`.
+/// already refuses the start. An over-budget path, an elevated token, an
+/// unreadable token, or an unlocalized home therefore never pays a
+/// `CreateProcess`.
 #[cfg(windows)]
-pub(crate) fn probe(environment: &Environment) -> Preconditions {
-    let socket = socket_budget(&environment.socket(), WINDOWS_SOCKET_PATH_LIMIT);
+pub(crate) fn probe(environment: Option<&Environment>) -> Preconditions {
+    let socket = match environment {
+        Some(environment) => socket_budget(&environment.socket(), WINDOWS_SOCKET_PATH_LIMIT),
+        None => SocketBudget::Unlocalized("cannot resolve CODEX_HOME or a home directory".to_string()),
+    };
     let elevation = probe_elevation();
-    let breakaway = match (&elevation, &socket) {
-        (Elevation::Elevated, _) => Breakaway::Skipped("令牌已提升".to_string()),
-        (_, SocketBudget::TooLong { .. } | SocketBudget::Unusable { .. }) => {
-            Breakaway::Skipped("控制套接字路径不可用".to_string())
-        }
-        _ => probe_breakaway(),
+    let breakaway = match skip_breakaway(&elevation, &socket) {
+        Some(reason) => Breakaway::Skipped(reason.to_string()),
+        None => probe_breakaway(),
     };
     Preconditions {
         elevation,
@@ -248,14 +265,29 @@ pub(crate) fn probe(environment: &Environment) -> Preconditions {
     }
 }
 
-/// `GetTokenInformation(TokenElevation)` through the first-party safe wrapper.
+/// Why the breakaway probe is skipped, if an earlier precondition already
+/// refuses a start. Pure so the decision is pinned on every platform.
+#[cfg(any(windows, test))]
+fn skip_breakaway(elevation: &Elevation, socket: &SocketBudget) -> Option<&'static str> {
+    match (elevation, socket) {
+        (Elevation::Elevated, _) => Some("令牌已提升"),
+        (Elevation::Unknown(_), _) => Some("无法读取令牌提升状态"),
+        (_, SocketBudget::TooLong { .. } | SocketBudget::Unusable { .. }) => Some("控制套接字路径不可用"),
+        (_, SocketBudget::Unlocalized(_)) => Some("无法定位 CODEX_HOME"),
+        _ => None,
+    }
+}
+
+/// `GetTokenInformation(TokenElevation)` through `check_elevation`.
 /// A failed query is [`Elevation::Unknown`], never a silent "not elevated".
 #[cfg(windows)]
 fn probe_elevation() -> Elevation {
-    match win_elevation::token_elevation() {
+    match check_elevation::is_elevated() {
         Ok(true) => Elevation::Elevated,
         Ok(false) => Elevation::NotElevated,
-        Err(detail) => Elevation::Unknown(detail),
+        Err(error) => Elevation::Unknown(format!(
+            "the Windows token-elevation query failed with error {error:#010x}"
+        )),
     }
 }
 
@@ -270,15 +302,26 @@ pub(crate) fn socket_budget(socket: &Path, limit: usize) -> SocketBudget {
     match socket_path_budget(socket, limit) {
         Ok(()) => {
             let measured = measured_socket_path(socket);
+            // The budget check above proved the measured path is UTF-8.
+            let length = measured
+                .to_str()
+                .expect("the budget check proved the path is UTF-8")
+                .len();
             SocketBudget::Fits {
                 path: measured.display().to_string(),
-                length: measured.to_str().map(str::len).unwrap_or_default(),
+                length,
                 limit,
             }
         }
         Err(CodexError::ControlSocketPathTooLong { path, length, limit }) => {
             SocketBudget::TooLong { path, length, limit }
         }
+        // `DaemonSocket` already prefixes the path with "is unusable"; keep
+        // only its detail so the doctor row does not nest the sentence.
+        Err(CodexError::DaemonSocket { detail, .. }) => SocketBudget::Unusable {
+            path: measured_socket_path(socket).display().to_string(),
+            detail,
+        },
         Err(error) => SocketBudget::Unusable {
             path: measured_socket_path(socket).display().to_string(),
             detail: error.to_string(),
@@ -292,7 +335,11 @@ pub(crate) fn socket_budget(socket: &Path, limit: usize) -> SocketBudget {
 #[cfg(any(windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SpawnAttempt {
-    Spawned,
+    /// The child was created. `cleanup` records a kill/reap failure, which is
+    /// logged but must not downgrade the spawn evidence.
+    Spawned {
+        cleanup: Option<String>,
+    },
     AccessDenied,
     Failed(String),
 }
@@ -307,8 +354,17 @@ enum SpawnAttempt {
 #[cfg(any(windows, test))]
 fn classify_breakaway(first: SpawnAttempt, retry: Option<SpawnAttempt>) -> Breakaway {
     match (first, retry) {
-        (SpawnAttempt::Spawned, _) => Breakaway::Allowed,
-        (SpawnAttempt::AccessDenied, Some(SpawnAttempt::Spawned)) => Breakaway::Rejected,
+        // A cleanup failure says the probe leaked a suspended child, not that
+        // the launcher is restricted. The spawn evidence still classifies it;
+        // the leak was logged at error! where it happened.
+        (SpawnAttempt::Spawned { cleanup }, _) => {
+            let _ = cleanup;
+            Breakaway::Allowed
+        }
+        (SpawnAttempt::AccessDenied, Some(SpawnAttempt::Spawned { cleanup })) => {
+            let _ = cleanup;
+            Breakaway::Rejected
+        }
         (SpawnAttempt::AccessDenied, Some(SpawnAttempt::Failed(detail))) => Breakaway::Unavailable(detail),
         (SpawnAttempt::AccessDenied, Some(SpawnAttempt::AccessDenied))
         | (SpawnAttempt::AccessDenied, None) => {
@@ -339,9 +395,11 @@ fn probe_breakaway() -> Breakaway {
 
 /// One suspended spawn attempt, reaped before returning.
 ///
-/// A failed `kill` is returned as a failure and the child is dropped rather
-/// than waited on: it is `CREATE_SUSPENDED`, so a wait would never return while
-/// the lifecycle pass lock is held. That matches upstream's shape.
+/// A failed `kill` is logged and retried once, but the child is never waited
+/// on: it is `CREATE_SUSPENDED`, so a wait could never return while the
+/// lifecycle pass lock is held. The spawn outcome is still `Spawned` — the
+/// cleanup failure must not turn proven launcher evidence into "unavailable" —
+/// and the cleanup detail says whether a suspended child was leaked.
 #[cfg(windows)]
 fn spawn_suspended(executable: &Path, breakaway: bool) -> SpawnAttempt {
     use std::os::windows::process::CommandExt;
@@ -359,17 +417,29 @@ fn spawn_suspended(executable: &Path, breakaway: bool) -> SpawnAttempt {
     match command.spawn() {
         Ok(mut child) => {
             if let Err(error) = child.kill() {
-                // Do not wait: a suspended child never exits on its own.
-                return SpawnAttempt::Failed(format!(
-                    "the suspended launch probe could not be terminated: {error}"
-                ));
+                tracing::error!("the breakaway launch probe could not be terminated: {error}; retrying once");
+                match child.kill() {
+                    Ok(()) => SpawnAttempt::Spawned {
+                        cleanup: Some(format!("the first termination attempt failed: {error}")),
+                    },
+                    Err(retry) => {
+                        tracing::error!(
+                            "the suspended breakaway launch probe was leaked: first kill \
+                             failed: {error}; retry failed: {retry}"
+                        );
+                        SpawnAttempt::Spawned {
+                            cleanup: Some(format!("could not terminate the suspended probe: {retry}")),
+                        }
+                    }
+                }
+            } else if let Err(error) = child.wait() {
+                tracing::error!("the breakaway launch probe could not be reaped: {error}");
+                SpawnAttempt::Spawned {
+                    cleanup: Some(format!("could not reap the suspended probe: {error}")),
+                }
+            } else {
+                SpawnAttempt::Spawned { cleanup: None }
             }
-            if let Err(error) = child.wait() {
-                return SpawnAttempt::Failed(format!(
-                    "the suspended launch probe could not be reaped: {error}"
-                ));
-            }
-            SpawnAttempt::Spawned
         }
         Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => SpawnAttempt::AccessDenied,
         Err(error) => SpawnAttempt::Failed(error.to_string()),
@@ -515,11 +585,14 @@ mod tests {
     #[test]
     fn breakaway_classification_requires_a_successful_retry() {
         assert_eq!(
-            classify_breakaway(SpawnAttempt::Spawned, None),
+            classify_breakaway(SpawnAttempt::Spawned { cleanup: None }, None),
             Breakaway::Allowed
         );
         assert_eq!(
-            classify_breakaway(SpawnAttempt::AccessDenied, Some(SpawnAttempt::Spawned)),
+            classify_breakaway(
+                SpawnAttempt::AccessDenied,
+                Some(SpawnAttempt::Spawned { cleanup: None })
+            ),
             Breakaway::Rejected
         );
         assert!(matches!(
@@ -542,6 +615,56 @@ mod tests {
             classify_breakaway(SpawnAttempt::Failed("no such file".into()), None),
             Breakaway::Unavailable(detail) if detail.contains("no such file")
         ));
+    }
+
+    /// A cleanup failure after a successful spawn is a leak to log, not proof
+    /// that the launcher is restricted: the spawn evidence still wins.
+    #[test]
+    fn a_failed_cleanup_keeps_the_spawn_evidence() {
+        assert_eq!(
+            classify_breakaway(
+                SpawnAttempt::Spawned {
+                    cleanup: Some("kill failed".into())
+                },
+                None
+            ),
+            Breakaway::Allowed
+        );
+        assert_eq!(
+            classify_breakaway(
+                SpawnAttempt::AccessDenied,
+                Some(SpawnAttempt::Spawned {
+                    cleanup: Some("kill failed".into())
+                })
+            ),
+            Breakaway::Rejected
+        );
+    }
+
+    /// An unresolvable home still reports the token and skips the launcher
+    /// spawn; the path row is the one that degrades to "unlocalized".
+    #[cfg(windows)]
+    #[test]
+    fn an_unlocalized_home_still_probes_the_token() {
+        let pre = probe(None);
+        assert!(matches!(pre.socket, SocketBudget::Unlocalized(_)));
+        assert!(matches!(pre.breakaway, Breakaway::Skipped(_)));
+    }
+
+    /// Every refusal that already blocks a start skips the breakaway spawn,
+    /// including an unreadable token (which still allows read-only work).
+    #[test]
+    fn a_refused_start_skips_the_breakaway_spawn() {
+        assert!(skip_breakaway(&Elevation::Elevated, &fits()).is_some());
+        assert!(skip_breakaway(&Elevation::Unknown("query failed".into()), &fits()).is_some());
+        assert_eq!(skip_breakaway(&Elevation::NotElevated, &fits()), None);
+        assert!(
+            skip_breakaway(
+                &Elevation::NotElevated,
+                &SocketBudget::Unlocalized("no home".into())
+            )
+            .is_some()
+        );
     }
 
     /// A probe that could not run is never reported as a rejection.

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/win-elevation", "xtask"]
+members = [".", "xtask"]
 # The cargo-fuzz crate is its own workspace; keep root commands (fmt, clippy,
 # test) from reaching into it.
 exclude = ["fuzz"]
@@ -83,11 +83,11 @@ flate2 = "1"
 tar = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# A safe wrapper over `OpenProcessToken` + `GetTokenInformation(TokenElevation)`
-# for `cola doctor`'s elevation precondition (ticket #952): this crate forbids
-# `unsafe` outside tests, so the Win32 call lives in a first-party crate whose
-# failure stays distinct from a non-elevated answer.
-win-elevation = { path = "crates/win-elevation" }
+# `GetTokenInformation(TokenElevation)` for `cola doctor`'s elevation
+# precondition (ticket #952): a safe, maintained wrapper whose `Result` keeps a
+# failed query distinct from a non-elevated answer. The crate is no_std and
+# closes its token handle; this crate forbids `unsafe` outside tests.
+check_elevation = "0.3.0"
 # Safe handle-identity comparison (`opened_stays_beneath`): the stable
 # `MetadataExt` volume/file-index accessors are still nightly-only.
 same-file = "1"
