@@ -245,7 +245,8 @@ jobs:
       # The suite asserts its own cleanup; this re-checks the pids and runtime
       # paths it recorded after the test process exits. The argv scan is only a
       # fallback: temp paths are random and a Windows daemon's argv does not
-      # carry them.
+      # carry them. The shared script also waits out the brief settle window
+      # before failing a pid or a path.
       - if: >-
           always() &&
           needs.classify.outputs.heavy != 'false' &&
@@ -254,68 +255,7 @@ jobs:
         shell: bash
         env:
           COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier1-pids.txt
-        run: |
-          set -euo pipefail
-          marker="$COLA_LIVE_CODEX_PID_FILE"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            marker=$(cygpath -u "$marker" 2>/dev/null || echo "$marker")
-          fi
-          if [ -f "$marker" ]; then
-            while IFS= read -r line; do
-              case "$line" in
-                pid:*)
-                  pid="${line#pid:}"
-                  if [ "$RUNNER_OS" = "Windows" ]; then
-                    alive=$(powershell -NoProfile -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { 'alive' }")
-                    if [ "$alive" = "alive" ]; then
-                      echo "tier-1 left pid $pid alive" >&2
-                      exit 1
-                    fi
-                  elif kill -0 "$pid" 2>/dev/null; then
-                    echo "tier-1 left pid $pid alive" >&2
-                    exit 1
-                  fi
-                  ;;
-                path:*)
-                  path="${line#path:}"
-                  if [ "$RUNNER_OS" = "Windows" ]; then
-                    path=$(cygpath -u "$path" 2>/dev/null || echo "$path")
-                  fi
-                  if [ -e "$path" ]; then
-                    echo "tier-1 left runtime path $path behind" >&2
-                    exit 1
-                  fi
-                  ;;
-              esac
-            done < "$marker"
-          fi
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            if tasklist | grep -qi 'codex'; then
-              tasklist | grep -i 'codex'
-              echo "the tier-1 suite left a live codex process behind" >&2
-              exit 1
-            fi
-          else
-            # The marker above is the authoritative check. The fallback must
-            # only name this suite's actual children: matching the temp prefix
-            # (`cola-cx`) also matched unrelated `git` processes, whose command
-            # lines happened to carry a lookalike path. A codex app-server
-            # listener or proxy is specific to the tier.
-            leftovers=""
-            for pattern in 'app-server proxy' 'app-server --listen'; do
-              # Drop this step's own shell: a `pgrep -f` over the pattern can
-              # match the script that contains it.
-              found=$(pgrep -fl "$pattern" | awk -v self="$$" '$1 != self')
-              if [ -n "$found" ]; then
-                leftovers="$leftovers$found"$'\n'
-              fi
-            done
-            if [ -n "$leftovers" ]; then
-              printf '%s' "$leftovers"
-              echo "the tier-1 suite left a live process behind" >&2
-              exit 1
-            fi
-          fi
+        run: bash .github/scripts/check-live-codex-cleanup.sh tier-1
 
   live-codex-tier2:
     # tier-2 of the Codex live contract (ticket #953): the real managed daemon
@@ -389,46 +329,7 @@ jobs:
         shell: bash
         env:
           COLA_LIVE_CODEX_PID_FILE: ${{ runner.temp }}/codex-live-tier2-pids.txt
-        run: |
-          set -euo pipefail
-          marker="$COLA_LIVE_CODEX_PID_FILE"
-          if [ -f "$marker" ]; then
-            while IFS= read -r line; do
-              case "$line" in
-                pid:*)
-                  pid="${line#pid:}"
-                  if kill -0 "$pid" 2>/dev/null; then
-                    echo "tier-2 left pid $pid alive" >&2
-                    exit 1
-                  fi
-                  ;;
-                path:*)
-                  path="${line#path:}"
-                  if [ -e "$path" ]; then
-                    echo "tier-2 left runtime path $path behind" >&2
-                    exit 1
-                  fi
-                  ;;
-              esac
-            done < "$marker"
-          fi
-          # The marker above is authoritative. As for tier-1, the temp-prefix
-          # fallback matched unrelated processes, so only the suite's own
-          # app-server listener/proxy children are checked here.
-          leftovers=""
-          for pattern in 'app-server proxy' 'app-server --listen'; do
-            # Drop this step's own shell: a `pgrep -f` over the pattern can
-            # match the script that contains it.
-            found=$(pgrep -fl "$pattern" | awk -v self="$$" '$1 != self')
-            if [ -n "$found" ]; then
-              leftovers="$leftovers$found"$'\n'
-            fi
-          done
-          if [ -n "$leftovers" ]; then
-            printf '%s' "$leftovers"
-            echo "the tier-2 suite left a live process behind" >&2
-            exit 1
-          fi
+        run: bash .github/scripts/check-live-codex-cleanup.sh tier-2
 
   test:
     # Compile + test only on the other platforms: catches platform quirks
