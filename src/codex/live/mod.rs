@@ -4,9 +4,11 @@
 //! credential-free and network-free:
 //!
 //! - **tier-1** ([`live_codex_tier1_scripted_transport`], every platform): the
-//!   real pinned `codex` starts `app-server --listen unix://<short path>` in an
-//!   isolated `CODEX_HOME`, a scripted Responses provider answers the model
-//!   protocol, and cola attaches through `codex app-server proxy`. The suite
+//!   real pinned `codex` starts `app-server --listen unix://<short path>` at
+//!   the discovered control-socket path in an isolated `CODEX_HOME`, a scripted
+//!   Responses provider answers the model protocol, and the production
+//!   `CodexLifecycle::ensure_attached` discovers the listener and attaches
+//!   through `codex app-server proxy`. The suite
 //!   asserts a `thread/start`, a completed turn carrying the scripted text, an
 //!   approval asked on the first connection and answered from a second one
 //!   subscribed with `thread/resume`, and a `turn/interrupt` that ends the
@@ -46,16 +48,17 @@ use tokio::time::sleep;
 
 use crate::backend::Backend;
 #[cfg(unix)]
-use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, RestartOutcome, ServerLifecycle};
+use crate::backend::lifecycle::RestartOutcome;
+use crate::backend::lifecycle::{AttachOutcome, EnsureAttached, ServerLifecycle};
 use crate::codex::client::{CodexClient, CodexOptions};
+use crate::codex::discovery::Daemon;
 #[cfg(unix)]
 use crate::codex::discovery::{self, DaemonState};
-use crate::codex::schema::{PINNED_VERSION, PinnedProbe, Surface};
+use crate::codex::lifecycle::{CodexLifecycle, ProbeSource};
+use crate::codex::schema::{AutoProbe, PINNED_VERSION, PinnedProbe, Surface, SurfaceProbe};
 use crate::codex::threads::{Adoption, ThreadModel, ThreadSettings};
 use crate::codex::transport::Inbound;
-#[cfg(unix)]
-use crate::config::ServerStartPolicy;
-use crate::config::{ApprovalPolicy, SandboxMode};
+use crate::config::{ApprovalPolicy, SandboxMode, ServerStartPolicy};
 
 use provider::{
     APPROVAL_COMMAND, APPROVAL_PROMPT, APPROVAL_TEXT, INTERRUPT_PROMPT, ScriptedProvider, TEXT, TEXT_PROMPT,
@@ -100,6 +103,30 @@ async fn connect(endpoint: crate::codex::transport::Endpoint, binary: &Path) -> 
     CodexClient::connect(&options(endpoint, binary), &PinnedProbe)
         .await
         .expect("attach cola through the codex proxy")
+}
+
+/// The tier-1 listener is a standalone `app-server --listen`, not a managed
+/// daemon, so its `daemon version` report may name no binary. Probe the binary
+/// the suite launched: it is the server that answers on the listener.
+struct ListenerProbe(PathBuf);
+
+impl ProbeSource for ListenerProbe {
+    fn probe(&self, _daemon: &Daemon) -> Box<dyn SurfaceProbe> {
+        Box::new(AutoProbe::new(self.0.clone()))
+    }
+}
+
+/// The lifecycle settings the tier-1 attach must carry: `never` (it may not
+/// spawn a daemon), plus the same read-only/`on-request` pair `live_settings`
+/// gives the direct client, because the lifecycle builds a client's thread
+/// settings from `CodexConfig`.
+fn live_config() -> crate::config::CodexConfig {
+    crate::config::CodexConfig {
+        start_server: ServerStartPolicy::Never,
+        sandbox: Some(SandboxMode::ReadOnly),
+        approval_policy: Some(ApprovalPolicy::OnRequest),
+        ..crate::config::CodexConfig::default()
+    }
 }
 
 /// Regenerate the schema from the **live** binary and compare it with the
@@ -319,7 +346,12 @@ async fn live_codex_tier1_scripted_transport() {
     let binary = codex_binary();
     let provider = ScriptedProvider::start().await;
     let mut server = LiveAppServer::start(&binary, &provider.base_url()).await;
-    let endpoint = server.endpoint();
+    // Record the listener immediately, before the schema run or any dial can
+    // fail: a panic after this point would otherwise leave CI no pid to check.
+    record_cleanup_marker(
+        &server.pid().into_iter().collect::<Vec<_>>(),
+        &server.runtime_paths(),
+    );
     let work = server.work().to_path_buf();
     let home = server.home().to_path_buf();
     let socket_path = server.socket().to_path_buf();
@@ -328,14 +360,38 @@ async fn live_codex_tier1_scripted_transport() {
     // The reference is checked against the *live* binary, not against itself.
     verify_live_surface(&binary, &home).await;
 
-    let client_a = connect(endpoint.clone(), &binary).await;
-    let client_b = connect(endpoint, &binary).await;
+    // Drive the production attach path, not a hand-built endpoint:
+    // `ensure_attached` discovers the listener at `Environment::socket()` and
+    // dials it through the proxy, exactly as production does on this platform.
+    let never_busy = || false;
+    let lifecycle = CodexLifecycle::new(
+        live_config(),
+        server.environment(),
+        Box::new(ListenerProbe(binary.clone())),
+    );
+    assert_eq!(
+        lifecycle
+            .ensure_attached(EnsureAttached {
+                allow_spawn: false,
+                heal_when_busy: false,
+                busy: &never_busy,
+                boot: false,
+            })
+            .await
+            .expect("attach through the lifecycle"),
+        AttachOutcome::Attached,
+        "the lifecycle attaches to the tier-1 listener"
+    );
+    let client_a = lifecycle
+        .attached_client()
+        .await
+        .expect("the lifecycle installed an attached client");
+    let client_b = connect(server.endpoint(), &binary).await;
     let pinned = Surface::pinned();
     assert_eq!(client_a.server_info().version.to_string(), PINNED_VERSION);
     assert_eq!(client_a.server_info().surface_counts, pinned.counts());
 
-    // Record the cleanup evidence now, so a later assertion failure still
-    // leaves CI a pid/path list to check.
+    // Extend the cleanup evidence now that both proxies exist.
     let proxy_pids: Vec<u32> = [&client_a, &client_b]
         .into_iter()
         .filter_map(|client| client.connection().proxy_pid())
@@ -447,9 +503,11 @@ async fn live_codex_tier1_scripted_transport() {
     drop(_adoption);
 
     // Cleanup is part of the contract: the server, the proxy children, the
-    // listener and the temp home must all be gone before the test returns.
+    // listener and the temp home must all be gone before the test returns. The
+    // lifecycle holds its own clone of the first client's connection.
     drop(client_b);
     drop(client_a);
+    drop(lifecycle);
     // Closing the listener is what makes each proxy child see EOF and exit;
     // the transport then reaps them as their connections drop.
     server.shutdown().await;
@@ -529,25 +587,27 @@ async fn live_codex_tier2_managed_daemon() {
         AttachOutcome::Attached
     );
 
-    // Record the cleanup evidence before any later assertion can fail: the
-    // daemon's argv does not carry the temp prefix, so pids are the CI-visible
-    // proof and the runtime paths are the Unix-side one.
-    let attached = auto.attached_client().await.expect("an attached client");
-    let proxy_pid = attached
-        .connection()
-        .proxy_pid()
-        .expect("the managed daemon was dialled through a proxy child");
-    drop(attached);
+    // Record the daemon pids immediately after `Attached`, before any later
+    // assertion can fail: the daemon's argv does not carry the temp prefix, so
+    // pids are the CI-visible proof. The proxy pid follows, then the paths once
+    // discovery has named them.
     let daemon_pids = daemon.process_ids();
     assert!(
         !daemon_pids.is_empty(),
         "the running daemon's processes were not found under {}",
         daemon.home().display()
     );
-    let cleanup_paths = daemon.runtime_paths();
     let mut cleanup_pids = daemon_pids.clone();
+    record_cleanup_marker(&cleanup_pids, &[]);
+
+    let attached = auto.attached_client().await.expect("an attached client");
+    let proxy_pid = attached
+        .connection()
+        .proxy_pid()
+        .expect("the managed daemon was dialled through a proxy child");
+    drop(attached);
     cleanup_pids.push(proxy_pid);
-    record_cleanup_marker(&cleanup_pids, &cleanup_paths);
+    record_cleanup_marker(&cleanup_pids, &[]);
 
     // Discovery through the control socket: the published path is a symlink
     // into the daemon's short runtime directory on Unix, and the report names
@@ -583,6 +643,11 @@ async fn live_codex_tier2_managed_daemon() {
     let info = found.info.as_ref().expect("discovery kept the version report");
     assert_eq!(info.app_server_version.as_deref(), Some(PINNED_VERSION));
     assert_eq!(info.cli_version.as_deref(), Some(PINNED_VERSION));
+
+    // Now that discovery named the published path and its runtime target, add
+    // the paths to the pids already recorded.
+    let cleanup_paths = daemon.runtime_paths();
+    record_cleanup_marker(&cleanup_pids, &cleanup_paths);
 
     // A second attach is the cached steady state, not a new daemon.
     assert_eq!(

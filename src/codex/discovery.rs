@@ -466,7 +466,7 @@ pub(crate) struct DaemonInfo {
     pub(crate) backend: Option<String>,
     /// The binary the running daemon executes. This — not the `codex` on
     /// `PATH` — is what the schema probe must ask (spec #860 ticket #876's
-    /// finding: a 0.163 CLI cannot vouch for a 0.164 daemon).
+    /// finding: a 0.165 CLI cannot vouch for a 0.166 daemon).
     #[serde(default)]
     pub(crate) managed_codex_path: Option<PathBuf>,
     #[serde(default)]
@@ -2262,7 +2262,7 @@ mod tests {
     }
 
     /// The daemon's own report shape, as `codex app-server daemon version`
-    /// prints it on a machine with a managed 0.164 daemon and a 0.163 CLI.
+    /// prints it on a machine whose daemon and CLI are both the pinned 0.166.
     #[test]
     fn the_daemon_report_parses_the_running_binary() {
         let info = parse_info(
