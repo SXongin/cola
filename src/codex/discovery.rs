@@ -1959,15 +1959,17 @@ fn normalized_unix_address(token: &str) -> Option<String> {
     Some(format!("0x{value:x}"))
 }
 
-/// No prover exists outside Linux and macOS. The argv may name the daemon, but
-/// cola has no evidence to promote it, so the attachment stays not hard-proven.
+/// No prover exists outside Linux and macOS. The argv may name the daemon and
+/// the process identity is visible, but cola has no descriptor or peer-address
+/// evidence to promote it, so the attachment stays not hard-proven.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn prove_unsupported(clients: &mut LocalClients, daemon: &Path) {
     let platform = std::env::consts::OS;
     for client in &mut clients.unverified {
         client.detail = format!(
-            "argv names the daemon at {}, but cola has no prover for {platform}: the attachment \
-             is not hard-proven",
+            "argv names the daemon at {}, and {platform} exposes the process identity, but cola \
+             has no socket descriptor or peer-address prover there: the attachment is not \
+             hard-proven",
             daemon.display()
         );
     }
@@ -3527,7 +3529,14 @@ codex 42 me 16u unix 0x0000000000000012 0t0 129 0x00000000000000ab ->0x000000000
         assert!(
             clients.unverified[0]
                 .detail
-                .contains("cola has no prover for windows"),
+                .contains("exposes the process identity"),
+            "{}",
+            clients.unverified[0].detail
+        );
+        assert!(
+            clients.unverified[0]
+                .detail
+                .contains("no socket descriptor or peer-address prover"),
             "{}",
             clients.unverified[0].detail
         );

@@ -108,12 +108,14 @@ const OUTGOING_CAPACITY: usize = 64;
 pub(crate) const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How to reach an app-server.
-// `ws://` endpoints are how a TUI's own listener is addressed (and how every
-// hermetic test dials a TCP fake server); the daemon path uses `Unix`.
+// `ws://` endpoints are how the hermetic tests dial a TCP fake server, and how
+// the live harness addresses an explicit listener; the daemon path uses `Unix`
+// because the daemon serves no WebSocket listener (ticket #954).
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Endpoint {
-    /// `ws://HOST:PORT` — the loopback listener Codex starts for a TUI.
+    /// `ws://HOST:PORT` — a test/live-only listener, never the daemon's
+    /// control endpoint.
     WebSocket(String),
     /// `unix://PATH` — a filesystem socket, usually the daemon control socket
     /// (a symlink; followed by the OS, not by string canonicalisation). The
