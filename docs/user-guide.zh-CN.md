@@ -256,13 +256,14 @@ daemon 端点。不同之处在于 `cola doctor` 能要求什么证据，才会�
 
 | 平台 | cola 连接 | `cola doctor` 证明*你的*客户端已连接 | 验证 |
 | --- | --- | --- | --- |
-| Linux | ✅ 由非强制 live 套件验证 | `/proc/<pid>/fd` 加 `ss -x -e` 的 peer 配对 | 非强制的 live 套件，托管 daemon |
-| macOS | ✅ 由非强制 live 套件验证 | `lsof` 的 peer 地址配对 | 非强制的 live 套件，托管 daemon |
-| Windows | ✅ 传输层与独立 app-server 由非强制 live 套件验证 | 只有进程身份与 `--remote` argv，因此**未经硬证明**（not hard-proven） | 非强制的 live 套件，独立 app-server |
+| Linux | ✅ 由非强制 live 套件覆盖 | `/proc/<pid>/fd` 加 `ss -x -e` 的 peer 配对 | 非强制的 live 套件，托管 daemon |
+| macOS | ✅ 由非强制 live 套件覆盖 | `lsof` 的 peer 地址配对 | 非强制的 live 套件，托管 daemon |
+| Windows | ✅ 传输层与独立 app-server 由非强制 live 套件覆盖 | 只有进程身份与 `--remote` argv，因此**未经硬证明**（not hard-proven） | 非强制的 live 套件，独立 app-server |
 
-这些是 live 套件要建立的受支持状态，不是已经观察到的必需检查：Codex live
+这些是 live 套件覆盖的受支持状态，不是已经观察到的必需检查：Codex live
 套件目前是非强制的（advisory），纯文档改动会跳过它们的步骤，所以一个绿色的
-非强制检查可能只是被跳过的任务，而不是一次绿色运行。提升为必需检查另行跟踪。
+非强制检查可能只是被跳过的任务，而不是一次绿色运行。提升为必需检查由 spec
+#948 下的 #953 跟踪。
 
 Windows 的“未经硬证明”说的是**证明**，不是传输。非强制的 live 套件会用真实
 固定版本的 Codex 二进制启动独立的
@@ -274,8 +275,8 @@ cola，并完成一个回合、一次审批往返和一次中断。cola 在 Wind
 启动，因为 runner 的令牌是提升的。
 
 在 Windows 上，启动 daemon 有三个 doctor 检查；当 Codex 运行在 WSL 内时还有
-第四个约束。大多数失败在 TUI 层面是静默的（它会退回内嵌服务器），但提升令牌
-的情况会以警告呈现：
+第四个约束。大多数失败在 TUI 层面是静默的（它会退回内嵌服务器）；在
+`cola doctor` 中，提升的令牌是 ❌，无法读取的提升状态是 ⚠️：
 
 - **非提升的进程令牌。** 管理员令牌会让每个共享客户端继承管理员权限；请从
   非提升的终端启动 cola。
@@ -284,9 +285,9 @@ cola，并完成一个回合、一次审批往返和一次中断。cola 在 Wind
   `codex.exe`。
 - **较短的 `CODEX_HOME`。** Windows 在发布路径上绑定 AF_UNIX 控制套接字，
   该路径（含终止 NUL）必须不超过 108 字节；超出时请缩短 `CODEX_HOME`。
-- **WSL 侧 home 不能来自 Windows 挂载。** 在 WSL 内运行的 Codex 不得使用从
-  Windows 挂载的 `CODEX_HOME`（DrvFS，`/mnt/c/...`）。这是 WSL 侧约束，
-  不是 Windows 主机的前置条件。
+- **WSL 侧 home 不能来自 Windows 挂载。** 当 Codex 在 WSL 内运行时，位于
+  Windows 挂载（DrvFS，`/mnt/c/...`）文件系统上的 `CODEX_HOME` 会被拒绝——
+  这会影响在 WSL 下运行 Codex 的 Windows 用户。它不是 Windows 主机的前置条件。
 
 `cola doctor` 会把前三条作为检查行列出，每行给出一条可执行的指示；第四条是
 Codex 自己的拒绝。

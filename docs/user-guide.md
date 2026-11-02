@@ -338,14 +338,14 @@ client's attachment proven.
 
 | Platform | cola attaches | `cola doctor` proves *your* client attached | Verification |
 | --- | --- | --- | --- |
-| Linux | ✅ verified by the advisory live suite | `/proc/<pid>/fd` plus `ss -x -e` peer pairing | advisory live suite, managed daemon |
-| macOS | ✅ verified by the advisory live suite | `lsof` peer-address pairing | advisory live suite, managed daemon |
-| Windows | ✅ transport and standalone app-server verified by the advisory live suite | process identity and `--remote` argv only, so **not hard-proven** | advisory live suite, standalone app-server |
+| Linux | ✅ covered by the advisory live suite | `/proc/<pid>/fd` plus `ss -x -e` peer pairing | advisory live suite, managed daemon |
+| macOS | ✅ covered by the advisory live suite | `lsof` peer-address pairing | advisory live suite, managed daemon |
+| Windows | ✅ transport and standalone app-server covered by the advisory live suite | process identity and `--remote` argv only, so **not hard-proven** | advisory live suite, standalone app-server |
 
-Those are the support states the live suites are written to establish, not an
-observed required check: the Codex live suites are advisory and a docs-only
-change skips their steps, so a green advisory check can be a skipped job rather
-than a green run. Promotion to a required check is tracked separately.
+Those are the support states the live suites cover, not an observed required
+check: the Codex live suites are advisory and a docs-only change skips their
+steps, so a green advisory check can be a skipped job rather than a green run.
+Promotion to a required check is tracked by #953 under spec #948.
 
 The Windows "not hard-proven" row is about **proof**, not about the transport.
 The advisory live suite starts a real pinned Codex binary with a standalone
@@ -359,8 +359,8 @@ hosted Windows runner, whose token is elevated.
 
 On Windows, a daemon start has three doctor checks; a fourth constraint
 applies when Codex runs inside WSL. Most failures are silent at the TUI level
-(it falls back to an embedded server), though the elevation case is surfaced as
-a warning:
+(it falls back to an embedded server); in `cola doctor` an elevated token is a
+❌ and an unreadable elevation a ⚠️:
 
 - **A non-elevated process token.** An administrator token would hand every
   shared client administrator privileges; start cola from a non-elevated
@@ -371,9 +371,10 @@ a warning:
 - **A short `CODEX_HOME`.** Windows binds the AF_UNIX control socket at the
   published path, which must fit 108 bytes including the terminating NUL;
   shorten `CODEX_HOME` when it does not.
-- **A WSL-side home that is not Windows-mounted.** Codex running inside WSL
-  must not use a `CODEX_HOME` mounted from Windows (DrvFS, `/mnt/c/...`). This
-  is a WSL-side constraint, not a Windows-host one.
+- **A WSL-side home that is not Windows-mounted.** A `CODEX_HOME` on a
+  Windows-mounted (DrvFS, `/mnt/c/...`) filesystem is refused when Codex runs
+  inside WSL — this affects Windows users who run Codex under WSL. It is not a
+  Windows-host precondition.
 
 `cola doctor` reports the first three as rows with one actionable instruction
 each; the fourth is Codex's own refusal.
