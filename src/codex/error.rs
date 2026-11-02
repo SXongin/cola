@@ -145,9 +145,11 @@ pub(crate) enum CodexError {
     Daemon(String),
 
     /// A Windows daemon precondition refused the start before anything was
-    /// spawned (ticket #952): an elevated token, a launcher that forbids
-    /// breakaway, or a control-socket path over the AF_UNIX budget. The detail
-    /// carries the same actionable instruction `cola doctor` prints.
+    /// spawned (ticket #952): an elevated or unreadable token, or a launcher
+    /// that forbids breakaway. The payload is English like every other
+    /// `CodexError`; `cola doctor` renders the Chinese instruction from the
+    /// same precondition. Path failures reuse [`Self::ControlSocketPathTooLong`]
+    /// (ticket #950) instead, so their message has one source.
     #[error("cannot start the codex daemon on Windows: {0}")]
     WindowsPrecondition(String),
 
