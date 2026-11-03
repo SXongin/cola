@@ -99,6 +99,10 @@ async fn new_worktree_declares_an_intent_and_materialises_lazily() {
     assert_eq!(pending.title.as_deref(), Some("Fix Login"));
     let intent = pending.worktree.as_ref().expect("the intent rides the pending");
     assert_eq!(intent.slug, "fix-login", "an ASCII title seeds the slug");
+    assert_eq!(
+        intent.branch, "fix-login",
+        "no prefix is added when the user names none"
+    );
     assert_eq!(intent.base, "main", "the ladder resolves the integration line");
     assert_eq!(intent.base_sha, head);
     assert_eq!(intent.target, target.to_string_lossy());
@@ -107,7 +111,7 @@ async fn new_worktree_declares_an_intent_and_materialises_lazily() {
     assert!(created.lock().await.is_empty(), "no server session is created");
     let texts = platform.texts().await.join("\n");
     assert!(texts.contains("已记下 worktree 意图"), "{texts}");
-    assert!(texts.contains("wt/fix-login"), "{texts}");
+    assert!(texts.contains("分支：`fix-login`"), "{texts}");
     assert!(texts.contains("main @"), "{texts}");
 
     app.handle_message(incoming(
@@ -126,7 +130,7 @@ async fn new_worktree_declares_an_intent_and_materialises_lazily() {
         "the session is created in the checkout"
     );
     assert!(target.is_dir(), "the first message creates the checkout");
-    git(repo.path(), &["rev-parse", "--verify", "refs/heads/wt/fix-login"]);
+    git(repo.path(), &["rev-parse", "--verify", "refs/heads/fix-login"]);
     assert!(
         app.sessions.lock().await.pending_for(&key()).is_none(),
         "materialisation clears the pending"
@@ -149,7 +153,7 @@ async fn topic_worktree_cover_names_the_target_branch_and_base() {
 
     send_command(
         &app,
-        "/topic --worktree --name 修复登录 --slug fix-login",
+        "/topic --worktree --name 修复登录 --branch feat/fix-login",
         "msg_topic_worktree_new",
     )
     .await;
@@ -182,9 +186,16 @@ async fn topic_worktree_cover_names_the_target_branch_and_base() {
         "pending-window commands read the source, not the target"
     );
     let intent = pending.worktree.as_ref().expect("the intent rides the pending");
-    assert_eq!(intent.slug, "fix-login", "an explicit slug wins over the title");
+    assert_eq!(
+        intent.branch, "feat/fix-login",
+        "the user's branch keeps its type prefix"
+    );
+    assert_eq!(
+        intent.slug, "fix-login",
+        "the directory is the branch's last segment"
+    );
     assert!(cover_text.contains(&intent.target), "{cover_text}");
-    assert!(cover_text.contains("wt/fix-login"), "{cover_text}");
+    assert!(cover_text.contains("feat/fix-login"), "{cover_text}");
     assert!(cover_text.contains("main @"), "{cover_text}");
     assert!(
         created.lock().await.is_empty(),
@@ -192,7 +203,7 @@ async fn topic_worktree_cover_names_the_target_branch_and_base() {
     );
 }
 
-/// A non-git source and a Chinese `--slug` refuse at command time, before any
+/// A non-git source and a Chinese `--branch` refuse at command time, before any
 /// pending is written (ADR-0095).
 #[tokio::test]
 async fn worktree_flag_refuses_a_non_git_source_and_a_chinese_slug() {
@@ -212,13 +223,13 @@ async fn worktree_flag_refuses_a_non_git_source_and_a_chinese_slug() {
     cfg.bridge.work_dir = Some(repo.path().to_path_buf());
     let repo_cfg = cfg.clone();
     let (app, platform) = build_app(repo_cfg, MockBackend::new(realistic_parts())).await;
-    send_command(&app, "/new --worktree --slug 用户指南", "msg_wt_cn").await;
+    send_command(&app, "/new --worktree --branch 用户指南", "msg_wt_cn").await;
     let texts = platform.texts().await.join("\n");
     assert!(texts.contains("只能包含英文"), "{texts}");
     assert!(app.sessions.lock().await.pending_for(&key()).is_none());
 }
 
-/// A Chinese title with no `--slug` falls back to the deterministic date
+/// A Chinese title with no `--branch` falls back to the deterministic date
 /// token; the title itself stays Chinese and is PATCHed at materialisation.
 #[tokio::test]
 async fn a_chinese_title_falls_back_to_the_date_slug() {
@@ -289,7 +300,7 @@ async fn a_failed_session_create_retries_the_same_checkout() {
     send_command(&app, "/worktree", "msg_wt_retry_show").await;
     let texts = platform.texts().await.join("\n");
     assert!(texts.contains("检出已创建"), "{texts}");
-    send_command(&app, "/worktree --slug other", "msg_wt_retry_adjust").await;
+    send_command(&app, "/worktree --branch other", "msg_wt_retry_adjust").await;
     let pending = app
         .sessions
         .lock()
@@ -421,7 +432,7 @@ async fn a_prompt_in_a_removed_worktree_ends_before_dispatch() {
     );
 }
 
-/// `/worktree` reports the pending intent; `/worktree --slug/--base` adjusts
+/// `/worktree` reports the pending intent; `/worktree --branch/--base` adjusts
 /// it before creation, and after materialisation there is no pending left.
 #[tokio::test]
 async fn worktree_status_and_adjust_before_creation() {
@@ -446,10 +457,10 @@ async fn worktree_status_and_adjust_before_creation() {
     let texts = platform.texts().await.join("\n");
     assert!(texts.contains("待建 worktree"), "{texts}");
     assert!(texts.contains(&target), "{texts}");
-    assert!(texts.contains("wt/fix-login"), "{texts}");
+    assert!(texts.contains("分支：`fix-login`"), "{texts}");
     assert!(texts.contains("main @"), "{texts}");
 
-    send_command(&app, "/worktree --slug better --base HEAD", "msg_wt_st_adjust").await;
+    send_command(&app, "/worktree --branch better --base HEAD", "msg_wt_st_adjust").await;
     let pending = app
         .sessions
         .lock()
@@ -459,6 +470,7 @@ async fn worktree_status_and_adjust_before_creation() {
         .expect("the pending survives the adjustment");
     let intent = pending.worktree.expect("intent");
     assert_eq!(intent.slug, "better");
+    assert_eq!(intent.branch, "better");
     assert!(
         std::path::Path::new(&intent.target)
             .file_name()
@@ -483,7 +495,7 @@ async fn worktree_status_and_adjust_before_creation() {
     assert!(texts.contains("当前没有待建会话"), "{texts}");
 }
 
-/// `/worktree --slug` re-renders a pending topic's cover, so the target the
+/// `/worktree --branch` re-renders a pending topic's cover, so the target the
 /// user is about to create is what the chat list shows (ADR-0095).
 #[tokio::test]
 async fn worktree_adjust_refreshes_the_pending_topic_cover() {
@@ -496,10 +508,15 @@ async fn worktree_adjust_refreshes_the_pending_topic_cover() {
     let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
 
-    send_command(&app, "/topic --worktree --name Fix --slug first", "msg_wt_topic").await;
+    send_command(
+        &app,
+        "/topic --worktree --name Fix --branch feat/first",
+        "msg_wt_topic",
+    )
+    .await;
     send_command_in(
         &app,
-        "/worktree --slug second",
+        "/worktree --branch feat/second",
         topic_key.clone(),
         "msg_wt_topic_adjust",
         crate::config::ConversationKind::Topic,
@@ -513,7 +530,10 @@ async fn worktree_adjust_refreshes_the_pending_topic_cover() {
         .pending_for(&topic_key)
         .cloned()
         .expect("the topic carries a pending");
-    let target = pending.worktree.expect("intent").target;
+    let intent = pending.worktree.expect("intent");
+    assert_eq!(intent.branch, "feat/second");
+    assert_eq!(intent.slug, "second");
+    let target = intent.target;
     let updated = platform.updated_cards().await;
     let updated_text: Vec<String> = updated.iter().flat_map(card_texts).collect();
     assert!(
@@ -521,7 +541,7 @@ async fn worktree_adjust_refreshes_the_pending_topic_cover() {
         "the cover names the new target: {updated_text:?}"
     );
     assert!(
-        updated_text.iter().any(|text| text.contains("wt/second")),
+        updated_text.iter().any(|text| text.contains("feat/second")),
         "and the new branch: {updated_text:?}"
     );
 }
@@ -629,9 +649,9 @@ async fn a_collision_at_creation_names_the_actual_path() {
 }
 
 /// A recorded checkout removed before the retry is stale: the adjuster allows
-/// a new slug instead of claiming the directory is fixed (ADR-0095).
+/// a new branch instead of claiming the directory is fixed (ADR-0095).
 #[tokio::test]
-async fn a_removed_checkout_allows_a_new_slug() {
+async fn a_removed_checkout_allows_a_new_branch() {
     let _wd = test_work_dir();
     let sessions = tempfile::tempdir().unwrap();
     let repo = init_repo();
@@ -656,7 +676,7 @@ async fn a_removed_checkout_allows_a_new_slug() {
     assert!(checkout.is_dir());
     std::fs::remove_dir_all(&checkout).unwrap();
 
-    send_command(&app, "/worktree --slug fresh", "msg_wt_stale_adjust").await;
+    send_command(&app, "/worktree --branch fresh", "msg_wt_stale_adjust").await;
     let pending = app
         .sessions
         .lock()
@@ -666,9 +686,10 @@ async fn a_removed_checkout_allows_a_new_slug() {
         .expect("the pending survives");
     let intent = pending.worktree.expect("intent");
     assert_eq!(
-        intent.slug, "fresh",
+        intent.branch, "fresh",
         "the vanished checkout is not a fixed directory"
     );
+    assert_eq!(intent.slug, "fresh");
     assert!(intent.path.is_none());
 }
 

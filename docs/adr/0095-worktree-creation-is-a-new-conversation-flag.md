@@ -57,10 +57,10 @@ setting, cola creates and never removes — stand.
    that SHA, so the cover's promise is what gets built; a stale ref is visible
    as a stale SHA (cola never fetches). `--base HEAD` is the explicit "branch
    off the branch I am looking at" (stacked work). A configured ref that does
-   not resolve is a refusal, never a silent fall-through. An existing
-   `wt/<slug>` branch is attached only when its tip is that SHA; a branch that
-   starts elsewhere is refused (reusing the name must not build a different
-   commit than the cover named).
+   not resolve is a refusal, never a silent fall-through. An existing branch is
+   attached only when its tip is that SHA; a branch that starts elsewhere is
+   refused (reusing the name must not build a different commit than the cover
+   named).
 4. **Preconditions fail at command time, before a pending is written.** The
    source must be a non-bare git work tree, the base must resolve, and the root
    must be creatable; otherwise reply `不能在当前目录创建 worktree：<reason>`. A
@@ -69,7 +69,7 @@ setting, cola creates and never removes — stand.
    `--base` without `--worktree` and `/topic --adopt --worktree` are usage
    errors.
 5. **Adjustment is pending-only.** Bare `/worktree` reports the intent (target,
-   branch, `base @ sha`, source); `/worktree --slug <slug>` and
+   branch, `base @ sha`, source); `/worktree --branch <branch>` and
    `/worktree --base <ref>` update it and re-render a pending topic's cover.
    Once the checkout exists — including a pending kept after a failed session
    create — the directory is fixed and the command says so instead of
@@ -80,7 +80,7 @@ setting, cola creates and never removes — stand.
    **before** the session is created, so a retry after a session-create failure
    reuses that checkout instead of making a `-2` sibling. The record is scoped
    to the claim's generation and the pending's epoch: a pending replaced while
-   the checkout was being made cannot inherit its path, and `/worktree --slug`
+   the checkout was being made cannot inherit its path, and `/worktree --branch`
    is refused while a materialisation owns the pending — both would otherwise
    route a later message into the wrong checkout.
 7. **Retire `/worktree new` and the read-only card.** Discovery is
@@ -88,24 +88,29 @@ setting, cola creates and never removes — stand.
    (adopting a session there stays `/switch`). Keep `[worktree] root`; keep
    "cola never removes worktrees" — lazy creation removes the abandoned-topic
    class, and a GC (clean + no live session + merged branch) is a follow-up.
-8. **The title and the slug are separate inputs.** `--name <title>` is the
+8. **The title and the branch are separate inputs.** `--name <title>` is the
    session title, exactly like `/new <name>` and `/topic <dir> <name>`: any
    language, PATCHed at materialisation, omitted means the server auto-titles.
-   `--slug <slug>` is the ASCII token both the directory and the branch use:
-   directory `<root>/<slug>`, branch `wt/<slug>`. Omitted, it is derived from
-   the title with a lenient ASCII slugifier, and a title with no usable ASCII
-   falls back to a deterministic `YYYYMMDD-1` token — never a refusal for a
-   value the user did not type. The strict slug also refuses a `.lock` suffix,
-   which git would reject only later inside `git worktree add`. The cover shows
-   both before the first message, which is the naming veto window. `--base`
-   without `--worktree` is a usage error; `/topic --adopt --worktree` is
-   rejected; `--name` takes words up to the next flag, `--slug` and `--base`
-   take one word.
+   `--branch <branch>` is the **full branch name**, with the repository's own
+   shape allowed but never forced: `feat/fix-login` names the branch and the
+   directory is its last segment (`<root>/fix-login`); a bare `fix-login` names
+   both; no `wt/` prefix is added. Omitted, it is derived from the title with a
+   lenient ASCII slugifier, and a title with no usable ASCII falls back to a
+   deterministic `YYYYMMDD-1` token — never a refusal for a value the user did
+   not type. Each component is validated by the strict slug rules (ASCII,
+   lowercased, at most 40 characters, no `.lock` suffix, which git would reject
+   only later inside `git worktree add`). The cover shows both before the first
+   message, which is the naming veto window. `--base` without `--worktree` is a
+   usage error; `/topic --adopt --worktree` is rejected; `--name` takes words
+   up to the next flag, `--branch` and `--base` take one word.
 9. **Alignment is a creation-time property.** The branch and directory share the
-   slug when created. At delivery the branch becomes `<type>/<slug>` (ADR-0088)
-   and the directory stays; the slug is the correspondence, not an invariant.
-   The alternative — moving the directory with the branch — needs an
-   unsupported session move and is rejected.
+   branch's last segment when created. The user chooses the delivery shape up
+   front (`feat/<slug>`), so no rename is needed at push time; if a branch is
+   renamed later, the directory stays and the last segment is the
+   correspondence, not an invariant. A directory collision suffixes only the
+   directory; the branch keeps the exact name the user typed. The alternative —
+   moving the directory with the branch — needs an unsupported session move and
+   is rejected.
 10. **No compatibility work.** The feature has never shipped.
 
 ## Considered options
@@ -137,7 +142,7 @@ setting, cola creates and never removes — stand.
   directory would have to move. The slug is the stable correspondence.
 - **Transliterate Chinese titles into slugs.** Rejected: a table that is always
   partly wrong, for a name that is a handle rather than an identity. The date
-  token is honest; the user can pass `--slug` or rename the branch later.
+  token is honest; the user can pass `--branch` or rename the branch later.
 
 ## Consequences
 

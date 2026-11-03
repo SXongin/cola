@@ -366,7 +366,7 @@ async fn pending_topic_cover_text(
         Some(intent) => s.push_str(&format!(
             "\n🌲 将在 `{}` 创建 · 分支 `{}` · 起点 `{} @ {}`\n下一条消息创建",
             intent.target,
-            intent.branch(),
+            intent.branch_name(),
             intent.base,
             intent.short_sha()
         )),

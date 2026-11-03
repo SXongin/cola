@@ -15,13 +15,14 @@ use crate::config::ThreadKey;
 /// retired in favour of `/run git worktree list`.
 pub(crate) const WORKTREE_USAGE: &str = "\
 用法：
-`/topic --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]`
-`/new --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]`
-- 在 `[worktree] root`（默认 `.worktrees`，相对主检出）下创建检出，分支为 `wt/<slug>`。
+`/topic --worktree [--name <标题>] [--branch <分支>] [--base <ref>]`
+`/new --worktree [--name <标题>] [--branch <分支>] [--base <ref>]`
+- 在 `[worktree] root`（默认 `.worktrees`，相对主检出）下创建检出。
+- `--branch` 是完整分支名，可带仓库的 `<type>/`（如 `feat/fix-login`）；目录取最后一段（`fix-login`）。不带 `/` 时分支和目录同名；不固定任何前缀。
 - 起点按 `[worktree] base` → `origin/HEAD` → `origin/main` → `origin/master` → `main` → `master` 解析；`--base` 覆盖，并在命令时固定成 SHA。
-- `--name` 是会话标题（可中文）；`--slug` 是目录/分支名（小写 ASCII），省略时从标题推导，推不出用日期默认值。
+- `--name` 是会话标题（可中文）；`--branch` 省略时从标题推导 slug，推不出用日期默认值。
 - 命令只记录意图，第一条消息才真正创建检出；放弃话题不会留下检出。
-- 待建期间用 `/worktree` 查看，`/worktree --slug <名字>` 或 `--base <ref>` 修改。已有检出用 `/dir <路径>` 进入，或 `/run git worktree list` 查看。";
+- 待建期间用 `/worktree` 查看，`/worktree --branch <分支>` 或 `--base <ref>` 修改。已有检出用 `/dir <路径>` 进入，或 `/run git worktree list` 查看。";
 
 /// The two "there is no checkout intent here" answers, shared by `/worktree`
 /// and its adjuster so the routes cannot drift.
@@ -70,24 +71,24 @@ fn status_text(
         .unwrap_or_default();
     let created = match intent.path.as_deref() {
         Some(path) if intent.checkout_exists() => {
-            format!("\n检出已创建：`{path}`（改 slug/base 不再影响它）")
+            format!("\n检出已创建：`{path}`（改 branch/base 不再影响它）")
         }
         Some(path) => format!(
-            "\n原检出已不存在：`{path}`；下一条消息会重建。若 `git worktree list` 仍登记旧路径或同名分支，重建会被拒绝——先 `/worktree --slug <新名字>` 换名即可"
+            "\n原检出已不存在：`{path}`；下一条消息会重建。若 `git worktree list` 仍登记旧路径或同名分支，重建会被拒绝——先 `/worktree --branch <新分支>` 换名即可"
         ),
         None => String::new(),
     };
     format!(
-        "🌲 待建 worktree{title}\n目标：`{}`（若被占用会加后缀）\n分支：`{}` · 起点：`{} @ {}`\n源目录：`{}`{created}\n第一条消息在该目录创建会话。用 `/worktree --slug <名字>` 或 `--base <ref>` 修改。",
+        "🌲 待建 worktree{title}\n目标：`{}`（若被占用会加后缀）\n分支：`{}` · 起点：`{} @ {}`\n源目录：`{}`{created}\n第一条消息在该目录创建会话。用 `/worktree --branch <分支>` 或 `--base <ref>` 修改。",
         intent.target,
-        intent.branch(),
+        intent.branch_name(),
         intent.base,
         intent.short_sha(),
         directory
     )
 }
 
-/// `/worktree --slug <slug>` / `--base <ref>`: adjust the pending intent
+/// `/worktree --branch <branch>` / `--base <ref>`: adjust the pending intent
 /// before the first message creates it. Once the checkout exists (a failed
 /// session create leaves the pending), the directory is fixed — the command
 /// says so instead of pretending a rename would move it.
@@ -95,7 +96,7 @@ pub(crate) async fn adjust(
     handles: &CommandHandles,
     thread_key: &ThreadKey,
     message_id: &str,
-    slug: Option<String>,
+    branch: Option<String>,
     base: Option<String>,
 ) -> crate::error::Result<()> {
     let (pending, epoch) = {
@@ -121,9 +122,9 @@ pub(crate) async fn adjust(
             .await?;
         return Ok(());
     };
-    let slug = match slug {
-        Some(slug) => match crate::git::normalize_name(&slug) {
-            Ok(slug) => slug,
+    let (branch, slug) = match branch {
+        Some(branch) => match crate::git::normalize_branch(&branch) {
+            Ok(pair) => pair,
             Err(error) => {
                 handles
                     .flow
@@ -133,7 +134,7 @@ pub(crate) async fn adjust(
                 return Ok(());
             }
         },
-        None => intent.slug.clone(),
+        None => (intent.branch_name(), intent.slug.clone()),
     };
     let (base, base_sha) = match base {
         Some(base) => match crate::git::resolve_base(&pending.directory, Some(&base)).await {
@@ -165,6 +166,7 @@ pub(crate) async fn adjust(
         base,
         base_sha,
         slug,
+        branch,
         target,
         path: None,
     };
@@ -182,10 +184,10 @@ pub(crate) async fn adjust(
             "⏳ 这个会话正在创建中，等它完成后再改 worktree。".to_string()
         }
         crate::bridge::session::WorktreeAdjust::Created(path) => format!(
-            "⚠️ 检出已创建：`{path}`；现在改 slug/base 不会移动它。第一条消息会在这个目录创建会话。"
+            "⚠️ 检出已创建：`{path}`；现在改 branch/base 不会移动它。第一条消息会在这个目录创建会话。"
         ),
         crate::bridge::session::WorktreeAdjust::Replaced => {
-            "⚠️ 待建会话已被替换（`/new`、`/dir` 或 `/topic`），这次修改没有生效；请重新执行 `/worktree --slug` 或 `--base`。".to_string()
+            "⚠️ 待建会话已被替换（`/new`、`/dir` 或 `/topic`），这次修改没有生效；请重新执行 `/worktree --branch` 或 `--base`。".to_string()
         }
         crate::bridge::session::WorktreeAdjust::NoPending => no_pending_reply().to_string(),
         crate::bridge::session::WorktreeAdjust::NoIntent => no_intent_reply(&pending.directory),
@@ -202,24 +204,27 @@ pub(crate) fn default_slug(now: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 /// Resolve a worktree intent at command time (ADR-0095): preconditions (a
-/// non-bare git source), the integration base to a SHA, the slug, and the
-/// planned target. Nothing is checked out here; `create_worktree` runs at
-/// materialisation, so an abandoned pending creates no checkout.
+/// non-bare git source), the integration base to a SHA, the branch/directory,
+/// and the planned target. Nothing is checked out here; `create_worktree` runs
+/// at materialisation, so an abandoned pending creates no checkout.
 pub(crate) async fn intent(
     source: &str,
     root: &std::path::Path,
     name: Option<&str>,
-    slug: Option<&str>,
+    branch: Option<&str>,
     base: Option<&str>,
     configured_base: Option<&str>,
 ) -> Result<(crate::bridge::session::WorktreeIntent, std::path::PathBuf), crate::git::WorktreeError> {
     crate::git::ensure_creatable(source).await?;
     let (base, base_sha) = crate::git::resolve_base(source, base.or(configured_base)).await?;
-    let slug = match slug {
-        Some(slug) => crate::git::normalize_name(slug)?,
-        None => name
-            .and_then(crate::git::derive_slug)
-            .unwrap_or_else(|| default_slug(chrono::Utc::now())),
+    let (branch, slug) = match branch {
+        Some(branch) => crate::git::normalize_branch(branch)?,
+        None => {
+            let slug = name
+                .and_then(crate::git::derive_slug)
+                .unwrap_or_else(|| default_slug(chrono::Utc::now()));
+            (slug.clone(), slug)
+        }
     };
     let root = crate::git::worktree_root(source, root).await?;
     // Refuse an uncreatable root at command time WITHOUT creating it: an
@@ -232,6 +237,7 @@ pub(crate) async fn intent(
             base,
             base_sha,
             slug,
+            branch,
             target,
             path: None,
         },
@@ -325,7 +331,7 @@ pub(crate) fn declared_reply(
     let mut reply = format!(
         "✅ 已记下 worktree 意图：`{}`\n分支：`{}` · 起点：`{} @ {}`\n源目录：`{source}`\n下一条消息在该目录创建会话{title}。",
         intent.target,
-        intent.branch(),
+        intent.branch_name(),
         intent.base,
         intent.short_sha(),
     );
