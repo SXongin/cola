@@ -44,6 +44,46 @@ pub struct PendingEntry {
     /// around (ADR-0023), carried onto the materialised SessionEntry.
     #[serde(default)]
     pub topic_root: Option<String>,
+    /// ADR-0095: create a linked checkout when this pending materialises.
+    /// `directory` above stays the SOURCE checkout for the whole pending
+    /// window, so `/cat`, `/diff` and `/dir` read where the conversation
+    /// stands; the target is computed by the intent.
+    #[serde(default)]
+    pub worktree: Option<WorktreeIntent>,
+}
+
+/// A Pending Session's intent to start in a fresh linked checkout (ADR-0095).
+/// The base is resolved to a SHA at command time — the cover's promise is what
+/// gets built. `slug` names both the directory and the branch; `path` is filled
+/// only after the checkout exists, so a failed session create retries against
+/// the same directory instead of a `-2` sibling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeIntent {
+    /// The ref that resolved (`origin/main`, `--base`, …).
+    pub base: String,
+    /// That ref's commit at command time.
+    pub base_sha: String,
+    /// The ASCII slug both the checkout and its `wt/<slug>` branch use.
+    pub slug: String,
+    /// The planned checkout path (`<root>/<slug>`); a collision may append
+    /// `-2` at creation, which the creation reply names.
+    pub target: String,
+    /// The actual path, recorded after a successful `git worktree add`.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl WorktreeIntent {
+    /// The branch the checkout starts on.
+    pub fn branch(&self) -> String {
+        format!("wt/{}", self.slug)
+    }
+
+    /// The first seven characters of the resolved base SHA, for a cover line.
+    pub fn short_sha(&self) -> &str {
+        let end = self.base_sha.len().min(7);
+        &self.base_sha[..end]
+    }
 }
 
 impl PendingEntry {
@@ -60,6 +100,7 @@ impl PendingEntry {
             auto_accept: false,
             topic_anchor: None,
             topic_root: None,
+            worktree: None,
         }
     }
 

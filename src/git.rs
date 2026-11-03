@@ -138,7 +138,7 @@ pub struct CreatedWorktree {
 pub struct WorktreeError(String);
 
 impl WorktreeError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -338,6 +338,51 @@ pub fn normalize_name(input: &str) -> Result<String, WorktreeError> {
     Ok(slug)
 }
 
+/// Best-effort slug from arbitrary text — a session title, not a typed name.
+/// Lowercases ASCII alphanumerics, turns every other run into `-`, trims and
+/// caps at 40 characters. `None` when nothing usable remains (a Chinese-only
+/// title), so the caller can fall back to a deterministic token. Unlike
+/// [`normalize_name`] this never refuses: the value was not typed by the user,
+/// so punctuation must not turn into an error (ADR-0095).
+pub fn derive_slug(input: &str) -> Option<String> {
+    let mut slug = String::with_capacity(input.len());
+    let mut word = false;
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if slug.len() >= 40 {
+                break;
+            }
+            slug.push(ch.to_ascii_lowercase());
+            word = true;
+        } else if word {
+            slug.push('-');
+            word = false;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    (!slug.is_empty()).then_some(slug)
+}
+
+/// The command-time precondition check (ADR-0095): a source that is not a
+/// non-bare git work tree is refused before any pending is written.
+pub async fn ensure_creatable(dir: &str) -> Result<(), WorktreeError> {
+    let inside = git_capture(dir, &["rev-parse", "--is-inside-work-tree"])
+        .await
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false);
+    if !inside {
+        return Err(WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")));
+    }
+    let bare = git_capture(dir, &["rev-parse", "--is-bare-repository"])
+        .await
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false);
+    if bare {
+        return Err(WorktreeError::new("这是 bare 仓库，不能创建 worktree"));
+    }
+    Ok(())
+}
+
 /// Resolve the integration ref a new worktree starts from (ADR-0088,
 /// ADR-0095): the configured `[worktree] base`, else `origin/HEAD` →
 /// `origin/main` → `origin/master` → `main` → `master`. Returns the ref that
@@ -466,7 +511,7 @@ pub async fn create_worktree(
 
 /// Whether `root` is ignored by the repository at `dir`. A root outside the
 /// primary checkout cannot dirty it, so it counts as covered.
-async fn root_is_ignored(dir: &str, root: &std::path::Path) -> bool {
+pub(crate) async fn root_is_ignored(dir: &str, root: &std::path::Path) -> bool {
     let Ok(common) = git_capture(dir, &["rev-parse", "--git-common-dir"]).await else {
         return true;
     };
@@ -755,6 +800,19 @@ mod tests {
         assert!(normalize_name("   ").is_err(), "an empty name is refused");
         let lock = normalize_name("a.lock").unwrap_err().to_string();
         assert!(lock.contains("`.lock`"), "{lock}");
+    }
+
+    /// The lenient slug is derived from a title, never refused (ADR-0095): a
+    /// Chinese-only title has no usable ASCII slug, punctuation is dropped.
+    #[test]
+    fn derive_slug_is_lenient_and_ascii_only() {
+        assert_eq!(derive_slug("Fix login!").as_deref(), Some("fix-login"));
+        assert_eq!(derive_slug("  --Fix  login-- ").as_deref(), Some("fix-login"));
+        assert_eq!(derive_slug("v1.2 release").as_deref(), Some("v1-2-release"));
+        assert_eq!(derive_slug("修复登录"), None);
+        assert_eq!(derive_slug("!!!"), None);
+        let long = derive_slug(&"a".repeat(60)).unwrap();
+        assert!(long.len() <= 40, "{long}");
     }
 
     /// The ladder resolves the integration line, and an explicit configured

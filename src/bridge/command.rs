@@ -39,6 +39,14 @@ pub enum Command {
     Sub(SubAction),
     /// Create a fresh session, optionally named
     New(Option<String>),
+    /// `/new --worktree [--name <title>] [--slug <slug>] [--base <ref>]` —
+    /// the same checkout intent as `TopicWorktree`, in this conversation
+    /// (ADR-0095).
+    NewWorktree {
+        name: Option<String>,
+        slug: Option<String>,
+        base: Option<String>,
+    },
     /// Create a real Feishu topic backed by a fresh session. `directory` is
     /// `None` for the bare `/topic` form, which inherits the conversation's
     /// current project (the active session's directory, ADR-0012) instead of an
@@ -46,6 +54,14 @@ pub enum Command {
     Topic {
         directory: Option<String>,
         name: Option<String>,
+    },
+    /// `/topic --worktree [--name <title>] [--slug <slug>] [--base <ref>]` —
+    /// open a topic whose first message creates a linked checkout and the
+    /// Session inside it (ADR-0095). Nothing is created at command time.
+    TopicWorktree {
+        name: Option<String>,
+        slug: Option<String>,
+        base: Option<String>,
     },
     /// Create a real Feishu topic whose backing session is an EXISTING server
     /// session (ADR-0016): resolve by keyword, adopt, and map to the new topic.
@@ -184,7 +200,7 @@ impl Command {
     /// - Every other command passes.
     pub(crate) fn topic_rejection(&self, has_session: bool) -> Option<&'static str> {
         match self {
-            Command::Topic { .. } => Some(TOPIC_NEST_REJECTION),
+            Command::Topic { .. } | Command::TopicWorktree { .. } => Some(TOPIC_NEST_REJECTION),
             Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
             Command::Dir(_)
             | Command::DirCard
@@ -193,6 +209,7 @@ impl Command {
             | Command::Switch(_)
             | Command::Sub(SubAction::Attach { .. })
             | Command::New(_)
+            | Command::NewWorktree { .. }
                 if has_session =>
             {
                 Some(TOPIC_SELECTION_REJECTION)
@@ -380,7 +397,10 @@ pub fn parse_command(text: &str) -> Option<Command> {
                 }
             }
         },
-        "/new" => Some(Command::New(arg.map(|s| s.to_string()))),
+        "/new" => match arg {
+            Some(a) if a.split_whitespace().next() == Some("--worktree") => Some(parse_new_worktree(a)),
+            other => Some(Command::New(other.map(|s| s.to_string()))),
+        },
         // `/cat <path>` opens one host file as a card, a directory as the
         // browse card, and a bare `/cat` answer usage (ADR-0083 §2). The whole
         // remainder of the line is the path, so a path with spaces survives.
@@ -412,6 +432,11 @@ pub fn parse_command(text: &str) -> Option<Command> {
         "/run" => Some(Command::Run(parse_run_arg(arg))),
         "/topic" => match arg {
             Some(a) => {
+                // `/topic --worktree [--name …] [--slug …] [--base …]` — a
+                // topic whose first message creates a checkout (ADR-0095).
+                if a.split_whitespace().next() == Some("--worktree") {
+                    return Some(parse_topic_worktree(a));
+                }
                 // `/topic --adopt <keyword> [--force]` — adopt an existing
                 // session into a new topic; `/topic --adopt` pops the card.
                 if a.split_whitespace().next() == Some("--adopt") {
@@ -504,6 +529,82 @@ pub fn parse_command(text: &str) -> Option<Command> {
         })),
         // `/init`, `/review`, or any unknown /command — forward to OpenCode
         _ => Some(Command::Forward(trimmed.to_string())),
+    }
+}
+
+/// Parse the `--name` / `--slug` / `--base` flags shared by the two
+/// worktree-creating forms (ADR-0095). `None` for an unknown flag, a bare
+/// flag, a duplicate, or a positional word — all answered with usage. `--name`
+/// takes words up to the next flag; `--slug` and `--base` take one word.
+fn parse_worktree_flags(arg: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
+    let mut name = None;
+    let mut slug = None;
+    let mut base = None;
+    // `--name` takes the remaining words up to the next recognised flag, so an
+    // English title keeps its spaces (`--name Fix Login`, like `/new Fix
+    // Login`); the two machine-facing values stay one word each.
+    let mut words = arg.split_whitespace().peekable();
+    while let Some(word) = words.next() {
+        match word {
+            "--name" => {
+                if name.is_some() {
+                    return None;
+                }
+                let mut parts = Vec::new();
+                while let Some(next) = words.peek() {
+                    if matches!(*next, "--name" | "--slug" | "--base") {
+                        break;
+                    }
+                    parts.push(*next);
+                    words.next();
+                }
+                if parts.is_empty() {
+                    return None;
+                }
+                name = Some(parts.join(" "));
+            }
+            "--slug" => {
+                if slug.is_some() {
+                    return None;
+                }
+                let value = words.next()?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                slug = Some(value.to_string());
+            }
+            "--base" => {
+                if base.is_some() {
+                    return None;
+                }
+                let value = words.next()?;
+                if value.starts_with('-') {
+                    return None;
+                }
+                base = Some(value.to_string());
+            }
+            _ => return None,
+        }
+    }
+    Some((name, slug, base))
+}
+
+/// `/topic --worktree …` (ADR-0095): the directory is the conversation's
+/// current project, exactly like the bare `/topic`; the flags only describe
+/// the checkout the first message creates.
+fn parse_topic_worktree(arg: &str) -> Command {
+    match parse_worktree_flags(arg.strip_prefix("--worktree").unwrap_or(arg).trim_start()) {
+        Some((name, slug, base)) => Command::TopicWorktree { name, slug, base },
+        None => Command::WorktreeUsage,
+    }
+}
+
+/// `/new --worktree …` (ADR-0095): the same flags, declared in the current
+/// conversation instead of a new topic.
+fn parse_new_worktree(arg: &str) -> Command {
+    match parse_worktree_flags(arg.strip_prefix("--worktree").unwrap_or(arg).trim_start()) {
+        Some((name, slug, base)) => Command::NewWorktree { name, slug, base },
+        None => Command::WorktreeUsage,
     }
 }
 
@@ -1069,6 +1170,55 @@ pub(crate) async fn handle_command(
             };
             handles.flow.platform.reply_text(message_id, &reply).await?;
         }
+        Command::NewWorktree { name, slug, base } => {
+            // ADR-0095: the same new-conversation decision as `/new`, plus a
+            // checkout intent. Only the intent is written here; the first
+            // message creates the checkout and the Session in it.
+            let source = handles.current_project_directory(&thread_key).await;
+            let intent = match crate::bridge::worktree::intent(
+                &source,
+                handles.config.worktree_root(),
+                name.as_deref(),
+                slug.as_deref(),
+                base.as_deref(),
+                handles.config.worktree_base(),
+            )
+            .await
+            {
+                Ok(intent) => intent,
+                Err(error) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("⚠️ /new --worktree 失败：{error}"))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let root = match crate::git::worktree_root(&source, handles.config.worktree_root()).await {
+                Ok(root) => root,
+                Err(error) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("⚠️ /new --worktree 失败：{error}"))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let root_ignored = crate::git::root_is_ignored(&source, &root).await;
+            let pending = handles
+                .declare_pending_in_current_project_worktree(&thread_key, name.clone(), intent.clone())
+                .await?;
+            let reply = crate::bridge::worktree::declared_reply(
+                pending.title.as_deref(),
+                &source,
+                &intent,
+                &root,
+                root_ignored,
+            );
+            handles.flow.platform.reply_text(message_id, &reply).await?;
+        }
         Command::Topic { directory, name } => {
             // Bare `/topic` (directory: None) inherits the conversation's
             // current project, exactly like `/new`; an explicit directory goes
@@ -1096,6 +1246,7 @@ pub(crate) async fn handle_command(
                 crate::bridge::topic::TopicOpening::Fresh {
                     directory: dir_str,
                     name,
+                    worktree: None,
                 },
             )
             .await
@@ -1112,6 +1263,62 @@ pub(crate) async fn handle_command(
                         .reply_text(
                             message_id,
                             "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/dir <目录>` 或在飞书里手动创建话题。",
+                        )
+                        .await?;
+                }
+                Err(crate::bridge::topic::OpenTopicError::Failed(e)) => return Err(e),
+            }
+        }
+        Command::TopicWorktree { name, slug, base } => {
+            // ADR-0095: creation is a flag on the new-conversation flow. The
+            // pending's directory stays the SOURCE, so every pending-window
+            // command reads where the conversation stands; the checkout is
+            // created by the first message from the stored intent.
+            let source = handles.current_project_directory(&thread_key).await;
+            let intent = match crate::bridge::worktree::intent(
+                &source,
+                handles.config.worktree_root(),
+                name.as_deref(),
+                slug.as_deref(),
+                base.as_deref(),
+                handles.config.worktree_base(),
+            )
+            .await
+            {
+                Ok(intent) => intent,
+                Err(error) => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(message_id, &format!("⚠️ /topic --worktree 失败：{error}"))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            match crate::bridge::topic::open_topic(
+                &handles.topic_handles(),
+                &thread_key.chat_id,
+                message_id,
+                crate::bridge::topic::TopicOpening::Fresh {
+                    directory: source,
+                    name,
+                    worktree: Some(intent),
+                },
+            )
+            .await
+            {
+                Ok(opened) => {
+                    tracing::info!(
+                        "topic: opened worktree topic {} with a pending session in chat {}",
+                        opened.thread_id,
+                        thread_key.chat_id
+                    );
+                }
+                Err(crate::bridge::topic::OpenTopicError::NoThreadId) => {
+                    handles.flow.platform
+                        .reply_text(
+                            message_id,
+                            "⚠️ 当前会话不支持创建话题（未返回 thread_id）。请改用 `/new --worktree` 或在飞书里手动创建话题。",
                         )
                         .await?;
                 }
@@ -3298,6 +3505,64 @@ mod tests {
             parse_command("/worktrees"),
             Some(Command::Forward("/worktrees".into()))
         );
+    }
+
+    /// ADR-0095: the two worktree-creating forms take `--name` / `--slug` /
+    /// `--base` in any order, each value one word. A positional word, a bare
+    /// flag, a duplicate or an unknown flag is the usage answer.
+    #[test]
+    fn parse_worktree_flag_forms() {
+        assert_eq!(
+            parse_command("/topic --worktree"),
+            Some(Command::TopicWorktree {
+                name: None,
+                slug: None,
+                base: None,
+            })
+        );
+        assert_eq!(
+            parse_command("/topic --worktree --name 修复登录 --slug fix-login --base main"),
+            Some(Command::TopicWorktree {
+                name: Some("修复登录".into()),
+                slug: Some("fix-login".into()),
+                base: Some("main".into()),
+            })
+        );
+        assert_eq!(
+            parse_command("/new --worktree --slug fix-login --name Fix"),
+            Some(Command::NewWorktree {
+                name: Some("Fix".into()),
+                slug: Some("fix-login".into()),
+                base: None,
+            })
+        );
+        assert_eq!(
+            parse_command("/new --worktree --name Fix Login --base main"),
+            Some(Command::NewWorktree {
+                name: Some("Fix Login".into()),
+                slug: None,
+                base: Some("main".into()),
+            }),
+            "--name keeps the title's spaces"
+        );
+        for bad in [
+            "/topic --worktree fix-login",
+            "/topic --worktree --name",
+            "/topic --worktree --name --slug x",
+            "/topic --worktree --slug a --slug b",
+            "/new --worktree --bogus x",
+        ] {
+            assert_eq!(parse_command(bad), Some(Command::WorktreeUsage), "{bad}");
+        }
+        // The non-worktree forms are unchanged.
+        assert_eq!(
+            parse_command("/topic /r/p"),
+            Some(Command::Topic {
+                directory: Some("/r/p".into()),
+                name: None,
+            })
+        );
+        assert_eq!(parse_command("/new fix"), Some(Command::New(Some("fix".into()))));
     }
 
     /// `/run` grammar (ADR-0086 §6): flags only before the command, `--` ends
