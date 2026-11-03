@@ -30,7 +30,13 @@ pub(crate) enum TopicOpening {
     /// no server session is created here (ADR-0041): the topic's first prompt
     /// materialises it. The cover shows `name` or the directory basename until
     /// the server auto-generates a real title.
-    Fresh { directory: String, name: Option<String> },
+    Fresh {
+        directory: String,
+        name: Option<String>,
+        /// ADR-0095: create a linked checkout at materialisation. The
+        /// directory above stays the source for the pending window.
+        worktree: Option<crate::bridge::session::WorktreeIntent>,
+    },
     /// Open the topic around an existing session (ADR-0016): the Session
     /// Snapshot card (ADR-0028) becomes the topic's first in-topic message
     /// and anchor, gathered before the mapping write.
@@ -111,7 +117,11 @@ async fn open_topic_inner(
     // caller can forget the ADR-0041 rule that nothing is created yet); Adopt
     // gathers the snapshot while the mapping is still unwritten.
     let parts = match opening {
-        TopicOpening::Fresh { directory, name } => {
+        TopicOpening::Fresh {
+            directory,
+            name,
+            worktree,
+        } => {
             let display_title = name.clone().unwrap_or_else(|| dir_basename(&directory));
             OpeningParts {
                 directory,
@@ -120,6 +130,7 @@ async fn open_topic_inner(
                 model: None,
                 seed: TopicSeed::ReplyHint,
                 side: OpeningSide::Pending { title: name },
+                worktree,
                 snapshot_claim: None,
             }
         }
@@ -148,6 +159,7 @@ async fn open_topic_inner(
                 model: model_display(info.model.as_ref()),
                 seed: TopicSeed::Snapshot(card),
                 side: OpeningSide::Adopt { session_id: info.id },
+                worktree: None,
                 snapshot_claim: Some(SnapshotClaim {
                     title: info.title,
                     data,
@@ -160,7 +172,9 @@ async fn open_topic_inner(
     // in `open_cover_topic`, so every surface gets it. The cover differs by
     // side: a pending topic has no session line yet (ADR-0041).
     let cover_text = match &parts.side {
-        OpeningSide::Pending { .. } => pending_topic_cover_text(&parts.display_title, &parts.directory).await,
+        OpeningSide::Pending { .. } => {
+            pending_topic_cover_text(&parts.display_title, &parts.directory, parts.worktree.as_ref()).await
+        }
         OpeningSide::Adopt { session_id } => {
             topic_cover_text(
                 &parts.display_title,
@@ -199,6 +213,7 @@ async fn open_topic_inner(
                 .new_pending(&topic_key, parts.directory, title);
             pending.topic_anchor = Some(anchor.clone());
             pending.topic_root = Some(topic_root);
+            pending.worktree = parts.worktree;
             handles.flow.sessions.set_pending(pending).await?;
             // The cover record must survive until materialisation; keyed by the
             // pending's thread (it has no session id yet) and flagged pending so
@@ -267,6 +282,9 @@ struct OpeningParts {
     model: Option<String>,
     seed: TopicSeed,
     side: OpeningSide,
+    /// ADR-0095: a fresh topic's checkout intent; `None` for adoption and for
+    /// a topic that starts in the source checkout.
+    worktree: Option<crate::bridge::session::WorktreeIntent>,
     /// ADR-0028: the adopt snapshot's title and claimable data, settled
     /// against the in-topic seed after the mapping write. `None` for fresh
     /// sessions.
@@ -334,11 +352,26 @@ async fn topic_cover_text(
 
 /// The pending variant of [`topic_cover_text`] (ADR-0041): no session exists
 /// yet, so the session line is replaced by the creation verb and the directory
-/// — 「会话」 stays reserved for a real Session. After materialisation the
-/// title-sync hook rebuilds the card as the full brief.
-async fn pending_topic_cover_text(title: &str, dir: &str) -> String {
+/// — 「会话」 stays reserved for a real Session. A worktree intent (ADR-0095)
+/// names the checkout and branch the first message will create, so the name is
+/// visible while it is still changeable. After materialisation the title-sync
+/// hook rebuilds the card as the full brief.
+async fn pending_topic_cover_text(
+    title: &str,
+    dir: &str,
+    worktree: Option<&crate::bridge::session::WorktreeIntent>,
+) -> String {
     let mut s = topic_cover_head(title, dir).await;
-    s.push_str(&format!("\n下一条消息创建 · `{dir}`"));
+    match worktree {
+        Some(intent) => s.push_str(&format!(
+            "\n🌲 将在 `{}` 创建 · 分支 `{}` · 起点 `{} @ {}`\n下一条消息创建",
+            intent.target,
+            intent.branch(),
+            intent.base,
+            intent.short_sha()
+        )),
+        None => s.push_str(&format!("\n下一条消息创建 · `{dir}`")),
+    }
     s
 }
 
@@ -638,13 +671,25 @@ pub(crate) async fn rename_pending_cover(handles: &TopicHandles, key: &ThreadKey
 
 /// [`rename_pending_cover`]'s body, run inside the pending topic's `topic` span.
 async fn rename_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, title: &str) {
-    let pending_root = {
+    refresh_pending_cover_inner(handles, key, Some(title)).await;
+}
+
+/// Re-render a pending topic's cover from the stored pending (ADR-0023,
+/// ADR-0041). `title` is the just-written one for `/name`; `None` reads the
+/// pending's own (a worktree adjustment changed only the intent).
+async fn refresh_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, title: Option<&str>) {
+    let pending = {
         let store = handles.flow.sessions.store.lock().await;
-        store
-            .pending_for(key)
-            .map(|p| (p.topic_root.clone(), p.directory.clone()))
+        store.pending_for(key).map(|p| {
+            (
+                p.topic_root.clone(),
+                p.directory.clone(),
+                p.title.clone(),
+                p.worktree.clone(),
+            )
+        })
     };
-    let Some((Some(root_id), directory)) = pending_root else {
+    let Some((Some(root_id), directory, stored_title, worktree)) = pending else {
         return;
     };
     let cache_key = pending_cover_key(key);
@@ -658,16 +703,20 @@ async fn rename_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, tit
     {
         return;
     }
-    let text = pending_topic_cover_text(title, &directory).await;
+    let display_title = title
+        .map(str::to_string)
+        .or(stored_title)
+        .unwrap_or_else(|| dir_basename(&directory));
+    let text = pending_topic_cover_text(&display_title, &directory, worktree.as_ref()).await;
     let card = crate::feishu::client::markdown_card(&text);
     match handles.flow.platform.update_message(&root_id, &card).await {
         Ok(()) => {
             if let Some(cover) = handles.flow.cards.cover_titles.lock().await.get_mut(&cache_key) {
-                cover.title = title.to_string();
+                cover.title = display_title.clone();
             }
             tracing::info!(
                 "pending topic cover retitled to {:?} for {}",
-                title,
+                display_title,
                 key.thread_id
             );
         }

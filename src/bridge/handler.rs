@@ -1447,6 +1447,7 @@ async fn open_topic_from_card(
         crate::bridge::topic::TopicOpening::Fresh {
             directory,
             name: None,
+            worktree: None,
         },
     )
     .await
@@ -2700,6 +2701,43 @@ impl App {
         generation: u64,
         message_id: &str,
     ) -> crate::error::Result<String> {
+        // ADR-0095: the pending may carry a checkout intent. Create it now —
+        // the first message is the moment the conversation actually starts —
+        // and point the pending at it. A failure leaves the pending (and the
+        // intent) intact for the next message. The created path is recorded
+        // before the session exists, so a retry after a session-create failure
+        // reuses the same checkout instead of making a `-2` sibling.
+        if let Some(intent) = pending.worktree.clone() {
+            let source = pending.directory.clone();
+            let path = match intent
+                .path
+                .clone()
+                .filter(|path| std::path::Path::new(path).is_dir())
+            {
+                Some(path) => path,
+                None => {
+                    let created = crate::git::create_worktree(
+                        &source,
+                        &self.worktree_root,
+                        &intent.slug,
+                        Some(&intent.base_sha),
+                    )
+                    .await
+                    .map_err(|error| {
+                        crate::error::BridgeError::State(format!("创建 worktree 失败：{error}"))
+                    })?;
+                    self.sessions_handle()
+                        .update_pending(&pending.thread_key, |pending| {
+                            if let Some(worktree) = pending.worktree.as_mut() {
+                                worktree.path = Some(created.path.clone());
+                            }
+                        })
+                        .await?;
+                    created.path
+                }
+            };
+            pending.directory = path;
+        }
         let mut input = self.client.new_session_input(Some(&pending.directory));
         // A Codex thread takes the model at creation; the provider is a config
         // fact and never a creation field (spec #930). A client whose thread

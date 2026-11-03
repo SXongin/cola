@@ -488,6 +488,30 @@ impl SessionsHandle {
         Ok(pending)
     }
 
+    /// [`Self::declare_pending`] with a worktree intent (ADR-0095): the
+    /// pending's directory is the SOURCE checkout; the checkout is created at
+    /// materialisation. Replacing a topic's pending keeps its
+    /// `topic_root`/`topic_anchor`, exactly like the plain form.
+    pub(crate) async fn declare_pending_worktree(
+        &self,
+        thread_key: &ThreadKey,
+        directory: impl Into<String>,
+        title: Option<String>,
+        worktree: crate::bridge::session::WorktreeIntent,
+    ) -> crate::error::Result<PendingEntry> {
+        let mut pending = self.new_pending(thread_key, directory, title);
+        pending.worktree = Some(worktree);
+        {
+            let store = self.store.lock().await;
+            if let Some(replaced) = store.pending_for(thread_key) {
+                pending.topic_anchor = replaced.topic_anchor.clone();
+                pending.topic_root = replaced.topic_root.clone();
+            }
+        }
+        self.set_pending(pending.clone()).await?;
+        Ok(pending)
+    }
+
     /// [`Self::declare_pending`] for a **card callback**, which runs on a
     /// deadline (ADR-0089): the pending is mutated in memory under the store
     /// lock, the write is deferred to the store's writer thread, and only the
@@ -2927,6 +2951,23 @@ impl CommandHandles {
         self.flow
             .sessions
             .declare_pending(thread_key, directory, title)
+            .await
+    }
+
+    /// [`Self::declare_pending_in_current_project`] with a worktree intent
+    /// (ADR-0095) — the shape `/new --worktree` uses. The directory recorded
+    /// is the current project (the source checkout); materialisation creates
+    /// the checkout from the intent.
+    pub(crate) async fn declare_pending_in_current_project_worktree(
+        &self,
+        thread_key: &ThreadKey,
+        title: Option<String>,
+        worktree: crate::bridge::session::WorktreeIntent,
+    ) -> crate::error::Result<PendingEntry> {
+        let directory = self.current_project_directory(thread_key).await;
+        self.flow
+            .sessions
+            .declare_pending_worktree(thread_key, directory, title, worktree)
             .await
     }
 
