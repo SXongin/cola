@@ -686,9 +686,9 @@ async fn rename_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, tit
 }
 
 /// Re-render a pending topic's cover from the stored pending (ADR-0023,
-/// ADR-0041). `title` is the just-written one for `/name`; `None` reads the
-/// pending's own (a worktree adjustment changed only the intent).
-async fn refresh_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, title: Option<&str>) {
+/// ADR-0041). `title_override` is the just-written title for `/name`; `None`
+/// reads the pending's own (a worktree adjustment changed only the intent).
+async fn refresh_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, title_override: Option<&str>) {
     let pending = {
         let store = handles.flow.sessions.store.lock().await;
         store.pending_for(key).map(|p| {
@@ -714,7 +714,7 @@ async fn refresh_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, ti
     {
         return;
     }
-    let display_title = title
+    let display_title = title_override
         .map(str::to_string)
         .or(stored_title)
         .unwrap_or_else(|| dir_basename(&directory));

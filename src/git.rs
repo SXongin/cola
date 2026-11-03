@@ -465,6 +465,22 @@ pub async fn create_worktree(
                 held.path
             )));
         }
+        // ADR-0095: the command fixed a base SHA, and the cover promised it.
+        // Attaching an existing branch that starts somewhere else would build
+        // a different commit than advertised; refuse instead.
+        if let Some(base) = base {
+            let tip = git_capture(dir, &["rev-parse", &format!("refs/heads/{branch}")])
+                .await
+                .map_err(|error| WorktreeError::new(format!("读取分支 `{branch}` 失败：{error}")))?;
+            if tip.trim() != base {
+                let short = |sha: &str| sha.get(..7).unwrap_or(sha).to_string();
+                return Err(WorktreeError::new(format!(
+                    "分支 `{branch}` 已存在，起点是 `{}`，不是请求的 `{}`；请换一个 `--slug`，或先删除该分支",
+                    short(tip.trim()),
+                    short(base)
+                )));
+            }
+        }
         git_capture(dir, &["worktree", "add", &directory_text, &branch])
             .await
             .map_err(|error| WorktreeError::new(format!("git worktree add 失败：{error}")))?;
@@ -898,6 +914,35 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&inside.stdout).trim(), "wt/reuse");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing branch is attached only when it starts at the requested
+    /// base; a different tip is refused, because the command promised a SHA
+    /// (ADR-0095).
+    #[tokio::test]
+    async fn worktree_create_refuses_an_existing_branch_at_a_different_base() {
+        let dir = init_repo("git-wt-reuse-base");
+        let first = git_out(&dir, &["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("b.txt"), "two").unwrap();
+        run(&dir, &["add", "b.txt"]);
+        run(&dir, &["commit", "-m", "second"]);
+        let second = git_out(&dir, &["rev-parse", "HEAD"]);
+        run(&dir, &["branch", "wt/reuse-base", &first]);
+        let s = dir.to_string_lossy().to_string();
+
+        let error = create_worktree(&s, Path::new(".worktrees"), "reuse-base", Some(&second))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("起点"), "{error}");
+        assert!(error.contains(&first[..7]), "{error}");
+
+        let created = create_worktree(&s, Path::new(".worktrees"), "reuse-base", Some(&first))
+            .await
+            .unwrap();
+        assert_eq!(git_out(Path::new(&created.path), &["rev-parse", "HEAD"]), first);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

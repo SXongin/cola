@@ -37,7 +37,7 @@ use crate::bridge::external::ExternalFlow;
 use crate::bridge::message_pins::MessagePins;
 use crate::bridge::reminder::ReminderState;
 use crate::bridge::request::flow::RequestFlow;
-use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore};
+use crate::bridge::session::{PendingEntry, SessionSettings, SessionStore, WorktreeAdjust};
 use crate::bridge::snapshot_claims::{ClaimKind, SnapshotClaims};
 use crate::bridge::turn::{CardSession, CollectReason, Turn};
 use crate::config::{SessionEntry, ThreadKey};
@@ -458,6 +458,34 @@ impl SessionsHandle {
         self.store.lock().await.update_pending(thread_key, f)
     }
 
+    /// Atomically rewrite a pending's worktree intent (ADR-0095): refused
+    /// while a materialisation owns it, and once the checkout exists.
+    pub(crate) async fn adjust_pending_worktree(
+        &self,
+        thread_key: &ThreadKey,
+        expected_epoch: u64,
+        updated: crate::bridge::session::WorktreeIntent,
+    ) -> crate::error::Result<WorktreeAdjust> {
+        self.store
+            .lock()
+            .await
+            .adjust_worktree(thread_key, expected_epoch, updated)
+    }
+
+    /// Record the path a materialisation created, only while it still owns
+    /// this exact pending (ADR-0095).
+    pub(crate) async fn record_worktree_path(
+        &self,
+        thread_key: &ThreadKey,
+        generation: u64,
+        path: &str,
+    ) -> crate::error::Result<bool> {
+        self.store
+            .lock()
+            .await
+            .record_worktree_path(thread_key, generation, path)
+    }
+
     /// Declare (or replace) the conversation's Pending Session and persist
     /// (ADR-0041). The session-list cache is untouched: a pending is not a
     /// server session, so `/switch` has nothing new to show.
@@ -476,16 +504,8 @@ impl SessionsHandle {
         directory: impl Into<String>,
         title: Option<String>,
     ) -> crate::error::Result<PendingEntry> {
-        let mut pending = self.new_pending(thread_key, directory, title);
-        {
-            let store = self.store.lock().await;
-            if let Some(replaced) = store.pending_for(thread_key) {
-                pending.topic_anchor = replaced.topic_anchor.clone();
-                pending.topic_root = replaced.topic_root.clone();
-            }
-        }
-        self.set_pending(pending.clone()).await?;
-        Ok(pending)
+        self.declare_pending_with(thread_key, directory, title, None)
+            .await
     }
 
     /// [`Self::declare_pending`] with a worktree intent (ADR-0095): the
@@ -499,8 +519,20 @@ impl SessionsHandle {
         title: Option<String>,
         worktree: crate::bridge::session::WorktreeIntent,
     ) -> crate::error::Result<PendingEntry> {
+        self.declare_pending_with(thread_key, directory, title, Some(worktree))
+            .await
+    }
+
+    /// The one pending-declaration body both public forms share.
+    async fn declare_pending_with(
+        &self,
+        thread_key: &ThreadKey,
+        directory: impl Into<String>,
+        title: Option<String>,
+        worktree: Option<crate::bridge::session::WorktreeIntent>,
+    ) -> crate::error::Result<PendingEntry> {
         let mut pending = self.new_pending(thread_key, directory, title);
-        pending.worktree = Some(worktree);
+        pending.worktree = worktree;
         {
             let store = self.store.lock().await;
             if let Some(replaced) = store.pending_for(thread_key) {

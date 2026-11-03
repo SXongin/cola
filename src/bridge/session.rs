@@ -5,6 +5,27 @@ use std::sync::Arc;
 
 use crate::bridge::sidecar;
 
+/// The verdict of a pending-only worktree adjustment (ADR-0095). The check
+/// and the write share one store lock, so an adjustment cannot clear the path
+/// a concurrent materialisation just recorded, and a materialisation cannot
+/// overwrite a pending that was replaced under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreeAdjust {
+    /// The intent was rewritten; the caller re-renders the cover.
+    Applied,
+    /// A materialisation owns this pending right now; changing the target
+    /// would race the checkout it is already making.
+    Creating,
+    /// The checkout already exists at this path; the directory is fixed.
+    Created(String),
+    /// The pending this adjustment was built from is gone — `/new`, `/dir` or
+    /// `/topic` replaced it while the adjustment resolved its slug/base. Apply
+    /// nothing: the caller must re-read and retry.
+    Replaced,
+    NoPending,
+    NoIntent,
+}
+
 /// A conversation's declared intent to create a session (ADR-0041). It is not
 /// a Session: no backend identity, invisible to the server and every session
 /// list. The conversation's first prompt materialises it; until then it
@@ -83,6 +104,15 @@ impl WorktreeIntent {
     pub fn short_sha(&self) -> &str {
         let end = self.base_sha.len().min(7);
         &self.base_sha[..end]
+    }
+
+    /// Whether the recorded checkout still exists. One predicate for the
+    /// adjuster, the status line and materialisation, so the three cannot
+    /// disagree about a vanished directory.
+    pub fn checkout_exists(&self) -> bool {
+        self.path
+            .as_deref()
+            .is_some_and(|path| std::path::Path::new(path).is_dir())
     }
 }
 
@@ -892,6 +922,87 @@ impl SessionStore {
         {
             self.creating.remove(key);
         }
+    }
+
+    /// Rewrite a pending's worktree intent under ONE lock (ADR-0095): refused
+    /// while a materialisation owns the pending, and once the checkout exists
+    /// the directory is fixed. This is the atomic counterpart of the old
+    /// read-then-`update_pending` pair, which could clear a path recorded by a
+    /// concurrent materialisation.
+    pub(crate) fn adjust_worktree(
+        &mut self,
+        key: &ThreadKey,
+        expected_epoch: u64,
+        updated: WorktreeIntent,
+    ) -> crate::error::Result<WorktreeAdjust> {
+        // The caller resolved its slug/base across awaits; a replacement
+        // pending in that window takes a new epoch and must not receive them.
+        if self.pending_epoch.get(key).copied().unwrap_or_default() != expected_epoch {
+            return Ok(WorktreeAdjust::Replaced);
+        }
+        let creating = self.creating.contains_key(key);
+        let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
+            return Ok(WorktreeAdjust::NoPending);
+        };
+        let Some(worktree) = pending.worktree.as_mut() else {
+            return Ok(WorktreeAdjust::NoIntent);
+        };
+        // The path is the most specific answer: the directory exists even if
+        // the session create that made it is still in flight. A path that no
+        // longer exists is stale — the next materialisation recreates, so a
+        // new slug/base is allowed. (One stat beside the persistence write this
+        // method already performs under the lock.)
+        let mut cleared_stale = false;
+        if let Some(path) = worktree.path.clone() {
+            if worktree.checkout_exists() {
+                return Ok(WorktreeAdjust::Created(path));
+            }
+            tracing::warn!("worktree checkout {path} vanished; allowing a new intent");
+            worktree.path = None;
+            cleared_stale = true;
+        }
+        if creating {
+            if cleared_stale {
+                self.write_to_disk()?;
+            }
+            return Ok(WorktreeAdjust::Creating);
+        }
+        *worktree = updated;
+        self.write_to_disk()?;
+        Ok(WorktreeAdjust::Applied)
+    }
+
+    /// Record the checkout a materialisation created, but ONLY if the claim is
+    /// still this generation's and the pending it took is still the pending
+    /// here (ADR-0095). A replacement pending bumps the epoch, so a stale
+    /// materialisation cannot stamp its path onto someone else's intent —
+    /// which would make the next message run in the wrong checkout.
+    pub(crate) fn record_worktree_path(
+        &mut self,
+        key: &ThreadKey,
+        generation: u64,
+        path: &str,
+    ) -> crate::error::Result<bool> {
+        let Some(claim) = self.creating.get(key).copied() else {
+            return Ok(false);
+        };
+        if claim.generation != generation
+            || self.pending_epoch.get(key).copied().unwrap_or_default() != claim.epoch
+        {
+            return Ok(false);
+        }
+        let Some(pending) = self.pending_mut().iter_mut().find(|p| &p.thread_key == key) else {
+            return Ok(false);
+        };
+        let Some(worktree) = pending.worktree.as_mut() else {
+            return Ok(false);
+        };
+        if worktree.path.is_some() {
+            return Ok(false);
+        }
+        worktree.path = Some(path.to_string());
+        self.write_to_disk()?;
+        Ok(true)
     }
 
     /// Write one conversation's `/agent` override, touching **only** that field
@@ -2057,6 +2168,112 @@ mod tests {
             store.claim_pending_for_creation(&key),
             PendingClaim::Claimed(_, _)
         ));
+    }
+
+    /// ADR-0095: the worktree-intent adjustment and the created-path record
+    /// share the store lock with the creation claim. An adjustment is refused
+    /// while a materialisation owns the pending, a stale materialisation cannot
+    /// stamp its path onto a replacement pending, and an adjustment built on a
+    /// replaced pending applies nothing.
+    #[test]
+    fn worktree_intent_adjustment_and_path_are_claim_scoped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.json");
+        let mut store = SessionStore::new(path.clone()).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        let checkout = dir.path().join("first");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let checkout_text = checkout.to_string_lossy().to_string();
+        let intent = |slug: &str| WorktreeIntent {
+            base: "main".into(),
+            base_sha: "abc1234".into(),
+            slug: slug.into(),
+            target: format!("/tmp/.worktrees/{slug}"),
+            path: None,
+        };
+        let mut pending = make_pending("chat1", "root1", "/tmp/source");
+        pending.worktree = Some(intent("first"));
+        store.set_pending(pending).unwrap();
+        let epoch = store.pending_epoch_for(&key);
+
+        let PendingClaim::Claimed(_, generation) = store.claim_pending_for_creation(&key) else {
+            panic!("claimable");
+        };
+        assert_eq!(
+            store.adjust_worktree(&key, epoch, intent("second")).unwrap(),
+            WorktreeAdjust::Creating,
+            "a materialisation owns the pending; the target must not move"
+        );
+        assert!(
+            store
+                .record_worktree_path(&key, generation, &checkout_text)
+                .unwrap()
+        );
+        assert_eq!(
+            store.adjust_worktree(&key, epoch, intent("second")).unwrap(),
+            WorktreeAdjust::Created(checkout_text.clone()),
+            "an existing checkout fixes the directory"
+        );
+
+        // A path that no longer exists is stale: once the claim is released,
+        // a fresh adjustment clears it and the next message recreates.
+        std::fs::remove_dir_all(&checkout).unwrap();
+
+        // A replacement pending bumps the epoch while the claim is still held.
+        let mut replacement = make_pending("chat1", "root1", "/tmp/source");
+        replacement.worktree = Some(intent("replacement"));
+        store.set_pending(replacement).unwrap();
+        let replacement_epoch = store.pending_epoch_for(&key);
+        assert!(
+            !store
+                .record_worktree_path(&key, generation, &checkout_text)
+                .unwrap(),
+            "a stale materialisation must not stamp its checkout onto the replacement"
+        );
+        assert_eq!(
+            store.adjust_worktree(&key, epoch, intent("adjusted")).unwrap(),
+            WorktreeAdjust::Replaced,
+            "an adjustment built on the old pending applies nothing"
+        );
+
+        store.unclaim_pending_creation(&key, generation);
+        // The replacement carries a path that no longer exists; a new
+        // adjustment is allowed and clears it.
+        {
+            let pending = store
+                .pending_mut()
+                .iter_mut()
+                .find(|pending| pending.thread_key == key)
+                .expect("the replacement pending");
+            pending.worktree.as_mut().expect("intent").path = Some(checkout_text.clone());
+        }
+        assert_eq!(
+            store
+                .adjust_worktree(&key, replacement_epoch, intent("stale"))
+                .unwrap(),
+            WorktreeAdjust::Applied
+        );
+        assert!(
+            store
+                .pending_for(&key)
+                .and_then(|pending| pending.worktree.as_ref())
+                .is_some_and(|intent| intent.path.is_none()),
+            "the stale path is cleared"
+        );
+        assert_eq!(
+            store
+                .adjust_worktree(&key, replacement_epoch, intent("adjusted"))
+                .unwrap(),
+            WorktreeAdjust::Applied
+        );
+        // The intent is durable, so a restart keeps the veto's result.
+        let reloaded = SessionStore::new(path).unwrap();
+        let pending = reloaded.pending_for(&key).expect("the pending survives");
+        assert_eq!(
+            pending.worktree.as_ref().map(|intent| intent.slug.as_str()),
+            Some("adjusted")
+        );
+        assert!(pending.worktree.as_ref().unwrap().path.is_none());
     }
 
     /// Issue #910 (extra finding): the pending-epoch map is pruned once a thread

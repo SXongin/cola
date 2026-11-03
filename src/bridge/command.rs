@@ -400,6 +400,9 @@ pub fn parse_command(text: &str) -> Option<Command> {
         },
         "/new" => match arg {
             Some(a) if a.split_whitespace().next() == Some("--worktree") => Some(parse_new_worktree(a)),
+            // ADR-0095 decision 8: `--base` without `--worktree` is usage, not
+            // a title. Any other leading flag is equally unaccounted for.
+            Some(a) if a.trim_start().starts_with("--") => Some(Command::WorktreeUsage),
             other => Some(Command::New(other.map(|s| s.to_string()))),
         },
         // `/cat <path>` opens one host file as a card, a directory as the
@@ -443,6 +446,11 @@ pub fn parse_command(text: &str) -> Option<Command> {
                     let mut words: Vec<&str> = Vec::new();
                     let mut force = false;
                     for w in a.split_whitespace().skip(1) {
+                        if w == "--worktree" {
+                            // ADR-0095 decision 8: adopting an existing
+                            // session never creates a checkout.
+                            return Some(Command::WorktreeUsage);
+                        }
                         if w == "--force" {
                             force = true;
                         } else {
@@ -455,6 +463,9 @@ pub fn parse_command(text: &str) -> Option<Command> {
                     } else {
                         Some(Command::TopicAdopt { keyword, force })
                     }
+                } else if a.trim_start().starts_with("--") {
+                    // `--base` without `--worktree`, or any other unknown flag.
+                    Some(Command::WorktreeUsage)
                 } else {
                     // `/topic <dir>` or `/topic <dir> <name>`
                     let mut it = a.splitn(2, ' ');
@@ -532,6 +543,13 @@ pub fn parse_command(text: &str) -> Option<Command> {
     }
 }
 
+/// Consume one flag value, refusing a leading `-` (a missing value is
+/// `None`). Shared by the creation and adjustment parsers so their syntax
+/// cannot drift.
+fn flag_value<'a>(words: &mut impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    words.next().filter(|value| !value.starts_with('-'))
+}
+
 /// Parse the `--name` / `--slug` / `--base` flags shared by the two
 /// worktree-creating forms (ADR-0095). `None` for an unknown flag, a bare
 /// flag, a duplicate, or a positional word — all answered with usage. `--name`
@@ -567,21 +585,13 @@ fn parse_worktree_flags(arg: &str) -> Option<(Option<String>, Option<String>, Op
                 if slug.is_some() {
                     return None;
                 }
-                let value = words.next()?;
-                if value.starts_with('-') {
-                    return None;
-                }
-                slug = Some(value.to_string());
+                slug = Some(flag_value(&mut words)?.to_string());
             }
             "--base" => {
                 if base.is_some() {
                     return None;
                 }
-                let value = words.next()?;
-                if value.starts_with('-') {
-                    return None;
-                }
-                base = Some(value.to_string());
+                base = Some(flag_value(&mut words)?.to_string());
             }
             _ => return None,
         }
@@ -626,12 +636,9 @@ fn parse_worktree_arg(arg: &str) -> Command {
         if slot.is_some() {
             return Command::WorktreeUsage;
         }
-        let Some(value) = words.next() else {
+        let Some(value) = flag_value(&mut words) else {
             return Command::WorktreeUsage;
         };
-        if value.starts_with('-') {
-            return Command::WorktreeUsage;
-        }
         *slot = Some(value.to_string());
     }
     if slug.is_none() && base.is_none() {
@@ -1166,7 +1173,7 @@ pub(crate) async fn handle_command(
             // checkout intent. Only the intent is written here; the first
             // message creates the checkout and the Session in it.
             let source = handles.current_project_directory(&thread_key).await;
-            let intent = match crate::bridge::worktree::intent(
+            let (intent, root) = match crate::bridge::worktree::intent(
                 &source,
                 handles.config.worktree_root(),
                 name.as_deref(),
@@ -1176,23 +1183,12 @@ pub(crate) async fn handle_command(
             )
             .await
             {
-                Ok(intent) => intent,
+                Ok(prepared) => prepared,
                 Err(error) => {
                     handles
                         .flow
                         .platform
-                        .reply_text(message_id, &format!("⚠️ /new --worktree 失败：{error}"))
-                        .await?;
-                    return Ok(());
-                }
-            };
-            let root = match crate::git::worktree_root(&source, handles.config.worktree_root()).await {
-                Ok(root) => root,
-                Err(error) => {
-                    handles
-                        .flow
-                        .platform
-                        .reply_text(message_id, &format!("⚠️ /new --worktree 失败：{error}"))
+                        .reply_text(message_id, &format!("不能在当前目录创建 worktree：{error}"))
                         .await?;
                     return Ok(());
                 }
@@ -1266,7 +1262,7 @@ pub(crate) async fn handle_command(
             // command reads where the conversation stands; the checkout is
             // created by the first message from the stored intent.
             let source = handles.current_project_directory(&thread_key).await;
-            let intent = match crate::bridge::worktree::intent(
+            let (intent, _root) = match crate::bridge::worktree::intent(
                 &source,
                 handles.config.worktree_root(),
                 name.as_deref(),
@@ -1276,12 +1272,12 @@ pub(crate) async fn handle_command(
             )
             .await
             {
-                Ok(intent) => intent,
+                Ok(prepared) => prepared,
                 Err(error) => {
                     handles
                         .flow
                         .platform
-                        .reply_text(message_id, &format!("⚠️ /topic --worktree 失败：{error}"))
+                        .reply_text(message_id, &format!("不能在当前目录创建 worktree：{error}"))
                         .await?;
                     return Ok(());
                 }
@@ -3526,6 +3522,10 @@ mod tests {
             "/topic --worktree --name --slug x",
             "/topic --worktree --slug a --slug b",
             "/new --worktree --bogus x",
+            "/new --base main",
+            "/topic --base main",
+            "/topic --adopt --worktree",
+            "/topic --adopt --worktree foo",
         ] {
             assert_eq!(parse_command(bad), Some(Command::WorktreeUsage), "{bad}");
         }

@@ -42,11 +42,6 @@ fn repo_canonical(repo: &tempfile::TempDir) -> std::path::PathBuf {
     crate::git::plain_path(std::fs::canonicalize(repo.path()).unwrap())
 }
 
-/// Picking the checkout the conversation already sits in is a no-op toast.
-/// Unknown ops and empty payloads are answered without touching git or the
-/// store.
-/// The card in a project that is not a git repository answers the reason
-/// instead of rendering an empty list.
 /// `git rev-parse …` in a test repository, trimmed.
 fn git_out(dir: &std::path::Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
@@ -289,6 +284,25 @@ async fn a_failed_session_create_retries_the_same_checkout() {
     );
     assert!(target.is_dir());
 
+    // ADR-0095: the status names the created checkout, and the adjuster
+    // refuses to pretend a rename would move it.
+    send_command(&app, "/worktree", "msg_wt_retry_show").await;
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("检出已创建"), "{texts}");
+    send_command(&app, "/worktree --slug other", "msg_wt_retry_adjust").await;
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending is still there");
+    assert_eq!(
+        pending.worktree.expect("intent").slug,
+        "retry",
+        "the created directory cannot be renamed"
+    );
+
     app.handle_message(incoming(
         "msg_wt_retry_2".into(),
         "chat_1".into(),
@@ -515,4 +529,153 @@ async fn worktree_outside_a_pending_is_usage() {
     send_command(&app, "/worktree list", "msg_wt_old_list").await;
     let texts = platform.texts().await.join("\n");
     assert!(texts.matches("用法：").count() >= 2, "{texts}");
+}
+
+/// The base SHA is frozen at command time: a commit on the ref afterwards
+/// cannot change what the checkout starts from (ADR-0095).
+#[tokio::test]
+async fn the_checkout_uses_the_sha_frozen_at_command_time() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from(".worktrees");
+    let backend = MockBackend::new(realistic_parts());
+    let (app, _platform) = build_app(cfg, backend).await;
+    let first = git_out(repo.path(), &["rev-parse", "HEAD"]);
+
+    send_command(&app, "/new --worktree --name frozen --base main", "msg_wt_frozen").await;
+    std::fs::write(repo.path().join("b.txt"), "two").unwrap();
+    git(repo.path(), &["add", "b.txt"]);
+    git(repo.path(), &["commit", "-m", "second"]);
+    let second = git_out(repo.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(first, second, "the ref moved after the command");
+
+    app.handle_message(incoming(
+        "msg_wt_frozen_after".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "开始吧".into(),
+        None,
+    ))
+    .await;
+
+    let target = repo_canonical(&repo).join(".worktrees").join("frozen");
+    assert_eq!(
+        git_out(&target, &["rev-parse", "HEAD"]),
+        first,
+        "the checkout starts at the SHA the command promised, not the ref's new tip"
+    );
+}
+
+/// A directory taken between the command and creation is suffixed; the
+/// materialisation names the actual path (ADR-0095).
+#[tokio::test]
+async fn a_collision_at_creation_names_the_actual_path() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from(".worktrees");
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, platform) = build_app(cfg, backend).await;
+    let taken = repo_canonical(&repo).join(".worktrees").join("taken");
+    std::fs::create_dir_all(&taken).unwrap();
+
+    send_command(&app, "/new --worktree --name taken", "msg_wt_taken").await;
+    app.handle_message(incoming(
+        "msg_wt_taken_after".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "开始吧".into(),
+        None,
+    ))
+    .await;
+
+    let expected = repo_canonical(&repo).join(".worktrees").join("taken-2");
+    assert_eq!(
+        created.lock().await.last().and_then(|dir| dir.as_deref()),
+        Some(expected.to_string_lossy().as_ref()),
+        "the checkout takes the -2 suffix"
+    );
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("目标目录已被占用"), "{texts}");
+    assert!(texts.contains("taken-2"), "{texts}");
+}
+
+/// A recorded checkout removed before the retry is stale: the adjuster allows
+/// a new slug instead of claiming the directory is fixed (ADR-0095).
+#[tokio::test]
+async fn a_removed_checkout_allows_a_new_slug() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from(".worktrees");
+    let mut backend = MockBackend::new(realistic_parts());
+    backend.fail_create_sessions(1);
+    let (app, _platform) = build_app(cfg, backend).await;
+    let checkout = repo_canonical(&repo).join(".worktrees").join("stale");
+
+    send_command(&app, "/new --worktree --name stale", "msg_wt_stale").await;
+    app.handle_message(incoming(
+        "msg_wt_stale_1".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        None,
+        "开始吧".into(),
+        None,
+    ))
+    .await;
+    assert!(checkout.is_dir());
+    std::fs::remove_dir_all(&checkout).unwrap();
+
+    send_command(&app, "/worktree --slug fresh", "msg_wt_stale_adjust").await;
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .cloned()
+        .expect("the pending survives");
+    let intent = pending.worktree.expect("intent");
+    assert_eq!(
+        intent.slug, "fresh",
+        "the vanished checkout is not a fixed directory"
+    );
+    assert!(intent.path.is_none());
+}
+
+/// A root whose parent is a file refuses at command time, and the refused
+/// command creates nothing on disk (ADR-0095).
+#[tokio::test]
+async fn an_uncreatable_root_refuses_without_creating_it() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let blocker = repo.path().join("blocker");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = blocker.join("nested");
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command(&app, "/new --worktree --name blocked", "msg_wt_blocked").await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("不是目录"), "{texts}");
+    assert!(
+        app.sessions.lock().await.pending_for(&key()).is_none(),
+        "a refused root declares no pending"
+    );
+    assert!(
+        !blocker.join("nested").exists(),
+        "the command must not create the root it refused"
+    );
 }
