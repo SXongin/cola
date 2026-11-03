@@ -1,5 +1,11 @@
 # Worktree: cola creates the checkout with git and starts by Pending Session
 
+> **Amended by ADR-0095**: creation is now a flag on the new-conversation flow
+> (`/topic --worktree`, `/new --worktree`), lazy at materialisation, and the base
+> is the integration ladder rather than `HEAD`. `/worktree new` and the read-only
+> inventory card are retired. Everything else here — cola runs git, the root is
+> cola's own setting, cola creates and never removes — stands.
+
 Issue #433 taught cola to **follow** a Session that has already moved into a linked
 worktree: the directory mapping follows the server's location and the **Turn
 Footer** marks the checkout (`📁 zh-user-guide 🌲 · docs/zh-user-guide`). What it

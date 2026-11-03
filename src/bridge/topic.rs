@@ -669,6 +669,17 @@ pub(crate) async fn rename_pending_cover(handles: &TopicHandles, key: &ThreadKey
         .await
 }
 
+/// [`rename_pending_cover`] for a change that did not touch the title — the
+/// pending's worktree intent changed (ADR-0095). Re-renders the cover from the
+/// stored pending, so the user sees the new target/branch before the first
+/// message creates it.
+pub(crate) async fn refresh_pending_cover(handles: &TopicHandles, key: &ThreadKey) {
+    let span = crate::bridge::span::topic(None, Some(key));
+    refresh_pending_cover_inner(handles, key, None)
+        .instrument(span)
+        .await;
+}
+
 /// [`rename_pending_cover`]'s body, run inside the pending topic's `topic` span.
 async fn rename_pending_cover_inner(handles: &TopicHandles, key: &ThreadKey, title: &str) {
     refresh_pending_cover_inner(handles, key, Some(title)).await;

@@ -505,15 +505,23 @@ each; the fourth is Codex's own refusal.
 ```toml
 [worktree]
 # root = ".worktrees"
+# base = "origin/main"
 ```
 
-- **`root`** — the parent directory `/worktree new` creates checkouts in. A
-  relative value resolves against the project's **primary checkout** (the main
-  worktree, not the session's own directory — that session may itself be in a
-  linked worktree); an absolute path is used as given. Defaults to `.worktrees`.
-  OpenCode's own `worktree.directory` in a project's `opencode.json` is a
-  separate setting read by the desktop/TUI; cola reads only this one, so set both
-  to the same value when the two clients should agree.
+- **`root`** — the parent directory `/topic --worktree` / `/new --worktree`
+  creates checkouts in. A relative value resolves against the project's
+  **primary checkout** (the main worktree, not the session's own directory —
+  that session may itself be in a linked worktree); an absolute path is used
+  as given. Defaults to `.worktrees`. OpenCode's own `worktree.directory` in a
+  project's `opencode.json` is a separate setting read by the desktop/TUI;
+  cola reads only this one, so set both to the same value when the two clients
+  should agree.
+- **`base`** — the integration ref a new checkout starts from. Unset runs
+  `origin/HEAD`, then `origin/main`, `origin/master`, `main`, `master`; an
+  explicit `--base` on the command wins. The chosen ref is resolved to a SHA
+  when the command runs, so a later move cannot change what was promised. A
+  configured ref that does not resolve refuses the command instead of silently
+  falling through to another branch.
 
 ## Run
 
@@ -778,8 +786,9 @@ detailed help for any of these.
 | `/cat <path>` | Open a Host file in a File Viewer card: text uses a fenced code block with an extension language hint (a markdown file keeps its source and offers a 「📖 渲染预览」 toggle), `.csv`/`.tsv` uses a markdown table, and images are embedded when Feishu's limits allow. Other binary files, images beyond those limits and text beyond the 8 MB preview cap use the File Message lane only up to Feishu's 30 MB upload cap; above it, nothing is sent and the card says 未发送. The card names the resolved path, size and type. `/cat <directory>` opens the Directory Browser there; bare `/cat` answers with usage (`/help cat` gives details). `~` expands, relative paths resolve against the session directory (the current project while a session is pending), and absolute paths resolve as absolute paths, including outside the session directory |
 | `/diff [--base <ref>]` | Send this branch's **repository review** as one self-contained HTML File Message: committed changes since the fork point, uncommitted tracked changes, and untracked files. The base is `--base`, else `[review] base`, else `origin/main`, else `main`; cola never fetches, never stages entries (no `git add -N`) and never changes tracked content; git may refresh index stat data. Runs in the conversation's current project directory and replies to the command message (its chat or topic). An empty review answers `分支 <branch> 相对 <base> 没有改动`, while an empty repository with no commit answers `仓库还没有提交，没有可对比的改动。`; non-git directories and missing bases answer their own readable error. One `/diff` per chat per 10 seconds (`稍后再试`) |
 | `/dir` | Recent Directories card: pick a folder and declare a session there, or open it as a fresh topic (每行「建话题」= `/topic <dir>` 的免打字版); its 📁 浏览目录 button opens a filesystem browser — drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, filter child names |
-| `/worktree` | Worktree card: this project's git checkouts — the main checkout included and labelled 「主检出」 — each with its branch, ⚠ dirty marker, session count and ✅ current marker. Read-only: to move the conversation into one, use `/dir <path>`; to adopt an existing session there, `/switch <name>`. Dirty is read per checkout, so a row that misses the 5 s bound shows `?` |
-| `/worktree new <name> [--base <ref>]` | Create a worktree at `<root>/<name>` on branch `wt/<name>` from the current session's HEAD (or `<ref>`) and declare the session there — nothing is moved, so a running turn is untouched. `<name>` is normalised to a lowercase ASCII slug (`[a-z0-9.-]`, at most 40 characters); a name with Chinese is refused with an example. An existing directory gets a `-2` suffix, an existing branch that no checkout holds is attached, and cola never removes worktrees |
+| `/topic --worktree [--name <title>] [--slug <slug>] [--base <ref>]` | Open a topic whose first message creates a linked checkout in the current project and starts the session there. Nothing is created at command time, so closing the topic leaves no checkout. The cover names the target, branch `wt/<slug>` and `base @ sha` before the first message. `--name` is the session title (any language); `--slug` is the ASCII directory/branch token (omitted: derived from an ASCII title, else a `YYYYMMDD-1` token); `--base` overrides the integration ladder and is resolved to a SHA. The checkout is a sibling under `<root>` (default `.worktrees`), never nested in a linked source |
+| `/new --worktree [--name <title>] [--slug <slug>] [--base <ref>]` | The same checkout intent in the current conversation — the first message creates the checkout and the session in it |
+| `/worktree` | Show the pending checkout intent: target, branch, `base @ sha`, source. `/worktree --slug <slug>` / `--base <ref>` adjust it before the first message; after the checkout exists they refuse (the directory is fixed). The old read-only inventory card is retired — list checkouts with `/run git worktree list` and enter one with `/dir <path>` |
 | `/switch` | Session card: browse / search / adopt / new |
 | `/switch <kw>` | Switch to a session by name/dir/id (adopts foreign ones; no match opens the card pre-filtered) |
 | `/switch <id> [--force]` | Take over a session by id/title |
@@ -863,17 +872,23 @@ Notes:
   outcome is unknown is not retried (a retry could duplicate the message). The
   10-second per-chat cooldown exists to stop a double click from uploading the
   same review twice, so a deliberate re-run after an edit needs a short wait.
-- `/new`, `/dir`, `/topic` and `/worktree new` only **declare** the session —
-  the conversation's next non-command message creates it in the chosen directory
-  and maps it here, so a mistaken `/new`, `/dir`, `/worktree new` or `/topic` can
-  be corrected with another `/new`, `/dir`, `/switch` or `/topic` before then
-  without leaving a session in the shared store. Inside a topic that is still
-  waiting for its first message, `/switch <id>` re-points the topic at an
-  existing session instead. The `/dir` card's pick and 建话题
-  follow the same timing (建话题's cover card shows 「下一条消息创建」
-  until then). This is why `/worktree new` is safe while a turn is running: it
-  writes a Pending Session and moves nothing, so the in-flight step is never
-  interrupted (the reason #428's mid-turn move was a dead end).
+- `/new`, `/dir`, `/topic`, `/topic --worktree` and `/new --worktree` only
+  **declare** the session — the conversation's next non-command message creates
+  it and maps it here, so a mistaken `/new`, `/dir`, `/topic` or worktree flag
+  can be corrected with another `/new`, `/dir`, `/switch` or `/topic` before
+  then without leaving a session in the shared store. Inside a topic that is
+  still waiting for its first message, `/switch <id>` re-points the topic at an
+  existing session instead. The `/dir` card's pick and 建话题 follow the same
+  timing (建话题's cover card shows 「下一条消息创建」 until then).
+- A worktree pending keeps the **source** directory for the whole pending
+  window: `/cat`, `/diff` and `/dir` read where the conversation currently
+  stands, and `/worktree` names the target it will create. The first message
+  creates the checkout from the stored base SHA and then the session inside it,
+  so an abandoned pending creates no checkout. This is why a worktree flag is
+  safe while a turn is running: it writes an intent and moves nothing, so the
+  in-flight step is never interrupted (the reason #428's mid-turn move was a
+  dead end). A failed create keeps the pending and the message, and the retry
+  reuses the checkout the first attempt made.
 - `/sub` is the read-only view of the current session's **child sessions** —
   the ones its `task` tool calls created. Each row carries the child's title,
   id, agent, last activity and live state (运行中 when Busy/Retry, 空闲 when
