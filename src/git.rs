@@ -121,7 +121,7 @@ pub struct WorktreeEntry {
     pub main: bool,
 }
 
-/// What `/worktree new` created (ADR-0088).
+/// What a worktree-creating command produced (ADR-0088, ADR-0095).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedWorktree {
     pub path: String,
@@ -254,32 +254,6 @@ fn parse_worktree_porcelain(text: &str) -> Vec<WorktreeEntry> {
         entries.push(entry);
     }
     entries
-}
-
-/// The bound the ADR promises for the dirty fan-out on the command path.
-pub const DIRTY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Dirty state per checkout, bounded (ADR-0088): one `git status --porcelain`
-/// each, at most four at a time, all under ONE shared deadline. A read that
-/// misses it reads `None` — the card renders `?` instead of claiming a clean
-/// tree it never measured — while a read that finished keeps its answer.
-pub async fn worktree_dirty_until(paths: &[String], deadline: tokio::time::Instant) -> Vec<Option<bool>> {
-    use std::sync::Arc;
-
-    const CONCURRENCY: usize = 4;
-
-    let limit = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
-    let reads = paths.iter().map(|path| {
-        let limit = Arc::clone(&limit);
-        async move {
-            let read = async move {
-                let _permit = limit.acquire().await.ok()?;
-                status_dirty(path).await
-            };
-            tokio::time::timeout_at(deadline, read).await.ok().flatten()
-        }
-    });
-    futures_util::future::join_all(reads).await
 }
 
 /// The slug a worktree name becomes (ADR-0088): trim, lowercase,
@@ -864,44 +838,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Dirty state is per checkout: a file written in the worktree must not
-    /// dirty the main checkout, and the read reports each separately.
-    #[tokio::test]
-    async fn worktree_dirty_reads_each_checkout_separately() {
-        let dir = init_repo("git-wt-dirty");
-        let s = dir.to_string_lossy().to_string();
-        let created = create_worktree(&s, Path::new(".worktrees"), "dirty", None)
-            .await
-            .unwrap();
-        std::fs::write(Path::new(&created.path).join("new.txt"), "x").unwrap();
-
-        let entries = list_worktrees(&s).await.unwrap();
-        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
-        let dirty = worktree_dirty_until(&paths, tokio::time::Instant::now() + DIRTY_BUDGET).await;
-        assert_eq!(
-            dirty,
-            vec![Some(true), Some(true)],
-            "the root is untracked in main too"
-        );
-
-        std::fs::write(dir.join(".gitignore"), ".worktrees/\n").unwrap();
-        run(&dir, &["add", ".gitignore"]);
-        run(&dir, &["commit", "-m", "ignore worktrees"]);
-        let paths: Vec<String> = list_worktrees(&s)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|e| e.path)
-            .collect();
-        assert_eq!(
-            worktree_dirty_until(&paths, tokio::time::Instant::now() + DIRTY_BUDGET).await,
-            vec![Some(false), Some(true)],
-            "ignored root: only the worktree itself is dirty"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// The root resolves against the PRIMARY checkout even when the session is
     /// already inside a linked worktree (ADR-0088): never worktree-in-worktree.
     #[tokio::test]
@@ -981,26 +917,6 @@ mod tests {
             .to_string();
         assert!(error.contains("已在"), "{error}");
         assert!(error.contains("wt/held"), "{error}");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An already-expired deadline returns one verdict per checkout without
-    /// waiting on git. (The read itself may still win the race on a loaded
-    /// machine — `timeout_at` polls the future first — so this pins the bound,
-    /// not the verdict.)
-    #[tokio::test]
-    async fn worktree_dirty_past_deadline_returns_promptly() {
-        let dir = init_repo("git-wt-past-deadline");
-        let s = dir.to_string_lossy().to_string();
-        let paths = vec![s];
-        let started = std::time::Instant::now();
-        let results = worktree_dirty_until(&paths, tokio::time::Instant::now()).await;
-        assert_eq!(results.len(), 1);
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "a past deadline must not wait on git"
-        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

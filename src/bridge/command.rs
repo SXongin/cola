@@ -142,15 +142,18 @@ pub enum Command {
     /// (ADR-0086): the command text and its cap. `None` is the bare `/run` or a
     /// refused flag form, both answered with usage and nothing spawned.
     Run(Option<RunSpec>),
-    /// `/worktree` (no args, or `/worktree list`) — the project's git checkouts
-    /// as a picker card; picking one declares a **Pending Session** there
-    /// (ADR-0088).
-    WorktreeCard,
-    /// `/worktree new <name> [--base <ref>]` — create a checkout on branch
-    /// `wt/<name>` and declare the Pending Session that starts in it.
-    WorktreeNew { name: String, base: Option<String> },
-    /// A bare or malformed `/worktree new` — answered with usage and no git
-    /// call; `/worktree` with no argument opens the card instead.
+    /// `/worktree` — report the pending checkout intent (ADR-0095). Outside a
+    /// pending it answers usage; the read-only inventory card is retired in
+    /// favour of `/run git worktree list`.
+    WorktreeStatus,
+    /// `/worktree --slug <slug> [--base <ref>]` — adjust the pending intent
+    /// before the first message creates it (ADR-0095).
+    WorktreeAdjust {
+        slug: Option<String>,
+        base: Option<String>,
+    },
+    /// A malformed `/worktree` form (including the retired `new` and `list`)
+    /// — answered with usage and no git call.
     WorktreeUsage,
 }
 
@@ -204,8 +207,6 @@ impl Command {
             Command::TopicAdopt { .. } | Command::TopicAdoptCard => Some(TOPIC_ADOPT_NEST_REJECTION),
             Command::Dir(_)
             | Command::DirCard
-            | Command::WorktreeCard
-            | Command::WorktreeNew { .. }
             | Command::Switch(_)
             | Command::Sub(SubAction::Attach { .. })
             | Command::New(_)
@@ -417,12 +418,11 @@ pub fn parse_command(text: &str) -> Option<Command> {
                 _ => Some(Command::DiffUsage),
             }
         }
-        // `/worktree` — the project's git checkouts (ADR-0088). No argument (or
-        // `list`) opens the picker card; `new <name> [--base <ref>]` creates a
-        // checkout and declares the Pending Session that starts in it. Every
-        // other form is answered with usage and runs no git.
+        // `/worktree` — the pending checkout intent (ADR-0095). No argument
+        // reports it; `--slug`/`--base` adjust it before the first message.
+        // The old card (`list`) and `new` forms are retired.
         "/worktree" => Some(match arg {
-            None => Command::WorktreeCard,
+            None => Command::WorktreeStatus,
             Some(a) => parse_worktree_arg(a),
         }),
         // `/run [--timeout <n>[smh]] [--] <cmd>` — one Terminal Command
@@ -608,46 +608,36 @@ fn parse_new_worktree(arg: &str) -> Command {
     }
 }
 
-/// Parse `/worktree`'s argument (ADR-0088). The grammar is `/worktree` (the
-/// card), `/worktree list` (the card), and `/worktree new <name> [--base
-/// <ref>]`. The name may span words (`Fix Login` normalises to `fix-login`),
-/// and `--base` may come before or after it; anything else — an unknown flag,
-/// a bare `--base`, a missing name — is usage, with no git call.
+/// Parse `/worktree`'s argument (ADR-0095). The grammar is bare `/worktree`
+/// (the pending status) and `--slug <slug>` / `--base <ref>` (adjust the
+/// pending intent), in any order, at least one flag. Everything else — the
+/// retired `new`/`list`, a bare or duplicate flag, a positional word — is
+/// usage, with no git call.
 fn parse_worktree_arg(arg: &str) -> Command {
+    let mut slug = None;
+    let mut base = None;
     let mut words = arg.split_whitespace();
-    match words.next() {
-        Some("list") => {
-            if words.next().is_none() {
-                Command::WorktreeCard
-            } else {
-                Command::WorktreeUsage
-            }
+    while let Some(word) = words.next() {
+        let slot = match word {
+            "--slug" => &mut slug,
+            "--base" => &mut base,
+            _ => return Command::WorktreeUsage,
+        };
+        if slot.is_some() {
+            return Command::WorktreeUsage;
         }
-        Some("new") => {
-            let mut name: Vec<&str> = Vec::new();
-            let mut base: Option<String> = None;
-            while let Some(word) = words.next() {
-                match word {
-                    "--base" => match words.next() {
-                        Some(value) if !value.starts_with('-') && base.is_none() => {
-                            base = Some(value.to_string());
-                        }
-                        _ => return Command::WorktreeUsage,
-                    },
-                    flag if flag.starts_with('-') => return Command::WorktreeUsage,
-                    word => name.push(word),
-                }
-            }
-            if name.is_empty() {
-                Command::WorktreeUsage
-            } else {
-                Command::WorktreeNew {
-                    name: name.join(" "),
-                    base,
-                }
-            }
+        let Some(value) = words.next() else {
+            return Command::WorktreeUsage;
+        };
+        if value.starts_with('-') {
+            return Command::WorktreeUsage;
         }
-        _ => Command::WorktreeUsage,
+        *slot = Some(value.to_string());
+    }
+    if slug.is_none() && base.is_none() {
+        Command::WorktreeUsage
+    } else {
+        Command::WorktreeAdjust { slug, base }
     }
 }
 
@@ -782,8 +772,9 @@ pub fn help_text() -> String {
     "\
 **cola commands**
 `/dir <path> [name]` · Declare a new session in a project directory (created by the next message)
-`/worktree` · Worktree card: this project's git checkouts (branch · dirty · session count), read-only
-`/worktree new <name> [--base <ref>]` · Create a worktree on branch `wt/<name>` and declare the session that starts there (nothing is moved)
+`/topic --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]` · Open a new topic whose first message creates a fresh checkout and starts there
+`/new --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]` · The same, in the current conversation
+`/worktree` · Show the pending checkout intent; `/worktree --slug <名字>` or `--base <ref>` changes it before the first message
 `/cat <path>` · View a host file in a card (a directory opens the Directory Browser there)
 `/diff [--base <ref>]` · Send this branch's repository changes against a base ref as one HTML file
 `/run [--timeout <n>[smh]] [--] <cmd>` · Run one shell command on the host and reply with a Terminal Card (also a message starting with `!<cmd>`)
@@ -835,7 +826,7 @@ pub fn command_help(name: &str) -> Option<String> {
             "/dir <path> [name]\nDeclare a new session rooted at <path>: nothing is created yet — the conversation's next non-command message creates the session in that directory and maps it here, so a mistaken `/dir` can be corrected with another `/dir`, `/new`, `/switch` or `/topic` and leaves no session behind.\n- `/dir` (no arg) — Recent Directories card: pick a recently-used folder and declare it there, or open it as a fresh topic (each row's 建话题 = `/topic <dir>` without typing; only from the main conversation). When there are many directories, the card carries a search box over the paths. Its 📁 浏览目录 button opens a filesystem browser: drill into subdirectories, type a path (前往 browses it, 选择 declares it), toggle dot-directories, and filter the child names.\nExample: `/dir /root/proj/lib`"
         }
         "worktree" => {
-            "/worktree\nList this project's git checkouts as a read-only card: each row names the directory, its branch, dirty marker, session count and the current marker, and the main checkout is included and labelled. The card is read-only: switch the conversation into a checkout with `/dir <path>`, and adopt an existing session there with `/switch <name>`.\n/worktree new <name> [--base <ref>]\nCreate a worktree at `[worktree] root` (default `.worktrees`, resolved against the main checkout) on branch `wt/<name>` from the current session's HEAD (or `<ref>`), then declare the session there. Nothing is moved, so a running turn is never interrupted.\nThe name is normalised to a lowercase ASCII slug (`[a-z0-9.-]`, at most 40 characters); a name with Chinese is refused with an example. An existing directory gets a `-2` suffix, an existing branch that no checkout holds is attached, and a branch already checked out elsewhere is refused with the holding checkout named. cola never removes worktrees.\nExamples: `/worktree`, `/worktree new fix-login`, `/worktree new fix-login --base main`"
+            "/worktree\nShow the pending checkout intent: the target directory, branch `wt/<slug>`, the resolved base `ref @ sha`, and the source directory. It is only meaningful while a Pending Session declared by `/topic --worktree` or `/new --worktree` exists; the first message creates the checkout, so an abandoned pending creates nothing.\n- `/worktree --slug <slug>` — change the target/branch slug (ASCII, lowercased; the title stays independent)\n- `/worktree --base <ref>` — re-resolve the start ref to a SHA\nBoth are refused after the checkout exists (the directory is fixed). The old read-only inventory card is retired: list checkouts with `/run git worktree list`, and enter an existing one with `/dir <path>`.\nThe base ladder is `[worktree] base`, then `origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`; an unresolvable explicit base is refused, never silently replaced.\nExamples: `/topic --worktree --name 修复登录 --slug fix-login`, `/new --worktree --name Fix Login`, `/worktree --base origin/main`"
         }
         "switch" => {
             "/switch [action]\nSession management card and text forms.\n- `/switch` (no arg) — interactive session card (browse / search / adopt / new)\n- `/switch <keyword>` — switch by title/directory/id; the current chat's sessions win, otherwise a unique global match is adopted. Ambiguous keywords list candidates; no match opens the card pre-filtered by the keyword.\n- `/switch <id|title> [--force]` — take over a session (exact id → id-prefix → title; the card's short hash works too; reject if owned by another chat unless `--force`, or use the card's 强制接管 button)\n- `/switch forget` — un-map this chat's session (server session stays)\nExamples: `/switch backend`, `/switch ses_abc --force`"
@@ -850,10 +841,10 @@ pub fn command_help(name: &str) -> Option<String> {
             "/switch forget\nUn-map this chat's session. The server session stays untouched and can be adopted again.\nExample: `/switch forget`"
         }
         "new" => {
-            "/new [name]\nDeclare a new session in the current project (the active session's directory, or the pending's when one is already declared); with neither, the default directory (`work_dir` or cwd). Nothing is created yet: the conversation's next non-command message creates the session and maps it here, so a mistaken `/new` can be corrected with another `/new`, `/dir`, `/switch` or `/topic` and leaves no session behind. The optional name becomes the created session's server title.\nExample: `/new api-refactor`"
+            "/new [name]\nDeclare a new session in the current project (the active session's directory, or the pending's when one is already declared); with neither, the default directory (`work_dir` or cwd). Nothing is created yet: the conversation's next non-command message creates the session and maps it here, so a mistaken `/new` can be corrected with another `/new`, `/dir`, `/switch` or `/topic` and leaves no session behind. The optional name becomes the created session's server title.\n\n/new --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]\nDeclare the same pending with a checkout intent: the first message creates a linked checkout under `[worktree] root` (default `.worktrees`) on branch `wt/<slug>` and starts the session there. The checkout does not exist until then, so an abandoned conversation leaves nothing. `--name` is the session title (any language); `--slug` is the ASCII directory/branch token (omitted: derived from an ASCII title, else a `YYYYMMDD-1` token); `--base` overrides the integration ladder and is resolved to a SHA now. While pending, `/worktree` shows the target and `/worktree --slug` / `--base` adjust it.\nExamples: `/new api-refactor`, `/new --worktree --name Fix Login`, `/new --worktree --name 修复登录 --slug fix-login --base origin/main`"
         }
         "topic" => {
-            "/topic [dir] [name]\nCreate a real Feishu topic for a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Opening the topic creates NO session yet: the topic's first non-command message creates the session in the chosen directory and maps it here, so a mistaken `/topic` leaves nothing in the shared store — correct it in place with `/switch <id>` (or `/dir`/`/new`) inside the topic.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\nExample: `/topic /root/proj/lib api-refactor`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
+            "/topic [dir] [name]\nCreate a real Feishu topic for a new session. The topic is UI-separated from the current conversation, so you can switch between topics in the Feishu client. Opening the topic creates NO session yet: the topic's first non-command message creates the session in the chosen directory and maps it here, so a mistaken `/topic` leaves nothing in the shared store — correct it in place with `/switch <id>` (or `/dir`/`/new`) inside the topic.\n- `/topic` (no args) — new session in the CURRENT PROJECT (the active session's directory, like `/new`; falls back to the default directory when the conversation has no session)\n- `/topic <dir>` — new session rooted at <dir>\n- `/topic <dir> <name>` — also name the session\n\n/topic --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]\nOpen a topic whose first message creates a linked checkout in the current project and starts the session there — the one-command form of \"create a worktree, then a topic in it\". The checkout is created lazily, so closing the topic without a message leaves nothing. `--name` is the title (any language); `--slug` is the ASCII directory/branch token; `--base` overrides the base ladder. The cover names the target, branch and `base @ sha` before the first message; `/worktree` shows and adjusts it while pending.\nExample: `/topic /root/proj/lib api-refactor`, `/topic --worktree --name 修复登录 --slug fix-login`\n\n/topic --adopt <keyword> [--force]\nOpen a topic around an EXISTING session instead of creating a new one. Resolution: exact id → unique id-prefix (the short hash shown on the card works too) → unique title substring (the whole remaining arg is the keyword, so multi-word titles match). Child (sub-task) sessions are rejected. If the session belongs to another chat, reject unless `--force` (which steals the mapping). No argument pops the session card — each row's 建话题接管 button does the same, and an occupied session offers a 强制建话题接管 confirmation.\nExample: `/topic --adopt 重写登录模块`"
         }
         "name" => {
             "/name <name>\nRename the current session server-side (visible to every client sharing the store). With no session yet (a Pending Session declared by `/new`/`/dir`/`/topic`), there is nothing to PATCH: the name becomes the created session's title instead, and a pending topic's cover card updates right away.\nExample: `/name frontend`"
@@ -1102,11 +1093,11 @@ pub(crate) async fn handle_command(
         Command::DirCard => {
             crate::feishu::card::command::send_dir_card(handles, &thread_key, message_id).await?;
         }
-        Command::WorktreeCard => {
-            crate::feishu::card::command::send_worktree_card(handles, &thread_key, message_id).await?;
+        Command::WorktreeStatus => {
+            crate::bridge::worktree::status(handles, &thread_key, message_id).await?;
         }
-        Command::WorktreeNew { name, base } => {
-            crate::bridge::worktree::create(handles, &thread_key, message_id, name, base).await?;
+        Command::WorktreeAdjust { slug, base } => {
+            crate::bridge::worktree::adjust(handles, &thread_key, message_id, slug, base).await?;
         }
         Command::WorktreeUsage => {
             handles
@@ -3450,57 +3441,41 @@ mod tests {
             Some(Command::Forward("/diffs x".into()))
         );
 
-        // ADR-0088: `/worktree` opens the card (also `/worktree list`);
-        // `new <name>` requires the name, accepts a multi-word name and
-        // `--base` on either side, and every other shape is usage.
-        assert_eq!(parse_command("/worktree"), Some(Command::WorktreeCard));
-        assert_eq!(parse_command("/worktree list"), Some(Command::WorktreeCard));
+        // ADR-0095: bare `/worktree` is the pending status; `--slug`/`--base`
+        // adjust the intent before creation. The old card (`list`) and `new`
+        // forms are retired and answer usage.
+        assert_eq!(parse_command("/worktree"), Some(Command::WorktreeStatus));
         assert_eq!(
-            parse_command("/worktree new fix-login"),
-            Some(Command::WorktreeNew {
-                name: "fix-login".into(),
+            parse_command("/worktree --slug fix-login"),
+            Some(Command::WorktreeAdjust {
+                slug: Some("fix-login".into()),
                 base: None,
             })
         );
         assert_eq!(
-            parse_command("/worktree new Fix Login"),
-            Some(Command::WorktreeNew {
-                name: "Fix Login".into(),
-                base: None,
-            })
-        );
-        assert_eq!(
-            parse_command("/worktree new fix --base main"),
-            Some(Command::WorktreeNew {
-                name: "fix".into(),
+            parse_command("/worktree --base main"),
+            Some(Command::WorktreeAdjust {
+                slug: None,
                 base: Some("main".into()),
             })
         );
         assert_eq!(
-            parse_command("/worktree new --base origin/main fix"),
-            Some(Command::WorktreeNew {
-                name: "fix".into(),
+            parse_command("/worktree --slug fix --base origin/main"),
+            Some(Command::WorktreeAdjust {
+                slug: Some("fix".into()),
                 base: Some("origin/main".into()),
             })
         );
-        assert_eq!(parse_command("/worktree new"), Some(Command::WorktreeUsage));
-        assert_eq!(
-            parse_command("/worktree new fix --base"),
-            Some(Command::WorktreeUsage)
-        );
-        assert_eq!(
-            parse_command("/worktree new fix --base --other"),
-            Some(Command::WorktreeUsage)
-        );
-        assert_eq!(
-            parse_command("/worktree new fix --force"),
-            Some(Command::WorktreeUsage)
-        );
-        assert_eq!(parse_command("/worktree bogus"), Some(Command::WorktreeUsage));
-        assert_eq!(
-            parse_command("/worktree list extra"),
-            Some(Command::WorktreeUsage)
-        );
+        for bad in [
+            "/worktree list",
+            "/worktree new fix",
+            "/worktree --slug",
+            "/worktree --slug a --slug b",
+            "/worktree --base --other",
+            "/worktree bogus",
+        ] {
+            assert_eq!(parse_command(bad), Some(Command::WorktreeUsage), "{bad}");
+        }
         assert_eq!(
             parse_command("/worktrees"),
             Some(Command::Forward("/worktrees".into()))
@@ -3743,13 +3718,21 @@ mod tests {
         assert!(diff.contains("/diff [--base <ref>]"), "{diff}");
         assert!(diff.contains("稍后再试"), "the cooldown is documented: {diff}");
         let worktree = command_help("worktree").expect("worktree has a help topic");
-        assert!(worktree.contains("/worktree new <name>"), "{worktree}");
+        assert!(worktree.contains("--slug"), "{worktree}");
         assert!(worktree.contains("--base"), "{worktree}");
-        assert!(worktree.contains("session"), "{worktree}");
+        assert!(worktree.contains("git worktree list"), "{worktree}");
         assert!(
-            help_text().contains("/worktree new <name>"),
+            help_text().contains("/topic --worktree"),
             "/worktree is listed in the command index: {}",
             help_text()
+        );
+        assert!(
+            command_help("new").unwrap().contains("--worktree"),
+            "/new documents the worktree flag"
+        );
+        assert!(
+            command_help("topic").unwrap().contains("--worktree"),
+            "/topic documents the worktree flag"
         );
         assert_eq!(command_help("nonexistent"), None);
         // The retired text-list form has no help topic of its own.

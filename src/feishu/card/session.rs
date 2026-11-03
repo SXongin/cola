@@ -879,70 +879,6 @@ fn dir_card_row(
     vec![text_row, btn_row]
 }
 
-/// One `/worktree` card row (ADR-0088): a checkout, its branch, whether it is
-/// dirty (`None` = the read missed its bound), how many sessions live there,
-/// and whether the conversation is already rooted there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorktreeRow {
-    pub path: String,
-    pub name: String,
-    pub branch: Option<String>,
-    pub dirty: Option<bool>,
-    pub main: bool,
-    pub sessions: usize,
-    pub current: bool,
-}
-
-/// The `/worktree` card (ADR-0088): the project's git checkouts, the main one
-/// included and labelled, each with its branch, dirty marker, session count and
-/// current marker. Read-only — re-rooting is `/dir`'s Pending Session and
-/// adoption is `/switch`'s job, so the card carries no callback and no button.
-pub fn build_worktree_card(rows: &[WorktreeRow], repo: &str) -> serde_json::Value {
-    let mut elements: Vec<serde_json::Value> = Vec::new();
-    elements.push(json!({
-        "tag": "markdown",
-        "content": crate::feishu::card::sanitize::sanitize_markdown(&format!(
-            "项目 `{repo}` 的 git 检出 · {} 个",
-            rows.len()
-        )),
-    }));
-    if rows.is_empty() {
-        elements.push(json!({
-            "tag": "markdown",
-            "content": "_(这个项目还没有 worktree。用 `/worktree new <名字>` 创建。)_",
-        }));
-    }
-    for row in rows {
-        let mut title = format!("**{}**", row.name);
-        if row.main {
-            title.push_str(" · 主检出");
-        }
-        if row.current {
-            title.push_str(" · ✅ 当前");
-        }
-        let branch = match &row.branch {
-            Some(branch) => format!("分支 `{branch}`"),
-            None => "detached HEAD".to_string(),
-        };
-        let dirty = match row.dirty {
-            Some(true) => " · ⚠ 有未提交改动",
-            Some(false) => "",
-            None => " · ? 状态未知",
-        };
-        let sessions = if row.sessions == 0 {
-            String::new()
-        } else {
-            format!(" · {} 个会话", row.sessions)
-        };
-        elements.push(card_text_row(&format!("{title}\n{branch}{dirty}{sessions}")));
-    }
-    // ADR-0088: the list is read-only and carries no how-to footer — re-rooting
-    // keeps the one meaning `/dir` already has, adopting stays `/switch`'s, and
-    // a hint line read as a required procedure rather than a card you can just
-    // read. The card needs no callback and no button.
-    card_shell("🌲 worktree", "blue", elements)
-}
-
 /// One child row of the `/dir` browse card (ADR-0078, ADR-0083 §3): the display
 /// name, the absolute path its button acts on, and what the row is. A directory
 /// carries `is_repo` (it holds a `.git` entry — floated to the front and marked
@@ -2576,51 +2512,6 @@ mod tests {
         assert_eq!(submit["value"]["op"], "search");
         assert_eq!(submit["value"]["chat_id"], "chat_1");
         assert_eq!(submit["value"]["thread_id"], "chat_1");
-    }
-
-    /// ADR-0088: the worktree card names each checkout, its branch (or
-    /// detached), dirty state (or `?`), session count and current marker; an
-    /// empty project points at `/worktree new`.
-    #[test]
-    fn worktree_card_renders_detached_unknown_dirty_and_empty() {
-        let rows = vec![
-            WorktreeRow {
-                path: "/r/.worktrees/a".into(),
-                name: "a".into(),
-                branch: None,
-                dirty: None,
-                main: false,
-                sessions: 0,
-                current: false,
-            },
-            WorktreeRow {
-                path: "/r".into(),
-                name: "r".into(),
-                branch: Some("main".into()),
-                dirty: Some(false),
-                main: true,
-                sessions: 3,
-                current: true,
-            },
-        ];
-        let text = build_worktree_card(&rows, "/r").to_string();
-        assert!(text.contains("detached HEAD"), "{text}");
-        assert!(text.contains("? 状态未知"), "{text}");
-        assert!(text.contains("主检出"), "{text}");
-        assert!(text.contains("3 个会话"), "{text}");
-        assert!(!text.contains("0 个会话"), "{text}");
-        assert!(text.contains("✅ 当前"), "{text}");
-        assert!(
-            !text.contains("\"tag\":\"button\""),
-            "the list is read-only: {text}"
-        );
-
-        let empty = build_worktree_card(&[], "/r").to_string();
-        assert!(empty.contains("还没有 worktree"), "{empty}");
-        assert!(
-            !empty.contains("\"tag\":\"button\""),
-            "no rows, no buttons: {empty}"
-        );
     }
 
     /// A keyword that matches nothing shows the no-match hint (not the

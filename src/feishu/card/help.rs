@@ -18,12 +18,16 @@ pub fn build_help_card() -> serde_json::Value {
                     "声明在新目录开会话（下一条消息创建；无参弹最近目录卡片，卡片上可进入 📁 浏览目录）",
                 ),
                 (
-                    "/worktree",
-                    "本项目 git 检出卡片（含主检出）：分支 · ⚠ · 会话数；只读",
+                    "/topic --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]",
+                    "打开话题，第一条消息创建新检出并在其中开始会话（放弃话题不留下检出）",
                 ),
                 (
-                    "/worktree new <名字> [--base <ref>]",
-                    "创建 worktree（分支 wt/<名字>）并在那里声明会话，不移动现有会话",
+                    "/new --worktree [--name <标题>] [--slug <路径名>] [--base <ref>]",
+                    "同上，用在当前对话",
+                ),
+                (
+                    "/worktree",
+                    "查看待建检出意图（目标 · 分支 · base @ sha）；--slug / --base 可改；已有检出用 /run git worktree list",
                 ),
                 (
                     "/cat <路径>",
