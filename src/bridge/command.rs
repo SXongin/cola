@@ -1194,8 +1194,13 @@ pub(crate) async fn handle_command(
                 }
             };
             let root_ignored = crate::git::root_is_ignored(&source, &root).await;
+            // Declare against the source the intent was resolved from — never
+            // re-read the current project here: `/dir` or `/new` may have
+            // replaced the pending while Git ran (ADR-0095).
             let pending = handles
-                .declare_pending_in_current_project_worktree(&thread_key, name.clone(), intent.clone())
+                .flow
+                .sessions
+                .declare_pending_worktree(&thread_key, source.clone(), name.clone(), intent.clone())
                 .await?;
             let reply = crate::bridge::worktree::declared_reply(
                 pending.title.as_deref(),

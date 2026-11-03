@@ -147,8 +147,9 @@ setting, cola creates and never removes — stand.
   pending-window reader keeps working without a new rule. Materialisation
   points the session entry at the created checkout before the session is
   created; the stored pending keeps its source until activation clears it.
-  The command-time root check walks to the nearest existing ancestor and does
-  not create the root, so an abandoned pending leaves nothing on disk.
+  The command-time root check walks to the nearest existing ancestor, proves
+  it writable with one transient probe directory, and does not create the
+  root, so an abandoned pending leaves nothing on disk.
 - The cover names the target/branch/base before the first message; a colliding
   directory at creation may still get a `-2` suffix, and materialisation
   replies with the actual path when that happens. The cover's path is a

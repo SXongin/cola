@@ -255,7 +255,7 @@ fn check_root_creatable(root: &std::path::Path) -> Result<(), crate::git::Worktr
     let mut probe = root;
     loop {
         match std::fs::metadata(probe) {
-            Ok(meta) if meta.is_dir() => return Ok(()),
+            Ok(meta) if meta.is_dir() => return probe_writable(probe, root),
             Ok(_) => {
                 return Err(crate::git::WorktreeError::new(format!(
                     "`{}` 已存在但不是目录",
@@ -283,6 +283,32 @@ fn check_root_creatable(root: &std::path::Path) -> Result<(), crate::git::Worktr
                 )));
             }
         }
+    }
+}
+
+/// Prove the nearest existing directory is writable by creating and removing
+/// one probe directory. A stat cannot answer "creatable" on a read-only
+/// filesystem, and creating the real root would leave it behind when the
+/// pending is abandoned (ADR-0095).
+fn probe_writable(
+    directory: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<(), crate::git::WorktreeError> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let probe = directory.join(format!(".cola-worktree-probe-{}-{stamp}", std::process::id()));
+    match std::fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir(&probe);
+            Ok(())
+        }
+        Err(error) => Err(crate::git::WorktreeError::new(format!(
+            "无法在 `{}` 创建目录（`{}` 不可写？）：{error}",
+            root.display(),
+            directory.display()
+        ))),
     }
 }
 

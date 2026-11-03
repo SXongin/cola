@@ -479,11 +479,12 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         generation: u64,
         path: &str,
+        branch: &str,
     ) -> crate::error::Result<bool> {
         self.store
             .lock()
             .await
-            .record_worktree_path(thread_key, generation, path)
+            .record_worktree_path(thread_key, generation, path, branch)
     }
 
     /// Declare (or replace) the conversation's Pending Session and persist
@@ -2983,23 +2984,6 @@ impl CommandHandles {
         self.flow
             .sessions
             .declare_pending(thread_key, directory, title)
-            .await
-    }
-
-    /// [`Self::declare_pending_in_current_project`] with a worktree intent
-    /// (ADR-0095) — the shape `/new --worktree` uses. The directory recorded
-    /// is the current project (the source checkout); materialisation creates
-    /// the checkout from the intent.
-    pub(crate) async fn declare_pending_in_current_project_worktree(
-        &self,
-        thread_key: &ThreadKey,
-        title: Option<String>,
-        worktree: crate::bridge::session::WorktreeIntent,
-    ) -> crate::error::Result<PendingEntry> {
-        let directory = self.current_project_directory(thread_key).await;
-        self.flow
-            .sessions
-            .declare_pending_worktree(thread_key, directory, title, worktree)
             .await
     }
 
