@@ -327,6 +327,46 @@ default_client = "ada"           # which Agent Client is active (default: "defau
 - **An Agent Client id is durable state.** cola records the active id beside
   each Session, so renaming an id is a state migration, not a config edit.
 
+### Connect a Codex client
+
+A Codex Agent Client needs a pinned Codex CLI, a signed-in `$CODEX_HOME`, and
+the client table below. There is no endpoint, port or socket key to configure:
+cola resolves the binary itself and reaches the daemon through
+`codex app-server proxy`.
+
+```toml
+[clients.ada]
+kind = "codex"
+# start_server = "auto"           # auto (default) | never | eager
+
+[bridge]
+default_client = "ada"
+```
+
+1. **Install the Codex CLI.** cola is written against `codex-cli 0.166.0`; an
+   older binary is refused with the pinned version in the error, and a newer one
+   is probed against its own generated schema. Put `codex` on `PATH`, or keep a
+   managed package at `$CODEX_HOME/packages/app-server-daemon/current/bin/codex`.
+   cola tries the daemon's reported `managedCodexPath`, then that package, then
+   `codex` on `PATH`, and names all three when none is executable.
+2. **Sign in with Codex itself.** Run `codex login` once; the credentials live
+   in `$CODEX_HOME` and are shared with the daemon. cola never writes that file.
+   `CODEX_HOME` defaults to `~/.codex`; point it at an absolute path to share a
+   different store.
+3. **Choose who may start the daemon.** `start_server = "auto"` (the default)
+   lets cola run `codex app-server daemon start` when no daemon answers;
+   `never` is attach-only. cola never owns, signals or reaps the daemon. If your
+   TUI is already running, cola attaches to the same session store.
+4. **Verify it.** `cola config show` prints the resolved client; `cola doctor`
+   reports whether the app-server daemon answers and whether it can prove your
+   own TUI is attached. On Windows that proof is limited to process identity and
+   `--remote` argv, so a client can be `unverified` while the transport itself
+   works — see the platform notes below.
+
+The control socket is `$CODEX_HOME/app-server-control/app-server-control.sock`
+on every platform. On Windows it must fit the 108-byte `sun_path` limit; the
+three preconditions are listed below.
+
 ### Codex on Linux, macOS and Windows
 
 A `kind = "codex"` client attaches to Codex's app-server daemon. The app-server
