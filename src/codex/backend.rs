@@ -6491,7 +6491,11 @@ mod tests {
             &client,
             crate::backend::types::ModelSurfaceQuery {
                 directory: Some("/work/cola"),
-                ack_budget: Some(Duration::from_secs(2)),
+                // Generous enough that a loaded full-suite run still completes
+                // a page before the slice expires; the uncapped read is ~15 s
+                // (100 pages × 150 ms), so the page-count bound below stays
+                // meaningful.
+                ack_budget: Some(Duration::from_secs(5)),
                 ..Default::default()
             },
         )
