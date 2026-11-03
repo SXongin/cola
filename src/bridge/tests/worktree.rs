@@ -131,6 +131,12 @@ async fn new_worktree_declares_an_intent_and_materialises_lazily() {
     );
     assert!(target.is_dir(), "the first message creates the checkout");
     git(repo.path(), &["rev-parse", "--verify", "refs/heads/fix-login"]);
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.contains("正在创建 worktree"),
+        "the wait is acknowledged before the checkout: {texts}"
+    );
+    assert!(texts.contains("worktree 建在"), "{texts}");
     assert!(
         app.sessions.lock().await.pending_for(&key()).is_none(),
         "materialisation clears the pending"

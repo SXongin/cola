@@ -329,7 +329,7 @@ pub(crate) fn declared_reply(
 ) -> String {
     let title = title.map(|title| format!("「{title}」")).unwrap_or_default();
     let mut reply = format!(
-        "✅ 已记下 worktree 意图：`{}`\n分支：`{}` · 起点：`{} @ {}`\n源目录：`{source}`\n下一条消息在该目录创建会话{title}。",
+        "✅ 已记下 worktree 意图：`{}`\n分支：`{}` · 起点：`{} @ {}`\n源目录：`{source}`\n下一条消息在该目录创建会话{title}。首次会先检出整棵工作树，可能多等几秒。",
         intent.target,
         intent.branch_name(),
         intent.base,

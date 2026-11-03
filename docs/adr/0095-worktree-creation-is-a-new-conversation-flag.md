@@ -155,6 +155,11 @@ setting, cola creates and never removes — stand.
   The command-time root check walks to the nearest existing ancestor, proves
   it writable with one transient probe directory, and does not create the
   root, so an abandoned pending leaves nothing on disk.
+- The first message pays the whole-tree `git worktree add` and the per-directory
+  instance boot; on a large repository that is seconds. cola sends an immediate
+  acknowledgement before the Git call (and the pending cover states the cost),
+  so the wait is visible rather than looking like a wedged bot. Later messages
+  in that checkout do not pay the checkout again.
 - The cover names the target/branch/base before the first message; a colliding
   directory at creation may still get a `-2` suffix, and materialisation
   replies with the actual path when that happens. The cover's path is a
