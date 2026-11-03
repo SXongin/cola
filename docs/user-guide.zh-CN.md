@@ -250,7 +250,7 @@ default_client = "ada"           # 哪个 Agent Client 处于活动状态（默�
 
 Codex Agent Client 需要固定版本的 Codex CLI、已登录的 `$CODEX_HOME`，以及
 下面的客户端表。没有 endpoint、端口或 socket 键需要配置：cola 自己解析
-二进制，并通过 `codex app-server proxy` 到达 daemon。
+二进制，并通过 `codex app-server proxy` 到达 app-server daemon。
 
 ```toml
 [clients.ada]
@@ -263,21 +263,28 @@ default_client = "ada"
 
 1. **安装 Codex CLI。** cola 针对 `codex-cli 0.166.0` 编写；更旧的二进制会
    被拒绝，错误里带着固定版本；更新的二进制会用自己生成的 schema 探测。把
-   `codex` 放到 `PATH`，或保留托管包
-   `$CODEX_HOME/packages/app-server-daemon/current/bin/codex`。cola 依次尝试
-   daemon 报告的 `managedCodexPath`、该包路径、`PATH` 上的 `codex`；都不可
-   执行时会把三条路径都列出来。
+   `codex` 放到 `PATH`：没有 app-server daemon 在运行时，
+   `start_server = "auto"` 会通过这个 CLI 启动它。托管包
+   `$CODEX_HOME/packages/app-server-daemon/current/bin/codex` 是
+   app-server daemon 已经运行后的 proxy 二进制回退，不是冷启动启动器。
+   代理二进制方面，cola 依次尝试 app-server daemon 报告的
+   `managedCodexPath`、该包路径、`PATH` 上的 `codex`；都不可执行时会把
+   三条路径都列出来。
 2. **用 Codex 自己登录。** 运行一次 `codex login`；凭据保存在 `$CODEX_HOME`
-   并与 daemon 共享。cola 从不写这个文件。`CODEX_HOME` 默认 `~/.codex`；要
-   共享另一个存储时把它设为绝对路径。
-3. **选择谁可以启动 daemon。** `start_server = "auto"`（默认）允许 cola 在
-   没有 daemon 应答时运行 `codex app-server daemon start`；`never` 只附加。
-   cola 从不拥有、发送信号或回收 daemon。TUI 已在运行时，cola 会附加到同一
-   个会话存储。
-4. **验证。** `cola config show` 打印解析后的客户端；`cola doctor` 报告
+   并与 app-server daemon 共享。cola 从不写这个文件。`CODEX_HOME` 默认
+   `~/.codex`；要共享另一个存储时把它设为绝对路径。
+3. **选择谁可以启动 app-server daemon。** `start_server = "auto"`（默认）
+   允许 cola 在没有 app-server daemon 应答时运行
+   `codex app-server daemon start`；`never` 只附加。cola 从不拥有、发送
+   信号或回收 app-server daemon。TUI 已在运行时，只有当该 TUI 也连接到
+   同一个 app-server daemon 时，cola 才会共享它的会话——同一个
+   `$CODEX_HOME`，既没有 `--no-daemon`，也没有退回内嵌服务器。内嵌
+   服务器或另一个 `$CODEX_HOME` 上的 TUI 不共享任何东西。
+4. **验证。** `cola config show` 打印文件里序列化的 Agent Client 设置，
+   包括会被解析拒绝的设置；它不做校验。`cola doctor` 才是检查：它报告
    app-server daemon 是否应答，以及它能否证明你自己的 TUI 已连接。在
-   Windows 上这个证明只到进程身份与 `--remote` argv，所以客户端可能是
-   `unverified`，而传输本身正常——见下面的平台说明。
+   Windows 上这个证明只到进程身份与 `--remote` argv，所以 Agent Client 可能
+   是 `unverified`，而传输本身正常——见下面的平台说明。
 
 控制 socket 在所有平台上都是
 `$CODEX_HOME/app-server-control/app-server-control.sock`。Windows 上它必须
