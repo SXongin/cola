@@ -2297,6 +2297,21 @@ mod tests {
         assert!(pending.worktree.as_ref().unwrap().path.is_none());
     }
 
+    /// A pending written before the `branch` field existed keeps the
+    /// historical `wt/<slug>` branch name instead of an empty ref.
+    #[test]
+    fn worktree_intent_branch_name_falls_back_for_a_legacy_pending() {
+        let intent = WorktreeIntent {
+            base: "main".into(),
+            base_sha: "abc1234".into(),
+            slug: "x".into(),
+            branch: String::new(),
+            target: "/tmp/.worktrees/x".into(),
+            path: None,
+        };
+        assert_eq!(intent.branch_name(), "wt/x");
+    }
+
     /// Issue #910 (extra finding): the pending-epoch map is pruned once a thread
     /// has neither a pending nor a claim, so it does not grow with every /new.
     #[test]
