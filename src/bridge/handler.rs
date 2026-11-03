@@ -2714,10 +2714,12 @@ impl App {
             let path = match intent.path.clone().filter(|_| intent.checkout_exists()) {
                 Some(path) => path,
                 None => {
+                    let branch = intent.branch_name();
                     let created = crate::git::create_worktree(
                         &source,
                         &self.worktree_root,
                         &intent.slug,
+                        Some(&branch),
                         Some(&intent.base_sha),
                     )
                     .await

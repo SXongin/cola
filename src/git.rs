@@ -312,8 +312,7 @@ pub fn normalize_name(input: &str) -> Result<String, WorktreeError> {
     Ok(slug)
 }
 
-/// Best-effort slug from arbitrary text — a session title, not a typed name.
-/// Lowercases ASCII alphanumerics, turns every other run into `-`, trims and
+/// Best-effort slug from arbitrary text — a session title, not a typed name./// Lowercases ASCII alphanumerics, turns every other run into `-`, trims and
 /// caps at 40 characters. `None` when nothing usable remains (a Chinese-only
 /// title), so the caller can fall back to a deterministic token. Unlike
 /// [`normalize_name`] this never refuses: the value was not typed by the user,
@@ -335,6 +334,36 @@ pub fn derive_slug(input: &str) -> Option<String> {
     }
     let slug = slug.trim_matches('-').to_string();
     (!slug.is_empty()).then_some(slug)
+}
+
+/// Normalize a worktree branch name (ADR-0095): one or more `/`-separated
+/// components, each the same strict slug as a directory name. The **last**
+/// component is the checkout directory; the whole value is the branch. No
+/// `wt/` prefix is added — the caller writes the repository's own
+/// `<type>/<slug>` shape when it wants one.
+pub fn normalize_branch(input: &str) -> Result<(String, String), WorktreeError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(WorktreeError::new("分支名不能为空"));
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for part in trimmed.split('/') {
+        if part.trim().is_empty() {
+            return Err(WorktreeError::new(format!(
+                "分支名 `{trimmed}` 不能有空的路径段（例如 `feat/` 或 `feat//x`）"
+            )));
+        }
+        parts.push(normalize_name(part)?);
+    }
+    let branch = parts.join("/");
+    if branch.len() > 80 {
+        return Err(WorktreeError::new(format!(
+            "分支名太长（{} 个字符，最多 80）；请缩短后再试",
+            branch.len()
+        )));
+    }
+    let directory = parts.last().cloned().unwrap_or_default();
+    Ok((branch, directory))
 }
 
 /// The command-time precondition check (ADR-0095): a source that is not a
@@ -405,13 +434,16 @@ pub async fn resolve_base(dir: &str, configured: Option<&str>) -> Result<(String
 
 /// Create a worktree for `name` under `root` (a path relative to the primary
 /// checkout or absolute) from `base` (default `HEAD`) and return what was
-/// made (ADR-0088). An existing directory gets a `-2`… suffix, the branch
-/// following it; an existing branch no checkout holds is attached, while a
+/// made (ADR-0088, ADR-0095). An existing directory gets a `-2`… suffix; a
+/// supplied branch keeps its exact name while the directory may be suffixed.
+/// With no branch, the historical `wt/<name>` is used. An existing branch no
+/// checkout holds is attached (only at the requested base), while a
 /// checked-out one is refused with git's own reason.
 pub async fn create_worktree(
     dir: &str,
     root: &std::path::Path,
     name: &str,
+    branch: Option<&str>,
     base: Option<&str>,
 ) -> Result<CreatedWorktree, WorktreeError> {
     let slug = normalize_name(name)?;
@@ -440,7 +472,10 @@ pub async fn create_worktree(
         candidate = format!("{slug}-{suffix}");
         directory = root.join(&candidate);
     }
-    let branch = format!("wt/{candidate}");
+    let branch = match branch {
+        Some(branch) => normalize_branch(branch)?.0,
+        None => format!("wt/{candidate}"),
+    };
     let directory_text = directory.to_string_lossy().to_string();
 
     let branch_exists = git_capture(
@@ -475,7 +510,7 @@ pub async fn create_worktree(
             if tip.trim() != base {
                 let short = |sha: &str| sha.get(..7).unwrap_or(sha).to_string();
                 return Err(WorktreeError::new(format!(
-                    "分支 `{branch}` 已存在，起点是 `{}`，不是请求的 `{}`；请换一个 `--slug`，或先删除该分支",
+                    "分支 `{branch}` 已存在，起点是 `{}`，不是请求的 `{}`；请换一个 `--branch`，或先删除该分支",
                     short(tip.trim()),
                     short(base)
                 )));
@@ -805,6 +840,27 @@ mod tests {
         assert!(long.len() <= 40, "{long}");
     }
 
+    /// `--branch` is the branch name; the last path component is the
+    /// directory slug, and no `wt/` prefix is added (ADR-0095).
+    #[test]
+    fn normalize_branch_splits_the_directory_from_the_branch() {
+        assert_eq!(
+            normalize_branch("feat/fix-login").unwrap(),
+            ("feat/fix-login".to_string(), "fix-login".to_string())
+        );
+        assert_eq!(
+            normalize_branch("fix-login").unwrap(),
+            ("fix-login".to_string(), "fix-login".to_string())
+        );
+        assert_eq!(
+            normalize_branch("Fix/Login").unwrap(),
+            ("fix/login".to_string(), "login".to_string())
+        );
+        for bad in ["", "feat/", "/fix", "feat//fix", "用户指南"] {
+            assert!(normalize_branch(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
+
     /// The ladder resolves the integration line, and an explicit configured
     /// base wins; an unresolvable configured base is a refusal, never a
     /// silent fall-through (ADR-0095).
@@ -836,7 +892,7 @@ mod tests {
     async fn worktree_list_marks_main_and_carries_branches() {
         let dir = init_repo("git-wt-list");
         let s = dir.to_string_lossy().to_string();
-        let created = create_worktree(&s, Path::new(".worktrees"), "Feature One", None)
+        let created = create_worktree(&s, Path::new(".worktrees"), "Feature One", None, None)
             .await
             .unwrap();
         assert_eq!(created.branch, "wt/feature-one");
@@ -860,7 +916,7 @@ mod tests {
     async fn worktree_root_resolves_against_the_primary_checkout() {
         let dir = init_repo("git-wt-root");
         let s = dir.to_string_lossy().to_string();
-        let created = create_worktree(&s, Path::new(".worktrees"), "inside", None)
+        let created = create_worktree(&s, Path::new(".worktrees"), "inside", None, None)
             .await
             .unwrap();
 
@@ -884,7 +940,7 @@ mod tests {
         let s = dir.to_string_lossy().to_string();
         std::fs::create_dir_all(dir.join(".worktrees").join("taken")).unwrap();
 
-        let created = create_worktree(&s, Path::new(".worktrees"), "taken", None)
+        let created = create_worktree(&s, Path::new(".worktrees"), "taken", None, None)
             .await
             .unwrap();
         assert!(
@@ -905,7 +961,7 @@ mod tests {
         run(&dir, &["branch", "wt/reuse"]);
         let s = dir.to_string_lossy().to_string();
 
-        let created = create_worktree(&s, Path::new(".worktrees"), "reuse", None)
+        let created = create_worktree(&s, Path::new(".worktrees"), "reuse", None, None)
             .await
             .unwrap();
         assert_eq!(created.branch, "wt/reuse");
@@ -932,17 +988,40 @@ mod tests {
         run(&dir, &["branch", "wt/reuse-base", &first]);
         let s = dir.to_string_lossy().to_string();
 
-        let error = create_worktree(&s, Path::new(".worktrees"), "reuse-base", Some(&second))
+        let error = create_worktree(&s, Path::new(".worktrees"), "reuse-base", None, Some(&second))
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("起点"), "{error}");
         assert!(error.contains(&first[..7]), "{error}");
 
-        let created = create_worktree(&s, Path::new(".worktrees"), "reuse-base", Some(&first))
+        let created = create_worktree(&s, Path::new(".worktrees"), "reuse-base", None, Some(&first))
             .await
             .unwrap();
         assert_eq!(git_out(Path::new(&created.path), &["rev-parse", "HEAD"]), first);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit branch is used verbatim (no `wt/` prefix), while the
+    /// directory keeps the branch's last component. A directory collision
+    /// suffixes only the directory; the user's branch name is not rewritten
+    /// (ADR-0095).
+    #[tokio::test]
+    async fn worktree_create_uses_the_explicit_branch_and_suffixes_only_the_directory() {
+        let dir = init_repo("git-wt-branch");
+        std::fs::create_dir_all(dir.join(".worktrees/login")).unwrap();
+        let s = dir.to_string_lossy().to_string();
+
+        let created = create_worktree(&s, Path::new(".worktrees"), "login", Some("feat/login"), None)
+            .await
+            .unwrap();
+        assert_eq!(created.branch, "feat/login");
+        assert!(std::path::Path::new(&created.path).ends_with(".worktrees/login-2"));
+        assert_eq!(
+            git_out(Path::new(&created.path), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feat/login"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -956,7 +1035,7 @@ mod tests {
         run(&dir, &["worktree", "add", ".worktrees/other", "wt/held"]);
         let s = dir.to_string_lossy().to_string();
 
-        let error = create_worktree(&s, Path::new(".worktrees"), "held", None)
+        let error = create_worktree(&s, Path::new(".worktrees"), "held", None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -975,7 +1054,7 @@ mod tests {
         let error = list_worktrees(&s).await.unwrap_err().to_string();
         assert!(error.contains("不是 git 仓库"), "{error}");
         assert!(
-            create_worktree(&s, Path::new(".worktrees"), "x", None)
+            create_worktree(&s, Path::new(".worktrees"), "x", None, None)
                 .await
                 .is_err()
         );
@@ -993,7 +1072,7 @@ mod tests {
         run(&dir, &["commit", "-m", "ignore"]);
         let s = dir.to_string_lossy().to_string();
 
-        let created = create_worktree(&s, Path::new(".worktrees"), "quiet", None)
+        let created = create_worktree(&s, Path::new(".worktrees"), "quiet", None, None)
             .await
             .unwrap();
         assert!(created.root_ignored);
@@ -1030,7 +1109,7 @@ mod tests {
         assert_ne!(first, git_out(&dir, &["rev-parse", "HEAD"]));
 
         let s = dir.to_string_lossy().to_string();
-        let created = create_worktree(&s, Path::new(".worktrees"), "based", Some(&first))
+        let created = create_worktree(&s, Path::new(".worktrees"), "based", None, Some(&first))
             .await
             .unwrap();
         assert_eq!(git_out(Path::new(&created.path), &["rev-parse", "HEAD"]), first);
@@ -1079,7 +1158,7 @@ mod tests {
         run(&dir, &["init", "--bare", "-b", "main"]);
         let s = dir.to_string_lossy().to_string();
 
-        let error = create_worktree(&s, Path::new(".worktrees"), "x", None)
+        let error = create_worktree(&s, Path::new(".worktrees"), "x", None, None)
             .await
             .unwrap_err()
             .to_string();
@@ -1118,7 +1197,7 @@ mod tests {
         let elsewhere = temp_dir("git-wt-elsewhere");
         let s = dir.to_string_lossy().to_string();
 
-        let created = create_worktree(&s, &elsewhere, "out", None).await.unwrap();
+        let created = create_worktree(&s, &elsewhere, "out", None, None).await.unwrap();
         assert!(created.root_ignored);
         assert!(Path::new(&created.path).starts_with(&elsewhere));
 

@@ -75,17 +75,23 @@ pub struct PendingEntry {
 
 /// A Pending Session's intent to start in a fresh linked checkout (ADR-0095).
 /// The base is resolved to a SHA at command time — the cover's promise is what
-/// gets built. `slug` names both the directory and the branch; `path` is filled
-/// only after the checkout exists, so a failed session create retries against
-/// the same directory instead of a `-2` sibling.
+/// gets built. `branch` is the full branch the user named (no forced `wt/`
+/// prefix); `slug` is the directory's last component. `path` is filled only
+/// after the checkout exists, so a failed session create retries against the
+/// same directory instead of a `-2` sibling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeIntent {
     /// The ref that resolved (`origin/main`, `--base`, …).
     pub base: String,
     /// That ref's commit at command time.
     pub base_sha: String,
-    /// The ASCII slug both the checkout and its `wt/<slug>` branch use.
+    /// The directory name: the branch's last `/` component.
     pub slug: String,
+    /// The full branch name (`feat/fix-login`, `fix-login`, …). Empty only for
+    /// a pending written before this field existed; [`Self::branch_name`]
+    /// falls back to the historical `wt/<slug>`.
+    #[serde(default)]
+    pub branch: String,
     /// The planned checkout path (`<root>/<slug>`); a collision may append
     /// `-2` at creation, which the creation reply names.
     pub target: String,
@@ -95,9 +101,14 @@ pub struct WorktreeIntent {
 }
 
 impl WorktreeIntent {
-    /// The branch the checkout starts on.
-    pub fn branch(&self) -> String {
-        format!("wt/{}", self.slug)
+    /// The full branch, with the pre-ADR-0095 `wt/<slug>` fallback for a
+    /// pending persisted without the field.
+    pub fn branch_name(&self) -> String {
+        if self.branch.is_empty() {
+            format!("wt/{}", self.slug)
+        } else {
+            self.branch.clone()
+        }
     }
 
     /// The first seven characters of the resolved base SHA, for a cover line.
@@ -1001,12 +1012,14 @@ impl SessionStore {
         if worktree.path.is_some() {
             return Ok(false);
         }
-        // A collision suffixes both the directory and the branch; record the
-        // actual pair so a later status reports what exists, not the plan.
+        // Record the actual path, branch and directory name: a collision
+        // suffixes only the directory, so the user's branch stays exactly as
+        // named while the status reports the checkout that exists.
         worktree.path = Some(path.to_string());
         worktree.target = path.to_string();
-        if let Some(slug) = branch.strip_prefix("wt/") {
-            worktree.slug = slug.to_string();
+        worktree.branch = branch.to_string();
+        if let Some(name) = std::path::Path::new(path).file_name() {
+            worktree.slug = name.to_string_lossy().into_owned();
         }
         self.write_to_disk()?;
         Ok(true)
@@ -2195,6 +2208,7 @@ mod tests {
             base: "main".into(),
             base_sha: "abc1234".into(),
             slug: slug.into(),
+            branch: slug.into(),
             target: format!("/tmp/.worktrees/{slug}"),
             path: None,
         };
@@ -2213,7 +2227,7 @@ mod tests {
         );
         assert!(
             store
-                .record_worktree_path(&key, generation, &checkout_text, "wt/first")
+                .record_worktree_path(&key, generation, &checkout_text, "feat/first")
                 .unwrap()
         );
         assert_eq!(
@@ -2233,7 +2247,7 @@ mod tests {
         let replacement_epoch = store.pending_epoch_for(&key);
         assert!(
             !store
-                .record_worktree_path(&key, generation, &checkout_text, "wt/first")
+                .record_worktree_path(&key, generation, &checkout_text, "feat/first")
                 .unwrap(),
             "a stale materialisation must not stamp its checkout onto the replacement"
         );
