@@ -497,6 +497,31 @@ impl SessionStore {
         self.write_to_disk()
     }
 
+    /// Replace the pending only while its identity is still `expected_epoch`
+    /// (ADR-0095): a `/dir`, `/new` or `/topic` that landed while a command was
+    /// doing its Git work must win, not be overwritten by the earlier command.
+    pub(crate) fn set_pending_if_epoch(
+        &mut self,
+        mut pending: PendingEntry,
+        expected_epoch: u64,
+    ) -> crate::error::Result<Option<PendingEntry>> {
+        if self
+            .pending_epoch
+            .get(&pending.thread_key)
+            .copied()
+            .unwrap_or_default()
+            != expected_epoch
+        {
+            return Ok(None);
+        }
+        if let Some(replaced) = self.pending_for(&pending.thread_key) {
+            pending.topic_anchor = replaced.topic_anchor.clone();
+            pending.topic_root = replaced.topic_root.clone();
+        }
+        self.set_pending(pending.clone())?;
+        Ok(Some(pending))
+    }
+
     /// Drop the conversation's Pending Session and persist.
     #[allow(dead_code)] // ADR-0041 storage; the command tickets (#211-#214) clear pendings
     pub fn clear_pending(&mut self, key: &ThreadKey) -> crate::error::Result<()> {
@@ -2295,6 +2320,41 @@ mod tests {
             Some("adjusted")
         );
         assert!(pending.worktree.as_ref().unwrap().path.is_none());
+    }
+
+    /// A worktree declaration built across Git awaits must not overwrite a
+    /// `/dir` or `/new` that landed meanwhile (ADR-0095).
+    #[test]
+    fn a_stale_worktree_declaration_does_not_overwrite_a_newer_pending() {
+        let dir = tempdir().unwrap();
+        let mut store = SessionStore::new(dir.path().join("sessions.json")).unwrap();
+        let key = ThreadKey::new("chat1".into(), "root1".into());
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/first"))
+            .unwrap();
+        let epoch = store.pending_epoch_for(&key);
+        store
+            .set_pending(make_pending("chat1", "root1", "/tmp/second"))
+            .unwrap();
+
+        let mut pending = make_pending("chat1", "root1", "/tmp/first");
+        pending.worktree = Some(WorktreeIntent {
+            base: "main".into(),
+            base_sha: "abc1234".into(),
+            slug: "first".into(),
+            branch: "feat/first".into(),
+            target: "/tmp/.worktrees/first".into(),
+            path: None,
+        });
+        assert!(
+            store.set_pending_if_epoch(pending, epoch).unwrap().is_none(),
+            "the newer pending wins"
+        );
+        assert_eq!(
+            store.pending_for(&key).unwrap().directory,
+            "/tmp/second",
+            "the earlier worktree command did not overwrite it"
+        );
     }
 
     /// A pending written before the `branch` field existed keeps the

@@ -505,23 +505,33 @@ impl SessionsHandle {
         directory: impl Into<String>,
         title: Option<String>,
     ) -> crate::error::Result<PendingEntry> {
-        self.declare_pending_with(thread_key, directory, title, None)
-            .await
+        self.declare_pending_with(thread_key, directory, title).await
     }
 
-    /// [`Self::declare_pending`] with a worktree intent (ADR-0095): the
-    /// pending's directory is the SOURCE checkout; the checkout is created at
-    /// materialisation. Replacing a topic's pending keeps its
-    /// `topic_root`/`topic_anchor`, exactly like the plain form.
-    pub(crate) async fn declare_pending_worktree(
+    /// The conversation's pending identity (issue #910), read before a command
+    /// does Git work it will later need to confirm against.
+    pub(crate) async fn pending_epoch_for(&self, thread_key: &ThreadKey) -> u64 {
+        self.store.lock().await.pending_epoch_for(thread_key)
+    }
+
+    /// Declare a worktree pending only while the conversation's pending is
+    /// still the one the command read (ADR-0095). `None` means a `/dir`,
+    /// `/new` or `/topic` landed during the command's Git work; the caller
+    /// must not overwrite it.
+    pub(crate) async fn declare_pending_worktree_if_unchanged(
         &self,
         thread_key: &ThreadKey,
+        expected_epoch: u64,
         directory: impl Into<String>,
         title: Option<String>,
         worktree: crate::bridge::session::WorktreeIntent,
-    ) -> crate::error::Result<PendingEntry> {
-        self.declare_pending_with(thread_key, directory, title, Some(worktree))
+    ) -> crate::error::Result<Option<PendingEntry>> {
+        let mut pending = self.new_pending(thread_key, directory, title);
+        pending.worktree = Some(worktree);
+        self.store
+            .lock()
             .await
+            .set_pending_if_epoch(pending, expected_epoch)
     }
 
     /// The one pending-declaration body both public forms share.
@@ -530,10 +540,8 @@ impl SessionsHandle {
         thread_key: &ThreadKey,
         directory: impl Into<String>,
         title: Option<String>,
-        worktree: Option<crate::bridge::session::WorktreeIntent>,
     ) -> crate::error::Result<PendingEntry> {
         let mut pending = self.new_pending(thread_key, directory, title);
-        pending.worktree = worktree;
         {
             let store = self.store.lock().await;
             if let Some(replaced) = store.pending_for(thread_key) {
