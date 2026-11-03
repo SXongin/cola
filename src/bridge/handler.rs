@@ -2647,6 +2647,7 @@ impl App {
         {
             crate::bridge::session::PendingClaim::Claimed(pending, generation) => {
                 let directory = pending.directory.clone();
+                let worktree_target = pending.worktree.as_ref().map(|intent| intent.target.clone());
                 return match self.materialise_pending(*pending, generation, message_id).await {
                     Ok(id) => Ok((id, false)),
                     Err(e) => {
@@ -2656,14 +2657,15 @@ impl App {
                         self.sessions_handle()
                             .unclaim_pending_creation(thread_key, generation)
                             .await;
+                        let place = match worktree_target {
+                            Some(target) => format!("worktree `{target}`"),
+                            None => format!("目录 `{directory}`"),
+                        };
                         let _ = self
                             .feishu
                             .reply_text(
                                 message_id,
-                                &format!(
-                                    "⚠️ 创建会话失败（目录 `{}`）：{}\n下一条消息会再试一次。",
-                                    directory, e
-                                ),
+                                &format!("⚠️ 创建会话失败（{place}）：{}\n下一条消息会再试一次。", e),
                             )
                             .await;
                         Err(e)
@@ -2709,11 +2711,7 @@ impl App {
         // reuses the same checkout instead of making a `-2` sibling.
         if let Some(intent) = pending.worktree.clone() {
             let source = pending.directory.clone();
-            let path = match intent
-                .path
-                .clone()
-                .filter(|path| std::path::Path::new(path).is_dir())
-            {
+            let path = match intent.path.clone().filter(|_| intent.checkout_exists()) {
                 Some(path) => path,
                 None => {
                     let created = crate::git::create_worktree(
@@ -2726,13 +2724,41 @@ impl App {
                     .map_err(|error| {
                         crate::error::BridgeError::State(format!("创建 worktree 失败：{error}"))
                     })?;
-                    self.sessions_handle()
-                        .update_pending(&pending.thread_key, |pending| {
-                            if let Some(worktree) = pending.worktree.as_mut() {
-                                worktree.path = Some(created.path.clone());
-                            }
-                        })
-                        .await?;
+                    // Record the path only while this exact pending is still
+                    // the one we claimed (ADR-0095). A replacement bumps the
+                    // epoch; stamping our path onto it would make its first
+                    // message run in the wrong checkout.
+                    if !self
+                        .sessions_handle()
+                        .record_worktree_path(&pending.thread_key, generation, &created.path)
+                        .await?
+                    {
+                        tracing::warn!(
+                            "worktree {} was created for a pending that was replaced; leaving it in place",
+                            created.path
+                        );
+                        return Err(crate::error::BridgeError::State(
+                            "the thread moved on while its checkout was being created".to_string(),
+                        ));
+                    }
+                    if crate::git::plain_path(std::path::PathBuf::from(&created.path))
+                        != crate::git::plain_path(std::path::PathBuf::from(&intent.target))
+                    {
+                        // The planned directory was taken between the command
+                        // and creation; name the actual checkout (ADR-0095).
+                        // Best-effort: the checkout is already made, and a
+                        // failed notice must not fail materialisation.
+                        let _ = self
+                            .feishu
+                            .reply_text(
+                                message_id,
+                                &format!(
+                                    "🌲 目标目录已被占用，worktree 建在 `{}`（分支 `{}`）。",
+                                    created.path, created.branch
+                                ),
+                            )
+                            .await;
+                    }
                     created.path
                 }
             };

@@ -23,8 +23,20 @@ pub(crate) const WORKTREE_USAGE: &str = "\
 - 命令只记录意图，第一条消息才真正创建检出；放弃话题不会留下检出。
 - 待建期间用 `/worktree` 查看，`/worktree --slug <名字>` 或 `--base <ref>` 修改。已有检出用 `/dir <路径>` 进入，或 `/run git worktree list` 查看。";
 
+/// The two "there is no checkout intent here" answers, shared by `/worktree`
+/// and its adjuster so the routes cannot drift.
+fn no_pending_reply() -> &'static str {
+    "当前没有待建会话。\n- 新建带 worktree 的会话：`/topic --worktree`（新话题）或 `/new --worktree`（当前对话）。\n- 进入已有检出：`/dir <路径>`；查看已有检出：`/run git worktree list`。"
+}
+
+fn no_intent_reply(directory: &str) -> String {
+    format!(
+        "当前待建会话没有 worktree 意图（目录 `{directory}`）。\n- 要带 worktree：用 `/topic --worktree`（新话题）或 `/new --worktree`（当前对话）重新声明。\n- 只想换目录：用 `/dir <路径>`。"
+    )
+}
+
 /// `/worktree`: report the pending checkout intent. Outside a pending it
-/// answers the usage line — the inventory card is retired, and discovery is
+/// answers the routes — the inventory card is retired, and discovery is
 /// `/run git worktree list` (ADR-0095).
 pub(crate) async fn status(
     handles: &CommandHandles,
@@ -37,13 +49,10 @@ pub(crate) async fn status(
     };
     let reply = match pending {
         Some(pending) => match &pending.worktree {
-            Some(intent) => status_text(&pending, intent),
-            None => format!(
-                "当前待建会话没有 worktree 意图（目录 `{}`）。\n- 要带 worktree：用 `/topic --worktree`（新话题）或 `/new --worktree`（当前对话）重新声明。\n- 只想换目录：用 `/dir <路径>`。",
-                pending.directory
-            ),
+            Some(intent) => status_text(pending.title.as_deref(), &pending.directory, intent),
+            None => no_intent_reply(&pending.directory),
         },
-        None => "当前没有待建会话。\n- 新建带 worktree 的会话：`/topic --worktree`（新话题）或 `/new --worktree`（当前对话）。\n- 进入已有检出：`/dir <路径>`；查看已有检出：`/run git worktree list`。".to_string(),
+        None => no_pending_reply().to_string(),
     };
     handles.flow.platform.reply_text(message_id, &reply).await?;
     Ok(())
@@ -52,26 +61,29 @@ pub(crate) async fn status(
 /// The status is the cover's facts in text form: target, branch, resolved
 /// base, source, and the one-line route to change it.
 fn status_text(
-    pending: &crate::bridge::session::PendingEntry,
+    title: Option<&str>,
+    directory: &str,
     intent: &crate::bridge::session::WorktreeIntent,
 ) -> String {
-    let title = pending
-        .title
-        .as_deref()
+    let title = title
         .map(|title| format!("\n标题：`{title}`"))
         .unwrap_or_default();
-    let created = intent
-        .path
-        .as_deref()
-        .map(|path| format!("\n检出已创建：`{path}`（改 slug/base 不再影响它）"))
-        .unwrap_or_default();
+    let created = match intent.path.as_deref() {
+        Some(path) if intent.checkout_exists() => {
+            format!("\n检出已创建：`{path}`（改 slug/base 不再影响它）")
+        }
+        Some(path) => format!(
+            "\n原检出已不存在：`{path}`；下一条消息会重建。若 `git worktree list` 仍登记旧路径或同名分支，重建会被拒绝——先 `/worktree --slug <新名字>` 换名即可"
+        ),
+        None => String::new(),
+    };
     format!(
         "🌲 待建 worktree{title}\n目标：`{}`（若被占用会加后缀）\n分支：`{}` · 起点：`{} @ {}`\n源目录：`{}`{created}\n第一条消息在该目录创建会话。用 `/worktree --slug <名字>` 或 `--base <ref>` 修改。",
         intent.target,
         intent.branch(),
         intent.base,
         intent.short_sha(),
-        pending.directory
+        directory
     )
 }
 
@@ -86,18 +98,18 @@ pub(crate) async fn adjust(
     slug: Option<String>,
     base: Option<String>,
 ) -> crate::error::Result<()> {
-    let pending = {
+    let (pending, epoch) = {
         let store = handles.flow.sessions.store.lock().await;
-        store.pending_for(thread_key).cloned()
+        (
+            store.pending_for(thread_key).cloned(),
+            store.pending_epoch_for(thread_key),
+        )
     };
     let Some(pending) = pending else {
         handles
             .flow
             .platform
-            .reply_text(
-                message_id,
-                "当前没有待建会话。\n- 新建带 worktree 的会话：`/topic --worktree`（新话题）或 `/new --worktree`（当前对话）。\n- 进入已有检出：`/dir <路径>`；查看已有检出：`/run git worktree list`。",
-            )
+            .reply_text(message_id, no_pending_reply())
             .await?;
         return Ok(());
     };
@@ -105,29 +117,10 @@ pub(crate) async fn adjust(
         handles
             .flow
             .platform
-            .reply_text(
-                message_id,
-                &format!(
-                    "当前待建会话没有 worktree 意图（目录 `{}`）。\n- 要带 worktree：用 `/topic --worktree`（新话题）或 `/new --worktree`（当前对话）重新声明。\n- 只想换目录：用 `/dir <路径>`。",
-                    pending.directory
-                ),
-            )
+            .reply_text(message_id, &no_intent_reply(&pending.directory))
             .await?;
         return Ok(());
     };
-    if let Some(path) = intent.path.as_deref() {
-        handles
-            .flow
-            .platform
-            .reply_text(
-                message_id,
-                &format!(
-                    "⚠️ 检出已创建：`{path}`；现在改 slug/base 不会移动它。第一条消息会在这个目录创建会话。"
-                ),
-            )
-            .await?;
-        return Ok(());
-    }
     let slug = match slug {
         Some(slug) => match crate::git::normalize_name(&slug) {
             Ok(slug) => slug,
@@ -167,9 +160,7 @@ pub(crate) async fn adjust(
             return Ok(());
         }
     };
-    let target = crate::git::plain_path(root.join(&slug))
-        .to_string_lossy()
-        .to_string();
+    let target = target_for(&root, &slug);
     let updated = crate::bridge::session::WorktreeIntent {
         base,
         base_sha,
@@ -177,31 +168,29 @@ pub(crate) async fn adjust(
         target,
         path: None,
     };
-    if !handles
+    let reply = match handles
         .flow
         .sessions
-        .update_pending(thread_key, |pending| {
-            if let Some(worktree) = pending.worktree.as_mut() {
-                *worktree = updated.clone();
-            }
-        })
+        .adjust_pending_worktree(thread_key, epoch, updated.clone())
         .await?
     {
-        handles
-            .flow
-            .platform
-            .reply_text(message_id, "当前没有待建会话。")
-            .await?;
-        return Ok(());
-    }
-    crate::bridge::topic::refresh_pending_cover(&handles.topic_handles(), thread_key).await;
-    let mut pending = pending;
-    pending.worktree = Some(updated.clone());
-    handles
-        .flow
-        .platform
-        .reply_text(message_id, &status_text(&pending, &updated))
-        .await?;
+        crate::bridge::session::WorktreeAdjust::Applied => {
+            crate::bridge::topic::refresh_pending_cover(&handles.topic_handles(), thread_key).await;
+            status_text(pending.title.as_deref(), &pending.directory, &updated)
+        }
+        crate::bridge::session::WorktreeAdjust::Creating => {
+            "⏳ 这个会话正在创建中，等它完成后再改 worktree。".to_string()
+        }
+        crate::bridge::session::WorktreeAdjust::Created(path) => format!(
+            "⚠️ 检出已创建：`{path}`；现在改 slug/base 不会移动它。第一条消息会在这个目录创建会话。"
+        ),
+        crate::bridge::session::WorktreeAdjust::Replaced => {
+            "⚠️ 待建会话已被替换（`/new`、`/dir` 或 `/topic`），这次修改没有生效；请重新执行 `/worktree --slug` 或 `--base`。".to_string()
+        }
+        crate::bridge::session::WorktreeAdjust::NoPending => no_pending_reply().to_string(),
+        crate::bridge::session::WorktreeAdjust::NoIntent => no_intent_reply(&pending.directory),
+    };
+    handles.flow.platform.reply_text(message_id, &reply).await?;
     Ok(())
 }
 
@@ -223,7 +212,7 @@ pub(crate) async fn intent(
     slug: Option<&str>,
     base: Option<&str>,
     configured_base: Option<&str>,
-) -> Result<crate::bridge::session::WorktreeIntent, crate::git::WorktreeError> {
+) -> Result<(crate::bridge::session::WorktreeIntent, std::path::PathBuf), crate::git::WorktreeError> {
     crate::git::ensure_creatable(source).await?;
     let (base, base_sha) = crate::git::resolve_base(source, base.or(configured_base)).await?;
     let slug = match slug {
@@ -233,22 +222,68 @@ pub(crate) async fn intent(
             .unwrap_or_else(|| default_slug(chrono::Utc::now())),
     };
     let root = crate::git::worktree_root(source, root).await?;
-    // Check the root is creatable now, so a missing permission is a command
-    // refusal rather than a first-message surprise. The root is a directory,
-    // not a checkout; lazy creation still owns the checkout itself.
-    std::fs::create_dir_all(&root).map_err(|error| {
-        crate::git::WorktreeError::new(format!("无法创建目录 `{}`：{error}", root.display()))
-    })?;
-    let target = crate::git::plain_path(root.join(&slug))
+    // Refuse an uncreatable root at command time WITHOUT creating it: an
+    // abandoned pending must leave nothing behind. Walk to the nearest
+    // existing ancestor; materialisation does the actual `create_dir_all`.
+    check_root_creatable(&root)?;
+    let target = target_for(&root, &slug);
+    Ok((
+        crate::bridge::session::WorktreeIntent {
+            base,
+            base_sha,
+            slug,
+            target,
+            path: None,
+        },
+        root,
+    ))
+}
+
+/// The planned checkout path. Both the declaration and the adjuster use this
+/// one expression, so their target cannot drift.
+fn target_for(root: &std::path::Path, slug: &str) -> String {
+    crate::git::plain_path(root.join(slug))
         .to_string_lossy()
-        .to_string();
-    Ok(crate::bridge::session::WorktreeIntent {
-        base,
-        base_sha,
-        slug,
-        target,
-        path: None,
-    })
+        .to_string()
+}
+
+/// Whether the root can plausibly be created, without creating it: walk up to
+/// the nearest existing ancestor and require a directory. A permission failure
+/// surfaces at materialisation (where the pending is kept); this check catches
+/// the clear "a parent is a file" case at command time (ADR-0095).
+fn check_root_creatable(root: &std::path::Path) -> Result<(), crate::git::WorktreeError> {
+    let mut probe = root;
+    loop {
+        match std::fs::metadata(probe) {
+            Ok(meta) if meta.is_dir() => return Ok(()),
+            Ok(_) => {
+                return Err(crate::git::WorktreeError::new(format!(
+                    "`{}` 已存在但不是目录",
+                    probe.display()
+                )));
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.kind() == std::io::ErrorKind::NotADirectory =>
+            {
+                match probe.parent() {
+                    Some(parent) if parent != probe => probe = parent,
+                    _ => {
+                        return Err(crate::git::WorktreeError::new(format!(
+                            "找不到可用的父目录：`{}`",
+                            root.display()
+                        )));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(crate::git::WorktreeError::new(format!(
+                    "无法检查目录 `{}`：{error}",
+                    probe.display()
+                )));
+            }
+        }
+    }
 }
 
 /// The `/new --worktree` reply: what was recorded and what the first message

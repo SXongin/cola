@@ -57,12 +57,17 @@ setting, cola creates and never removes — stand.
    that SHA, so the cover's promise is what gets built; a stale ref is visible
    as a stale SHA (cola never fetches). `--base HEAD` is the explicit "branch
    off the branch I am looking at" (stacked work). A configured ref that does
-   not resolve is a refusal, never a silent fall-through.
+   not resolve is a refusal, never a silent fall-through. An existing
+   `wt/<slug>` branch is attached only when its tip is that SHA; a branch that
+   starts elsewhere is refused (reusing the name must not build a different
+   commit than the cover named).
 4. **Preconditions fail at command time, before a pending is written.** The
    source must be a non-bare git work tree, the base must resolve, and the root
-   must be creatable; otherwise reply `⚠️ … --worktree 失败：<reason>`. A source
-   that is itself a linked worktree is allowed: `worktree_root` resolves to the
-   primary checkout, so the new checkout is a sibling, never nested.
+   must be creatable; otherwise reply `不能在当前目录创建 worktree：<reason>`. A
+   source that is itself a linked worktree is allowed: `worktree_root` resolves
+   to the primary checkout, so the new checkout is a sibling, never nested.
+   `--base` without `--worktree` and `/topic --adopt --worktree` are usage
+   errors.
 5. **Adjustment is pending-only.** Bare `/worktree` reports the intent (target,
    branch, `base @ sha`, source); `/worktree --slug <slug>` and
    `/worktree --base <ref>` update it and re-render a pending topic's cover.
@@ -73,7 +78,11 @@ setting, cola creates and never removes — stand.
    pending, do not treat the first message as delivered, and reply that
    resending retries. The created checkout's path is recorded on the intent
    **before** the session is created, so a retry after a session-create failure
-   reuses that checkout instead of making a `-2` sibling.
+   reuses that checkout instead of making a `-2` sibling. The record is scoped
+   to the claim's generation and the pending's epoch: a pending replaced while
+   the checkout was being made cannot inherit its path, and `/worktree --slug`
+   is refused while a materialisation owns the pending — both would otherwise
+   route a later message into the wrong checkout.
 7. **Retire `/worktree new` and the read-only card.** Discovery is
    `/run git worktree list`; entering an existing checkout is `/dir <path>`
    (adopting a session there stays `/switch`). Keep `[worktree] root`; keep
@@ -86,10 +95,12 @@ setting, cola creates and never removes — stand.
    directory `<root>/<slug>`, branch `wt/<slug>`. Omitted, it is derived from
    the title with a lenient ASCII slugifier, and a title with no usable ASCII
    falls back to a deterministic `YYYYMMDD-1` token — never a refusal for a
-   value the user did not type. The cover shows both before the first message,
-   which is the naming veto window. `--base` without `--worktree` is a usage
-   error; `/topic --adopt --worktree` is rejected; `--name` takes words up to
-   the next flag, `--slug` and `--base` take one word.
+   value the user did not type. The strict slug also refuses a `.lock` suffix,
+   which git would reject only later inside `git worktree add`. The cover shows
+   both before the first message, which is the naming veto window. `--base`
+   without `--worktree` is a usage error; `/topic --adopt --worktree` is
+   rejected; `--name` takes words up to the next flag, `--slug` and `--base`
+   take one word.
 9. **Alignment is a creation-time property.** The branch and directory share the
    slug when created. At delivery the branch becomes `<type>/<slug>` (ADR-0088)
    and the directory stays; the slug is the correspondence, not an invariant.
@@ -134,10 +145,19 @@ setting, cola creates and never removes — stand.
   binary ignores the unknown field, and an abandoned intent creates nothing.
 - The pending's directory is the **source**, not the target; every
   pending-window reader keeps working without a new rule. Materialisation
-  rewrites it to the created checkout before the session is created.
+  points the session entry at the created checkout before the session is
+  created; the stored pending keeps its source until activation clears it.
+  The command-time root check walks to the nearest existing ancestor and does
+  not create the root, so an abandoned pending leaves nothing on disk.
 - The cover names the target/branch/base before the first message; a colliding
-  directory at creation may still get a `-2` suffix, and the creation reply
-  names the actual path. The cover's path is a prediction, not a reservation.
+  directory at creation may still get a `-2` suffix, and materialisation
+  replies with the actual path when that happens. The cover's path is a
+  prediction, not a reservation. A recorded checkout that disappears before
+  the retry is reported as missing; the next message recreates it, and a new
+  slug/base is allowed again.
+- An older binary ignores the unknown `worktree` field and would materialise in
+  the source directory. The feature has never shipped (decision 10), so that
+  downgrade is not supported; this is a forward-compatible format only.
 - The `[worktree] base` setting can disagree with the source checkout's branch;
   that is the point, and the reason is documented on the setting.
 - The feature's surface shrinks to a flag on two commands plus one pending
