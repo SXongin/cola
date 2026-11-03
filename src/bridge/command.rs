@@ -1173,6 +1173,11 @@ pub(crate) async fn handle_command(
             // ADR-0095: the same new-conversation decision as `/new`, plus a
             // checkout intent. Only the intent is written here; the first
             // message creates the checkout and the Session in it.
+            //
+            // Capture the pending identity BEFORE the Git work: a `/dir`,
+            // `/new` or `/topic` that lands while we resolve the intent must
+            // win, not be overwritten by this earlier command.
+            let expected_epoch = handles.flow.sessions.pending_epoch_for(&thread_key).await;
             let source = handles.current_project_directory(&thread_key).await;
             let (intent, root) = match crate::bridge::worktree::intent(
                 &source,
@@ -1196,13 +1201,33 @@ pub(crate) async fn handle_command(
             };
             let root_ignored = crate::git::root_is_ignored(&source, &root).await;
             // Declare against the source the intent was resolved from — never
-            // re-read the current project here: `/dir` or `/new` may have
-            // replaced the pending while Git ran (ADR-0095).
-            let pending = handles
+            // re-read the current project here — and only if no newer pending
+            // replaced it while Git ran.
+            let pending = match handles
                 .flow
                 .sessions
-                .declare_pending_worktree(&thread_key, source.clone(), name.clone(), intent.clone())
-                .await?;
+                .declare_pending_worktree_if_unchanged(
+                    &thread_key,
+                    expected_epoch,
+                    source.clone(),
+                    name.clone(),
+                    intent.clone(),
+                )
+                .await?
+            {
+                Some(pending) => pending,
+                None => {
+                    handles
+                        .flow
+                        .platform
+                        .reply_text(
+                            message_id,
+                            "⚠️ 这个对话的待建会话在这条命令执行期间已经变了（可能刚发了 `/dir`、`/new` 或另一个 `/topic`），这次 worktree 意图没有覆盖它；请重试。",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            };
             let reply = crate::bridge::worktree::declared_reply(
                 pending.title.as_deref(),
                 &source,
