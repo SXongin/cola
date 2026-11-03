@@ -1469,6 +1469,27 @@ impl ServerLifecycle for CodexLifecycle {
             },
         }
     }
+
+    /// Give the daemon back every thread the attached connection holds (issue
+    /// #918). An unattached lifecycle holds nothing — this is the same
+    /// "nothing to report" default as the other optional lifecycle methods,
+    /// not a failed release.
+    ///
+    /// The attachment is read without waiting: an `ensure_attached` pass holds
+    /// that lock across its liveness probe, and an exit must not queue behind
+    /// it. When the lock is busy, the lightweight snapshot (the same client,
+    /// kept for reads that must not wait on the attachment) is the target; if a
+    /// replacement is in flight it names the outgoing connection, whose release
+    /// attempts only log.
+    async fn detach(&self, budget: std::time::Duration) {
+        let client = match self.attached.try_lock() {
+            Ok(attached) => attached.as_ref().map(|attachment| attachment.client.clone()),
+            Err(_) => self.provider_fact_client_snapshot(),
+        };
+        if let Some(client) = client {
+            client.release_all(budget).await;
+        }
+    }
 }
 
 // The lifecycle's tests drive a real unix socket through the proxy child (the

@@ -1909,8 +1909,21 @@ pub(crate) async fn handle_command(
             // code and let `Restart=on-failure` bring the unit back up from the
             // same ExecStart (ADR-0015, ADR-0021 — same as `/update`).
             if let Some(code) = crate::update::supervisor_restart_code() {
+                // Hand back what this process holds before the unit brings the
+                // replacement up (issue #918). Best effort and bounded: the
+                // reply is already sent, and a wedged runtime must not hold the
+                // restart.
+                handles.flow.detach_for_exit().await;
                 std::process::exit(code);
             }
+            // The replacement spawns inside `restart_process`, so hand the
+            // runtime back FIRST: a new connection that re-adopts a held thread
+            // before this one lets go would keep it loaded, and the handback
+            // would not start the grace window. A failed spawn leaves this
+            // process running with its subscriptions released; the next read
+            // re-adopts (a released thread is explicitly incomplete, never a
+            // lost session).
+            handles.flow.detach_for_exit().await;
             match restart_process() {
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
@@ -1989,6 +2002,9 @@ pub(crate) async fn handle_command(
                 notify.kind = RestartKind::Update;
                 notify.version = Some(new_version.to_string());
                 write_restart_notify(&handles.flow.layout, &notify);
+                // Same exit contract as `/restart` (issue #918): the new
+                // process relearns its own attachments.
+                handles.flow.detach_for_exit().await;
                 crate::update::restart();
             }
         }

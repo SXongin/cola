@@ -2779,6 +2779,20 @@ impl FlowHandles {
         }
     }
 
+    /// Give the runtime back what this process holds before an explicit exit
+    /// (issue #918): a restart or a self-update is about to re-exec, and the
+    /// next process will open its own connection.
+    ///
+    /// Best effort and **bounded**: the caller is already leaving, so a wedged
+    /// runtime must never delay the exit. The backend's own pass takes the
+    /// budget; the backstop in [`crate::backend::lifecycle::detach_within`] is
+    /// the guarantee if an implementation ignores it. A client with nothing to
+    /// give back (OpenCode) is a no-op.
+    pub(crate) async fn detach_for_exit(&self) {
+        crate::backend::lifecycle::detach_within(&*self.backend, crate::backend::lifecycle::DETACH_BUDGET)
+            .await;
+    }
+
     /// Promote `entry` as its thread's Active Session, collecting the displaced
     /// Session's waiting card first (ADR-0059, spec #405): the displaced
     /// Session can no longer be continued by a message in this thread, so a
