@@ -32,7 +32,25 @@ pub(crate) async fn create(
 ) -> crate::error::Result<()> {
     let source = handles.current_project_directory(thread_key).await;
     let root = handles.config.worktree_root().to_path_buf();
-    let created = match crate::git::create_worktree(&source, &root, &name, base.as_deref()).await {
+    // ADR-0095: the base is the integration line, never the source's HEAD.
+    // Resolve it to a SHA now, so the reply names what will actually be built.
+    let base = match crate::git::resolve_base(
+        &source,
+        base.as_deref().or_else(|| handles.config.worktree_base()),
+    )
+    .await
+    {
+        Ok(base) => base,
+        Err(error) => {
+            handles
+                .flow
+                .platform
+                .reply_text(message_id, &format!("⚠️ /worktree new 失败：{error}"))
+                .await?;
+            return Ok(());
+        }
+    };
+    let created = match crate::git::create_worktree(&source, &root, &name, Some(&base.1)).await {
         Ok(created) => created,
         Err(error) => {
             handles
@@ -56,7 +74,7 @@ pub(crate) async fn create(
         .declare_pending(thread_key, created.path.clone(), title)
         .await?;
 
-    let start = base.as_deref().unwrap_or("HEAD");
+    let start = format!("{} @ {}", base.0, &base.1[..7.min(base.1.len())]);
     let mut reply = format!(
         "✅ 已创建 worktree `{}`\n分支：`{}`（起点 `{}`）\n下一条消息将在该目录创建会话「{}」。",
         created.path,

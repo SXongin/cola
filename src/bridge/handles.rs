@@ -2476,9 +2476,12 @@ pub(crate) struct TurnConfig {
     /// (`[review] base`, spec #803). `None` leaves the producer's
     /// `origin/main` → `main` resolution.
     review_base: Option<String>,
-    /// The parent directory for `/worktree new` (`[worktree] root`,
+    /// The parent directory for new worktrees (`[worktree] root`,
     /// ADR-0088), relative to the primary checkout unless absolute.
     worktree_root: std::path::PathBuf,
+    /// The configured integration ref new worktrees start from
+    /// (`[worktree] base`, ADR-0095); `None` runs the ladder.
+    worktree_base: Option<String>,
 }
 
 impl TurnConfig {
@@ -2494,6 +2497,7 @@ impl TurnConfig {
         work_dir: Option<String>,
         review_base: Option<String>,
         worktree_root: std::path::PathBuf,
+        worktree_base: Option<String>,
     ) -> Self {
         Self {
             group_completion_notice,
@@ -2506,6 +2510,7 @@ impl TurnConfig {
             work_dir,
             review_base,
             worktree_root,
+            worktree_base,
         }
     }
 
@@ -2514,9 +2519,14 @@ impl TurnConfig {
         self.review_base.as_deref()
     }
 
-    /// The configured parent directory for `/worktree new` (`[worktree] root`).
+    /// The configured parent directory for new worktrees (`[worktree] root`).
     pub(crate) fn worktree_root(&self) -> &std::path::Path {
         &self.worktree_root
+    }
+
+    /// The configured integration ref for new worktrees (`[worktree] base`).
+    pub(crate) fn worktree_base(&self) -> Option<&str> {
+        self.worktree_base.as_deref()
     }
 
     /// The directory a brand-new session starts in: `[bridge] work_dir` when

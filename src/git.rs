@@ -327,7 +327,61 @@ pub fn normalize_name(input: &str) -> Result<String, WorktreeError> {
             slug.len()
         )));
     }
+    // `refs/heads/wt/a.lock` is not a valid ref: git rejects any component
+    // ending in `.lock`. Check it here so the user hears it at command time,
+    // not from `git worktree add` (ADR-0095).
+    if slug.to_ascii_lowercase().ends_with(".lock") {
+        return Err(WorktreeError::new(format!(
+            "名字 `{trimmed}` 不能以 `.lock` 结尾（git 分支名不允许）"
+        )));
+    }
     Ok(slug)
+}
+
+/// Resolve the integration ref a new worktree starts from (ADR-0088,
+/// ADR-0095): the configured `[worktree] base`, else `origin/HEAD` →
+/// `origin/main` → `origin/master` → `main` → `master`. Returns the ref that
+/// resolved and its commit SHA. A configured ref that does not resolve is an
+/// error naming it — a typo must never silently fall through to another
+/// branch. The caller stores the SHA, so a ref that moves later cannot change
+/// what the pending cover promised.
+pub async fn resolve_base(dir: &str, configured: Option<&str>) -> Result<(String, String), WorktreeError> {
+    let configured = configured.map(str::trim).filter(|base| !base.is_empty());
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(base) = configured {
+        candidates.push(base.to_string());
+    } else {
+        // `origin/HEAD` is a symbolic ref; its short target is more
+        // informative on the cover, and the alias itself covers an origin
+        // whose HEAD is set but whose target does not resolve as a branch.
+        if let Ok(target) = git_capture(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).await
+            && !target.trim().is_empty()
+        {
+            candidates.push(target.trim().to_string());
+        }
+        for candidate in ["origin/HEAD", "origin/main", "origin/master", "main", "master"] {
+            if !candidates.iter().any(|known| known == candidate) {
+                candidates.push(candidate.to_string());
+            }
+        }
+    }
+    for candidate in &candidates {
+        let spec = format!("{candidate}^{{commit}}");
+        if let Ok(sha) = git_capture(dir, &["rev-parse", "--verify", "--quiet", &spec]).await {
+            let sha = sha.trim().to_string();
+            if !sha.is_empty() {
+                return Ok((candidate.clone(), sha));
+            }
+        }
+    }
+    if let Some(base) = configured {
+        return Err(WorktreeError::new(format!(
+            "找不到 base `{base}`；请用 `--base <ref>` 指定一个存在的提交"
+        )));
+    }
+    Err(WorktreeError::new(
+        "找不到集成分支（origin/HEAD、origin/main、origin/master、main、master 都不存在）；请用 `--base <ref>` 指定起点",
+    ))
 }
 
 /// Create a worktree for `name` under `root` (a path relative to the primary
@@ -699,6 +753,33 @@ mod tests {
         let long = "a".repeat(41);
         assert!(normalize_name(&long).unwrap_err().to_string().contains("太长"));
         assert!(normalize_name("   ").is_err(), "an empty name is refused");
+        let lock = normalize_name("a.lock").unwrap_err().to_string();
+        assert!(lock.contains("`.lock`"), "{lock}");
+    }
+
+    /// The ladder resolves the integration line, and an explicit configured
+    /// base wins; an unresolvable configured base is a refusal, never a
+    /// silent fall-through (ADR-0095).
+    #[tokio::test]
+    async fn resolve_base_ladder_and_configured_refusal() {
+        let dir = init_repo("git-wt-base-ladder");
+        let s = dir.to_string_lossy().to_string();
+        let head = git_out(&dir, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            resolve_base(&s, None).await.unwrap(),
+            ("main".to_string(), head.clone())
+        );
+        assert_eq!(
+            resolve_base(&s, Some("HEAD")).await.unwrap(),
+            ("HEAD".to_string(), head)
+        );
+        let error = resolve_base(&s, Some("no-such-ref"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no-such-ref"), "{error}");
+        assert!(error.contains("--base"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `worktree list` parses the main checkout first, then each linked one
