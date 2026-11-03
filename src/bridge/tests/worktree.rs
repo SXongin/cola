@@ -571,10 +571,118 @@ async fn worktree_outside_a_pending_is_usage() {
     assert!(texts.contains("/new --worktree"), "{texts}");
     assert!(texts.contains("/dir <路径>"), "{texts}");
 
+    send_command(&app, "/worktree --branch feat/x", "msg_wt_adjust_none").await;
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.matches("当前没有待建会话").count() >= 2,
+        "both the status and the adjuster name the routes: {texts}"
+    );
+
     send_command(&app, "/worktree new fix", "msg_wt_old_new").await;
     send_command(&app, "/worktree list", "msg_wt_old_list").await;
     let texts = platform.texts().await.join("\n");
     assert!(texts.matches("用法：").count() >= 2, "{texts}");
+}
+
+/// A pending declared by `/dir` has no checkout intent; both the status and
+/// the adjuster say so instead of inventing one.
+#[tokio::test]
+async fn worktree_pending_without_an_intent_names_the_routes() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command(
+        &app,
+        &format!("/dir {}", repo.path().display()),
+        "msg_wt_dir_pending",
+    )
+    .await;
+    send_command(&app, "/worktree", "msg_wt_dir_status").await;
+    send_command(&app, "/worktree --branch feat/x", "msg_wt_dir_adjust").await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(
+        texts.matches("没有 worktree 意图").count() >= 2,
+        "the status and the adjuster both refuse an intent-less pending: {texts}"
+    );
+}
+
+/// Bad branch/base input refuses without changing the pending.
+#[tokio::test]
+async fn worktree_adjust_refuses_a_bad_branch_and_base() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command(&app, "/new --worktree --name Fix", "msg_wt_bad").await;
+    send_command(&app, "/worktree --branch 用户指南", "msg_wt_bad_branch").await;
+    send_command(&app, "/worktree --base no-such-ref", "msg_wt_bad_base").await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("只能包含英文"), "{texts}");
+    assert!(texts.contains("找不到 base"), "{texts}");
+    let intent = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .and_then(|pending| pending.worktree.clone())
+        .expect("the pending survives a refused adjustment");
+    assert_eq!(intent.branch, "fix");
+    assert_eq!(intent.base, "main");
+}
+
+/// A root the process cannot write refuses at command time, and the probe
+/// leaves nothing behind. `/proc` is a read-only mount on Linux for every
+/// user, so this exercises the probe failure without a permission dance.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_unwritable_root_refuses_without_creating_it() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from("/proc/.cola-worktrees");
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command(&app, "/new --worktree --name ro", "msg_wt_ro").await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("无法在"), "{texts}");
+    assert!(app.sessions.lock().await.pending_for(&key()).is_none());
+}
+
+/// An ignored root omits the dirty-main-checkout warning.
+#[tokio::test]
+async fn an_ignored_root_skips_the_dirty_warning() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    std::fs::write(repo.path().join(".gitignore"), ".worktrees/\n").unwrap();
+    git(repo.path(), &["add", ".gitignore"]);
+    git(repo.path(), &["commit", "-m", "ignore worktrees"]);
+    std::fs::create_dir_all(repo.path().join(".worktrees")).unwrap();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from(".worktrees");
+    let (app, platform) = build_app(cfg, MockBackend::new(realistic_parts())).await;
+
+    send_command(&app, "/new --worktree --name quiet", "msg_wt_quiet").await;
+
+    let texts = platform.texts().await.join("\n");
+    assert!(texts.contains("已记下 worktree 意图"), "{texts}");
+    assert!(
+        !texts.contains("未被 `.gitignore` 忽略"),
+        "an ignored root stays quiet: {texts}"
+    );
 }
 
 /// The base SHA is frozen at command time: a commit on the ref afterwards

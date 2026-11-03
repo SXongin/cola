@@ -369,19 +369,22 @@ pub fn normalize_branch(input: &str) -> Result<(String, String), WorktreeError> 
 /// The command-time precondition check (ADR-0095): a source that is not a
 /// non-bare git work tree is refused before any pending is written.
 pub async fn ensure_creatable(dir: &str) -> Result<(), WorktreeError> {
-    let inside = git_capture(dir, &["rev-parse", "--is-inside-work-tree"])
-        .await
-        .map(|out| out.trim() == "true")
-        .unwrap_or(false);
-    if !inside {
-        return Err(WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")));
-    }
+    // Check bare first, so a bare repository gets its own reason instead of
+    // the generic "not a work tree" (a bare repo reports false for
+    // `--is-inside-work-tree`).
     let bare = git_capture(dir, &["rev-parse", "--is-bare-repository"])
         .await
         .map(|out| out.trim() == "true")
         .unwrap_or(false);
     if bare {
         return Err(WorktreeError::new("这是 bare 仓库，不能创建 worktree"));
+    }
+    let inside = git_capture(dir, &["rev-parse", "--is-inside-work-tree"])
+        .await
+        .map(|out| out.trim() == "true")
+        .unwrap_or(false);
+    if !inside {
+        return Err(WorktreeError::new(format!("目录 `{dir}` 不是 git 仓库")));
     }
     Ok(())
 }
@@ -859,6 +862,35 @@ mod tests {
         for bad in ["", "feat/", "/fix", "feat//fix", "用户指南"] {
             assert!(normalize_branch(bad).is_err(), "{bad:?} should be refused");
         }
+        let long = format!("{}/{}", "a".repeat(40), "b".repeat(40));
+        assert!(
+            normalize_branch(&long).is_err(),
+            "the full branch is capped at 80 characters"
+        );
+    }
+
+    /// A bare repository is refused by the command-time precondition check
+    /// with its own reason (not the generic "not a work tree").
+    #[tokio::test]
+    async fn ensure_creatable_refuses_a_bare_repository() {
+        let dir = temp_dir("git-wt-bare-check");
+        run(&dir, &["init", "--bare"]);
+        let s = dir.to_string_lossy().to_string();
+        let error = ensure_creatable(&s).await.unwrap_err().to_string();
+        assert!(error.contains("bare"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository with no integration line at all refuses the base ladder
+    /// rather than guessing `HEAD`.
+    #[tokio::test]
+    async fn resolve_base_refuses_when_no_integration_line_exists() {
+        let dir = temp_dir("git-wt-no-base");
+        run(&dir, &["init", "-b", "trunk"]);
+        let s = dir.to_string_lossy().to_string();
+        let error = resolve_base(&s, None).await.unwrap_err().to_string();
+        assert!(error.contains("找不到集成分支"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The ladder resolves the integration line, and an explicit configured
@@ -1022,6 +1054,71 @@ mod tests {
             git_out(Path::new(&created.path), &["rev-parse", "--abbrev-ref", "HEAD"]),
             "feat/login"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit branch that already exists is attached at the requested
+    /// base, exactly like the historical `wt/` fallback.
+    #[tokio::test]
+    async fn worktree_create_attaches_an_explicit_branch_at_the_base() {
+        let dir = init_repo("git-wt-explicit-attach");
+        run(&dir, &["branch", "feat/reuse"]);
+        let head = git_out(&dir, &["rev-parse", "HEAD"]);
+        let s = dir.to_string_lossy().to_string();
+
+        let created = create_worktree(
+            &s,
+            Path::new(".worktrees"),
+            "reuse",
+            Some("feat/reuse"),
+            Some(&head),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.branch, "feat/reuse");
+        assert_eq!(
+            git_out(Path::new(&created.path), &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "feat/reuse"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An explicit branch held by another checkout is refused, not silently
+    /// replaced by a suffixed name.
+    #[tokio::test]
+    async fn worktree_create_refuses_an_explicit_held_branch() {
+        let dir = init_repo("git-wt-explicit-held");
+        run(&dir, &["branch", "feat/held"]);
+        run(&dir, &["worktree", "add", ".worktrees/other", "feat/held"]);
+        let s = dir.to_string_lossy().to_string();
+
+        let error = create_worktree(&s, Path::new(".worktrees"), "held", Some("feat/held"), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("已在"), "{error}");
+        assert!(error.contains("feat/held"), "{error}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The directory suffix ladder stops after nine retries.
+    #[tokio::test]
+    async fn worktree_create_refuses_more_than_ten_directory_collisions() {
+        let dir = init_repo("git-wt-suffix-cap");
+        std::fs::create_dir_all(dir.join(".worktrees/a")).unwrap();
+        for suffix in 2..=10 {
+            std::fs::create_dir_all(dir.join(format!(".worktrees/a-{suffix}"))).unwrap();
+        }
+        let s = dir.to_string_lossy().to_string();
+
+        let error = create_worktree(&s, Path::new(".worktrees"), "a", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("9 个后缀"), "{error}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
