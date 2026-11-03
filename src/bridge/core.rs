@@ -171,8 +171,11 @@ pub struct SharedCore {
     pub work_dir: Option<String>,
     /// The configured base ref for `/diff` (`[review] base`, spec #803).
     pub review_base: Option<String>,
-    /// The parent directory for `/worktree new` (`[worktree] root`, ADR-0088).
+    /// The parent directory for new worktrees (`[worktree] root`, ADR-0088).
     pub worktree_root: std::path::PathBuf,
+    /// The configured integration ref new worktrees start from
+    /// (`[worktree] base`, ADR-0095). `None` runs the ladder at command time.
+    pub worktree_base: Option<String>,
     /// `/diff`'s process-internal cooldown (spec #803): keyed by chat id,
     /// claimed before any git/render/upload work.
     pub diff_cooldown: Arc<std::sync::Mutex<crate::bridge::repo_diff::DiffCooldown>>,
@@ -403,6 +406,7 @@ impl SharedCore {
                 .map(|p| p.to_string_lossy().to_string()),
             review_base: cfg.review.base.clone(),
             worktree_root: cfg.worktree.root.clone(),
+            worktree_base: cfg.worktree.base.clone(),
             diff_cooldown: Arc::new(std::sync::Mutex::new(
                 crate::bridge::repo_diff::DiffCooldown::default(),
             )),
@@ -600,6 +604,7 @@ impl SharedCore {
             self.work_dir.clone(),
             self.review_base.clone(),
             self.worktree_root.clone(),
+            self.worktree_base.clone(),
         )
     }
 

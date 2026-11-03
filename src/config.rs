@@ -69,7 +69,8 @@ pub struct ReviewConfig {
     pub base: Option<String>,
 }
 
-/// Worktree settings (ADR-0088): where `/worktree new` creates its checkouts.
+/// Worktree settings (ADR-0088, ADR-0095): where and from what new worktrees
+/// are created.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeConfig {
     /// The parent directory for new worktrees. A relative value resolves
@@ -79,12 +80,19 @@ pub struct WorktreeConfig {
     /// convention.
     #[serde(default = "default_worktree_root")]
     pub root: PathBuf,
+    /// The integration ref a new worktree starts from. `None` runs the ladder
+    /// `origin/HEAD` → `origin/main` → `origin/master` → `main` → `master`;
+    /// a configured value that does not resolve is a refusal, never a silent
+    /// fall-through (ADR-0095).
+    #[serde(default)]
+    pub base: Option<String>,
 }
 
 impl Default for WorktreeConfig {
     fn default() -> Self {
         Self {
             root: default_worktree_root(),
+            base: None,
         }
     }
 }
@@ -1223,19 +1231,22 @@ mod tests {
         assert_eq!(configured.review.base.as_deref(), Some("upstream/dev"));
     }
 
-    /// ADR-0088: the root is optional and defaults to the repository's own
-    /// `.worktrees`; an absolute path is kept verbatim.
+    /// ADR-0088/0095: the root is optional and defaults to the repository's
+    /// own `.worktrees`; an absolute path is kept verbatim. The base ref is
+    /// optional and absent by default (the ladder runs at command time).
     #[test]
     fn worktree_root_defaults_and_parses() {
         let minimal: Config =
             toml::from_str("[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n").unwrap();
         assert_eq!(minimal.worktree.root, PathBuf::from(".worktrees"));
+        assert_eq!(minimal.worktree.base, None);
 
         let configured: Config = toml::from_str(
-            "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n[worktree]\nroot = \"/tmp/wt\"\n",
+            "[feishu]\napp_id = \"cli_abc\"\napp_secret = \"s3cr3t\"\n[worktree]\nroot = \"/tmp/wt\"\nbase = \"origin/main\"\n",
         )
         .unwrap();
         assert_eq!(configured.worktree.root, PathBuf::from("/tmp/wt"));
+        assert_eq!(configured.worktree.base.as_deref(), Some("origin/main"));
     }
 
     #[test]
