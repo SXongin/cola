@@ -982,6 +982,7 @@ impl SessionStore {
         key: &ThreadKey,
         generation: u64,
         path: &str,
+        branch: &str,
     ) -> crate::error::Result<bool> {
         let Some(claim) = self.creating.get(key).copied() else {
             return Ok(false);
@@ -1000,7 +1001,13 @@ impl SessionStore {
         if worktree.path.is_some() {
             return Ok(false);
         }
+        // A collision suffixes both the directory and the branch; record the
+        // actual pair so a later status reports what exists, not the plan.
         worktree.path = Some(path.to_string());
+        worktree.target = path.to_string();
+        if let Some(slug) = branch.strip_prefix("wt/") {
+            worktree.slug = slug.to_string();
+        }
         self.write_to_disk()?;
         Ok(true)
     }
@@ -2206,7 +2213,7 @@ mod tests {
         );
         assert!(
             store
-                .record_worktree_path(&key, generation, &checkout_text)
+                .record_worktree_path(&key, generation, &checkout_text, "wt/first")
                 .unwrap()
         );
         assert_eq!(
@@ -2226,7 +2233,7 @@ mod tests {
         let replacement_epoch = store.pending_epoch_for(&key);
         assert!(
             !store
-                .record_worktree_path(&key, generation, &checkout_text)
+                .record_worktree_path(&key, generation, &checkout_text, "wt/first")
                 .unwrap(),
             "a stale materialisation must not stamp its checkout onto the replacement"
         );

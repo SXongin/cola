@@ -159,16 +159,13 @@ async fn topic_worktree_cover_names_the_target_branch_and_base() {
         .await
         .into_iter()
         .next()
-        .map(|card| card.to_string())
         .expect("a cover card is sent");
-    assert!(cover.contains("修复登录"), "{cover}");
+    let cover_text = card_texts(&cover).join("\n");
+    assert!(cover_text.contains("修复登录"), "{cover_text}");
     assert!(
-        cover.contains("🌲"),
-        "the cover marks the future checkout: {cover}"
+        cover_text.contains("🌲"),
+        "the cover marks the future checkout: {cover_text}"
     );
-    assert!(cover.contains("wt/fix-login"), "{cover}");
-    assert!(cover.contains(".worktrees/fix-login"), "{cover}");
-    assert!(cover.contains("main @"), "{cover}");
 
     let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
     let pending = app
@@ -186,6 +183,9 @@ async fn topic_worktree_cover_names_the_target_branch_and_base() {
     );
     let intent = pending.worktree.as_ref().expect("the intent rides the pending");
     assert_eq!(intent.slug, "fix-login", "an explicit slug wins over the title");
+    assert!(cover_text.contains(&intent.target), "{cover_text}");
+    assert!(cover_text.contains("wt/fix-login"), "{cover_text}");
+    assert!(cover_text.contains("main @"), "{cover_text}");
     assert!(
         created.lock().await.is_empty(),
         "opening the topic creates no session"
@@ -435,10 +435,17 @@ async fn worktree_status_and_adjust_before_creation() {
     let (app, platform) = build_app(cfg, backend).await;
 
     send_command(&app, "/new --worktree --name Fix Login", "msg_wt_st").await;
+    let target = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&key())
+        .and_then(|pending| pending.worktree.as_ref().map(|intent| intent.target.clone()))
+        .expect("the command declares the intent");
     send_command(&app, "/worktree", "msg_wt_st_show").await;
     let texts = platform.texts().await.join("\n");
     assert!(texts.contains("待建 worktree"), "{texts}");
-    assert!(texts.contains(".worktrees/fix-login"), "{texts}");
+    assert!(texts.contains(&target), "{texts}");
     assert!(texts.contains("wt/fix-login"), "{texts}");
     assert!(texts.contains("main @"), "{texts}");
 
@@ -452,7 +459,13 @@ async fn worktree_status_and_adjust_before_creation() {
         .expect("the pending survives the adjustment");
     let intent = pending.worktree.expect("intent");
     assert_eq!(intent.slug, "better");
-    assert!(intent.target.ends_with(".worktrees/better"), "{}", intent.target);
+    assert!(
+        std::path::Path::new(&intent.target)
+            .file_name()
+            .is_some_and(|name| name == "better"),
+        "{}",
+        intent.target
+    );
     assert_eq!(intent.base, "HEAD");
     assert_eq!(intent.base_sha, git_out(repo.path(), &["rev-parse", "HEAD"]));
 
@@ -487,22 +500,29 @@ async fn worktree_adjust_refreshes_the_pending_topic_cover() {
     send_command_in(
         &app,
         "/worktree --slug second",
-        topic_key,
+        topic_key.clone(),
         "msg_wt_topic_adjust",
         crate::config::ConversationKind::Topic,
     )
     .await;
 
+    let pending = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&topic_key)
+        .cloned()
+        .expect("the topic carries a pending");
+    let target = pending.worktree.expect("intent").target;
     let updated = platform.updated_cards().await;
+    let updated_text: Vec<String> = updated.iter().flat_map(card_texts).collect();
     assert!(
-        updated
-            .iter()
-            .any(|card| card.to_string().contains(".worktrees/second")),
-        "the cover names the new target: {updated:?}"
+        updated_text.iter().any(|text| text.contains(&target)),
+        "the cover names the new target: {updated_text:?}"
     );
     assert!(
-        updated.iter().any(|card| card.to_string().contains("wt/second")),
-        "and the new branch: {updated:?}"
+        updated_text.iter().any(|text| text.contains("wt/second")),
+        "and the new branch: {updated_text:?}"
     );
 }
 
@@ -678,4 +698,46 @@ async fn an_uncreatable_root_refuses_without_creating_it() {
         !blocker.join("nested").exists(),
         "the command must not create the root it refused"
     );
+}
+
+/// The topic route materialises end to end: the first in-topic message creates
+/// the checkout and the session inside it (ADR-0095).
+#[tokio::test]
+async fn the_first_topic_message_creates_the_session_in_the_checkout() {
+    let _wd = test_work_dir();
+    let sessions = tempfile::tempdir().unwrap();
+    let repo = init_repo();
+    let mut cfg = test_config(&sessions.path().join("sessions.json"));
+    cfg.bridge.work_dir = Some(repo.path().to_path_buf());
+    cfg.worktree.root = std::path::PathBuf::from(".worktrees");
+    let backend = MockBackend::new(realistic_parts());
+    let created = backend.created_session_dirs.clone();
+    let (app, _platform) = build_app(cfg, backend).await;
+    let topic_key = crate::config::ThreadKey::new("chat_1".into(), "omt_created_topic".into());
+
+    send_command(&app, "/topic --worktree --name topic-wt", "msg_topic_wt").await;
+    let target = app
+        .sessions
+        .lock()
+        .await
+        .pending_for(&topic_key)
+        .and_then(|pending| pending.worktree.as_ref().map(|intent| intent.target.clone()))
+        .expect("the topic carries the intent");
+
+    app.handle_message(incoming(
+        "msg_topic_wt_after".into(),
+        "chat_1".into(),
+        "p2p".into(),
+        Some("omt_created_topic".into()),
+        "开始吧".into(),
+        None,
+    ))
+    .await;
+
+    assert_eq!(
+        created.lock().await.last().and_then(|dir| dir.as_deref()),
+        Some(target.as_str()),
+        "the topic's first message creates the session in the checkout"
+    );
+    assert!(std::path::Path::new(&target).is_dir());
 }

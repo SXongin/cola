@@ -2730,7 +2730,7 @@ impl App {
                     // message run in the wrong checkout.
                     if !self
                         .sessions_handle()
-                        .record_worktree_path(&pending.thread_key, generation, &created.path)
+                        .record_worktree_path(&pending.thread_key, generation, &created.path, &created.branch)
                         .await?
                     {
                         tracing::warn!(
@@ -2741,24 +2741,30 @@ impl App {
                             "the thread moved on while its checkout was being created".to_string(),
                         ));
                     }
-                    if crate::git::plain_path(std::path::PathBuf::from(&created.path))
-                        != crate::git::plain_path(std::path::PathBuf::from(&intent.target))
-                    {
-                        // The planned directory was taken between the command
-                        // and creation; name the actual checkout (ADR-0095).
-                        // Best-effort: the checkout is already made, and a
-                        // failed notice must not fail materialisation.
-                        let _ = self
-                            .feishu
-                            .reply_text(
-                                message_id,
-                                &format!(
-                                    "🌲 目标目录已被占用，worktree 建在 `{}`（分支 `{}`）。",
-                                    created.path, created.branch
-                                ),
-                            )
-                            .await;
-                    }
+                    // Name what actually exists, including a `-2` suffix from a
+                    // collision (ADR-0095 decision 3). Best-effort: the
+                    // checkout is already made, and a failed notice must not
+                    // fail materialisation.
+                    let collision = crate::git::plain_path(std::path::PathBuf::from(&created.path))
+                        != crate::git::plain_path(std::path::PathBuf::from(&intent.target));
+                    let lead = if collision {
+                        "目标目录已被占用，"
+                    } else {
+                        ""
+                    };
+                    let _ = self
+                        .feishu
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "🌲 {lead}worktree 建在 `{}`（分支 `{}`，起点 `{} @ {}`）。",
+                                created.path,
+                                created.branch,
+                                intent.base,
+                                intent.short_sha()
+                            ),
+                        )
+                        .await;
                     created.path
                 }
             };
