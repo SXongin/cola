@@ -445,25 +445,25 @@ mod tests {
         // secret both halves read — a preflight on one key with the action on
         // another would pass the check and 401 only when Codex runs.
         assert!(
-            workflow.contains("\n      GATE_ENDPOINT: https://api.deepseek.com/responses\n"),
-            "the gate's endpoint must be DeepSeek's own Responses API"
+            workflow.contains("\n      GATE_ENDPOINT: https://opencode.ai/zen/go/v1/responses\n"),
+            "the gate's endpoint must be OpenCode Go's Responses endpoint"
         );
         assert!(
-            workflow.contains("\n      GATE_MODEL: deepseek-flash\n"),
-            "the gate's model must be deepseek-flash"
+            workflow.contains("\n      GATE_MODEL: gpt-6-luna\n"),
+            "the gate's model must be gpt-6-luna"
         );
-        let secret_reads = workflow.matches("secrets.DEEPSEEK_API_KEY").count();
+        let secret_reads = workflow.matches("secrets.OPENCODE_API_KEY").count();
         assert_eq!(
             secret_reads, 2,
             "the preflight and the action must read the same secret"
         );
         assert!(
-            workflow.contains("DEEPSEEK_API_KEY is empty"),
+            workflow.contains("OPENCODE_API_KEY is empty"),
             "the empty-key message must name the secret it wants"
         );
         assert!(
-            !workflow.contains("secrets.OPENCODE_API_KEY"),
-            "no step may still read the retired OpenCode key"
+            !workflow.contains("secrets.DEEPSEEK_API_KEY"),
+            "no step may still read the retired DeepSeek key"
         );
         // The action's `drop-sudo` fails on the ubuntu-26.04 image (2026-11-01),
         // so the job runs on the image that still works.
@@ -509,12 +509,12 @@ mod tests {
             seen.contains("Authorization: Bearer test-key"),
             "the step must send the workflow's key"
         );
-        // The probe is a plain Responses call: no lane-specific header. The
-        // `x-opencode-session` the Go lane needed was dropped with the move to
-        // DeepSeek, which takes only the bearer token.
+        // The Go lane rejects a request without a session header, so the probe
+        // must carry it (measured: 400 `MissingSessionID` without one).
         assert!(
-            !seen.to_lowercase().contains("x-opencode-session"),
-            "the probe must send only what the endpoint needs: {seen}"
+            seen.to_lowercase()
+                .contains("x-opencode-session: cola-codex-gate-preflight"),
+            "the Go lane rejects a request without a session header: {seen}"
         );
         for field in [
             r#""model":"test-model""#,
@@ -531,7 +531,7 @@ mod tests {
         let log = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "an empty key must fail the step");
         assert!(
-            log.contains("DEEPSEEK_API_KEY is empty"),
+            log.contains("OPENCODE_API_KEY is empty"),
             "the step must name the missing secret: {log}"
         );
     }
