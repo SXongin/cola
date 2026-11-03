@@ -499,9 +499,10 @@ pub(crate) struct DetachReport {
     pub(crate) released: usize,
     /// Releases the daemon refused or the connection dropped.
     pub(crate) failed: usize,
-    /// Attempts still awaiting an answer when the budget expired. Their
-    /// consumer task may still complete the unsubscribe; the process exits
-    /// without waiting to learn.
+    /// Attempts the pass gave up on when the budget expired — still awaiting
+    /// an answer, or never polled at all. One that did reach its consumer task
+    /// may still complete the unsubscribe; the process exits without waiting
+    /// to learn.
     pub(crate) unfinished: usize,
 }
 

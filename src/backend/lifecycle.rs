@@ -430,7 +430,15 @@ mod tests {
             ..RecordingDetach::default()
         };
         let started = std::time::Instant::now();
-        detach_within(&client, Duration::from_millis(20)).await;
+        // A reverted `detach_within` (a direct `client.detach` await) would
+        // hang here; the outer timeout turns that regression into a failure
+        // instead of a stuck test.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            detach_within(&client, Duration::from_millis(20)),
+        )
+        .await
+        .expect("detach_within must return on its own backstop");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the backstop must end the wait near the budget, not on the client"

@@ -71,3 +71,8 @@ the connection's id bookkeeping.
   (plus the backstop margin) before the process ends. The signal handler only
   exists while the run loop is awaited; a signal during startup still takes the
   default action, which is acceptable because nothing is held yet.
+- The run loop does not abort its pollers before the pass. A poll that adopts a
+  thread inside the exit window can therefore leave that one subscription
+  unreleased; the exit closes it with the connection, and only that thread's
+  grace window is missed. Closing that gap would mean stopping the pollers
+  first, which this change deliberately does not do.
