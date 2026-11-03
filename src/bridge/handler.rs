@@ -1877,8 +1877,55 @@ impl App {
                 tracing::error!("Reconnect poller: {}", e);
             }
         });
-        tokio::try_join!(ws_task, perm_task, question_task, external_task, reconnect_task)?;
+        let shutdown_handles = self.flow_handles();
+        tokio::select! {
+            joined = async {
+                tokio::try_join!(ws_task, perm_task, question_task, external_task, reconnect_task)
+            } => {
+                joined?;
+            }
+            // A stop request is a normal exit (issue #918): hand the runtime back
+            // what this process holds before it ends. Bounded, so a wedged
+            // runtime cannot hold `cola stop` or Ctrl-C.
+            _ = Self::shutdown_signal() => {
+                tracing::info!("stop requested; handing the runtime back before exit");
+                shutdown_handles.detach_for_exit().await;
+            }
+        }
         Ok(())
+    }
+
+    /// Resolve on the process's first **stop request**: `SIGTERM` (systemd,
+    /// `cola stop`) or `SIGINT` (Ctrl-C) on unix, Ctrl-C elsewhere. The default
+    /// signal action would end the process with no code running, so this is the
+    /// one hook a normal exit gets (issue #918). Registration failures degrade
+    /// to "this signal cannot arrive", never to a panic on a thread the whole
+    /// bridge depends on.
+    async fn shutdown_signal() {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut terminate = signal(SignalKind::terminate()).ok();
+            let mut interrupt = signal(SignalKind::interrupt()).ok();
+            tokio::select! {
+                _ = async {
+                    match terminate.as_mut() {
+                        Some(stream) => drop(stream.recv().await),
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+                _ = async {
+                    match interrupt.as_mut() {
+                        Some(stream) => drop(stream.recv().await),
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 
     pub async fn handle_message(self: &Arc<Self>, msg: crate::bridge::IncomingMessage) {

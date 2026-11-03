@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -483,6 +484,25 @@ impl Drop for Projections {
 /// `thread/resume` cannot race the teardown.
 struct ReleaseCommand {
     ack: tokio::sync::oneshot::Sender<CodexResult<()>>,
+}
+
+/// What one exit-time release pass managed (issue #918): how many held
+/// subscriptions it asked to release, and how each attempt ended. Logged, never
+/// reported to the user — the process is on its way out.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachReport {
+    /// Held subscriptions the pass found and tried.
+    pub(crate) requested: usize,
+    /// Releases that ended without an error within the budget. An already
+    /// ended consumer (its connection is gone, so the subscription is too) is a
+    /// no-op and counts here, not as a failure.
+    pub(crate) released: usize,
+    /// Releases the daemon refused or the connection dropped.
+    pub(crate) failed: usize,
+    /// Attempts still awaiting an answer when the budget expired. Their
+    /// consumer task may still complete the unsubscribe; the process exits
+    /// without waiting to learn.
+    pub(crate) unfinished: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1132,6 +1152,22 @@ impl Projections {
             .insert(thread_id.to_string(), sender);
     }
 
+    /// Every thread this connection holds a live subscription to, sorted so a
+    /// release pass and its log are deterministic. The release channel is
+    /// registered before the subscriber task starts, so an `Adopting` thread
+    /// is included and a completed release is not.
+    fn live_threads(&self) -> Vec<String> {
+        let mut threads: Vec<String> = self
+            .releases
+            .lock()
+            .expect("codex release channels")
+            .keys()
+            .cloned()
+            .collect();
+        threads.sort();
+        threads
+    }
+
     /// Claim `thread_id`'s release channel. `None` means no consumer is live:
     /// the thread was never adopted on this connection, or it was already
     /// released — either way there is nothing to unsubscribe.
@@ -1309,6 +1345,71 @@ impl CodexClient {
             // the cache, so this connection is gone.
             Err(_) => Err(CodexError::NoResponse(format!("thread/unsubscribe {thread_id}"))),
         }
+    }
+
+    /// Release every thread this connection holds, best-effort within `budget`
+    /// (issue #918). Only a process exit calls this — never a turn, a switch or
+    /// a read — so the normal path gains no requests.
+    ///
+    /// Each release goes through the thread's subscriber task, the only holder
+    /// of its [`ThreadSubscription`], so the "last local handle" rule still
+    /// decides whether `thread/unsubscribe` goes out. The attempts run
+    /// concurrently because they are independent threads, and the whole pass
+    /// shares one deadline: a wedged daemon costs the budget once, not once per
+    /// thread.
+    ///
+    /// What it buys is only the daemon's own grace window starting earlier.
+    /// Nothing depends on a thread being unloaded (spec #922 made the provider
+    /// creation-only), and a thread another client holds cannot be unloaded at
+    /// all — this is hygiene, never a guarantee.
+    pub(crate) async fn release_all(&self, budget: Duration) -> DetachReport {
+        let threads = self.projections.live_threads();
+        let mut report = DetachReport {
+            requested: threads.len(),
+            ..DetachReport::default()
+        };
+        if threads.is_empty() {
+            return report;
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut pending: FuturesUnordered<_> = threads
+            .iter()
+            .map(|thread_id| async move { (thread_id.as_str(), self.release_thread(thread_id).await) })
+            .collect();
+        loop {
+            match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some((thread_id, Ok(())))) => {
+                    report.released += 1;
+                    tracing::debug!(
+                        thread = %thread_id,
+                        "codex: released a held thread subscription on exit"
+                    );
+                }
+                Ok(Some((thread_id, Err(error)))) => {
+                    report.failed += 1;
+                    tracing::warn!(
+                        thread = %thread_id,
+                        "codex: thread/unsubscribe failed on exit: {error}"
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    // The attempts were cancelled with the budget; their
+                    // consumer tasks may still complete the unsubscribe, but
+                    // the process stops waiting here.
+                    report.unfinished = pending.len();
+                    break;
+                }
+            }
+        }
+        tracing::info!(
+            requested = report.requested,
+            released = report.released,
+            failed = report.failed,
+            unfinished = report.unfinished,
+            "codex: released held thread subscriptions before exit"
+        );
+        report
     }
 
     /// The live turn a `/stop` should interrupt.
@@ -2217,6 +2318,12 @@ impl ServerLifecycle for CodexClient {
     /// run here. The active client's lifecycle is [`CodexLifecycle`].
     async fn ensure_attached(&self, _request: EnsureAttached<'_>) -> Result<AttachOutcome> {
         Ok(AttachOutcome::Attached)
+    }
+
+    /// Hand the daemon back every thread this connection still subscribes to
+    /// (issue #918). See [`CodexClient::release_all`].
+    async fn detach(&self, budget: Duration) {
+        self.release_all(budget).await;
     }
 }
 
@@ -8550,6 +8657,134 @@ mod tests {
             .expect("an unadopted release is a no-op");
         assert_eq!(server.unsubscribe_calls(), 0);
         assert_eq!(server.resume_calls(), 0, "a release never adopts");
+    }
+
+    /// Seed `count` adoptable threads (`thread-0`…).
+    fn seed_held_threads(server: &FakeServer, count: usize) {
+        for index in 0..count {
+            server.seed_thread(ScriptedThread::adopted(
+                &format!("thread-{index}"),
+                "session-root",
+                "/work/cola",
+                "a real thread",
+            ));
+        }
+    }
+
+    /// Adopt `thread-0`… on `client`, so the connection holds `count` live
+    /// subscriptions.
+    async fn adopt_held_threads(client: &CodexClient, count: usize) {
+        for index in 0..count {
+            client
+                .transcript(&format!("thread-{index}"))
+                .await
+                .expect("adopt");
+        }
+    }
+
+    /// A process exit releases every subscription this connection still holds
+    /// (issue #918): one `thread/unsubscribe` per held thread, and a report
+    /// that names what it managed.
+    #[tokio::test]
+    async fn exit_detach_releases_every_held_thread() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        seed_held_threads(&server, 3);
+        let client = connect(&url).await;
+        adopt_held_threads(&client, 3).await;
+        assert_eq!(server.unsubscribe_calls(), 0);
+
+        let report = client.release_all(Duration::from_millis(500)).await;
+        assert_eq!(report.requested, 3);
+        assert_eq!(report.released, 3);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.unfinished, 0);
+        assert_eq!(
+            server.unsubscribe_calls(),
+            3,
+            "every held thread is asked to unsubscribe exactly once"
+        );
+        assert_eq!(server.resume_calls(), 3, "a release pass never adopts");
+    }
+
+    /// A daemon that never answers `thread/unsubscribe` cannot hold an exit
+    /// past the pass's budget (issue #918): the pass returns, reports what was
+    /// left unfinished, and does not panic.
+    #[tokio::test]
+    async fn exit_detach_is_bounded_when_the_daemon_never_answers() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        seed_held_threads(&server, 2);
+        let client = connect(&url).await;
+        adopt_held_threads(&client, 2).await;
+        server.silence_unsubscribe(2);
+
+        let started = std::time::Instant::now();
+        let report = client.release_all(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the pass must return near its budget instead of waiting on the daemon"
+        );
+        assert_eq!(report.requested, 2);
+        assert_eq!(report.released, 0);
+        assert_eq!(report.unfinished, 2);
+    }
+
+    /// A daemon that refuses the release is reported as a failure and does not
+    /// abort the pass (issue #918).
+    #[tokio::test]
+    async fn exit_detach_reports_a_refused_release() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        seed_held_threads(&server, 1);
+        let client = connect(&url).await;
+        adopt_held_threads(&client, 1).await;
+        server.reject_unsubscribe(1);
+
+        let report = client.release_all(Duration::from_millis(500)).await;
+        assert_eq!(report.requested, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.released, 0);
+        assert_eq!(server.unsubscribe_calls(), 1);
+    }
+
+    /// An exit pass on a connection that holds nothing sends nothing at all —
+    /// no unsubscribe and, above all, no adoption (issue #918's "the normal
+    /// paths gain no requests").
+    #[tokio::test]
+    async fn exit_detach_sends_nothing_when_nothing_is_held() {
+        let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+        server.seed_thread(ScriptedThread::adopted(
+            "thread-1",
+            "session-root",
+            "/work/cola",
+            "a real thread",
+        ));
+        let client = connect(&url).await;
+
+        let report = client.release_all(Duration::from_millis(50)).await;
+        assert_eq!(report.requested, 0);
+        assert_eq!(server.unsubscribe_calls(), 0);
+        assert_eq!(server.resume_calls(), 0, "an exit pass never adopts");
+    }
+
+    /// The active client's lifecycle hands the pass to its attached connection;
+    /// unattached, there is nothing to give back and no error to report.
+    #[tokio::test]
+    async fn detaching_an_unattached_lifecycle_holds_nothing() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let settings = crate::config::CodexConfig::default();
+        let environment = crate::codex::discovery::Environment {
+            home: directory.path().to_path_buf(),
+            cli: directory.path().join("no-codex"),
+            version_timeout: Duration::from_millis(50),
+            start_timeout: Duration::from_millis(50),
+            socket_ready_timeout: Duration::from_millis(50),
+        };
+        let lifecycle = CodexLifecycle::new(settings, environment, Box::new(crate::codex::ManagedProbe));
+        let started = std::time::Instant::now();
+        lifecycle.detach(Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an unattached detach must not discover or dial a daemon"
+        );
     }
 
     /// A released thread is adoptable again: the next read sends a fresh

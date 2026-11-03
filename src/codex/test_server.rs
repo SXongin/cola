@@ -601,6 +601,9 @@ struct State {
     /// How many upcoming `thread/unsubscribe` calls answer with a JSON-RPC
     /// error, so the release path's failure arm is exercised.
     reject_unsubscribe: AtomicUsize,
+    /// How many upcoming `thread/unsubscribe` calls are left unanswered, so a
+    /// test can prove the exit release pass is bounded (issue #918).
+    silent_unsubscribe: AtomicUsize,
     /// Answer `thread/resume` without a response, so a test can cancel a
     /// pending adopt.
     silent_resume: std::sync::atomic::AtomicBool,
@@ -736,6 +739,7 @@ impl Default for State {
             turns_params: std::sync::Mutex::new(Vec::new()),
             unsubscribe_calls: AtomicUsize::new(0),
             reject_unsubscribe: AtomicUsize::new(0),
+            silent_unsubscribe: AtomicUsize::new(0),
             silent_resume: std::sync::atomic::AtomicBool::new(false),
             calls: std::sync::Mutex::new(Vec::new()),
             fail_turns_pages: AtomicUsize::new(0),
@@ -1172,6 +1176,13 @@ impl FakeServer {
     /// test can prove the release path survives a server that refuses it.
     pub(crate) fn reject_unsubscribe(&self, count: usize) {
         self.state.reject_unsubscribe.store(count, Ordering::SeqCst);
+    }
+
+    /// Leave the next `count` `thread/unsubscribe` calls unanswered (the
+    /// connection stays open), so a test can prove an exit release pass is
+    /// bounded by its budget instead of waiting on a wedged daemon.
+    pub(crate) fn silence_unsubscribe(&self, count: usize) {
+        self.state.silent_unsubscribe.store(count, Ordering::SeqCst);
     }
 
     /// Wait until the server has recorded a live turn for a thread — the
@@ -2213,6 +2224,10 @@ where
         }
         Some("thread/unsubscribe") => {
             state.unsubscribe_calls.fetch_add(1, Ordering::SeqCst);
+            if state.silent_unsubscribe.load(Ordering::SeqCst) > 0 {
+                state.silent_unsubscribe.fetch_sub(1, Ordering::SeqCst);
+                return true;
+            }
             if state.reject_unsubscribe.load(Ordering::SeqCst) > 0 {
                 state.reject_unsubscribe.fetch_sub(1, Ordering::SeqCst);
                 return reply_error(sink, id, -32600, "thread unsubscribe failed").await;

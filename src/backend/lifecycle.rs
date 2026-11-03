@@ -214,6 +214,15 @@ pub enum RestartOutcome {
     NoServer,
 }
 
+/// How long a process that is about to exit lets a client give back what it
+/// holds on the runtime (issue #918).
+///
+/// A hint, not a security boundary: the caller wraps the call in its own
+/// [`tokio::time::timeout`], so a wedged runtime delays an exit by at most this
+/// much (plus scheduling). Kept short — a restart's user-visible cost — because
+/// the work is a handful of local round trips on an already-open connection.
+pub const DETACH_BUDGET: Duration = Duration::from_millis(300);
+
 /// The active client's discover / attach / health / optionally-start surface.
 ///
 /// [`Self::ensure_attached`] is required: a client must state its attachment
@@ -265,6 +274,48 @@ pub trait ServerLifecycle: Send + Sync {
     /// server to restart (only an Owned Server may ever be touched).
     async fn restart_server(&self) -> Result<RestartOutcome> {
         Ok(RestartOutcome::NoServer)
+    }
+
+    /// Give back what this client holds on the runtime before the process
+    /// exits (issue #918). **Not a stop**: the runtime, its servers and its
+    /// sessions are untouched; only this client's own holds — a push
+    /// subscription, a lease — are released.
+    ///
+    /// A client whose runtime has no such concept keeps this default: there is
+    /// nothing to give back, and the default is the explicit statement, not a
+    /// failed release. Best-effort by contract: an implementation must return
+    /// within `budget`, log what it managed, and never panic or fail — the
+    /// caller is already leaving and must not be delayed or turned into an
+    /// error by it.
+    ///
+    /// What this buys is bounded: the Codex daemon keeps an unsubscribed
+    /// thread loaded for its own grace window, and a release only starts that
+    /// window earlier. It is not a correctness guarantee for any operation
+    /// (spec #922 made the provider creation-only, so nothing depends on a
+    /// thread being cold).
+    async fn detach(&self, _budget: Duration) {}
+}
+
+/// Run [`ServerLifecycle::detach`] under an exit's hard backstop.
+///
+/// The client's own pass must respect `budget`; this wrapper is what makes a
+/// client that ignores the contract harmless to the exit. The margin lets a
+/// slow-but-finishing pass write its own summary line before the hard limit
+/// fires. Failures are already the client's to log — this adds one line when
+/// the client did not finish in time and then returns, never an error.
+pub async fn detach_within<C>(client: &C, budget: Duration)
+where
+    C: ServerLifecycle + ?Sized,
+{
+    /// How much longer than the client's own budget the exit waits.
+    const BACKSTOP_MARGIN: Duration = Duration::from_millis(50);
+
+    let backstop = budget + BACKSTOP_MARGIN;
+    match tokio::time::timeout(backstop, client.detach(budget)).await {
+        Ok(()) => {}
+        Err(_) => {
+            tracing::warn!("the client did not hand back what it holds within {backstop:?}; exiting anyway")
+        }
     }
 }
 
@@ -323,7 +374,69 @@ fn answered(error: &crate::error::BridgeError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use super::*;
+
+    /// A lifecycle that records the exit pass instead of holding anything.
+    #[derive(Default)]
+    struct RecordingDetach {
+        calls: std::sync::atomic::AtomicUsize,
+        budget: std::sync::Mutex<Option<Duration>>,
+        /// Ignore the budget entirely, the contract violation the backstop is
+        /// for.
+        hang: bool,
+    }
+
+    impl RecordingDetach {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn budget(&self) -> Option<Duration> {
+            *self.budget.lock().expect("recorded budget")
+        }
+    }
+
+    #[async_trait]
+    impl ServerLifecycle for RecordingDetach {
+        async fn ensure_attached(&self, _request: EnsureAttached<'_>) -> Result<AttachOutcome> {
+            Ok(AttachOutcome::Attached)
+        }
+
+        async fn detach(&self, budget: Duration) {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.budget.lock().expect("recorded budget") = Some(budget);
+            if self.hang {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// An exit detach reaches the client once, with the caller's budget.
+    #[tokio::test]
+    async fn detach_within_calls_the_client_with_its_budget() {
+        let client = RecordingDetach::default();
+        detach_within(&client, Duration::from_millis(20)).await;
+        assert_eq!(client.calls(), 1);
+        assert_eq!(client.budget(), Some(Duration::from_millis(20)));
+    }
+
+    /// A client that ignores its budget cannot hold the exit past the backstop.
+    #[tokio::test]
+    async fn detach_within_bounds_a_client_that_never_returns() {
+        let client = RecordingDetach {
+            hang: true,
+            ..RecordingDetach::default()
+        };
+        let started = std::time::Instant::now();
+        detach_within(&client, Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the backstop must end the wait near the budget, not on the client"
+        );
+        assert_eq!(client.calls(), 1);
+    }
 
     #[tokio::test]
     async fn a_connection_failure_is_not_readiness() {
