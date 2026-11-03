@@ -888,7 +888,9 @@ Notes:
   safe while a turn is running: it writes an intent and moves nothing, so the
   in-flight step is never interrupted (the reason #428's mid-turn move was a
   dead end). A failed create keeps the pending and the message, and the retry
-  reuses the checkout the first attempt made.
+  reuses the checkout the first attempt made. The first message pays for the
+  whole-tree checkout (and the directory instance boot), so cola acknowledges
+  it before the Git call; later messages do not pay it again.
 - `/sub` is the read-only view of the current session's **child sessions** —
   the ones its `task` tool calls created. Each row carries the child's title,
   id, agent, last activity and live state (运行中 when Busy/Retry, 空闲 when

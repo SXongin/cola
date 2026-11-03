@@ -2648,6 +2648,26 @@ impl App {
             crate::bridge::session::PendingClaim::Claimed(pending, generation) => {
                 let directory = pending.directory.clone();
                 let worktree_target = pending.worktree.as_ref().map(|intent| intent.target.clone());
+                // The first message pays for the whole-tree checkout (and the
+                // directory instance boot), which can take seconds on a large
+                // repository. Acknowledge it before the Git call so the wait
+                // never looks like a wedged cola (ADR-0095).
+                if let Some(intent) = pending
+                    .worktree
+                    .as_ref()
+                    .filter(|intent| !intent.checkout_exists())
+                {
+                    let _ = self
+                        .feishu
+                        .reply_text(
+                            message_id,
+                            &format!(
+                                "⏳ 正在创建 worktree `{}`（首次需要检出文件，可能多等几秒）…",
+                                intent.target
+                            ),
+                        )
+                        .await;
+                }
                 return match self.materialise_pending(*pending, generation, message_id).await {
                     Ok(id) => Ok((id, false)),
                     Err(e) => {

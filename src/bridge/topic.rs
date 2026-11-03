@@ -364,7 +364,7 @@ async fn pending_topic_cover_text(
     let mut s = topic_cover_head(title, dir).await;
     match worktree {
         Some(intent) => s.push_str(&format!(
-            "\n🌲 将在 `{}` 创建 · 分支 `{}` · 起点 `{} @ {}`\n下一条消息创建",
+            "\n🌲 将在 `{}` 创建 · 分支 `{}` · 起点 `{} @ {}`\n下一条消息创建（首次会先检出整棵工作树，可能多等几秒）",
             intent.target,
             intent.branch_name(),
             intent.base,
