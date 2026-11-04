@@ -951,6 +951,131 @@ async fn a_feishu_prompt_becomes_a_user_message_and_completes() {
     assert_eq!(user[0].text(), "please help");
 }
 
+/// Issue #962: a V2 collaboration call reaches the card as one folded panel —
+/// its title names the call and its target thread, its body the prompt, the
+/// model/effort and the target's own state — and the child's
+/// `subAgentActivity` is a row beside it. Both items ride the PARENT thread's
+/// stream; no child-thread subscription is involved.
+#[tokio::test]
+async fn a_collab_call_and_a_child_activity_render_on_the_card() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+    server.echo_prompts(THREAD);
+    let now = chrono::Utc::now().timestamp();
+    let child = "0192f0aa-0000-7000-8000-000000000001";
+    server.script_turn(
+        THREAD,
+        vec![
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turnId": "turn-1",
+                    "completedAtMs": now * 1000,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-collab",
+                        "tool": "spawnAgent",
+                        "status": "completed",
+                        "senderThreadId": THREAD,
+                        "receiverThreadIds": [child],
+                        "prompt": "Review the diff and report the blocking findings.",
+                        "model": "gpt-5.1-codex",
+                        "reasoningEffort": "high",
+                        "agentsStates": {
+                            "0192f0aa-0000-7000-8000-000000000001": {
+                                "status": "running",
+                                "message": null
+                            }
+                        }
+                    }
+                }
+            }),
+            json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turnId": "turn-1",
+                    "completedAtMs": now * 1000 + 1,
+                    "item": {
+                        "type": "subAgentActivity",
+                        "id": "item-activity",
+                        "kind": "started",
+                        "agentThreadId": child,
+                        "agentPath": "/root/worker",
+                        "model": "gpt-5.1-codex",
+                        "reasoningEffort": null
+                    }
+                }
+            }),
+            json!({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": THREAD,
+                    "turn": {
+                        "id": "turn-1",
+                        "status": "completed",
+                        "startedAt": now,
+                        "completedAt": now + 1
+                    },
+                },
+            }),
+        ],
+    );
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let (app, platform, _client) = build_bridge(&url, &directory.path().join("sessions.json"), 0).await;
+    let handler = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.handle_message(prompt_message("delegate the review", "om_collab"))
+                .await
+        }
+    });
+
+    wait_for_card_update(&platform, "the collab panel", CardUpdates::Any, |card| {
+        card_text(card).contains("派生子 Agent")
+    })
+    .await;
+    wait_for_card_update(&platform, "the settled turn", CardUpdates::Any, |card| {
+        card_header(card).contains("完成")
+    })
+    .await;
+    wait_for_handler(handler, "the collab turn", SETTLE_DEADLINE).await;
+
+    let card = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the settled card");
+    let text = card_text(&card);
+    assert!(text.contains("派生子 Agent"), "the call's title: {text}");
+    assert!(text.contains("🧵 /root/worker"), "the target thread: {text}");
+    assert!(
+        text.contains("📝 Review the diff and report the blocking findings."),
+        "the prompt: {text}"
+    );
+    assert!(
+        text.contains("🤖 `gpt-5.1-codex` · high"),
+        "the model and effort: {text}"
+    );
+    assert!(
+        text.contains("⏳ `/root/worker` · 运行中"),
+        "the target's own state: {text}"
+    );
+    assert!(
+        text.contains("子 Agent · ") && text.contains("🧵 /root/worker"),
+        "the child activity row names its path: {text}"
+    );
+    assert!(text.contains("🌱 启动"), "the activity kind: {text}");
+}
+
 /// Ticket #881 acceptance 3 through the bridge: a second message while cola owns
 /// the live run is a Supplement → `turn/steer`, never a second `turn/start`, and
 /// its text renders once on the split continuation.

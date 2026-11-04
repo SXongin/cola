@@ -579,7 +579,16 @@ impl ThreadProjection {
     /// The neutral read. A pure fold over the cached items: no lock is held
     /// across an await, so a mid-turn read cannot block on the subscription.
     pub(crate) fn transcript(&self) -> SessionTranscript {
-        let mut messages: Vec<TranscriptMessage> = self.items.iter().map(|item| self.message(item)).collect();
+        // The readable identity each child agent's own activity reported. A
+        // collaboration call names its targets by thread id only, so the card
+        // prefers this path when the same read carries one (issue #962,
+        // acceptance 2) — no extra read is made for it.
+        let labels = self.agent_labels();
+        let mut messages: Vec<TranscriptMessage> = self
+            .items
+            .iter()
+            .map(|item| self.message(item, &labels))
+            .collect();
 
         // Turn-level facts attach to the turn's NEWEST assistant message: the
         // card footer reads token usage there, and `TurnView` reads a turn's
@@ -732,12 +741,32 @@ impl ThreadProjection {
         self.context_window
     }
 
-    fn message(&self, item: &Item) -> TranscriptMessage {
+    /// The readable agent path per child thread id, as the child's own
+    /// `subAgentActivity` items report it (`agentPath`, e.g.
+    /// `/root/spawn_smoke_test`). A later activity for the same agent wins; the
+    /// path is stable for the agent's life.
+    fn agent_labels(&self) -> HashMap<&str, &str> {
+        let mut labels = HashMap::new();
+        for item in &self.items {
+            if let ItemKind::SubAgentActivity {
+                agent_thread_id,
+                agent_path,
+                ..
+            } = &item.kind
+                && !agent_path.is_empty()
+            {
+                labels.insert(agent_thread_id.as_str(), agent_path.as_str());
+            }
+        }
+        labels
+    }
+
+    fn message(&self, item: &Item, labels: &HashMap<&str, &str>) -> TranscriptMessage {
         let created = item
             .started_at_ms
             .or_else(|| self.turns.get(&item.turn_id).and_then(|turn| turn.started_ms))
             .unwrap_or(0);
-        let (role, parts) = item.parts();
+        let (role, parts) = item.parts(labels);
         // Codex's items carry no model — the thread does (issue #904), and only
         // an assistant message can honestly name the model that produced it.
         let model = matches!(role, MessageRole::Assistant)
@@ -1347,7 +1376,7 @@ impl Item {
     /// The neutral role and parts of this item. One item becomes one message:
     /// Codex items are already atomic (a command, a message, a reasoning
     /// block), so no part assembly beyond the item's own content is needed.
-    fn parts(&self) -> (MessageRole, Vec<Part>) {
+    fn parts(&self, labels: &HashMap<&str, &str>) -> (MessageRole, Vec<Part>) {
         match &self.kind {
             ItemKind::UserMessage { parts } => (MessageRole::User, parts.clone()),
             ItemKind::AgentMessage { text } => (
@@ -1522,6 +1551,79 @@ impl Item {
                     output: ToolOutput::default(),
                 })],
             ),
+            // One collab call becomes one card's Tool Panel: the adapter writes
+            // the whole shape its renderer is gated on (ADR-0042's amendment),
+            // including the state rows in a deterministic order so an
+            // unchanged call compares equal on the next poll.
+            ItemKind::Collab {
+                tool,
+                status,
+                sender,
+                receivers,
+                prompt,
+                model,
+                reasoning_effort,
+                agents,
+            } => (
+                MessageRole::Assistant,
+                vec![Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: codex_tool_id("collab_agent"),
+                        call_id: self.id.clone(),
+                    },
+                    status: collab_status(status),
+                    started_at: self.started_at_ms,
+                    input: Some(json!({
+                        "tool": tool,
+                        "status": status,
+                        "senderThreadId": sender,
+                        "receiverThreadIds": receivers,
+                        "prompt": prompt,
+                        "model": model,
+                        "reasoningEffort": reasoning_effort,
+                        "agents": agents
+                            .iter()
+                            .map(|agent| json!({
+                                "threadId": agent.thread_id,
+                                "label": labels.get(agent.thread_id.as_str()),
+                                "status": agent.status,
+                                "message": agent.message,
+                            }))
+                            .collect::<Vec<_>>(),
+                    })),
+                    metadata: None,
+                    output: ToolOutput::default(),
+                })],
+            ),
+            // A child agent's activity is one line on the parent's card. It
+            // carries no status field: like `webSearch`/`image`, it is live
+            // until its `item/completed` arrives.
+            ItemKind::SubAgentActivity {
+                kind,
+                agent_thread_id,
+                agent_path,
+                model,
+                reasoning_effort,
+            } => (
+                MessageRole::Assistant,
+                vec![Part::Tool(ToolCall {
+                    identity: ToolIdentity {
+                        name: codex_tool_id("sub_agent_activity"),
+                        call_id: self.id.clone(),
+                    },
+                    status: activity_status(kind, self.completed),
+                    started_at: self.started_at_ms,
+                    input: Some(json!({
+                        "kind": kind,
+                        "agentThreadId": agent_thread_id,
+                        "agentPath": agent_path,
+                        "model": model,
+                        "reasoningEffort": reasoning_effort,
+                    })),
+                    metadata: None,
+                    output: ToolOutput::default(),
+                })],
+            ),
             ItemKind::Plan { text } => (
                 MessageRole::Assistant,
                 vec![Part::Text(TextPart {
@@ -1650,6 +1752,69 @@ impl ItemKind {
                     *path = Some(value.to_string());
                 }
             }
+            // A collaboration item has no streaming delta, so a start merged
+            // over accumulated state only fills what is missing: a field the
+            // payload does not carry keeps what the item already had.
+            ItemKind::Collab {
+                tool,
+                status,
+                sender,
+                receivers,
+                prompt,
+                model,
+                reasoning_effort,
+                agents,
+            } => {
+                if let Some(value) = item.get("tool").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *tool = value.to_string();
+                }
+                if let Some(value) = item.get("status").and_then(Value::as_str) {
+                    *status = Some(value.to_string());
+                }
+                if let Some(value) = item.get("senderThreadId").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *sender = value.to_string();
+                }
+                let started = string_list(item.get("receiverThreadIds"));
+                if !started.is_empty() {
+                    *receivers = started;
+                }
+                fill_optional(prompt, item.get("prompt"));
+                fill_optional(model, item.get("model"));
+                fill_optional(reasoning_effort, item.get("reasoningEffort"));
+                let states = collab_agents(item);
+                if !states.is_empty() {
+                    *agents = states;
+                }
+            }
+            ItemKind::SubAgentActivity {
+                kind,
+                agent_thread_id,
+                agent_path,
+                model,
+                reasoning_effort,
+            } => {
+                if let Some(value) = item.get("kind").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *kind = value.to_string();
+                }
+                if let Some(value) = item.get("agentThreadId").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *agent_thread_id = value.to_string();
+                }
+                if let Some(value) = item.get("agentPath").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *agent_path = value.to_string();
+                }
+                fill_optional(model, item.get("model"));
+                fill_optional(reasoning_effort, item.get("reasoningEffort"));
+            }
         }
     }
 
@@ -1762,6 +1927,69 @@ impl ItemKind {
                     *path = Some(value.to_string());
                 }
             }
+            // The completion is authoritative where it speaks: a state map or
+            // receiver list it carries replaces the start's (even when empty,
+            // which is how a `spawnAgent` that created no thread reports), and
+            // the optional scalars are taken only when present — the wire
+            // writes them as `null` for the calls that have none.
+            ItemKind::Collab {
+                tool,
+                status,
+                sender,
+                receivers,
+                prompt,
+                model,
+                reasoning_effort,
+                agents,
+            } => {
+                if let Some(value) = item.get("tool").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *tool = value.to_string();
+                }
+                if let Some(value) = item.get("status").and_then(Value::as_str) {
+                    *status = Some(value.to_string());
+                }
+                if let Some(value) = item.get("senderThreadId").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *sender = value.to_string();
+                }
+                if item.get("receiverThreadIds").is_some() {
+                    *receivers = string_list(item.get("receiverThreadIds"));
+                }
+                take_optional(prompt, item.get("prompt"));
+                take_optional(model, item.get("model"));
+                take_optional(reasoning_effort, item.get("reasoningEffort"));
+                if item.get("agentsStates").is_some() || item.get("receiverThreadIds").is_some() {
+                    *agents = collab_agents(item);
+                }
+            }
+            ItemKind::SubAgentActivity {
+                kind,
+                agent_thread_id,
+                agent_path,
+                model,
+                reasoning_effort,
+            } => {
+                if let Some(value) = item.get("kind").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *kind = value.to_string();
+                }
+                if let Some(value) = item.get("agentThreadId").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *agent_thread_id = value.to_string();
+                }
+                if let Some(value) = item.get("agentPath").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    *agent_path = value.to_string();
+                }
+                take_optional(model, item.get("model"));
+                take_optional(reasoning_effort, item.get("reasoningEffort"));
+            }
             ItemKind::Plan { text } => {
                 if let Some(value) = item.get("text").and_then(Value::as_str)
                     && !value.is_empty()
@@ -1821,6 +2049,33 @@ enum ItemKind {
     Image {
         path: Option<String>,
     },
+    /// One `collabAgentToolCall` (issue #962): a V2 collaboration tool call —
+    /// `spawnAgent`, `sendInput`, `wait`, `closeAgent`, … — as the parent
+    /// thread records it. `tool` and `status` stay raw strings because the wire
+    /// enum is upstream's to extend: an unknown value must still render a card
+    /// instead of becoming `Other`.
+    Collab {
+        tool: String,
+        status: Option<String>,
+        sender: String,
+        /// The wire's own receiver list, in order.
+        receivers: Vec<String>,
+        prompt: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        /// Every known target's last reported state, in row order: the
+        /// receivers first, then any state the list did not name.
+        agents: Vec<AgentState>,
+    },
+    /// One `subAgentActivity`: a child agent's lifecycle event (`started`,
+    /// `interacted`, `interrupted`, `completed`) surfaced on the parent thread.
+    SubAgentActivity {
+        kind: String,
+        agent_thread_id: String,
+        agent_path: String,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+    },
     Plan {
         text: String,
     },
@@ -1829,6 +2084,17 @@ enum ItemKind {
         kind: String,
         raw: Value,
     },
+}
+
+/// One target agent's last reported state inside a [`ItemKind::Collab`] call
+/// (`agentsStates` on the wire). The status stays raw for the same reason the
+/// call's does: the card maps the known values and shows an unknown one as
+/// itself rather than dropping the row.
+#[derive(Debug, Clone)]
+struct AgentState {
+    thread_id: String,
+    status: String,
+    message: Option<String>,
 }
 
 impl ItemKind {
@@ -1907,6 +2173,43 @@ impl ItemKind {
             },
             Some("imageGeneration") => Self::Image {
                 path: item.get("savedPath").and_then(Value::as_str).map(str::to_string),
+            },
+            Some("collabAgentToolCall") => Self::Collab {
+                tool: item
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                status: item.get("status").and_then(Value::as_str).map(str::to_string),
+                sender: item
+                    .get("senderThreadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                receivers: string_list(item.get("receiverThreadIds")),
+                prompt: optional_string(item.get("prompt")),
+                model: optional_string(item.get("model")),
+                reasoning_effort: optional_string(item.get("reasoningEffort")),
+                agents: collab_agents(item),
+            },
+            Some("subAgentActivity") => Self::SubAgentActivity {
+                kind: item
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                agent_thread_id: item
+                    .get("agentThreadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                agent_path: item
+                    .get("agentPath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                model: optional_string(item.get("model")),
+                reasoning_effort: optional_string(item.get("reasoningEffort")),
             },
             Some("plan") => Self::Plan {
                 text: item
@@ -2071,6 +2374,97 @@ fn string_array(value: Option<&Value>) -> String {
         .unwrap_or_default()
 }
 
+/// The string entries of a JSON array, in order. A non-array or a non-string
+/// entry is dropped rather than failing the item: this is display data.
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A wire string that may be absent, null, or empty. The empty string reads as
+/// absent so an optional line (a prompt, a model) never renders blank.
+fn optional_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+/// Fill an absent optional field from the payload; never clear one the item
+/// already has (a merge over accumulated state keeps what it knows).
+fn fill_optional(slot: &mut Option<String>, value: Option<&Value>) {
+    if slot.is_none()
+        && let Some(value) = optional_string(value)
+    {
+        *slot = Some(value);
+    }
+}
+
+/// Take the payload's optional value when it carries one: a completion is
+/// authoritative where it speaks, so a different value replaces the start's —
+/// including an empty string, which is a value the call reported — while only a
+/// `null`/absent field leaves what the item already had.
+fn take_optional(slot: &mut Option<String>, value: Option<&Value>) {
+    if let Some(value) = value.and_then(Value::as_str) {
+        *slot = Some(value.to_string());
+    }
+}
+
+/// The target-agent rows a collaboration item reports: the wire's receiver
+/// order first (so the card's rows follow the call, not a hash order), then any
+/// state the receiver list did not name, sorted by thread id. Deterministic on
+/// every replay, so an unchanged call's Tool Panel compares equal.
+fn collab_agents(item: &Value) -> Vec<AgentState> {
+    let mut states: Vec<AgentState> = item
+        .get("agentsStates")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(thread_id, state)| AgentState {
+                    thread_id: thread_id.clone(),
+                    status: state
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    message: optional_string(state.get("message")),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    states.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+
+    let mut rows = Vec::with_capacity(states.len());
+    let mut seen: Vec<String> = Vec::new();
+    for thread_id in string_list(item.get("receiverThreadIds")) {
+        if seen.contains(&thread_id) {
+            continue;
+        }
+        if let Some(index) = states.iter().position(|state| state.thread_id == thread_id) {
+            rows.push(states.remove(index));
+        } else {
+            // A receiver the state map has not named yet (a start payload):
+            // still a row, with its state unknown.
+            rows.push(AgentState {
+                thread_id: thread_id.clone(),
+                status: String::new(),
+                message: None,
+            });
+        }
+        seen.push(thread_id);
+    }
+    rows.extend(states);
+    rows
+}
+
 fn combine_reasoning(summary: &str, text: &str) -> Option<String> {
     match (summary.is_empty(), text.is_empty()) {
         (true, true) => None,
@@ -2164,6 +2558,32 @@ fn mcp_status(status: &Option<String>) -> ToolStatus {
         Some("failed") => ToolStatus::Error,
         Some(other) => ToolStatus::Other(other.to_string()),
         None => ToolStatus::Unknown,
+    }
+}
+
+/// A collaboration call's own status. Unlike the other tool kinds, the wire
+/// carries an `interrupted` outcome too (a close/interrupt that landed), which
+/// is a failure for the card's icon rather than an unknown status.
+fn collab_status(status: &Option<String>) -> ToolStatus {
+    match status.as_deref() {
+        Some("inProgress") => ToolStatus::Running,
+        Some("completed") => ToolStatus::Completed,
+        Some("failed") | Some("interrupted") => ToolStatus::Error,
+        Some(other) => ToolStatus::Other(other.to_string()),
+        None => ToolStatus::Unknown,
+    }
+}
+
+/// A child agent activity carries no status field. An interruption is the
+/// card's failure mark; any other activity is live until its completion
+/// arrives (the same rule `webSearch`/`image` use).
+fn activity_status(kind: &str, completed: bool) -> ToolStatus {
+    if kind == "interrupted" {
+        ToolStatus::Error
+    } else if completed {
+        ToolStatus::Completed
+    } else {
+        ToolStatus::Running
     }
 }
 
@@ -2680,6 +3100,9 @@ mod tests {
                 "item-image",
                 "item-plan",
                 "item-compaction",
+                "item-collab-spawn",
+                "item-collab-wait",
+                "item-subagent-activity",
             ],
             "one message per server-owned item, in first-seen order"
         );
@@ -2706,12 +3129,508 @@ mod tests {
             "codex/file_change",
             "codex/web_search",
             "codex/image",
+            "codex/collab_agent",
+            "codex/sub_agent_activity",
         ] {
             assert!(names.contains(&expected), "{expected} missing from {names:?}");
         }
-        for bare in ["command_execution", "file_change", "web_search", "image"] {
+        for bare in [
+            "command_execution",
+            "file_change",
+            "web_search",
+            "image",
+            "collab_agent",
+            "sub_agent_activity",
+        ] {
             assert!(!names.contains(&bare), "bare id leaked: {names:?}");
         }
+    }
+
+    /// Issue #962: a `collabAgentToolCall` is one Tool Panel, and the start's
+    /// fields survive the completion's nulls (the wire omits `prompt` on a call
+    /// that has none rather than repeating it), while the completion's receiver
+    /// list and state rows are authoritative.
+    #[test]
+    fn a_collab_call_merges_its_completion_without_dropping_the_start() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(&mut projection, &recording());
+
+        let call = projected_tool(&projection, "item-collab-spawn");
+        assert_eq!(call.identity.name, "codex/collab_agent");
+        assert_eq!(call.status, ToolStatus::Completed);
+        let input = call.input.as_ref().expect("the adapter's shape");
+        assert_eq!(input["tool"], "spawnAgent");
+        assert_eq!(input["status"], "completed");
+        assert_eq!(input["senderThreadId"], "thread-1");
+        assert_eq!(
+            input["receiverThreadIds"],
+            json!(["0192f0aa-0000-7000-8000-000000000001"])
+        );
+        assert_eq!(
+            input["prompt"],
+            "Review the diff and report the blocking findings."
+        );
+        assert_eq!(input["model"], "gpt-5.1-codex");
+        assert_eq!(input["reasoningEffort"], "high");
+        assert_eq!(
+            input["agents"][0]["threadId"],
+            "0192f0aa-0000-7000-8000-000000000001"
+        );
+        assert_eq!(input["agents"][0]["status"], "running");
+        assert_eq!(input["agents"][0]["message"], Value::Null);
+
+        // The completion is authoritative where it SPEAKS: a different non-null
+        // value replaces the start's, while a null field keeps what the start
+        // said (the wire writes null for the calls that have none).
+        let mut changed = ThreadProjection::new("thread-1");
+        replay(
+            &mut changed,
+            &[
+                json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "startedAtMs": 1_700_000_000_100i64,
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "item-collab-changed",
+                            "tool": "spawnAgent",
+                            "status": "inProgress",
+                            "senderThreadId": "thread-1",
+                            "receiverThreadIds": [],
+                            "prompt": "the first prompt",
+                            "model": "gpt-5.1-codex",
+                            "reasoningEffort": "low",
+                            "agentsStates": {}
+                        }
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_200i64,
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "item-collab-changed",
+                            "tool": "spawnAgent",
+                            "status": "completed",
+                            "senderThreadId": "thread-1",
+                            "receiverThreadIds": [],
+                            "prompt": null,
+                            "model": "gpt-5.2-codex",
+                            "reasoningEffort": "high",
+                            "agentsStates": {}
+                        }
+                    }
+                }),
+            ],
+        );
+        let call = projected_tool(&changed, "item-collab-changed");
+        let input = call.input.as_ref().expect("the shape");
+        assert_eq!(input["status"], "completed");
+        assert_eq!(
+            input["prompt"], "the first prompt",
+            "a null completion field keeps the start's value"
+        );
+        assert_eq!(
+            input["model"], "gpt-5.2-codex",
+            "a changed completion value is authoritative"
+        );
+        assert_eq!(input["reasoningEffort"], "high");
+    }
+
+    /// Review round 3: an empty string is a VALUE the completion reported, not
+    /// an absent field — it clears the start's prompt instead of resurrecting
+    /// it (the card then shows no prompt line).
+    #[test]
+    fn an_empty_completion_prompt_is_a_value_not_an_absence() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[
+                json!({
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "startedAtMs": 1_700_000_000_100i64,
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "item-collab-empty",
+                            "tool": "spawnAgent",
+                            "status": "inProgress",
+                            "senderThreadId": "thread-1",
+                            "receiverThreadIds": [],
+                            "prompt": "the first prompt",
+                            "model": null,
+                            "reasoningEffort": null,
+                            "agentsStates": {}
+                        }
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_200i64,
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "item-collab-empty",
+                            "tool": "spawnAgent",
+                            "status": "completed",
+                            "senderThreadId": "thread-1",
+                            "receiverThreadIds": [],
+                            "prompt": "",
+                            "model": null,
+                            "reasoningEffort": null,
+                            "agentsStates": {}
+                        }
+                    }
+                }),
+            ],
+        );
+        let call = projected_tool(&projection, "item-collab-empty");
+        assert_eq!(
+            call.input.as_ref().expect("the shape")["prompt"],
+            "",
+            "an empty completion prompt clears the start's"
+        );
+    }
+
+    /// Issue #962 acceptance 2's readable name: the collaboration item names
+    /// its targets by thread id, and the same read carries each child's
+    /// `agentPath` from its own activity — the card prefers it, with no extra
+    /// read. Without such an activity the id head stays the label.
+    #[test]
+    fn a_collab_target_uses_the_childs_reported_agent_path() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_100i64,
+                        "item": {
+                            "type": "subAgentActivity",
+                            "id": "item-activity-path",
+                            "kind": "started",
+                            "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+                            "agentPath": "/root/spawn_smoke_test",
+                            "model": null,
+                            "reasoningEffort": null
+                        }
+                    }
+                }),
+                json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_200i64,
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "item-collab-path",
+                            "tool": "wait",
+                            "status": "completed",
+                            "senderThreadId": "thread-1",
+                            "receiverThreadIds": ["0192f0aa-0000-7000-8000-000000000001"],
+                            "prompt": null,
+                            "model": null,
+                            "reasoningEffort": null,
+                            "agentsStates": {
+                                "0192f0aa-0000-7000-8000-000000000001": {
+                                    "status": "completed",
+                                    "message": null
+                                }
+                            }
+                        }
+                    }
+                }),
+            ],
+        );
+        let call = projected_tool(&projection, "item-collab-path");
+        assert_eq!(
+            call.input.as_ref().expect("the shape")["agents"][0]["label"],
+            "/root/spawn_smoke_test"
+        );
+    }
+
+    /// Review round 6: an activity is live between its start and its
+    /// completion (the same rule every statusless item takes), and the
+    /// completion settles it.
+    #[test]
+    fn a_sub_agent_activity_is_running_until_its_completion_arrives() {
+        let start = json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "startedAtMs": 1_700_000_000_100i64,
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "item-activity-live",
+                    "kind": "started",
+                    "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+                    "agentPath": "/root/worker",
+                    "model": "gpt-5.1-codex",
+                    "reasoningEffort": "high"
+                }
+            }
+        });
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "completedAtMs": 1_700_000_000_200i64,
+                "item": {
+                    "type": "subAgentActivity",
+                    "id": "item-activity-live",
+                    "kind": "started",
+                    "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+                    "agentPath": "/root/worker",
+                    "model": "gpt-5.1-codex",
+                    "reasoningEffort": "high"
+                }
+            }
+        });
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(&mut projection, std::slice::from_ref(&start));
+        assert_eq!(
+            projected_tool(&projection, "item-activity-live").status,
+            ToolStatus::Running,
+            "an uncompleted activity is live"
+        );
+        replay(&mut projection, std::slice::from_ref(&completed));
+        assert_eq!(
+            projected_tool(&projection, "item-activity-live").status,
+            ToolStatus::Completed
+        );
+    }
+
+    /// The `wait` call carries two targets, one of which errored: both rows are
+    /// in receiver order and the failure is the row's own state, not the call's.
+    #[test]
+    fn a_wait_collab_call_lists_every_target_with_its_own_state() {
+        let projection = projected();
+        let call = projected_tool(&projection, "item-collab-wait");
+        assert_eq!(call.status, ToolStatus::Completed);
+
+        let agents = call.input.as_ref().expect("the shape")["agents"]
+            .as_array()
+            .expect("the row list");
+        let rows: Vec<(&str, &str, Option<&str>)> = agents
+            .iter()
+            .map(|agent| {
+                (
+                    agent["threadId"].as_str().expect("a thread id"),
+                    agent["status"].as_str().expect("a state"),
+                    agent["message"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("0192f0aa-0000-7000-8000-000000000001", "completed", None),
+                (
+                    "0192f0bb-0000-7000-8000-000000000002",
+                    "errored",
+                    Some("the worker hit a compile error")
+                ),
+            ]
+        );
+    }
+
+    /// An unknown `tool` (or `status`) is upstream's to add: it keeps its raw
+    /// string and still becomes a card rather than `Part::Other`.
+    #[test]
+    fn an_unknown_collab_tool_keeps_its_name_and_still_renders() {
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(
+            &mut projection,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "collabAgentToolCall",
+                        "id": "item-collab-future",
+                        "tool": "futureTool",
+                        "status": "future",
+                        "senderThreadId": "thread-1",
+                        "receiverThreadIds": [],
+                        "prompt": null,
+                        "model": null,
+                        "reasoningEffort": null,
+                        "agentsStates": {}
+                    }
+                }
+            })],
+        );
+
+        let call = projected_tool(&projection, "item-collab-future");
+        assert_eq!(call.identity.name, "codex/collab_agent");
+        assert_eq!(call.status, ToolStatus::Other("future".into()));
+        assert_eq!(call.input.as_ref().unwrap()["tool"], "futureTool");
+        assert!(
+            call.input.as_ref().unwrap()["agents"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "no receivers writes no rows"
+        );
+    }
+
+    /// Issue #962 acceptance 3: the call's own status drives the card's icon,
+    /// and `failed`/`interrupted` are failures — a regression here would show a
+    /// settled ✅ on a call that never succeeded.
+    #[test]
+    fn a_failed_or_interrupted_collab_call_is_a_failure() {
+        for (status, expected) in [
+            ("inProgress", ToolStatus::Running),
+            ("completed", ToolStatus::Completed),
+            ("failed", ToolStatus::Error),
+            ("interrupted", ToolStatus::Error),
+        ] {
+            let mut projection = ThreadProjection::new("thread-1");
+            replay(
+                &mut projection,
+                &[json!({
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "completedAtMs": 1_700_000_000_100i64,
+                        "item": {
+                            "type": "collabAgentToolCall",
+                            "id": "item-collab-status",
+                            "tool": "spawnAgent",
+                            "status": status,
+                            "senderThreadId": "thread-1",
+                            "receiverThreadIds": [],
+                            "prompt": null,
+                            "model": null,
+                            "reasoningEffort": null,
+                            "agentsStates": {}
+                        }
+                    }
+                })],
+            );
+            let call = projected_tool(&projection, "item-collab-status");
+            assert_eq!(call.status, expected, "status {status}");
+        }
+    }
+
+    /// The row order is the wire's receiver order first, then any extra state,
+    /// sorted by id — never a hash order, so replaying the same item yields an
+    /// identical `ToolCall` and the card is not repainted for nothing.
+    #[test]
+    fn collab_rows_are_ordered_and_replay_identically() {
+        let event = json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "completedAtMs": 1_700_000_000_100i64,
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "item-collab-rows",
+                    "tool": "wait",
+                    "status": "completed",
+                    "senderThreadId": "thread-1",
+                    "receiverThreadIds": ["thread-b", "thread-a"],
+                    "prompt": null,
+                    "model": null,
+                    "reasoningEffort": null,
+                    "agentsStates": {
+                        "thread-c": { "status": "running", "message": null },
+                        "thread-a": { "status": "completed", "message": null },
+                        "thread-b": { "status": "completed", "message": null }
+                    }
+                }
+            }
+        });
+        let mut projection = ThreadProjection::new("thread-1");
+        replay(&mut projection, std::slice::from_ref(&event));
+
+        let first = projected_tool(&projection, "item-collab-rows");
+        let ids: Vec<&str> = first.input.as_ref().unwrap()["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["threadId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["thread-b", "thread-a", "thread-c"]);
+
+        replay(&mut projection, std::slice::from_ref(&event));
+        let again = projected_tool(&projection, "item-collab-rows");
+        assert_eq!(again, first, "a replay must not reorder the rows");
+    }
+
+    /// Issue #962: a `subAgentActivity` becomes one small Tool Panel carrying
+    /// the child's path and the model it was started with. An interrupted
+    /// activity is the card's failure mark, never a settled ✅.
+    #[test]
+    fn a_sub_agent_activity_becomes_one_panel_with_its_path() {
+        let projection = projected();
+        let call = projected_tool(&projection, "item-subagent-activity");
+        assert_eq!(call.identity.name, "codex/sub_agent_activity");
+        assert_eq!(call.status, ToolStatus::Completed);
+        let input = call.input.as_ref().expect("the shape");
+        assert_eq!(input["kind"], "started");
+        assert_eq!(input["agentThreadId"], "0192f0aa-0000-7000-8000-000000000001");
+        assert_eq!(input["agentPath"], "/root/worker");
+        assert_eq!(input["model"], "gpt-5.1-codex");
+        assert_eq!(input["reasoningEffort"], "high");
+
+        let mut interrupted = ThreadProjection::new("thread-1");
+        replay(
+            &mut interrupted,
+            &[json!({
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "completedAtMs": 1_700_000_000_100i64,
+                    "item": {
+                        "type": "subAgentActivity",
+                        "id": "item-activity-interrupted",
+                        "kind": "interrupted",
+                        "agentThreadId": "0192f0aa-0000-7000-8000-000000000001",
+                        "agentPath": "/root/worker",
+                        "model": null,
+                        "reasoningEffort": null
+                    }
+                }
+            })],
+        );
+        let call = projected_tool(&interrupted, "item-activity-interrupted");
+        assert_eq!(call.status, ToolStatus::Error);
+    }
+
+    /// The one Tool Panel a given item id projects, through the neutral read.
+    fn projected_tool(projection: &ThreadProjection, item_id: &str) -> ToolCall {
+        projection
+            .transcript()
+            .messages
+            .iter()
+            .find(|message| message.id.as_str() == item_id)
+            .and_then(|message| {
+                message.parts.iter().find_map(|part| match part {
+                    Part::Tool(call) => Some(call.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| panic!("{item_id} projects a tool call"))
     }
 
     /// Acceptance 2: a mid-turn read is the cache's current state — the applied
