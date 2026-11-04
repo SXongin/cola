@@ -14,7 +14,8 @@ Rust edition 2024. The toolchain is pinned by CI (stable). Local dev mirrors CI.
 their commands, and what each `xtask` guard protects. Run that loop before
 pushing. Linting here means zero warnings (`-D warnings`), and the
 git hooks (lefthook) run the cheap subset automatically (`pre-commit`: fmt +
-clippy on staged `*.rs`; `pre-push`: audit).
+`clippy` on the bin target for staged `*.rs`; `pre-push`: the full
+`clippy --all-targets` + audit).
 
 ## Commits
 
