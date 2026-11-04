@@ -115,8 +115,9 @@ hardcode it.
 ## Verification loop (must pass before pushing)
 
 Git hooks (lefthook) enforce the cheap ones automatically — `pre-commit` runs
-`fmt` + `clippy` when Rust files are staged, `commit-msg` checks Conventional
-Commits, `pre-push` runs the dependency audit. The full loop CI runs:
+`fmt` + `clippy` on the bin target when Rust files are staged, `commit-msg`
+checks Conventional Commits, `pre-push` runs the full `clippy --all-targets`
+(which also lints test code) and the dependency audit. The full loop CI runs:
 
 ```bash
 cargo fmt --all -- --check
@@ -128,6 +129,21 @@ cargo xtask check-doc-drift
 cargo test --workspace --locked
 cargo build --release --locked
 ```
+
+### While iterating
+
+The block above is the gate **before a push**, not a loop to re-run after every
+edit. Measured on a 6-core host with a warm `target/` (2026-11-04), one touched
+Rust file costs `clippy --workspace` 32 s, `clippy --all-targets` 101 s,
+`build --release` 87 s, and `test --workspace` five minutes — and CI re-runs
+every one of them on the push regardless. So iterate on the module you touched
+(`cargo test --bin cola <filter>`, or `cargo test --workspace <module>::` when
+the change crosses modules) and run the whole block once, on the tree that
+ships, immediately before pushing.
+
+The hook split assumes the same boundary: `pre-commit` deliberately stops at the
+bin target (32 s, not 101 s), so a lint in `#[cfg(test)]` code is caught by
+`pre-push` and CI — not by the commit that introduced it.
 
 `cargo xtask check-generation` is the V1 coupling guard (spec #364): V1 route
 literals and wire field names may live only in the V1 generation strategy
