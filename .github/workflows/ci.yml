@@ -128,21 +128,25 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
-  live-v1:
-    # The live V1 contract suite (ADR-0057): the real pinned 1.18.31 binary
-    # runs its agent loop against an in-process scripted provider, in an
-    # isolated store. Required by the `main: CI` ruleset (#376). The suite is
-    # `#[ignore]`-gated, so no hermetic job ever runs it.
+  live-opencode:
+    # Both live contract suites (ADR-0057) in one job: the V1 chains and the V2
+    # chains need different pinned binaries but the *same* compiled test binary,
+    # so two jobs built the 314k-line crate twice to run a handful of
+    # `#[ignore]` tests (measured 2026-11-04: 2.3 min and 2.0 min, almost none
+    # of it suite time). One job installs both binaries — they expose different
+    # names, `opencode` and `opencode2`, so neither shadows the other — and runs
+    # each suite in turn.
     #
-    # The docs-only and release/* skips gate the STEPS, not the job: a
-    # job-level skip would leave the required `Live V1` check unreported and
-    # block the PR. A dispatched job with skipped steps reports success under
-    # the required name instead (the same shape as the Test matrix).
-    name: Live V1
+    # Required by the `main: CI` ruleset as `Live OpenCode` (#376). The
+    # docs-only and release/* skips gate the STEPS, not the job: a job-level
+    # skip would leave the required check unreported and block the PR. A
+    # dispatched job with skipped steps reports success under its name instead
+    # (the same shape as the Test matrix).
+    name: Live OpenCode
     needs: classify
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - if: >-
           needs.classify.outputs.heavy != 'false' &&
@@ -167,38 +171,16 @@ jobs:
           !startsWith(github.head_ref || '', 'release/')
         name: Live V1 suite
         run: cargo test --locked -- --ignored live_v1
-
-  live-v2:
-    # The live V2 contract suite (ADR-0057): the real pinned 2.0.27 binary runs
-    # its agent loop against an in-process scripted provider, in an isolated
-    # store. Required by the `main: CI` ruleset (#376), same step-gating shape
-    # as Live V1: only the steps are skipped for docs-only and release/* PRs,
-    # so the required `Live V2` check still reports.
-    name: Live V2
-    needs: classify
-    if: always()
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
+      # `always()` on the V2 steps: a broken V1 chain must not hide the V2
+      # result for the same commit. The heavy/release gate still applies, so a
+      # docs-only PR skips both.
       - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: stable
-      - if: >-
-          needs.classify.outputs.heavy != 'false' &&
-          !startsWith(github.head_ref || '', 'release/')
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - if: >-
+          always() &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         uses: ./.github/actions/install-opencode-v2
       - if: >-
+          always() &&
           needs.classify.outputs.heavy != 'false' &&
           !startsWith(github.head_ref || '', 'release/')
         name: Live V2 suite
