@@ -292,9 +292,15 @@ impl CardBuilder {
         todo: TodoPanel,
         at_ms: Option<i64>,
         element_id: Option<&str>,
+        session_id: Option<&str>,
     ) -> Self {
-        self.body
-            .push(todo_panel_element(&todo, at_ms, element_id, &mut self.markdown));
+        self.body.push(todo_panel_element(
+            &todo,
+            at_ms,
+            element_id,
+            session_id,
+            &mut self.markdown,
+        ));
         self
     }
 

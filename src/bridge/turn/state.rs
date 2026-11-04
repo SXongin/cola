@@ -4637,7 +4637,8 @@ impl StreamAccumulator {
             // what the build will not render.
             if let Some(todo) = &self.todo_panel {
                 comps += 1;
-                size += todo_panel_estimate(todo);
+                size +=
+                    todo_panel_estimate(todo, self.todo_shown_at, Some("todo"), self.session_id.as_deref());
             }
             if !self.ledger.is_empty() {
                 comps += 1;
@@ -4907,7 +4908,12 @@ impl StreamAccumulator {
             // on a finalized one). The block spans below are recorded from
             // `builder.body_len()`, so they stay correct with it in front.
             if let Some(todo) = &self.todo_panel {
-                builder = builder.with_todo_at(todo.clone(), self.todo_shown_at, Some("todo"));
+                builder = builder.with_todo_at(
+                    todo.clone(),
+                    self.todo_shown_at,
+                    Some("todo"),
+                    self.session_id.as_deref(),
+                );
             }
             // The Background Task Ledger follows the todo list (ADR-0060): the
             // Session's live tasks, kept on the newest card by the tail's own

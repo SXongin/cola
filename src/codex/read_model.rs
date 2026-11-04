@@ -2797,11 +2797,13 @@ impl TurnPlanUpdated {
                 .iter()
                 .map(|step| TodoStep {
                     text: step.step.clone(),
+                    // Only the three documented statuses are known here; any
+                    // other spelling keeps its row and renders as pending
+                    // (issue #961 acceptance 5).
                     status: match step.status.as_str() {
                         "pending" => TodoStatus::Pending,
                         "inProgress" => TodoStatus::InProgress,
                         "completed" => TodoStatus::Completed,
-                        "cancelled" => TodoStatus::Cancelled,
                         other => TodoStatus::Other(other.to_string()),
                     },
                 })
@@ -3092,6 +3094,22 @@ mod tests {
                 .todo
                 .is_some_and(TodoList::is_empty),
             "an empty replacement is retained so the card can clear the old panel"
+        );
+    }
+
+    /// Issue #961 acceptance 2: a malformed `turn/plan/updated` follows the
+    /// shared decode rule — it marks the read incomplete rather than silently
+    /// disappearing.
+    #[test]
+    fn a_malformed_plan_update_marks_the_read_incomplete() {
+        let mut projection = projected();
+        assert!(!projection.apply(
+            TURN_PLAN_UPDATED,
+            &json!({ "threadId": "thread-1", "turnId": "turn-1" })
+        ));
+        assert!(
+            projection.transcript().truncated,
+            "a decode failure must state the gap"
         );
     }
 
