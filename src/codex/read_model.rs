@@ -35,8 +35,8 @@ use serde_json::{Value, json};
 use crate::backend::{
     Compaction, CompactionReason, CompactionStatus, ContentBlock, FileContent, FinishReason, MessageId,
     MessageRole, MessageTime, ModelIdentity, OtherPart, Part, ReasoningPart, SessionTranscript, StepFinish,
-    TextPart, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus, TranscriptMessage, TurnDiff,
-    TurnDiffFile,
+    TextPart, TodoList, TodoStatus, TodoStep, TokenUsage, ToolCall, ToolIdentity, ToolOutput, ToolStatus,
+    TranscriptMessage, TurnDiff, TurnDiffFile,
 };
 
 /// `item/started`: the server's opening payload for one item.
@@ -55,6 +55,7 @@ const PLAN_DELTA: &str = "item/plan/delta";
 const TURN_STARTED: &str = "turn/started";
 const TURN_COMPLETED: &str = "turn/completed";
 const TURN_DIFF_UPDATED: &str = "turn/diff/updated";
+const TURN_PLAN_UPDATED: &str = "turn/plan/updated";
 const TOKEN_USAGE_UPDATED: &str = "thread/tokenUsage/updated";
 const ERROR_NOTIFICATION: &str = "error";
 /// The server's own thread-level settings broadcast (issue #910): `ThreadSettings
@@ -145,6 +146,9 @@ pub(crate) struct ThreadProjection {
     turn_order: Vec<String>,
     /// The latest `turn/diff/updated` per turn.
     diffs: HashMap<String, TurnDiff>,
+    /// The latest `turn/plan/updated` per turn. Each notification replaces the
+    /// whole checklist; it is not a transcript item.
+    plans: HashMap<String, TurnPlanUpdated>,
     /// The latest `thread/tokenUsage/updated` per turn, as the neutral shape.
     usage: HashMap<String, TokenUsage>,
     /// `tokenUsage.modelContextWindow`, once one arrived.
@@ -410,6 +414,7 @@ impl ThreadProjection {
             MCP_PROGRESS => self.decode(params, |this, n: Delta| this.mcp_progress(n)),
             PLAN_DELTA => self.decode(params, |this, n: Delta| this.plan_delta(n)),
             TURN_DIFF_UPDATED => self.decode(params, |this, n: TurnDiffUpdated| this.turn_diff(n)),
+            TURN_PLAN_UPDATED => self.decode(params, |this, n: TurnPlanUpdated| this.turn_plan(n)),
             TOKEN_USAGE_UPDATED => self.decode(params, |this, n: TokenUsageUpdated| this.token_usage(n)),
             ERROR_NOTIFICATION => self.decode(params, |this, n: ErrorNotification| this.turn_error(n, seq)),
             _ => false,
@@ -695,6 +700,17 @@ impl ThreadProjection {
             })
             .collect();
         transcript = transcript.with_submissions(submissions);
+        for (turn_id, plan) in &self.plans {
+            let Some(message_id) = self
+                .items
+                .iter()
+                .find(|item| item.turn_id == *turn_id && matches!(item.kind, ItemKind::UserMessage { .. }))
+                .map(|item| MessageId::new(item.id.clone()))
+            else {
+                continue;
+            };
+            transcript = transcript.with_todo_list(message_id, plan.todo_list());
+        }
         transcript.truncated = self.incomplete;
         transcript
     }
@@ -945,6 +961,10 @@ impl ThreadProjection {
     fn turn_diff(&mut self, notification: TurnDiffUpdated) {
         let diff = parse_unified_diff(&notification.diff);
         self.diffs.insert(notification.turn_id, diff);
+    }
+
+    fn turn_plan(&mut self, notification: TurnPlanUpdated) {
+        self.plans.insert(notification.turn_id.clone(), notification);
     }
 
     fn token_usage(&mut self, notification: TokenUsageUpdated) {
@@ -2758,6 +2778,46 @@ struct TurnDiffUpdated {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct TurnPlanUpdated {
+    #[serde(default)]
+    #[allow(dead_code)]
+    thread_id: String,
+    turn_id: String,
+    #[serde(default)]
+    explanation: Option<String>,
+    plan: Vec<TurnPlanStep>,
+}
+
+impl TurnPlanUpdated {
+    fn todo_list(&self) -> TodoList {
+        TodoList {
+            explanation: self.explanation.clone().filter(|text| !text.is_empty()),
+            steps: self
+                .plan
+                .iter()
+                .map(|step| TodoStep {
+                    text: step.step.clone(),
+                    status: match step.status.as_str() {
+                        "pending" => TodoStatus::Pending,
+                        "inProgress" => TodoStatus::InProgress,
+                        "completed" => TodoStatus::Completed,
+                        "cancelled" => TodoStatus::Cancelled,
+                        other => TodoStatus::Other(other.to_string()),
+                    },
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnPlanStep {
+    step: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TokenUsageUpdated {
     #[serde(default)]
     #[allow(dead_code)]
@@ -2967,6 +3027,72 @@ mod tests {
         let mut projection = ThreadProjection::new("thread-1");
         replay(&mut projection, &recording());
         projection
+    }
+
+    /// Issue #961: `update_plan` is a checklist notification, not a transcript
+    /// item. The projection must retain the latest whole list for its turn.
+    #[test]
+    fn a_plan_update_is_folded_into_the_projection() {
+        let mut projection = projected();
+        assert!(projection.apply(
+            TURN_PLAN_UPDATED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "explanation": "Keep the boundary intact",
+                "plan": [
+                    { "step": "Inspect code", "status": "completed" },
+                    { "step": "Implement fix", "status": "inProgress" },
+                    { "step": "Carry the unknown", "status": "paused" }
+                ]
+            })
+        ));
+
+        let transcript = projection.transcript();
+        let anchor = transcript
+            .anchor_of_user("item-user")
+            .expect("the recording's user message is the turn anchor");
+        let todo = transcript
+            .turn_for_user(&anchor)
+            .todo
+            .expect("the plan belongs to the turn");
+        assert_eq!(todo.explanation.as_deref(), Some("Keep the boundary intact"));
+        assert_eq!(todo.steps.len(), 3);
+        assert_eq!(todo.steps[0].status, TodoStatus::Completed);
+        assert_eq!(todo.steps[1].status, TodoStatus::InProgress);
+        assert_eq!(todo.steps[2].status, TodoStatus::Other("paused".to_string()));
+
+        assert!(projection.apply(
+            TURN_PLAN_UPDATED,
+            &json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "plan": [
+                    { "step": "Only the new step", "status": "pending" }
+                ]
+            })
+        ));
+        let transcript = projection.transcript();
+        let todo = transcript
+            .turn_for_user(&anchor)
+            .todo
+            .expect("the replacement remains attached");
+        assert_eq!(todo.steps.len(), 1, "the whole list is replaced");
+        assert_eq!(todo.steps[0].text, "Only the new step");
+        assert_eq!(todo.explanation, None);
+
+        assert!(projection.apply(
+            TURN_PLAN_UPDATED,
+            &json!({ "threadId": "thread-1", "turnId": "turn-1", "plan": [] })
+        ));
+        let transcript = projection.transcript();
+        assert!(
+            transcript
+                .turn_for_user(&anchor)
+                .todo
+                .is_some_and(TodoList::is_empty),
+            "an empty replacement is retained so the card can clear the old panel"
+        );
     }
 
     /// Issue #904: Codex items carry no model — the thread does — so the

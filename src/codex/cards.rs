@@ -278,6 +278,155 @@ async fn a_turn_started_on_another_connection_renders_on_the_feishu_card() {
     sync.abort();
 }
 
+/// Issue #961: `turn/plan/updated` replaces one card-tail Todo Panel. The list
+/// is not an item, so it never becomes a Tool Panel or a standalone timeline
+/// row; an empty replacement removes the panel and a later list restores it.
+#[tokio::test]
+async fn update_plan_replaces_the_card_tail_todo_panel() {
+    let (server, url) = FakeServer::tcp("codex-tui/0.166.0 (test)").await;
+    server.seed_thread(ScriptedThread::adopted(
+        THREAD,
+        "session-root",
+        WORK,
+        "a real thread",
+    ));
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let now = chrono::Utc::now().timestamp_millis() / 1_000 * 1_000;
+    let (app, platform, _client) =
+        build_bridge(&url, &directory.path().join("sessions.json"), now - 60_000).await;
+    let sync = spawn_sync(&app);
+    server.wait_for_subscribers(THREAD, 1).await;
+
+    server.push_to_thread(
+        THREAD,
+        "turn/started",
+        json!({
+            "threadId": THREAD,
+            "turn": { "id": "turn-plan", "status": "inProgress", "startedAt": now / 1_000 }
+        }),
+    );
+    server.push_to_thread(
+        THREAD,
+        "item/started",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-plan",
+            "startedAtMs": now - 1_000,
+            "item": {
+                "type": "userMessage",
+                "id": "item-plan-user",
+                "content": [{ "type": "text", "text": "show the plan" }]
+            }
+        }),
+    );
+    wait_for_card_update(
+        &platform,
+        "the plan turn's user message",
+        CardUpdates::Any,
+        |card| card_text(card).contains("show the plan"),
+    )
+    .await;
+
+    server.push_to_thread(
+        THREAD,
+        "turn/plan/updated",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-plan",
+            "explanation": "Work through the parser in order",
+            "plan": [
+                { "step": "Inspect parser", "status": "completed" },
+                { "step": "Patch decoder", "status": "inProgress" },
+                { "step": "Run tests", "status": "paused" }
+            ]
+        }),
+    );
+    wait_for_card_update(&platform, "the first plan", CardUpdates::Latest, |card| {
+        card_text(card).contains("Work through the parser in order")
+            && card_text(card).contains("Patch decoder")
+    })
+    .await;
+    let first = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the first plan's card");
+    let text = card_text(&first);
+    assert!(
+        text.contains("📋 todowrite"),
+        "the tail Todo Panel renders: {first}"
+    );
+    assert!(text.contains("共 3 项 · 🔄 1 · ⬜ 1 · ✅ 1"), "{first}");
+    assert!(text.contains("✅ ~~Inspect parser~~"), "{first}");
+    assert!(text.contains("🔄 **Patch decoder**"), "{first}");
+    assert!(
+        text.contains("⬜ Run tests"),
+        "an unknown status keeps its row with the pending icon: {first}"
+    );
+    assert!(
+        !text.contains("codex/plan"),
+        "the list is not a tool row: {first}"
+    );
+
+    server.push_to_thread(
+        THREAD,
+        "turn/plan/updated",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-plan",
+            "plan": [
+                { "step": "Ship replacement", "status": "inProgress" },
+                { "step": "Verify card", "status": "pending" }
+            ]
+        }),
+    );
+    wait_for_card_update(&platform, "the replacement plan", CardUpdates::Latest, |card| {
+        card_text(card).contains("Ship replacement")
+    })
+    .await;
+    let replaced = platform
+        .updated_cards()
+        .await
+        .last()
+        .cloned()
+        .expect("the replacement plan's card");
+    let text = card_text(&replaced);
+    assert!(
+        !text.contains("Inspect parser"),
+        "old steps do not accumulate: {replaced}"
+    );
+    assert!(text.contains("共 2 项"), "{replaced}");
+    assert_eq!(text.matches("📋 todowrite").count(), 1, "{replaced}");
+
+    server.push_to_thread(
+        THREAD,
+        "turn/plan/updated",
+        json!({ "threadId": THREAD, "turnId": "turn-plan", "plan": [] }),
+    );
+    wait_for_card_update(&platform, "the cleared plan", CardUpdates::Latest, |card| {
+        !card_text(card).contains("todowrite")
+    })
+    .await;
+
+    server.push_to_thread(
+        THREAD,
+        "turn/plan/updated",
+        json!({
+            "threadId": THREAD,
+            "turnId": "turn-plan",
+            "plan": [{ "step": "Plan returns", "status": "pending" }]
+        }),
+    );
+    wait_for_card_update(&platform, "the restored plan", CardUpdates::Latest, |card| {
+        card_text(card).contains("Plan returns")
+    })
+    .await;
+
+    sync.abort();
+}
+
 /// Ticket #880 acceptance 5: a terminal `error` notification mid-turn settles
 /// the card with the error text even though no `turn/completed` follows.
 #[tokio::test]

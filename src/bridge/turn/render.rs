@@ -242,9 +242,6 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
             acc.mark_reasoning();
         }
         Part::Tool(call) => {
-            // The panel is a view over the typed call; the Platform assembles
-            // the output text and status icon from it (ADR-0042, ADR-0053).
-            let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
             if call.identity.name == "todowrite" {
                 // A live status section, not a transcript row: the latest call
                 // replaces the panel the card tail renders (on the live card,
@@ -252,8 +249,19 @@ fn render_part(acc: &mut StreamAccumulator, source: Option<PartSource>, part: &P
                 // always reassigned — a payload without a server time shows no
                 // clock rather than the previous call's, which would read as a
                 // write time this list never had.
-                acc.set_todo_panel(panel, call.started_at);
+                match crate::feishu::card::tool_render::TodoPanel::from_tool(call.clone()) {
+                    crate::feishu::card::tool_render::TodoPanel::List { todo, live } => {
+                        acc.set_todo_list(&todo, call.started_at, live);
+                    }
+                    crate::feishu::card::tool_render::TodoPanel::Tool(panel) => {
+                        acc.set_todo_panel(*panel, call.started_at);
+                    }
+                }
             } else {
+                // The panel is a view over the typed call; the Platform
+                // assembles the output text and status icon from it (ADR-0042,
+                // ADR-0053).
+                let panel = crate::feishu::card::tool_render::ToolPanel::new(call.clone());
                 acc.push_tool_from(call.started_at, &call.identity.call_id, panel, source);
             }
             if call.status == ToolStatus::Running {
@@ -1639,7 +1647,11 @@ pub(super) fn render_turn_parts(
     // lock. The timeline keys the entry before the work it announces, so
     // committing it here or after the parts render is one card.
     let seed = acc.seed().cloned();
-    for message in transcript.turn_for_user(&anchor).messages {
+    let turn = transcript.turn_for_user(&anchor);
+    if let Some(todo) = turn.todo {
+        rendered_any |= acc.set_todo_list(todo, None, false);
+    }
+    for message in turn.messages {
         // A message the seed's own scope already walked is done: walking it
         // again would render its frontier part's suffix twice in one pass.
         if seeded_messages.contains(&message.id) {
@@ -3036,8 +3048,8 @@ mod tests {
 
     use crate::backend::{
         BackgroundTask, Compaction, CompactionReason, CompactionStatus, FileContent, MessageId, MessageRole,
-        MessageTime, ReasoningPart, StepFinish, StepStart, ToolCall, ToolIdentity, ToolOutput,
-        TranscriptMessage, TurnAnchor, TurnSettle,
+        MessageTime, ReasoningPart, StepFinish, StepStart, TodoList, TodoStatus, TodoStep, ToolCall,
+        ToolIdentity, ToolOutput, TranscriptMessage, TurnAnchor, TurnSettle,
     };
     use crate::bridge::App;
     use crate::bridge::chain::{
@@ -6563,6 +6575,40 @@ Index: /x/src/main.rs
         assert!(
             rest_text.contains("- ✅ ~~第一步~~") && rest_text.contains("- ⬜ 第二步"),
             "the continuation must show the latest list: {rest_text}"
+        );
+    }
+
+    /// Issue #961: Codex's neutral plan enters through the same tail seam, so a
+    /// split never strands the old list on the finalized card.
+    #[test]
+    fn a_plan_panel_rides_the_live_continuation_after_a_split() {
+        let mut acc = StreamAccumulator::new("test");
+        assert!(acc.set_todo_list(
+            &TodoList {
+                explanation: None,
+                steps: vec![TodoStep {
+                    text: "Patch decoder".to_string(),
+                    status: TodoStatus::InProgress,
+                }],
+            },
+            None,
+            false,
+        ));
+        acc.push_text(&"很长的回答。".repeat(2000));
+
+        let (full_card, full) = acc.build_card_with_split();
+        assert!(full, "long text must split");
+        assert!(
+            !full_card.to_string().contains("Patch decoder"),
+            "a finalized card carries no tail: {full_card}"
+        );
+
+        let (rest, full2) = acc.build_card_with_split();
+        assert!(!full2, "the tail should fit on the continuation");
+        let rest_text = rest.to_string();
+        assert!(
+            rest_text.contains("- 🔄 **Patch decoder**"),
+            "the continuation carries the current plan: {rest_text}"
         );
     }
 

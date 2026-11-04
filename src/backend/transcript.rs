@@ -87,6 +87,11 @@ pub struct SessionTranscript {
     /// reports the pairing here (ADR-0092), because the Turn's anchor is found
     /// by the id cola submitted and that id is not the message's.
     pub submissions: std::collections::HashMap<String, MessageId>,
+    /// The latest whole TODO list each Turn's user message owns. A backend
+    /// that reports the list outside its transcript items (Codex's
+    /// `turn/plan/updated`) stores it here so the card can render it as a
+    /// tail section without inventing a tool call or timeline item.
+    todo_lists: std::collections::HashMap<MessageId, TodoList>,
 }
 
 impl SessionTranscript {
@@ -101,6 +106,7 @@ impl SessionTranscript {
             truncated: false,
             shell_outputs: std::collections::HashMap::new(),
             submissions: std::collections::HashMap::new(),
+            todo_lists: std::collections::HashMap::new(),
         }
     }
 
@@ -109,6 +115,12 @@ impl SessionTranscript {
     /// message ids needs it; every OpenCode read leaves the map empty.
     pub fn with_submissions(mut self, submissions: std::collections::HashMap<String, MessageId>) -> Self {
         self.submissions = submissions;
+        self
+    }
+
+    /// Attach the latest whole TODO list for the Turn anchored on `message_id`.
+    pub fn with_todo_list(mut self, message_id: MessageId, todo: TodoList) -> Self {
+        self.todo_lists.insert(message_id, todo);
         self
     }
 
@@ -472,6 +484,7 @@ impl SessionTranscript {
             messages,
             complete,
             error,
+            todo: self.todo_lists.get(&anchor.message_id),
         }
     }
 
@@ -878,6 +891,57 @@ pub struct TurnView<'a> {
     /// The failure recorded on the Turn's NEWEST assistant message, if any — a
     /// recovered earlier step is not a failure.
     pub error: Option<String>,
+    /// The Turn's latest whole TODO list, when the backend reports one outside
+    /// the transcript items.
+    pub todo: Option<&'a TodoList>,
+}
+
+/// One whole TODO list for a Turn. Each source update replaces the complete
+/// list; the status vocabulary is neutral, and an unknown status keeps its
+/// original spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TodoList {
+    pub explanation: Option<String>,
+    pub steps: Vec<TodoStep>,
+}
+
+impl TodoList {
+    /// An empty list renders no panel.
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+}
+
+/// One step in a [`TodoList`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoStep {
+    pub text: String,
+    pub status: TodoStatus,
+}
+
+/// A TODO step's neutral status. `Other` is retained so an unseen wire status
+/// renders the step instead of dropping it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+    Other(String),
+}
+
+impl TodoStatus {
+    /// The wire spelling shared by OpenCode's `todowrite` and Codex's
+    /// `update_plan` after normalization.
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Other(status) => status,
+        }
+    }
 }
 
 /// How a Turn ends, as [`SessionTranscript::settle`] decides it (ADR-0059,
